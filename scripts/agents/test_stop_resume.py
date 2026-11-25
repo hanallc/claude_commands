@@ -5236,6 +5236,23 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.closed, [])
         self.assertEqual(self.client.started, [])
 
+    def test_resume_standalone_claude_preserves_its_implicit_home(self) -> None:
+        home = self.root / "source-home"
+        home.mkdir()
+        session = self.entry["session_id"]
+        row = staff.create_session("alpha", session, staff.SessionLaunchFolder(remote.local_machine(), self.root),
+                                   staff.SessionHome(home / ".claude"))
+        entry = pane_record.launch("w1:p2", session, str(self.root), {"HOME": str(home)}, ["claude", "-n", "alpha"])
+        pane_record.write("agents", entry)
+        resumed = stop_resume.resume("alpha", why="maintenance")
+        self.assertIsInstance(resumed, stop_resume.ClaudeUp, resumed)
+        command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
+        self.assertIn(f"HOME={home}", command)
+        self.assertEqual(command[command.index("CLAUDE_CONFIG_DIR") - 1], "-u")
+        self.assertFalse(any(part.startswith("CLAUDE_CONFIG_DIR=") for part in command))
+        self.assertEqual(command[command.index("exec") + 1], "claude")
+        self.assertIsInstance(herdr.claude_trust(self.root, home / ".claude.json"), herdr.Trusted)
+        self.assertEqual(staff.snapshot().by_id(row.id), row)
 
     def test_resume_launches_in_the_saved_move_destination(self) -> None:
         from scripts.worktree import worktrees

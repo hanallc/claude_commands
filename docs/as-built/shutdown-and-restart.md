@@ -25,7 +25,7 @@ A browser leaves helper processes after its own exit or a timeout, and a plain `
 
 The `/agents` skill uses the `agents` program.
 `agents` and `agents help` print the same usage and return status 0.
-The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.
+The public commands include `help`, `status`, `pause`, `exit`, `resume`, `clone`, `restart`, and `stop`.
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
 SESSION is a staff id, a session id, a unique name, or a staff path.
@@ -36,6 +36,26 @@ A path that matches more than one staff row stops nothing and returns status 2 w
 Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.
+
+`agents clone NAME --as NEW` forks a live conversation on the source machine.
+Use a staff name, saved launch name, staff ID, or native session ID.
+The command refuses a saved launch name that matches multiple sessions on this machine.
+The command requires one proved pane and opens the clone after its source tab on the same Herdr server.
+The live pane must show the current model and effort.
+For Codex, show Model with Reasoning in the status line.
+Claude uses `--resume --fork-session`.
+Codex uses `codex fork`.
+The first prompt names both sessions and asks the clone to wait for a request addressed to it.
+The command refuses occupied names and reserved message addresses.
+The fork uses the source account environment.
+An absent `CLAUDE_CONFIG_DIR` stays absent.
+Resume and restart keep the saved implicit Claude home unless an explicit account is selected.
+The command verifies the fork before it saves the launch or adds a root `session` row.
+It saves the launch before the staff write.
+A definite refusal closes only the fork terminal.
+The staff owner checks the name and ID together before it creates the row.
+The row stores the launch folder and account for ordinary restart and resume.
+Messages to each name resolve to that session's native ID.
 
 `agents pause NAME [--keep-workers] --why TEXT` pauses a director.
 The director finishes its current turn and holds at the prompt.

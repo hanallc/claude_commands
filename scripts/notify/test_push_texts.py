@@ -172,6 +172,16 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual(push.body, "")
                 self.assertEqual(push.message, "Action: Wake the Mac or check its network.")
 
+    def test_hana_screenshot_lock_catalog_has_the_unlock_action(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "hana_shot.mac_locked")
+        example, = entry.examples
+        self.assertEqual(example.name, "typical")
+        push = push_texts.render_entry(entry, example.values)
+        self.assertEqual(push.need, "blocked")
+        self.assertEqual(push.title, "Hana screenshot waits for the Mac")
+        self.assertEqual(push.action, ActionRequired("Unlock the Mac."))
+        self.assertEqual(push.body, "The screenshot starts when the Mac is ready. This alert stops on its own.")
+
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
         self.assertTrue(entries, "push_catalog.ENTRIES must include script and nixos pushes")

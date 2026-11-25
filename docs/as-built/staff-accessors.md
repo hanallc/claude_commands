@@ -20,7 +20,11 @@ The fixed `id` identifies a member across session changes.
 `set_run` stores the open run path.
 `clear_run` clears pointers that match the supplied run path.
 
-`Kind` is `Literal["showrunner", "unit", "worker", "producer"]`.
+`Kind` is `Literal["showrunner", "unit", "worker", "producer", "session"]`.
+A session has `StaffRoot` as its parent.
+Its `launch_folder` field records where it starts.
+A unit can still own that folder as its worktree.
+`create_session` adds a session and its account in one staff transaction.
 A producer has `StaffRoot` as its parent.
 It can hold both a worktree and a document.
 It can start a staff path, such as `morty`.
@@ -164,6 +168,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/session_state.py` | read | StaffRow, Exited, Paused |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
+| `scripts/adhoc_review/shared_review.py` | read | snapshot supplies the staff names and current sessions for join |
 | `scripts/agents/codex_test_support.py` | read | CodexBackend (fixture) |
 | `scripts/agents/detached_runs.py` | read | local_snapshot |
 | `scripts/agents/restart_support.py` | read | Kind (type only); the continuation send names the recipient kind |
@@ -357,6 +362,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
 | `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers; by_id and StaffRow top_item mark the top priority items |
 | `scripts/review_links/studio_page.py` | read | active and StaffRow retirement pick the producers that get a Studio tab; the snapshot comes from `list_page.render` |
+| `scripts/agents/clone_session.py` | write | create_session adds the clone with its distinct native ID. |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
@@ -398,7 +404,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 247 accessor rows (43 write, 203 read, and 1 owner).
+The table has 249 accessor rows (44 write, 204 read, and 1 owner).
 
 ## Approved copies
 

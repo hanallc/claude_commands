@@ -43,6 +43,26 @@ These fields do not change the recipient, reply name, or message key.
 
 ### Messages during an ad hoc review
 
+`/adhoc_review join <staff name>` opens the owner's review on the same machine.
+The owner keeps the decision document from the solo workflow.
+If sharing cannot start, the owner continues the solo review.
+The helper stores the shared record at `~/.local/state/adhoc_review/.shared/<owner-session-id>.md` with mode `0600`.
+One file lock covers changes to the item list, claims, and decisions in the shared record.
+The owner uses `claim` and `decide`. A joined session uses `next` and `record`.
+Both claim commands return items in review order with stable IDs and saved decisions.
+Without `--item`, `next` returns the current item or claims the first available item.
+`leave` releases a joined session's claim.
+The helper requires a verified process start to save a joined session's PID and start.
+A joined session keeps its claim while the saved PID runs with the saved start time.
+The helper releases the claim when the shared reader reports a zombie.
+The helper checks existing claims without reading the registry or a socket.
+Joined sessions can claim items, save decisions, and release claims while the owner is absent.
+The owner's claim stays with the owner.
+The owner's `end` freezes the shared record and returns the final decisions.
+Only the owner's `end --finish` removes the shared record. The owner saves the decisions first.
+Each session keeps its own message hold and item count.
+Joined sessions apply the count after `join`, `next`, and `record`.
+
 `review_hold=off` in `config/send.conf` disables message holding for all sessions.
 The next prompt or session start delivers any messages still held.
 Use `/tune` to set `review_hold=on` when message holding can resume.

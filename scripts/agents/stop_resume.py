@@ -1327,6 +1327,10 @@ def _pane_environment(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     unset = ["HERDR_TAB_ID", "STAFF_ID", "STAFF_OPERATION_FD", "PYTHONUNBUFFERED", "REFUSAL_WATCH_INVENTORY",
              *sorted(key for key in os.environ.keys() | entry["environment"].keys() if key.startswith("STAFF_ROW_FD_"))]
     environment = {key: value for key, value in entry["environment"].items() if key not in unset}
+    implicit = pane_launch.implicit_claude_home(entry)
+    if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+        unset.append("CLAUDE_CONFIG_DIR")
+        environment = implicit.environment(environment)
     environment = {**environment, "HERDR_PANE_ID": tab.pane_id,
                    "HERDR_WORKSPACE_ID": pane["workspace_id"], "RELAUNCH_PROMPT_DELIVERY": "pane"}
     return unset, environment
@@ -1348,9 +1352,11 @@ def _pane_command(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, ac
     """Build the account command for a shell in another pane."""
     unset, environment = _pane_environment(tab, entry)
     kind = pane_launch.saved_kind(entry)
+    implicit = pane_launch.implicit_claude_home(entry)
     if kind == "claude":
-        home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
-        herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
+        trust = (herdr.ClaudeTrustFile(implicit.settings_file) if isinstance(implicit, pane_launch.ImplicitClaudeHome)
+                 else Path(environment.get("CLAUDE_CONFIG_DIR") or _launch_home(entry).path))
+        herdr.trust_claude_launch(Path(entry["cwd"]), trust)
     program = [sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account]
     if kind == "codex":
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
@@ -1370,13 +1376,18 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     environment.update(pane_environment)
     for key in unset:
         _ = environment.pop(key, None)
+    implicit = pane_launch.implicit_claude_home(entry)
     if kind == "claude":
-        prepared = accounts.prepare_claude_launch(account, resume=True)
-        for key in prepared.remove:
-            _ = environment.pop(key, None)
-        environment.update(prepared.variables)
-        home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
-        herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            _ = environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            herdr.trust_claude_launch(Path(entry["cwd"]), herdr.ClaudeTrustFile(implicit.settings_file))
+        else:
+            prepared = accounts.prepare_claude_launch(account, resume=True)
+            for key in prepared.remove:
+                _ = environment.pop(key, None)
+            environment.update(prepared.variables)
+            home = environment.get("CLAUDE_CONFIG_DIR") or str(_launch_home(entry).path)
+            herdr.trust_claude_launch(Path(entry["cwd"]), Path(home))
     else:
         environment["CODEX_HOME"] = environment.get("CODEX_HOME") or str(_launch_home(entry).path)
     program = agent_program.resolve_program(kind, environment=environment)
@@ -1390,7 +1401,8 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
     row = staff.initial_snapshot().by_member_reference(entry["session_id"])
     if row is not None and isinstance(row.exited, staff.Exited):
         _ = staff.resume(str(row.id))
-    selected_home = staff.SessionHome(Path(environment["CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"]).absolute())
+    selected_home = (staff.SessionHome(implicit.config_dir) if isinstance(implicit, pane_launch.ImplicitClaudeHome)
+                     else staff.SessionHome(Path(environment["CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"]).absolute()))
     if row is not None and row.home != selected_home:
         try:
             _ = staff.set_home(row.id, selected_home)
@@ -1410,11 +1422,11 @@ def _exec_in_own_pane(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch
         raise
 
 
-def _prompt_identity(client: herdr.Herdr, pane: str, deadline: float) -> str:
+def wait_for_native_session(client: herdr.Herdr, pane: str, deadline: float, *, kind: Literal["claude", "codex"]) -> str:
     """Wait for the pane to expose its native identity within the start deadline."""
     while True:
         try:
-            return client.native_session(pane, "claude", operation_deadline.remaining(max(0.001, deadline - monotonic())))
+            return client.native_session(pane, kind, operation_deadline.remaining(max(0.001, deadline - monotonic())))
         except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure):
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -1453,7 +1465,7 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
     if not message:
         return live
     try:
-        identity = _prompt_identity(client, tab.pane_id, deadline)
+        identity = wait_for_native_session(client, tab.pane_id, deadline, kind="claude")
     except (OSError, ValueError, subprocess.SubprocessError, herdr_types.HerdrFailure) as error:
         print(f"{entry['session_id']}: prompt identity anomaly: {error}", file=sys.stderr)
         return live
@@ -1558,6 +1570,8 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", cap
 
 def member_machine(member: StaffRow) -> str:
     """Return the member's recorded machine, or an empty string when unknown."""
+    if isinstance(member.launch_folder, staff.SessionLaunchFolder):
+        return member.launch_folder.machine
     location = member.worktree if isinstance(member.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else member.doc
     if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
         return location.machine
@@ -1890,14 +1904,21 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         else:
             print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
         selected = member_account.resume_account(kind, row if row is not None else SESSION_WITHOUT_STAFF_ROW, to=to or "")
+        implicit = member_account.implicit_claude_resume(
+            row if row is not None else SESSION_WITHOUT_STAFF_ROW, entry, to or "")
         copied_from = ""
         if isinstance(selected, accounts.CodexWorkersAccount):
             target_dir, label = selected.home, selected.label
             account_environment = {"CODEX_HOME": str(target_dir)}
         else:
             target_dir, label = selected.dir, selected.label
-            account_environment = account_reader.named_account_environment(target_dir)
-        entry["environment"] = {**entry["environment"], **account_environment}
+            account_environment = ({} if isinstance(implicit, pane_launch.ImplicitClaudeHome)
+                                   else account_reader.named_account_environment(target_dir))
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            entry["environment"] = implicit.environment(entry["environment"])
+        else:
+            _ = entry.pop("implicit_claude_home", None)
+            entry["environment"] = {**entry["environment"], **account_environment}
         if row is not None and row.kind == "producer":
             expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(entry["cwd"]), target_dir)
             entry["environment"] = expectation.environment(entry["environment"])

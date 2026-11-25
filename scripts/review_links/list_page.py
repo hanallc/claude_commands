@@ -642,6 +642,7 @@ ASK_BUTTONS = {the_list.AskKind.GO: "Go", the_list.AskKind.APPROVAL: "Approved"}
 ASK_NOTES = {the_list.AskKind.GO: "Pressing Go sends your go to {agent}.",
              the_list.AskKind.APPROVAL: "Pressing Approved sends your approval to {agent}."}
 UNIT_ROLES = {"direct": ("a", "unit director"), "merge": ("the", "merge director"), "style": ("the", "style director")}
+KIND_ROLES = {"unit": "unit director", "session": "standalone session"}
 
 
 def staff_role_html(member: staff.StaffRow, names: staff_names.StaffNames) -> str:
@@ -649,7 +650,7 @@ def staff_role_html(member: staff.StaffRow, names: staff_names.StaffNames) -> st
     if member.kind == "producer" and member.name == "morty":
         return "the " + names.role_label("producer", "List producer")
     article, role = (UNIT_ROLES[member.unit_type.value] if isinstance(member.unit_type, staff.UnitDetails)
-                     else ("a", "unit director" if member.kind == "unit" else member.kind))
+                     else ("a", KIND_ROLES.get(member.kind, member.kind)))
     parent = names.members.by_id(member.parent.id) if isinstance(member.parent, staff.ReportsTo) else None
     return article + " " + names.role_label(role, role) + (" of " + names.html(parent.id, parent.name) if parent is not None else "")
 
