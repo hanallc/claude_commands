@@ -1090,6 +1090,37 @@ assert not loaded, sorted(loaded)
         self.assertEqual((target / "payload").read_text(), "")
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_source_when_final_scan_removes_copied_lease(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        path.with_name(path.name + ".lock").touch()
+        source_lease = build_folders.lease_path(path)
+        copied_lease = build_folders.lease_path(target)
+        lease_contents = '{"pid": 42, "process_start": "123"}'
+        _ = source_lease.write_text(lease_contents)
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        scan = cleanup.require_no_process_use
+
+        def remove_copied_lease(
+                scanned_path: Path, fds: Sequence[int], *, sidecars: tuple[Path, ...],
+                gate_root: Path | cleanup_old_folders.GateRootNotSelected = cleanup.GateRootNotSelected.NOT_SELECTED,
+        ) -> None:
+            if scanned_path == path and gate_root == self.gate and target.is_dir():
+                copied_lease.unlink()
+            scan(scanned_path, fds, sidecars=sidecars, gate_root=gate_root)
+
+        with (mock.patch.object(process_start, "process_start", return_value=process_start.Gone()),
+              mock.patch.object(cleanup, "require_no_process_use", side_effect=remove_copied_lease),
+              redirect_stdout(io.StringIO()) as output):
+            review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+        self.assertIn("the published copy changed during verification", output.getvalue())
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertEqual(source_lease.read_text(), lease_contents)
+        self.assertFalse(copied_lease.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
     def test_gate_move_rolls_back_published_paths_when_a_sidecar_rename_fails(self) -> None:
         cleanup = cleanup_old_folders
         path = self.gate_checkout_to_move()

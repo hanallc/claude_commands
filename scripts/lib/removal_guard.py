@@ -497,6 +497,7 @@ def remove_proved_copy(checked: CheckedCleanupPath, proof: ProvedCopyCleanup, ap
     _remove(checked, proof, None, mode=RemovalPass.CHECK)
     proof.require_unchanged_destination(approved_target)
     before_delete()
+    proof.require_unchanged_destination(approved_target)
     _delete_cleanup_entries(checked, proof, ())
 
 
