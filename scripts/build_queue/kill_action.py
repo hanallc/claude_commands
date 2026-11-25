@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Generator, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
@@ -15,12 +15,13 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import signal
 import subprocess
 import sys
 import threading
 import time
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast, final
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity
@@ -217,66 +218,87 @@ def outside_stop_route(
     return NoStopRoute()
 
 
-def stable_outside_parent(pid: int, identity: memory_admit.ProcessIdentity) -> bool:
-    try:
-        with process_stop.pin_process(process_stop.ProcessLifetime(pid, identity.start)):
-            fields = (PROC / str(pid) / "stat").read_bytes().rsplit(b") ", 1)[1].split()
-            return (fields[0] not in (b"Z", b"X", b"x") and int(fields[1]) == identity.parent
-                    and fields[19] == identity.start.encode("ascii"))
-    except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+def pidfd_live(descriptor: int) -> bool:
+    ended = select.poll()
+    ended.register(descriptor, select.POLLIN)
+    return not ended.poll(0)
+
+
+class OutsideBranchUnconfirmed(OSError):
+    """A live process could not be verified as part of the command tree."""
+
+
+@final
+class OutsideTree:
+    """Keep verified process identities through both stop phases."""
+
+    def __init__(self, pins: ExitStack, root: process_stop.ProcessLifetime, descriptor: int) -> None:
+        self.pins = pins
+        self.known = {root: descriptor}
+
+    def pin_child(self, parent: process_stop.ProcessLifetime, child: process_stop.ProcessLifetime) -> bool:
+        try:
+            with ExitStack() as pin:
+                descriptor = pin.enter_context(process_stop.pin_process(child))
+                fields = (PROC / str(child.pid) / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+                if (int(fields[1]) == parent.pid and fields[19] == child.start.encode("ascii")
+                        and int(parent.start) <= int(child.start) and pidfd_live(descriptor)
+                        and live(parent.pid, parent.start) and pidfd_live(self.known[parent])):
+                    _ = self.pins.enter_context(pin.pop_all())
+                    self.known[child] = descriptor
+                    return True
+        except (OSError, IndexError, ValueError):
+            pass
         return False
 
+    def require_branch_gone(self, child: process_stop.ProcessLifetime,
+                            observed: dict[int, memory_admit.ProcessIdentity]) -> None:
+        for pid in sorted(memory_admit.process_tree({child.pid: child.start}, observed)):
+            process = process_stop.ProcessLifetime(pid, observed[pid].start)
+            if process in self.known:
+                continue
+            state = process_start.proc_table_start(pid, PROC)
+            if isinstance(state, process_start.Unreadable) or state == process_start.Started(process.start):
+                raise OutsideBranchUnconfirmed(f"Cannot verify the process tree at pid {pid}.")
 
-def outside_tree(known: set[process_stop.ProcessLifetime]) -> set[process_stop.ProcessLifetime]:
-    """Find and retain live descendants of the observed processes."""
-    observed = memory_admit.process_table(PROC)
-    # A parent PID can change lifetime between stat reads.
-    processes = {pid: replace(identity, parent=0)
-                 if (parent := observed.get(identity.parent)) is not None and int(parent.start) > int(identity.start)
-                 else identity for pid, identity in observed.items()}
-    roots = {item.pid: item.start for item in known
-             if (identity := processes.get(item.pid)) is not None and identity.start == item.start}
-    reachable = memory_admit.process_tree(roots, processes)
-    rejected: list[int] = []
-    for pid in reachable - roots.keys():
-        identity = processes[pid]
-        if processes[identity.parent].start == identity.start and not stable_outside_parent(pid, identity):
-            rejected.append(pid)
-    if rejected:
-        for pid in rejected:
-            processes[pid] = replace(processes[pid], parent=0)
-        reachable = memory_admit.process_tree(roots, processes)
-    members = {process_stop.ProcessLifetime(pid, processes[pid].start) for pid in reachable}
-    # A process can leave the table during a scan. Check its identity before declaring it gone.
-    for item in known - members:
-        state = process_start.proc_table_start(item.pid, PROC)
-        if isinstance(state, process_start.Unreadable):
-            raise OSError(f"Cannot confirm whether pid {item.pid} is still running.")
-        if state == process_start.Started(item.start):
-            members.add(item)
-    known.update(members)
-    return members
+    def scan(self) -> set[process_stop.ProcessLifetime]:
+        observed = memory_admit.process_table(PROC)
+        children: dict[int, list[process_stop.ProcessLifetime]] = {}
+        for pid, identity in observed.items():
+            children.setdefault(identity.parent, []).append(process_stop.ProcessLifetime(pid, identity.start))
+        pending = list(self.known)
+        while pending:
+            parent = pending.pop()
+            current = observed.get(parent.pid)
+            if current is not None and current.start != parent.start:
+                continue
+            for child in children.get(parent.pid, ()):
+                if child in self.known:
+                    continue
+                if self.pin_child(parent, child):
+                    pending.append(child)
+                else:
+                    self.require_branch_gone(child, observed)
+        return {process for process, descriptor in self.known.items() if pidfd_live(descriptor)}
 
-
-def signal_outside_process(process: process_stop.ProcessLifetime, number: int) -> None:
-    try:
-        with process_stop.pin_process(process) as descriptor:
-            signal.pidfd_send_signal(descriptor, number)
-    except (ProcessLookupError, PermissionError):
-        # The next scan reports a process that stays.
-        pass
+    def send(self, process: process_stop.ProcessLifetime, number: int) -> None:
+        try:
+            signal.pidfd_send_signal(self.known[process], number)
+        except (ProcessLookupError, PermissionError):
+            # The next scan reports a process that stays.
+            pass
 
 
-def wait_outside_tree(known: set[process_stop.ProcessLifetime], sent: set[process_stop.ProcessLifetime],
+def wait_outside_tree(tree: OutsideTree, sent: set[process_stop.ProcessLifetime],
                       number: int, grace: float) -> set[process_stop.ProcessLifetime]:
     deadline = time.monotonic() + grace
-    while members := outside_tree(known):
+    while members := tree.scan():
         for process in members - sent:
-            signal_outside_process(process, number)
+            tree.send(process, number)
         sent.update(members)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return outside_tree(known)
+            return tree.scan()
         time.sleep(min(remaining, 0.1))
     return set()
 
@@ -301,23 +323,23 @@ def stop_outside_tree(run: OutsideKillCandidate) -> OutsideTreeEmpty | OutsideId
     grace = float(settings.text("STOP_GRACE_SECONDS"))
     kill_grace = float(settings.text("KILL_GRACE_SECONDS"))
     root = process_stop.ProcessLifetime(run.row_pid, run.row_start)
-    known = {root}
     try:
-        with process_stop.pin_process(root) as descriptor:
-            members = outside_tree(known)
+        with ExitStack() as pins:
+            descriptor = pins.enter_context(process_stop.pin_process(root))
+            tree = OutsideTree(pins, root, descriptor)
+            members = tree.scan()
             if root not in members or not live(root.pid, root.start):
                 return OutsideIdentityUnconfirmed("The command ended before the tree could be checked.")
             for process in members - {root}:
-                signal_outside_process(process, signal.SIGTERM)
-            try:
-                signal.pidfd_send_signal(descriptor, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
+                tree.send(process, signal.SIGTERM)
+            tree.send(root, signal.SIGTERM)
+            remaining = wait_outside_tree(tree, members, signal.SIGTERM, grace)
+            if remaining:
+                remaining = wait_outside_tree(tree, set(), signal.SIGKILL, kill_grace)
+    except OutsideBranchUnconfirmed as error:
+        return OutsideIdentityUnconfirmed(str(error))
     except ProcessLookupError:
         return OutsideIdentityUnconfirmed("The command PID changed before the stop.")
-    remaining = wait_outside_tree(known, members, signal.SIGTERM, grace)
-    if remaining:
-        remaining = wait_outside_tree(known, set(), signal.SIGKILL, kill_grace)
     if remaining:
         return OutsideProcessSurvived(min(process.pid for process in remaining))
     return OutsideTreeEmpty()

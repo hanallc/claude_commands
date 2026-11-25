@@ -2826,6 +2826,16 @@ def is_agent_command(command: Sequence[str]) -> bool:
     return is_claude_process(command) or is_codex_agent(command)
 
 
+@dataclass(frozen=True)
+class OutsideThreadHost:
+    """The process hosts threads and has no session of its own."""
+
+
+@dataclass(frozen=True)
+class OutsideIdentityUnreadable:
+    """The scan could not verify the agent's session."""
+
+
 @final
 class OutsideQueueScan:
     """Read current placement for one feed refresh."""
@@ -2840,7 +2850,7 @@ class OutsideQueueScan:
         self.groups: dict[int, Path | None] = {}
         self.for_table = for_table
         self.commands: dict[int, tuple[str, ...]] = {}
-        self.native_sessions: dict[int, str] = {}
+        self.native_sessions: dict[int, str | OutsideThreadHost | OutsideIdentityUnreadable] = {}
         self.codex_threads = staff_sources.CodexProcessThreads()
         self.children: dict[int, list[int]] = {}
         for pid, process in processes.items():
@@ -2883,34 +2893,38 @@ class OutsideQueueScan:
         return {(record["pid"], start): record["sessionId"] for entry in sessions.read_registry().entries
                 if (start := (record := entry.record).get("procStart"))}
 
-    def read_native_session(self, pid: int, command: tuple[str, ...]) -> str:
+    def read_native_session(self, pid: int, command: tuple[str, ...]) -> str | OutsideThreadHost | OutsideIdentityUnreadable:
         if is_claude_process(command):
             native = self.claude_sessions.get((pid, self.processes[pid].start), "")
         else:
             if staff_sources.codex_thread_host(list(command)):
-                return ""
+                process = self.current_process(pid)
+                return OutsideThreadHost() if process is not None and not process.zombie else OutsideIdentityUnreadable()
             try:
-                environment = herdr.process_environment(pid)
-                if any(ancestor != pid and is_codex_agent(self.command(ancestor)) for ancestor in self.ancestors(pid)):
-                    # A nested Codex can inherit the thread ID of its parent.
-                    _ = environment.pop("CODEX_THREAD_ID", None)
-                result = self.codex_threads.thread(pid, environment)
+                native = herdr.codex_resume_thread(pid)
             except (OSError, ValueError):
-                return ""
-            native = result.owner if isinstance(result, herdr.ProvedMatch) else ""
+                try:
+                    environment = herdr.process_environment(pid)
+                    # A child can inherit this value from an agent that has exited.
+                    _ = environment.pop("CODEX_THREAD_ID", None)
+                    result = self.codex_threads.thread(pid, environment)
+                except (OSError, ValueError):
+                    return OutsideIdentityUnreadable()
+                native = result.owner if isinstance(result, herdr.ProvedMatch) else ""
         process = self.current_process(pid)
-        return native if process is not None and not process.zombie else ""
+        return native if native and process is not None and not process.zombie else OutsideIdentityUnreadable()
 
     def parent_first(self, pids: set[int]) -> Iterable[int]:
-        """Visit every member, with its parent first if the parent is also a member."""
+        """Visit each candidate after its candidate ancestors."""
         visited: set[int] = set()
         for member in sorted(pids, reverse=True):
             branch: list[int] = []
-            pid = member
-            while pid in pids and pid not in visited:
+            for pid in self.ancestors(member):
+                if pid in visited:
+                    break
                 visited.add(pid)
-                branch.append(pid)
-                pid = self.processes[pid].parent
+                if pid in pids:
+                    branch.append(pid)
             yield from reversed(branch)
 
     def ancestors(self, pid: int) -> Iterable[int]:
@@ -2930,7 +2944,9 @@ class OutsideQueueScan:
             if ancestor not in self.native_sessions:
                 self.native_sessions[ancestor] = self.read_native_session(ancestor, command)
             native = self.native_sessions[ancestor]
-            if not native:
+            if isinstance(native, OutsideThreadHost):
+                continue
+            if isinstance(native, OutsideIdentityUnreadable):
                 return None
             if (owner := self.staff_members.members.by_current_session(native)) is not None:
                 return owner
@@ -2958,7 +2974,8 @@ class OutsideQueueScan:
                     continue
             seen.add(child)
             tree.append(child)
-            pending.extend(self.children.get(child, ()))
+            pending.extend(pid for pid in self.children.get(child, ())
+                           if int(self.processes[child].start) <= int(self.processes[pid].start))
         return tree
 
     def current_process(self, pid: int) -> OutsideProcess | None:
@@ -3001,11 +3018,11 @@ def is_outside_tree_wrapper(command: tuple[str, ...]) -> bool:
         Path(command[0]).name.lstrip("-") in SHELLS and not command_script(("sh", *command[1:])))
 
 
-def outside_agent_rows(scope: Path, scan: OutsideQueueScan, limit: float) -> list[OutsideCommand]:
+def outside_agent_rows(scopes: Iterable[Path], scan: OutsideQueueScan, limit: float) -> list[OutsideCommand]:
     """Measure command trees below agents and session launchers."""
     rows: list[OutsideCommand] = []
-    pids = outside_scope_pids(scope, scan.processes)
-    commands = scan.scope_commands(scope, pids)
+    commands = {pid: command for scope in scopes
+                for pid, command in scan.scope_commands(scope, outside_scope_pids(scope, scan.processes)).items()}
     agents = {pid for pid, command in commands.items() if is_agent_command(command)}
     launchers = {ancestor for pid in agents for ancestor in scan.ancestors(pid)}
     launchers.update(pid for pid, command in commands.items() if is_session_launcher(command))
@@ -3099,7 +3116,7 @@ def outside_commands(inputs: admission_records.QueueInputs, staff_members: FeedS
     except OSError:
         return []
     scan = OutsideQueueScan(inputs, processes, staff_members, builds, for_table=for_table)
-    rows = [row for scope in agent_scopes for row in outside_agent_rows(scope, scan, limit)]
+    rows = outside_agent_rows(agent_scopes, scan, limit)
     rows.extend(row for scope in sorted(detached_scopes) if (row := outside_detached_row(scope, scan, limit)) is not None)
     return rows
 

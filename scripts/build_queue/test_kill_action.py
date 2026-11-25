@@ -168,61 +168,114 @@ class KillActionTests(unittest.TestCase):
         _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=1\nKILL_GRACE_SECONDS=1")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root)})))
 
-    def test_outside_tree_excludes_links_to_newer_parent_lifetimes(self) -> None:
-        root = process_stop.ProcessLifetime(810, "200")
-        observed = {810: memory_admit.ProcessIdentity(1, "200"),
-                    811: memory_admit.ProcessIdentity(810, "199"),
-                    812: memory_admit.ProcessIdentity(811, "201"),
-                    813: memory_admit.ProcessIdentity(810, "201"),
-                    814: memory_admit.ProcessIdentity(813, "202")}
-        known = {root}
-        with patch.object(memory_admit, "process_table", return_value=observed):
-            self.assertEqual(kill_action.outside_tree(known),
-                             {root, process_stop.ProcessLifetime(813, "201"),
-                              process_stop.ProcessLifetime(814, "202")})
-
-    def test_outside_tree_checks_equal_start_ticks_after_opening_the_pidfd(self) -> None:
-        root = process_stop.ProcessLifetime(810, "200")
-        stable = process_stop.ProcessLifetime(811, "200")
-        moved = process_stop.ProcessLifetime(812, "200")
-        observed = {810: memory_admit.ProcessIdentity(1, "200"),
-                    811: memory_admit.ProcessIdentity(810, "200"),
-                    812: memory_admit.ProcessIdentity(810, "200"),
-                    813: memory_admit.ProcessIdentity(812, "201")}
+    def outside_stop_fixture(self) -> Path:
+        self.install_outside_stop_graces()
         proc = self.root / "proc"
+        write_process(proc, 810, parent=1, start="200")
+        _ = self.enterContext(patch.object(kill_action, "PROC", proc))
+        return proc
+
+    def pin_fixture_process(self, process: process_stop.ProcessLifetime) -> AbstractContextManager[int]:
+        if not kill_action.live(process.pid, process.start):
+            raise ProcessLookupError(process.pid)
+        return nullcontext(process.pid)
+
+    def test_outside_tree_refuses_a_later_child_of_a_reused_parent_pid(self) -> None:
+        proc = self.outside_stop_fixture()
+        write_process(proc, 811, parent=1, start="202")
+        write_process(proc, 812, parent=811, start="203")
+        observed = {810: memory_admit.ProcessIdentity(1, "200"),
+                    811: memory_admit.ProcessIdentity(810, "201"),
+                    812: memory_admit.ProcessIdentity(811, "203")}
+        run = kill_action.OutsideKillCandidate(810, "200", "test.py")
+        with (patch.object(memory_admit, "process_table", return_value=observed),
+              patch.object(process_stop, "pin_process", side_effect=self.pin_fixture_process),
+              patch.object(signal, "pidfd_send_signal") as sent):
+            self.assertEqual(kill_action.stop_outside_tree(run),
+                             kill_action.OutsideIdentityUnconfirmed("Cannot verify the process tree at pid 812."))
+        sent.assert_not_called()
+
+    def test_outside_tree_reports_a_live_child_when_its_parent_exits_during_the_scan(self) -> None:
+        proc = self.outside_stop_fixture()
+        write_process(proc, 811, parent=810, start="201")
+        write_process(proc, 812, parent=811, start="202")
+        observed = {810: memory_admit.ProcessIdentity(1, "200"),
+                    811: memory_admit.ProcessIdentity(810, "201"),
+                    812: memory_admit.ProcessIdentity(811, "202")}
+        run = kill_action.OutsideKillCandidate(810, "200", "test.py")
+        open_pids: set[int] = set()
+        exited: set[int] = set()
+
+        @contextmanager
+        def pin(process: process_stop.ProcessLifetime) -> Generator[int]:
+            with self.pin_fixture_process(process) as descriptor:
+                open_pids.add(process.pid)
+                if process.pid == 812:
+                    self.assertIn(811, open_pids)
+                    # A stat read can still describe the parent after its pidfd reports exit.
+                    exited.add(811)
+                try:
+                    yield descriptor
+                finally:
+                    open_pids.remove(process.pid)
+
+        def pidfd_live(pid: int) -> bool:
+            return pid in open_pids and pid not in exited
+
+        with (patch.object(memory_admit, "process_table", return_value=observed),
+              patch.object(process_stop, "pin_process", side_effect=pin),
+              patch.object(kill_action, "pidfd_live", side_effect=pidfd_live),
+              patch.object(signal, "pidfd_send_signal") as sent):
+            self.assertEqual(kill_action.stop_outside_tree(run),
+                             kill_action.OutsideIdentityUnconfirmed("Cannot verify the process tree at pid 812."))
+        self.assertEqual(open_pids, set())
+        sent.assert_not_called()
+
+    def test_outside_tree_rereads_the_child_parent_after_opening_the_pidfd(self) -> None:
+        proc = self.outside_stop_fixture()
         write_process(proc, 811, parent=810, start="200")
-        write_process(proc, 812, parent=810, start="200")
+        observed = {810: memory_admit.ProcessIdentity(1, "200"),
+                    811: memory_admit.ProcessIdentity(810, "200")}
+        run = kill_action.OutsideKillCandidate(810, "200", "test.py")
 
         def pin(process: process_stop.ProcessLifetime) -> AbstractContextManager[int]:
-            if process == moved:
-                write_process(proc, 812, parent=1, start="200")
-            return nullcontext(42)
+            if process.pid == 811:
+                write_process(proc, 811, parent=1, start="200")
+            return self.pin_fixture_process(process)
 
-        known = {root}
-        with (patch.object(kill_action, "PROC", proc),
-              patch.object(memory_admit, "process_table", return_value=observed),
-              patch.object(process_stop, "pin_process", side_effect=pin) as pinned):
-            self.assertEqual(kill_action.outside_tree(known), {root, stable})
-        pinned.assert_has_calls([call(stable), call(moved)], any_order=True)
-        self.assertEqual(known, {root, stable})
+        with (patch.object(memory_admit, "process_table", return_value=observed),
+              patch.object(process_stop, "pin_process", side_effect=pin),
+              patch.object(kill_action, "pidfd_live", return_value=True),
+              patch.object(signal, "pidfd_send_signal") as sent):
+            self.assertEqual(kill_action.stop_outside_tree(run),
+                             kill_action.OutsideIdentityUnconfirmed("Cannot verify the process tree at pid 811."))
+        sent.assert_not_called()
 
     def test_outside_tree_keeps_a_child_from_the_final_term_scan(self) -> None:
-        self.install_outside_stop_graces()
+        proc = self.outside_stop_fixture()
+        write_process(proc, 811, parent=810, start="201")
         run = kill_action.OutsideKillCandidate(810, "200", "test.py")
         root = {810: memory_admit.ProcessIdentity(1, "200")}
-        late = process_stop.ProcessLifetime(811, "201")
-        with (patch.object(memory_admit, "process_table", side_effect=(
-                  root, root, {**root, 811: memory_admit.ProcessIdentity(810, "201")},
-                  {811: memory_admit.ProcessIdentity(1, "201")}, {})),
-              patch.object(process_start, "proc_table_start", return_value=process_start.Gone()),
-              patch.object(process_stop, "pin_process", return_value=nullcontext(42)),
-              patch.object(kill_action, "live", return_value=True),
-              patch.object(signal, "pidfd_send_signal") as term,
-              patch.object(kill_action, "signal_outside_process") as escalate,
+        empty: dict[int, memory_admit.ProcessIdentity] = {}
+        snapshots = iter((root, root, {**root, 811: memory_admit.ProcessIdentity(810, "201")},
+                          {811: memory_admit.ProcessIdentity(1, "201")}, empty))
+        current: dict[int, memory_admit.ProcessIdentity] = {}
+
+        def read_table(_proc: Path) -> dict[int, memory_admit.ProcessIdentity]:
+            nonlocal current
+            current = next(snapshots)
+            return current
+
+        def pidfd_live(pid: int) -> bool:
+            return pid in current
+
+        with (patch.object(memory_admit, "process_table", side_effect=read_table),
+              patch.object(process_stop, "pin_process", side_effect=self.pin_fixture_process),
+              patch.object(kill_action, "pidfd_live", side_effect=pidfd_live),
+              patch.object(signal, "pidfd_send_signal") as sent,
               patch.object(time, "monotonic", side_effect=(0, 1, 2, 3))):
             self.assertEqual(kill_action.stop_outside_tree(run), kill_action.OutsideTreeEmpty())
-        term.assert_called_once_with(42, signal.SIGTERM)
-        escalate.assert_called_once_with(late, signal.SIGKILL)
+        self.assertEqual(sent.call_args_list, [call(810, signal.SIGTERM), call(811, signal.SIGKILL)])
 
     @contextmanager
     def launch_outside_process(self, source: str) -> Generator[tuple[subprocess.Popen[bytes], IO[bytes]]]:
