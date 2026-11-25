@@ -55,6 +55,13 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(first.created_at, first.updated_at)
         self.assertEqual((self.folder / (action.action_id(first.key) + ".json")).stat().st_mode & 0o777, 0o600)
 
+    def test_an_unresolved_home_raises_an_action_store_error(self) -> None:
+        folder = "~missing-fixture-user/actions"
+        with (patch.dict(os.environ, {"FOR_YOU_ACTIONS_DIR": folder}),
+              patch("pwd.getpwnam", side_effect=KeyError("missing-fixture-user")),
+              self.assertRaisesRegex(action.ActionStoreError, "Cannot expand the action folder")):
+            _ = action.ActionStore()
+
     def test_dedupe_preserves_existing_open_action(self) -> None:
         first = self.add()
         path = self.folder / (action.action_id(first.key) + ".json")

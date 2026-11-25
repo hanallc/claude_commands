@@ -23,6 +23,7 @@ import sys
 import time
 from time import monotonic
 from typing import cast, final
+from uuid import uuid4
 
 from scripts.aws_target import hana_spend, key_refusal, ledger, measurement, price_days, quota_requests, run_cost
 from scripts.aws_target.aws_cli import KEY_REFUSED_CODES, aws_error_code
@@ -103,6 +104,14 @@ class SnapshotFailure:
 class SnapshotFailureStreak:
     since: int
     notice_claimed: bool
+    action_key: str
+    action_created: bool
+
+    def record(self) -> dict[str, object]:
+        output: dict[str, object] = {'since': self.since, 'notice_claimed': self.notice_claimed}
+        if self.action_key:
+            output.update(action_key=self.action_key, action_created=self.action_created)
+        return output
 
 
 @dataclass(frozen=True)
@@ -141,7 +150,7 @@ def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.Ren
     return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
 
 
-def update_price_read_action(failures: Sequence[SnapshotFailure], now: int) -> int:
+def update_price_read_action(failures: Sequence[SnapshotFailure], now: int, *, key: str = '') -> int:
     """File the action for a permission refusal or withdraw it after recovery."""
     try:
         actions = ActionStore()
@@ -154,7 +163,7 @@ def update_price_read_action(failures: Sequence[SnapshotFailure], now: int) -> i
                 reason=f'AWS refused the price read in {regions}. '
                        + 'After 2 hours without the read, test runs on AWS try that region last. '
                        + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.',
-                waits=f'Test runs on AWS in {regions}', concerns='aws', dedupe_key=PRICE_READ_ACTION_KEY,
+                waits=f'Test runs on AWS in {regions}', concerns='aws', dedupe_key=PRICE_READ_ACTION_KEY, key=key,
             )
         else:
             for record in actions.list():
@@ -536,33 +545,48 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             {'region': row.region, 'standard': quota_requests.request_record(row.standard),
              'gpu': quota_requests.request_record(row.gpu)}
             for row in request_readings]
-        # Success drops an unsent notice because no user action remains.
+        access_failures = tuple(row for row in current_failures if snapshot_permission_failure(row))
+        previous = ledger.mapping(document['failure_streak']) if 'failure_streak' in document else {}
+        withdrawal_status = update_price_read_action((), now) if not current_failures else 0
+        status |= withdrawal_status
         streak: SnapshotFailureStreak | SnapshotHealthy = SnapshotHealthy()
-        if current_failures:
-            previous = ledger.mapping(document['failure_streak']) if 'failure_streak' in document else {}
+        if current_failures or (previous and withdrawal_status):
             since = ledger.instant(previous, 'since') if previous else now
             notice_claimed = previous.get('notice_claimed', previous.get('notified')) is True
-            streak = SnapshotFailureStreak(since, notice_claimed)
-            output['failure_streak'] = {'since': streak.since, 'notice_claimed': streak.notice_claimed}
-        write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+            action_key = ledger.text(previous, 'action_key') if 'action_key' in previous else ''
+            if access_failures and not action_key:
+                # Save the key before creating the action so a retry uses the same key.
+                action_key = f'action/{uuid4()}'
+            streak = SnapshotFailureStreak(since, notice_claimed, action_key,
+                                           previous.get('action_created') is True)
+
+        def save_snapshot() -> None:
+            if isinstance(streak, SnapshotFailureStreak):
+                output['failure_streak'] = streak.record()
+            write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+
+        save_snapshot()
         try:
             price_days.record(directory, read_prices, now, configuration.whole('spot_price_days_keep'))
         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
             print(f'aws_target: daily Spot prices not saved: {type(error).__name__}: {error}', file=sys.stderr)
             status = 1
-        access_failures = tuple(row for row in current_failures if snapshot_permission_failure(row))
-        if access_failures and isinstance(streak, SnapshotFailureStreak) and not streak.notice_claimed:
-            # Save the claim before delivery because note keys alone do not suppress repeats.
-            output['failure_streak'] = {'since': streak.since, 'notice_claimed': True}
-            write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
-            status |= update_price_read_action(access_failures, now)
-            if not notify(f'aws-spot-snapshot:{streak.since}', snapshot_failure_push(access_failures),
-                          configuration.number('snapshot_notification_timeout_s')):
-                output['failure_streak'] = {'since': streak.since, 'notice_claimed': False}
-                write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
-                print('aws_target: snapshot user notice remains pending', file=sys.stderr)
-        elif not current_failures:
-            status |= update_price_read_action((), now)
+        if access_failures and isinstance(streak, SnapshotFailureStreak):
+            if not streak.action_created:
+                action_status = update_price_read_action(access_failures, now, key=streak.action_key)
+                status |= action_status
+                if not action_status:
+                    streak = replace(streak, action_created=True)
+                    save_snapshot()
+            if not streak.notice_claimed:
+                # Save the claim before delivery because note keys alone do not suppress repeats.
+                streak = replace(streak, notice_claimed=True)
+                save_snapshot()
+                if not notify(f'aws-spot-snapshot:{streak.since}', snapshot_failure_push(access_failures),
+                              configuration.number('snapshot_notification_timeout_s')):
+                    streak = replace(streak, notice_claimed=False)
+                    save_snapshot()
+                    print('aws_target: snapshot user notice remains pending', file=sys.stderr)
         # The stamp is the last scheduled read. A forced read leaves it, so the next hourly read still runs.
         if not force:
             _ = lock.seek(0)

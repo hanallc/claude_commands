@@ -25,7 +25,11 @@ class ActionStoreError(ValueError):
 
 def actions_folder() -> Path:
     """Return the action folder selected by FOR_YOU_ACTIONS_DIR."""
-    return Path(os.environ.get("FOR_YOU_ACTIONS_DIR", "~/.local/state/for-you/actions")).expanduser()
+    folder = Path(os.environ.get("FOR_YOU_ACTIONS_DIR", "~/.local/state/for-you/actions"))
+    try:
+        return folder.expanduser()
+    except RuntimeError as error:
+        raise ActionStoreError(f"Cannot expand the action folder {folder}: {error}") from error
 
 
 def action_id(key: str) -> str:
@@ -154,14 +158,21 @@ class ActionStore:
         return record
 
     def add(self, *, title: str, command: str, machine: str, cwd: str, requested_by: str,
-            reason: str, waits: str, concerns: str, dedupe_key: str) -> UserAction:
-        """Create one action unless its requester already has the same open request."""
+            reason: str, waits: str, concerns: str, dedupe_key: str, key: str = "") -> UserAction:
+        """Create an action or return the same key or open request."""
         now = datetime.now(timezone.utc).isoformat()
-        record = UserAction(f"action/{uuid4()}", 1, title, command, machine, cwd, requested_by,
+        identifier = action_id(key) if key else str(uuid4())
+        record = UserAction(f"action/{identifier}", 1, title, command, machine, cwd, requested_by,
                             reason, waits, concerns, dedupe_key, "open", now, now)
         self.folder.mkdir(parents=True, exist_ok=True)
         with file_lock.exclusive(self.folder / ".lock"):
-            for existing in self.list():
+            records = self.list()
+            for existing in records:
+                if existing.key == record.key:
+                    if (existing.requested_by, existing.dedupe_key) != (requested_by, dedupe_key):
+                        raise ActionStoreError("Another request uses this action key.")
+                    return existing
+            for existing in records:
                 if (existing.status == "open" and existing.requested_by == requested_by
                         and existing.dedupe_key == dedupe_key):
                     return existing

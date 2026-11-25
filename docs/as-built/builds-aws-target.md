@@ -1183,8 +1183,13 @@ It renders the registered `aws.snapshot_failed` text and sends it through `push_
 The message key comes from the streak's start time.
 The notice names each region and read that AWS refused. The saved failure keeps the AWS error code.
 `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, and `not authorized` permit a notice.
-The notice claim also files the **Allow AWS price reads** action with `deploy.py up --approve-resources` on natedev.
-A successful read in every candidate region withdraws the action.
+The first permission refusal files the **Allow AWS price reads** action with `deploy.py up --approve-resources` on natedev.
+The streak saves the action key before it files the action.
+It records successful action creation separately from the notice claim.
+A later permission refusal retries a failed action creation, even after the notice goes out.
+Completing the action leaves the creation record in the streak.
+A clean read withdraws the open action and ends the streak.
+A withdrawal failure retains the streak for the next clean read.
 That command updates permissions but does not replace scaler credentials.
 Credential errors, timeouts, network errors, and throttling send no phone notice.
 `deploy.py apply --approve-resources` replaces the scaler key and checks its identity.
@@ -1197,7 +1202,7 @@ The snapshot saves the notice claim before it calls the message process.
 The claim prevents another send for that streak after a crash.
 A crash before delivery can suppress that streak's notice.
 A normal delivery failure clears the claim for the next snapshot attempt with the same key.
-Success in every candidate region ends the streak and drops any unsent notice because no user action remains.
+A completed streak drops any unsent notice.
 A later failure starts a new streak and permits a new notice.
 `snapshot_notification_timeout_s=120` bounds message review and delivery in seconds.
 Each failure logs the region, the failed read, the error class, and a redacted reason on one line.

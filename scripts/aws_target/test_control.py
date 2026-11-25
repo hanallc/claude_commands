@@ -89,7 +89,6 @@ region_transfer_usd={"us-west-1":0.00015}
             'AWS_SESSION_TOKEN': 'fixture-token', 'AWS_CONFIG_FILE': '/fixture/admin-config',
             'AWS_PROFILE': 'fixture-admin', 'AWS_DEFAULT_PROFILE': 'fixture-admin',
             'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'private-scaler'),
-            'FOR_YOU_ACTIONS_DIR': str(self.root / 'actions'),
         }))
         _ = self.enterContext(mock.patch.object(plan_identity, 'plan_credentials',
                                                 side_effect=plan_identity.PlanIdentityRefused('The AWS plan key is missing.')))
@@ -1028,7 +1027,70 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(errors.getvalue().splitlines(),
                          ['aws_target: cannot update the AWS price read action: fixture list failure'])
         self.assertEqual(aws_target.snapshot_failures(aws_target.read_snapshot(self.state)), ())
+        self.assertIn('failure_streak', aws_target.read_snapshot(self.state))
         self.assertEqual(len(self.notices), 1)
+
+    def test_failed_price_read_action_retries_after_a_successful_notice(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        actions = action.ActionStore()
+        with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('Fixture failure.')),
+              redirect_stderr(StringIO())):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), ())
+        previous = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertTrue(previous['notice_claimed'])
+        self.assertFalse(previous['action_created'])
+
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        opened, = actions.list()
+        self.assertEqual((opened.key, opened.status), (previous['action_key'], 'open'))
+        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
+        self.assertEqual(len(self.notices), 1)
+
+    def test_done_price_read_action_stays_done_when_the_notice_retries(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        self.notice_accepted = False
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        done = actions.mark_done(opened.key, evidence='The user completed the action.')
+        document = aws_target.read_snapshot(self.state)
+        streak = ledger.mapping(document['failure_streak'])
+        self.assertTrue(streak['action_created'])
+        self.assertFalse(streak['notice_claimed'])
+
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        self.clock.advance(interval)
+        self.notice_accepted = True
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (done,))
+        self.assertEqual(len(self.notices), 2)
+        self.assertEqual(self.notices[0][0], self.notices[1][0])
+
+        # Replay the saved state from before the card creation was recorded.
+        document = aws_target.read_snapshot(self.state)
+        ledger.mapping(document['failure_streak'])['action_created'] = False
+        _ = (self.state / 'spot-prices.json').write_text(json.dumps(document))
+        self.clock.advance(interval)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (done,))
+        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
+        self.assertEqual(len(self.notices), 2)
+
+        self.failure = ''
+        self.clock.advance(interval)
+        self.assertEqual(self.snapshot(), 0)
+        self.assertNotIn('failure_streak', aws_target.read_snapshot(self.state))
+        self.failure = 'describe-spot-price-history'
+        self.clock.advance(interval)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(sorted(record.status for record in actions.list()), ['done', 'open'])
 
     def test_crash_after_notice_delivery_does_not_repeat_the_streak_notice(self) -> None:
         self.failure = 'describe-spot-price-history'
@@ -1048,8 +1110,11 @@ region_transfer_usd={"us-west-1":0.00015}
 
     def test_previous_notified_field_still_suppresses_the_streak_notice(self) -> None:
         self.failure = 'describe-spot-price-history'
-        with redirect_stderr(StringIO()):
+        with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('Fixture failure.')),
+              redirect_stderr(StringIO())):
             self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        self.assertEqual(actions.list(), ())
         path = self.state / 'spot-prices.json'
         document = aws_target.read_snapshot(self.state)
         streak = ledger.mapping(document['failure_streak'])
@@ -1060,6 +1125,8 @@ region_transfer_usd={"us-west-1":0.00015}
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(len(self.notices), 1)
         self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['notice_claimed'])
+        opened, = actions.list()
+        self.assertEqual(opened.status, 'open')
 
     def test_failed_notice_retries_without_changing_its_key(self) -> None:
         self.failure = 'describe-spot-price-history'
