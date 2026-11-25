@@ -10,6 +10,7 @@ import contextlib
 from dataclasses import dataclass
 from enum import Enum
 import math
+import os
 import shlex
 import subprocess
 import sys
@@ -19,6 +20,8 @@ from scripts.lib import conf
 
 # SSH asks no question: a run with no key fails at once.
 BATCH_MODE = ("-o", "BatchMode=yes")
+# The gate passes a local descriptor for the parsed exit status.
+MAC_GATE_EXIT_STATUS_FD = "MAC_GATE_EXIT_STATUS_FD"
 
 
 @dataclass(frozen=True)
@@ -155,7 +158,10 @@ def stream_remote(command: list[str], remote: RemoteRun, ssh: contextlib.ExitSta
         last = line.rstrip("\n")
     ssh_status = process.wait()
     if last.startswith("mac_exit=") and last.removeprefix("mac_exit=").isdigit():
+        status = int(last.removeprefix("mac_exit="))
         remote.state = RemoteState.EXITED
-        return int(last.removeprefix("mac_exit="))
+        if descriptor := os.environ.get(MAC_GATE_EXIT_STATUS_FD):
+            _ = os.write(int(descriptor), f"{status}\n".encode("ascii"))
+        return status
     print("mac queue: the Mac returned no exit status", file=sys.stderr)
     return ssh_status or 255
