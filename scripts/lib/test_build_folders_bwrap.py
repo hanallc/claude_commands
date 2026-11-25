@@ -24,7 +24,9 @@ import unittest
 from unittest import mock
 
 from scripts.lib import build_folder_lock, build_folders, removal_guard
-from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox, mac_profile
+from scripts.lib.removal_bwrap_test_support import (
+    BuildMount, LINUX_CHECKOUT, RemovalSandbox, mac_profile, run_mac_fixture_command,
+)
 from scripts.lint.test_removal_bwrap import CANARY, PROBE_MOUNT, PROBE_OUTSIDE
 
 
@@ -334,46 +336,69 @@ class ToolFolderRemovalTests(unittest.TestCase):
         self.assertFalse(local.exists())
         self.assert_canary(keep)
 
-    def disk_image(self, *arguments: str) -> str:
+    def disk_image(self, *arguments: str, allow_skip: bool = False) -> str:
+        command = ["/usr/bin/hdiutil", *arguments]
         try:
-            result = subprocess.run(["/usr/bin/hdiutil", *arguments], stdin=subprocess.DEVNULL,
-                                    text=True, capture_output=True, timeout=20, check=False)
+            result = run_mac_fixture_command(command, timeout=20)
         except (FileNotFoundError, PermissionError) as error:
-            self.skipTest(f"hdiutil {arguments[0]} is unavailable: {error}")
-        detail = (result.stderr or result.stdout).strip()
-        if result.returncode and any(reason in detail.lower() for reason in (
+            if allow_skip:
+                self.skipTest(f"hdiutil {arguments[0]} is unavailable: {error}")
+            raise
+        detail = f"{shlex.join(command)}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        if allow_skip and result.returncode and any(reason in (result.stderr or result.stdout).lower() for reason in (
                 "permission denied", "operation not permitted", "not authorized")):
             self.skipTest(f"hdiutil {arguments[0]} cannot use the fixture: {detail}")
         self.assertEqual(result.returncode, 0, detail)
         return result.stdout
 
-    def detach_image(self, image: Path) -> None:
-        result = subprocess.run(["/usr/bin/hdiutil", "info", "-plist"], stdin=subprocess.DEVNULL,
-                                text=True, capture_output=True, timeout=20, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        reply = cast(dict[str, list[dict[str, object]]], plistlib.loads(result.stdout.encode()))
-        for attached in reply["images"]:
+    def attached_images(self) -> list[dict[str, object]]:
+        reply = cast(dict[str, list[dict[str, object]]], plistlib.loads(self.disk_image("info", "-plist").encode()))
+        return reply["images"]
+
+    def current_mount(self, mount: Path, moved_mount: Path | None) -> Path | None:
+        # The mount table can still show the original path after a rename.
+        return next((path for path in (moved_mount, mount) if path is not None and path.is_mount()), None)
+
+    def detach_image(self, image: Path, mount: Path, moved_mount: Path | None) -> None:
+        for attached in self.attached_images():
             if attached.get("image-path") != str(image):
                 continue
+            if current := self.current_mount(mount, moved_mount):
+                _ = self.disk_image("detach", "-force", str(current))
+                continue
             entities = cast(list[dict[str, str]], attached["system-entities"])
-            [device] = [entry["dev-entry"] for entry in entities
-                        if re.fullmatch(r"/dev/disk[0-9]+", entry.get("dev-entry", ""))]
-            result = subprocess.run(["/usr/bin/hdiutil", "detach", "-force", device], stdin=subprocess.DEVNULL,
-                                    text=True, capture_output=True, timeout=20, check=False)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            device = next((entry["dev-entry"] for entry in entities
+                           if re.fullmatch(r"/dev/disk[0-9]+", entry.get("dev-entry", ""))), None)
+            assert device is not None, f"no disk device for {image}: {entities}"
+            _ = self.disk_image("detach", "-force", device)
+
+    def assert_no_images(self, image: Path, mount: Path, moved_mount: Path | None) -> None:
+        root = image.parent.parent
+        remaining: list[str] = []
+        for attached in self.attached_images():
+            image_path = attached.get("image-path")
+            if not isinstance(image_path, str) or not Path(image_path).is_relative_to(root):
+                continue
+            if image_path == str(image) and (current := self.current_mount(mount, moved_mount)):
+                remaining.append(str(current))
+                continue
+            entities = cast(list[dict[str, str]], attached["system-entities"])
+            paths = [entry["mount-point"] for entry in entities if "mount-point" in entry]
+            remaining.extend(paths or [image_path])
+        self.assertFalse(remaining, f"disk images still attached: {', '.join(remaining)}")
 
     @contextmanager
-    def attach_image(self, image: Path, mount: Path) -> Generator[None]:
-        try:
+    def attach_image(self, image: Path, mount: Path, moved_mount: Path | None = None) -> Generator[None]:
+        with ExitStack() as cleanup:
+            _ = cleanup.callback(self.assert_no_images, image, mount, moved_mount)
+            _ = cleanup.callback(self.detach_image, image, mount, moved_mount)
             _ = self.disk_image("attach", "-nobrowse", "-mountpoint", str(mount),
-                                "-owners", "off", "-plist", str(image))
+                                "-owners", "off", "-plist", str(image), allow_skip=True)
             self.assertTrue(mount.is_mount(), f"hdiutil did not mount {mount}")
             yield
-        finally:
-            self.detach_image(image)
 
     @contextmanager
-    def mount_canary(self, sandbox: RemovalSandbox, candidate: Path) -> Generator[Path]:
+    def mount_canary(self, sandbox: RemovalSandbox, candidate: Path, *, moved: Path | None = None) -> Generator[Path]:
         mount = candidate / "unit"
         local = sandbox.host_path(mount)
         local.mkdir()
@@ -381,8 +406,9 @@ class ToolFolderRemovalTests(unittest.TestCase):
             if sys.platform == "darwin":
                 image = sandbox.fixture / "removal.dmg"
                 _ = self.disk_image("create", "-size", "16m", "-fs", "HFS+", "-layout", "NONE",
-                                    "-type", "UDIF", str(image))
-                cleanup.enter_context(self.attach_image(image, local))
+                                    "-type", "UDIF", str(image), allow_skip=True)
+                moved_mount = sandbox.host_path(moved / "unit") if moved is not None else None
+                cleanup.enter_context(self.attach_image(image, local, moved_mount))
                 keep = local / "output"
                 probe = (PROBE_MAC_MOUNT, str(sandbox.checkout), str(mount))
             else:
@@ -394,19 +420,19 @@ class ToolFolderRemovalTests(unittest.TestCase):
             yield keep
 
     def test_interrupted_image_attach_detaches_only_the_private_image(self) -> None:
-        fixture = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        fixture = root / "fixture"
         image = fixture / "removal.dmg"
         mount = fixture / "mount"
-        info = plistlib.dumps({"images": [
-            {"image-path": str(fixture / "other.dmg"), "system-entities": [{"dev-entry": "/dev/disk8"}]},
-            {"image-path": str(image), "system-entities": [
-                {"dev-entry": "/dev/disk9"}, {"dev-entry": "/dev/disk9s1", "mount-point": str(fixture / "moved")},
-            ]},
-        ]}).decode()
+        other = {"image-path": str(root.parent / "other.dmg"), "system-entities": [{"dev-entry": "/dev/disk8"}]}
+        attached = {"image-path": str(image), "system-entities": [{"dev-entry": "/dev/disk9"}]}
+        info = plistlib.dumps({"images": [other, attached]}).decode()
+        clean = plistlib.dumps({"images": [other]}).decode()
         with mock.patch.object(subprocess, "run", side_effect=[
             KeyboardInterrupt(),
             subprocess.CompletedProcess([], 0, info, ""),
             subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, clean, ""),
         ]) as run:
             with self.assertRaises(KeyboardInterrupt), self.attach_image(image, mount):
                 self.fail("the interrupted attach returned")
@@ -414,7 +440,45 @@ class ToolFolderRemovalTests(unittest.TestCase):
             ["/usr/bin/hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount), "-owners", "off", "-plist", str(image)],
             ["/usr/bin/hdiutil", "info", "-plist"],
             ["/usr/bin/hdiutil", "detach", "-force", "/dev/disk9"],
+            ["/usr/bin/hdiutil", "info", "-plist"],
         ])
+
+    def test_detaches_at_the_moved_mount_when_info_has_the_old_path(self) -> None:
+        image = Path("/private/tmp/test-root/fixture/removal.dmg")
+        mount = image.parent / "unit/proof/unit"
+        moved = image.parent / "moved/proof/unit"
+        info = plistlib.dumps({"images": [
+            {"image-path": str(image), "system-entities": [{"mount-point": str(mount)}]},
+        ]}).decode()
+        with (mock.patch.object(subprocess, "run", side_effect=[
+            subprocess.CompletedProcess([], 0, info, ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]) as run, mock.patch.object(Path, "is_mount", autospec=True, return_value=True) as is_mount):
+            self.detach_image(image, mount, moved)
+        is_mount.assert_called_once_with(moved)
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/hdiutil", "detach", "-force", str(moved)])
+
+    def test_reports_a_disk_image_that_stays_attached(self) -> None:
+        image = Path("/private/tmp/test-root/fixture/removal.dmg")
+        mount = image.parent / "unit/proof/unit"
+        moved = image.parent / "moved/proof/unit"
+        info = plistlib.dumps({"images": [
+            {"image-path": str(image), "system-entities": [{"mount-point": str(mount)}]},
+        ]}).decode()
+        with (mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, info, "")),
+              mock.patch.object(Path, "is_mount", return_value=True),
+              self.assertRaisesRegex(AssertionError, f"disk images still attached: {re.escape(str(moved))}")):
+            self.assert_no_images(image, mount, moved)
+
+    def test_mac_fixture_timeout_reports_partial_output(self) -> None:
+        command = ["/usr/bin/hdiutil", "info", "-plist"]
+        with (mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired(
+                  command, 20, output=b"partial output", stderr=b"partial error")),
+              self.assertRaises(AssertionError) as failure):
+            _ = run_mac_fixture_command(command, timeout=20)
+        self.assertIn("timed out after 20 s: /usr/bin/hdiutil info -plist", str(failure.exception))
+        self.assertIn("stdout:\npartial output", str(failure.exception))
+        self.assertIn("stderr:\npartial error", str(failure.exception))
 
     def test_does_not_follow_a_bind_mount_inside_the_leftover(self) -> None:
         sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
@@ -428,11 +492,11 @@ class ToolFolderRemovalTests(unittest.TestCase):
     def test_keeps_a_bind_mount_after_the_removal_parent_moves(self) -> None:
         sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
         candidate = self.candidate(sandbox)
-        with self.mount_canary(sandbox, candidate) as keep:
+        moved = candidate.parent.with_name("moved") / candidate.name
+        with self.mount_canary(sandbox, candidate, moved=moved) as keep:
             checkout = sandbox.checkout if sys.platform == "darwin" else LINUX_CHECKOUT
             result = self.run_python(sandbox, candidate, RUN_MOVED_PARENT, str(checkout), str(candidate))
             self.assert_child_ok(result)
-            moved = candidate.parent.with_name("moved") / candidate.name
             self.assert_canary(sandbox.host_path(moved / "old" / "output"))
             self.assert_canary(sandbox.host_path(moved / "unit" / "output") if sys.platform == "darwin" else keep)
 

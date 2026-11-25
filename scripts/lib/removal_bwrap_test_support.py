@@ -21,6 +21,19 @@ CONFIG_ROOT_KEYS = frozenset(("sweep_floor_roots", "sweep_ci_targets", "folder_s
 ROOT_CONFIGS = ("build_folders.conf", "lint.conf", "mac_test.conf", "scratch.conf")
 
 
+def run_mac_fixture_command(command: list[str], *, timeout: int, cwd: Path | None = None,
+                            env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, text=True,
+                              capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        stdout = (error.stdout or b"").decode(errors="replace")
+        stderr = (error.stderr or b"").decode(errors="replace")
+        raise AssertionError(
+            f"timed out after {timeout} s: {shlex.join(command)}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ) from error
+
+
 def is_declared_root(key: str) -> bool:
     return key.startswith("roots.") or key.partition(".")[0] in CONFIG_ROOT_KEYS
 
@@ -194,8 +207,8 @@ printf '1 0 launchd\n%s 1 %s\n' "$PPID" "$REMOVAL_PROOF_CALLER_ARGS"
             profile = self.fixture / "removal.sb"
             env["PATH"] = f"{self.fixture / 'bin'}:{env['PATH']}"
             env["REMOVAL_PROOF_CALLER_ARGS"] = " ".join(arguments)
-            return subprocess.run([str(MAC_BACKEND), "-f", str(profile), *arguments], cwd=self.fixture,
-                                  env=env, text=True, capture_output=True, timeout=90, check=False)
+            return run_mac_fixture_command([str(MAC_BACKEND), "-f", str(profile), *arguments],
+                                           cwd=self.fixture, env=env, timeout=90)
         if sys.platform != "linux":
             raise AssertionError(f"removal proof has no sandbox backend for {sys.platform}")
         bubblewrap = shutil.which("bwrap")
