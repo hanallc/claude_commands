@@ -38,12 +38,18 @@ else
         echo "Error: the worktree branch does not match $BRANCH_NAME."
         exit 1
     fi
-    if [[ "$(git -C "$WORKTREE_PATH" rev-parse --path-format=absolute --git-common-dir)" != \
-          "$(git rev-parse --path-format=absolute --git-common-dir)" ]]; then
+fi
+
+if [[ -e "$WORKTREE_PATH" ]] && {
+    ! WORKTREE_COMMON_DIR=$(git -C "$WORKTREE_PATH" rev-parse --path-format=absolute --git-common-dir) ||
+    ! CALLER_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir) ||
+    [[ "$WORKTREE_COMMON_DIR" != "$CALLER_COMMON_DIR" ]];
+}; then
+    if [[ "$HAS_CONFIRMATION" == false ]]; then
         wt_check_and_consume "$WORKTREE_PATH" "$BRANCH_NAME" || true
-        echo "Error: the worktree belongs to a different repository."
-        exit 1
     fi
+    echo "Error: the worktree belongs to a different repository."
+    exit 1
 fi
 
 # Refuse a branch lookup fault before origin deletion.
