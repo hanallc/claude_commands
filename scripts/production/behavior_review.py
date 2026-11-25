@@ -8,6 +8,7 @@ import json
 import re
 import sys
 from typing import cast
+from unicodedata import category
 
 from scripts.astra import astra_review, astra_roles, astra_work
 from scripts.direct import pass_record, progress_history, recorder_state
@@ -248,18 +249,18 @@ def question_answer(key: str, owner: str, number: str) -> (
         raise behavior_check.BehaviorCheckError(f"Cannot read the behavior question {number}.")
     if record.status != "closed":
         return behavior_check.Waiting(number, owner)
-    parts = record.item.get("parts")
-    choices = parts["choices"] if parts is not None else []
     for event in reversed(review_events.decode(record.item.get("review_log", ""))):
         if event.who == "nate" and event.words.casefold().startswith("answer:"):
             words = event.words.partition(":")[2].strip()
-            approval = {"yes": behavior_check.Approval.YES, "no": behavior_check.Approval.NO}.get(words.casefold())
-            if approval is None and words in choices:
-                approval = {YES_CHOICE: behavior_check.Approval.YES, NO_CHOICE: behavior_check.Approval.NO}.get(words)
+            first_word = words.split(maxsplit=1)[0] if words else ""
+            end = len(first_word)
+            while end and category(first_word[end - 1]).startswith("P"):
+                end -= 1
+            approval = {"yes": behavior_check.Approval.YES, "no": behavior_check.Approval.NO}.get(first_word[:end].casefold())
             if approval is not None:
                 return behavior_check.Answered(number, owner, approval, words, event.time)
-            break
-    return behavior_check.InvalidAnswer(number, owner, f"{number} closed without Yes, No, or one of its filed choices.")
+            return behavior_check.InvalidAnswer(number, owner, f"Nate's answer to {number}, {words!r}, is not Yes or No.")
+    return behavior_check.InvalidAnswer(number, owner, f"{number} closed without an answer from Nate.")
 
 
 def refresh_answer(key: str, waiting: behavior_check.Waiting | behavior_check.InvalidAnswer) -> (

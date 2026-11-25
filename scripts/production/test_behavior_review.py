@@ -221,8 +221,6 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def test_review_choice_text_maps_to_yes_and_no(self) -> None:
         _, key, waiting, question = self.filed_question()
         update_registration.write_question_record(replace(question, status="closed"))
-        update_registration.record_review_log(question, "answer: Yes, please.")
-        self.assertIn("without Yes, No, or one of its filed choices", self.cli("status", "--key", key)[1])
         for words, approval in ((behavior_review.YES_CHOICE, behavior_check.Approval.YES),
                                 (behavior_review.NO_CHOICE, behavior_check.Approval.NO)):
             with self.subTest(answer=words):
@@ -235,23 +233,33 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                 self.assertEqual(behavior_check.read_record(key),
                                  behavior_check.Answered(waiting.question_id, waiting.owner, approval, words, event.time))
 
-    def test_plain_yes_and_no_set_the_verdict_and_other_answers_record_a_refusal(self) -> None:
+    def test_the_first_word_sets_the_verdict_and_other_answers_record_a_refusal(self) -> None:
         args, key, waiting, question = self.filed_question()
         update_registration.write_question_record(replace(question, status="closed"))
-        update_registration.record_review_log(question, "answer: Yes, please.")
-        status, reason = self.cli("status", "--key", key)
-        self.assertEqual(status, 1)
+        words = "Yesterday was too soon.\nPlease explain."
+        update_registration.record_review_log(question, f"answer: {words}")
+        reason = f"Nate's answer to {waiting.question_id}, {words!r}, is not Yes or No."
+        self.assertEqual(self.cli("run", *args), (1, reason + "\n"))
+        self.assertEqual(self.cli("status", "--key", key), (1, reason + "\n"))
         saved = behavior_check.read_record(key)
-        self.assertEqual(saved, behavior_check.InvalidAnswer(waiting.question_id, waiting.owner, reason.strip()))
-        self.assertIn(reason.strip(), self.cli("check", *args)[1])
+        self.assertEqual(saved, behavior_check.InvalidAnswer(waiting.question_id, waiting.owner, reason))
+        status, output = self.cli("check", *args)
+        self.assertEqual(status, 1)
+        self.assertIn(reason, output)
 
-        update_registration.record_review_log(question, "answer:  yEs  ")
-        self.assertEqual(self.cli("status", "--key", key)[0], 0)
-        self.assertEqual(self.cli("check", *args), (0, ""))
-        behavior_check.write_record(key, waiting)
-        update_registration.record_review_log(question, "answer:  nO  ")
-        self.assertEqual(self.cli("status", "--key", key)[0], 1)
-        self.assertIn("answered No", self.cli("check", *args)[1])
+        for words, approval in (("  yEs  ", behavior_check.Approval.YES),
+                                ("Yes, please.", behavior_check.Approval.YES),
+                                ("  nO  ", behavior_check.Approval.NO),
+                                ("NO… keep it.", behavior_check.Approval.NO)):
+            with self.subTest(answer=words):
+                update_registration.record_review_log(question, f"answer: {words}")
+                code = 0 if approval is behavior_check.Approval.YES else 1
+                self.assertEqual(self.cli("run", *args), (code, f"{key} {approval} ({waiting.question_id})\n"))
+                status, output = self.cli("check", *args)
+                self.assertEqual(status, code, output)
+                if approval is behavior_check.Approval.NO:
+                    self.assertIn("answered No", output)
+                behavior_check.write_record(key, waiting)
 
     def test_questions_with_the_same_test_title_keep_distinct_request_keys(self) -> None:
         _, key, first, question = self.filed_question()

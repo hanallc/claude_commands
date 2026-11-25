@@ -140,6 +140,24 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
         self.assertEqual(first.tests, second.tests)
         self.assertNotEqual(first.key, second.key)
 
+    def test_the_same_blob_edits_have_different_keys_when_a_file_mode_changes(self) -> None:
+        test = self.write(self.repo / "test_fixture.py", "def test_fixture():\n    assert 1\n")
+        script = self.write(self.repo / "run.sh", "#!/bin/sh\necho before\n")
+        plain_base = self.commit_files()
+        script.chmod(0o755)
+        executable_base = self.commit_files()
+        _ = self.write(test, "def test_fixture():\n    assert 2\n")
+        _ = self.write(script, "#!/bin/sh\necho after\n")
+        executable_head = self.commit_files()
+        script.chmod(0o644)
+        plain_head = self.commit_files()
+        executable = self.changes(executable_base, executable_head)
+        for base, head in ((plain_base, executable_head), (executable_base, plain_head)):
+            with self.subTest(base=base, head=head):
+                changed = self.changes(base, head)
+                self.assertEqual(changed.tests, executable.tests)
+                self.assertNotEqual(changed.key, executable.key)
+
     def test_a_class_decorator_changes_each_enclosed_python_test(self) -> None:
         original = ("class Demo:\n    def test_first(self):\n        pass\n"
                     "    class Inner:\n        async def test_second(self):\n            pass\n")

@@ -8,7 +8,7 @@ The finder reads Python test functions and Rust functions with test attributes. 
 It includes the attributes of enclosing Rust modules in the test text.
 
 The key hashes the origin identity, the changed files, and the old and new test text.
-Each changed file contributes its path and its old and new Git object IDs.
+Each changed file contributes its path, its old and new Git modes, and its old and new Git object IDs.
 
 `land_main.py` and direct checkpoint pushes read the default branch from origin.
 They check default-branch pushes against the fetched tip.
@@ -31,5 +31,6 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 5. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.
 
 A retry starts a new review if the prior reviewer process ended before it saved a valid reply.
-The collector accepts the filed choices and plain Yes or No in any letter case.
+The collector reads the first word of the answer. It ignores letter case and punctuation at the end of that word.
+If the first word is neither Yes nor No, `behavior_check.py run` quotes the answer and the land stays refused.
 A missing review, an incomplete review, a question without an answer, and a No answer stop the land. Review errors also stop the land.

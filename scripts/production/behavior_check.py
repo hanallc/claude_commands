@@ -93,6 +93,8 @@ class NoChangedTests(StrEnum):
 
 class ChangedFile(NamedTuple):
     path: str
+    old_mode: str
+    new_mode: str
     old_blob: str
     new_blob: str
 
@@ -330,8 +332,8 @@ def changed_tests(change: GitRange, *, timeout: float | None = None) -> ChangedT
     fields = iter(os.fsdecode(raw).removesuffix("\0").split("\0")) if raw else iter(())
     files: list[ChangedFile] = []
     for entry in fields:
-        _, _, old_blob, new_blob, _ = entry.split()
-        files.append(ChangedFile(next(fields), old_blob, new_blob))
+        old_mode, new_mode, old_blob, new_blob, _ = entry.removeprefix(":").split()
+        files.append(ChangedFile(next(fields), old_mode, new_mode, old_blob, new_blob))
     paths = [file.path for file in files if is_test_file(file.path)]
     if not paths:
         return NoChangedTests.EMPTY
