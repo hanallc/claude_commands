@@ -3464,6 +3464,19 @@ def review_local(machine: Machine, *, mode: CleanupMode = CleanupMode.STANDARD) 
     return (move_only_list(listed) if mode is CleanupMode.MOVE_GATE_GIT else listed), bounds
 
 
+def show_apply_command(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, approval: str, *,
+                       mode: CleanupMode, host_list: bool) -> None:
+    sudo = mode is CleanupMode.MOVE_GATE_GIT
+    outcome = WouldMove if sudo else WouldRemove
+    rows = chain(local.rows, mac.rows) if not sudo and isinstance(mac, HostList) else local.rows
+    if any(isinstance(row.outcome, outcome) for row in rows):
+        prefix = "sudo " if sudo else ""
+        scope = " --host-list" if host_list else ""
+        print(f"To {'move' if sudo else 'remove'} these folders, run:")
+        print(f'{prefix}"$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
+              + f"{scope} --go {approval}")
+
+
 def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_local: Callable[[], int], *,
                    mode: CleanupMode = CleanupMode.STANDARD) -> int:
     local_record = local.record()
@@ -3481,6 +3494,7 @@ def finish_cleanup(args: Arguments, local: HostList, run_ssh: SshRunner, apply_l
         approval = digest((approval, MAC_UNREACHABLE))
     if args.go is None:
         show(local, mac, approval, mode=mode)
+        show_apply_command(local, mac, approval, mode=mode, host_list=args.host_list)
         return 0
     if isinstance(mac, MacListUnavailable):
         print(mac.message(), file=sys.stderr)
