@@ -53,7 +53,7 @@ It creates the README if needed and prints the staff id, account and tab.
 Repeat the command with the same options after an interruption.
 
 First admission adopts one proved live Claude session or Codex thread with the producer name.
-It also checks live agents in matching tabs and panes in `PRODUCER_WORKSPACE`.
+It also checks live agents in matching tabs and panes in `producer_workspace`.
 Adoption writes the staff row with that native session. It launches nothing.
 Two live sessions cause refusal. An unproved live session also causes refusal.
 The refusal names each conflicting session and pane. It writes no staff row.

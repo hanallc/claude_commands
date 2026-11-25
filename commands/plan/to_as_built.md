@@ -96,7 +96,9 @@ Capture it as ${CHANGE_SURFACE} and skip to `<ChooseDestination/>`.
 **Goal:** an as-built overview, drafted without burning orchestrator tokens on a
 codebase re-read.
 
-Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
+Assign one read-only worker through `/showrunner:worker` when enrolled.
+Keep its order and reply in the existing run directory. Before enrollment, use one built-in helper.
+Give it these instructions:
 
 - ${SOURCE} `plan` — the absolute plan-doc path, and a directive to read the plan
   **and** the key shipped files it names (the Delegation Context **Key files**
@@ -210,8 +212,8 @@ source plan (and/or in the as-built directory). If this feature changed a type,
 signature, invariant, behavior, or ownership model, nearby docs may now be stale.
 Reconcile them so the as-built corpus and surrounding docs stay accurate.
 
-Dispatch ONE `general-purpose` subagent (it must be able to edit). Its prompt
-must include:
+When enrolled, send each write step to the unit that owns the documents.
+Before enrollment, assign one built-in helper with edit access. Include:
 
 - The absolute path of the **source plan** doc, when there is one. In `diff` mode
   give the diff base and the changed-file list instead.

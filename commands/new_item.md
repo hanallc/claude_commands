@@ -23,4 +23,4 @@ The CLI is `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/n
 6. Exit 4: the output asks about the name. Nothing is filed. Send nate the output as is. On "yes", do step 3 again with the name that the output guessed. Else use the name he gives.
 7. Exit 1 or 2: show nate the error line and stop.
 8. If the result line says "this session", do the work now. Send no "On deck" line.
-   Else go back to the open point in a few words: "On deck: <open point>. <its question, if any>"
+   Else go back to the open point. Name it in one full sentence, in nate's words. Ask one question with one answer word, for example: Say "show it". Do not repeat the choice words of an item that is not on the screen.

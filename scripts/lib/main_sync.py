@@ -33,15 +33,22 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 from scripts.lib import conf, waiting_rows
+from scripts.lib.file_lock import exclusive
 from scripts.message import session_send
 from scripts.lib.process_failure import failure_detail
+from scripts.production.production_doc import (
+    LiveFileConflict as LiveFileConflict, ProductionPathsError, live_file_conflicts as live_file_conflicts,
+    live_paths_lock_file,
+)
 
 STATE_ENV = "MAIN_SYNC_STATE_DIR"
 DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "main-sync")
 SYNC_LOG = "sync.jsonl"
 FETCH_TIMEOUT_SECONDS = 120
+TRACKING_REF = "refs/remotes/origin/main"
 IN_PROGRESS = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply")
 # A job has no terminal: git and ssh must fail rather than ask.
 GIT_ENVIRONMENT = {"GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=20"}
@@ -191,9 +198,16 @@ def sync(checkout: Path) -> Outcome:
     busy = [name for name in IN_PROGRESS if (git_dir / name).exists()]
     if busy:
         return Outcome("in-progress", f"{checkout} has a git operation in progress ({busy[0]})")
+    fetch_ref = f"refs/main-sync/{uuid4().hex}"
     try:
-        waiting_rows.restore_live(checkout)
-        fetched = _git(checkout, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main",
+        path_lock = live_paths_lock_file(checkout)
+        with exclusive(path_lock):
+            waiting_rows.restore_live(checkout)
+            before_fetch = _git(checkout, "rev-parse", "--verify", "--quiet", TRACKING_REF)
+            if before_fetch.returncode not in (0, 1):
+                return Outcome("fetch-failed", _first_line(before_fetch))
+        fetched = _git(checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-prune", "--refmap=",
+                       "origin", f"refs/heads/main:{fetch_ref}",
                        timeout=FETCH_TIMEOUT_SECONDS)
         if fetched.returncode:
             try:
@@ -203,13 +217,36 @@ def sync(checkout: Path) -> Outcome:
             advice = ("GitHub credentials are warm. GitHub refused the fetch. This is likely a GitHub incident; "
                       + "the job retries" if warm else f"run github-warmup at a terminal on {socket.gethostname()}")
             return Outcome("fetch-failed", f"git fetch origin main failed in {checkout}: {_first_line(fetched)}; {advice}")
-        with waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
-            move = waiting_rows.move_target(checkout, "origin/main", pending, fast_forward=True)
+        with exclusive(path_lock), waiting_rows.locked_journal(waiting_rows.journal_path()) as pending:
+            fetched_tip = _git(checkout, "rev-parse", "--verify", f"{fetch_ref}^{{commit}}")
+            if fetched_tip.returncode:
+                return Outcome("fetch-failed", _first_line(fetched_tip))
+            tip = fetched_tip.stdout.strip()
+            conflicts = live_file_conflicts(checkout, tip)
+            if conflicts:
+                return Outcome("live-file-conflict", "\n".join(str(conflict) for conflict in conflicts))
+            tracking = _git(checkout, "rev-parse", "--verify", "--quiet", TRACKING_REF)
+            if tracking.returncode not in (0, 1):
+                return Outcome("fetch-failed", _first_line(tracking))
+            old_tip = tracking.stdout.strip()
+            if old_tip and old_tip != tip:
+                ancestor = _git(checkout, "merge-base", "--is-ancestor", old_tip, tip)
+                if ancestor.returncode == 1:
+                    if old_tip != before_fetch.stdout.strip():
+                        return Outcome("diverged", f"{TRACKING_REF} changed during the fetch")
+                elif ancestor.returncode:
+                    return Outcome("fetch-failed", _first_line(ancestor))
+            move = waiting_rows.move_target(checkout, tip, pending, fast_forward=True)
+            tracked = _git(checkout, "update-ref", TRACKING_REF, tip, old_tip or "0" * len(tip))
+            if tracked.returncode:
+                return Outcome("fetch-failed", _first_line(tracked))
             return _advance(checkout, move, pending)
     except waiting_rows.Diverged:
         return Outcome("diverged", f"{checkout} main holds commits not on origin/main, so it cannot fast-forward")
-    except (OSError, UnicodeError, ValueError) as error:
+    except (OSError, UnicodeError, ValueError, ProductionPathsError) as error:
         return Outcome("ff-failed", f"the move to origin/main failed in {checkout}: {' '.join(str(error).split())}")
+    finally:
+        _ = _git(checkout, "update-ref", "-d", fetch_ref)
 
 
 def _advance(checkout: Path, move: waiting_rows.CheckoutMove, pending: waiting_rows.LockedJournal) -> Outcome:

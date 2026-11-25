@@ -54,6 +54,8 @@ else
 fi
 
 echo "Pushing ${BRANCH_NAME}..."
+BRANCH_REF="refs/heads/$BRANCH_NAME"
+BRANCH_TIP="$(git rev-parse --verify "$BRANCH_REF")"
 git push -u origin "$BRANCH_NAME"
 
 if PR_NUMBER="$(gh pr view --json number -q .number 2>/dev/null)"; then
@@ -93,7 +95,7 @@ fi
 
 echo "Merging PR #${PR_NUMBER}..."
 set +e
-MERGE_OUTPUT="$(gh pr merge "$PR_NUMBER" --rebase --delete-branch 2>&1)"
+MERGE_OUTPUT="$(gh pr merge "$PR_NUMBER" --rebase --match-head-commit "$BRANCH_TIP" 2>&1)"
 MERGE_STATUS="$?"
 set -e
 
@@ -101,15 +103,19 @@ if [[ -n "$MERGE_OUTPUT" ]]; then
   printf '%s\n' "$MERGE_OUTPUT"
 fi
 
-if [[ "$MERGE_STATUS" -ne 0 ]]; then
-  PR_STATE="$(gh pr view "$PR_NUMBER" --json state -q .state 2>/dev/null || true)"
-
-  if [[ "$PR_STATE" == "MERGED" && "$MERGE_OUTPUT" == *"Reference does not exist"* ]]; then
-    echo "PR #${PR_NUMBER} merged and remote branch ${BRANCH_NAME} was already deleted; continuing."
-  else
-    echo "ERROR: failed to merge PR #${PR_NUMBER}." >&2
-    exit "$MERGE_STATUS"
-  fi
+PR_STATE="$(gh pr view "$PR_NUMBER" --json state -q .state)"
+if [[ "$PR_STATE" != "MERGED" ]]; then
+  echo "ERROR: PR #${PR_NUMBER} has not merged." >&2
+  exit "$((MERGE_STATUS == 0 ? 1 : MERGE_STATUS))"
+fi
+MERGED_HEAD="$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)"
+if [[ "$MERGED_HEAD" != "$BRANCH_TIP" ]]; then
+  echo "ERROR: PR #${PR_NUMBER} merged a different commit. The origin ref stays." >&2
+  exit 1
+fi
+if ! "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/origin_deletion.py" \
+    "$PWD" origin "$BRANCH_REF" "$BRANCH_TIP"; then
+  echo "Origin ref cleanup failed for $BRANCH_REF." >&2
 fi
 MERGE_SHA="$(gh pr view "$PR_NUMBER" --json mergeCommit -q .mergeCommit.oid 2>/dev/null || true)"
 

@@ -462,10 +462,19 @@ class MemoryFeedTests(unittest.TestCase):
         runner = staff.StaffRow(staff.StaffId("fixture-runner"), "showrunner", "fixture-runner", staff.StaffRoot(),
                                 current_session=staff.StaffId("fixture-runner"))
         owner = unit_labels.make_labels("fixture-runner", unit_labels.RunsProduction("fixture-runner"), unit_labels.NoDirector())
+        settings = self.root / "statusline.conf"
+        _ = settings.write_text("role.showrunner=#123456\n")
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((runner,))):
             page = self.owner_machine_page(owner)
+            _ = settings.write_text("role.showrunner=#abcdef\n")
+            refreshed = self.owner_machine_page(owner)
         self.assertIn('data-color-text="role.showrunner"', page.get("staff_names", {}).get(runner.name, ""))
         self.assertNotIn("nate", page.get("staff_names", {}))
+        self.assertEqual(page.get("role_labels"), {"showrunner": {
+            "opening": '<span class="staff-name" data-color-text="role.showrunner" style="color:#123456">',
+            "css": "#123456"}})
+        assert "role_labels" in refreshed
+        self.assertEqual(refreshed["role_labels"]["showrunner"]["css"], "#abcdef")
 
     def test_feed_reads_the_staff_record_once_across_destinations(self) -> None:
         reading = cloud_reading(with_wait_reason(reservation_reading(), admission_records.NeedsMemory()))
@@ -684,7 +693,7 @@ class MemoryFeedTests(unittest.TestCase):
         proc = self.root / "proc"
         proc.mkdir()
         _ = (proc / "meminfo").write_text("SwapTotal: 8388608 kB\nSwapFree: 8388608 kB\n")
-        _ = (self.root / "buildlog.conf").write_text("# whole: 1..\nTOP_COST_RECENT_DAYS=3\n")
+        _ = (self.root / "buildlog.conf").write_text("# whole: 1..\ntop_cost_recent_days=3\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
@@ -2797,14 +2806,14 @@ const refresh = createPageRefresh(tick);
             self.assertNotIn("Errno", value.reason)
 
     def test_history_shorter_than_the_recent_window_names_the_configuration_error(self) -> None:
-        _ = (self.root / "buildlog.conf").write_text("# whole: 1..\nTOP_COST_RECENT_DAYS=8\n")
+        _ = (self.root / "buildlog.conf").write_text("# whole: 1..\ntop_cost_recent_days=8\n")
         with (mock.patch.object(charts, "page_data") as provider,
               mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reservation_reading()))):
             page = memory_feed.reading()
             text = memory_feed.report_file(memory_feed.report_reading(memory_feed.read_configuration().history_days)).text
         provider.assert_not_called()
         self.assertIn("history_days", text)
-        self.assertIn("TOP_COST_RECENT_DAYS", text)
+        self.assertIn("top_cost_recent_days", text)
         self.assertTrue(page["walk"])
 
     def test_installed_feed_sources_and_startup_files_change_the_fixed_version(self) -> None:
@@ -3208,6 +3217,7 @@ const refresh = createPageRefresh(tick);
         assert key
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         nate = fixture_member("showrunner", name="nate")
+        _ = fixture_member("unit", name="nate", parent=nate.id)
         person_actions.save_bump(fixture.state_dir, person_actions.Bump("move-201",
             person_actions.SetBump(key, 2), "report", str(nate.id), fixture.clock.now(), "urgent"))
         _ = fixture.server.run_pass()
@@ -3216,10 +3226,13 @@ const refresh = createPageRefresh(tick);
         _ = fixture.server.handle_request(request)
         _ = fixture.server.run_pass()
         expected: memory_feed.LastMove = {
-            "kind": "bump", "who": "nate", "from_place": 2, "to_place": 1, "at": "12:22 PST"}
+            "kind": "bump", "who": "nate", "who_id": nate.id, "from_place": 2, "to_place": 1, "at": "12:22 PST"}
         with mock.patch.dict(os.environ, {"CONF_DIR": str(self.root), "USER_ZONE": "America/Los_Angeles"}):
             page = memory_feed.reading()
             waiting = page["waiters"]
+            registry = page.get("staff_names", {})
+            self.assertNotIn("nate", registry)
+            self.assertIn('data-color-text="role.showrunner"', registry.get(nate.id, ""))
             self.assertEqual(page["priority_text"], 'queue priority: report (nate: "urgent")')
             self.assertEqual(waiting[0].get("priority_lines"), ['report (nate: "urgent")'])
             self.assertEqual([(row["pid"], row.get("last_move")) for row in waiting],
@@ -3427,7 +3440,7 @@ const refresh = createPageRefresh(tick);
         with PlacementFixture() as fixture:
             fixture.configure(slot_gap_seconds=60)
             config = fixture.root / "build_admission.conf"
-            _ = config.write_text(config.read_text() + f"\nmax_runs.{fixture.server.host}.fixture=0\nmax_runs.exempt_unit=natemerge\n")
+            _ = config.write_text(config.read_text() + f"\nmax_runs.{conf.host_key_name(fixture.server.host)}.fixture=0\nmax_runs.exempt_unit=natemerge\n")
             _ = fixture.run_pass()
             fixture.clock.advance(1)
             step = placement_request(fixture)

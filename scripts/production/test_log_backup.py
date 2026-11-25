@@ -1,160 +1,207 @@
-"""Keep the newest LOG copies from explicit backup calls and production checks."""
+"""Use temporary Git repositories to verify backup and restore."""
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import foreign_hostname
-
 import os
-import subprocess
-import sys
-import tempfile
-import unittest
-from unittest import mock
-from datetime import datetime, timedelta
+from dataclasses import replace
 from pathlib import Path
-from typing import cast, override
-from zoneinfo import ZoneInfo
+import subprocess
+
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from tempfile import TemporaryDirectory
+import tarfile
+import unittest
+from unittest.mock import patch
 
 from scripts.agents import remote
-from scripts.production import log_backup, staff
+from scripts.copies import copies
+from scripts.lib.git_test_support import fixture_git_environment
+from scripts.production import log_backup, record_store, staff, tidy_wrapped
+from scripts.production.production_doc import Production, production_backup_checkout, production_backup_root, read_production
+from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY, LEGACY_COPIES
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.herdr.missing_binary import MISSING_HERDR_BIN
-
-# Script completion deadlines only bound hangs; startup can be slow under load.
-SCRIPT = Path(__file__).with_name("log_backup.py")
-CHECK = Path(__file__).with_name("production_check.sh")
-ZONE = ZoneInfo("America/Los_Angeles")
-NOON = datetime(2026, 10, 12, 12, 0, tzinfo=ZONE)
-
-
-def setUpModule() -> None:
-    unittest.enterModuleContext(foreign_hostname())
+from scripts.production.update_registration import QuestionStaff
 
 
 class LogBackupTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.root: Path = Path()
-        self.log: Path = Path()
-        self.doc: Path = Path()
-        self.state: Path = Path()
-        self.backups: Path = Path()
-        self.owner_id: staff.StaffId = staff.StaffId("")
+    def test_production_check_keeps_backups_until_hourly_migration(self) -> None:
+        with (TemporaryDirectory() as folder,
+              patch.dict(os.environ, fixture_git_environment(Path(folder)), clear=True)):
+            root = Path(folder)
+            document = root / "production.md"
+            check = Path(__file__).with_name("production_check.sh")
+            state = root / "state"
+            log = root / "LOG.md"
+            with (isolated_staff_file(root / "staff.json", {}),
+                  patch.dict(os.environ, {"HOME": str(root), "SHOWRUNNER_STATE_DIR": str(state)})):
+                owner = fixture_member("showrunner", name="backup-owner",
+                                       doc=staff.LiveDoc(remote.local_machine(), document))
+                legacy = state / owner.id / LEGACY_COPIES
+                backup_root = production_backup_root()
+                migrated = backup_root / owner.id / LEGACY_COPIES
 
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        checkout = self.root / "checkout"
-        self.log = checkout / "docs/plans/demo-log.md"
-        self.log.parent.mkdir(parents=True)
-        self.state = self.root / "state"
-        self.doc = self.root / "demo-production.md"
-        self.write_doc("running")
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "HERDR_BIN": MISSING_HERDR_BIN,
-            "SHOWRUNNER_STATE_DIR": str(self.state),
-        })))
-        owner = fixture_member("showrunner", name="backup-owner", doc=staff.LiveDoc(remote.local_machine(), self.doc))
-        _ = staff.update_current_session(owner.id, staff.native_id("2798657c-063d-4dcb-9c0a-b20bb56cfa53"))
-        self.owner_id = owner.id
-        self.backups = self.state / owner.id / "log-backups"
+                def no_mirror(identity: staff.StaffId) -> log_backup.BackupMirror:
+                    raise AssertionError(f"{identity}: no Git history to publish")
 
-    def write_doc(self, status: str, *, log_field: bool = True) -> None:
-        fields = [
-            f"> **Status: PRODUCTION — {status}.** demo",
-            "- **Merge branch:** `demo`",
-            f"- **Showrunner checkout:** `{self.root / 'checkout'}`",
-            "- **User zone:** America/Los_Angeles — demo",
-        ]
-        if log_field:
-            fields.insert(2, "- **Log:** `docs/plans/demo-log.md`")
-        _ = self.doc.write_text("\n".join(fields) + "\n", encoding="utf-8")
+                cases = (("before migration", "running", 0, 1),
+                         ("migration conflict", "running", 0, 2),
+                         ("after migration", "running", 0, 2),
+                         ("after wrap", "wrapped", 2, 2),
+                         ("while paused", "paused", 1, 2))
+                with self.subTest(stage="wrap while the first copy holds the lock"):
+                    _ = document.write_text(f"- **Showrunner checkout:** `{root}`\n"
+                                            + "- **Merge branch:** `integration`\n- **Log:** `LOG.md`\n")
+                    _ = log.write_bytes(b"LOG during wrap\n")
+                    state_file = state / owner.id / "state.json"
+                    state_file.parent.mkdir(parents=True)
+                    _ = state_file.write_text("{}")
 
-    def names(self) -> list[str]:
-        return sorted(path.name for path in self.backups.iterdir()) if self.backups.exists() else []
+                    def wrap_during_check(member: staff.StaffRow) -> Production:
+                        production = read_production(member)
+                        self.assertFalse(legacy.exists())
+                        _ = staff.set_doc(owner.id, staff.WrappedDoc(remote.local_machine(), document))
+                        with self.assertRaises(tidy_wrapped.TidyRefused):
+                            _ = tidy_wrapped.tidy(owner.name)
+                        self.assertTrue(state_file.exists())
+                        return production
 
-    def run_script(self, script: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(script, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
-                              env={**os.environ, "HOME": str(self.root), "SHOWRUNNER_STATE_DIR": str(self.state)})
+                    with (patch.object(tidy_wrapped, "STATE_DIR", state),
+                          patch.object(copies, "remove_trees"),
+                          patch.object(record_store, "staff_store_folders", return_value=())):
+                        with patch.object(log_backup, "read_production", side_effect=wrap_during_check):
+                            log_backup.backup_during_check(backup_root, state, owner.id)
+                        (copied,) = legacy.iterdir()
+                        _ = tidy_wrapped.tidy(owner.name)
+                        self.assertEqual((migrated / copied.name).read_bytes(), b"LOG during wrap\n")
+                        log_backup.backup_during_check(backup_root, state, owner.id)
+                        self.assertFalse(state_file.parent.exists())
+                    _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), document))
+                    (migrated / copied.name).unlink()
 
-    def test_a_log_is_copied_under_its_stamp(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        target = log_backup.backup(self.log, self.backups, NOON)
-        self.assertEqual(target, self.backups / "log-20261012T1200.md")
-        self.assertEqual(self.names(), ["log-20261012T1200.md"])
-        self.assertEqual((self.backups / "log-20261012T1200.md").read_text(encoding="utf-8"), "- 11:59 PDT: merged\n")
+                for stage, status, code, count in cases:
+                    with self.subTest(stage=stage):
+                        if stage == "migration conflict":
+                            migrated.mkdir(parents=True, exist_ok=True)
+                            (copied,) = legacy.iterdir()
+                            conflict = migrated / copied.name
+                            _ = conflict.write_bytes(b"Different content")
+                            self.assertEqual(log_backup.backup_all(backup_root, state, staff.StaffSnapshot(()),
+                                                                  no_mirror, 1, hourly=True), 1)
+                            conflict.unlink()
+                        elif stage == "after migration":
+                            self.assertEqual(log_backup.backup_all(backup_root, state, staff.StaffSnapshot(()),
+                                                                  no_mirror, 1, hourly=True), 0)
+                            expected = {path.name: path.read_bytes() for path in legacy.iterdir()}
+                            self.assertEqual({path.name: path.read_bytes() for path in migrated.iterdir()}, expected)
+                        _ = document.write_text(f"> **Status: PRODUCTION — {status}.**\n"
+                                                + f"- **Showrunner checkout:** `{root}`\n"
+                                                + "- **Merge branch:** `integration`\n- **Log:** `LOG.md`\n")
+                        _ = log.write_text(stage)
+                        result = subprocess.run(["zsh", str(check), owner.id], capture_output=True, text=True,
+                                                env={**os.environ, "XDG_STATE_HOME": str(root)},
+                                                check=False, timeout=TEST_HANG_GUARD_SECS)
+                        self.assertEqual((result.returncode, result.stdout, result.stderr), (code, "", ""))
+                        self.assertEqual(len(list(legacy.glob("log-*.md"))), count)
 
-    def test_an_unchanged_log_is_not_copied_again(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        _ = log_backup.backup(self.log, self.backups, NOON)
-        self.assertIsNone(log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=15)))
-        self.assertEqual(self.names(), ["log-20261012T1200.md"])
-        _ = self.log.write_text("- 11:59 PDT: merged\n- 12:20 PDT: gate green\n", encoding="utf-8")
-        self.assertIsNotNone(log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=30)))
-        self.assertEqual(self.names(), ["log-20261012T1200.md", "log-20261012T1230.md"])
+    def test_backup_restores_both_repositories_and_retries_after_wrap(self) -> None:
+        with (TemporaryDirectory() as folder,
+              patch.dict(os.environ, {**fixture_git_environment(Path(folder)),
+                         "GIT_CONFIG_SYSTEM": os.devnull}, clear=True)):
+            root = Path(folder)
+            state = root / "staff-state"
+            checkout = root / "worktree"
+            checkout.mkdir()
+            document = checkout / "demo-production.md"
+            log = checkout / "LOG.md"
+            notes = root / "staged-notes"
+            notes.mkdir()
+            document_bytes = (f"- **Showrunner checkout:** `{checkout}`\r\n"
+                              "- **Merge branch:** `integration`\r\n- **Log:** `LOG.md`\r\n").encode()
+            _ = document.write_bytes(document_bytes)
+            _ = log.write_bytes(b"First entry\r\n")
+            note = notes / "review.txt"
+            _ = note.write_bytes(b"\x00\xff\r\n")
+            _ = (notes / ".gitattributes").write_text("* text eol=lf\n")
+            mirror = root / "mac.git"
+            mirror.mkdir()
+            _ = log_backup.git(mirror, "init", "--bare", "--initial-branch=main")
 
-    def test_an_emptied_or_missing_log_is_never_copied(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        _ = log_backup.backup(self.log, self.backups, NOON)
-        for emptied in ("", " \n\n"):
-            with self.subTest(emptied=emptied):
-                _ = self.log.write_text(emptied, encoding="utf-8")
-                self.assertIsNone(log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=15)))
-        self.log.unlink()
-        self.assertIsNone(log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=30)))
-        self.assertEqual(self.names(), ["log-20261012T1200.md"])
-        self.assertEqual((self.backups / "log-20261012T1200.md").read_text(encoding="utf-8"), "- 11:59 PDT: merged\n")
+            def measure(repack: bool) -> str:
+                if repack:
+                    _ = log_backup.git(mirror, "gc", "--no-prune")
+                return log_backup.command("du", "-sk", str(mirror))
 
-    def test_only_the_newest_copies_are_kept(self) -> None:
-        for tick in range(log_backup.KEEP + 2):
-            _ = self.log.write_text(f"- event {tick}\n", encoding="utf-8")
-            _ = log_backup.backup(self.log, self.backups, NOON + timedelta(minutes=15 * tick))
-        names = self.names()
-        self.assertEqual(len(names), log_backup.KEEP)
-        self.assertEqual(names[0], "log-20261012T1230.md")
-        self.assertEqual((self.backups / names[-1]).read_text(encoding="utf-8"), f"- event {log_backup.KEEP + 1}\n")
+            def destination(identity: staff.StaffId) -> log_backup.BackupMirror:
+                self.assertEqual(identity, owner.id)
+                return log_backup.BackupMirror(str(mirror), measure)
 
-    def test_the_command_copies_into_the_production_s_own_directory(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
-        self.assertEqual(result.returncode, 0, result.stderr)
-        names = self.names()
-        self.assertEqual(len(names), 1)
-        self.assertRegex(names[0], r"^log-\d{8}T\d{4}\.md$")
-        self.assertEqual(result.stdout, f"copied to {self.backups / names[0]}\n")
-        self.assertEqual(self.run_script([sys.executable, str(SCRIPT), "backup-owner"]).stdout, "nothing new to copy\n")
+            with isolated_staff_file(root / "staff.json", {}), patch.dict(os.environ, {"HOME": str(root)}):
+                owner = fixture_member("showrunner", name="backup-owner",
+                                       doc=staff.LiveDoc(remote.local_machine(), document))
+                live = staff.local_snapshot()
+                legacy = state / owner.id / LEGACY_COPIES
+                legacy.mkdir(parents=True)
+                _ = (legacy / "log-old.md").write_bytes(b"Original copy\r\n")
+                backup_root = production_backup_root()
+                repository = production_backup_checkout(owner.id)
+                with patch.object(log_backup, "staged_notes_directory", return_value=notes):
+                    protected = checkout / "document" / "live.md"
+                    protected.parent.mkdir()
+                    _ = protected.write_bytes(b"Live document\n")
+                    _ = log_backup.git(checkout, "init", "--initial-branch=main")
+                    repository.parent.mkdir(parents=True)
+                    with self.subTest(destination="link to production checkout"):
+                        repository.symlink_to(checkout, target_is_directory=True)
+                        self.assertEqual(log_backup.backup_all(backup_root, state, live, destination, 1), 1)
+                        self.assertEqual(protected.read_bytes(), b"Live document\n")
+                        repository.unlink()
+                    displaced = mirror.with_name("unavailable.git")
+                    _ = mirror.rename(displaced)
+                    self.assertEqual(log_backup.backup_all(backup_root, state, live, destination, 1), 1)
+                    first = log_backup.git(repository, "rev-parse", "HEAD")
+                    mirror = displaced.rename(mirror)
+                    for item in (document, log):
+                        item.unlink()
+                    with self.subTest(wrap="new legacy copy before the next backup"):
+                        late = legacy / "log-before-wrap.md"
+                        _ = late.write_bytes(b"Late LOG copy\r\n")
+                        wrapped_owner = replace(owner, doc=staff.WrappedDoc(remote.local_machine(), document))
+                        identities = QuestionStaff.for_record(staff.StaffSnapshot((wrapped_owner,)))
+                        with (patch.object(tidy_wrapped, "STATE_DIR", state),
+                              patch.object(copies, "remove_trees"),
+                              patch.object(record_store, "staff_store_folders", return_value=())):
+                            _ = tidy_wrapped.tidy(owner.name, identities=identities)
+                        self.assertFalse(legacy.exists())
+                        self.assertEqual((backup_root / owner.id / LEGACY_COPIES / late.name).read_bytes(),
+                                         b"Late LOG copy\r\n")
+                    wrapped = staff.StaffSnapshot(())
+                    self.assertEqual(log_backup.backup_all(backup_root, state, wrapped, destination, 1), 0)
+                    self.assertEqual(log_backup.git(mirror, "rev-parse", "HEAD"), first)
+                    self.assertEqual((backup_root / owner.id / LEGACY_COPIES / "log-old.md").read_bytes(),
+                                     b"Original copy\r\n")
 
-    def test_the_command_refuses_a_doc_it_cannot_read(self) -> None:
-        self.write_doc("running", log_field=False)
-        result = self.run_script([sys.executable, str(SCRIPT), "backup-owner"])
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("log_backup: production doc lacks Log", result.stderr)
-        self.assertEqual(self.run_script([sys.executable, str(SCRIPT)]).returncode, 2)
-
-    def test_the_update_check_copies_the_log_of_a_running_production_only(self) -> None:
-        _ = self.log.write_text("- 11:59 PDT: merged\n", encoding="utf-8")
-        for status, code, copied in (("wrapped", 2, 0), ("paused", 1, 0), ("running", 0, 1)):
-            with self.subTest(status=status):
-                self.write_doc(status)
-                result = self.run_script(["zsh", str(CHECK), str(self.owner_id)])
-                self.assertEqual(result.returncode, code, result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertEqual(len(self.names()), copied)
-
-    def test_an_unknown_staff_id_keeps_the_check_unsuccessful(self) -> None:
-        result = self.run_script(["zsh", str(CHECK), "00000000-0000-4000-8000-000000000000"])
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(self.names(), [])
-
-    def test_a_failed_copy_never_changes_the_check_s_answer(self) -> None:
-        self.write_doc("running", log_field=False)
-        result = self.run_script(["zsh", str(CHECK), str(self.owner_id)])
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("log_backup: production doc lacks Log", result.stderr)
-        self.assertEqual(self.names(), [])
-
-
-if __name__ == "__main__":
-    _ = unittest.main()
+                    _ = document.write_bytes(document_bytes)
+                    _ = log.write_bytes(b"Second entry\r\n")
+                    self.assertEqual(log_backup.backup_all(backup_root, state, live, destination, 1), 0)
+                    self.assertEqual(log_backup.backup_all(backup_root, state, live, destination, 1), 0)
+                    second = log_backup.git(repository, "rev-parse", "HEAD")
+                    self.assertEqual(log_backup.git(repository, "rev-list", "--count", second), "2")
+                    for label, source in (("natedev", repository), ("mac", mirror)):
+                        restored = root / label
+                        _ = log_backup.command("git", "clone", "--quiet", "--no-checkout", str(source), str(restored))
+                        for commit, content in ((second, b"Second entry\r\n"), (first, b"First entry\r\n")):
+                            with self.subTest(label=label, commit=commit):
+                                archive = root / f"{label}-{commit}.tar"
+                                _ = log_backup.git(restored, "archive", f"--output={archive}", commit)
+                                destination_folder = root / f"{label}-restore-{commit}"
+                                destination_folder.mkdir()
+                                with tarfile.open(archive) as files:
+                                    files.extractall(destination_folder, filter="data")
+                                expected = {f"{BACKUP_DOCUMENT_DIRECTORY}/demo-production.md": document_bytes,
+                                            "log/LOG.md": content, "notes/review.txt": note.read_bytes(),
+                                            "notes/.gitattributes": b"* text eol=lf\n"}
+                                self.assertEqual({str(path.relative_to(destination_folder))
+                                                  for path in destination_folder.rglob("*") if path.is_file()},
+                                                 set(expected))
+                                for name, data in expected.items():
+                                    self.assertEqual((destination_folder / name).read_bytes(), data)
