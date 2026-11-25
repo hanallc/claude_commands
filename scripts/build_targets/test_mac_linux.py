@@ -39,7 +39,7 @@ from scripts.copies import copies
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
 from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.lib.test_hang_guard import LauncherHangGuard
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.mac_test import claim_state, eligibility, mac_test
 from scripts.production import checkpoint_gate, gate
@@ -2425,7 +2425,7 @@ fi
             mac_linux.TARGET, self.placed.attempt, str(self.guest_home / 'build/claude/caller/1'), str(self.guest_home))))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
-    def check_folder_report_stream(self, *, arm_requested: bool = False) -> None:
+    def check_folder_report_stream(self, *, arm_requested: bool = False, timeout: int = 2) -> None:
         attempt = self.placed.attempt
         marker = mac_linux.guest_start_line(attempt, self.repo, self.guest_home)
         command = [sys.executable, '-c',
@@ -2435,7 +2435,7 @@ fi
         dispatch = self.guest_dispatch()
         dispatch.arm_requested = arm_requested
         with mac_linux.guest_link() as link:
-            result = mac_linux.stream_guest_bundle(self.repo, command, b'', 2, link, armed, dispatch)
+            result = mac_linux.stream_guest_bundle(self.repo, command, b'', timeout, link, armed, dispatch)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b'result\n')
         self.assertEqual(result.stderr, marker.encode() + b'\n' + b'x' * 131072)
@@ -2516,6 +2516,40 @@ fi
             'Guest result returned.',
             'Mac Linux guest queue report failed: the queue report configuration read timed out',
         ])
+
+    def test_a_stalled_folder_config_read_does_not_block_interpreter_exit(self) -> None:
+        program = """
+from pathlib import Path
+import sys
+from threading import Event
+from unittest.mock import patch
+
+from scripts.build_targets.test_mac_linux import MacLinuxRouteTests
+from scripts.lib import conf
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+read_started = Event()
+read = conf.read
+
+def read_config(file):
+    if file == 'build_admission':
+        read_started.set()
+        Event().wait()
+    return read(file)
+
+case = MacLinuxRouteTests('runTest')
+case.repo, case.guest_home = map(Path, sys.argv[1:])
+with patch.object(conf, 'read', read_config):
+    case.check_folder_report_stream(timeout=TEST_HANG_GUARD_SECS)
+    read_started.wait()
+    print('The guest result returned and the config read is still blocked.', flush=True)
+"""
+        process = subprocess.run([sys.executable, '-B', '-c', program, str(self.repo), str(self.guest_home)],
+                                 cwd=CHECKOUT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(process.returncode, 0, process.stdout)
+        self.assertIn('The guest result returned and the config read is still blocked.',
+                      process.stdout.splitlines(), process.stdout)
 
     def test_a_report_preparation_start_failure_preserves_the_command_output(self) -> None:
         self.check_folder_report_thread_failure('prepare')
