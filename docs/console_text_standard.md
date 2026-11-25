@@ -13,6 +13,11 @@ Use this standard for all text that Nate reads on the Console.
 9. Do not give a behavior as a fact when Nate did not ask for it. Say that it is an addition, and give the choice to remove it.
 10. Read the title and the point as a new reader. Check that the reader knows why the item exists and what each choice does.
 
+## Captions
+
+11. Start with Nate's request in his words or with the thing he sees. For example, “Your bug: the New item screenshot must show where you are.”
+12. If a picture has two halves, name what each half shows. Skip this for before and after views.
+
 ## Example
 
 ### A test of the speech change needs you at the Mac for one minute

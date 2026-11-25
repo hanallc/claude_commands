@@ -1648,19 +1648,19 @@ class DeliveryStatus:
         if not text.strip():
             raise question_record.AnswerRefused("enter an answer")
         text = text.strip()
+        if isinstance(self.question_for_reply(self.slots(page, row), question_id, text), AnsweredQuestion):
+            return NO_ANSWER_TIME
+        console_text.require(text, "reply", identity=f"{page.review_list}/{row}/{question_id}",
+                             refusal=question_record.AnswerRefused)
         with self.locked():
             slots = self.slots(page, row)
-            question = self.question_for_reply(page, row, question_id, text)
-            if isinstance(question, AnsweredQuestion) and question.answer == text:
+            question = self.question_for_reply(slots, question_id, text)
+            if isinstance(question, AnsweredQuestion):
                 return NO_ANSWER_TIME
-            if not isinstance(question, OpenQuestion):
-                raise question_record.AnswerRefused("this row has no open question")
             record = answer_row(page, row)
             if record.get("Verdict"):
                 raise question_record.AnswerRefused("this row already has a saved answer")
             production = row_production(page, record)
-            console_text.require(text, "reply", identity=f"{page.review_list}/{row}/{question_id}",
-                                 refusal=question_record.AnswerRefused)
             completed = AnsweredQuestion
             if isinstance(question, OpenFeedback):
                 completed = CompletedFeedback
@@ -1673,11 +1673,11 @@ class DeliveryStatus:
                              answered_at=answered_at)
             return answered_at
 
-    def question_for_reply(self, page: ReviewPage, row: str, question_id: str, text: str) -> OpenQuestion | AnsweredQuestion:
-        """Apply the existing exchange identity rule to each Review type."""
-        question = self.slots(page, row).question
+    @staticmethod
+    def question_for_reply(slots: DeliverySlots, question_id: str, text: str) -> OpenQuestion | AnsweredQuestion:
+        """Check the exchange ID and answer against the saved delivery slots."""
         try:
-            return delivery_state.question_exchange_for_reply(question, question_id, text)
+            return delivery_state.question_exchange_for_reply(slots.question, question_id, text)
         except delivery_state.StaleQuestionExchange as error:
             raise question_record.AnswerRefused(str(error)) from error
 
@@ -3279,11 +3279,18 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
             path, row = efficiency_reviews.path(source.path), decision_store.efficiency_identity(item)
         page = status.metadata_page(ReviewPage(path, path.parent, (row,), ''))
         row = page.rows[0]
+        if isinstance(source, (review_items.ProposalSource, review_items.EfficiencySource)):
+            slots = status.slots(page, row)
+            if not isinstance(slots.question, NoQuestion) or question_id:
+                if isinstance(status.question_for_reply(slots, question_id, words.strip()), AnsweredQuestion):
+                    return False
+            console_text.require(words, "reply", identity=f"{path}/{row}/{question_id}",
+                                 refusal=question_record.AnswerRefused)
         with status.locked():
             slots = status.slots(page, row)
             tracked = not isinstance(slots.question, NoQuestion) or bool(question_id)
             if tracked:
-                question = status.question_for_reply(page, row, question_id, words.strip())
+                question = status.question_for_reply(slots, question_id, words.strip())
                 if isinstance(question, AnsweredQuestion):
                     return False
             if isinstance(source, review_items.QuestionSource):
@@ -3294,8 +3301,6 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
                 _ = investigation.answer(source.record.owner,source.record.id,words,question_id=question_id)
                 changed = True
             else:
-                console_text.require(words, "reply", identity=f"{path}/{row}/{question_id}",
-                                     refusal=question_record.AnswerRefused)
                 try:
                     changed = decision_store.answer(item,words,who)
                 except decision_store.NoOpenQuestion as error:

@@ -29,6 +29,7 @@ from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
+from scripts.notify import review
 from scripts.production import delivery_state, staff, unrouted_alert
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production.staff_test_support import fixture_member
@@ -69,6 +70,8 @@ class ImagesFixture(unittest.TestCase):
         self.shot = self.temporary / "before.png"
         _ = self.shot.write_bytes(PNG)
         self.sent = []
+        _ = self.enterContext(patch.object(
+            review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
         _ = self.enterContext(patch.object(change_page, "send_message", side_effect=self.capture))
         _ = self.enterContext(patch.object(change_page, "send_question", side_effect=self.capture_question))
 
@@ -252,6 +255,17 @@ class ImagesTests(ImagesFixture):
         with redirect_stdout(StringIO()):
             self.assertEqual(images.main([*command, "--caption", caption]), 0)
         self.assertEqual([record["caption"] for record in images.records(self.root)], [caption])
+
+    def test_caption_reader_checks_context_and_names_for_both_halves(self) -> None:
+        caption = "Here is the result."
+        failures = (review.RuleFailure("console-standard-11", caption),
+                    review.RuleFailure("console-standard-12", caption))
+        with patch.object(review, "review_question",
+                          return_value=review.QuestionReviewFailed(caption, (), failures)) as reader:
+            with self.assertRaisesRegex(ValueError, "console-standard-11: .*console-standard-12:"):
+                _ = self.register(caption)
+        reader.assert_called_once_with(review.QuestionKey("image caption", caption), caption, console_kind="image caption")
+        self.assertEqual(images.records(self.root), [])
 
     def test_command_prints_the_image_and_console_links_and_deletes(self) -> None:
         output = StringIO()

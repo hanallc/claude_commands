@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Literal
 
 from scripts.notify import review
@@ -10,12 +11,12 @@ from scripts.notify import review
 type Kind = Literal["question", "reply", "change", "proposal", "investigation answer",
                     "efficiency candidate", "list field", "image caption"]
 
-_FAST_ONLY = frozenset(("efficiency candidate", "list field", "image caption"))
+_FAST_ONLY = frozenset(("efficiency candidate", "list field"))
 _URL = re.compile(r"https?://[^\s<>()`]+")
 _PATH_PART = r"[\w.-]+"
 _PATH = re.compile(
-    rf"(?<![\w/])(?:(?:~|\.\.?)?/{_PATH_PART}(?:/{_PATH_PART})*"
-    + rf"|{_PATH_PART}/(?:{_PATH_PART}/)+{_PATH_PART}|{_PATH_PART}/[\w-]+\.{_PATH_PART})(?<!\.)"
+    rf"(?<![\w./])(?:(?:~|\.)?/{_PATH_PART}(?:/{_PATH_PART})*"
+    + rf"|(?:{_PATH_PART}/)+{_PATH_PART}\.[\w-]+)(?<!\.)"
 )
 _SESSION = re.compile(r"(?<![\w-])[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![\w-])", re.I)
 _RUN = re.compile(
@@ -96,7 +97,10 @@ def check(text: str, kind: Kind, *, key: review.QuestionKey | None = None,
           title: str = "") -> review.QuestionOutcome:
     """Run the filing check. Use a stable key to save the hold for a revised draft."""
     failures = fast_check(text, kind)
-    if title and title not in text.splitlines():
+    heading = f"## {title}"
+    lines = text.splitlines()
+    separate_title = bool(title) and title not in lines and heading not in lines
+    if separate_title:
         failures += fast_check(title, "list field")
     if failures:
         outcome = review.QuestionReviewFailed(text, (), failures)
@@ -105,7 +109,9 @@ def check(text: str, kind: Kind, *, key: review.QuestionKey | None = None,
         return outcome
     if kind in _FAST_ONLY:
         return review.QuestionAccepted(text)
-    return review.review_question(key or review.QuestionKey(kind, text), text, console_kind=kind)
+    draft = f"{heading}\n\n{text}" if separate_title else text
+    result = review.review_question(key or review.QuestionKey(kind, draft), draft, console_kind=kind)
+    return replace(result, question=text) if separate_title else result
 
 
 def require(text: str | Sequence[str], kind: Kind, *, identity: str = "", title: str = "",

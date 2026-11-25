@@ -53,6 +53,7 @@ from scripts.review_links import new_item_dialog, question_record, reply_tokens,
 from scripts.review_links.server_test_support import started_review_server
 from scripts.rebuild import need
 from scripts.statusline import rebuild_row
+from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.production.production_doc import read_production
 
@@ -673,6 +674,42 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(saved, change_page.AnsweredQuestion(
                 question.question_id, question.text, "The window stays open."))
             reader.assert_called_once()
+
+    def test_reply_reader_runs_before_the_delivery_lock_and_fits_the_ssh_timeout(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        question = status.ask(self.page, "C1", "What happens next?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        words = "The window stays open."
+        with (patch.object(status, "locked", wraps=status.locked) as locked,
+              patch.object(review, "review_question") as reader):
+            def replace_question(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+                locked.assert_not_called()
+                slots = status.slots(self.page, "C1")
+                assert isinstance(slots.question, change_page.OpenQuestion)
+                replacement = replace(slots.question, question_id="new-question")
+                with status.locked():
+                    status.write_slots(self.page, "C1", replace(slots, question=replacement))
+                return review.QuestionAccepted(words)
+
+            reader.side_effect = replace_question
+            with self.assertRaisesRegex(question_record.AnswerRefused, "does not match"):
+                _ = status.answer_question(self.page, "C1", question.question_id, words)
+            saved = status.slots(self.page, "C1").question
+            assert isinstance(saved, change_page.OpenQuestion)
+            self.assertEqual(saved.question_id, "new-question")
+
+        config = self.temporary / "notify.conf"
+        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=113\n")
+        with (patch.object(review, "NOTIFY_CONFIG", config),
+              patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(remote, "machine_alias", return_value=remote.MachineAlias("mac")),
+              patch.object(remote, "this_machine", return_value="natedev"),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as ssh):
+            self.assertEqual(change_page.main([
+                "answer-question", "--machine", "mac", "--item", "submission/question/owner/item/request",
+                "--question", question.question_id, "--text", words,
+            ]), 0)
+        self.assertEqual(ssh.call_args.kwargs["timeout"], 143)
 
     def test_answer_question_keeps_internal_line_breaks_and_an_identical_rerun_changes_nothing(self) -> None:
         status = change_page.DeliveryStatus(self.root)

@@ -51,10 +51,19 @@ class ConsoleTextCheckTests(unittest.TestCase):
                 self.assertEqual(check.fast_check(f"The result is in {accepted}.", "reply"), ())
         self.assertEqual(check.fast_check("Open the image at https://example.org/image/07ffc9e69e.", "image caption"), ())
 
+    def test_paths_require_a_file_sign(self) -> None:
+        for text in ("The date is 11/25/2026.", "Open Tools/Audio/Output."):
+            with self.subTest(text=text):
+                self.assertEqual(check.fast_check(text, "reply"), ())
+        for path in ("/tmp/proof", "~/notes/proof", "./notes/proof", "scripts/review_links/check.py"):
+            with self.subTest(path=path):
+                self.assertEqual(check.fast_check(f"Open {path}.", "reply"),
+                                 (review.RuleFailure("omit-file-path", path),))
+
     def test_fast_only_kinds_skip_the_model(self) -> None:
         text = "The image shows the old layout."
         with patch.object(review, "review_question") as reviewer:
-            for kind in ("list field", "image caption", "efficiency candidate"):
+            for kind in ("list field", "efficiency candidate"):
                 with self.subTest(kind=kind):
                     self.assertEqual(check.check(text, kind), review.QuestionAccepted(text))
             reviewer.assert_not_called()
@@ -89,3 +98,17 @@ class ConsoleTextCheckTests(unittest.TestCase):
             self.assertIn("Console text kind: reply", cast(str, reader.call_args.kwargs["prompt"]))
             hold = root / "questions" / f"{key.digest}.json"
             self.assertIn("console-standard-5: Step B", hold.read_text())
+
+    def test_console_reader_checks_a_separate_title(self) -> None:
+        title = "Phase 15 is ready"
+        text = "The display is ready."
+        draft = f"## {title}\n\n{text}"
+        key = review.QuestionKey("example", title)
+        failure = review.RuleFailure("console-standard-5", "Phase 15")
+        with patch.object(review, "review_question", side_effect=(
+                review.QuestionReviewFailed(draft, (), (failure,)), review.QuestionAccepted(draft))) as reader:
+            self.assertEqual(check.check(text, "question", key=key, title=title),
+                             review.QuestionReviewFailed(text, (), (failure,)))
+            reader.assert_called_once_with(key, draft, console_kind="question")
+            self.assertEqual(check.check(text, "question", key=key, title=title),
+                             review.QuestionAccepted(text))
