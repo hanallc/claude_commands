@@ -1119,7 +1119,7 @@ The account swatch column is between **account** and **left**.
 Hover over an account name to see the email from its login record.
 When the record has no usable email, the title says **No email in the login record**.
 **Fable left** follows **left** and shows the cached weekly Fable percent for Claude accounts.
-It shows a dash for Codex accounts and when the cache has no current Fable window.
+It is empty for Codex accounts. It shows a dash for a Claude account when the cache has no current Fable window.
 The role swatch column is between **role** and **next**.
 After **next**, **weekly reset** shows the weekly reset time.
 A running account uses green. This includes a Claude account with an unassigned session.

@@ -621,7 +621,8 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         table = markup.split('aria-label="Accounts"', 1)[1].split("</table>", 1)[0]
         lines = cast(list[str], re.findall(r'<tr[^>]+data-account-row="[^"]+">(.*?)</tr>', table, re.S))
         cells = [cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S)) for line in lines]
-        self.assertEqual([re.sub("<[^>]+>", "", row[4]) for row in cells], ["9%", "100%", "—", "—", "—", "—"])
+        self.assertEqual([row[4] for row in cells[2:]], [accounts_page.DASH, "", "", ""])
+        self.assertEqual([re.sub("<[^>]+>", "", row[4]) for row in cells[:2]], ["9%", "100%"])
         self.assertEqual([re.sub("<[^>]+>", "", row[11]) for row in cells], ["—", "—", "—", "12", "0", "—"])
         self.assertIn('title="Claude does not give this count to our tools."', cells[0][11])
         orders = rendered_sort_orders(markup, "accounts")

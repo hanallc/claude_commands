@@ -564,7 +564,9 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
         if alert := alerts.get(label):
             left = _quota_button(label, alert) + left
         fable = row.fable_left_percent if row.tool == "claude" and isinstance(row.fable_left_percent, (int, float)) else None
-        fable_text = DASH if fable is None else f'<span class="{"error" if fable == 0 else "default"}">{round(fable)}%</span>'
+        fable_text = "" if row.tool == "codex" else DASH
+        if fable is not None:
+            fable_text = f'<span class="{"error" if fable == 0 else "default"}">{round(fable)}%</span>'
         reset_count = row.limit_reset_count if row.tool == "codex" and isinstance(row.limit_reset_count, int) else None
         reset_count_text = (
             '<span class="next-muted" title="Claude does not give this count to our tools.">—</span>'
