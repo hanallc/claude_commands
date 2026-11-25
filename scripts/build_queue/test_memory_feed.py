@@ -463,6 +463,70 @@ class MemoryFeedTests(unittest.TestCase):
                          [(pid, "test") for pid in siblings])
         self.assertEqual([event.args[1] for event in read_session.call_args_list], [8101, 8100])
 
+    def test_outside_queue_shares_one_herdr_host_scan_for_three_codex_agents(self) -> None:
+        fixture = write_outside_queue_fixture(self.root, siblings=(8200, 8201))
+        runner, director, worker = fixture.rows
+        director = replace(director, current_session=staff.StaffId(fixture_runtime_id("director-session")))
+        owners = memory_feed.FeedStaff(replace(fixture, rows=(runner, director, worker)))
+        proc = self.root / "proc"
+        config = self.root / "config"
+        sockets = proc / "net/unix"
+        sockets.parent.mkdir()
+        _ = sockets.write_text(f"0: 00000002 00000000 00010000 0001 01 100 {config}/herdr/herdr.sock\n")
+        write_process(proc, 8090)
+        descriptors = proc / "8090/fd"
+        descriptors.mkdir()
+        (descriptors / "3").symlink_to("socket:[100]")
+        set_outside_cpu(self.root, 8100, (200, 0, 0, 0), parent=8090)
+        set_outside_cpu(self.root, 8200, (121, 0, 0, 0), parent=8104)
+        set_outside_cpu(self.root, 8201, (121, 0, 0, 0), parent=8107)
+        panes: dict[str, dict[str, object]] = {}
+        foreground: dict[str, dict[str, object]] = {}
+        for pid, member in ((8101, worker), (8104, director), (8107, runner)):
+            pane = f"w1:p{pid}"
+            argv = ["/bin/codex", "resume", member.current_session]
+            _ = (proc / str(pid) / "cmdline").write_text("\0".join(argv) + "\0")
+            _ = (proc / str(pid) / "environ").write_text(f"HERDR_PANE_ID={pane}\0")
+            panes[pane] = {"pane_id": pane, "workspace_id": "w1", "session_id": member.current_session}
+            foreground[pane] = {"pid": pid, "argv": argv}
+
+        foreground_reads: list[str] = []
+
+        def result(_client: herdr.Herdr, *arguments: str) -> dict[str, object]:
+            if arguments == ("pane", "list"):
+                return {"panes": list(panes.values())}
+            if arguments[:2] == ("pane", "get"):
+                return {"pane": panes[arguments[-1]]}
+            self.assertEqual(arguments[:3], ("pane", "process-info", "--pane"))
+            pane = arguments[-1]
+            foreground_reads.append(pane)
+            return {"process_info": {"foreground_processes": [foreground[pane]]}}
+
+        socket_reads: list[Path] = []
+        read_text = Path.read_text
+
+        def count_host_reads(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == sockets:
+                socket_reads.append(path)
+            return read_text(path, encoding=encoding, errors=errors)
+
+        inputs = captured_reading().explanation.decided_from
+        environment = {**outside_queue_fixture_groups(self.root), "XDG_CONFIG_HOME": str(config)}
+        with (mock.patch.dict(os.environ, environment),
+              mock.patch.object(sessions, "process_start", side_effect=str),
+              mock.patch.object(herdr.Herdr, "result", new=result),
+              mock.patch.object(Path, "read_text", new=count_host_reads)):
+            rows = memory_feed.outside_queue_processes(inputs, owners, for_table=True)
+            self.assertEqual({row["pid"]: row["owner"] for row in rows},
+                             {8102: "test", 8200: "queue", 8201: "builds"})
+            self.assertEqual(socket_reads, [sockets])
+            self.assertCountEqual(foreground_reads, panes)
+
+            foreground["w1:p8104"]["pid"] = 8107
+            rows = memory_feed.outside_queue_processes(inputs, owners, for_table=True)
+            self.assertEqual({row["pid"] for row in rows if "kill_ref" in row}, {8102, 8201})
+            self.assertEqual(socket_reads, [sockets, sockets])
+
     def test_outside_kill_uses_the_nearest_registered_agent_for_each_row(self) -> None:
         members = write_outside_queue_fixture(self.root, siblings=(8200, 8201))
         set_outside_launcher(self.root)

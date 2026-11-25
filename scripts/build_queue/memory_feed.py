@@ -77,6 +77,7 @@ from scripts.build_queue.memory_files import DATA_NAME, PAGE_NAME, PAGE_SOURCE, 
 from scripts.build_targets import target_config
 from scripts.herdr import herdr
 from scripts.herdr.herdr import is_claude_process, is_codex_process
+from scripts.herdr.herdr_types import HerdrFailure
 from scripts.lint import memory_admit as gate
 from scripts.message import sessions, unit_labels
 from scripts.production import staff, staff_sources
@@ -2851,7 +2852,6 @@ class OutsideQueueScan:
         self.for_table = for_table
         self.commands: dict[int, tuple[str, ...]] = {}
         self.native_sessions: dict[int, str | OutsideThreadHost | OutsideIdentityUnreadable] = {}
-        self.codex_threads = staff_sources.CodexProcessThreads()
         self.children: dict[int, list[int]] = {}
         for pid, process in processes.items():
             self.children.setdefault(process.parent, []).append(pid)
@@ -2893,6 +2893,30 @@ class OutsideQueueScan:
         return {(record["pid"], start): record["sessionId"] for entry in sessions.read_registry().entries
                 if (start := (record := entry.record).get("procStart"))}
 
+    @cached_property
+    def herdr_places(self) -> herdr.HerdrProcessPlacements:
+        return herdr.herdr_places()
+
+    def codex_session(self, pid: int) -> str:
+        environment = herdr.process_environment(pid)
+        if environment.get("HERDR_PANE_ID") and not environment.get("TMUX_PANE"):
+            place = self.herdr_places.get(pid)
+        else:
+            place = herdr.process_placement(pid, environment=environment)
+        if isinstance(place, herdr.NotInHerdr):
+            return herdr.codex_resume_thread(pid)
+        if not isinstance(place, herdr.HerdrPlace):
+            return ""
+        client = herdr.Herdr(place.session)
+        info = herdr.json_object(client.result("pane", "process-info", "--pane", place.pane).get("process_info"),
+                                 "Codex pane process info")
+        owner = herdr.pane_foreground(place, info)
+        if not isinstance(owner, herdr.ProvedCodexForeground) or owner.pid != pid:
+            return ""
+        pane = herdr.json_object(client.result("pane", "get", place.pane).get("pane"), "Codex pane")
+        native = herdr.read_foreground_pane_owner(owner, {**pane, "pane_id": place.pane})
+        return native.current_identity if native.started == self.processes[pid].start else ""
+
     def read_native_session(self, pid: int, command: tuple[str, ...]) -> str | OutsideThreadHost | OutsideIdentityUnreadable:
         if is_claude_process(command):
             native = self.claude_sessions.get((pid, self.processes[pid].start), "")
@@ -2901,13 +2925,9 @@ class OutsideQueueScan:
             return OutsideThreadHost() if process is not None and not process.zombie else OutsideIdentityUnreadable()
         else:
             try:
-                environment = herdr.process_environment(pid)
-                # A child can inherit this value from an agent that has exited.
-                _ = environment.pop("CODEX_THREAD_ID", None)
-                result = self.codex_threads.thread(pid, environment)
-            except (OSError, ValueError):
+                native = self.codex_session(pid)
+            except (OSError, ValueError, HerdrFailure, subprocess.SubprocessError):
                 return OutsideIdentityUnreadable()
-            native = result.owner if isinstance(result, herdr.ProvedMatch) else ""
         process = self.current_process(pid)
         return native if native and process is not None and not process.zombie else OutsideIdentityUnreadable()
 
