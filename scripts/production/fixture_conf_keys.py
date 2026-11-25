@@ -7,8 +7,8 @@ Each literal fixture text of a config file must hold each plain key that the tip
 that file. A per-name key (`kind.mac`, `value.natedev`) is not required, because a
 fixture names only its own targets and hosts.
 
-The report lists reads of removed keys and fixed-name reads of keys absent from the tip config files.
-The report counts sources it cannot scan. The advisory scan does not affect the exit code.
+The check refuses matching literal file and key reads of a removed key in the same source on main and tip, with other reads advisory.
+The report counts tip sources that the scan cannot read.
 """
 from __future__ import annotations
 try:
@@ -18,6 +18,7 @@ except FileNotFoundError:
 
 import argparse
 import ast
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -57,6 +58,11 @@ class RemovedKeyRead:
 
 
 @dataclass(frozen=True)
+class RefusedKeyRead(RemovedKeyRead):
+    """A removed key read that main shares for at least one named file."""
+
+
+@dataclass(frozen=True)
 class AbsentKeyRead:
     source: str
     line: int
@@ -70,6 +76,14 @@ class AdvisoryReads:
     sources_not_scanned: int = 0
 
 
+@dataclass
+class KeyReadScan:
+    removed: list[RemovedKeyRead] = field(default_factory=list)
+    absent: list[AbsentKeyRead] = field(default_factory=list)
+    sources_not_scanned: int = 0
+    resolved_removals: dict[str, set[ConfigKeyRead]] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class KeyReport:
     new_keys: dict[str, set[str]]
@@ -77,6 +91,7 @@ class KeyReport:
     not_checked: list[FixtureWrite]
     removed_keys: dict[str, set[str]]
     advisory: AdvisoryReads
+    refused_reads: list[RefusedKeyRead]
 
 
 def new_keys(base: dict[str, str], tip: dict[str, str]) -> dict[str, set[str]]:
@@ -262,14 +277,55 @@ type KeyOccurrence = tuple[str, int]
 type SourcePosition = tuple[int, int]
 
 
+@dataclass(frozen=True)
+class ConfigKey:
+    conf_name: str
+    key: str
+
+
+@dataclass(frozen=True)
+class ConfigKeyRead:
+    setting: ConfigKey
+    line: int
+
+
 @dataclass
 class SourceKeyReads:
     mentions: set[KeyOccurrence] = field(default_factory=set)
     fixed: set[KeyOccurrence] = field(default_factory=set)
+    resolved: set[ConfigKeyRead] = field(default_factory=set)
 
 
 def imported_name(item: ast.alias) -> str:
     return item.asname or item.name.partition(".")[0]
+
+
+def root_name(node: ast.expr) -> str:
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def module_binding_counts(tree: ast.Module) -> Counter[str]:
+    """Count bindings and attribute writes across all scopes in a source."""
+    counts: Counter[str] = Counter()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name | ast.Attribute) and isinstance(node.ctx, ast.Store | ast.Del):
+            counts[root_name(node)] += 1
+        elif isinstance(node, ast.arg):
+            counts[node.arg] += 1
+        elif isinstance(node, ast.alias):
+            if node.name == "*":
+                return Counter()
+            counts[imported_name(node)] += 1
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+                        | ast.TypeVar | ast.TypeVarTuple | ast.ParamSpec):
+            counts[node.name] += 1
+        elif isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name is not None:
+            counts[node.name] += 1
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            counts[node.rest] += 1
+    return counts
 
 
 def is_config_module(node: ast.expr, names: ReadBindings) -> bool:
@@ -367,6 +423,7 @@ class PythonKeyScan(ast.NodeVisitor):
         self.bindings: ReadBindings = {}
         self.assignments: list[tuple[str, ast.Call]] = []
         self.key_assignments: dict[str, list[KeyAssignment]] = {}
+        self.literal_readers: dict[str, str] = {}
         self.loop_bodies: list[LoopBody] = []
         self.parameters: list[ast.arg] = []
         self.calls: list[FixedReadCall] = []
@@ -412,14 +469,18 @@ class PythonKeyScan(ast.NodeVisitor):
         if self.tokens and isinstance(node.value, str) and node.value in self.tokens:
             self.reads.mentions.add((node.value, node.lineno))
 
+    def record_import(self, name: str, kind: ReadName | None) -> None:
+        self.local_names.add(name)
+        if kind is not None:
+            self.imports.setdefault(name, set()).add(kind)
+
     @override
     def visit_Import(self, node: ast.Import) -> None:
         for item in node.names:
-            name = imported_name(item)
-            self.local_names.add(name)
+            kind = None
             if item.name == "scripts.lib.conf":
                 kind = ReadName.CONFIG_MODULE if item.asname else ReadName.SCRIPTS_PACKAGE_WITH_CONF
-                self.imports.setdefault(name, set()).add(kind)
+            self.record_import(imported_name(item), kind)
 
     @override
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -430,15 +491,15 @@ class PythonKeyScan(ast.NodeVisitor):
             except ImportError:
                 module = ""
         for item in node.names:
-            name = imported_name(item)
-            self.local_names.add(name)
+            kind = None
             if module == "scripts.lib" and item.name == "conf":
-                self.imports.setdefault(name, set()).add(ReadName.CONFIG_MODULE)
+                kind = ReadName.CONFIG_MODULE
             elif module == "scripts.lib.conf":
                 if item.name in _LOADERS:
-                    self.imports.setdefault(name, set()).add(ReadName.CONFIG_LOADER)
+                    kind = ReadName.CONFIG_LOADER
                 elif item.name == "ConfigRead":
-                    self.imports.setdefault(name, set()).add(ReadName.CONFIG_READER_TYPE)
+                    kind = ReadName.CONFIG_READER_TYPE
+            self.record_import(imported_name(item), kind)
 
     @override
     def visit_Name(self, node: ast.Name) -> None:
@@ -614,7 +675,31 @@ class PythonKeyScan(ast.NodeVisitor):
                     break
         return keys
 
-    def resolve_calls(self) -> None:
+    def name_scope(self, name: str) -> PythonKeyScan:
+        scope = next(scope for scope in (self, *self.enclosing())
+                     if scope.outer is None or name in scope.local_names
+                     or name in scope.global_names or name in scope.nonlocal_names)
+        return scope.binding_scope(name)
+
+    def literal_loader_file(self, call: ast.Call, binding_counts: Counter[str]) -> str:
+        """Return the config file name for a loader with one positional string literal."""
+        if len(call.args) != 1 or call.keywords:
+            return ""
+        name = root_name(call.func)
+        if binding_counts[name] != 1 or not is_config_loader(call.func, self.name_scope(name).bindings):
+            return ""
+        stem = call.args[0]
+        if isinstance(stem, ast.Constant) and isinstance(stem.value, str):
+            if stem.value and "/" not in stem.value and not stem.value.endswith(".conf"):
+                return stem.value + ".conf"
+        return ""
+
+    def bind_literal_readers(self, binding_counts: Counter[str]) -> None:
+        for name, loader in self.assignments:
+            if binding_counts[name] == 1 and (file := self.literal_loader_file(loader, binding_counts)):
+                self.binding_scope(name).literal_readers[name] = file
+
+    def resolve_calls(self, binding_counts: Counter[str]) -> None:
         if not self.calls:
             return
         names = self.visible_bindings()
@@ -624,25 +709,38 @@ class PythonKeyScan(ast.NodeVisitor):
             receiver = call.receiver
             if (isinstance(receiver, ast.Call) and is_config_loader(receiver.func, names)
                     or isinstance(receiver, ast.Name) and ReadName.CONFIG_READER in names.get(receiver.id, ())):
+                candidates: list[KeyOccurrence] = []
                 for key in call.keys:
                     if isinstance(key, ast.Constant) and isinstance(key.value, str):
                         self.reads.fixed.add((key.value, key.lineno))
+                        if key.value in self.tokens:
+                            candidates.append((key.value, key.lineno))
                     elif isinstance(key, ast.Name):
                         self.reads.fixed.update((value, key.lineno) for value in self.assigned_keys(key))
+                if candidates:
+                    file = (self.literal_loader_file(receiver, binding_counts) if isinstance(receiver, ast.Call)
+                            else self.name_scope(receiver.id).literal_readers.get(receiver.id, ""))
+                    if file:
+                        self.reads.resolved.update(ConfigKeyRead(ConfigKey(file, key), line)
+                                                   for key, line in candidates)
 
 
 def python_key_reads(source: str, content: bytes, tokens: set[str]) -> SourceKeyReads:
     reads = SourceKeyReads()
     package = ".".join(PurePosixPath(source).parts[:-1])
     scan = PythonKeyScan(package, tokens, reads)
-    scan.visit(ast.parse(content, source))
+    tree = ast.parse(content, source)
+    scan.visit(tree)
     scopes = tuple(scan.scopes())
     for scope in scopes:
         scope.bind_imports()
+    binding_counts = module_binding_counts(tree) if reads.mentions else Counter[str]()
     for scope in scopes:
         scope.bind_readers()
+        if binding_counts:
+            scope.bind_literal_readers(binding_counts)
     for scope in scopes:
-        scope.resolve_calls()
+        scope.resolve_calls(binding_counts)
     return reads
 
 
@@ -653,6 +751,7 @@ _SHELL_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SHELL_CONTROL = {"if", "then", "elif", "else", "while", "until", "do", "!"}
 _SHELL_BOUNDARY = {";", "&", "|", "(", ")", "\n"}
 _SHELL_REDIRECT_WORD = re.compile(_SHELL_REDIRECT)
+_SHELL_CONF_VALUE_DEFINITION = re.compile(r"(?<![\w./-])(?:conf_value\s*\(\s*\)|function[ \t]+conf_value(?![\w./-]))")
 
 
 def shell_commands(text: str) -> Iterator[list[tuple[str, int]]]:
@@ -735,6 +834,11 @@ def shell_command_start(words: Sequence[tuple[str, int]]) -> int:
 
 def shell_key_reads(text: str, mentions: re.Pattern[str] | None) -> SourceKeyReads:
     reads = SourceKeyReads()
+    literal_reads = mentions
+    if literal_reads is not None:
+        joined_lines = text.replace("\\\n", "").replace("\\\r\n", "")
+        if "<<" in text or _SHELL_CONF_VALUE_DEFINITION.search(joined_lines):
+            literal_reads = None
     for words in shell_commands(text):
         if mentions is not None:
             for word, line in words:
@@ -746,6 +850,7 @@ def shell_key_reads(text: str, mentions: re.Pattern[str] | None) -> SourceKeyRea
             continue
         program = shell_literal(command[0][0])
         if program in ("conf_value", "conf_get"):
+            file_word, _ = command[1]
             key, line = command[2]
         else:
             executable = program.rsplit("/", 1)[-1]
@@ -753,15 +858,21 @@ def shell_key_reads(text: str, mentions: re.Pattern[str] | None) -> SourceKeyRea
             if (len(cli) < 4 or shell_literal(cli[0][0]).rsplit("/", 1)[-1] != "conf.py"
                     or shell_literal(cli[1][0]) != "get"):
                 continue
+            file_word, _ = cli[2]
             key, line = cli[3]
         key = shell_literal(key)
         if _SHELL_KEY.fullmatch(key):
             reads.fixed.add((key, line))
+            stem = shell_literal(file_word)
+            if (literal_reads is not None and literal_reads.fullmatch(key) and program != "conf_get"
+                    and _SHELL_KEY.fullmatch(stem)):
+                reads.resolved.add(ConfigKeyRead(ConfigKey(stem + ".conf", key), line))
     return reads
 
 
 def tip_key_reads(repo: Path, tip_files: dict[str, str], removed: dict[str, set[str]],
-                  tip_keys: dict[str, set[str]]) -> AdvisoryReads:
+                  tip_keys: dict[str, set[str]]) -> KeyReadScan:
+    """Scan source files for reads of removed keys and keys absent from the tip."""
     removed_from: dict[str, list[str]] = {}
     for name, keys in sorted(removed.items()):
         for key in keys:
@@ -779,9 +890,9 @@ def tip_key_reads(repo: Path, tip_files: dict[str, str], removed: dict[str, set[
 
     sources = {path: blob for path, blob in tip_files.items() if path.startswith("scripts/") and (
         path.endswith((".sh", ".zsh", ".bash")) or path.endswith(".py") and not is_fixture_source(path))}
-    advisory = AdvisoryReads(sources_not_scanned=len(sources))
+    scanned = KeyReadScan(sources_not_scanned=len(sources))
     if not sources:
-        return advisory
+        return scanned
     try:
         for source, content in blob_contents(repo, sources, report_missing=True):
             if isinstance(content, MissingBlob):
@@ -791,20 +902,46 @@ def tip_key_reads(repo: Path, tip_files: dict[str, str], removed: dict[str, set[
                          else shell_key_reads(content.decode("utf-8"), shell_mentions))
             except (SyntaxError, UnicodeError, RecursionError, ValueError):
                 continue
-            advisory.sources_not_scanned -= 1
+            scanned.sources_not_scanned -= 1
             named_tokens = {token for token, _ in reads.mentions}
-            reported: set[KeyOccurrence] = set()
+            reported: dict[KeyOccurrence, set[str]] = {}
             for key, line in reads.mentions:
-                names = tuple(name for name in removed_from.get(key, ())
-                              if key not in shared or not aliases[name].isdisjoint(named_tokens))
+                names = {name for name in removed_from.get(key, ())
+                         if key not in shared or not aliases[name].isdisjoint(named_tokens)}
                 if names:
-                    advisory.removed.append(RemovedKeyRead(source, line, key, names))
-                    reported.add((key, line))
-            advisory.absent.extend(AbsentKeyRead(source, line, key) for key, line in reads.fixed - reported
-                                   if key not in held)
+                    reported[key, line] = names
+            for read in reads.resolved:
+                name, key = read.setting.conf_name, read.setting.key
+                if key in removed.get(name, ()):
+                    scanned.resolved_removals.setdefault(source, set()).add(read)
+                    reported.setdefault((key, read.line), set()).add(name)
+            scanned.removed.extend(RemovedKeyRead(source, line, key, tuple(sorted(names)))
+                                   for (key, line), names in reported.items())
+            scanned.absent.extend(AbsentKeyRead(source, line, key) for key, line in reads.fixed - reported.keys()
+                                  if key not in held)
     except (GitReadFailed, OSError):
         pass
-    return advisory
+    return scanned
+
+
+def refused_main_reads(repo: Path, tip_reads: dict[str, set[ConfigKeyRead]], base_files: dict[str, str],
+                       tip_files: dict[str, str], removed: dict[str, set[str]],
+                       tip_keys: dict[str, set[str]]) -> dict[str, set[KeyOccurrence]]:
+    """Find reads of removed config keys that the same source path on main also reads."""
+    changed_sources: dict[str, str] = {}
+    for source in tip_reads:
+        if (blob := base_files.get(source)) is not None and blob != tip_files[source]:
+            changed_sources[source] = blob
+
+    main_reads = tip_key_reads(repo, changed_sources, removed, tip_keys).resolved_removals if changed_sources else {}
+    refused: dict[str, set[KeyOccurrence]] = {}
+    for source, reads in tip_reads.items():
+        keys = {read.setting for read in main_reads.get(source, ())}
+        unchanged = base_files.get(source) == tip_files[source]
+        for read in reads:
+            if unchanged or read.setting in keys:
+                refused.setdefault(source, set()).add((read.setting.key, read.line))
+    return refused
 
 
 def check(repo: Path, base: str, tip: str) -> KeyReport:
@@ -836,8 +973,16 @@ def check(repo: Path, base: str, tip: str) -> KeyReport:
             else:
                 held = set(conf.settings(write.text))
                 missing.extend(MissingKey(write, key) for key in sorted(added[write.conf_name] - held))
-    advisory = tip_key_reads(repo, tip_files, removed, tip_keys)
-    return KeyReport(added, missing, not_checked, removed, advisory)
+    scanned = tip_key_reads(repo, tip_files, removed, tip_keys)
+    refusals = refused_main_reads(repo, scanned.resolved_removals, base_files, tip_files, removed, tip_keys)
+    advisory = AdvisoryReads(absent=scanned.absent, sources_not_scanned=scanned.sources_not_scanned)
+    refused: list[RefusedKeyRead] = []
+    for read in scanned.removed:
+        if (read.key, read.line) in refusals.get(read.source, ()):
+            refused.append(RefusedKeyRead(read.source, read.line, read.key, read.conf_names))
+        else:
+            advisory.removed.append(read)
+    return KeyReport(added, missing, not_checked, removed, advisory, refused)
 
 
 def report(result: KeyReport) -> int:
@@ -848,20 +993,24 @@ def report(result: KeyReport) -> int:
     for name, keys in sorted(result.removed_keys.items()):
         print(f"removed keys in config/{name}: {', '.join(sorted(keys))}")
     advisory = result.advisory
-    reads: list[RemovedKeyRead | AbsentKeyRead] = [*advisory.removed, *advisory.absent]
+    reads: list[RemovedKeyRead | AbsentKeyRead] = [*advisory.removed, *advisory.absent, *result.refused_reads]
     for read in sorted(reads, key=lambda read: (read.source, read.line, read.key)):
         reason = ("the tip removes from " + ", ".join(f"config/{name}" for name in read.conf_names)
                   if isinstance(read, RemovedKeyRead)
                   else "no config file on the tip holds")
-        print(f"{read.source}:{read.line}: reads {read.key}, which {reason}")
+        refusal = "; main reads it too: refused" if isinstance(read, RefusedKeyRead) else ""
+        print(f"{read.source}:{read.line}: reads {read.key}, which {reason}{refusal}")
     print(f"fixture config keys: {len(result.missing)} missing, "
           + f"{len(result.not_checked)} fixtures not checked because their text is not a literal")
-    summary = (f"config key reads: {len(advisory.removed)} of a removed key, "
+    removed_count = len(advisory.removed) + len(result.refused_reads)
+    summary = (f"config key reads: {removed_count} of a removed key, "
                + f"{len(advisory.absent)} of a key no config file holds")
     if advisory.sources_not_scanned:
         summary += f", {advisory.sources_not_scanned} sources not scanned"
     print(summary)
-    return 1 if result.missing else 0
+    if result.refused_reads:
+        print(f"config key check: refused {len(result.refused_reads)} reads of a removed key that main still reads")
+    return 1 if result.missing or result.refused_reads else 0
 
 
 class Arguments(argparse.Namespace):
