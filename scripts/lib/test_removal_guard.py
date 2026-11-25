@@ -6,15 +6,19 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
+import sys
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import tempfile
 import unittest
-from typing import override
+from typing import cast, override
 from unittest import mock
 
-from scripts.lib import cargo_output, removal_guard, scratch
+from scripts.disks import cleanup_old_folders
+from scripts.lib import cargo_output, removal_guard, scratch, session_move
 from scripts.production import staff
 
 
@@ -157,6 +161,242 @@ class RemovalGuardTests(unittest.TestCase):
                 removal_guard.remove(checked)
         self.assertTrue(original.is_dir())
         self.assertEqual(hold.read_text(), "replacement")
+
+    def test_cleanup_approval_checks_exact_paths_without_extending_build_forms(self) -> None:
+        candidate = self.home / "old"
+        candidate.mkdir()
+        child = candidate / "payload"
+        child.mkdir()
+        payload = child / "file"
+        _ = payload.write_text("old output")
+        (child / "hardlink").hardlink_to(payload)
+        neighbour = self.home / "unlisted"
+        neighbour.mkdir()
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate, self.target)), bounds,
+                                                 mount_reader=lambda: (Path("/"),))
+        self.assert_refused(candidate, removal_guard.RefusalReason.OUTSIDE_ROOT)
+        for refused, reason in ((child, removal_guard.RefusalReason.OUTSIDE_ROOT),
+                                (neighbour, removal_guard.RefusalReason.OUTSIDE_ROOT),
+                                (self.target, removal_guard.RefusalReason.PROTECTED_PATH)):
+            with (self.subTest(path=refused), self.assertRaises(removal_guard.Refused) as error,
+                  guard.check(refused)):
+                self.fail("the cleanup guard accepted a protected path")
+            self.assertEqual(error.exception.reason, reason)
+        with guard.check(candidate) as checked:
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            approval = removal_guard.ApprovedCleanup(entries, removal_guard.CleanupRemoval.PLAIN)
+            removal_guard.remove_cleanup(checked, approval)
+        self.assertFalse(candidate.exists())
+        self.assertTrue(neighbour.is_dir())
+        self.assertTrue(self.target.is_dir())
+
+    def test_cleanup_removal_refuses_new_or_replaced_entries(self) -> None:
+        for change, name in (("new file", "new"), ("replacement", "approved"), ("bare Git", "HEAD")):
+            with self.subTest(change=change):
+                candidate = self.home / change
+                folder = candidate / "nested"
+                folder.mkdir(parents=True)
+                original = folder / "approved"
+                _ = original.write_text("old output")
+                changed = folder / name
+                bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+                guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate,)), bounds,
+                                                         mount_reader=lambda: (Path("/"),))
+                listdir = os.listdir
+                folder_info = folder.stat()
+
+                def change_before_listing(directory: int) -> list[str]:
+                    if os.path.samestat(os.fstat(directory), folder_info):
+                        if change == "replacement":
+                            replacement = self.home / "replacement-payload"
+                            _ = replacement.write_text("keep the new entry")
+                            _ = replacement.replace(original)
+                        else:
+                            _ = changed.write_text("keep the new entry")
+                            if change == "bare Git":
+                                (folder / "refs").mkdir()
+                                (folder / "objects").mkdir()
+                    return listdir(directory)
+
+                with guard.check(candidate) as checked:
+                    entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+                    _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+                    approval = removal_guard.ApprovedCleanup(entries, removal_guard.CleanupRemoval.PLAIN)
+                    reason = "holds Git work" if change == "bare Git" else "changed before removal"
+                    with (mock.patch.object(os, "listdir", side_effect=change_before_listing),
+                          self.assertRaisesRegex(removal_guard.ChangedEntry, reason)):
+                        removal_guard.remove_cleanup(checked, approval)
+                self.assertEqual(changed.read_text(), "keep the new entry")
+                if change != "replacement":
+                    self.assertEqual(original.read_text(), "old output")
+
+    def test_cleanup_guard_refuses_mounts_aliases_git_and_replaced_directories(self) -> None:
+        candidate = self.home / "old"
+        nested = candidate / "nested"
+        nested.mkdir(parents=True)
+        linked = self.home / "linked"
+        linked.symlink_to(candidate, target_is_directory=True)
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        for mount in (candidate, nested):
+            guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate,)), bounds,
+                                                     mount_reader=lambda: (Path("/"), mount))
+            with (self.subTest(mount=mount), self.assertRaises(removal_guard.Refused) as error,
+                  guard.check(candidate)):
+                self.fail("the cleanup guard approved a mounted tree")
+            self.assertEqual(error.exception.reason, removal_guard.RefusalReason.MOUNT)
+        alias = linked / nested.name
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate, linked, alias)), bounds,
+                                                 mount_reader=lambda: (Path("/"),))
+        for path in (linked, alias):
+            with self.subTest(path=path), self.assertRaises(OSError), guard.check(path):
+                self.fail("the cleanup guard followed a link")
+        git = nested / ".git"
+        _ = git.write_text("keep Git metadata")
+        with guard.check(candidate) as checked:
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            measured = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            self.assertIs(measured.git, cleanup_old_folders.CleanupGit.PROTECTED)
+            self.assertGreaterEqual(measured.size, git.stat().st_blocks * 512)
+            approval = removal_guard.ApprovedCleanup(entries, removal_guard.CleanupRemoval.PLAIN)
+            with self.assertRaisesRegex(removal_guard.ChangedEntry, "holds Git work"):
+                removal_guard.remove_cleanup(checked, approval)
+            saved = candidate.with_name("saved")
+            _ = candidate.rename(saved)
+            candidate.mkdir()
+            with self.assertRaises(removal_guard.ChangedEntry):
+                removal_guard.remove_cleanup(checked, approval)
+        self.assertEqual((saved / "nested/.git").read_text(), "keep Git metadata")
+        self.assertTrue(candidate.is_dir())
+
+    def test_saved_checkout_approval_does_not_allow_nested_git(self) -> None:
+        candidate = self.home / "old"
+        (candidate / ".git").mkdir(parents=True)
+        nested = candidate / "nested/.git"
+        nested.mkdir(parents=True)
+        head = nested / "HEAD"
+        _ = head.write_text("ref: refs/heads/main\n")
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate,)), bounds,
+                                                       mount_reader=lambda: (Path("/"),))
+        with guard.check(candidate) as checked:
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            approval = removal_guard.ApprovedCleanup(entries, removal_guard.CleanupRemoval.SAVED_CHECKOUT)
+            with self.assertRaisesRegex(removal_guard.ChangedEntry, "holds Git work"):
+                removal_guard.remove_cleanup(checked, approval)
+        self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
+
+    def test_source_stamps_without_a_copy_cannot_authorize_nested_git_removal(self) -> None:
+        candidate = self.home / "old"
+        nested = candidate / "nested/.git"
+        nested.mkdir(parents=True)
+        head = nested / "HEAD"
+        _ = head.write_text("ref: refs/heads/main\n")
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate,)), bounds,
+                                                       mount_reader=lambda: (Path("/"),))
+        with guard.check(candidate) as checked:
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            source_only = cast(Callable[[Path, dict[Path, cleanup_old_folders.CleanupEntry]],
+                                        removal_guard.ProvedCopyCleanup], removal_guard.ProvedCopyCleanup)
+            with self.assertRaises((TypeError, removal_guard.ChangedEntry)):
+                removal_guard.remove_proved_copy(checked, source_only(candidate, entries), checked.published_copy_path,
+                                                 before_delete=lambda: None)
+        self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux copy verifier")
+    def test_a_proved_staging_copy_cannot_authorize_removal(self) -> None:
+        candidate = self.home / "old"
+        nested = candidate / "nested/.git"
+        nested.mkdir(parents=True)
+        head = nested / "HEAD"
+        _ = head.write_text("ref: refs/heads/main\n")
+        destination = self.root / "claude/resources/shm-moved/.gate-move-fixture" / candidate.name
+        _ = shutil.copytree(candidate, destination)
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate,)), bounds,
+                                                       mount_reader=lambda: (Path("/"),))
+        with (guard.check(candidate) as checked, session_move.open_directory(candidate) as source,
+              session_move.open_directory(destination) as copied):
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            with mock.patch.object(type(checked), "published_copy_path", new_callable=mock.PropertyMock,
+                                   return_value=destination):
+                proof = removal_guard.ProvedCopyCleanup(
+                    checked, source, removal_guard.CopyDestination(destination, copied), entries)
+            approved_target = destination.parent.parent / candidate.name
+            with self.assertRaisesRegex(removal_guard.ChangedEntry, "final target path"):
+                removal_guard.remove_proved_copy(checked, proof, approved_target, before_delete=lambda: None)
+        self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux copy verifier")
+    def test_copied_cleanup_refuses_an_extra_target(self) -> None:
+        candidate = self.home / "old"
+        nested = candidate / "nested/.git"
+        nested.mkdir(parents=True)
+        head = nested / "HEAD"
+        _ = head.write_text("ref: refs/heads/main\n")
+        destination = self.root / "claude/resources/shm-moved" / candidate.name
+        _ = shutil.copytree(candidate, destination)
+        extra = self.home / "extra"
+        extra.mkdir()
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate, extra)), bounds,
+                                                       mount_reader=lambda: (Path("/"),))
+        with (guard.check(candidate) as checked, session_move.open_directory(candidate) as source,
+              session_move.open_directory(destination) as copied, guard.check(extra) as checked_extra):
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            extra_entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked_extra, extra_entries)
+            proof = removal_guard.ProvedCopyCleanup(
+                checked, source, removal_guard.CopyDestination(destination, copied), entries)
+            extra_approval = removal_guard.ApprovedCleanup(extra_entries, removal_guard.CleanupRemoval.PLAIN)
+            target = removal_guard.CleanupTarget(checked_extra, extra_approval)
+            remove_with_extra = cast(Callable[..., None], removal_guard.remove_proved_copy)
+            with self.assertRaises(TypeError):
+                remove_with_extra(checked, proof, destination, target, before_delete=lambda: None)
+            with self.assertRaisesRegex(removal_guard.ChangedEntry, "approved move target"):
+                removal_guard.remove_cleanup(checked, cast(removal_guard.ApprovedCleanup, cast(object, proof)), target)
+            proof_target = removal_guard.CleanupTarget(checked, cast(removal_guard.ApprovedCleanup, cast(object, proof)))
+            with self.assertRaisesRegex(removal_guard.ChangedEntry, "approved move target"):
+                removal_guard.remove_cleanup(checked_extra, extra_approval, proof_target)
+        self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
+        self.assertTrue(extra.is_dir())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux copy verifier")
+    def test_proved_copy_requires_a_final_check_of_the_published_destination(self) -> None:
+        candidate = self.home / "old"
+        nested = candidate / "nested/.git"
+        nested.mkdir(parents=True)
+        head = nested / "HEAD"
+        _ = head.write_text("ref: refs/heads/main\n")
+        destination = self.root / "claude/resources/shm-moved" / candidate.name
+        _ = shutil.copytree(candidate, destination)
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate,)), bounds,
+                                                       mount_reader=lambda: (Path("/"),))
+
+        with (guard.check(candidate) as checked, session_move.open_directory(candidate) as source,
+              session_move.open_directory(destination) as copied):
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            proof = removal_guard.ProvedCopyCleanup(
+                checked, source, removal_guard.CopyDestination(destination, copied), entries)
+            saved = destination.rename(destination.with_name("saved"))
+            _ = shutil.copytree(saved, destination)
+            with self.assertRaisesRegex(ValueError, "parent changed during the move"):
+                removal_guard.remove_proved_copy(checked, proof, destination, before_delete=lambda: None)
+            self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
+            with session_move.open_directory(destination) as replacement:
+                current = removal_guard.ProvedCopyCleanup(
+                    checked, source, removal_guard.CopyDestination(destination, replacement), entries)
+                removal_guard.remove_proved_copy(checked, current, destination, before_delete=lambda: None)
+        self.assertFalse(candidate.exists())
+        self.assertEqual((destination / head.relative_to(candidate)).read_text(), "ref: refs/heads/main\n")
 
     def test_each_form_checks_depth_and_number(self) -> None:
         cases = (
