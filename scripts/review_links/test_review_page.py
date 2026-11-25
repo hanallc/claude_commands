@@ -1970,6 +1970,12 @@ window.fetch=(url,options)=>{
   const end=performance.now()+8000;
   while(!predicate()){if(performance.now()>end) throw new Error('Timed out waiting for '+label+'.');await frame();}
  };
+ const refresh=()=>{
+  const review=document.querySelector('[data-review]');
+  const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  return refreshed;
+ };
  const row=key=>document.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
  const inline=()=>document.querySelector('[data-record-inline-view]');
  const close=()=>inline().closest('[data-list-item]').querySelector('.list-toggle').click();
@@ -2023,7 +2029,7 @@ window.fetch=(url,options)=>{
   await open(DRAFT_KEY);
   form(DRAFT_KEY).elements.feedback.focus();
   await fetch('/advance');
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await refresh();
   await until(()=>form(DRAFT_KEY)?.elements.token.value===EXPECTED_TOKEN,'the refreshed form');
   check(!inline().querySelector('[data-show-record-updates]'),'The inline row has no update control.');
   check(document.activeElement===form(DRAFT_KEY).elements.feedback,'F007: refresh retains focus in the row.');
@@ -2036,8 +2042,7 @@ window.fetch=(url,options)=>{
   check(form(DRAFT_KEY).elements.revision.value===EXPECTED_REVISION,
    'F024: the refreshed body supplies the current record revision.');
   await fetch('/reset-counts');
-  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-  await frame();await frame();
+  await refresh();
   const counts=await (await fetch('/counts')).json();
   check(counts.version===1 && counts.index===0,'An unchanged version does not fetch the index.');
   check(document.documentElement.scrollWidth<=innerWidth,'The row window fits the viewport.');
@@ -2259,7 +2264,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
  }
  return measuredFetch(url,options);
 };</script>"""
-        markup = (initial.render(show='all').decode().replace('<head>','<head>'+spy,1)
+        markup = (replace(initial, refresh_seconds=0).render(show='all').decode().replace('<head>','<head>'+spy,1)
                   .replace('</body>',probe+'<img hidden src="/complete"></body>'))
 
         class Probe(BaseHTTPRequestHandler):
