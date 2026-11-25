@@ -32,6 +32,7 @@ from scripts.review_links import new_item_dialog, reply_tokens, review_submissio
 from scripts.review_links import question_path, question_record, review_actions, review_events, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
+from scripts.statusline import rebuild_row
 
 PAGE_PATH = REVIEW_PATH
 NEW_ITEM_PATH = '/console/review/new-item'
@@ -1022,6 +1023,8 @@ def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBody
     requester = row.requested_by or 'Not recorded'
     rebuild = row.kind == 'rebuild'
     asker = inputs.names.html(row.requester_reference, requester) if rebuild else inputs.names.html(item.owner, requester)
+    if rebuild and not row.requests:
+        asker = 'Found by the system check'
     fields = (
         ('Machine', html.escape(row.machine)),
         ('Working directory', html.escape(row.cwd or 'Not recorded')),
@@ -1042,10 +1045,10 @@ def for_you_details(item: ReviewItem, row: for_you.ForYouRow, inputs: ReviewBody
             text = ('<span>' + html.escape(request.reason) + '</span>' if request.reason
                     else f'<span class="rebuild-secondary">{need.NO_REASON}</span>')
             why.append(f'<li>{text}<small>{name} · <time datetime="{shown.isoformat()}">{label}</time></small></li>')
-        reason = ('<section><h3>Why</h3>'
-                  + ('<ul class="rebuild-why">' + ''.join(why) + '</ul>' if why
-                     else f'<p class="rebuild-secondary">{need.NO_REASON}</p>')
-                  + '</section>')
+        history = '<ul class="rebuild-why">' + ''.join(why) + '</ul>' if why else ''
+        comparison = (f'<p>{html.escape(row.reason or rebuild_row.CHANGES_NOT_READ)}</p>'
+                      if row.reason or not why else '')
+        reason = '<section><h3>Why</h3>' + history + comparison + '</section>'
         if not row.running_revision:
             reason += '<p class="rebuild-secondary">The running revision is unknown.</p>'
     return ('<div class="list-panel review-panel for-you"><div data-review-body>'

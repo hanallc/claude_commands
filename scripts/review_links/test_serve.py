@@ -67,7 +67,7 @@ from scripts.review_links import accounts_page, change_browser, change_page, con
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.statusline import rebuild_row
+from scripts.statusline import assignment, rebuild_row
 from scripts.whoami import usage_store
 
 
@@ -5609,19 +5609,64 @@ class ReviewLinksServerTests(unittest.TestCase):
         row = for_you.ForYouRow("action/fixture", "action", "Long command", "x" * 70000,
                                "mac", "/fixture", "sdlc", "Login", "Release", "", "open", "manual", "")
         rebuild = replace(row, key="rebuild/mac", kind="rebuild", title="Rebuild mac", command="rebuild")
-        snapshot = for_you.ForYouSnapshot((row, rebuild), (), ("mac",))
+        reasons = {"mac": "Update the editor +2"}
+        snapshot = for_you.ForYouSnapshot((row, rebuild), (), ("mac",), rebuild_reasons=reasons)
         with patch.object(for_you, "read", return_value=snapshot) as read:
             status, headers, body = self.head("/console/for-you.json?view=count")
         self.assertEqual(status, 200)
         self.assertEqual(headers["cache-control"], "no-store")
-        self.assertEqual(json.loads(body), {"available": True, "count": 2, "other_count": 1, "rebuild_machines": ["mac"]})
-        read.assert_called_once_with(include_running_revision=False)
+        self.assertEqual(json.loads(body), {"available": True, "count": 2, "other_count": 1,
+                                           "rebuild_machines": ["mac"], "rebuild_reasons": reasons})
+        read.assert_called_once_with(conf.path("statusline"), rebuild=None, include_running_revision=False,
+                                     include_status_reasons=True, watch=None)
         partial = replace(snapshot, unavailable=(for_you.UnavailableSource("rebuild needs", "Bad record.", partial=True),))
         with patch.object(for_you, "read", return_value=partial):
             status, _, body = self.head("/console/for-you.json?view=count")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body), {"available": False, "partial": True, "other_count": 1,
-                                           "rebuild_machines": ["mac"]})
+                                           "rebuild_machines": ["mac"], "rebuild_reasons": reasons})
+
+    def test_mac_status_line_renders_the_cached_reason_from_the_count_route(self) -> None:
+        configuration = conf.path("statusline")
+        cache = self.root.parent / "rebuild-cache"
+        _ = write_config_fixture(configuration, f"rebuild.cache={cache}\n")
+        running = "/nix/store/running-mac"
+        configured = "a" * 40
+        paths = {"natedev": "/nix/store/current-linux", "mac": "/nix/store/configured-mac"}
+        details = {"commit": configured, "source": ["/etc/nixos", "main", "natedev", "MacBook-Pro"], **paths,
+                   "running_system_probes": {"natedev": True, "mac": True},
+                   "running_system_paths": {**paths, "mac": running}}
+        _ = cache.write_text(f"rebuild mac\n9999999999\n{configuration}\n{json.dumps(details)}\n", encoding="utf-8")
+        at = "2026-11-21T12:00:00Z"
+        subject = "Update the editor " + "x" * 65
+        commits = (rebuild_row.Change(configured, at, subject, ""),
+                   rebuild_row.Change("b" * 40, at, "Update the shell", ""),
+                   rebuild_row.Change("c" * 40, at, "Update the terminal", ""))
+        comparison = rebuild_row.ComparedChanges(running, "d" * 40, configured, commits)
+        _ = rebuild_row.changes_path(cache).write_text(json.dumps({"mac": asdict(comparison)}), encoding="utf-8")
+        expected = "Update the editor " + "x" * 38 + "… +2"
+        with (patch.object(for_you, "console_address", return_value=for_you.ConsoleAddress("127.0.0.1", self.port)),
+              patch.object(rebuild_row, "DEFAULT_CONFIG", configuration),
+              patch.object(subprocess, "run", side_effect=AssertionError("The count route ran a command."))):
+            status, _, body = self.head("/console/for-you.json?view=count")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"available": True, "count": 1, "other_count": 0,
+                                               "rebuild_machines": ["mac"], "rebuild_reasons": {"mac": expected}})
+            fields = assignment.read_actions(remote=True).value
+        jq = Path(rebuild_row.__file__).with_name("statusline.jq")
+        result = subprocess.run(["jq", "-r", "--arg", "pwd", str(self.root), "--arg", "for_you", fields.other_count,
+                                 "--arg", "rebuild", fields.waiting_rebuilds, "-f", str(jq)],
+                                input="{}", text=True, capture_output=True, check=True)
+        self.assertIn(f"For you: rebuild mac: {expected}", result.stdout.splitlines())
+
+        actions = ActionStore().folder
+        actions.mkdir()
+        _ = (actions / "corrupt.json").write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+        with patch.object(subprocess, "run", side_effect=AssertionError("The count route ran a command.")):
+            status, _, body = self.head("/console/for-you.json?view=count")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"available": False, "rebuild_machines": ["mac"],
+                                           "rebuild_reasons": {"mac": expected}})
 
     def test_for_you_count_view_keeps_rebuilds_when_the_read_exceeds_the_recursion_limit(self) -> None:
         rebuild = rebuild_row.RebuildAnswer(("natedev", "mac"), False)

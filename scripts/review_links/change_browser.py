@@ -9,7 +9,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from importlib import import_module
@@ -543,7 +543,7 @@ class Rebuild:
     text: str
 
 
-def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[rebuild_row.Change, ...]],
+def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: Mapping[str, rebuild_row.CachedChanges],
                  record: staff.StaffSnapshot, completed: tuple[need.CompletedNeedRecord, ...] = (),
                  damaged: Iterable[str] = ()) -> str:
     """Show waiting machines and completed requests."""
@@ -556,19 +556,20 @@ def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[reb
     blocks: list[str] = []
     for machine_name, name in zip(answer.machines, names):
         records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
-        filed = {item["nixos_commit"] for item in records}
         items = [Rebuild(item["created_at"], who(item["requested_by"] or item["concerns"]),
                          item["reason"].strip() or need.NO_REASON)
                  for item in records]
-        commits = [Rebuild(change.at, who(change.session), change.reason)
-                   for change in changes.get(machine_name, ()) if change.commit not in filed]
+        comparison = rebuild_row.matched_changes(answer, machine_name, changes.get(machine_name))
+        display = rebuild_row.changes_for_display(answer, machine_name, comparison, records)
         staff_names_by_reference = staff_names.StaffNames(record)
         listed = owner_groups(items, staff_names_by_reference)
-        if commits:
+        if display.commits:
+            more = f'<p>{display.more}</p>' if display.more else ''
+            groups = [Rebuild(change.at, who(change.session), change.reason) for change in display.commits]
             listed += '<section class="rebuild-commits"><h3>Commits</h3>' + owner_groups(
-                commits, staff_names_by_reference, heading="h4") + '</section>'
-        if not listed:
-            listed = '<p>The change list is not available yet.</p>'
+                groups, staff_names_by_reference, heading="h4") + more + '</section>'
+        elif display.fallback:
+            listed += f'<p>{html.escape(display.fallback)}</p>'
         blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
     label = f"Rebuild {' and '.join(names)}" if names else ""
     if not blocks:
@@ -610,6 +611,7 @@ def owner_groups(items: list[Rebuild],
 # Machines sit side by side when the frame is wide; under each owner, a time is a column beside its reasons.
 REBUILD_STYLE = """<style>main{max-width:1124px}
 [data-rebuilds]{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:32px 48px;align-items:start}
+[data-rebuilds] article{overflow-wrap:anywhere}
 [data-rebuilds] h2{margin:8px 0 0}[data-rebuilds] h3{font-size:17px;line-height:1.3;margin:24px 0 8px}
 [data-rebuilds] h4{font-size:15px;line-height:1.3;margin:16px 0 8px}
 [data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr);column-gap:16px;row-gap:4px;margin:0;font-size:15px}
@@ -627,7 +629,7 @@ def render_rebuilds() -> bytes:
     config = conf.path("statusline")
     damaged: list[str] = []
     completed = need.read_completed_needs(damaged)
-    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot(),
+    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_recorded_changes(config), staff.snapshot(),
                             completed, damaged)
     return change_page.document(REBUILD_STYLE + '<h1 class="page-title">Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
