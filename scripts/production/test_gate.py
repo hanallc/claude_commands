@@ -24,7 +24,7 @@ import tempfile
 from textwrap import dedent
 import time
 from typing import cast, final, override
-from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Generator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, tzinfo
@@ -786,6 +786,24 @@ class MergeGateCheckpointTests(MergeGateFixture):
                 self.assertTrue(folders)
                 self.assertTrue(all(not folder.exists() for folder in folders), folders)
 
+    def test_finished_module_keeps_a_held_child_folder(self) -> None:
+        prepare = gate.test_module_environment
+        children: list[Path] = []
+
+        def hold_child(root: Path, environment: dict[str, str]) -> dict[str, str]:
+            child = root / "active-child"
+            child.mkdir()
+            lock = self.enterContext((root / "active-child.lock").open("wb"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            children.append(child)
+            return prepare(root, environment)
+
+        with mock.patch.object(gate, "test_module_environment", side_effect=hold_child):
+            result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(children)
+        self.assertTrue(all(child.is_dir() for child in children), children)
+
     def test_nested_modules_run_and_retry_from_their_own_folder_under_the_top_suite(self) -> None:
         nested = self.checkout / "scripts" / "hooks" / "tests" / "test_first.py"
         self.write(nested, SUITE_MODULE)
@@ -1290,14 +1308,15 @@ class GateRecoveryTests(MergeGateFixture):
 class LiveConfigTripwireTests(unittest.TestCase):
     def test_live_config_violation_uses_the_nonrerunnable_tripwire(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        job_root = root / "job"
-        job_root.mkdir()
+        folders = self.enterContext(ExitStack())
+        spec = build_folders.BuildFolderSpec(kind="tool", parent=root, purpose="job", suffix_length=0)
+        job_root = folders.enter_context(build_folders.temporary_build_folder(spec))
         marker = job_root / "live-config-writes"
         _ = marker.write_text("/fixture/config/console.conf\n")
         log = job_root / "output.log"
         process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen))
         job = gate.RunningGateJob("hooks", Path("test_fixture.py"), process, time.monotonic(),
-                                  time.time(), log.open("w+"), log, "test_fixture.py")
+                                  time.time(), log.open("w+"), log, "test_fixture.py", folder_cleanup=folders)
         self.addCleanup(job.output.close)
         with mock.patch.object(gate, "kill_job_group"):
             result = gate.finish_gate_job(job, 0)
