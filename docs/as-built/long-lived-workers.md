@@ -1074,6 +1074,14 @@ A detached run result that arrives after the DONE needs a new matching DONE.
 Until that DONE, `end` keeps the worker and `answer` sends input with the DONE instruction.
 When the pass is open, the `end` refusal names the next step: `worker.py answer <name> --text TEXT` from the parent session.
 That command asks the worker for the DONE.
+When an ended pass still waits for DONE, `worker.py answer` checks the same receipt.
+This includes a canceled pass without a stopped hook outcome.
+If the idle worker still owes a reply, `answer` sends the director's text and names the results that need replies.
+If Codex aborts that turn after it accepts the prompt, the director can repeat `answer`.
+Each reply clears the results it names by run ID. A matching DONE follows the pass receipt rules.
+When no reply is due, `answer` queues undelivered results for the director before it releases the wait.
+The run ID identifies the notice across retries.
+The command keeps saved delivery records for results it releases.
 `end` gives no `answer` step while a detached run is live, while the pass waits only for reap, or after the pass is canceled.
 `worker.py end` also checks for a late reply after recorder cancellation, even when the pane is closed.
 If it finds a verified reply, it saves the reply and completes the hook before retirement.

@@ -36,7 +36,7 @@ import uuid
 from typing import Literal, Protocol, TextIO, cast, final
 
 from scripts.agents import detached_runs, pane_record, shutdown_record, worker_lifecycle
-from scripts.herdr import herdr_types, pane_launch
+from scripts.herdr import herdr_types, pane_launch, pass_notices
 from scripts.accounts import accounts, session_state
 from scripts.direct import progress_history, recorder_state
 from scripts.herdr import worker_panes
@@ -188,6 +188,7 @@ class DispatchAwaitingReply:
     last_reply: str
     runs: tuple[str, ...]
     matching_done: DispatchComplete | NoMatchingDone
+    unanswered_runs: frozenset[str] = frozenset()
 
 
 DispatchReceipt = (DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown
@@ -323,10 +324,11 @@ class _TranscriptReceiptState:
             if not results:
                 return
             if isinstance(self.reply, DispatchAwaitingReply):
-                self.reply = replace(self.reply, runs=tuple(sorted(results.union(self.reply.runs))))
+                self.reply = replace(self.reply, runs=tuple(sorted(results.union(self.reply.runs))),
+                                     unanswered_runs=self.reply.unanswered_runs.union(results))
             else:
                 matching_done = self.reply if isinstance(self.reply, DispatchComplete) else NoMatchingDone.UNRECORDED
-                self.reply = DispatchAwaitingReply(self.reply.reply, tuple(sorted(results)), matching_done)
+                self.reply = DispatchAwaitingReply(self.reply.reply, tuple(sorted(results)), matching_done, frozenset(results))
 
     def assistant_message(self, text: str, timestamp: object,
                           cursor: TranscriptCursor | NoMatchingDone) -> None:
@@ -364,7 +366,9 @@ class _TranscriptReceiptState:
                 run_id = self.result_message.text.partition("\n")[0].removeprefix("Detached run: ")
                 self.result_replies.append(TranscriptResultReply(run_id, self.result_message, self.latest_reply))
         if isinstance(self.reply, DispatchAwaitingReply):
-            self.reply = replace(self.reply, last_reply=text)
+            mentioned = re.findall(r"[\w@-]+", text)
+            unanswered = self.reply.unanswered_runs.difference(mentioned)
+            self.reply = replace(self.reply, last_reply=text, unanswered_runs=unanswered)
         elif isinstance(self.completion, FinalReply) or isinstance(self.reply, DispatchSubmitted):
             turn = (TranscriptTurn(cursor, text) if self.responding and isinstance(cursor, TranscriptCursor)
                     else NoTranscriptTurn.UNRECORDED)
@@ -447,7 +451,8 @@ def _transcript_turn_boundary(fields: dict[str, object]) -> bool:
         return True
     if fields.get("type") == "event_msg":
         payload = fields.get("payload")
-        return isinstance(payload, dict) and cast(dict[str, object], payload).get("type") == "task_complete"
+        return (isinstance(payload, dict)
+                and cast(dict[str, object], payload).get("type") in ("task_complete", "turn_aborted"))
     return False
 
 
@@ -714,6 +719,7 @@ def _prove_result_delivery(directory: Path, row: staff.StaffRow, passed: dict[st
 
 def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                      run: Path, require_transcript: bool = False,
+                     require_current_transcript: bool = False,
                      pane_pass: CurrentPanePass | progress_history.StoppedPassReceipt | worker_panes.PassDetachedResults = CurrentPanePass.CURRENT,
                      require_done: bool = False, verify: VerifyPassDone | ReadPassDone = ReadPassDone.READ,
                      ) -> DispatchReceipt:
@@ -745,6 +751,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
 
     previous = saved.done.cursor if isinstance(saved, SavedPassDone) else NoMatchingDone.UNRECORDED
     notice_positions = verify.notice_positions if isinstance(verify, VerifyPassDone) else NO_NOTICE_POSITIONS
+    require_transcript |= require_current_transcript
     transcript = _dispatch_transcript(row, line, done, require_transcript=require_transcript, previous=previous,
         notice_positions=notice_positions, stopped=stopped, late_result_ids=late_result_ids,
         other_pass_results=other_pass_results)
@@ -781,6 +788,9 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             verified = _select_pass_done(transcript, saved)
             reply = transcript.receipt
         other_pass_results = frozenset(other_passes)
+    if require_current_transcript and isinstance(reply, DispatchEvidenceUnknown):
+        return reply
+    unanswered = reply.unanswered_runs if isinstance(reply, DispatchAwaitingReply) else NO_RESULT_IDS
     read_extends_saved = not isinstance(saved, SavedPassDone) or transcript.extends_saved
     received = transcript.received_runs if read_extends_saved else NO_RESULT_IDS
     if isinstance(saved, SavedPassDone):
@@ -794,9 +804,10 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             pending_runs.update(saved.pending_runs)
         pending_runs.difference_update(verified.results_before_done | other_pass_results)
         if pending_runs:
-            last_reply = (reply.last_reply if read_extends_saved and isinstance(reply, DispatchAwaitingReply)
-                          else verified.reply.reply)
-            reply = DispatchAwaitingReply(last_reply, tuple(sorted(pending_runs)), verified.reply)
+            if read_extends_saved and isinstance(reply, DispatchAwaitingReply):
+                reply = replace(reply, runs=tuple(sorted(pending_runs)), matching_done=verified.reply)
+            else:
+                reply = DispatchAwaitingReply(verified.reply.reply, tuple(sorted(pending_runs)), verified.reply, unanswered)
         else:
             reply = verified.reply
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
@@ -831,7 +842,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             and isinstance(delivered_at := deliveries[run_id].delivered_at, (int, float))
             and delivered_at < done_at)))
         if after_done:
-            reply = DispatchAwaitingReply(reply.reply, after_done, reply)
+            reply = DispatchAwaitingReply(reply.reply, after_done, reply, unanswered)
         elif not live and not reap_required:
             reply = replace(reply, anomalies=tuple(
                 f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(unseen)))
@@ -1596,6 +1607,9 @@ def _awaiting_dispatch_hook(passed: dict[str, object], *, same_pass: bool) -> bo
             and isinstance(progress_history.hook_completion(passed), progress_history.NoHookCompletion))
 
 
+ENDED_PASS_STATUSES = ("completed", "error", "canceled", "interrupted")
+
+
 def _pending_dispatch_completion(row: staff.StaffRow, run: Path, passed: dict[str, object], *,
                                  same_pass: bool) -> CompletionRecovery:
     """Read the receipt that can prevent recovery before a new dispatch."""
@@ -1606,7 +1620,7 @@ def _pending_dispatch_completion(row: staff.StaffRow, run: Path, passed: dict[st
         return CompletionRecovery.NO_PENDING_NOTICE
     completion = progress_history.hook_completion(passed)
     saved_done = isinstance(completion, progress_history.HookCompletion) and completion.outcome in ("done", "late_done")
-    ended = passed.get("status") in ("completed", "error", "canceled", "interrupted")
+    ended = passed.get("status") in ENDED_PASS_STATUSES
     if isinstance(completion, progress_history.HookCompletion):
         if completion.outcome == "stopped" or saved_done and completion.finished:
             return CompletionRecovery.NO_PENDING_NOTICE
@@ -2653,9 +2667,7 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
         if entry.startswith("user:\n"):
             body = entry.removeprefix("user:\n")
             accepted |= _answer_digest(script_prompt(body)) == saved.get("answer_digest")
-        elif accepted and (entry.startswith("assistant:\n")
-                           or fields.get("type") == "event_msg" and kind == "task_complete"
-                           or fields.get("type") == "system" and fields.get("subtype") == "turn_duration"):
+        elif accepted and (entry.startswith("assistant:\n") or _transcript_turn_boundary(fields)):
             next_request = True
     if not number or number < boundary:
         return AnswerBlocked.UNAVAILABLE
@@ -2665,8 +2677,94 @@ def _answer_request(path: Path, row: staff.StaffRow, backend: staff.ClaudeBacken
                          _answer_digest(script_prompt(text)), question_call if status is herdr.AgentStatus.BLOCKED else "")
 
 
+def _submit_answer(parent: StaffId, row: staff.StaffRow, run: Path, record: staff.StaffSnapshot,
+                   hold: worker_panes.WorkerLockHold, passed: dict[str, object], instance: str,
+                   completion_id: str, text: str, *, ask_for_done: bool = True) -> ExitCode:
+    name = WorkerName.parse(row.name)
+    backend = record.backends.get(row.id, staff.BACKEND_UNAVAILABLE)
+    if isinstance(backend, staff.BackendUnavailable):
+        return _refuse_answer(name, "the worker transcript is unavailable", ExitCode.UNCERTAIN)
+    state = worker_panes.observe_worker(parent, row, record)
+    if not isinstance(state, worker_panes.OpenWorker) or not hold.owns(row):
+        return _refuse_answer(name, "the worker pane is unavailable", ExitCode.UNCERTAIN)
+    if state.status is herdr.AgentStatus.WORKING:
+        return _refuse_answer(name, "the worker is working", ExitCode.BUSY)
+    if not state.status.idle and state.status is not herdr.AgentStatus.BLOCKED:
+        return _refuse_answer(name, "the worker may be working", ExitCode.UNCERTAIN)
+    client = _client()
+    owner = record.by_id(parent)
+    if owner is not None:
+        try:
+            _require_review_delivery(owner, row, run, passed)
+            _require_running_review(owner, client, state)
+        except (OSError, ValueError, ProductionPathsError, herdr_types.HerdrFailure, subprocess.SubprocessError,
+                staff.StaffRefused, staff.StaffUnreadable) as error:
+            return _refuse_answer(name, str(error))
+    blocked_codex = state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend)
+    submitted = text + "\n" + _done_instruction(completion_id) if ask_for_done and not blocked_codex else text
+    scope = _answer_digest(json.dumps((row.id, instance, completion_id)))
+    path = run / f".{scope}.pending-answer.json"
+    request = _answer_request(path, row, backend, state.status, submitted)
+    if isinstance(request, AnswerBlocked):
+        code = ExitCode.BUSY if request is AnswerBlocked.PENDING else ExitCode.UNCERTAIN
+        return _refuse_answer(name, request.value, code)
+    if owner is None:
+        return _refuse_answer(name, "the owner is unavailable")
+    artifacts = CompletionArtifacts(owner, run)
+    artifacts.write(path, json.dumps(asdict(request)))
+    try:
+        if blocked_codex:
+            client.answer_question(state.pane, submitted, target=str(row.current_session))
+        else:
+            client.prompt(state.pane, submitted, target=str(row.current_session))
+    except herdr.HerdrCommandNotStarted:
+        artifacts.unlink(path)
+        raise
+    return ExitCode.OK
+
+
+def _answer_ended_pass(row: staff.StaffRow, run: Path, passed: dict[str, object],
+                       record: staff.StaffSnapshot, after_unlock: ExitStack,
+                       hold: worker_panes.WorkerLockHold, text: str) -> ExitCode:
+    name = WorkerName.parse(row.name)
+    instance = pass_recorder.string(passed.get("instance_id"))
+    delivery = pass_recorder.dispatch_delivery(passed)
+    started = passed.get("started_at")
+    director = record.parent_of(row)
+    completion = progress_history.hook_completion(passed)
+    if (passed.get("status") not in ENDED_PASS_STATUSES or not instance or not delivery.line
+            or isinstance(completion, progress_history.HookCompletion) and completion.outcome == "stopped"
+            or not isinstance(started, (int, float)) or director is None):
+        return _refuse_answer(name, "no active pass")
+    completion_id = delivery.completion_id or instance
+    receipt = dispatch_receipt(row, delivery.line, completion_id, run=run, require_current_transcript=True)
+    if isinstance(receipt, DispatchEvidenceUnknown):
+        return _refuse_answer(name, f"completion evidence is unavailable: {receipt.reason}", ExitCode.UNCERTAIN)
+    if (not isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply))
+            or waiting_recovery(receipt) is not CompletionRecovery.WAITING_ON_REPLY):
+        return _refuse_answer(name, "no active pass")
+    reply = receipt.reply if isinstance(receipt, DispatchWaitingForRuns) else receipt
+    if isinstance(reply, DispatchAwaitingReply) and (unanswered := reply.unanswered_runs.intersection(receipt.runs)):
+        runs = ", ".join(sorted(unanswered))
+        submitted = f"{text}\n\nReply to the detached run results below. Include each run ID in your reply.\n{runs}"
+        return _submit_answer(director.id, row, run, record, hold, passed, instance, completion_id, submitted,
+                              ask_for_done=False)
+    released = detached_runs.stage_ended_pass_results(run, row, director, instance=instance, started=started,
+                                                     ids=receipt.runs, membership=record)
+    if not released.count:
+        return _refuse_answer(name, "the ended pass has no verified finished run to forward", ExitCode.UNCERTAIN)
+    for key in released.notice_keys:
+        _ = after_unlock.callback(pass_notices.retry_result, run, instance, key)
+    if released.notice_keys:
+        count = len(released.notice_keys)
+        print(f"{row.name}: queued {count} detached run {'result' if count == 1 else 'results'} for {director.name}")
+    if released.count > len(released.notice_keys):
+        print(f"{row.name}: released the DONE wait for delivered detached run results")
+    return ExitCode.OK
+
+
 def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
-    with worker_panes.worker_lock(parent, name) as hold:
+    with ExitStack() as after_unlock, worker_panes.worker_lock(parent, name) as hold:
         if isinstance(hold, worker_panes.Kept):
             return _busy_dispatch(f"{name.value}: {hold.blocker}. Use assign.sh for new work.")
         record = staff.snapshot()
@@ -2678,9 +2776,11 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
         active = progress_history.active_dispatch(row.id, run)
         if isinstance(active, progress_history.ActiveDispatchUnavailable):
             return _refuse_answer(name, "the active pass is unavailable", ExitCode.UNCERTAIN)
-        if isinstance(active, progress_history.NoActiveDispatch):
-            return _refuse_answer(name, "no active pass")
         passed = worker_panes.worker_pass(row, run, record=record)
+        if isinstance(active, progress_history.NoActiveDispatch):
+            if not hold.owns(row):
+                return _refuse_answer(name, "the worker changed", ExitCode.UNCERTAIN)
+            return _answer_ended_pass(row, run, passed, record, after_unlock, hold, text)
         delivery = pass_recorder.dispatch_delivery(passed)
         if passed.get("instance_id") != active.instance_id or not all((delivery.line, delivery.completion_id, delivery.reply_file)):
             return _refuse_answer(name, "the active pass has no saved delivery")
@@ -2696,43 +2796,7 @@ def answer(parent: StaffId, name: WorkerName, text: str) -> ExitCode:
         if isinstance(receipt, DispatchNotSubmitted):
             return _refuse_answer(name, "the transcript does not show acceptance of the active pass")
 
-        state = worker_panes.observe_worker(parent, row, record)
-        if not isinstance(state, worker_panes.OpenWorker) or not hold.owns(row):
-            return _refuse_answer(name, "the worker pane is unavailable", ExitCode.UNCERTAIN)
-        if state.status is herdr.AgentStatus.WORKING:
-            return _refuse_answer(name, "the worker is working", ExitCode.BUSY)
-        if not state.status.idle and state.status is not herdr.AgentStatus.BLOCKED:
-            return _refuse_answer(name, "the worker may be working", ExitCode.UNCERTAIN)
-        client = _client()
-        if (owner := record.by_id(parent)) is not None:
-            try:
-                _require_review_delivery(owner, row, run, passed)
-                _require_running_review(owner, client, state)
-            except (OSError, ValueError, ProductionPathsError, herdr_types.HerdrFailure, subprocess.SubprocessError,
-                    staff.StaffRefused, staff.StaffUnreadable) as error:
-                return _refuse_answer(name, str(error))
-        blocked_codex = state.status is herdr.AgentStatus.BLOCKED and isinstance(backend, staff.CodexBackend)
-        submitted = text if blocked_codex else text + "\n" + _done_instruction(delivery.completion_id)
-        scope = _answer_digest(json.dumps((row.id, active.instance_id, delivery.completion_id)))
-        path = run / f".{scope}.pending-answer.json"
-        request = _answer_request(path, row, backend, state.status, submitted)
-        if isinstance(request, AnswerBlocked):
-            code = ExitCode.BUSY if request is AnswerBlocked.PENDING else ExitCode.UNCERTAIN
-            return _refuse_answer(name, request.value, code)
-        owner = record.by_id(parent)
-        if owner is None:
-            return _refuse_answer(name, "the owner is unavailable")
-        artifacts = CompletionArtifacts(owner, run)
-        artifacts.write(path, json.dumps(asdict(request)))
-        try:
-            if blocked_codex:
-                client.answer_question(state.pane, submitted, target=str(row.current_session))
-            else:
-                client.prompt(state.pane, submitted, target=str(row.current_session))
-        except herdr.HerdrCommandNotStarted:
-            artifacts.unlink(path)
-            raise
-        return ExitCode.OK
+        return _submit_answer(parent, row, run, record, hold, passed, active.instance_id, delivery.completion_id, text)
 
 
 def _end_refusal(row: staff.StaffRow, record: staff.StaffSnapshot, reason: str | CompletionRecovery) -> str:

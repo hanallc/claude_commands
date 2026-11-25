@@ -151,6 +151,7 @@ class RunRecord(StopFields):
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
     delivered_at: NotRequired[float]
+    ended_pass_result_released: NotRequired[Literal[True]]
     worker_result_receipt: NotRequired[object]
     blocked_notice_accepted: NotRequired[Literal[True]]
     push_retries: NotRequired[int]
@@ -318,7 +319,7 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
                                         "blocked_notice_accepted", "push_alert_attempted",
                                         "slice_cleanup_pending", "slice_leftovers",
-                                        "completion_after_slice_cleanup"))
+                                        "completion_after_slice_cleanup", "ended_pass_result_released"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)
                          or (isinstance(pane_dispatch, dict)
                              and isinstance(cast(dict[str, object], pane_dispatch).get("unavailable"), str))))
@@ -872,6 +873,7 @@ def _retired_worker_result(record: RunRecord) -> bool:
 SUPERSEDED_ORPHAN_DELIVERY = "nothing delivered: the supervisor is gone and a newer run of the same command answers"
 OTHER_PASS_DELIVERY = "nothing delivered: the result belongs to a different pane pass"
 COVERED_BY_DONE = "finished: the pass DONE covers the result"
+ENDED_PASS_RESULT_QUEUED = "queued: the director has a notice for the ended pass result"
 INTERRUPTED_PASS_DELIVERY = "interrupted pass result: "
 
 
@@ -1055,7 +1057,9 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
                 delivery = deliver(record, command_result(record))
                 if _worker_result_pending(delivery) and delivery != PARKED_WORKER_RESULT:
                     return CompletionReplay.RETRY
-            if delivery != OTHER_PASS_DELIVERY and _complete_worker_dispatch(record) == CompletionReplay.RETRY:
+            if (not record.get("ended_pass_result_released")
+                    and delivery not in (OTHER_PASS_DELIVERY, ENDED_PASS_RESULT_QUEUED)
+                    and _complete_worker_dispatch(record) == CompletionReplay.RETRY):
                 return CompletionReplay.RETRY
             if delivery == PARKED_WORKER_RESULT and _worker_result_pending(_read_record(path).get("delivery", "")):
                 return CompletionReplay.RETRY
@@ -1767,7 +1771,8 @@ def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dis
     for record in _registered_runs(runs, worker.id):
         if record.get("staff_id") != worker.id:
             continue
-        if result_is_from_another_pass(record, pane_dispatch_id):
+        if (record.get("ended_pass_result_released") or record.get("delivery") == ENDED_PASS_RESULT_QUEUED
+                or result_is_from_another_pass(record, pane_dispatch_id)):
             other_passes.add(record["run_id"])
             continue
         link = record.get("pane_dispatch_id")
@@ -1796,6 +1801,58 @@ def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dis
                 record, finished, record.get("delivered_at", DeliveryTimeUnknown.UNRECORDED),
                 requires_done_after_finish=stop_fallback)
     return results, other_passes
+
+
+@dataclass(frozen=True)
+class EndedPassResults:
+    count: int
+    notice_keys: tuple[str, ...]
+
+
+def stage_ended_pass_results(run: Path, row: staff.StaffRow, director: staff.StaffRow, *,
+                             instance: str, started: float, ids: Collection[str], membership: staff.StaffSnapshot,
+                             ) -> EndedPassResults:
+    """Queue pending results before releasing the DONE wait. The caller holds the worker lock."""
+    from scripts.herdr import pass_notices
+
+    route = pass_notices.Route(instance, director.id, row.name)
+    notices = pass_notices.read(run, instance)
+    if notices is not None and notices.route.director_id != director.id:
+        raise ValueError("the pass notice recipient changed")
+    prefix = "session:" if isinstance(staff.backend(row), staff.ClaudeBackend) else "codex:"
+    sender = prefix + str(row.current_session)
+    keys: list[str] = []
+    count = 0
+    directory = run / DETACHED_RUNS_DIR
+    for saved in _registered_runs(directory, row.id):
+        if saved["run_id"] not in ids:
+            continue
+        path = directory / f"{saved['run_id']}.json"
+        with _delivery_lock(path):
+            record = _read_record(path)
+            if (record["staff_id"] != row.id or record["status"] != "finished"
+                    or Path(record["session_dir"]).resolve() != run.resolve()
+                    or (record.get("pane_dispatch_id") != instance
+                        and ("pane_dispatch_id" in record or record["started_at"] < started))):
+                continue
+            result = command_result(record)
+            delivery = record.get("delivery", "")
+            if (record.get("ended_pass_result_released") or delivery in (COVERED_BY_DONE, ENDED_PASS_RESULT_QUEUED)
+                    or (record["done_message_file"] and delivery == _success_only_delivery(result))):
+                continue
+            received = delivery.startswith(UNCONFIRMED_WORKER_RESULT) and _unconfirmed_result_received(
+                record, membership, delivery)
+            if received:
+                record["delivery"] = _save_delivery(path, f"already delivered: {record['run_id']}", if_current=delivery)
+            if received or delivery and not _worker_result_pending(delivery):
+                record["ended_pass_result_released"] = True
+                _ = _write_record(path, record)
+            else:
+                message = _worker_result_message(record, result)
+                keys.append(pass_notices.stage_ended_run_result(run, route, sender, record["run_id"], message))
+                _ = _save_delivery(path, ENDED_PASS_RESULT_QUEUED)
+            count += 1
+    return EndedPassResults(count, tuple(keys))
 
 
 @dataclass(frozen=True)
