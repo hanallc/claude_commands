@@ -1160,6 +1160,39 @@ with folders.temporary_build_folder(request) as path:
                 self.assertEqual(len(backups), 1)
                 self.assertEqual(backups[0].read_bytes(), damaged)
 
+    def test_rescue_read_tree_survives_release_of_another_copy(self) -> None:
+        with self.take_queue_copy() as copy:
+            path = copy.path
+            index = Path(self.git(path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+            _ = index.write_bytes(b"damaged index")
+
+        held, release = threading.Event(), threading.Event()
+        run = cast(Callable[..., subprocess.CompletedProcess[str | bytes]], subprocess.run)
+        read_tree = ["git", "-C", str(path), "read-tree", "HEAD"]
+
+        def hold_other_copy() -> None:
+            with build_copies.take_copy(self.source, self.base, showrunner="builds", unit="queue",
+                    work="proof", purpose="test", selection=build_copies.ExactCopyRequest(2)):
+                held.set()
+                self.assertTrue(release.wait(TEST_HANG_GUARD_SECS), "The first copy did not rebuild its index.")
+
+        def release_before_read_tree(command: list[str], **options: object) -> subprocess.CompletedProcess[str | bytes]:
+            if command == read_tree:
+                release.set()
+                other.result(timeout=TEST_HANG_GUARD_SECS)
+            return run(command, **options)
+
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            other = worker.submit(hold_other_copy)
+            try:
+                self.assertTrue(held.wait(TEST_HANG_GUARD_SECS), "The second copy did not take its lease.")
+                with mock.patch.object(subprocess, "run", new=release_before_read_tree), self.take_queue_copy() as recovered:
+                    self.assertEqual(recovered.path, path)
+                    self.assertTrue(release.is_set(), "The test did not rebuild the damaged index.")
+                    self.assertEqual(self.git(path, "status", "--porcelain"), "")
+            finally:
+                release.set()
+
     def test_copy_size_limit_deletes_output_after_rescue_and_retains_source_times(self) -> None:
         with self.take_queue_copy() as copy:
             path = copy.path
