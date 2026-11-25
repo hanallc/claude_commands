@@ -31,13 +31,13 @@ scripts/build_queue/test_placement.py
 scripts/build_queue/test_progress_profile.py
 scripts/build_queue/test_queue_place.py
 scripts/build_queue/test_queue_view.py
-scripts/build_queue/test_slot_wait.py
+scripts/build_queue/test_queue_wait.py
 scripts/build_queue/test_snapshot_codec.py
 scripts/build_targets/test_doc_routing.py
 scripts/copies/test_copies.py
 scripts/copies/test_remote_copies.py
 scripts/copies/test_review_remote_copies.py
-scripts/copies/test_slot_order.py
+scripts/copies/test_copy_order.py
 scripts/direct/test_assign_claude_door.py
 scripts/direct/test_assign_claude.py
 scripts/direct/test_assign_gate.py
@@ -175,7 +175,7 @@ scripts/direct/test_verify_token_reclaim.py
 scripts/direct/test_verify_token_release.py
 scripts/direct/test_verify_token_renew.py
 scripts/direct/test_verify_token_reservation.py
-scripts/direct/test_verify_token_same_slot.py
+scripts/direct/test_verify_token_same_copy.py
 scripts/direct/test_verify_token_signals.py
 scripts/direct/test_verify_token_wait.py
 scripts/direct/test_verify_tree_cancel_history.py
@@ -190,7 +190,7 @@ scripts/disks/test_disks_page.py
 scripts/herdr/test_conversation_reader.py
 scripts/hooks/test_brp_launch_gate.py
 scripts/lib/test_build_folders.py
-scripts/lib/test_build_slots.py
+scripts/lib/test_build_copies.py
 scripts/lib/test_py_root.py
 scripts/lib/test_session_move.py
 scripts/lib/test_zone.py
@@ -212,7 +212,7 @@ scripts/mac_test/test_offload_cleanup_takeover.py
 scripts/mac_test/test_offload_forward.py
 scripts/mac_test/test_offload_lifecycle.py
 scripts/mac_test/test_offload.py
-scripts/mac_test/test_target_slots.py
+scripts/mac_test/test_repository_claims.py
 scripts/message/test_notifier.py
 scripts/message/test_process_test_support.py
 scripts/message/test_rca.py

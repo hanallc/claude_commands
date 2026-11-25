@@ -55,6 +55,7 @@ from scripts.mac_test.offload_test_commands import install_nextest_log_writer
 from scripts.mac_test.offload_test_support import (
     CLAIM_STUB, OffloadCommandFixture, FILTER, FIXTURE_MIRROR_ROOT, HANA, HANA_COMMAND_PATTERN, split_mac_run_command,
 )
+from scripts.mac_test.test_floor_sweep import install_floor_sweep_stub
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -574,12 +575,12 @@ class LocalVersionPreflightTests(unittest.TestCase):
                     if later_match:
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
-                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                        claim.assert_called_once_with(controller, config, request, HANA,
                                                       mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                                                       retire_wait=False)
                         self.assertFalse(eligibility.linux_version_decline_path("linux", HANA.name).exists())
                 else:
-                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                    claim.assert_called_once_with(controller, config, request, HANA,
                                                   mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                                                   retire_wait=False)
                     self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))
@@ -626,14 +627,15 @@ class OffloadSettingsTests(unittest.TestCase):
               mock.patch.object(offload, "check_taken_over_claim", return_value=offload.LeftoversEnded()),
               mock.patch.object(offload, "release_claim", return_value=offload.ClaimReleaseConfirmed()) as release,
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, {1: lease})
+            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, lease,
+                                            admission_slot=1)
             assert isinstance(result, offload.DeclinedMacRun)
             self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
 
         self.assertEqual(claim.call_args_list, [
-            mock.call(controller, config, request, HANA, (1,), mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
+            mock.call(controller, config, request, HANA, mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                       retire_wait=False),
-            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA, (1,),
+            mock.call(controller, config, replace(request, admission=offload.UnclaimedMacRun()), HANA,
                       mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY),
         ])
         release.assert_called_once_with(controller, request.target)
@@ -753,7 +755,7 @@ class OffloadSettingsTests(unittest.TestCase):
                     _ = offload.remote_test_command(config, request, HANA)
 
     def test_explicit_mac_settings_use_host_only_nextest_limits(self) -> None:
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         source = self.settings.read_text()
         for key, value in ((nextest_log.TAIL_BYTES, 36), (nextest_log.SUMMARY_BYTES, 52)):
             source = re.sub(rf"^{key}=\d+$", f"{key}.{host}={value}", source, flags=re.MULTILINE)
@@ -1084,7 +1086,7 @@ class BusyHolderTests(unittest.TestCase):
         unknown = "cannot adopt the Mac claim: unknown check\n"
         cases = (
             (12, "state", "", offload.NoWaitClaimCheck),
-            (11, "busy", "cannot adopt the Mac claim: leased slot\n", claim_state.WaitClaimCheck.LEASED_SLOT),
+            (11, "busy", "cannot adopt the Mac claim: scope\n", claim_state.WaitClaimCheck.SCOPE),
         )
         for status, reason, diagnostic, check in cases:
             with self.subTest(status=status):
@@ -1155,9 +1157,6 @@ fi
 """
         script = git.read_text().replace("#!/bin/bash\n", "#!/bin/bash\n" + origin, 1)
         self.write_executable(git, script)
-        mac_host = conf.read(self.root / "machines.conf").words("mac.hosts")[0]
-        with (self.root / "build_folders.conf").open("a", encoding="utf-8") as settings:
-            _ = settings.write(f"\n# whole: 1..\nslots.{mac_host}.{self.root.name}.max=1\n")
         holder = "last recorded mirror session reader (mirror process check)"
         self.environment.update({"TEST_FREE_NOW_FREE": "1", "TEST_RUNNER_HOLDER": holder})
         process = self.start_routing()
@@ -1469,10 +1468,15 @@ class OffloadCommandTests(OffloadCommandFixture):
                 self.assertIn("alternate-mac:.local/state/mac-test/test-mirror/hana/", copied)
 
     def test_low_disk_declines_after_probe(self) -> None:
+        install_floor_sweep_stub(self)
         self.fixture["probe_lines"] = ["free_gib=59", "host=Mac", "rc=0"]
         self.sync_fixture()
         self.assert_declined(self.command(), "disk")
         self.assertEqual(self.events_for("rsync"), [])
+        [arguments] = [event["args"] for event in self.events_for("ssh")
+                       if "sweep.py --mac-floor-deadline " in event["args"][-1]]
+        self.assertIn("-tt", arguments)
+        self.assertEqual(arguments[arguments.index("-S") + 1], "none")
 
     def test_battery_power_does_not_decline_mac_tests(self) -> None:
         self.assertNotIn("pmset", offload.probe_script(eligibility.KnownRepository("hana")))

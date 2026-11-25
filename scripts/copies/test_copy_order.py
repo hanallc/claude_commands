@@ -30,13 +30,12 @@ from scripts.buildlog import repository, treekey
 from scripts.build_queue.admission_test_support import AdmissionFixture, private_caller_provider
 from scripts.build_targets import target_config
 from scripts.copies import copies
-from scripts.copies.copies_test_support import AdmissionWaitReached, copies_environment, stop_before_slot
+from scripts.copies.copies_test_support import AdmissionWaitReached, copies_environment, stop_before_copy
 from scripts.build_queue import step_estimator
 from scripts.mac_test import eligibility, offload
-from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
-from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env
+from scripts.lib import build_folders, build_copies, conf, copy_record, nix_env
 from scripts.build_queue.admission_jobs import StepJob
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -53,7 +52,7 @@ from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 CHECKOUT = Path(__file__).resolve().parents[2]
 GATE_COMMAND = """from pathlib import Path
 import json, os, sys, time
-sys.path.insert(0, os.environ['SLOT_ORDER_CHECKOUT'])
+sys.path.insert(0, os.environ['COPY_ORDER_CHECKOUT'])
 from scripts.build_queue.queue_place import queue_place
 
 for phase in range(2):
@@ -71,7 +70,7 @@ import sys
 import time
 
 from scripts.build_queue import admission_client as client
-from scripts.lib import build_slots
+from scripts.lib import build_copies
 
 endpoint, caller, source_key, folder = sys.argv[1:]
 source = Path(folder)
@@ -84,7 +83,7 @@ status = client.main(["place-step", "--pid", str(os.getpid()), "--episode", f"ca
 if status:
     raise SystemExit(status)
 try:
-    with build_slots.take_copy(source, "HEAD", showrunner="builds", unit="slot-order", work="test",
+    with build_copies.take_copy(source, "HEAD", showrunner="builds", unit="copy-order", work="test",
             purpose="competing copy") as copy:
         with socket(AF_UNIX, SOCK_STREAM) as ready:
             ready.connect(endpoint)
@@ -113,12 +112,12 @@ class StartedStep(TypedDict):
     assignment: NotRequired[str]
 
 
-class SlotOrderTests(unittest.TestCase):
+class CopyOrderTests(unittest.TestCase):
     repository_seed: ClassVar[ImmutableGitSeed]
     child_bytecode: ClassVar[Path]
     root: Path = Path()
     source: Path = Path()
-    slot_root: Path = Path()
+    copy_root: Path = Path()
     owner: str = ""
     build_sessions: dict[str, str] = {}
     queue: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
@@ -132,15 +131,15 @@ class SlotOrderTests(unittest.TestCase):
     @override
     def setUpClass(cls) -> None:
         super().setUpClass()
-        seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="slot-order-seed-")))
+        seed = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="copy-order-seed-")))
         cls.child_bytecode = seed / "bytecode"
-        cls.repository_seed = ImmutableGitSeed.create(seed / "git", "main", "Slot Tests", "slots@example.invalid",
+        cls.repository_seed = ImmutableGitSeed.create(seed / "git", "main", "Copy Tests", "copies@example.invalid",
             {"Cargo.toml": "[workspace]\n", "tracked.txt": "committed\n", "gate.py": GATE_COMMAND,
              ".gitignore": "target/\n"})
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="slot-order-"))).resolve()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="copy-order-"))).resolve()
         environment = {**copies_environment(self.root, repository="origin"), **build_fixture_sessions("")}
         _ = shutil.copyfile(ADMISSION_CONFIG_FIXTURE, Path(environment["CONF_DIR"]) / "build_admission.conf")
         # Reuse child imports in a private cache outside the checkout.
@@ -156,19 +155,19 @@ class SlotOrderTests(unittest.TestCase):
         server.host_probe = probe
         self.queue.clock.epoch = time.time()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {**environment,
-            "PYTHONPATH": str(CHECKOUT), "SLOT_ORDER_CHECKOUT": str(CHECKOUT),
+            "PYTHONPATH": str(CHECKOUT), "COPY_ORDER_CHECKOUT": str(CHECKOUT),
             "HERDR_BIN": MISSING_HERDR_BIN, "BUILDLOG_RUN": ""})))
         for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR"):
             _ = os.environ.pop(key, None)
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         parent = fixture_member("showrunner", name="builds")
-        member = fixture_member("unit", name="slot-order", parent=parent.id, runtime_id=staff.caller_identity())
+        member = fixture_member("unit", name="copy-order", parent=parent.id, runtime_id=staff.caller_identity())
         self.owner = str(member.id)
         self.build_sessions = build_fixture_sessions(member.current_session)
         os.environ.update(self.build_sessions)
         self.source = self.root / "repository" / "checkout"
         self.repository_seed.copy_to(self.source, self.source.parent / "origin.git")
-        self.slot_root = self.root / "build"
+        self.copy_root = self.root / "build"
         self.processes = []
         self.requests = []
         self.request_times = []
@@ -298,7 +297,7 @@ class SlotOrderTests(unittest.TestCase):
             bus.bind(str(runtime / "bus"))
             process = self.start_shell_cargo(runtime)
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS), "Cargo did not enter admission")
-        checkout = self.slot_root / "origin/slot-order/1"
+        checkout = self.copy_root / "origin/copy-order/1"
         self.assertEqual(build_folders.build_folder_state(checkout), "held")
         self.assertFalse((checkout / "target/debug/app").exists())
         write_pressure_reading(self.queue.readings.pressure_path)
@@ -311,18 +310,13 @@ class SlotOrderTests(unittest.TestCase):
     def test_shell_cargo_direct_uses_its_leased_copy_and_runs_the_app(self) -> None:
         self.queue.hold_starts()
         process = self.start_shell_cargo(self.root / "no-bus")
-        checkout = self.slot_root / "origin/slot-order/1"
+        checkout = self.copy_root / "origin/copy-order/1"
         self.assertEqual(Path(self.next_step(process)["cwd"]), checkout)
         self.assertEqual(build_folders.build_folder_state(checkout), "held")
         self.assert_shell_cargo_finishes(process, checkout)
         self.assertEqual(self.requests, [])
 
-    def report(self) -> slots.SlotReport:
-        return slots.read_slots(self.slot_root, conf.read("build_folders"),
-            self.queue.server.host, None, self.queue.clock.now(), build_folders.build_folder_state,
-            owners=lambda owner: owner)
-
-    def test_scratch_queue_command_waits_before_it_creates_a_slot(self) -> None:
+    def test_scratch_queue_command_waits_before_it_creates_a_copy(self) -> None:
         self.queue.hold_starts()
         owner = fixture_member("showrunner", name="scratch-owner")
         production = Production(self.root / "production.md", owner.name, "main", self.source,
@@ -332,7 +326,7 @@ class SlotOrderTests(unittest.TestCase):
         execute = mock.Mock(side_effect=AssertionError("the scratch command started before admission"))
         with (mock.patch.object(waiting, "named_unit", return_value=unit),
               mock.patch.object(waiting, "subprocess", SimpleNamespace(run=execute, STDOUT=subprocess.STDOUT)),
-              self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
+              self.assertRaises(AdmissionWaitReached), stop_before_copy(self, self.copy_root)):
             waiting.scratch_test(production, unit.name, command, self.root / "scratch-state")
 
     def test_scratch_gate_keeps_the_program_grant_without_placement(self) -> None:
@@ -356,7 +350,7 @@ class SlotOrderTests(unittest.TestCase):
             waiting.scratch_test(production, unit.name, command, self.root / "scratch-state")
         admit.assert_called_once()
 
-    def test_bump_queue_command_waits_before_it_creates_a_slot(self) -> None:
+    def test_bump_queue_command_waits_before_it_creates_a_copy(self) -> None:
         self.queue.hold_starts()
         tip = subprocess.run(["git", "-C", str(self.source), "rev-parse", "HEAD"], check=True,
             capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
@@ -374,7 +368,7 @@ class SlotOrderTests(unittest.TestCase):
                   side_effect=AssertionError("the bump command started before admission")),
               mock.patch.object(bump_gate, "complete_gate",
                   side_effect=AssertionError("the pending bump gate sent a result")),
-              self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
+              self.assertRaises(AdmissionWaitReached), stop_before_copy(self, self.copy_root)):
             _ = bump_gate.run_gate(path)
         request = next(request for request in self.requests if isinstance(request, wire.AdmitRequest))
         self.assertEqual(request.identity.job, StepJob("test-all"))
@@ -388,7 +382,7 @@ class SlotOrderTests(unittest.TestCase):
         manifest = self.source / "Cargo.toml"
         _ = manifest.write_text(manifest.read_text().replace('name = "sample"', 'name = "renamed"'))
         _ = copies.git(self.source, "add", "Cargo.toml")
-        _ = copies.git(self.source, "-c", "user.name=Test", "-c", "user.email=slots@example.invalid",
+        _ = copies.git(self.source, "-c", "user.name=Test", "-c", "user.email=copies@example.invalid",
                        "commit", "-qm", "rename the current package")
         record: checkpoint_gate.BumpGateRecord = {
             "tip": tip, "checkpoint": tip, "production_doc": str(self.root / "production.md"),
@@ -405,7 +399,7 @@ class SlotOrderTests(unittest.TestCase):
                   side_effect=AssertionError("the bump command started before admission")),
               mock.patch.object(bump_gate, "complete_gate",
                   side_effect=AssertionError("the pending bump gate sent a result")),
-              self.assertRaises(AdmissionWaitReached), stop_before_slot(self, self.slot_root)):
+              self.assertRaises(AdmissionWaitReached), stop_before_copy(self, self.copy_root)):
             _ = bump_gate.run_gate(path)
         request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
         self.assertEqual(request.constraints.package, "sample")
@@ -481,11 +475,11 @@ printf '%s\n' "$PLACEMENT_OWNER_PID" "$PLACEMENT_SINCE" "$PLACEMENT_EPISODE" "$P
 [[ -z "${BUILDLOG_FIRST_STEP_ASSIGNMENT:-}${BUILDLOG_FIRST_STEP_ROUTE:-}${BUILDLOG_FIRST_STEP_SINCE:-}" ]]
 placement_once
 '''
-        for slot_source in ("", str(self.source)):
-            with self.subTest(slot_source=slot_source):
+        for copy_source in ("", str(self.source)):
+            with self.subTest(copy_source=copy_source):
                 arguments_file.unlink(missing_ok=True)
                 environment = {**os.environ, "HOLD_WAIT_DIR": str(self.root),
-                               "TEST_PLACEMENT_ARGUMENTS": str(arguments_file), "VERIFY_SLOT_SOURCE": slot_source}
+                               "TEST_PLACEMENT_ARGUMENTS": str(arguments_file), "VERIFY_COPY_SOURCE": copy_source}
                 result = subprocess.run(["bash", "--noprofile", "--norc", "-c", script], cwd=self.source,
                     env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -497,9 +491,9 @@ placement_once
                 self.assertEqual(arguments[arguments.index("--since") + 1], "123.25")
                 self.assertEqual(arguments[arguments.index("--episode") + 1], "parent-episode")
                 self.assertEqual(arguments[arguments.index("--assignment-file") + 1], str(self.root / "parent-assignment.json"))
-                self.assertEqual("--run" in arguments, not slot_source)
+                self.assertEqual("--run" in arguments, not copy_source)
 
-    def test_waiting_and_stopped_runs_leave_no_slot_or_lease(self) -> None:
+    def test_waiting_and_stopped_runs_leave_no_copy_or_lease(self) -> None:
         self.queue.hold_starts()
         process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"),
                              separate_command=False)
@@ -511,14 +505,14 @@ placement_once
             assert isinstance(reply, wire.ViewReply)
             waiting, = reply.reading.view.waiting
             self.assertEqual(waiting.job, StepJob("test-all"))
-        self.assertFalse(self.slot_root.exists())
-        self.assertEqual(self.report()["groups"], [])
+        self.assertFalse(self.copy_root.exists())
+        self.assertEqual(list(build_folders.held_folder_leases()), [])
         process.kill()
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
-        self.assertFalse(self.slot_root.exists())
-        self.assertFalse(list(self.slot_root.glob("*/*/*.lease.json")))
+        self.assertFalse(self.copy_root.exists())
+        self.assertFalse(list(self.copy_root.glob("*/*/*.lease.json")))
 
-    def test_first_step_and_later_steps_reuse_the_run_and_keep_its_slot(self) -> None:
+    def test_first_step_and_later_steps_reuse_the_run_and_keep_its_copy(self) -> None:
         occupied = self.queue.occupy_host()
         self.queue.hold_starts()
         _ = (self.source / "tracked.txt").write_text("applied after admission\n")
@@ -547,7 +541,7 @@ placement_once
             process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"),
                 "--apply-uncommitted", str(self.source))
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
-        self.assertFalse(self.slot_root.exists())
+        self.assertFalse(self.copy_root.exists())
         with self.queue.loop_turn():
             write_pressure_reading(self.queue.readings.pressure_path)
             self.queue.server.wake_loop()
@@ -559,7 +553,7 @@ placement_once
             self.assertEqual(preparation.owner.pid, process.pid)
             self.assertGreater(preparation.need, 0)
             self.queue.free(0)
-        # Keep the held slot alive across the handoff, independent of scheduling.
+        # Keep the held copy alive across the handoff, independent of scheduling.
         with mock.patch.object(self.queue.clock, "advance", return_value=None):
             self.waiting.clear()
             _ = os.write(proceed_fd, b"x\n")
@@ -568,7 +562,7 @@ placement_once
         self.assertFalse(self.waiting.is_set(), "the first command step entered the memory queue again")
         self.assertTrue(first["run"].startswith(f"{process.pid}:"), first)
         tree = Path(first["cwd"])
-        self.assertEqual(tree, self.slot_root / "origin/slot-order/1")
+        self.assertEqual(tree, self.copy_root / "origin/copy-order/1")
         self.assertEqual((tree / "tracked.txt").read_text(), "applied after admission\n")
         self.assertEqual(build_folders.build_folder_state(tree), "held")
         memory_requests = [request for request in self.requests if isinstance(request, wire.AdmitRequest)
@@ -578,7 +572,7 @@ placement_once
             {wire.RunIdentity(process.pid, first["run"].split(":", 1)[1])})
         release_times = [observed for request, observed in self.request_times if isinstance(request, wire.ReleaseRequest)]
         self.assertTrue(release_times)
-        print(f"slot hand-off to the first step: {first['at'] - release_times[-1]:.3f} s")
+        print(f"copy hand-off to the first step: {first['at'] - release_times[-1]:.3f} s")
         self.waiting.clear()
         with self.queue.loop_turn():
             self.queue.free(0)
@@ -592,7 +586,7 @@ placement_once
         self.assertEqual(build_folders.build_folder_state(tree), "free")
         self.queue.release(occupied)
 
-    def test_leaving_before_admission_returns_without_a_slot(self) -> None:
+    def test_leaving_before_admission_returns_without_a_copy(self) -> None:
         leave = self.root / "leave"
         self.queue.hold_starts()
         with mock.patch.dict(os.environ, {"LINT_QUEUE_LEAVE_HOOK": "test -e " + shlex.quote(str(leave))}):
@@ -614,8 +608,8 @@ placement_once
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         errors = notice.decode(errors="replace") + errors
         self.assertEqual(process.returncode, 75, output + errors)
-        self.assertFalse(self.slot_root.exists())
-        self.assertFalse(list(self.slot_root.glob("*/*/*.lease.json")))
+        self.assertFalse(self.copy_root.exists())
+        self.assertFalse(list(self.copy_root.glob("*/*/*.lease.json")))
         with self.queue.loop_turn():
             self.assertFalse(self.queue.server.waiters)
             self.assertFalse(self.queue.caller_reservations())
@@ -643,13 +637,13 @@ placement_once
             started_at = time.time()
             process = self.start((sys.executable, str(self.source / "gate.py"), "--tests-only"), since_age=since_age)
             self.assertTrue(granted.wait(TEST_HANG_GUARD_SECS))
-            with build_slots.take_copy(self.source, "HEAD", showrunner="builds", unit="slot-order",
+            with build_copies.take_copy(self.source, "HEAD", showrunner="builds", unit="copy-order",
                     work="race", purpose="competing run") as peer:
-                self.assertEqual(peer.path, self.slot_root / "origin/slot-order/1")
+                self.assertEqual(peer.path, self.copy_root / "origin/copy-order/1")
                 deliver.set()
                 started = self.next_step(process)
                 copy = Path(started["cwd"])
-                self.assertEqual(copy, self.slot_root / "origin/slot-order/2")
+                self.assertEqual(copy, self.copy_root / "origin/copy-order/2")
                 self.assertEqual(build_folders.build_folder_state(peer.path), "held")
                 self.assertEqual(build_folders.build_folder_state(copy), "held")
                 self.finish(process)
@@ -675,7 +669,7 @@ placement_once
         with locked_environment({**os.environ, **environment}, self.queue.loop_access):
             gate_process = self.start((sys.executable, str(gate), "--tests-only"))
             gate_copy = Path(self.next_step(gate_process)["cwd"])
-            self.assertEqual(gate_copy, self.slot_root / "verify/slot-order/1")
+            self.assertEqual(gate_copy, self.copy_root / "verify/copy-order/1")
             self.queue.hold_starts()
             _ = self.queue.run_pass()
             first_request = len(self.requests)
@@ -716,7 +710,7 @@ placement_once
         process = self.start((sys.executable, "-c", program))
         started = self.next_step(process)
         checkout = Path(started["cwd"])
-        self.assertEqual(checkout, self.slot_root / "origin/slot-order/1")
+        self.assertEqual(checkout, self.copy_root / "origin/copy-order/1")
         self.assertEqual(build_folders.build_folder_state(checkout), "held")
         self.assertEqual(self.requests, [])
         self.finish(process)
@@ -750,7 +744,7 @@ placement_once
         origin = self.root / "remotes" / "verify.git"
         for arguments in (("init", "-q", "--bare", str(origin)), ("init", "-q", "-b", "main"),
                 ("remote", "add", "origin", str(origin)), ("add", "Cargo.toml", "src"),
-                ("-c", "user.name=Test", "-c", "user.email=slots@example.invalid", "commit", "-qm", "fixture")):
+                ("-c", "user.name=Test", "-c", "user.email=copies@example.invalid", "commit", "-qm", "fixture")):
             _ = subprocess.run([real_git, *arguments], cwd=tools.root, env=tools.environment,
                 capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS)
         tools.environment["TEST_METADATA"] = json.dumps({"workspace_root": str(tools.root),
@@ -787,7 +781,7 @@ placement_once
         self.source = tools.root
         return environment
 
-    def test_admission_source_keeps_repository_identity_and_the_real_slot_pool(self) -> None:
+    def test_admission_source_keeps_repository_identity_and_the_real_copy_pool(self) -> None:
         source = self.source
         linked = self.root / "linked-source"
         _ = copies.git(source, "worktree", "add", "--quiet", "--detach", str(linked), "HEAD")
@@ -799,22 +793,22 @@ placement_once
             for checkout in (source, linked):
                 with self.subTest(origin=origin, checkout=checkout):
                     expected = repository.repository_key(str(checkout))
-                    canonical = copies.slot_source(checkout)
+                    canonical = copies.copy_source(checkout)
                     with copies.requested_source(checkout, copies.CommittedSource("HEAD"), copies.NO_MERGE) as snapshot:
                         self.assertEqual(repository.repository_key(str(snapshot)), expected)
                         self.assertEqual(eligibility.repository_identity(snapshot), eligibility.repository_identity(checkout))
                         self.assertEqual(step_estimator.git_identity(["cargo", "check"], str(snapshot))[0],
                             step_estimator.git_identity(["cargo", "check"], str(checkout))[0])
                         self.assertEqual(treekey.tree_key(str(snapshot)), treekey.tree_key(str(checkout)))
-                        self.assertEqual(copies.slot_source(snapshot), canonical)
+                        self.assertEqual(copies.copy_source(snapshot), canonical)
                         if not origin:
                             with self.assertRaisesRegex(build_folders.InvalidFolderForm, "cannot read the origin URL"):
                                 with copies.standing(self.owner, snapshot, copies.CommittedSource("HEAD")):
                                     self.fail("A numbered copy needs a Git origin.")
                         else:
                             with copies.standing(self.owner, snapshot, copies.CommittedSource("HEAD")) as tree:
-                                self.assertEqual(tree, self.slot_root / "origin/slot-order/1")
-                                self.assertEqual(build_slots.source_checkout(tree), canonical)
+                                self.assertEqual(tree, self.copy_root / "origin/copy-order/1")
+                                self.assertEqual(build_copies.source_checkout(tree), canonical)
                     self.assertFalse(copies.ADMISSION_SOURCE_COPIES.get())
 
     def test_working_changes_leave_no_source_objects_while_waiting_or_after_leaving(self) -> None:
@@ -840,14 +834,14 @@ placement_once
         self.assertEqual((snapshot / "src/lib.rs").read_text(), "pub fn unstaged() {}\n")
         self.assertEqual((snapshot / "src/new.rs").read_text(), "pub fn new() {}\n")
         self.assertFalse((snapshot / "src/main.rs").exists())
-        self.assertFalse(self.slot_root.exists())
+        self.assertFalse(self.copy_root.exists())
         leave.touch()
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 75, output + errors)
         self.assertEqual(copies.git(tools.root, "count-objects", "-v"), before)
         self.assertEqual((tools.root / ".git/index").read_bytes(), index)
         self.assertFalse(snapshot.parent.exists())
-        self.assertFalse(self.slot_root.exists())
+        self.assertFalse(self.copy_root.exists())
         self.assertNotIn("GIT_OBJECT_DIRECTORY", os.environ)
 
     def test_next_allocation_removes_a_stopped_verify_waiters_source_copy(self) -> None:
@@ -870,9 +864,9 @@ placement_once
         self.assertFalse(leftover.exists())
         self.assertFalse(leftover.with_name(leftover.name + ".lease.json").exists())
         self.assertFalse(leftover.with_name(leftover.name + ".lock").exists())
-        self.assertFalse(self.slot_root.exists())
+        self.assertFalse(self.copy_root.exists())
 
-    def test_verify_waiter_leaves_without_a_slot_lease_or_folder(self) -> None:
+    def test_verify_waiter_leaves_without_a_copy_lease_or_folder(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
         _ = write_config_fixture(self.queue.root / "build_admission.conf", "running_pass_seconds=0.05\n")
@@ -881,8 +875,8 @@ placement_once
             process = self.start(("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "check", "sample"))
         output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 75, output + errors)
-        self.assertFalse(self.slot_root.exists())
-        self.assertFalse(list(self.slot_root.glob("*/*/*.lease.json")))
+        self.assertFalse(self.copy_root.exists())
+        self.assertFalse(list(self.copy_root.glob("*/*/*.lease.json")))
         self.assertFalse(list((self.root / "session").rglob("Cargo.toml")))
         with self.queue.loop_turn():
             self.assertFalse(self.queue.server.waiters)
@@ -901,9 +895,9 @@ placement_once
         mac_ready = self.root / "mac-ready"
         environment.update(memory, UNIT_DETACHED_RUN="1", BUILDLOG_RUN="", TEST_RUNNER_MAC="passed",
                            TEST_RUNNER_STATUS="0", TEST_RUNNER_BUSY_UNTIL=str(mac_ready),
-                           COPY_SLOT_TEST_ROOT=str(self.root))
+                           NUMBERED_COPY_TEST_ROOT=str(self.root))
         _ = self.enterContext(locked_environment({**os.environ, **environment}, self.queue.loop_access))
-        self.addCleanup(reap, f"COPY_SLOT_TEST_ROOT={self.root}")
+        self.addCleanup(reap, f"NUMBERED_COPY_TEST_ROOT={self.root}")
 
         def read_host(key: placement.HostEvidenceKey) -> placement.HostEvidence:
             if key.destination.provider == "local":
@@ -918,8 +912,8 @@ placement_once
                 from socket import AF_UNIX, SOCK_STREAM, socket
                 with socket(AF_UNIX, SOCK_STREAM) as ready:
                     ready.connect({str(endpoint)!r})
-                    caller = os.environ["COPY_SLOT_TEST_CALLER"]
-                    Path("report.txt").write_text("a report from the slot")
+                    caller = os.environ["NUMBERED_COPY_TEST_CALLER"]
+                    Path("report.txt").write_text("a report from the copy")
                     ready.sendall(f"{{caller}}\\t{{Path.cwd()}}\\n".encode())
                     ready.recv(1)
             ''').strip()
@@ -971,7 +965,7 @@ placement_once
             temporary.mkdir()
             capacity_command = ("env", f"PYTHONPATH={CHECKOUT}", sys.executable, str(capacity_caller), str(endpoint), str(caller),
                                 source_key, str(tools.root))
-            caller_environment = {**os.environ, "COPY_SLOT_TEST_CALLER": str(caller), "UNIT_RUN_DIR": str(board),
+            caller_environment = {**os.environ, "NUMBERED_COPY_TEST_CALLER": str(caller), "UNIT_RUN_DIR": str(board),
                                   "VERIFY_SCRIPT": verify, "TMPDIR": str(temporary)}
             if variant == "capacity":
                 process = subprocess.Popen(capacity_command,
@@ -993,7 +987,7 @@ placement_once
                 return self.start(command, *options)
 
         def held_folders() -> set[Path]:
-            return {path for path in self.slot_root.glob("*/*/[0-9]*")
+            return {path for path in self.copy_root.glob("*/*/[0-9]*")
                     if path.name.isdecimal() and path.is_dir() and build_folders.build_folder_state(path) == "held"}
 
         with (mock.patch.object(self.queue.server, "host_probe", new=read_host),
@@ -1052,7 +1046,7 @@ placement_once
                 with self.subTest(wait="Mac", wrapper="bash -c"):
                     self.assertEqual(len(wrapper_folders), 2)
                     self.assertEqual(held_folders(), wrapper_folders)
-                    self.assertEqual(build_slots.source_checkout(wrapper_checkout), tools.root)
+                    self.assertEqual(build_copies.source_checkout(wrapper_checkout), tools.root)
                 for _ in range(2):
                     _ = start_caller("capacity")
                 mac_ready.touch()
@@ -1081,7 +1075,7 @@ placement_once
             self.assertEqual({folder for folder, (_, process) in running.items() if process is env_caller}, env_folders)
             verify_checkout, = (folder for folder, (_, process) in running.items() if process is verify_caller)
             self.assertNotIn(verify_checkout, wrapper_folders)
-            self.assertEqual(build_slots.source_checkout(verify_checkout), tools.root)
+            self.assertEqual(build_copies.source_checkout(verify_checkout), tools.root)
 
             def finish_caller(process: subprocess.Popen[str]) -> None:
                 output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -1105,8 +1099,8 @@ placement_once
     def test_cargo_keeps_the_folder_after_its_launcher_dies(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
-        marker = f"COPY_SLOT_TEST_ROOT={self.root}"
-        environment["COPY_SLOT_TEST_ROOT"] = str(self.root)
+        marker = f"NUMBERED_COPY_TEST_ROOT={self.root}"
+        environment["NUMBERED_COPY_TEST_ROOT"] = str(self.root)
         self.addCleanup(reap, marker)
         endpoint = self.queue.socket_dir / "cargo-lock.sock"
         cargo = tools.bin_directory / "cargo"
@@ -1180,7 +1174,7 @@ placement_once
 
     def pause_cargo_check(self, tools: VerifyMacOffloadFixture) -> tuple[Path, Path]:
         started, release = self.root / "check-pid", self.root / "check-release"
-        marker = f"SLOT_ORDER_CHECK={started}"
+        marker = f"COPY_ORDER_CHECK={started}"
         self.addCleanup(reap, marker)
         cargo = tools.bin_directory / "cargo"
         pause = dedent(f'''
@@ -1199,20 +1193,20 @@ placement_once
         environment = self.verify_run_environment(tools)
         started, release = self.pause_cargo_check(tools)
         self.queue.hold_starts()
-        with mock.patch.dict(os.environ, {**environment, "SLOT_ORDER_CHECK": str(started)}):
+        with mock.patch.dict(os.environ, {**environment, "COPY_ORDER_CHECK": str(started)}):
             process = self.start(("bash", str(CHECKOUT / "scripts/direct/verify.sh"), "check", "sample"))
         self.assertTrue(self.waiting.wait(TEST_HANG_GUARD_SECS))
         request = next(request for request in self.requests if isinstance(request, wire.PlacementRequest))
         snapshot = Path(request.constraints.repository)
         self.assertEqual(snapshot.name, "source")
         self.assertEqual(build_folders.build_folder_state(snapshot.parent), "held")
-        self.assertFalse(self.slot_root.exists())
+        self.assertFalse(self.copy_root.exists())
 
         write_pressure_reading(self.queue.readings.pressure_path)
         self.queue.server.wake_loop()
         cargo = wait_for_pid(started, processes=(process,))
         checkout = (Path("/proc") / str(cargo) / "cwd").resolve(strict=True)
-        self.assertEqual(checkout, self.slot_root / "verify/slot-order/1")
+        self.assertEqual(checkout, self.copy_root / "verify/copy-order/1")
         self.assertEqual(build_folders.build_folder_state(checkout), "held")
         release.touch()
         self.finish(process)
@@ -1248,10 +1242,10 @@ placement_once
         published = [line.removeprefix("published: ").rsplit(" ", 1)[0]
                      for line in output.splitlines() if line.startswith("published: ")]
         self.assertEqual(len(published), 1, output + errors)
-        checkout = self.slot_root / "verify/slot-order/1"
+        checkout = self.copy_root / "verify/copy-order/1"
         self.assertEqual(Path(published[0]).read_text(), f"doc from {checkout}\n")
         self.assertEqual((checkout / asset).read_bytes(), Path(published[0]).read_bytes())
-        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_folders.lease_path(checkout)])
+        self.assertEqual(list(self.copy_root.glob("*/*/*.lease.json")), [build_folders.lease_path(checkout)])
         self.assertEqual(build_folders.build_folder_state(checkout), "free")
 
     def test_shell_wrapped_verify_doc_refuses_edits_outside_the_index(self) -> None:
@@ -1284,11 +1278,11 @@ placement_once
                                  "--apply-uncommitted", str(tools.root))
         self.finish(process)
 
-        checkout = self.slot_root / "verify/slot-order/1"
+        checkout = self.copy_root / "verify/copy-order/1"
         self.assertEqual(copies.git(checkout, "show", ":src/lib.rs").decode(), applied)
         self.assertTrue((checkout / "target/ignored").is_file())
         self.assertEqual(sum(event["args"][:1] == ["doc"] for event in tools.cargo_events()), 1)
-        self.assertEqual(list(self.slot_root.glob("*/*/*.lease.json")), [build_folders.lease_path(checkout)])
+        self.assertEqual(list(self.copy_root.glob("*/*/*.lease.json")), [build_folders.lease_path(checkout)])
 
     def test_shell_wrapped_verify_doc_refuses_an_assume_unchanged_edit(self) -> None:
         tools = self.verify_source()
@@ -1337,7 +1331,7 @@ placement_once
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
         started, release = self.pause_cargo_check(tools)
-        environment["SLOT_ORDER_CHECK"] = str(started)
+        environment["COPY_ORDER_CHECK"] = str(started)
         _ = copies.git(tools.root, "tag", "with-package")
         _ = (tools.root / "Cargo.toml").write_text('[workspace]\nmembers = []\n')
         _ = copies.git(tools.root, "add", "Cargo.toml")
@@ -1363,7 +1357,7 @@ placement_once
             PLACEMENT_ASSIGNMENT_FILE=$1
             MAC_RUNNER=$2
             CMD=test PINNED_TARGET=hana-gpu DOC_REPO_TOP=/caller
-            VERIFY_SLOT_SOURCE=/snapshot VERIFY_SLOT_TREE=admitted
+            VERIFY_COPY_SOURCE=/snapshot VERIFY_COPY_TREE=admitted
             COPIES_STEP_REPOSITORY=/caller
             STEP_TARGET_TABLE='' MAC_ONLY=0 MAC_PASSED=0
             PLACEMENT_COMMAND=(cargo nextest run)
@@ -1420,9 +1414,9 @@ placement_once
                 self.assertEqual((checkout / "src/lib.rs").read_text(), "pub fn changed() {}\n")
                 self.assertEqual((checkout / "src/merged.rs").read_text(), "pub fn merged() {}\n")
                 self.assertEqual(treekey.tree_key(str(checkout)), treekey.committed_tree_key(tree.encode("ascii")))
-            self.assertFalse(self.slot_root.exists())
+            self.assertFalse(self.copy_root.exists())
 
-    def test_remote_grant_source_key_matches_the_prepared_slot(self) -> None:
+    def test_remote_grant_source_key_matches_the_prepared_copy(self) -> None:
         tools = self.verify_source()
         environment = self.verify_run_environment(tools)
         (self.root / ".claude").symlink_to(tools.home / ".claude", target_is_directory=True)
@@ -1532,7 +1526,7 @@ placement_once
                 words = ("bash", str(verify), "doc" if doc else "check", "sample",
                          "--target", "peer" if linux else "mac")
                 case_environment = {**environment, "VERIFY_MAC_RUNNER": str(parser_runner),
-                                    "TEST_REMOTE_SOURCE": str(observed), "SLOT_ORDER_CHECK": str(started),
+                                    "TEST_REMOTE_SOURCE": str(observed), "COPY_ORDER_CHECK": str(started),
                                     "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"}
                 if scenario == "retry":
                     words = words[:-2]
@@ -1589,7 +1583,7 @@ placement_once
                         self.assertEqual(process.returncode, 2, stdout + stderr)
                         self.assertIn("the admitted tree contains .scratch.json", stderr)
                         self.assertFalse(observed.exists())
-                        self.assertFalse(self.slot_root.exists())
+                        self.assertFalse(self.copy_root.exists())
                         caller, tree = observed.with_suffix(".source").read_text().splitlines()
                         request = next(request for request in self.requests[first_request:]
                                        if isinstance(request, wire.PlacementRequest))
@@ -1653,7 +1647,7 @@ placement_once
                         self.assertTrue(any(row.get("kind") == "step" and row.get("tree_key") == local_key
                                             for row in records), records)
                     else:
-                        self.assertFalse(self.slot_root.exists())
+                        self.assertFalse(self.copy_root.exists())
                     cwd, supplied_root, executed_key, library, merged, binary = cast(
                         list[str], json.loads(observed.read_text()))
                     self.assertEqual(cwd, supplied_root)
@@ -1679,7 +1673,7 @@ placement_once
                         self.assertIsInstance(saved, wire.Assignment)
                         self.assertEqual(saved.assignment.source_key, execution_identity.SourceKeyKnown(executed_key))
 
-    def test_verify_request_only_keeps_the_first_step_routing_and_creates_no_slot(self) -> None:
+    def test_verify_request_only_keeps_the_first_step_routing_and_creates_no_copy(self) -> None:
         tools = self.verify_source()
         source_key = treekey.committed_tree_key(copies.git(tools.root, "rev-parse", "HEAD^{tree}").strip())
         cases: tuple[tuple[tuple[str, ...], placement.HostSelection, target_config.StepRoute], ...] = (

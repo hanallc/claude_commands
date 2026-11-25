@@ -257,12 +257,12 @@ instance_tick() {
     rc=$?
     kill -TERM "$watchdog_pid" 2>/dev/null
     wait "$watchdog_pid" 2>/dev/null
+    result="exit $rc"
     if [[ -e $timeout_marker ]]; then
       rm -f -- "$timeout_marker"
-      print -r -- "$fired | run timeout" >> "$dir/fire.log"
-    elif (( rc != 0 )); then
-      print -r -- "$fired | run exit $rc" >> "$dir/fire.log"
+      result=timeout
     fi
+    print -r -- "$fired | run result $result" >> "$dir/fire.log"
     return 0
   fi
 
@@ -410,8 +410,9 @@ cmd_status_all() {
 }
 
 cmd_health() {
-  local name=$1 dir last=0 line rc previous='' latest=''
-  typeset -A state
+  local name=$1 dir last=0 line previous='' latest=''
+  local result_pattern='\| exit ([0-9]+) \|' failure_label='last two sends exit'
+  typeset -A conf state
   valid_name "$name"
   if ! require_instance "$name" 2>/dev/null; then
     print -r -- 'failing: no instance'
@@ -432,16 +433,22 @@ cmd_health() {
     print -r -- 'ok: stopped'
     return 0
   fi
+  read_conf
+  if [[ -n ${conf[RUN]:-} ]]; then
+    # Older run logs omitted successes.
+    result_pattern='^[^|]+ \| run result (exit [0-9]+|timeout)$'
+    failure_label='last two runs'
+  fi
   if [[ -r $dir/fire.log ]]; then
     while IFS= read -r line; do
-      if [[ $line =~ '\| exit ([0-9]+) \|' ]]; then
+      if [[ $line =~ $result_pattern ]]; then
         previous=$latest
         latest=$match[1]
       fi
     done < "$dir/fire.log"
   fi
-  if [[ -n $previous && -n $latest ]] && (( previous != 0 && latest != 0 )); then
-    print -r -- "failing: last two sends exit $previous, $latest"
+  if [[ -n $previous && ${previous#exit } != 0 && ${latest#exit } != 0 ]]; then
+    print -r -- "failing: $failure_label $previous, $latest"
     return 1
   fi
   print -r -- ok
@@ -494,6 +501,15 @@ clear_check() {
   log_error "clear-check: ${output//$'\n'/ / }"
 }
 
+ensure_production_backup() {
+  [[ -z ${NOTIFIER_STATE_DIR:-} && $(hostname -s) == natedev ]] || return 0
+  local name=production-backup command backup_script="${SCRIPT:h:h}/production/log_backup.py"
+  [[ ! -r $STATE_DIR/$name/conf || ! -r $STATE_DIR/$name/state ]] || return 0
+  # The first successful hourly run ends the legacy LOG backup route.
+  command="${(q)PY} ${(q)backup_script} --hourly"
+  cmd_new "$name" --every 60 --run "$command" >/dev/null
+}
+
 cmd_tick() {
   local tick_fd dir name fired
   local -a deferred_runs
@@ -502,6 +518,7 @@ cmd_tick() {
   [[ -e $STATE_DIR/.tick.lock ]] || : > "$STATE_DIR/.tick.lock"
   zsystem flock -t 0 -f tick_fd "$STATE_DIR/.tick.lock" || return 0
   print -r -- "$NOW" > "$STATE_DIR/.last_tick"
+  ensure_production_backup || log_error "cannot register the production backup job"
   for dir in "$STATE_DIR"/*(/N); do
     [[ -r $dir/conf && -r $dir/state ]] || continue
     read_state
@@ -524,6 +541,9 @@ cmd_tick() {
   for name in "${deferred_runs[@]}"; do
     run_due "$name"
   done
+  if [[ -z ${NOTIFIER_STATE_DIR:-} ]]; then
+    launch_job "unit-run-end-recovery" "$PY" "${SCRIPT:h:h}/direct/progress_history.py" recover-run-ends
+  fi
   # After the unlock, so a slow check never holds the scheduled messages back.
   local repeat_state=${NOTIFIER_REPEAT_STATE:-}
   if [[ -z $repeat_state && -z ${NOTIFIER_STATE_DIR:-} ]]; then

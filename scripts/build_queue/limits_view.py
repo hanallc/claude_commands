@@ -17,7 +17,7 @@ from scripts.aws_target import config as aws_config, hana_box, hana_placement, s
 from scripts.build_queue import admission_protocol as wire, admission_records as records
 from scripts.build_queue import placement, queue_view, target_availability
 from scripts.build_queue.admission_wire import ReservedCloudSlot
-from scripts.build_queue.slot_wait import public_queue_text
+from scripts.build_queue.queue_wait import public_queue_text
 from scripts.build_targets import target_config, targets
 from scripts.build_targets.execution_transport import HanaControlTransport, HanaGpuNextestTransport
 from scripts.buildlog import charts, machine_facts, repository, store
@@ -494,7 +494,7 @@ def background(history: frozenset[str] | ReadingState, money: Metric | ReadingSt
     aws = AwsRoutes() if isinstance(routes, ReadingState) else routes
     hana_routes = routes if isinstance(routes, ReadingState) else routes.hana
     hana = (hana_routes if isinstance(hana_routes, ReadingState) else
-            tuple(HanaCapacity(route.settings.repository_key, route.settings.max_steps,
+            tuple(HanaCapacity(route.settings.repository_key, 1,
                                occupancy if isinstance(occupancy, ReadingState)
                                else occupancy.get(route, ReadingState.OMITTED)) for route in hana_routes))
     spend_metric = Metric("money", None, None, "USD", unreadable=money is ReadingState.UNAVAILABLE)
@@ -668,7 +668,7 @@ def read_mac(snapshot: targets.TargetSnapshot, origins: Origins) -> MacReading:
         kept = mac_test.run_is_kept(record)
         session = record["submitting_session"] if not record.get("cleanup_pending") and not kept else ""
         use = MacClaimUse.KEPT if kept else MacClaimUse.WORKING
-        claims.append(MacClaim(scope, mac_test.slot_capacity(paths, scope), session, use))
+        claims.append(MacClaim(scope, 1, session, use))
     configured: dict[str, int] = {}
     if origins.source_names:
         settings = conf.read(target.settings)
@@ -676,7 +676,7 @@ def read_mac(snapshot: targets.TargetSnapshot, origins: Origins) -> MacReading:
             try:
                 policy = eligibility.linux_only_policy(settings, eligibility.KnownRepository(name), Path(), "", "check")
                 if isinstance(policy, eligibility.KnownRepository):
-                    configured[name] = mac_test.slot_capacity(paths, claim_state.RepositoryScope(name), configuration=settings)
+                    configured[name] = 1
             except conf.Unusable:
                 continue
     return MacReading(tuple(claims), configured, claims_readable=True)

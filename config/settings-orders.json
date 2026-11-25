@@ -8,10 +8,6 @@
   "build_admission": {
     "head_stall_alert_minutes": 9
   },
-  "build_folders": {
-    "slots.Nates-MacBook-Pro-2023.cargo-liner.max": 14,
-    "slots.Nates-MacBook-Pro-2023.hana.max": 13
-  },
   "build_targets": {
     "enabled.mac-linux": 22
   },
@@ -34,8 +30,8 @@
     "offload": 21,
     "probe_timeout_s": 26
   },
-  "merge_gate": {
-    "GATE_TIME_LIMIT_FACTOR": 5
+  "gate": {
+    "gate_time_limit_factor": 5
   },
   "send": {
     "review_hold": 16,

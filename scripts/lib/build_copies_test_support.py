@@ -1,4 +1,4 @@
-"""Give numbered copy tests private roots and Mac claim limits."""
+"""Give numbered copy tests private roots."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -12,12 +12,7 @@ from scripts.lint.memory_test_support import config_environment, write_config_fi
 
 
 @dataclass(frozen=True)
-class UseDefaultMaximum:
-    """Leave the repository limit unset to test the default limit."""
-
-
-@dataclass(frozen=True)
-class SlotTestConfiguration:
+class CopyTestConfiguration:
     settings: Path
     machine: str
     environment: Mapping[str, str]
@@ -29,17 +24,17 @@ def write_private_build_roots(settings: Path, root: Path, machine: str) -> None:
         _ = write_config_fixture(settings)
     lines = [line for line in settings.read_text().splitlines() if not line.startswith("roots.build")]
     lines.append(f"roots.build={root / 'build'}")
-    for host in sorted({"natedev", machine}):
+    for host in sorted({"natedev", conf.host_key_name(machine)}):
         lines.append(f"roots.build.{host}={root / 'build'}")
     _ = settings.write_text("\n".join(lines) + "\n")
 
 
-def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaultMaximum = 2,
-                        default_maximum: int = 1) -> SlotTestConfiguration:
+def private_copy_config(root: Path) -> CopyTestConfiguration:
     """Give direct calls and child commands private roots without a caller session."""
     environment = config_environment(root / "config")
     settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
     machine = host_name()
+    host = conf.host_key_name(machine)
     fixed = f"""# whole: 1..
 names.suffix_length=8
 # whole: 1..64
@@ -70,22 +65,15 @@ locks.probe_wait_seconds=0.25
 # range: 0.001..1
 locks.probe_retry_seconds=0.005
 # whole: 1..
-slots.{machine}.default_max={default_maximum}
-# whole: 1..
 folders.unused_days=2"""
     fixed_lines = fixed.splitlines()
-    if machine != "natedev":
-        fixed_lines.append(f"roots.build.{machine}={root / 'build'}")
-    mac_hosts = conf.read(settings.with_name("machines.conf")).words("mac.hosts")
-    if mac_hosts and mac_hosts[0] != machine:
-        fixed_lines.extend(("# whole: 1..", f"slots.{mac_hosts[0]}.default_max=1"))
+    if host != "natedev":
+        fixed_lines.append(f"roots.build.{host}={root / 'build'}")
     keys = {line.partition("=")[0] for line in fixed_lines if "=" in line}
-    replaced_prefixes = ("slots.", *(f"{key}." for key in keys))
+    replaced_prefixes = tuple(f"{key}." for key in keys)
     lines = [line for line in settings.read_text().splitlines()
              if (key := line.partition("=")[0].strip()) not in keys and not key.startswith(replaced_prefixes)]
     lines.extend(fixed_lines)
-    if isinstance(maximum, int):
-        lines.extend(("# whole: 1..", f"slots.{machine}.{repository}.max={maximum}"))
     _ = settings.write_text("\n".join(lines) + "\n")
     copies = settings.with_name("copies.conf")
     _ = write_config_fixture(copies, f"remote_registry={root / 'remote-mirrors'}\ngit_timeout_seconds=10\n")
@@ -99,4 +87,4 @@ folders.unused_days=2"""
         "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
         "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
     })
-    return SlotTestConfiguration(settings, machine, environment)
+    return CopyTestConfiguration(settings, machine, environment)

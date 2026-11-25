@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import sys
 import tempfile
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -28,18 +29,28 @@ def sync_folder(folder: Path) -> None:
         os.close(descriptor)
 
 
+def remove_abandoned_temporary_file(path: Path, writer_pid: int) -> None:
+    """Try to remove a staging file after its writer exits."""
+    if writer_pid <= 1:
+        return
+    try:
+        os.kill(writer_pid, 0)
+    except (ProcessLookupError, OverflowError):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            print(f"cannot remove abandoned staging file {path}: {error.strerror or error}", file=sys.stderr)
+    except PermissionError:
+        return
+
+
 def remove_dead_temporary_files(path: Path) -> None:
     """Remove sibling temporary files whose writing process has ended."""
     for sibling in path.parent.iterdir():
         match = TEMPORARY_NAME.fullmatch(sibling.name)
         if match is None or match.group("target") != path.name:
             continue
-        try:
-            os.kill(int(match.group("pid")), 0)
-        except ProcessLookupError:
-            sibling.unlink(missing_ok=True)
-        except PermissionError:
-            continue
+        remove_abandoned_temporary_file(sibling, int(match.group("pid")))
 
 
 @contextmanager

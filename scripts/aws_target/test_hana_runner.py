@@ -37,7 +37,7 @@ from scripts.aws_target.hana_placement import HanaHostGeneration
 from scripts.aws_target.hana_result import HanaAttemptKey, LogicalStepLink
 from scripts.aws_target.ledger_test_support import override_fixture_settings
 from scripts.aws_target import test_hana_receiver as receiver_tests, test_hana_source as source_tests
-from scripts.lib import build_folders, build_slots, process_stat
+from scripts.lib import build_folders, build_copies, process_stat
 from scripts.mac_test import linux_runner
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -273,7 +273,7 @@ class HanaRunnerTests(unittest.TestCase):
             self.assertEqual(supervisor.outcome(directory), outcome)
 
     def test_command_exit_drains_output_while_a_descendant_holds_both_pipes(self) -> None:
-        slot = build_slots.LeasedCopy(self.root, 'hana', 1, {}, ())
+        slot = build_copies.LeasedCopy(self.root, 'hana', 1, {}, ())
         read_fd, write_fd = os.pipe()
         with os.fdopen(read_fd, 'rb'), os.fdopen(write_fd, 'wb'):
             script = '''
@@ -300,7 +300,7 @@ raise SystemExit(13)
             self.assertTrue(ready, 'The command did not exit')
 
     def test_command_exit_wins_when_the_runner_resumes_after_its_deadline(self) -> None:
-        slot = build_slots.LeasedCopy(self.root, 'hana', 1, {}, ())
+        slot = build_copies.LeasedCopy(self.root, 'hana', 1, {}, ())
         execution = linux_runner.LeasedSlotExecution(slot, ())
         command = [sys.executable, '-c', 'import sys; sys.stdin.buffer.read(1); print("done"); sys.exit(13)']
         clock = 1000.0
@@ -323,7 +323,7 @@ raise SystemExit(13)
         self.assertEqual((result.status, result.stdout, result.stderr), (13, b'done\n', b''))
 
     def test_command_exit_reads_only_pending_bytes_from_pipes_with_a_continuous_writer(self) -> None:
-        slot = build_slots.LeasedCopy(self.root, 'hana', 1, {}, ())
+        slot = build_copies.LeasedCopy(self.root, 'hana', 1, {}, ())
         read_fd, write_fd = os.pipe()
         ready_read, ready_write = os.pipe()
         script = '''
@@ -392,7 +392,7 @@ raise SystemExit(13)
                          (13, payload + b'compiler output\n', b'compiler diagnostic\n'))
 
     def test_command_deadline_leaves_a_live_command_for_the_unit_to_stop(self) -> None:
-        slot = build_slots.LeasedCopy(self.root, 'hana', 1, {}, ())
+        slot = build_copies.LeasedCopy(self.root, 'hana', 1, {}, ())
         execution = linux_runner.LeasedSlotExecution(slot, ())
         script = '''
 import os, sys

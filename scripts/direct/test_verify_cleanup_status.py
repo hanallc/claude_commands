@@ -191,7 +191,8 @@ class ExitTrapTests(unittest.TestCase):
         self, command: str, last: str, names: tuple[str, ...] = (),
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         script = "set -euo pipefail\n" + shell_functions(
-            VERIFY, "run", "report_stop", "verify_exit", "finish_exit_diagnostics", "finish_run", *names,
+            VERIFY, "run", "report_stop", "verify_exit", "finish_exit_diagnostics", "finish_run",
+            "finish_verify_temp_allocation", "close_verify_session_temp", *names,
         )
         script += f"""
 run_step() {{ return "$STEP_STATUS"; }}

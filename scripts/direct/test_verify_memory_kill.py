@@ -39,7 +39,8 @@ def classifier_functions() -> str:
         (VERIFY.parent.parent / "lint" / "invoke.sh", "buildlog_step_compiles"),
         *((VERIFY, name) for name in (
             "verify_helper", "memory_kill_in_journal", "step_was_killed_for_memory", "lint_failure_is_the_tree",
-            "release_wait_claim", "step_writes_tree", "finish_step_token", "run", "run_step", "note_event")),
+            "release_wait_claim", "step_writes_tree", "finish_step_token", "run", "run_step", "note_event",
+            "wait_for_verify_child", "wait_for_verify_step_group")),
     ):
         functions.append(shell_function(path.read_text(), name))
     return "\n".join(functions)

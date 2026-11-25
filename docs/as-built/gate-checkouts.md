@@ -249,7 +249,7 @@ Callers must finish all checkout access before the context ends.
 
 `hold --repo R --tree T --scratch` holds a checkout of staged tree `T` until its standard input closes.
 It prints the checkout path.
-`hold --repo R --tree T` without `--scratch` runs one slot step in that tree.
+`hold --repo R --tree T` without `--scratch` runs one step in a numbered copy of that tree.
 `hold` without `--tree` exits with status 2 and prints `copies: hold requires --tree. Run verify.sh again.` before it opens a checkout.
 That message reaches a `verify.sh` run that started before the `--tree` change.
 It reads the source owner, including the owner in a standing checkout's `.gate.json`.
@@ -310,8 +310,8 @@ An unset source or Git path inside interpreter text can also pass when its top-l
 | `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
 | `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |
 
-Cargo gates use the first available cache slot.
-More than two Cargo gates for one owner and repository wait.
+Cargo gates use the lowest available copy number.
+If all existing copies are busy, the next gate takes the lowest unused number.
 TMPDIR cleanup at reboot removes checkouts left by killed gate processes.
 
 ## Remote mirrors
@@ -363,10 +363,8 @@ The lsof scanner accepts output only with exit status 0 or 1.
 Every other status makes the scan unavailable.
 The Linux scanner reports unreadable working directories during its single process scan.
 
-`target_config.slot_capacity` reads the slot capacity for claims and offload admission.
-Both callers raise `ConfigError` for a bad configured value, including an empty value.
-The required `missing` policy applies only when both capacity keys are absent.
-Mac claims still use one slot.
+Each SSH target permits one claim per repository.
+The claim reader keeps the saved file for each old numbered claim until release.
 Offload records use `owning_session.owning_session()` before the shell session fallback.
 Busy refusals can therefore name the unit director's session.
 

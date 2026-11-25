@@ -26,6 +26,13 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
+The queue checks waiters in order for each remote place.
+For Mac places only, a lower step's newer free reading clears a higher step's busy result for the same destination.
+The higher step can take the place in that pass.
+The queue keeps each step's other eligibility results.
+A step that needs evidence can hold the place for one waiting pass interval plus the probe time limit.
+The remote claim checks the place again before the step starts.
+
 ## Mac Linux gate type checks
 
 A gate that runs in the Mac Linux guest runs its requested type checks and tests in the same numbered copy.
@@ -118,8 +125,8 @@ A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fi
 
 ## Mac Linux guest folders
 
-The Mac Linux route uses `mac_run.held` to take a repository slot on the Mac.
-A Mac block or a busy repository slot can refuse the claim.
+The Mac Linux route uses `mac_run.held` to claim a repository on the Mac.
+A Mac block or an active claim for the repository can refuse the claim.
 The route returns `GuestNotStarted` with the refusal reason before any upload or retry backoff.
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
@@ -283,7 +290,8 @@ The check writes `~/.local/state/mac-idle/alert.json` on each pass.
 The hub `scripts/buildlog/mac_idle_alert.py` owns the path, record validation, and alert text.
 The views read the saved file and local configuration.
 Before a view shows a `MAC BLOCKED`, `MAC IDLE` or `MAC UNREACHABLE` line, it reads the live Mac state with `mac_idle.mac_work` (`mac_idle.view_alert_line`).
-That read uses only the local block, claim and `unreachable_until` files, and `/proc` for the claim holder's process.
+That read uses the local block, claim, `unreachable_until` and `failed_probe` files.
+It uses `/proc` to check the claim holder's process.
 It does not look for a CI job on the Mac, so a saved `free` line can show for one sample beside a CI job that just started.
 It compares the cause, not the holder, so a block or idle claim that replaces another one of the same cause shows the old holder until the next sample.
 The view shows the saved line only when the live state and cause agree with the saved reading.
@@ -337,7 +345,10 @@ It resolves the address with `showrunners.py address builds`.
 The message names the block, idle claim, free Mac, disk exclusion, or unreachable Mac.
 It lists the waiting steps and their wait evidence.
 The views place the same `MAC IDLE` alert first.
-`MAC UNREACHABLE` identifies a future connection backoff.
+`MAC UNREACHABLE` shows the retry deadline while the connection backoff is active.
+After the deadline, running Mac CI counts as work when eligible steps wait.
+The `failed_probe` mark keeps the alert visible when the watch finds no work.
+The line says that the last probe failed.
 `MAC IDLE WATCH` identifies unreadable or stale state.
 The unreachable state sends the message after `alert_seconds` while eligible steps wait.
 The unreadable state sends no message or phone push.
@@ -345,6 +356,8 @@ The unreadable state sends no message or phone push.
 The machine watch, `scripts/buildlog/machine_watch.py`, sends the phone push. See [build-targets.md](build-targets.md).
 It reads the saved alert of the same pass.
 The unreachable state uses `mac_idle.unreachable` with `need=blocked` after `excluded_notice_seconds.mac` (600 s) while eligible steps wait.
+The failed probe mark keeps the same outage across retry deadlines.
+A successful probe clears the mark.
 A free Mac, an idle claim or a disk exclusion with waiting steps sends no phone push.
 `mac_idle` counts a waiting step only after `alert_seconds`.
 The machine watch sends one message to bob and the builds showrunner 600 s after it first sees the waiting steps.
@@ -453,7 +466,7 @@ The runner uses `rsync -rlp --safe-links` and publishes the completed copy throu
 Files return to `~/.local/state/mac-test/fetched/<call id>/<folder>`. Existing destinations are refused. A failure or signal removes the partial copy.
 A fetch result adds `fetch=fetched|missing|too_large|failed|not_run` to the result file.
 
-After a Linux run reports completion, natedev releases the slot claim before it calls `buildlog.sync.sync_target(target)`.
+After a Linux run reports completion, natedev releases the repository claim before it calls `buildlog.sync.sync_target(target)`.
 The exchange selects one configured peer and preserves the host paths from `sync.hosts.<target>`.
 AWS rows arrive under `~/.local/state/buildlog/aws-build/` on natedev.
 The Linux runner uses `BUILDLOG_SYNC=1` to finish the local recorder write before it reports completion.
@@ -477,7 +490,7 @@ It also excludes direct children of another user, except children of PID 1.
 Slot processes keep their user, but an orphan can acquire PID 1 as its parent.
 Other same-user processes with unreadable evidence keep the slot busy.
 
-`verify-linux` steps use the target slots and build budget for admission.
+`verify-linux` steps use the repository claim and build budget for admission.
 They do not contact natedev's admission service or obey natedev's hold.
 The controller still checks spending before AWS admission.
 
@@ -629,12 +642,12 @@ The runner refuses `PATH`, `HOME`, `MACOSX_DEPLOYMENT_TARGET`, `RUSTFLAGS` and `
 It also refuses prefixes `BUILDLOG_`, `LINT_`, `CARGO_`, `RUSTC`, `NEXTEST_`, `DYLD_`, `MAC_TEST_` and `VERIFY_` there.
 The fetch folder must be git-ignored and relative to the mirror root. Empty, `.` and `..` path parts are refused.
 One trailing slash is removed. Tests must write to that root-relative folder, even when nextest runs them inside a package folder.
-Each test uses the terminal values from `VERIFY_TEST_FIXED_ENV` in `config/direct.conf`.
+Each test uses the terminal values from `verify_test_fixed_env` in `config/direct.conf`.
 The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
 The rule includes local tests and the test step of `final`.
 Test keys hold configured fixed values, instead of the caller's terminal values.
 
-`result_environment.py` reads `VERIFY_RESULT_ENV_NAMES`, `VERIFY_RESULT_ENV_PREFIXES`, and `VERIFY_TEST_FIXED_ENV` from `config/direct.conf` at use.
+`result_environment.py` reads `verify_result_env_names`, `verify_result_env_prefixes`, and `verify_test_fixed_env` from `config/direct.conf` at use.
 The selected name defaults include `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG`, and the configured `LC_` categories.
 `LC_TERMINAL` and `LC_TERMINAL_VERSION` are excluded.
 The prefix defaults are `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, and `TRACE_`.
@@ -688,6 +701,8 @@ The saved script name identifies the callback.
 The current callback invokes the installed Mac gate script to stop the attempt.
 It checks the saved checkout path even if the attempt folder is absent.
 For older inline checkouts without a journal, it checks for test processes before removal.
+Cleanup checks the disk device and mount before it makes one detach attempt per gate image.
+A failed detach reports the error and keeps the gate folder.
 Custom callbacks use their saved path.
 The queue removes its run record and receipt after the callback confirms cleanup.
 
@@ -819,12 +834,16 @@ It also carries the repository scope.
 Busy refusals can name the unit director's session.
 
 `offload.py` requests Mac, Linux, and AWS mirrors through `copies.py`.
-It publishes ownership only for the selected slot after admission succeeds.
-Failed admission and unselected slots retain their owners.
-Claims and admission use `target_config.slot_capacity` with an explicit missing-value policy.
-An empty configured capacity raises `ConfigError`.
-The policy supplies a fallback only when both capacity keys are absent.
-The Mac retains its single slot per repository.
+Each SSH target permits one claim per repository.
+Native Mac and mac-linux work share this limit.
+On Linux targets, the sender publishes mirror ownership after admission succeeds.
+Failed admission preserves the mirror owner.
+The reader keeps the saved file and fence for each old numbered claim.
+An old live claim holds the repository.
+When a local owner ends, the reader releases its local claim.
+For each remote claim, the runner checks the saved mirror before release.
+New Linux claims use the first mirror.
+The runner takes the saved assignment's mirror lease before it adopts a Linux reservation.
 
 The Terminal launcher enters the numbered copy before it checks its per-run token.
 Cleanup removes the token before `stop-checkout` scans the copy.
@@ -900,9 +919,29 @@ Existing waits keep their place on natedev until then.
 ### Disk floor recovery
 
 `ensure_mac_disk_floor` returns `MacDiskReady`, `SweepShort`, or `SweepFailed`.
-Below the required floor, it runs one shared floor sweep and reads free space again.
+Below the required floor, it runs one shared floor sweep.
+It reads free space again after a successful sweep.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
 A direct caller that finds a running sweep waits for its result.
+The sweep uses a dedicated SSH terminal. The terminal sends `SIGHUP` when the SSH connection closes.
+Natedev uses the full `floor_sweep_timeout_s` for SSH.
+Natedev reserves the smaller of half that timeout and the sum of its `connect_timeout_s` and `probe_timeout_s`.
+It sends the resulting deadline as a Unix time when it starts SSH.
+The Mac supervisor uses the time that remains at startup. It skips the sweep if the deadline has passed.
+This deadline relies on the two clocks agreeing. The reserve estimates time for SSH setup and the reply.
+Slow setup, clock differences, or a transport failure can prevent natedev from receiving the result in time.
+On disconnect or timeout, the supervisor stops the sweep process group and waits for the sweep process to exit.
+The supervisor sends a cleanup record after the worker exits. It also sends one if the deadline passed before startup.
+If `SIGKILL` ends the worker, the supervisor exits with status 137 and sends no record.
+Natedev reports an unsuccessful sweep without that record as unconfirmed cleanup.
+Natedev also reports unconfirmed cleanup if SSH times out, loses the connection, or leaves no result.
+An SSH retry waits for `floor.lock` within its deadline before it reads mirror leases and claims.
+A standalone sweep skips an occupied floor lock and returns status 0.
+The sweep publishes a complete review file with an atomic rename.
+A later publication removes temporary files from writers that have exited.
+Both scans report a temporary file removal error and continue with publication, including when the list path stays the same.
+If the rename succeeds and the directory sync fails, a later publication by the same list keeps that path. A new SSH attempt starts a new list with a new path.
+Floor rows require manual review. The removal command refuses those rows.
 The evidence worker reads disk space and saved mirror processes in one SSH command per Mac probe cycle.
 The same command reports setup for each required mirror.
 Each step requires a successful setup result for its mirror.
@@ -913,7 +952,7 @@ The worker checks repository policy, session, and claim scope for each key.
 The worker reports pending disk recovery while a separate thread runs the sweep.
 The Mac stays excluded during recovery even when a probe reports enough free space.
 When the sweep ends, the worker probes all subscribed Mac keys again.
-The sweep holds no admission or claim lock during removal.
+The sweep holds no admission or claim lock while it lists output.
 `floor_claims.serve()` reads claims and mirror leases under `state.lock`.
 It builds the reply under the lock and prints after the lock closes.
 It exits without reading stdin.
@@ -922,16 +961,19 @@ A lost SSH session cannot retain the state lock while the sweep runs.
 An unavailable or unreadable claim reply protects all output.
 
 `mirror_sweep_leases()` reports acquired leases separately from busy mirrors.
-The sweep keeps busy mirrors and holds acquired leases through removal.
-For output outside those leases, it reads claims again immediately before each removal group.
+Discovery still walks all three configured roots.
+The alert still measures folders under those roots when a disk alert is due.
+Mirror leases and the claim snapshot protect busy mirrors during candidate selection.
+The sweep holds acquired leases while it lists output.
+For output outside those leases, it reads claims again before it adds each group to the list.
 A new claim or an unreadable reply keeps that output.
 Cargo locks, scratch busy locks, and process checks retain their existing roles.
 
-| Path class | Protection during removal |
+| Path class | Protection during listing or removal |
 | --- | --- |
-| Mirror build units, orphan files, and whole targets | The sweep holds the Mac-side mirror lease. |
-| Registered mirror clones outside the mirror root | The sweep holds their registered Mac-side mirror leases. |
-| Marked gate caches and other output outside acquired leases | The sweep reads claims again before each removal group and retains existing output locks. |
+| Mirror build units, orphan files, and whole targets | The sweep holds the Mac-side mirror lease while it lists output. |
+| Registered mirror clones outside the mirror root | The sweep holds their registered Mac-side mirror leases while it lists output. |
+| Marked gate caches and other output outside acquired leases | The sweep reads claims again before listing each group and holds existing output locks. |
 | `mirror-remove` payload, metadata, and removal authority | `local_mirror_lease` covers the operation; the record lock serializes metadata changes. |
 | A registered task clone's parent folder | An outside mirror lease survives parent removal and blocks concurrent `mirror-use`. No parent busy lock applies. |
 | `mirror-receive` cleanup of interrupted removal | The mirror lease and record lock cover the old payload and metadata. |
@@ -962,8 +1004,7 @@ Token readiness reports remain separate from fixed placement constraints.
 No placement wait holds the cargo token; a local grant takes it.
 A remote selection releases the unused continuation claim.
 
-The adapter claims only the assignment's target, scope, and slot under the existing provider lock.
-Linux repository scopes carry the selected slot.
+The adapter claims the assignment's target and scope under the provider lock.
 Distinct known Mac repository scopes can coexist.
 A whole-Mac scope overlaps every repository scope.
 A definite refusal reports `ClaimFailure` before the queue decides another attempt.
@@ -1008,7 +1049,7 @@ Unknown remote memory remains unknown and creates no local memory charge.
 One `mirror_busy_backoff_s` key in `mac_test.conf` serves both Mac and AWS targets.
 Each target stores `mirror-busy-<repository>.until` beside its unreachable backoff record.
 A mirror busy refusal during copy writes this time.
-No available slot lease also writes this time.
+If the mirror lease is busy, the caller also writes this time.
 A `mirror-use` busy refusal after copy becomes `BusyMacDecline`, without a lost run.
 A successful copy removes the repository's refusal time.
 `free-now` reads this local record without SSH or a lock.

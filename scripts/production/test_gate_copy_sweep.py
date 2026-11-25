@@ -17,12 +17,12 @@ from scripts.build_queue import admission_records
 from scripts.copies import copies
 from scripts.lib import scratch
 from scripts.lint import sweep as folder_sweep
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.production import gate, staff
 from scripts.production.gate_modules import GateRefused
 
 
-class NightlySlotSweepTests(unittest.TestCase):
+class NightlyCopySweepTests(unittest.TestCase):
     def test_nightly_requires_a_unit_or_production_before_work_starts(self) -> None:
         with (mock.patch.object(gate, "nightly_git") as git,
               mock.patch.object(gate, "_sweep_nightly_build_folders") as sweep,
@@ -101,7 +101,7 @@ class NightlySlotSweepTests(unittest.TestCase):
     def test_local_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
         for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
-                config = private_slot_config(Path(temporary), repository="fixture")
+                config = private_copy_config(Path(temporary))
                 events: list[str] = []
                 notices: list[str] = []
 
@@ -148,7 +148,7 @@ class NightlySlotSweepTests(unittest.TestCase):
     def test_mac_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
         for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
-                config = private_slot_config(Path(temporary), repository="fixture")
+                config = private_copy_config(Path(temporary))
                 notices: list[str] = []
 
                 def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -177,7 +177,7 @@ class NightlySlotSweepTests(unittest.TestCase):
 
     def test_gate_failure_still_sweeps_both_pools(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            config = private_slot_config(Path(temporary), repository="fixture")
+            config = private_copy_config(Path(temporary))
             events: list[str] = []
 
             def nightly(args: gate.GateArguments, target: gate.GateTarget) -> int:
