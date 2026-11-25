@@ -537,7 +537,8 @@ The copies root (`build_folders.conf` `roots.copies`: `/tmp/claude/copies` on na
 Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)`. A copy's lifetime is `Live(why)`, `Ended(evidence)` or `Unknown(reason)`; cleanup removes only `Ended` copies and names the repair reason for unknown state. An open phase keeps its copy at any age; the recorder's completed, stopped and error states end it. A `landed:<unit>/<branch>` copy ends only when `origin/<branch>` is an ancestor of its recorded land target (default `origin/main`) in the recorded source checkout, whose sessions keep its refs fresh, and all copy work is saved; cleanup never fetches. The tmp sweep then requires seven days without a change. A parent stays while an existing child record borrows its Git objects.
 
 Holders create `.claude-busy` and use a shared flock for the whole run. Judges and dry runs do not create the mark. 
-`targeted_test.py --checkout <copy>` and `merge_gate.py --checkout <copy>` take the shared lock before tests start.
+The affected gate takes the shared lock after it accepts the prepared copy.
+The merge gate takes the shared lock before tests start.
 Scratch end, the tmp sweep and the floor sweep claim an exclusive lock without waiting.
 They create the mark when absent and retain it through deletion.
 A folder with a maker lock beside it (`<name>.lock`) is a managed folder.
@@ -637,8 +638,19 @@ Each step checks its package when it runs.
 The first failure ends either list with its status.
 A step list reports the command and exit status for each step it runs, including the package of a failed test step.
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
-Both list forms keep the queue place during checkout for steps that share the slot.
-A `doc` step with its own slot uses `NO_RUN` in its placement request.
+Both list forms keep the queue place during checkout, including for `doc`.
+The `doc` step acquires its own checkout and uses ordinary memory admission.
+It takes no memory handoff or repository slot.
+A busy Mac leaves a mend step at its existing queue rank for the next placement.
+The Cargo token report uses the existing `wait_s` field to locate the end of the token wait.
+The `admission_wait_s` field totals the waits for memory, routing, holds, and the Cargo token.
+The `step_wait_s` field gives the wait for each step, including separate waits for mend and clippy.
+Verify counts the placement samples after it receives a grant, a refusal, or a confirmed cancellation.
+A confirmed cancellation includes the cancellation that Verify requests before lint formatting.
+A canceled episode stops accruing wait before formatting starts.
+That mend wait ends at the last queue reply before Verify cancels; the cancel call itself, about one second, is not counted.
+If Verify stops before it reads a final reply or a sample is missing, it records null for the step and admission totals.
+The `hold_wait_s` field is null when the call has no valid hold sample.
 A standalone step with its own checkout slot also uses `NO_RUN`.
 Steps with `NO_RUN` can leave their grants without a memory handoff.
 
@@ -653,19 +665,25 @@ Call records use the package name or `workspace`.
 
 After help and saved-pass query exits, verify reads the Git top level.
 If the root has no `Cargo.toml`, Verify prints `verify.sh: <root> has no Cargo.toml; verify.sh checks Cargo repositories only` on stderr and exits 2.
-If the root has `scripts/copies/copies.py`, Verify also prints `claude_commands: run tests with copies.py --affected or --module` on stderr.
+If the root has `scripts/copies/copies.py`, Verify also prints the command below on stderr.
 This refusal precedes environment setup and Cargo calls.
 
-From a `claude_commands` checkout, run the affected tests through the queue with:
+Run affected tests from a `claude_commands` checkout through `copies.py run`.
+A direct `gate.py --affected` call prints the command with the Git worktree root and its current `HEAD` commit.
+The gate exits with status 1 before it requests placement.
+
+Run this command from the worktree root.
 
 ```sh
-./scripts/lib/py scripts/copies/copies.py run --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
+~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+  --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
 ```
 
 Add `--module <module>` after `--affected` to select a module.
+Merge-line gates use `--tests-only`.
 
 The final run contract chooses the repository's unit gate when the root has no Cargo manifest.
-For `~/.claude`, that gate is `scripts/lib/py scripts/production/targeted_test.py --checkout <tree>`.
+For `~/.claude`, run the affected gate with the prepared checkout from `copies.py run`.
 No configuration maps repositories to unit gates.
 [Checkpoint documentation and final targets](rustdoc-once-and-final-targets.md) defines the Cargo doc and final behavior.
 

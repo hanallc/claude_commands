@@ -115,7 +115,7 @@ from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.test_times import gate_record
 from scripts.build_queue import admission_client, admission_records, admission_wire, first_step, placement  # noqa: E402
-from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER
+from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED
 from scripts.build_queue import progress_profile
 from scripts.build_queue.admission_client import (  # noqa: E402
     AdmissionHoldCheck, OuterReservation, cpu_pool_path, outer_reservation, step_identity,
@@ -3428,6 +3428,9 @@ class GuestNotStartedOutcome(Protocol):
     @property
     def settlement_required(self) -> bool: ...
 
+    @property
+    def retry_before_settlement(self) -> bool: ...
+
 
 class GuestToolSettings(Protocol):
     def command(self, shell: str) -> tuple[str, ...]: ...
@@ -3529,15 +3532,18 @@ def run_gate_suites(repo: Path, type_dirs: Sequence[str] = (),
         if isinstance(outcome, str):
             raise MacLinuxGateRefused(f"Mac Linux guest gate failed: {outcome}")
         if not isinstance(outcome, GateRun):
-            failure = admission_wire.ClaimFailure(token_hex(16), assignment, MAC_LINUX_NO_ANSWER)
-            if outcome.settlement_required:
-                try:
-                    write_gate_claim_failure(failure)
-                except (KeyError, OSError) as error:
-                    raise GateSettlementPending(f'Mac Linux guest took no run. {outcome.reason}. '
-                                                + f'Cannot save the placement refusal. {error}') from error
-                raise GateSettlementPending(f"Mac Linux guest took no run: {outcome.reason}")
-            write_gate_claim_failure(failure)
+            if outcome.settlement_required and not outcome.retry_before_settlement:
+                raise GateSettlementPending(f'Mac Linux guest gate blocked. {outcome.reason}. '
+                                            + 'The queue did not confirm consumption for this launch claim.')
+            reason = MAC_LINUX_START_UNCONFIRMED if outcome.retry_before_settlement else MAC_LINUX_NO_ANSWER
+            failure = admission_wire.ClaimFailure(token_hex(16), assignment, reason)
+            try:
+                write_gate_claim_failure(failure)
+            except (KeyError, OSError) as error:
+                if not outcome.settlement_required:
+                    raise
+                raise GateSettlementPending(f'Mac Linux guest took no run. {outcome.reason}. '
+                                            + f'Cannot save the placement refusal. {error}') from error
             raise MacLinuxTookNoRun(f"Mac Linux guest took no run: {outcome.reason}")
         first_failures = {(job.suite, job.module): job for job in outcome.executions
                           if job.kind is GateJobKind.TEST_MODULE and job.returncode
@@ -3813,14 +3819,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--nightly needs --unit or --production")
     if args.nightly and (args.tests_only or args.promote_only or args.promote):
         parser.error("--nightly cannot be combined with --tests-only or promotion")
-    if args.modules and not (args.tests_only or args.affected):
-        parser.error("--module needs --tests-only or --affected")
+    if error := first_step.gate_module_mode_error(
+            has_modules=bool(args.modules), tests_only=args.tests_only, affected=args.affected):
+        parser.error(error)
     if not args.tests_only and not args.affected and not args.promote_only and not args.nightly:
         required = ("merge_branch", "unit_branch", "checkpoint", "previous_checkpoint", "unit", "phase")
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
+        if args.affected and not args.prepared_copy:
+            try:
+                checkout = Path(args.repo).expanduser().resolve()
+                repo = Path(checked_git(checkout, "rev-parse", "--show-toplevel"))
+                commit = checked_git(repo, "rev-parse", "--verify", "HEAD")
+            except (GateRefused, OSError, RuntimeError) as error:
+                raise GateRefused(" ".join(str(error).splitlines())) from error
+            command = ["run", "--repo", str(repo), "--commit", commit, "--",
+                       "./scripts/lib/py", "scripts/production/gate.py"]
+            remaining = iter(arguments)
+            for word in remaining:
+                if word in ("--repo", "--checkout"):
+                    _ = next(remaining)
+                elif not word.startswith(("--repo=", "--checkout=")):
+                    command.append(word)
+            # copies.py replaces {tree} with the prepared checkout path.
+            command.extend(("--repo", "{tree}"))
+            # Keep newlines in quoted arguments on one shell command line.
+            words = shlex.join(command).replace("\n", "'$'\\n''")
+            print(f"~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py {words}", file=sys.stderr, flush=True)
+            return 1
         target = checked_gate_target(args)
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):

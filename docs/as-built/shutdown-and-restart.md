@@ -10,6 +10,16 @@ Callers handle `ProcessLookupError` when the group has ended.
 Shell callers use their checkout's helper through `scripts/lib/py`.
 The helper returns exit 3 for a missing group and exit 2 for refusal or failure.
 `test_process_group.unguarded_group_signals` checks Python references, embedded scripts, and shell commands for unguarded signals.
+`run_process_group(command, timeout=..., env=...)` runs a command in its own group and returns its text output.
+It waits up to the timeout for the command to exit, then stops the whole group.
+After a timeout it stops the group and raises `subprocess.TimeoutExpired` with the output.
+Output goes to temporary files, so a helper process that keeps the output open cannot delay the result.
+Bytes that are not UTF-8 decode as replacement characters.
+`stop_process_group(process)` sends TERM, then KILL, to the group of a `start_new_session` child and closes its pipes.
+Every headless Firefox and Chrome run starts with `run_process_group`, or with `Popen(start_new_session=True)` and ends with `stop_process_group`.
+On macOS the gate has no subreaper, and its group kill does not reach a browser group when it stops a module during a browser run.
+The Node proof `memory_page_proof.mjs` starts Chrome, so its tests start Node with `run_process_group`.
+A browser leaves helper processes after its own exit or a timeout, and a plain `subprocess.run` stops only the leader.
 
 ## Session commands
 
@@ -27,24 +37,49 @@ Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.
 
-`agents pause NAME --why TEXT` stops the workers now.
+`agents pause NAME [--keep-workers] --why TEXT` pauses a director.
 The director finishes its current turn and holds at the prompt.
+By default, pause stops the workers.
+With `--keep-workers`, the workers continue their current work.
+The command refuses `--keep-workers` for Codex directors and offers the default pause.
+Codex support needs a runtime check that proves the hook through the worker result route.
+It reports each refusal and pauses the other selected directors.
 `agents exit NAME --why TEXT` stops the director and its workers.
 Both commands preserve the staff rows, tabs, and shells.
 Add `--finish-step` to wait for the workers' current tasks before stopping them.
 The staff row records the time, caller, and reason under `paused` or `exited`.
 The board shows that state.
-`agents pause --production SHOWRUNNER [--except UNIT ...] --why TEXT` selects units within one production.
+The pause record includes `keep_workers` when pause keeps the workers.
+`agents status` names the kept workers with open agent panes.
+JSON status lists the names under `kept_workers`.
+`agents pause --production SHOWRUNNER [--except UNIT ...] [--keep-workers] --why TEXT` selects units within one production.
 `agents resume --production SHOWRUNNER` resumes its units.
-Resume removes a pause record and sends a running director one continuation message.
+It reports each held row and its holder when known.
+It resumes the available rows and returns exit 2 if a row lock blocks a resume.
+Resume sends a running director one continuation per pause.
+Resume saves the pending message and clears the pause in one staff write before calling the sender.
+A retry recovers the pending continuation even when the director is active.
+A durable send, queue entry, or review entry completes the pending resume.
+A remote send saves its destination before delivery.
+A retry checks the remote receipt before it looks for a live director.
+A lost reply keeps the resume pending until the sender can confirm acceptance.
+A retry can reclaim a relay if its owner died before the socket write.
+An unconfirmed socket write keeps the resume pending.
+Review release publishes the continuation once and can retry the notice.
+Resume skips worker restoration for a director paused with `--keep-workers`.
+A worker message to a paused director waits in the director's transcript until resume.
 A paused director on the other machine gets the continuation message without a local liveness read.
 The machine comes from its worktree or its showrunner document.
 A stopped paused director starts through the shared resume path, including its requested `--to` account.
-Queued or failed delivery restores the same pause record and returns failure.
+With `--keep-workers`, resume requires a live staff recipient for its continuation.
+If its socket is unavailable, the send fails and leaves no queued continuation.
+Definite delivery failure restores the same pause record.
+Uncertain delivery keeps the pending resume for a retry.
 A failed start or a start exception also restores the pause record.
 Resume starts an exited director through the shared role-account path and removes its exit record after success.
-The prompt hook retains a paused director's hold for every prompt source.
-It adds context without blocking or removing the message.
+The Claude and Codex prompt hooks read the same director hold for every prompt source.
+Each hook adds the hold instruction and preserves the message in the transcript.
+The Codex hook installer registers and trusts the director hold in each selected Codex home.
 An own-pane resume resolves the agent executable before it removes the exit record.
 It executes that path directly. A missing executable retains the exit record.
 The stop hook skips the automatic continuation for that director.
@@ -642,7 +677,13 @@ Restore holds the dispatch lock across the record read, receipt read, and prompt
 Restore, named resume, and director notes use one receipt rule.
 An unsubmitted dispatch keeps the saved assign command and its saved prompt path.
 Director notes reuse shared dispatch history reads.
-A DONE line or a finished record closes the dispatch and suppresses its resume note and step.
+A matching DONE or a finished record suppresses the resume step for that pass.
+A later detached result from that pass still requires another matching DONE.
+Resume checks the later result records in the run that owns the dispatch.
+Resume preserves DONE when every later result belongs to another pass.
+Resume reports each unreadable record once. An unreadable record for a later result keeps that worker's transcript receipt.
+Restore uses the worker pane with the proved native identity for its continuation.
+It checks that the worker is idle. The prompt checks the native identity again before it sends input.
 The decision reads the record and transcript once per worker and uses the restart's shared run index.
 
 ## Launch names

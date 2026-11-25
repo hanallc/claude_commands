@@ -81,11 +81,21 @@ from scripts.production.rename_unit_test_support import FolderRenameFixture, Fol
 
 class AgentsUsageTests(unittest.TestCase):
     def test_resume_forwards_a_mac_staff_row_through_ssh(self) -> None:
+        for kind in ("unit", "showrunner"):
+            with self.subTest(kind=kind):
+                self._check_mac_resume(kind)
+
+    def _check_mac_resume(self, kind: staff.Kind) -> None:
         host = "Nates-MacBook-Pro-2023"
-        row = staff.StaffRow(StaffId("unit-row"), "unit", "alpha", staff.StaffRoot(),
+        row = staff.StaffRow(StaffId("alpha-row"), kind, "alpha", staff.StaffRoot(),
             current_session=StaffId("alpha-session"), worktree=staff.PresentWorktree(host, Path("/mac/alpha")),
-            unit_type=staff.UnitDetails("direct"))
+            unit_type=staff.UnitDetails("direct") if kind == "unit" else staff.NotUnit())
         record = staff.StaffSnapshot((row,))
+
+        def row_operation(identity: str) -> nullcontext[None]:
+            self.assertEqual(identity, row.id)
+            self.assertTrue(shutdown.unit_machine_is_local(host))
+            return nullcontext()
 
         def run_ssh(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "mac"])
@@ -104,7 +114,7 @@ class AgentsUsageTests(unittest.TestCase):
               mock.patch.object(shutdown, "other_machine", return_value="mac"),
               mock.patch.object(remote, "other_machine", return_value="mac"),
               mock.patch.object(staff, "initial_snapshot", return_value=record),
-              mock.patch.object(staff, "row_operation", return_value=nullcontext()),
+              mock.patch.object(staff, "row_operation", side_effect=row_operation) as operation,
               mock.patch.object(herdr, "reboot_lock", return_value=nullcontext()),
               mock.patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp(row.current_session, "pane", "claude4")) as resume,
               mock.patch.object(subprocess, "run", side_effect=run_ssh) as ssh):
@@ -112,6 +122,7 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual((code, errors), (0, ""))
         self.assertIn("Claude is up on claude4", output)
         resume.assert_called_once_with(str(row.id), why="retry after exit", to="claude 4")
+        operation.assert_called_once_with(str(row.id))
         ssh.assert_called_once()
 
     def test_resume_refuses_unknown_or_unreachable_machines(self) -> None:
@@ -204,6 +215,8 @@ class AgentsUsageTests(unittest.TestCase):
                          ["help", "status", "pause", "exit", "pause", "resume", "resume", "resume", "retire", "rename", "move",
                           "reboot", "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
         self.assertIn("resume NAME", output)
+        self.assertIn("pause NAME [--finish-step] [--keep-workers] --why TEXT", output)
+        self.assertIn("pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
@@ -2117,13 +2130,16 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
         row = unit_membership("alpha", "alpha")
         before = self.staff.staff_file.read_bytes(), self.parked_facts().read_bytes()
         for name in (row.name, str(row.id), row.current_session):
-            with self.subTest(name=name), mock.patch.object(stop_resume, "resume") as start:
+            with (self.subTest(name=name), mock.patch.object(stop_resume, "resume") as start,
+                  mock.patch.object(shutdown, "unit_machine_is_local", return_value=False),
+                  mock.patch.object(shutdown, "run_remote") as forward):
                 output = io.StringIO()
                 with redirect_stderr(output):
                     code = shutdown.main(["resume", name])
                 self.assertEqual(code, 2)
                 self.assertIn(f"agents resume {row.name} --retired", output.getvalue())
                 start.assert_not_called()
+                forward.assert_not_called()
         self.assertEqual((self.staff.staff_file.read_bytes(), self.parked_facts().read_bytes()), before)
         self.assertEqual(self.calls, [])
 
