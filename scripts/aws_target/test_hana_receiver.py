@@ -194,14 +194,14 @@ assert 'roots.build=/fixture/build' in policy
 assert '# whole: 1..\\nslots.aws-hana.hana.max=1\\n' in policy
 assert '# range: 0..\\nlocks.probe_wait_seconds=0\\n' in policy
 assert '/bad' not in policy
-assert 'patterns.slot=fixture' in policy
+assert 'patterns.tool=fixture' in policy
 print(args['--command-timeout-s'])
 """
             payload = archive_bytes(('source.bundle', bundle, tarfile.REGTYPE),
                 ('runtime/runner.py', runner, tarfile.REGTYPE),
                 ('runtime/abi', f'{hana_protocol.RUNTIME_ABI}\n'.encode(), tarfile.REGTYPE),
                 ('runtime/config/build_folders.conf',
-                 b'patterns.slot=fixture\nroots.build=/bad\nroots.build.aws-hana=/bad\n'
+                 b'patterns.tool=fixture\nroots.build=/bad\nroots.build.aws-hana=/bad\n'
                  + b'slots.aws-hana.hana.max.aws-hana=9\n',
                  tarfile.REGTYPE))
             write_policy(root / 'policy.conf', Path('/fixture/build'))
@@ -217,7 +217,7 @@ print(args['--command-timeout-s'])
                         payload = archive_bytes(('source.bundle', bundle, tarfile.REGTYPE),
                             ('runtime/runner.py', b'import missing_hana_fixture_module\n', tarfile.REGTYPE),
                             ('runtime/abi', f'{hana_protocol.RUNTIME_ABI}\n'.encode(), tarfile.REGTYPE),
-                            ('runtime/config/build_folders.conf', b'patterns.slot=fixture\n', tarfile.REGTYPE))
+                            ('runtime/config/build_folders.conf', b'patterns.tool=fixture\n', tarfile.REGTYPE))
                     if label in ('archive failed', 'wrong digest'):
                         payload = b'not a tar archive'
                     request = request_for(b'different archive' if label == 'wrong digest' else payload)
@@ -271,7 +271,7 @@ with socket.socket(socket.AF_UNIX) as connection:
             payload = archive_bytes(('source.bundle', b'fixture bundle', tarfile.REGTYPE),
                 ('runtime/runner.py', runner, tarfile.REGTYPE),
                 ('runtime/abi', f'{hana_protocol.RUNTIME_ABI}\n'.encode(), tarfile.REGTYPE),
-                ('runtime/config/build_folders.conf', b'patterns.slot=fixture\n', tarfile.REGTYPE))
+                ('runtime/config/build_folders.conf', b'patterns.tool=fixture\n', tarfile.REGTYPE))
             bootstrap, _, _ = bootstrap_fixture(root, payload, request_for(payload))
             launch = ['systemd-run', '--user', '--wait', '--collect', '--property=PrivateUsers=yes',
                       '--property=KillSignal=SIGKILL',

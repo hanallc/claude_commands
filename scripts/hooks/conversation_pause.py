@@ -881,6 +881,9 @@ class DirectorTurn(Enum):
     HOLD = "hold"
 
 
+DIRECTOR_HOLD_CONTEXT = "This unit is paused. Hold at the prompt. Do not start new work. Wait for agents resume."
+
+
 def director_turn(
     session_id: str, *,
     record: staff.StaffSnapshot | unit_runs.RunStaffAtUse = unit_runs.RunStaffAtUse.LOCAL,
@@ -898,7 +901,7 @@ def message_arrived(
 ) -> HookReply:
     record = session_staff(session_id) if isinstance(record, unit_runs.RunStaffAtUse) else record
     if director_turn(session_id, record=record) is DirectorTurn.HOLD:
-        return ContextOnly("This unit is paused. Hold at the prompt. Do not start new work. Wait for agents resume.")
+        return ContextOnly(DIRECTOR_HOLD_CONTEXT)
     response = answer(prompt) if source is PromptSource.TYPED else NotAnAnswer()
     return_question = is_return_question(prompt)
     if not return_question and not pauses(source):
