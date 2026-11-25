@@ -36,6 +36,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from scripts.agents.remote import local_machine
+from scripts.for_you.action import ActionStore
 from scripts.nightly_review import candidates
 from scripts.production.production_doc import read_production
 from scripts.production.issues import Issue
@@ -3041,6 +3042,32 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         markup = review_page.render(self.root).decode()
         self.assertEqual(re.findall(r'data-show-chip="([^"]+)" aria-pressed="[^"]+">([^<]+) <b>', markup),
                          [('all', 'All'), ('open', 'Open'), ('Waiting', 'Waiting'), ('Done', 'Done'), ('Validating', 'Validating')])
+
+    def test_for_you_shows_completion_labels_and_keeps_done_for_automatic_actions(self) -> None:
+        store = ActionStore()
+        opened = store.add(title='Allow AWS price reads', command='deploy.py up --approve-resources',
+                           machine='natedev', cwd='/fixture', requested_by=self.fixture.unit.id,
+                           reason='AWS refused the price read.', waits='Test runs on AWS', concerns='aws',
+                           dedupe_key='aws-price-read', completion='automatic')
+        automatic = for_you.action_row(opened, self.fixture.unit.name)
+        manual = replace(automatic, key=f'action/{uuid4()}', completion='manual')
+        rebuild = replace(automatic, key='rebuild/natedev', kind='rebuild')
+        done_button = b'<button name="outcome" value="done"'
+        with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((automatic, manual, rebuild), ())):
+            snapshot = review_page.build_snapshot(self.root)
+            markup = snapshot.body(automatic.key)
+            self.assertIn(b'<dt>Completion</dt><dd>Automatic</dd>', markup)
+            self.assertIn(done_button, markup)
+            self.assertIn(b'<dt>Completion</dt><dd>Manual</dd>', snapshot.body(manual.key))
+            self.assertIn(done_button, snapshot.body(manual.key))
+            self.assertIn(b'<dt>Completion</dt><dd>Automatic after rebuild</dd>', snapshot.body(rebuild.key))
+            self.assertNotIn(done_button, snapshot.body(rebuild.key))
+            delivery, result = review_page.submit(self.root, self.card_body(snapshot, automatic.key, 'done'),
+                                                  self.status, snapshot=snapshot)
+        self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+        self.assertEqual(result, 'Done')
+        saved = store.get(automatic.key)
+        self.assertEqual((saved.status, saved.completion, saved.evidence), ('done', 'automatic', 'Marked Done in Review.'))
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_for_you_notifier_copy_done_and_rebuild_keep_the_review_draft(self) -> None:
