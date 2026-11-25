@@ -2828,7 +2828,6 @@ def _write_move_progress(batch: MoveBatch, session: str, result: MoveResult | mo
                 reason = "Another operation held this row."
             else:
                 reason = result.reason
-                failure_kind = moves.refusal_failure_kind(reason)
             destination = result.account if isinstance(result, ResumePending) else batch.destinations.get(session, batch.target)
             state = moves.MemberMoveFailed(ended, elapsed, moves.move_failure_reason(reason),
                                            moves.move_destination(destination), stopped=confirmed_stopped,

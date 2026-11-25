@@ -19,7 +19,7 @@ import sys
 import tempfile
 from collections import Counter
 from collections.abc import Callable, Generator, Mapping
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -153,9 +153,6 @@ class HoldStartedDocument(TypedDict):
     at: str
     move_id: str
     percent: float
-    group: NotRequired[accounts.ClaudeGroup]
-    target: NotRequired[str]
-    measure: NotRequired[str]
     minutes: NotRequired[float]
     source: NotRequired[dict[str, object]]
 
@@ -175,48 +172,13 @@ class LegacyHoldDuration:
 @dataclass(frozen=True)
 class GroupSelection:
     account: str | accounts.GroupNotConfigured
-    transition: accounts.GroupTransition | accounts.NoGroupTransition
-
-    @property
-    def move_id(self) -> str | accounts.NoGroupTransition:
-        return self.transition.move_id if isinstance(self.transition, accounts.GroupTransition) else self.transition
+    move_id: str | accounts.NoGroupTransition
 
 
 def _group_selection(selected: accounts.GroupAccounts, group: accounts.ClaudeGroup) -> GroupSelection:
-    return GroupSelection(accounts.group_label(selected, group), accounts.group_transition(group))
-
-
-def _read_group_selection(group: accounts.ClaudeGroup) -> GroupSelection:
-    with role_map.supplied_role_map(accounts.read_role_map(fresh=True)):
-        return _group_selection(accounts.group_accounts(), group)
-
-
-class ObservedGroupSelectionChanged(Exception):
-    """The selection changed before the watcher could write its decision."""
-
-
-@contextmanager
-def _write_for_selection(group: accounts.ClaudeGroup, expected: GroupSelection) -> Generator[accounts.GroupSelectionClaim]:
-    with accounts.claim_group_selection(group) as claim:
-        if _read_group_selection(group) != expected:
-            raise ObservedGroupSelectionChanged()
-        yield claim
-
-
-@dataclass(frozen=True)
-class HoldRuleScope:
-    group: accounts.ClaudeGroup
-    target: str
-    measure: next_moves.QuotaMeasure
-
-    @classmethod
-    def from_entry(cls, entry: next_moves.ClaudeGroupMove) -> HoldRuleScope:
-        return cls(entry.group, entry.to, entry.measure)
-
-
-@dataclass(frozen=True)
-class UnboundHoldRule:
-    """An older timer has no saved group, target, or measure."""
+    transition = accounts.group_transition(group)
+    return GroupSelection(accounts.group_label(selected, group),
+                          transition.move_id if isinstance(transition, accounts.GroupTransition) else transition)
 
 
 @dataclass(frozen=True)
@@ -226,18 +188,20 @@ class HoldStarted:
     move_id: str | accounts.NoGroupTransition
     percent: float
     duration: next_moves.ResolvedHold | LegacyHoldDuration = LegacyHoldDuration()
-    rule: HoldRuleScope | UnboundHoldRule = UnboundHoldRule()
 
     def __post_init__(self) -> None:
         if self.at.utcoffset() is None:
             raise ValueError("hold start needs a zone")
+
+    def is_current(self, selection: GroupSelection, percent: float) -> bool:
+        return (self.account == selection.account and self.move_id == selection.move_id
+                and self.percent == percent)
 
 
 @dataclass(frozen=True)
 class LeftAtMost:
     percent: float
     hold_mode: next_moves.HoldMode = next_moves.FixedHold(0)
-    measure: next_moves.QuotaMeasure = next_moves.QuotaMeasure.ALL_MODELS
 
 
 @dataclass(frozen=True)
@@ -248,43 +212,6 @@ class AutoMoveRule:
     when: LeftAtMost
     fallback_targets: tuple[str, ...] = ()
 
-    @classmethod
-    def from_entry(cls, entry: next_moves.ClaudeGroupMove) -> AutoMoveRule:
-        return cls(entry.id, entry.group, entry.to, LeftAtMost(entry.at_percent, entry.hold_mode, entry.measure),
-                   entry.fallback_targets)
-
-
-@dataclass(frozen=True)
-class NoActiveAutoHold:
-    """The rule has no active hold for this selection."""
-
-
-def _current_saved_hold(holds: Mapping[str, HoldStarted], rule: AutoMoveRule,
-                        selection: GroupSelection) -> HoldStarted | NoActiveAutoHold:
-    hold = holds.get(rule.entry_id)
-    if (hold is None or hold.account != selection.account or hold.move_id != selection.move_id
-            or hold.percent != rule.when.percent):
-        return NoActiveAutoHold()
-    scope = HoldRuleScope(rule.group, rule.to, rule.when.measure)
-    if isinstance(hold.rule, UnboundHoldRule):
-        if scope.measure is not next_moves.QuotaMeasure.ALL_MODELS:
-            return NoActiveAutoHold()
-    elif hold.rule != scope:
-        return NoActiveAutoHold()
-
-    mode = rule.when.hold_mode
-    duration = hold.duration
-    if isinstance(mode, next_moves.FixedHold):
-        if mode.minutes == 0:
-            return NoActiveAutoHold()
-        if isinstance(duration, LegacyHoldDuration):
-            duration = next_moves.ResolvedHold(mode.minutes, mode)
-        elif duration.source != mode:
-            return NoActiveAutoHold()
-    elif isinstance(duration, LegacyHoldDuration) or isinstance(duration.source, next_moves.FixedHold):
-        return NoActiveAutoHold()
-    return replace(hold, rule=scope, duration=duration)
-
 
 @dataclass(frozen=True)
 class UnreadableNextMoveLog:
@@ -293,7 +220,8 @@ class UnreadableNextMoveLog:
 
 def read_auto_move_rules() -> tuple[AutoMoveRule | UnreadableNextMoveLog, ...]:
     try:
-        return tuple(AutoMoveRule.from_entry(entry)
+        return tuple(AutoMoveRule(entry.id, entry.group, entry.to,
+                                  LeftAtMost(entry.at_percent, entry.hold_mode), entry.fallback_targets)
                      for entry in next_moves.read_next_moves() if isinstance(entry, next_moves.ClaudeGroupMove))
     except next_moves.NextMoveError as error:
         return (UnreadableNextMoveLog(str(error)),)
@@ -355,20 +283,11 @@ def _load_state() -> WatchState:
                 try:
                     holds[name] = HoldStarted(label, datetime.fromisoformat(at),
                                              move_id if move_id else accounts.NoGroupTransition(), float(percent),
-                                             _decode_hold_duration(fields), _decode_hold_rule(fields))
+                                             _decode_hold_duration(fields))
                 except ValueError:
                     continue
         result["auto_move_holds"] = holds
     return result
-
-
-def _decode_hold_rule(fields: dict[str, object]) -> HoldRuleScope | UnboundHoldRule:
-    group, target, measure = fields.get("group"), fields.get("target"), fields.get("measure")
-    if group is None and target is None and measure is None:
-        return UnboundHoldRule()
-    if group not in accounts.CLAUDE_GROUPS or not isinstance(target, str) or not isinstance(measure, str):
-        raise ValueError("invalid hold rule")
-    return HoldRuleScope(group, target, next_moves.parse_quota_measure(measure))
 
 
 def _decode_hold_duration(fields: dict[str, object]) -> next_moves.ResolvedHold | LegacyHoldDuration:
@@ -394,8 +313,6 @@ def _decode_hold_duration(fields: dict[str, object]) -> next_moves.ResolvedHold 
 def _hold_document(hold: HoldStarted) -> HoldStartedDocument:
     document = HoldStartedDocument(account=hold.account, at=hold.at.isoformat(),
                                    move_id=hold.move_id if isinstance(hold.move_id, str) else "", percent=hold.percent)
-    if isinstance(hold.rule, HoldRuleScope):
-        document.update(group=hold.rule.group, target=hold.rule.target, measure=hold.rule.measure.value)
     if isinstance(hold.duration, next_moves.ResolvedHold):
         document["minutes"] = hold.duration.minutes
         source = hold.duration.source
@@ -441,10 +358,13 @@ def started_next_move_holds(entries: tuple[next_moves.NextMove, ...]) -> dict[st
         if not isinstance(entry, next_moves.ClaudeGroupMove) or entry.group in heads:
             continue
         heads.add(entry.group)
-        if entry.id not in holds:
+        if isinstance(entry.hold_mode, next_moves.FixedHold) and entry.hold_mode.minutes == 0:
             continue
-        hold = _current_saved_hold(holds, AutoMoveRule.from_entry(entry), _group_selection(selected, entry.group))
-        if isinstance(hold, HoldStarted) and isinstance(hold.duration, next_moves.ResolvedHold):
+        hold = holds.get(entry.id)
+        if hold is None or not isinstance(hold.duration, next_moves.ResolvedHold):
+            continue
+        selection = _group_selection(selected, entry.group)
+        if hold.is_current(selection, entry.at_percent):
             started[entry.id] = next_moves.StartedHold(hold.at, hold.duration)
     return started
 
@@ -459,22 +379,9 @@ def _watch_lock() -> Generator[None]:
         yield
 
 
-def _clear_queued_move_state(holds: set[str], notices: set[str]) -> None:
-    if not holds and not notices:
-        return
-    state = _load_state()
-    original = deepcopy(state)
-    for entry_id in holds:
-        _ = state.get("auto_move_holds", {}).pop(entry_id, None)
-    for entry_id in notices:
-        _ = state.get("auto_move_notices", {}).pop(entry_id, None)
-    if state != original:
-        _save_state(state)
-
-
 @dataclass(frozen=True)
 class LockedNextMoveEdit:
-    """An edit that holds the watch and log locks through commit and cleanup."""
+    """An edit whose watch and log locks remain held through cleanup and commit."""
 
     before: tuple[next_moves.NextMove, ...]
 
@@ -490,27 +397,26 @@ class LockedNextMoveEdit:
         prior_modes = {entry.id: entry.hold_mode for entry in self.before if isinstance(entry, next_moves.ClaudeGroupMove)}
         changed_modes = {entry.id for entry in entries if isinstance(entry, next_moves.ClaudeGroupMove)
                          and entry.id in prior_modes and prior_modes[entry.id] != entry.hold_mode}
-        _clear_queued_move_state(discarded | changed_modes, discarded)
-        if discarded:
-            from scripts.whoami import quota_alert
-            with quota_alert.state_file() as quota_state:
-                for entry_id in discarded:
-                    _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
+        if discarded or changed_modes:
+            state = _load_state()
+            original = deepcopy(state)
+            for entry_id in discarded | changed_modes:
+                _ = state.get("auto_move_holds", {}).pop(entry_id, None)
+            for entry_id in discarded:
+                _ = state.get("auto_move_notices", {}).pop(entry_id, None)
+            if state != original:
+                _save_state(state)
+            if discarded:
+                from scripts.whoami import quota_alert
+                with quota_alert.state_file() as quota_state:
+                    for entry_id in discarded:
+                        _ = quota_state.get("workers_move_notices", {}).pop(entry_id, None)
         next_moves.write_next_moves(entries)
-
-    def commit_rule_replacement(self, entries: tuple[next_moves.NextMove, ...], previous_id: str) -> None:
-        # Publish the new ID before clearing the previous rule's state.
-        next_moves.write_next_moves(entries)
-        try:
-            _clear_queued_move_state({previous_id}, {previous_id})
-        except (OSError, ValueError):
-            next_moves.write_next_moves(self.before)
-            raise
 
 
 @contextmanager
 def editing_next_moves() -> Generator[LockedNextMoveEdit]:
-    """Resolve edits under the watch lock, then the log lock."""
+    """Resolve edits under watch then log locks; cleanup must precede the log write."""
     with _watch_lock(), next_moves.next_moves_lock():
         yield LockedNextMoveEdit(next_moves.read_next_moves())
 
@@ -1031,8 +937,6 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     groups: dict[str, list[tuple[inventory_module.Session, TranscriptRefusal | ProofRefusal, refusals.AccountRefusal]]] = {}
     lines: list[str] = []
     selected_groups = accounts.GroupAccounts() if proof_group else accounts.group_accounts()
-    selection_checks = {group: _group_selection(selected_groups, group) for group in
-                        (() if proof_group else accounts.CLAUDE_GROUPS)}
     unconfigured = {group for group in (() if proof_group else accounts.CLAUDE_GROUPS) if isinstance(accounts.group_label(selected_groups, group), accounts.GroupNotConfigured)}
     reported_unconfigured: set[accounts.ClaudeGroup] = set()
     live = [session for session in sessions.live_sessions()
@@ -1205,10 +1109,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         all_members = _action_group_members()
 
     moved_groups: set[accounts.ClaudeGroup] = set()
-    busy_groups: set[accounts.ClaudeGroup] = set()
     no_room_groups: set[accounts.ClaudeGroup] = set()
-    if not dry_run and state != original_state:
-        _save_state(state)
     for login, group in groups.items():
         group_name = cast(accounts.ClaudeGroup, login.removeprefix("group:")) if login.startswith("group:") else "ungrouped"
         if group_name in waiting_groups:
@@ -1246,111 +1147,92 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             else:
                 assert isinstance(placed.label, str) and isinstance(placed.dir, Path)
                 chosen = accounts.PickedAccount(placed.label, placed.dir, 0, accounts.NoResetKnown())
-        with ExitStack() as claim_scope:
-            held_claim: accounts.GroupSelectionClaim | accounts.AcquireGroupSelectionClaim = accounts.ACQUIRE_GROUP_SELECTION_CLAIM
-            if not dry_run and group_name != "ungrouped":
-                try:
-                    held_claim = claim_scope.enter_context(_write_for_selection(
-                        group_name, selection_checks[group_name]))
-                except accounts.GroupMoveBusy:
-                    lines.append(f"{group_name}: {moves.GROUP_MOVE_BUSY_REASON}")
-                    busy_groups.add(group_name)
-                    continue
-                except ObservedGroupSelectionChanged:
-                    busy_groups.add(group_name)
-                    continue
-            if isinstance(chosen, accounts.NoAccountWithRoom):
-                if group_name != "ungrouped":
-                    no_room_groups.add(group_name)
-                text = source + " refused; " + accounts.no_room_line("claude", chosen)
-                lines.extend(f"{session['name']}: refused; {text}" for session, _, _ in group)
-                if not dry_run:
-                    before_decision = deepcopy(state)
-                    for session, refusal, _ in group:
-                        prior = state["sessions"].get(session["session_id"])
-                        if not prior or prior["entry_id"] != refusal.entry_id or prior["state"] != "no room":
-                            move_id = uuid4().hex
-                            moves.append_move(moves.NoRoomMove(kind="no room", at=now.isoformat(), tool="claude",
-                                subject=session["session_id"] + ": " + session["name"], move_id=move_id,
-                                earliest_reset=chosen.earliest_reset.at.isoformat() if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
-                            _set_transition(state, session["session_id"], refusal.entry_id, "no room", move_id)
-                            if prior and prior["entry_id"] == refusal.entry_id and prior["state"] == "retry":
-                                state["sessions"][session["session_id"]]["retry_decision"] = prior["move_id"]
-                    notice_key = login if isinstance(group[0][1], ProofRefusal) else source_login.casefold()
-                    if state["notices"].get(notice_key) != fingerprint:
-                        _ = state["notices"].pop(notice_key, None)
-                        if _notify_no_room(text, now):
-                            state["notices"][notice_key] = fingerprint
-                    if state != before_decision:
-                        _save_state(state)
-                continue
-            first_refusal = group[0][2]
-            window_name = refusals.window_name(first_refusal.window)
-            reset_text = first_refusal.reset.at.astimezone(agent_accounts.user_zone()).isoformat() if isinstance(first_refusal.reset, refusals.KnownReset) else "unknown reset"
-            why = f"{source} refused: {window_name} limit until {reset_text}"
-            move_origin = accounts.RefusalOrigin(refusals.move_window(first_refusal.window), first_refusal.reset)
-            refusal_ids = sorted((session["session_id"], refusal.entry_id) for session, refusal, _ in group)
-            transition = accounts.GroupTransition(uuid5(NAMESPACE_URL, json.dumps(refusal_ids)).hex,
-                                                  move_origin, accounts.RecordedTransitionReason(why))
-            if not dry_run and group_name != "ungrouped":
-                transition = accounts.set_group_account(group_name, chosen.label, why=why, now=now,
-                                                        origin=move_origin, held_claim=held_claim)
-            by_id = {session["session_id"]: refusal for session, refusal, _ in group}
-            batches: dict[str, list[str]] = {}
+        if isinstance(chosen, accounts.NoAccountWithRoom):
             if group_name != "ungrouped":
-                lines.extend(f"{session.name}: refused group {group_name}; move to {chosen.label}" for session in all_members[group_name]
-                             if session.session_id not in {item[0]["session_id"] for item in group})
-            for session, _, _ in group:
-                lines.append(f"{session['name']}: refused; move from {source} to {chosen.label}")
-                prior = state["sessions"].get(session["session_id"])
-                if not dry_run and prior and prior["state"] == "no room":
-                    moves.append_move(moves.RoomAgainMove(kind="room again", at=now.isoformat(), tool="claude",
-                        subject=session["session_id"] + ": " + session["name"], move_id=prior["move_id"], label=chosen.label))
-            if dry_run:
-                if group_name != "ungrouped":
-                    selected_groups[group_name] = chosen.label
-                    moved_groups.add(group_name)
-                continue
+                no_room_groups.add(group_name)
+            text = source + " refused; " + accounts.no_room_line("claude", chosen)
+            lines.extend(f"{session['name']}: refused; {text}" for session, _, _ in group)
+            if not dry_run:
+                for session, refusal, _ in group:
+                    prior = state["sessions"].get(session["session_id"])
+                    if not prior or prior["entry_id"] != refusal.entry_id or prior["state"] != "no room":
+                        move_id = uuid4().hex
+                        moves.append_move(moves.NoRoomMove(kind="no room", at=now.isoformat(), tool="claude",
+                            subject=session["session_id"] + ": " + session["name"], move_id=move_id,
+                            earliest_reset=chosen.earliest_reset.at.isoformat() if isinstance(chosen.earliest_reset, accounts.EarliestReset) else ""))
+                        _set_transition(state, session["session_id"], refusal.entry_id, "no room", move_id)
+                        if prior and prior["entry_id"] == refusal.entry_id and prior["state"] == "retry":
+                            state["sessions"][session["session_id"]]["retry_decision"] = prior["move_id"]
+                notice_key = login if isinstance(group[0][1], ProofRefusal) else source_login.casefold()
+                if state["notices"].get(notice_key) != fingerprint:
+                    _ = state["notices"].pop(notice_key, None)
+                    if _notify_no_room(text, now):
+                        state["notices"][notice_key] = fingerprint
+            continue
+        by_id = {session["session_id"]: refusal for session, refusal, _ in group}
+        batches: dict[str, list[str]] = {}
+        if group_name != "ungrouped":
+            lines.extend(f"{session.name}: refused group {group_name}; move to {chosen.label}" for session in all_members[group_name]
+                         if session.session_id not in {item[0]["session_id"] for item in group})
+        for session, _, _ in group:
+            lines.append(f"{session['name']}: refused; move from {source} to {chosen.label}")
+            prior = state["sessions"].get(session["session_id"])
+            if not dry_run and prior and prior["state"] == "no room":
+                moves.append_move(moves.RoomAgainMove(kind="room again", at=now.isoformat(), tool="claude",
+                    subject=session["session_id"] + ": " + session["name"], move_id=prior["move_id"], label=chosen.label))
+        if dry_run:
             if group_name != "ungrouped":
                 selected_groups[group_name] = chosen.label
                 moved_groups.add(group_name)
-                for session, refusal, _ in group:
-                    _set_transition(state, session["session_id"], refusal.entry_id, "group selected", "")
-                # The chosen group account survives a member's failed request or interrupted delivery.
-                _save_state(state)
-                batches[transition.move_id] = [session.session_id for session in all_members[group_name]]
-            else:
-                for identity, refusal in by_id.items():
-                    prior = state["sessions"].get(identity)
-                    decision = transition.move_id
-                    if prior and prior["entry_id"] == refusal.entry_id:
-                        decision = (prior.get("retry_decision") or
-                                    (prior["move_id"] if prior["state"] == "retry" else "")) or decision
-                    batches.setdefault(decision, []).append(identity)
-                    _set_transition(state, identity, refusal.entry_id, "retry", decision)
-                # The decision survives an interruption before a move returns.
-                _save_state(state)
-            before_results = deepcopy(state)
-            for decision, members in batches.items():
-                available = _available_members(tuple(members)) if group_name == "ungrouped" else tuple(members)
-                intent = (moves.ExplicitMoveTarget.REQUESTED_ACCOUNT if group_name == "ungrouped"
-                          else moves.FollowGroupAccount(group_name))
-                outcomes = accounts.move_sessions(available, chosen.label, why=why, cause="refusal",
-                                                  intent=intent) if available else ()
-                for outcome in outcomes:
-                    lines.append(accounts.move_result_line(outcome))
-                    if (refusal := by_id.get(outcome.session_id)) is None:
-                        continue
-                    accepted = (isinstance(outcome, (stop_results.ClaudeUp, stop_results.MoveHandedOff))
-                                and not isinstance(outcome, moves.MoveInProgress))
-                    _set_transition(state, outcome.session_id, refusal.entry_id,
-                        "requested" if accepted else "group selected" if group_name != "ungrouped" else "retry",
-                        decision if accepted or group_name == "ungrouped" else "")
-            if state != before_results:
-                _save_state(state)
+            continue
+        first_refusal = group[0][2]
+        window_name = refusals.window_name(first_refusal.window)
+        reset_text = first_refusal.reset.at.astimezone(agent_accounts.user_zone()).isoformat() if isinstance(first_refusal.reset, refusals.KnownReset) else "unknown reset"
+        why = f"{source} refused: {window_name} limit until {reset_text}"
+        move_origin = accounts.RefusalOrigin(refusals.move_window(first_refusal.window), first_refusal.reset)
+        refusal_ids = sorted((session["session_id"], refusal.entry_id) for session, refusal, _ in group)
+        transition = accounts.GroupTransition(uuid5(NAMESPACE_URL, json.dumps(refusal_ids)).hex,
+                                              move_origin, accounts.RecordedTransitionReason(why))
+        if group_name != "ungrouped":
+            transition = accounts.set_group_account(group_name, chosen.label, why=why, now=now, origin=move_origin)
+            selected_groups[group_name] = chosen.label
+            moved_groups.add(group_name)
+            for session, refusal, _ in group:
+                _set_transition(state, session["session_id"], refusal.entry_id, "group selected", "")
+            # The chosen group account survives a member's failed request or interrupted delivery.
+            _save_state(state)
+            batches[transition.move_id] = [session.session_id for session in all_members[group_name]]
+        else:
+            for identity, refusal in by_id.items():
+                prior = state["sessions"].get(identity)
+                decision = transition.move_id
+                if prior and prior["entry_id"] == refusal.entry_id:
+                    decision = (prior.get("retry_decision") or
+                                (prior["move_id"] if prior["state"] == "retry" else "")) or decision
+                batches.setdefault(decision, []).append(identity)
+                _set_transition(state, identity, refusal.entry_id, "retry", decision)
+            # The decision survives an interruption before a move returns.
+            _save_state(state)
+        for decision, members in batches.items():
+            available = _available_members(tuple(members)) if group_name == "ungrouped" else tuple(members)
+            intent = (moves.ExplicitMoveTarget.REQUESTED_ACCOUNT if group_name == "ungrouped"
+                      else moves.FollowGroupAccount(group_name))
+            outcomes = accounts.move_sessions(available, chosen.label, why=why, cause="refusal",
+                                              intent=intent) if available else ()
+            for outcome in outcomes:
+                lines.append(accounts.move_result_line(outcome))
+                if (refusal := by_id.get(outcome.session_id)) is None:
+                    continue
+                accepted = (isinstance(outcome, (stop_results.ClaudeUp, stop_results.MoveHandedOff))
+                            and not isinstance(outcome, moves.MoveInProgress))
+                _set_transition(state, outcome.session_id, refusal.entry_id,
+                    "requested" if accepted else "group selected" if group_name != "ungrouped" else "retry",
+                    decision if accepted or group_name == "ungrouped" else "")
     if not proof_group:
+        if not dry_run and state != original_state:
+            _save_state(state)
         before_rules = dict(selected_groups)
-        lines.extend(run_auto_moves(now, dry_run=dry_run, moved_groups=frozenset(moved_groups | busy_groups), account_config=account_config))
+        lines.extend(run_auto_moves(now, dry_run=dry_run, moved_groups=frozenset(moved_groups), account_config=account_config))
         if not dry_run:
             selected_groups = accounts.group_accounts()
             moved_groups.update(group for group in accounts.CLAUDE_GROUPS
@@ -1358,7 +1240,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             state = _load_state()
             original_state = deepcopy(state)
     if not proof_group:
-        skipped = frozenset(moved_groups | waiting_groups | no_room_groups | busy_groups)
+        skipped = frozenset(moved_groups | waiting_groups | no_room_groups)
         if not dry_run:
             # The Mac age rule covers a plan that is not saved, so the save never stops this pass.
             try:
@@ -1369,7 +1251,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                                       refusals_of=lambda ids: {session_id: detected[session_id] for session_id in ids
                                                                if session_id in detected},
                                       stale_after=stale_after))
-    if not proof_group and not dry_run and state != original_state:
+    if not dry_run and state != original_state:
         _save_state(state)
     return lines
 
@@ -1448,23 +1330,14 @@ def _complete_groups(now: datetime, *, dry_run: bool, selected_groups: accounts.
                 latest_requests.get(session.session_id), target, selected_at)]
             if not members:
                 continue
-            target_refused = _target_refused(target, group_name, now, stale_after)
+            if _target_refused(target, group_name, now, stale_after):
+                lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
+                continue
             if dry_run:
-                if target_refused:
-                    lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
-                else:
-                    lines.extend(accounts.move_preview_line(session, target) for session in members)
+                lines.extend(accounts.move_preview_line(session, target) for session in members)
             else:
-                try:
-                    with _write_for_selection(group_name, GroupSelection(target, transition)) as claim:
-                        if target_refused:
-                            lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
-                            continue
-                        if isinstance(transition, accounts.NoGroupTransition):
-                            transition = accounts.set_group_account(group_name, target,
-                                why=f"complete {group_name} move to {target}", now=now, held_claim=claim)
-                except (accounts.GroupMoveBusy, ObservedGroupSelectionChanged):
-                    continue
+                if isinstance(transition, accounts.NoGroupTransition):
+                    transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
                 outcomes = accounts.move_sessions(tuple(session.session_id for session in members), target,
                     why=_completion_why(group_name, target, transition),
                     cause=accounts.move_origin_fields(transition.origin)["cause"],
@@ -1504,12 +1377,13 @@ class CompletionPlanDocument(TypedDict):
 def _save_completion_plan(now: datetime, selected_groups: accounts.GroupAccounts,
                           skipped: frozenset[accounts.ClaudeGroup], stale_after: timedelta) -> None:
     """Save the groups that this pass would complete, for the machines that natedev does not run."""
-    candidates: dict[accounts.ClaudeGroup, tuple[GroupSelection, PlannedCompletionDocument]] = {}
+    groups: dict[str, PlannedCompletionDocument] = {}
     for group_name, target in _eligible_groups(selected_groups, skipped).items():
         transition = accounts.group_transition(group_name)
+        # This pass records a transition for a legacy selection before it moves a local member.
         if isinstance(transition, accounts.NoGroupTransition):
             continue
-        # Omit groups whose refusal evidence cannot be read.
+        # An unreadable refusal store leaves the group out, so the Mac does not move to a refused account.
         try:
             if _target_refused(target, group_name, now, stale_after):
                 continue
@@ -1519,17 +1393,8 @@ def _save_completion_plan(now: datetime, selected_groups: accounts.GroupAccounts
                                           why=_completion_why(group_name, target, transition))
         if transition.at is not None:
             entry["selected_at"] = transition.at.isoformat()
-        candidates[group_name] = (GroupSelection(target, transition), entry)
-
-    groups: dict[str, PlannedCompletionDocument] = {}
-    with ExitStack() as claims:
-        for group_name, (selection, entry) in candidates.items():
-            try:
-                _ = claims.enter_context(_write_for_selection(group_name, selection))
-            except (accounts.GroupMoveBusy, ObservedGroupSelectionChanged):
-                continue
-            groups[group_name] = entry
-        _atomic_json(role_map.completion_plan_file(), CompletionPlanDocument(at=now.isoformat(), groups=groups))
+        groups[group_name] = entry
+    _atomic_json(role_map.completion_plan_file(), CompletionPlanDocument(at=now.isoformat(), groups=groups))
 
 
 def decode_completion_plan(text: str) -> CompletionPlan:
@@ -1669,7 +1534,6 @@ def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: date
     families = accounts.group_model_families(rule.group)
     family = next(iter(families)) if len(families) == 1 else refusals.UNKNOWN_FAMILY
     needs_fable = refusals.FABLE_FAMILY in families
-    measures_fable = rule.when.measure is next_moves.QuotaMeasure.FABLE
     stale_after = timedelta(minutes=account_config.whole("usage_stale_minutes"))
     blocked: list[tuple[AutoMoveRule, BlockedHeadReason]] = []
     for label in (rule.to, *rule.fallback_targets):
@@ -1691,7 +1555,7 @@ def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: date
         target = refusals.usage_reading_with_age("claude", target_usage, checked_at, stale_after)
         weekly = target.weekly if not isinstance(target, refusals.NoReading) else refusals.NoWindow()
         last_read = weekly.at if isinstance(weekly, refusals.ReadingWindow) else NoTargetReading()
-        fable = (target.weekly_fable if (needs_fable or measures_fable) and not isinstance(target, refusals.NoReading)
+        fable = (target.weekly_fable if needs_fable and not isinstance(target, refusals.NoReading)
                  else refusals.NoWindow())
         passed_resets = [window.reset.at for window in (weekly, fable)
                          if isinstance(window, refusals.ReadingWindow)
@@ -1714,27 +1578,20 @@ def _choose_auto_move_target(rule: AutoMoveRule, current_account: str, now: date
                       else TargetReadingUnavailable(last_read))
         elif not isinstance(target, refusals.FreshReading):
             reason = TargetReadingUnavailable(last_read)
-        else:
-            if measures_fable or needs_fable:
-                fable = accounts.fable_weekly_reading(target, checked_at, stale_after)
-            window = fable if measures_fable else target.weekly
-            if isinstance(window, refusals.NoWindow):
+        elif target.weekly.left <= rule.when.percent:
+            reason = TargetAtOrBelowThreshold(target.weekly.left, rule.when.percent)
+        elif refusals.blocking(held_refusals, "claude", sign_in.login, family, target, checked_at) is not None:
+            reason = TargetUnresolvedRefusal()
+        elif needs_fable:
+            fable = accounts.fable_weekly_reading(target, checked_at, stale_after)
+            if isinstance(fable, refusals.NoWindow):
                 reason = TargetAccountUnavailable("no readable Fable weekly window")
-            elif window.left <= rule.when.percent:
-                reason = TargetAtOrBelowThreshold(window.left, rule.when.percent)
-            elif target.weekly.left <= 0:
+            elif fable.left <= 0 or isinstance(target.five_hour, refusals.ReadingWindow) and target.five_hour.left <= 0:
                 reason = TargetAtOrBelowThreshold(0, 0)
-            elif refusals.blocking(held_refusals, "claude", sign_in.login, family, target, checked_at) is not None:
-                reason = TargetUnresolvedRefusal()
-            elif needs_fable:
-                if isinstance(fable, refusals.NoWindow):
-                    reason = TargetAccountUnavailable("no readable Fable weekly window")
-                elif fable.left <= 0 or isinstance(target.five_hour, refusals.ReadingWindow) and target.five_hour.left <= 0:
-                    reason = TargetAtOrBelowThreshold(0, 0)
-                else:
-                    return candidate
             else:
                 return candidate
+        else:
+            return candidate
         blocked.append((candidate, reason))
     return BlockedAutoMoveTargets(tuple(blocked))
 
@@ -1747,8 +1604,8 @@ def _remove_auto_move_entries(entry_ids: frozenset[str]) -> None:
         if isinstance(entry, next_moves.ClaudeGroupMove):
             positions[entry.group] += 1
             if entry.id in entry_ids:
-                threshold = next_moves.format_next_move_threshold(entry.at_percent, entry.measure)
-                lines.append(f"Removed next move {entry.group} {positions[entry.group]} at {threshold} to {entry.to}.")
+                percent = next_moves.format_next_move_percent(entry.at_percent)
+                lines.append(f"Removed next move {entry.group} {positions[entry.group]} at {percent}% to {entry.to}.")
                 continue
         remaining.append(entry)
     if lines:
@@ -1762,146 +1619,28 @@ def _remove_auto_move_entries(entry_ids: frozenset[str]) -> None:
 
 @dataclass(frozen=True)
 class AutoMoveTargetSelected:
-    """The selected account satisfies the entry."""
+    """The selected account already satisfies this queue entry."""
 
 
 @dataclass(frozen=True)
-class AutoMoveNotDue:
-    line: str = ""
+class ObservedGroupSelection:
+    selection: GroupSelection
+    observed_at: datetime
 
 
-@dataclass(frozen=True)
-class AutoMoveCheck:
-    action: AutoMoveRule | AutoMoveTargetSelected | AutoMoveNotDue | BlockedAutoMoveTargets
-    hold: HoldStarted | NoActiveAutoHold
-
-
-@dataclass(frozen=True)
-class PreviewSelection:
-    """The caller can report the decision without writing it."""
-
-
-def _check_auto_move(rule: AutoMoveRule, selection: GroupSelection, observed_at: datetime,
-                     hold: HoldStarted | NoActiveAutoHold, now: datetime, account_config: conf.ConfigRead,
-                     *, dry_run: bool, moved_groups: frozenset[accounts.ClaudeGroup]) -> AutoMoveCheck:
-    if selection.account == rule.to:
-        return AutoMoveCheck(AutoMoveTargetSelected(), NoActiveAutoHold())
-    if isinstance(selection.account, accounts.GroupNotConfigured) or rule.group in moved_groups:
-        return AutoMoveCheck(AutoMoveNotDue(), hold)
-    stale_after = timedelta(minutes=account_config.whole("usage_stale_minutes"))
-    login = accounts.claude_login(accounts.claude_account_dir(selection.account))
-    source = refusals.stored_reading_with_age("claude", login, now, stale_after)
-    if rule.when.measure is next_moves.QuotaMeasure.FABLE:
-        window = accounts.fable_weekly_reading(source, now, stale_after)
-        if isinstance(window, refusals.NoWindow):
-            return AutoMoveCheck(AutoMoveNotDue(
-                f"{rule.group}: {accounts.FABLE_WEEKLY_UNREADABLE} on {selection.account}"), hold)
-    elif isinstance(source, refusals.FreshReading):
-        window = source.weekly
-    else:
-        return AutoMoveCheck(AutoMoveNotDue(), hold)
-    if window.left > rule.when.percent:
-        return AutoMoveCheck(AutoMoveNotDue(), NoActiveAutoHold())
-    mode = rule.when.hold_mode
-    if isinstance(mode, next_moves.HalfPointHold) or mode.minutes > 0:
-        if isinstance(hold, NoActiveAutoHold):
-            duration = next_moves.resolve_hold(mode, selection.account, now, account_config=account_config)
-            hold_rule = HoldRuleScope(rule.group, rule.to, rule.when.measure)
-            hold = HoldStarted(selection.account, observed_at, selection.move_id, rule.when.percent, duration, hold_rule)
-        if (isinstance(hold.duration, next_moves.ResolvedHold)
-                and (now - hold.at).total_seconds() / 60 < hold.duration.minutes):
-            return AutoMoveCheck(AutoMoveNotDue(), hold)
-    chosen = (_choose_auto_move_target(rule, selection.account, now, account_config, dry_run=True) if dry_run
-              else _choose_auto_move_target(rule, selection.account, now, account_config))
-    if isinstance(chosen, AutoMoveRule) and chosen.to == selection.account:
-        return AutoMoveCheck(AutoMoveTargetSelected(), NoActiveAutoHold())
-    return AutoMoveCheck(chosen, hold)
-
-
-def _apply_auto_move_check(rule: AutoMoveRule, selection: GroupSelection, check: AutoMoveCheck,
-                           state: WatchState, now: datetime,
-                           claim: accounts.GroupSelectionClaim | PreviewSelection) -> list[str]:
-    action = check.action
-    dry_run = isinstance(claim, PreviewSelection)
-    before = deepcopy(state)
-    if not dry_run:
-        if isinstance(check.hold, HoldStarted):
-            state.setdefault("auto_move_holds", {})[rule.entry_id] = check.hold
+def _remove_head_if_selected(rule: AutoMoveRule, lines: list[str], *,
+                             dry_run: bool) -> ObservedGroupSelection | AutoMoveTargetSelected:
+    # The caller holds the queue lock during a real pass.
+    with nullcontext() if dry_run else role_map._groups_lock():  # pyright: ignore[reportPrivateUsage]
+        with role_map.supplied_role_map(accounts.read_role_map(fresh=True)):
+            selection = _group_selection(accounts.group_accounts(), rule.group)
+        if selection.account != rule.to:
+            return ObservedGroupSelection(selection, datetime.now(timezone.utc))
+        if dry_run:
+            lines.append(f"{rule.group}: unchanged")
         else:
-            _ = state.get("auto_move_holds", {}).pop(rule.entry_id, None)
-    if isinstance(action, AutoMoveNotDue):
-        lines = [action.line] if action.line else []
-    elif isinstance(action, AutoMoveTargetSelected):
-        lines = [f"{rule.group}: unchanged"] if dry_run else []
-        if not dry_run:
             _remove_auto_move_entries(frozenset({rule.entry_id}))
-            _ = state.get("auto_move_notices", {}).pop(rule.entry_id, None)
-    elif isinstance(action, BlockedAutoMoveTargets):
-        blocked_rule, reason = action.reasons[0]
-        lines = [reason.reason if not rule.fallback_targets and isinstance(reason, TargetAccountUnavailable)
-                 else _record_blocked_head(state, blocked_rule, reason, now, dry_run, other_targets=action.reasons[1:])]
-    else:
-        assert isinstance(selection.account, str)
-        why = f"auto: {rule.entry_id}"
-        if isinstance(claim, PreviewSelection):
-            return [f"{rule.group}: {why}; would move from {selection.account} to {action.to}"]
-        members = _action_group_members()
-        destination = accounts.NamedAccount(action.to, accounts.account_dir(action.to))
-        checked_at = datetime.now(timezone.utc)
-        sign_in = accounts.move_target_sign_in(destination, checked_at)
-        if isinstance(sign_in, accounts.MoveRefused):
-            lines = [_record_blocked_head(state, rule, TargetPreparationRefused(sign_in.reason), checked_at, False)]
-        else:
-            _ = accounts.set_group_account(rule.group, action.to, why=why, now=now, origin=accounts.AutoOrigin(),
-                                           held_claim=claim)
-            _remove_auto_move_entries(frozenset({rule.entry_id}))
-            _ = state.get("auto_move_notices", {}).pop(rule.entry_id, None)
-            _ = state.get("auto_move_holds", {}).pop(rule.entry_id, None)
-            _save_state(state)
-            ids = tuple(member.session_id for member in members.get(rule.group, ()))
-            threshold = next_moves.format_next_move_threshold(rule.when.percent, rule.when.measure)
-            outcomes = accounts.move_sessions(ids, action.to, why=f"{selection.account} at {threshold}", cause="auto",
-                                              intent=moves.FollowGroupAccount(rule.group)) if ids else ()
-            return [f"{rule.group}: {why}; move from {selection.account} to {action.to}",
-                    *(accounts.move_result_line(outcome) for outcome in outcomes)]
-    if not dry_run and state != before:
-        _save_state(state)
-    return lines
-
-
-@dataclass(frozen=True)
-class AutoMoveReplay:
-    consumed: frozenset[str]
-    deferred: frozenset[accounts.ClaudeGroup]
-
-
-def _replay_auto_moves(rules: list[AutoMoveRule], state: WatchState, now: datetime, *, dry_run: bool) -> AutoMoveReplay:
-    deferred: set[accounts.ClaudeGroup] = set()
-    with ExitStack() as claims:
-        if not dry_run:
-            groups = {rule.group for rule in rules}
-            for group in accounts.CLAUDE_GROUPS:
-                if group not in groups:
-                    continue
-                try:
-                    selection = _read_group_selection(group)
-                    _ = claims.enter_context(_write_for_selection(group, selection))
-                except (accounts.GroupMoveBusy, ObservedGroupSelectionChanged):
-                    deferred.add(group)
-        eligible = [rule for rule in rules if rule.group not in deferred]
-        recorded = role_map.repair_selected_auto_moves(tuple(role_map.AutoMoveTarget(rule.entry_id, rule.group, target)
-            for rule in eligible for target in (rule.to, *rule.fallback_targets)), now, dry_run=dry_run)
-        consumed = frozenset(rule.entry_id for rule in eligible
-                             if isinstance(recorded, RecordedAutoMoves) and rule.entry_id in recorded.entry_ids)
-        if consumed and not dry_run:
-            before = deepcopy(state)
-            _remove_auto_move_entries(consumed)
-            for entry_id in consumed:
-                _ = state.get("auto_move_holds", {}).pop(entry_id, None)
-                _ = state.get("auto_move_notices", {}).pop(entry_id, None)
-            if state != before:
-                _save_state(state)
-    return AutoMoveReplay(consumed, frozenset(deferred))
+        return AutoMoveTargetSelected()
 
 
 def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
@@ -1915,29 +1654,113 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
     lines = [rule.reason for rule in configured if isinstance(rule, UnreadableNextMoveLog)]
     state = _load_state()
     original = deepcopy(state)
+    holds = state.get("auto_move_holds", {})
+    notices = state.get("auto_move_notices", {})
     heads: dict[accounts.ClaudeGroup, AutoMoveRule] = {}
     for rule in rules:
         _ = heads.setdefault(rule.group, rule)
     head_ids = {rule.entry_id for rule in heads.values()}
-    for hold_ids in (state.get("auto_move_holds", {}), state.get("auto_move_notices", {})):
-        for entry_id in set(hold_ids) - head_ids:
-            del hold_ids[entry_id]
+    for entry_id in set(holds) - head_ids:
+        del holds[entry_id]
+    for entry_id in set(notices) - head_ids:
+        del notices[entry_id]
+    recorded = role_map.repair_selected_auto_moves(tuple(role_map.AutoMoveTarget(rule.entry_id, rule.group, target)
+        for rule in rules for target in (rule.to, *rule.fallback_targets)), now, dry_run=dry_run)
+    consumed: frozenset[str] = (recorded.entry_ids & {rule.entry_id for rule in rules}
+                if isinstance(recorded, RecordedAutoMoves) else frozenset())
+    if consumed:
+        for entry_id in consumed:
+            _ = holds.pop(entry_id, None)
+            _ = notices.pop(entry_id, None)
+        if not dry_run:
+            _remove_auto_move_entries(consumed)
+    # A successor starts on a later pass, even when replay consumes its head here.
+    rules = [rule for rule in heads.values() if rule.entry_id not in consumed]
+    if not rules:
+        if not dry_run and state != original:
+            _save_state(state)
+        return lines
+    moved = set(moved_groups)
+    stale_after = timedelta(minutes=account_config.whole("usage_stale_minutes"))
+    for rule in rules:
+        observed = _remove_head_if_selected(rule, lines, dry_run=dry_run)
+        if isinstance(observed, AutoMoveTargetSelected):
+            _ = holds.pop(rule.entry_id, None)
+            _ = notices.pop(rule.entry_id, None)
+            continue
+        selection = observed.selection
+        hold = holds.get(rule.entry_id)
+        if hold is not None and not hold.is_current(selection, rule.when.percent):
+            del holds[rule.entry_id]
+        if (isinstance(selection.account, accounts.GroupNotConfigured)
+                or rule.group in moved):
+            continue
+        source_login = accounts.claude_login(accounts.claude_account_dir(selection.account))
+        source = refusals.stored_reading_with_age("claude", source_login, now, stale_after)
+        if not isinstance(source, refusals.FreshReading):
+            continue
+        if source.weekly.left > rule.when.percent:
+            _ = holds.pop(rule.entry_id, None)
+            continue
+        if isinstance(rule.when.hold_mode, next_moves.HalfPointHold) or rule.when.hold_mode.minutes > 0:
+            if rule.entry_id not in holds:
+                holds[rule.entry_id] = HoldStarted(selection.account, observed.observed_at, selection.move_id, rule.when.percent,
+                                                  next_moves.resolve_hold(rule.when.hold_mode, selection.account, now, account_config=account_config))
+                state["auto_move_holds"] = holds
+            started = holds[rule.entry_id]
+            if isinstance(started.duration, LegacyHoldDuration):
+                started = HoldStarted(started.account, started.at, started.move_id, started.percent,
+                                      next_moves.resolve_hold(rule.when.hold_mode, selection.account, now, account_config=account_config))
+                holds[rule.entry_id] = started
+                state["auto_move_holds"] = holds
+            if (isinstance(started.duration, next_moves.ResolvedHold)
+                    and (now - started.at).total_seconds() / 60 < started.duration.minutes):
+                continue
+        if dry_run:
+            chosen = _choose_auto_move_target(rule, selection.account, now, account_config, dry_run=True)
+        else:
+            chosen = _choose_auto_move_target(rule, selection.account, now, account_config)
+        if isinstance(chosen, BlockedAutoMoveTargets):
+            blocked_rule, reason = chosen.reasons[0]
+            if not rule.fallback_targets and isinstance(reason, TargetAccountUnavailable):
+                lines.append(reason.reason)
+            else:
+                lines.append(_record_blocked_head(state, blocked_rule, reason, now, dry_run,
+                                                  other_targets=chosen.reasons[1:]))
+            continue
+        if selection.account == chosen.to:
+            if isinstance(_remove_head_if_selected(chosen, lines, dry_run=dry_run), AutoMoveTargetSelected):
+                _ = holds.pop(rule.entry_id, None)
+                _ = notices.pop(rule.entry_id, None)
+            continue
+        why = f"auto: {rule.entry_id}"
+        if dry_run:
+            lines.append(f"{rule.group}: {why}; would move from {selection.account} to {chosen.to}")
+            moved.add(rule.group)
+            continue
+        members = _action_group_members()
+        destination = accounts.NamedAccount(chosen.to, accounts.account_dir(chosen.to))
+        checked_at = datetime.now(timezone.utc)
+        sign_in = accounts.move_target_sign_in(destination, checked_at)
+        if isinstance(sign_in, accounts.MoveRefused):
+            lines.append(_record_blocked_head(state, rule, TargetPreparationRefused(sign_in.reason), checked_at, dry_run))
+            continue
+        rule = chosen
+        _ = accounts.set_group_account(rule.group, rule.to, why=why, now=now, origin=accounts.AutoOrigin())
+        _ = notices.pop(rule.entry_id, None)
+        lines.append(f"{rule.group}: {why}; move from {selection.account} to {rule.to}")
+        moved.add(rule.group)
+        _ = holds.pop(rule.entry_id, None)
+        # Remove the entry after the role writer records the selection.
+        _remove_auto_move_entries(frozenset({rule.entry_id}))
+        _save_state(state)
+        ids = tuple(member.session_id for member in members.get(rule.group, ()))
+        percent = str(rule.when.percent).removesuffix(".0")
+        outcomes = accounts.move_sessions(ids, rule.to, why=f"{selection.account} at {percent}%", cause="auto",
+                                         intent=moves.FollowGroupAccount(rule.group)) if ids else ()
+        lines.extend(accounts.move_result_line(outcome) for outcome in outcomes)
     if not dry_run and state != original:
         _save_state(state)
-    replay = _replay_auto_moves(rules, state, now, dry_run=dry_run)
-    for rule in heads.values():
-        if rule.entry_id in replay.consumed or rule.group in replay.deferred:
-            continue
-        selection = _read_group_selection(rule.group)
-        observed_at = datetime.now(timezone.utc)
-        hold = _current_saved_hold(state.get("auto_move_holds", {}), rule, selection)
-        check = _check_auto_move(rule, selection, observed_at, hold, now, account_config,
-                                 dry_run=dry_run, moved_groups=moved_groups)
-        try:
-            with nullcontext(PreviewSelection()) if dry_run else _write_for_selection(rule.group, selection) as claim:
-                lines.extend(_apply_auto_move_check(rule, selection, check, state, now, claim))
-        except (accounts.GroupMoveBusy, ObservedGroupSelectionChanged):
-            continue
     return lines
 
 

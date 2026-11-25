@@ -5785,16 +5785,6 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("next", "list")
         self.assertEqual((code, output.strip(), error), (0, "nothing set up", ""))
 
-    def test_next_cli_round_trips_the_fable_measure(self) -> None:
-        self.login_directory("claude2", "target@example.invalid")
-        code, output, error = self.run_cli("next", "add", "units", "4.5", "claude2", "--measure", "fable")
-        self.assertEqual((code, output.strip(), error), (0, "units 1: at 4.5% Fable → claude2", ""))
-        code, output, error = self.run_cli("next", "list")
-        self.assertEqual((code, output.strip(), error), (0, "units 1: at 4.5% Fable → claude2", ""))
-        entry, = next_moves.read_next_moves()
-        assert isinstance(entry, next_moves.ClaudeGroupMove)
-        self.assertIs(entry.measure, next_moves.QuotaMeasure.FABLE)
-
     def test_next_list_numbers_each_group_in_display_order_without_exposing_ids(self) -> None:
         self.login_directory("claude2", "target@example.invalid")
         units = next_moves.add_next_move("units", 1, "claude2", 40)

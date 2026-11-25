@@ -9,7 +9,6 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import html
 from http.client import HTTPConnection
-from http.server import ThreadingHTTPServer
 import io
 import json
 import os
@@ -23,8 +22,7 @@ import threading
 import unittest
 from types import SimpleNamespace
 from typing import cast, override
-from unittest.mock import ANY, patch
-from urllib.parse import urlencode
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results, newer_script_reload_results
@@ -79,14 +77,6 @@ def move_progress_fixture() -> moves.MoveProgress:
     )
 
 
-def first_moves(*entries: next_moves.NextMove) -> accounts.FirstNextMoveEntries:
-    return accounts.FirstNextMoveEntries({entry.group: entry for entry in entries})
-
-
-def claude_move(group: accounts.ClaudeGroup, label: str) -> next_moves.ClaudeGroupMove:
-    return next_moves.ClaudeGroupMove(f"{group}-fixture", group, 1, 0, label, AT)
-
-
 def sort_reading() -> accounts.StatusReading:
     """Include shared accounts, tied values, zero values, and missing values."""
     return accounts.StatusReading((
@@ -103,7 +93,7 @@ def sort_reading() -> accounts.StatusReading:
         replace(status_row("codex2"), tool="codex", roles=("spare",), role_counts=(accounts.NoRoleCount(),),
                 weekly_left_percent=accounts.StatusUnavailable("fixture"), resets_at=AT + timedelta(days=2),
                 credits="unlimited", use_credits=True)), (), (), timezone.utc, AT,
-        first_next_moves=first_moves(claude_move("units", "claude3"), claude_move("showrunners", "claude1")))
+        first_next_moves=accounts.FirstNextMoveTargets({"units": "claude3", "showrunners": "claude1"}))
 
 
 def rendered_sort_orders(markup: str, table: str) -> dict[str, list[int]]:
@@ -250,12 +240,6 @@ class MovesBoardTests(unittest.TestCase):
         self.assertIn('<span class="next-muted">Next:</span> report. 1 more units wait.</p>', board)
         self.assertEqual(moves.move_display_reason("auto", "auto: fixture@example.invalid"), "scheduled quota limit")
         self.assertEqual(moves.move_display_reason("auto", "claude3 at 1e-05%"), "claude3 at 1e-05%")
-        fable = replace(move, reason=moves.move_display_reason("auto", "claude1 at 20% Fable"))
-        board = accounts_page.moves_board((fable,), AT, ZoneInfo("America/Los_Angeles"), 75)
-        self.assertIn("automatic · claude1 at 20% Fable", board)
-        for suffix in (" fable", "  Fable", " Fable ", " Fable fixture@example.invalid"):
-            with self.subTest(suffix=suffix):
-                self.assertEqual(moves.move_display_reason("auto", "claude1 at 20%" + suffix), "scheduled quota limit")
 
     def test_move_failure_text_uses_the_saved_kind_and_reads_old_records(self) -> None:
         scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -346,115 +330,96 @@ class MovesBoardTests(unittest.TestCase):
 
 MENU_SETUP = '''<script>
 let reads=0;const saves=[];const realFetch=fetch;let freshPage=FRESH_PAGE;
-window.fetch=(path,options)=>options?.method==='POST' ? new Promise((resolve,reject)=>saves.push({options,resolve,reject}))
+window.fetch=(path,options)=>options?.method==='POST' ? new Promise(resolve=>saves.push({options,resolve}))
  : (reads++,Promise.resolve({ok:true,text:async()=>freshPage}));
 </script>'''
 
-MOVE_DIALOG_PROBE = '''<script>
+MENU_PROBE = '''<script>
 (async()=>{
  const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
  const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>setTimeout(resolve,0))));
- const dialog=document.querySelector('[data-move-dialog]'), form=dialog.querySelector('form');
- const button=group=>document.querySelector('[data-next-button][data-move-group="'+group+'"]');
- const target=value=>form.querySelector('[name="target"][value="'+value+'"]');
- const measure=value=>form.querySelector('[name="measure"][value="'+value+'"]');
- const percent=form.elements.namedItem('percent'), save=form.querySelector('[data-move-submit]');
- const cancel=form.querySelector('[data-move-cancel]'), now=form.querySelector('[data-move-now]');
- const error=form.querySelector('[data-move-error]');
- let nativeValidation=0;form.addEventListener('invalid',()=>nativeValidation++,true);
- const fields=index=>Object.fromEntries(new URLSearchParams(saves[index].options.body));
- const reply=(index,ok,result)=>saves[index].resolve({ok,json:async()=>result});
- const key=(name,shiftKey=false)=>document.activeElement.dispatchEvent(new KeyboardEvent('keydown',
-  {key:name,bubbles:true,cancelable:true,shiftKey}));
- const starts=group=>{button(group).focus();key('Enter');};
+ const state=()=>document.querySelector('[data-page-status]').dataset.state;
+ const menu=document.querySelector('[data-move-menu]');
+ const items=()=>[...menu.querySelectorAll('[data-move-target]')];
+ const button=()=>document.querySelector('[data-next-button]');
+ const open=()=>button().click();
+ const activate=name=>button().dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
+ const key=name=>menu.dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
+ const groupRow=()=>button().closest('tr');
  try{
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
   frameElement.style.width='800px';frameElement.style.height='480px';await flush();
-  const state=()=>document.querySelector('[data-page-status]').dataset.state;
-  starts('units');
-  check(dialog.open && button('units').getAttribute('aria-haspopup')==='dialog','Enter opens a dialog');
-  check(dialog.querySelector('#move-title').textContent==='Next move of units' &&
-   dialog.querySelector('[data-move-current]').textContent==='The units run on claude1 now.','the form names the role and account');
-  check(percent.value==='4.5' && measure('fable').checked && target('claude2').checked,'the form reads the units settings');
-  check(target('claude2').parentElement.textContent==='claude260% left' &&
-   target('claude2').nextElementSibling.style.color==='rgb(178, 148, 187)','a target shows quota and account color');
-  check(!target('claude1') && !target('codex1'),'the current and Codex accounts are excluded');
-  check(document.activeElement===target('claude2') && state()==='Paused','focus enters the dialog and refresh pauses');
-  key('Tab',true);check(document.activeElement===save,'Shift+Tab wraps to Save');
-  key('Tab');check(document.activeElement===target('claude2'),'Tab wraps to the selected target');
-  target('claude3').click();measure('all-models').click();percent.value='7.5';
-  check(saves.length===0,'editing sends no request');
+  check(document.querySelectorAll('[data-move-group]').length===1 && button().dataset.moveAccount==='claude1'
+   && button().dataset.moveGroup==='units','only the selected Claude group line takes the menu');
+  check(document.querySelectorAll('[data-next-button]').length===1,'only the selected Claude line has a button');
+  const keepsBrowserMenu=cell=>cell.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true})) && menu.hidden;
+  const unselected=document.querySelector('[data-color-key="account.claude2"]').closest('tr');
+  check(keepsBrowserMenu(groupRow().cells[3]),'the selected row keeps the browser menu');
+  check(keepsBrowserMenu(unselected.cells[1]),'the unselected row keeps the browser menu');
+  open();
+  check(!menu.hidden && button().getAttribute('aria-expanded')==='true','a click opens the menu');
+  check(menu.querySelector('[data-move-title]').textContent==='When claude1 reaches 1%, move units to',
+   'the title names the account, percent and group');
+  check(JSON.stringify(items().map(item=>item.dataset.moveTarget))==='["claude2","claude3"]','the menu lists the other Claude accounts');
+  check(items()[0].textContent==='claude260% left' && items()[1].textContent==='claude3',
+   'each item shows the weekly percent left when known');
+  check(items()[0].querySelector('.move-name').style.color==='rgb(178, 148, 187)','each item uses the account color');
+  check(items()[0].querySelector('.move-left').className==='move-left','a healthy percent keeps the plain tone');
+  check(document.activeElement===items()[0],'the first item takes the focus');
+  key('ArrowDown');check(document.activeElement===items()[1],'ArrowDown moves to the next item');
+  key('ArrowDown');check(document.activeElement===menu.querySelector('[data-move-clear]'),'ArrowDown reaches No next move');
+  key('ArrowDown');check(document.activeElement===items()[0],'ArrowDown wraps to the first item');
+  key('ArrowUp');check(document.activeElement===menu.querySelector('[data-move-clear]'),'ArrowUp wraps to the last item');
+  key('Home');check(document.activeElement===items()[0],'Home moves to the first item');
+  key('End');check(document.activeElement===menu.querySelector('[data-move-clear]'),'End moves to the last item');
+  const box=menu.getBoundingClientRect();
+  check(box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight,'the menu fits the viewport');
+  check(items()[0].getAttribute('role')==='menuitemradio' && items()[0].getAttribute('aria-checked')==='true'
+   && items()[1].getAttribute('aria-checked')==='false','the current target is marked');
   key('Escape');
-  check(!dialog.open && document.activeElement===button('units'),'Escape returns focus to the next cell');
-  starts('showrunners');
-  check(percent.value==='2' && measure('all-models').checked && target('claude1').checked,'the form reads the other role settings');
-  cancel.click();
-  check(!dialog.open && saves.length===0 && document.activeElement===button('showrunners'),'Cancel sends no request');
-  starts('units');
-  check(percent.value==='4.5' && measure('fable').checked && target('claude2').checked,'reopening discards local edits');
-  const saveFailure='The settings were not saved. Try again.';
-  target('claude3').click();
-  for(const invalid of ['101','-1','']){
-   percent.value=invalid;save.click();
-   check(saves.length===0 && dialog.open && percent.value===invalid && document.activeElement===percent &&
-    nativeValidation===0 && !error.hidden && error.textContent===saveFailure,
-    'invalid percent shows the form message and keeps the edit: '+invalid);
-  }
-  percent.value='9.25';save.click();
-  check(JSON.stringify(fields(0))===JSON.stringify({group:'units',to:'claude3',percent:'9.25',measure:'fable'}),
-   'Save sends the target, percent, and measure');
-  reply(0,false,{reason:'next: cannot set entry: busy'});await flush();
-  const moveFailure='The move did not start. Try again.';
-  check(dialog.open && !error.hidden && error.textContent===saveFailure && percent.value==='9.25',
-   'Save failure keeps the dialog and edits and shows the form message');
-  save.click();reply(1,true,{state:'saved'});await flush();await flush();
-  check(!dialog.open && document.activeElement===button('units'),'Save closes the dialog and keeps focus across a refresh');
-  starts('units');
-  target('claude3').click();percent.value='88';measure('all-models').click();now.click();
-  check(JSON.stringify(fields(2))===JSON.stringify({group:'units',move_now:'claude3'}),
-   'Move now posts only the role and target');
-  saves[2].resolve({ok:false,status:409,json:async()=>({state:'move-in-progress',reason:'fixture details'})});
-  await flush();
-  check(dialog.open && error.textContent==='Another move is in progress. Try again when it ends.',
-   'Move now shows the in-progress message');
-  now.click();reply(3,false,{reason:'private launcher error'});await flush();
-  check(dialog.open && error.textContent===moveFailure,'a launch refusal shows the move message');
-  now.click();saves[4].reject(new DOMException('fixture deadline','TimeoutError'));await flush();
-  check(dialog.open && error.textContent===moveFailure,'a Move now timeout shows the move message');
-  now.click();reply(5,true,{state:'saved'});await flush();await flush();
-  starts('units');
-  check(percent.value==='4.5' && measure('fable').checked,'Move now did not save the edits');
-  target('').click();check(now.disabled && saves.length===6,'No next move disables Move now and sends no request');
-  percent.value='';save.click();
-  check(JSON.stringify(fields(6))===JSON.stringify({group:'units',clear:'first'}),'Save clears the first entry without percent validation');
-  saves[6].resolve({ok:true,json:async()=>{throw new SyntaxError('fixture bad JSON');}});await flush();
-  check(dialog.open && error.textContent===saveFailure,'a bad Clear reply shows the save message');
-  save.click();saves[7].reject(new TypeError('fixture network error'));await flush();
-  check(dialog.open && error.textContent===saveFailure,'a Clear network error shows the save message');
-  save.click();
+  button().style.cssText='position:fixed;right:0;bottom:0';open();
+  const edge=menu.getBoundingClientRect();
+  check(edge.left>=8 && edge.top>=8 && edge.right<=innerWidth-7.5 && edge.bottom<=innerHeight-7.5,
+   'a button at the corner keeps the menu inside the viewport:'+JSON.stringify([edge.left,edge.top,edge.right,edge.bottom,innerWidth,innerHeight]));
+  check(state()==='Paused','an open menu pauses refresh');
+  key('Escape');check(menu.hidden && state()!=='Paused' && document.activeElement===button()
+   && button().getAttribute('aria-expanded')==='false','Escape closes the menu, returns focus and resumes refresh');
+  button().style.cssText='';activate('Enter');check(!menu.hidden,'Enter opens the menu');
+  key('Escape');activate(' ');check(!menu.hidden,'Space opens the menu');
+  key('Escape');
+  open();
+  document.body.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
+  check(menu.hidden && document.activeElement===button(),'a click outside closes the menu and returns focus');
+  open();
+  const readsBefore=reads;
+  items()[1].click();
+  check(menu.hidden && saves.length===1,'a choice closes the menu and posts once');
+  const form=new URLSearchParams(saves[0].options.body);
+  check(form.get('group')==='units' && form.get('to')==='claude3' && [...form.keys()].length===2 &&
+   saves[0].options.headers['Content-Type']==='application/x-www-form-urlencoded','the post names the group and the account');
+  check(state()==='Paused','a pending move holds refresh');
+  saves[0].resolve({ok:true,json:async()=>({state:'saved'})});await flush();await flush();
+  check(reads===readsBefore+1 && state()!=='Paused','a saved move reloads the board');
+  open();items()[0].click();
+  saves[1].resolve({ok:false,json:async()=>({reason:'next: cannot set entry: busy'})});await flush();
+  const error=document.querySelector('[data-color-save-error]');
+  check(!error.hidden && error.textContent==='units: next: cannot set entry: busy','a failed move reports its reason in the status line');
+  open();menu.querySelector('[data-move-clear]').click();
+  const cleared=new URLSearchParams(saves[2].options.body);
+  check(cleared.get('group')==='units' && cleared.get('clear')==='first' && [...cleared.keys()].length===2,
+   'No next move posts only the group and clear=first');
+  check(menu.hidden && document.activeElement===button(),'clear returns focus to the button');
   freshPage=EMPTY_PAGE;
-  reply(8,true,{state:'saved'});await flush();await flush();
-  starts('units');
-  check(percent.value==='1' && measure('all-models').checked && target('').checked && now.disabled,
-   'an empty group uses the configured percent and all models');
-  const edge=dialog.getBoundingClientRect();
-  check(edge.left>=7.5 && edge.top>=7.5 && edge.right<=innerWidth-7.5 && edge.bottom<=innerHeight-7.5,
-   'the dialog stays inside the viewport');
-  cancel.click();
-  freshPage=UNAVAILABLE_PAGE;
-  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
-  starts('units');
-  const unavailable=form.querySelector('[data-move-unavailable]');
-  check(dialog.open && !unavailable.hidden && unavailable.textContent==='The next moves cannot be read now.',
-   'the dialog names an unavailable queue');
-  check(save.disabled && now.disabled && percent.matches(':disabled') && document.activeElement===cancel,
-   'an unavailable queue disables both actions and focuses Cancel');
-  key('Tab');check(document.activeElement===cancel,'focus stays in the unavailable dialog');
-  now.click();save.click();check(saves.length===9,'an unavailable queue sends no POST');
-  cancel.click();
+  saves[2].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
+  check(button().closest('td').querySelector('.next-muted').textContent==='none','clear refreshes the cell to none');
+  open();check(!menu.querySelector('[data-move-clear]'),'an empty group has no clear item');key('Escape');
+  open();dispatchEvent(new Event('resize'));check(menu.hidden,'resize closes the menu');
+  open();dispatchEvent(new Event('scroll'));check(menu.hidden,'scroll closes the menu');
+
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
+
 
 class AccountsPageTests(unittest.TestCase):
     review_root: Path = Path()
@@ -1384,7 +1349,7 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                     codex_weekly_freshness=accounts.CodexWeeklyFreshness.FRESH),
             replace(exhausted, label="codex3", tool="codex", weekly_left_percent=accounts.StatusUnavailable()),
         )
-        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
         probe = """<script>
 const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
 const canvas=document.createElement('canvas').getContext('2d',{willReadFrequently:true});
@@ -1515,7 +1480,7 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                     role_counts=(accounts.RoleSessionCounts(8, 0, 0, 0),)),
         )
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
-                                         first_next_moves=first_moves(claude_move("units", "claude1")))
+                                         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude1"}))
         markup = accounts_page.board(reading)
         roles_table = markup.split('<h2>Roles</h2>', 1)[1]
         units, other, _ = roles_table.split(">units</span>", 1)[1].split("</tr>", 2)
@@ -1567,7 +1532,7 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 
     def test_a_role_with_one_account_keeps_its_row(self) -> None:
         reading = accounts.StatusReading((replace(status_row("claude1"), selected_roles=("units",)),), (),
-                                         (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
+                                         (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
         roles = accounts_page.board(reading).split('aria-label="Roles"', 1)[1].split("</table>", 1)[0]
         units = roles.split(">units</span>", 1)[1].split("</tr>", 1)[0]
         self.assertEqual(roles.count("<tr>"), 5)
@@ -1607,7 +1572,7 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
             replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
         )
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
-                                         first_next_moves=first_moves(claude_move("units", "claude2")))
+                                         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2"}))
         markup = accounts_page.board(reading)
         account_table, roles_table = markup.split('aria-label="Roles"', 1)
         self.assertIn('data-next-button', account_table)
@@ -1776,7 +1741,7 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                         weekly_left_percent=30),
                 replace(status_row("codex2"), tool="codex", roles=("workers",), selected_roles=("workers",),
                         weekly_left_percent=20))
-        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
 
         def left(*percents: float | accounts.StatusUnavailable) -> accounts.StatusReading:
             return replace(reading, rows=(rows[0], *(replace(row, weekly_left_percent=percent)
@@ -1814,8 +1779,7 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         for invalid in ("#12345", "not-a-color", ""):
             with self.subTest(color=invalid):
                 self.assertEqual([style for style, _, _ in pair(reading, invalid)], ["", ""])
-        worker_target = next_moves.WorkersToClaude(next_moves.ClaudeWorkersTarget("claude1"))
-        targeted = replace(reading, first_next_moves=first_moves(next_moves.WorkersMove("fixture", 1, worker_target, AT)))
+        targeted = replace(reading, first_next_moves=accounts.FirstNextMoveTargets({"workers": "claude1"}))
         self.assertNotIn("auto-pair", accounts_page.board(targeted))
         self.assertIn("tr.auto-pair+tr.auto-pair td{border-top-color:transparent}", accounts_page.STYLE)
 
@@ -1827,7 +1791,7 @@ fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                         named_sessions_by_role={"units": (accounts.NamedSession("tile", "paused"),)}),
                 replace(status_row("codex1"), tool="codex", roles=("spare",), role_counts=(accounts.NoRoleCount(),)),
                 replace(status_row("codex2"), tool="codex", roles=("workers",), selected_roles=("workers",)))
-        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
         with patch.object(accounts, "read_status", return_value=reading):
             page = accounts_page.page().decode()
         # The refreshed reading drains both Codex accounts, so the pair text changes.
@@ -1910,7 +1874,7 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
             replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
         )
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
-                                         first_next_moves=first_moves(claude_move("units", "claude3")))
+                                         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude3"}))
         orders = rendered_sort_orders(accounts_page.board(reading), "accounts")
 
         self.assertEqual(orders["next"], [3, 1, 0, 2])
@@ -2366,11 +2330,10 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
                              credits=123, use_credits=True)
                      if row.label == "claude1" else replace(row, selected_roles=()) for row in reading.rows)
         reading = replace(reading, rows=rows,
-                          first_next_moves=first_moves(claude_move("units", "claude2"),
-                                                      claude_move("showrunners", "claude3")))
+                          first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2", "showrunners": "claude3"}))
         with patch.object(accounts, "read_status", return_value=reading):
             rendered = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
-        fresh = replace(reading, first_next_moves=first_moves(claude_move("units", "claude3")))
+        fresh = replace(reading, first_next_moves=accounts.FirstNextMoveTargets({"units": "claude3"}))
         with patch.object(accounts, "read_status", return_value=fresh):
             refreshed = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
         setup = '''<script>
@@ -2398,8 +2361,8 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
   check(JSON.stringify(details(showrunners))===JSON.stringify(empty),'the added row starts with no account data');
   const button=next(units).querySelector('[data-next-button]');
   button.click();
-  const menu=document.querySelector('[data-move-dialog]');
-  check(menu.open && nextHeader.getAttribute('aria-sort')==='none'
+  const menu=document.querySelector('[data-move-menu]');
+  check(!menu.hidden && nextHeader.getAttribute('aria-sort')==='none'
    && rows().every((row,index)=>row===original[index]),'the next button preserves the sort');
   menu.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
   nextHeader.click();
@@ -2591,7 +2554,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         self.assertEqual(markup.count("data-move-group="), 1)
         targets = json.dumps([["claude1", "60%", "#af875f", "default"], ["claude2", "12%", "#b294bb", "warning"]])
         self.assertIn('data-move-percent="1"', markup)
-        self.assertIn(f'data-move-targets="{html.escape(targets, quote=True)}"', markup)
+        self.assertIn(f'data-move-targets="{html.escape(targets, quote=True)}">', markup)
         settings = Path(os.environ["CONF_DIR"]) / "accounts.conf"
         _ = write_config_fixture(settings, "next_move_percent=2.5\n")
         self.assertIn('data-move-percent="2.5"', accounts_page.board(reading))
@@ -2601,7 +2564,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 status_row("claude2"),
                 replace(status_row("codex1"), tool="codex", roles=("producers",)))
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
-            first_next_moves=first_moves(claude_move("producers", "claude2")))
+            first_next_moves=accounts.FirstNextMoveTargets({"producers": "claude2"}))
         markup = accounts_page.board(reading)
         self.assertIn('data-move-account="claude1" data-move-group="producers"', markup)
         self.assertIn('data-next-target="claude2" data-move-account="claude1" data-move-group="producers"', markup)
@@ -2611,7 +2574,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         row = replace(status_row("claude1"), roles=("showrunners", "producers"),
                       selected_roles=("showrunners", "producers"), inherited_roles=("producers",))
         reading = accounts.StatusReading((row,), (), (), timezone.utc, AT,
-                                         first_next_moves=accounts.FirstNextMoveEntries())
+                                         first_next_moves=accounts.FirstNextMoveTargets())
         markup = accounts_page.board(reading)
         self.assertIn('data-move-account="claude1" data-move-group="producers"', markup)
         self.assertIn('> (inherited)</span>', markup)
@@ -2622,9 +2585,8 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 status_row("claude2"), replace(status_row("claude3"), roles=("spare",)),
                 replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
                 replace(status_row("codex2"), tool="codex", roles=("spare",)))
-        worker_move = next_moves.WorkersMove("workers-fixture", 1, next_moves.CodexWorkersTarget("codex2"), AT)
-        for first in (first_moves(claude_move("units", "claude2"), worker_move),
-                      accounts.FirstNextMoveEntries(), accounts.NextMovesUnavailable("fixture damaged log")):
+        for first in (accounts.FirstNextMoveTargets({"units": "claude2", "workers": "codex2"}),
+                      accounts.FirstNextMoveTargets(), accounts.NextMovesUnavailable("fixture damaged log")):
             with self.subTest(first=first):
                 markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=first))
                 account_table, roles_table = markup.split('aria-label="Roles"', 1)
@@ -2636,13 +2598,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 self.assertEqual(len(cells), 6)
                 units, showrunners, unselected, spare, workers, codex_spare = cells
                 # With no Claude target for workers, the spare Codex account takes workers in turn and reads auto.
-                workers_auto = isinstance(first, accounts.FirstNextMoveEntries) and "workers" not in first.entries
+                workers_auto = isinstance(first, accounts.FirstNextMoveTargets) and "workers" not in first.targets
                 for cell in (unselected, spare, *(() if workers_auto else (codex_spare,))):
                     self.assertIn('title="Not the selected account for a role"', cell)
                     self.assertIn('lucide-minus', cell)
                 for cell, group in ((units, "units"), (showrunners, "showrunners")):
                     self.assertIn(f'aria-label="Choose the next account for {group}"', cell)
-                    self.assertIn('aria-haspopup="dialog" aria-expanded="false"', cell)
+                    self.assertIn('aria-haspopup="menu" aria-expanded="false"', cell)
                     self.assertIn('lucide-chevron-down', cell)
                 self.assertNotIn('<button', workers)
                 if isinstance(first, accounts.NextMovesUnavailable):
@@ -2651,7 +2613,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                         self.assertIn('fixture damaged log', cell)
                 else:
                     self.assertIn('>none</span>', showrunners)
-                    if first.entries:
+                    if first.targets:
                         self.assertIn('data-color-text="account.claude2">claude2</span>', units)
                         self.assertIn('style="color:#123456" data-color-text="account.codex2">codex2</span>', workers)
                     else:
@@ -2664,7 +2626,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
     def test_muted_next_cells_meet_the_contrast_floors_in_both_themes(self) -> None:
         rows = (replace(status_row("claude1"), selected_roles=("units",)), status_row("claude2"),
                 replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)))
-        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
         boards = accounts_page.board(reading) + accounts_page.board(replace(
             reading, first_next_moves=accounts.NextMovesUnavailable("fixture unavailable")))
         probe = '''<script>
@@ -2724,199 +2686,35 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             with patch.object(next_moves, "read_next_moves", side_effect=next_moves.NextMoveError("fixture damaged log")):
                 self.assertEqual(accounts_page.clear_next_move("units"), accounts_page.SaveFailed("fixture damaged log"))
 
-    def test_next_move_save_checks_the_group_and_account_then_sets_the_submitted_threshold(self) -> None:
+    def test_next_move_save_checks_the_group_and_account_then_sets_the_first_entry_at_the_configured_percent(self) -> None:
         with patch.object(next_moves, "set_first_next_move") as setter:
-            self.assertEqual(accounts_page.save_next_move_settings("workers", "claude2", "2.5", "fable"),
+            self.assertEqual(accounts_page.save_next_move("workers", "claude2"),
                              accounts_page.Refused("Choose units, showrunners, or producers."))
             with patch.object(accounts, "claude_account_dir", side_effect=accounts.AccountsError("accounts: claude9 has no note")):
-                self.assertEqual(accounts_page.save_next_move_settings("units", "claude9", "2.5", "fable"),
+                self.assertEqual(accounts_page.save_next_move("units", "claude9"),
                                  accounts_page.Refused("accounts: claude9 has no note"))
             setter.assert_not_called()
         with patch.object(accounts, "claude_account_dir", return_value=Path("/nonexistent/claude2")):
             with patch.object(next_moves, "set_first_next_move") as setter:
-                self.assertEqual(accounts_page.save_next_move_settings("showrunners", "claude2", "2.5", "fable"),
-                                 accounts_page.Saved())
-                setter.assert_called_once_with("showrunners", 2.5, "claude2", measure=next_moves.QuotaMeasure.FABLE)
+                self.assertEqual(accounts_page.save_next_move("showrunners", "claude2"), accounts_page.Saved())
+                setter.assert_called_once_with("showrunners", 1.0, "claude2")
             with patch.object(next_moves, "set_first_next_move", side_effect=next_moves.NextMoveError("next: cannot set entry: busy")):
-                self.assertEqual(accounts_page.save_next_move_settings("units", "claude2", "2.5", "fable"),
+                self.assertEqual(accounts_page.save_next_move("units", "claude2"),
                                  accounts_page.SaveFailed("next: cannot set entry: busy"))
 
-    def test_move_now_leaves_the_current_targets_next_move_in_the_log(self) -> None:
-        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        output = home / "move.log"
-        with (scratch_account_home(home, {}, clear=True),
-              patch.object(role_map, "is_role_map_host", return_value=True),
-              patch.object(accounts, "claude_account_dir", return_value=home / ".claude2"),
-              patch.object(stop_resume, "detach", return_value=output) as detach):
-            _ = next_moves.add_next_move("units", 1, "claude2")
-            _ = next_moves.add_next_move("units", 2, "claude3")
-            before = next_moves.next_moves_file().read_bytes()
-            with patch.object(accounts, "move_group") as move:
-                self.assertEqual(accounts_page.move_group_now("units", "claude2"), accounts_page.Saved())
-                move.assert_not_called()
-            detach.assert_called_once_with(["console-group-move", "units", "claude2"], "move",
-                                           program=Path(accounts.__file__), initiator=moves.MoveInitiator.CONSOLE)
-            self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
-
-            destination = accounts.MoveTargetReady(accounts.NamedAccount("claude2", home / ".claude2"), ())
-            members = accounts.GroupMoveMembers((), (), False, frozenset())
-            with (patch.object(accounts, "check_move_target", return_value=destination),
-                  patch.object(accounts, "group_transition", return_value=accounts.NoGroupTransition()),
-                  patch.object(accounts, "group_move_members", return_value=members),
-                  patch.object(accounts, "set_group_account") as select):
-                self.assertEqual(accounts.main(["console-group-move", "--log", str(output),
-                                                "--requester", "", "units", "claude2"]), 0)
-            select.assert_called_once_with("units", "claude2", why="units moved by hand",
-                                           keep_claim=ANY, reuse_current=True, prepare=ANY)
-            self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
-
-    def test_two_detached_group_starts_refuse_the_second_before_selection(self) -> None:
-        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        first_log, second_log = home / "first.log", home / "second.log"
-        starts: list[list[str]] = []
-
-        def detach(arguments: list[str], _task: str, *, program: Path, initiator: moves.MoveInitiator) -> Path:
-            self.assertEqual(program, Path(accounts.__file__))
-            self.assertIs(initiator, moves.MoveInitiator.CONSOLE)
-            output = first_log if not starts else second_log
-            starts.append([arguments[0], "--log", str(output), *arguments[1:]])
-            return output
-
-        write = accounts.write_role_map
-
-        def start_second(change: role_map.RoleMapChange | role_map.WorkersClaudeRouteChange) -> None:
-            self.assertFalse(accounts.groups_file().exists())
-            self.assertEqual(moves.read_move_progress(), ())
-            self.assertEqual(accounts.main(starts[1]), 1)
-            self.assertFalse(accounts.groups_file().exists())
-            write(change)
-
-        destination = accounts.MoveTargetReady(accounts.NamedAccount("claude2", home / ".claude2"), ())
-        members = accounts.GroupMoveMembers((), (), False, frozenset())
-        with (scratch_account_home(home, {}, clear=True),
-              patch.object(role_map, "is_role_map_host", return_value=True),
-              patch.object(accounts, "claude_account_dir", return_value=home / ".claude2"),
-              patch.object(accounts, "check_move_target", return_value=destination) as check,
-              patch.object(accounts, "group_move_members", return_value=members),
-              patch.object(accounts, "write_role_map", side_effect=start_second) as selecting,
-              patch.object(stop_resume, "detach", side_effect=detach)):
-            self.assertEqual(accounts_page.move_group_now("units", "claude2"), accounts_page.Saved())
-            self.assertEqual(accounts_page.move_group_now("units", "claude3"), accounts_page.Saved())
-            self.assertEqual(len(starts), 2)
-            self.assertEqual(accounts.main(starts[0]), 0)
-            self.assertEqual(accounts.current_move_account("units"), "claude2")
-            check.assert_called_once()
-            selecting.assert_called_once()
-
-            refused, = moves.read_move_progress()
-            self.assertEqual(refused.target, "claude3")
-            self.assertIs(refused.initiator, moves.MoveInitiator.CONSOLE)
-            reason = "Another move is in progress. Try again when it ends."
-            self.assertEqual(second_log.read_text(), reason + "\n")
-            card = accounts_page.moves_board((refused,), AT, timezone.utc)
-            self.assertIn(reason, card)
-
-    def test_dialog_posts_save_clear_and_hand_move_through_the_accounts_route(self) -> None:
-        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
-
-        def account_home(label: str) -> Path:
-            return home / f".{accounts.numbered_account_label(label, 'claude').label}"
-
-        class AccountsPostServer(ThreadingHTTPServer):
-            bound_address: str = "127.0.0.1"
-            mode: serve.ServerMode = serve.ServerMode.LIVE
-            accounts_cache: serve.AccountsPageCache = serve.AccountsPageCache()
-
-            def request_tailscale_address(self) -> str:
-                return self.bound_address
-
-        with (scratch_account_home(home, {}, clear=True),
-              patch.object(role_map, "is_role_map_host", return_value=True),
-              patch.object(accounts, "claude_account_dir", new=account_home),
-              AccountsPostServer(("127.0.0.1", 0), serve.ReviewLinksHandler) as server):
-            original = next_moves.add_next_move("units", 4.5, "claude4", next_moves.HalfPointHold(),
-                                                fallback_targets=("claude2", "claude3"))
-            assert isinstance(original, next_moves.ClaudeGroupMove)
-            later = next_moves.add_next_move("units", 2, "claude3")
-            other = next_moves.add_next_move("showrunners", 3, "claude2")
-            worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-            worker.start()
-
-            def post(fields: dict[str, str], *, origin: str = "same") -> tuple[int, bytes]:
-                headers = {"Content-Type": "application/x-www-form-urlencoded"}
-                if origin:
-                    headers["Origin"] = f"http://127.0.0.1:{server.server_port}" if origin == "same" else origin
-                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
-                try:
-                    connection.request("POST", accounts_page.PAGE_PATH, urlencode({"group": "units", **fields}), headers)
-                    response = connection.getresponse()
-                    return response.status, response.read()
-                finally:
-                    connection.close()
-
-            try:
-                settings = {"to": "claude4", "percent": "4.5", "measure": "fable"}
-                self.assertEqual(post(settings)[0], 200)
-                first, second, third = next_moves.read_next_moves()
-                assert isinstance(first, next_moves.ClaudeGroupMove)
-                self.assertNotEqual(first.id, original.id)
-                self.assertEqual(first, replace(original, id=first.id, measure=next_moves.QuotaMeasure.FABLE))
-                self.assertEqual((second, third), (later, other))
-                with redirect_stderr(io.StringIO()) as errors:
-                    status, body = post({**settings, "percent": "nan"})
-                    self.assertEqual((status, json.loads(body)), (400, {}))
-                    status, body = post({**settings, "measure": "weekly"})
-                    self.assertEqual((status, json.loads(body)), (400, {}))
-                    self.assertEqual(errors.getvalue().count("next: percent must be from 0 to 100"), 1)
-                    self.assertEqual(errors.getvalue().count("next: measure must be all-models or fable"), 1)
-                self.assertEqual(post({**settings, "move_now": "claude4"})[0], 400)
-                self.assertEqual(post({"to": "claude4"})[0], 400)
-                before = next_moves.next_moves_file().read_bytes()
-                action = {"move_now": "claude4"}
-                with patch.object(stop_resume, "detach", return_value=home / "move.log") as detach:
-                    self.assertEqual(post(action, origin="")[0], 403)
-                    self.assertEqual(post(action, origin="http://other.invalid")[0], 403)
-                    with patch.object(moves, "read_move_progress", return_value=(move_progress_fixture(),)):
-                        status, body = post(action)
-                    self.assertEqual(status, 409)
-                    self.assertEqual(json.loads(body)["state"], "move-in-progress")
-                    detach.assert_not_called()
-                    self.assertEqual(post(action)[0], 200)
-                    detach.assert_called_once_with(["console-group-move", "units", "claude4"], "move",
-                                                   program=Path(accounts.__file__), initiator=moves.MoveInitiator.CONSOLE)
-                with (patch.object(stop_resume, "detach", side_effect=OSError("fixture launch failure")),
-                      redirect_stderr(io.StringIO()) as errors):
-                    status, body = post(action)
-                    self.assertEqual((status, json.loads(body)), (503, {}))
-                    self.assertEqual(errors.getvalue().count("fixture launch failure"), 1)
-                self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
-                self.assertEqual(post({"clear": "first"})[0], 200)
-                self.assertEqual(next_moves.read_next_moves(), (later, other))
-            finally:
-                server.shutdown()
-                worker.join(TEST_HANG_GUARD_SECS)
-
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
-    def test_dialog_edits_each_role_and_contains_the_keyboard_focus(self) -> None:
-        rows = (replace(status_row("claude1"), selected_roles=("units",)),
-                replace(status_row("claude2"), roles=("showrunners",), selected_roles=("showrunners",)),
+    def test_the_next_button_opens_the_move_menu_and_saves_or_clears_the_chosen_account(self) -> None:
+        rows = (replace(status_row("claude1"), selected_roles=("units",)), status_row("claude2"),
                 replace(status_row("claude3"), weekly_left_percent=accounts.StatusUnavailable("unavailable")),
                 replace(status_row("codex1"), tool="codex"))
-        units = next_moves.ClaudeGroupMove("unit-fixture", "units", 4.5, 0, "claude2", AT,
-                                         measure=next_moves.QuotaMeasure.FABLE)
-        runners = next_moves.ClaudeGroupMove("runner-fixture", "showrunners", 2, 0, "claude1", AT)
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
-            first_next_moves=first_moves(units, runners))
+            first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2"}))
         with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         initial = accounts_page.AccountsRender(content, 0.5, 200).with_recent_times((0.5,)).decode()
-        with patch.object(accounts, "read_status", return_value=replace(reading, first_next_moves=accounts.FirstNextMoveEntries())):
+        with patch.object(accounts, "read_status", return_value=replace(reading, first_next_moves=accounts.FirstNextMoveTargets())):
             empty = accounts_page.page().decode()
-        unreadable = replace(reading, first_next_moves=accounts.NextMovesUnavailable("fixture read error"))
-        with patch.object(accounts, "read_status", return_value=unreadable):
-            unavailable = accounts_page.page().decode()
-        probe = (MOVE_DIALOG_PROBE.replace("EMPTY_PAGE", json.dumps(empty).replace("</", "<\\/"))
-                 .replace("UNAVAILABLE_PAGE", json.dumps(unavailable).replace("</", "<\\/")))
+        probe = MENU_PROBE.replace("EMPTY_PAGE", json.dumps(empty).replace("</", "<\\/"))
         setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(initial).replace("</", "<\\/"))
         page = initial.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>").encode()
         self.assertEqual(firefox_probe_results(page), [[]])
@@ -3071,7 +2869,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_refresh_obeys_visibility_and_updates_the_load_time_and_data_age(self) -> None:
         reading = accounts.StatusReading((status_row("claude1"), replace(status_row("claude2"), selected_roles=("units",))),
-            (), (), timezone.utc, AT, first_next_moves=first_moves(claude_move("units", "claude1")))
+            (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets({"units": "claude1"}))
         with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         initial = accounts_page.AccountsRender(content, 0.75, 200).with_recent_times((0.25, 0.75)).decode()
