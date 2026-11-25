@@ -45,7 +45,7 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from scripts.lib.test_build_folders_bwrap import ClaimCase, run_claim
 
-run_claim(Path(sys.argv[2]), ClaimCase(sys.argv[3]))
+run_claim(Path(sys.argv[2]), ClaimCase(sys.argv[3]), *map(int, sys.argv[4:]))
 """
 
 
@@ -90,16 +90,16 @@ def _check_missing_pid(pid: int) -> None:
     raise AssertionError(f"fixture process {pid} still exists")
 
 
-def _lease_owner(case: ClaimCase) -> int:
+def _lease_owner(case: ClaimCase, foreign_pid: int) -> int:
     if case is ClaimCase.LIVE_OWNER:
         return os.getpid()
     if case is ClaimCase.FOREIGN_OWNER:
         if sys.platform == "linux":
-            assert Path("/proc/1").stat().st_uid != os.geteuid()
+            assert (Path("/proc") / str(foreign_pid)).stat().st_uid != os.geteuid()
         try:
-            os.kill(1, 0)
+            os.kill(foreign_pid, 0)
         except PermissionError:
-            return 1
+            return foreign_pid
         raise AssertionError("the claim process can signal the foreign lease owner")
     child = subprocess.run([sys.executable, "-B", "-c", "import os; print(os.getpid())"],
                            check=True, capture_output=True, text=True, timeout=10)
@@ -146,13 +146,13 @@ def _claim_after_other_owner(candidate: Path) -> None:
     print(Path(second.getvalue().strip()).name)
 
 
-def run_claim(candidate: Path, case: ClaimCase) -> None:
+def run_claim(candidate: Path, case: ClaimCase, foreign_pid: int = 1) -> None:
     """Run the real claim with the selected fixture state."""
     if case is ClaimCase.NESTED_MOUNT:
         assert not build_folders.may_remove_folder_tree(candidate), f"the mount table allowed removal of {candidate}"
     check_guard(candidate, case)
     lease = build_folders.lease_path(candidate)
-    _ = lease.write_text(json.dumps({"pid": _lease_owner(case)}))
+    _ = lease.write_text(json.dumps({"pid": _lease_owner(case, foreign_pid)}))
     if case is ClaimCase.OWNER_REPLACEMENT:
         _claim_after_other_owner(candidate)
         return
@@ -336,10 +336,25 @@ class ToolFolderRemovalTests(ToolFolderRemovalFixture):
                 os.kill(1, 0)
             self.assert_claim(self.claim(sandbox, candidate, ClaimCase.FOREIGN_OWNER), "proof-2")
         else:
-            self.assert_claim(self.claim_with_host_pids(sandbox, sandbox.host_path(candidate)), "proof-2")
+            uid = os.geteuid()
+            for process in Path("/proc").iterdir():
+                if not process.name.isdecimal():
+                    continue
+                try:
+                    owner = process.stat().st_uid
+                except (FileNotFoundError, PermissionError, ProcessLookupError):
+                    continue
+                if owner != uid:
+                    foreign_pid = int(process.name)
+                    break
+            else:
+                self.skipTest("not run: the guest sandbox shows no process of another owner")
+            result = self.claim_with_host_pids(sandbox, sandbox.host_path(candidate), foreign_pid)
+            self.assert_claim(result, "proof-2")
         self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
 
-    def claim_with_host_pids(self, sandbox: RemovalSandbox, candidate: Path) -> subprocess.CompletedProcess[str]:
+    def claim_with_host_pids(self, sandbox: RemovalSandbox, candidate: Path,
+                             foreign_pid: int) -> subprocess.CompletedProcess[str]:
         bubblewrap = shutil.which("bwrap")
         self.assertIsNotNone(bubblewrap)
         assert bubblewrap is not None
@@ -358,7 +373,7 @@ class ToolFolderRemovalTests(ToolFolderRemovalFixture):
             "--setenv", "CONF_DIR", str(sandbox.host_path(sandbox.home / "config")),
             "--setenv", "CLAUDE_DISABLE_DATACLASS_CODE_CACHE", "1",
             str(Path(sys.executable).resolve()), "-B", "-c", RUN_CLAIM, str(sandbox.checkout), str(candidate),
-            ClaimCase.FOREIGN_OWNER.value,
+            ClaimCase.FOREIGN_OWNER.value, str(foreign_pid),
         ], check=False, capture_output=True, text=True, timeout=90)
 
     def test_keeps_a_folder_with_a_held_lock(self) -> None:
