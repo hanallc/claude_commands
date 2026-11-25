@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents.remote import local_machine
 from scripts.notify import review
 from scripts.production import proposal_issue
@@ -72,8 +73,7 @@ class ProposalIssueTests(unittest.TestCase):
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.runtime = home / ".local/state/proposal-issue/locks"
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=home))
-        _ = self.enterContext(mock.patch.object(
-            review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
+        self.enterContext(accepting_console_text())
         _ = self.enterContext(mock.patch.object(reply_tokens, "platform", "linux"))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime),
                                                      "XDG_STATE_HOME": str(home / "key-state"),

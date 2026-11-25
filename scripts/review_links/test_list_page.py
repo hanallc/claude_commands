@@ -30,6 +30,7 @@ from uuid import uuid4
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
@@ -427,6 +428,7 @@ class ListPageTests(unittest.TestCase):
     @classmethod
     @override
     def setUpClass(cls) -> None:
+        cls.enterClassContext(accepting_console_text())
         cls.browser_root = Path(cls.enterClassContext(tempfile.TemporaryDirectory(prefix="list-page-class-")))
         cls._chrome = None
         cls._firefox = None

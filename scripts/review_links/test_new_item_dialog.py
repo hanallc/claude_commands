@@ -16,6 +16,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff
 from scripts.review_links import (console_theme, new_item_dialog, page_frame, reply_tokens, review_page,
@@ -1891,6 +1892,8 @@ function checkEmpty() {
    checkEmpty();
    selectType('investigation');
    checkEmpty();
+   const draftKeys = Object.keys(sessionStorage).filter(key => /^console\.list\.pending-send\.r6-/.test(key));
+   check(draftKeys.length === 1, 'Only the current draft can restore its recipient.');
    if (!failures.length) {
     sessionStorage.setItem(probeKey, JSON.stringify({...earlier, cleared:true}));
     location.reload();
@@ -2105,7 +2108,7 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+    with accepting_console_text(), ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         try:

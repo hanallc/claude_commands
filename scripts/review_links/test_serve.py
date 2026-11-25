@@ -1,6 +1,7 @@
 """HTTP behavior on localhost and retention in disposable snapshot folders."""
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 from scripts.lib.checkout_test_support import python_tool_source
@@ -112,6 +113,7 @@ def write_server_config(configuration: Path) -> dict[str, str]:
 
 
 def setUpModule() -> None:
+    unittest.enterModuleContext(accepting_console_text())
     configuration = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, write_server_config(configuration))))
 

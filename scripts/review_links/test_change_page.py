@@ -1,6 +1,7 @@
 """Test page publication, HTTP forms, verdict calls and checkpoint routing."""
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.console_text import check as console_text
 from scripts.notify import review
 from scripts.production.change_review_test_support import fixture_image, fixture_row_image, pictured_changes, registered_fixture_image
@@ -591,7 +592,7 @@ class ChangePageTests(unittest.TestCase):
                 arguments: list[str]) -> subprocess.CompletedProcess[str]:
         if process_boundary_for_case(self):
             return subprocess.run([str(Path(__file__).resolve().parents[1] / "lib/py"),
-                                   str(module.__file__), *arguments],
+                                   "-m", "scripts.console_text.test_support", str(module.__file__), *arguments],
                                   capture_output=True, text=True, check=False)
         return invoke_cli(module, lambda: main(arguments), arguments, dict(os.environ), Path.cwd())
 
@@ -612,8 +613,8 @@ class ChangePageTests(unittest.TestCase):
                 self.assertIn('<h2>Answer</h2><p>Use these:</p><ul><li>One</li><li>Two</li></ul>', content)
 
     def test_both_pages_copy_question_feedback_and_answer_code_without_boxing_plain_text(self) -> None:
-        code = 'git -C /etc/nixos status --short\ngit -C /etc/nixos log --oneline -3'
-        fenced = 'Run this in a natedev terminal:\n\n```sh\n' + code + '\n```\n\nRead the result.'
+        code = '{\n  "layout": "compact"\n}'
+        fenced = 'Check this example.\n\n```json\n' + code + '\n```\n\nRead the result.'
         status = change_page.DeliveryStatus(self.root)
         for feedback in (False, True):
             for answer in (fenced, 'First line\nSecond line'):
@@ -1002,8 +1003,7 @@ class ChangePageTests(unittest.TestCase):
 
     def set_up_review(self, *, changes: int, legacy_links: bool = False) -> None:
         self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="change-page-test-")))
-        _ = self.enterContext(patch.object(
-            review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
+        self.enterContext(accepting_console_text())
         self.enterContext(patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.temporary / "notify")}))
         if legacy_links:
             cache_home = self.temporary / "cache"

@@ -1344,7 +1344,10 @@ function bindDraft(dialog, fresh = false) {
   if (sending || isRecovering()) return;
   if (event?.target.name === 'kind') {
    discardCapture();
-   if (!awaitingNativeRecovery || isEditingLater()) draftId = undefined;
+   if (!awaitingNativeRecovery || isEditingLater()) {
+    if (!awaitingEarlierSend && !isEditingLater()) forgetListDraft();
+    draftId = undefined;
+   }
    ensureDraftId();
    showRecipients();
    showBugPage();
@@ -1813,14 +1816,18 @@ function bindDraft(dialog, fresh = false) {
   }
  }
 
- function finishDraft() {
-  clearSubmittedDraft();
+ function forgetListDraft() {
   if (ownerPage === 'list' && draftId && !separateFromNativeDraft) {
    try {
     sessionStorage.removeItem(listDraftPrefix + draftId);
     sessionStorage.removeItem(listStatePrefix + draftId);
    } catch (_) {}
   }
+ }
+
+ function finishDraft() {
+  clearSubmittedDraft();
+  forgetListDraft();
   draftId = undefined;
   awaitingEarlierSend = awaitingNativeRecovery = false;
  }

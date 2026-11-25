@@ -22,6 +22,7 @@ from typing import ClassVar, cast, override
 from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
@@ -70,8 +71,7 @@ class ImagesFixture(unittest.TestCase):
         self.shot = self.temporary / "before.png"
         _ = self.shot.write_bytes(PNG)
         self.sent = []
-        _ = self.enterContext(patch.object(
-            review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
+        self.enterContext(accepting_console_text())
         _ = self.enterContext(patch.object(change_page, "send_message", side_effect=self.capture))
         _ = self.enterContext(patch.object(change_page, "send_question", side_effect=self.capture_question))
 

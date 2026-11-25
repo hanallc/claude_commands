@@ -22,6 +22,7 @@ from typing import Literal, Protocol, cast, final, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
 from scripts.herdr.place import HerdrPlace
@@ -80,7 +81,7 @@ class TheListTests(unittest.TestCase):
         settings = {**LIST_TEXT_LIMITS, "series_run_limit": 730, "confirm_wait_minutes": 15}
         _ = self.list_config.write_text("".join(f"# whole: 1..\n{key}={limit}\n" for key, limit in settings.items()))
         _ = self.enterContext(patch.object(the_list, "now", return_value=START))
-        _ = self.enterContext(patch.object(review, "review_question", return_value=review.QuestionAccepted("")))
+        self.enterContext(accepting_console_text())
         _ = self.send_patch.start()
         self.addCleanup(self.send_patch.stop)
 

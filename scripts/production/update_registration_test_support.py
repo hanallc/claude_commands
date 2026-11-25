@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents import remote
 
 import io
@@ -116,6 +117,7 @@ class RegistrationFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.addCleanup(shutil.rmtree, self.fixture_root)
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)

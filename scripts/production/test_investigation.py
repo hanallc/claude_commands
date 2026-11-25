@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.notify import review
 from scripts.production import investigation, staff
 from scripts.review_links import change_page, new_item_dialog, reply_tokens, review_page, test_review_page
@@ -32,6 +33,7 @@ class InvestigationTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         staff_file = self.root / "staff.json"
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [RUNNER.to_json(), OWNER.to_json(), OTHER.to_json()]}))

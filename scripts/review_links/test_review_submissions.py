@@ -26,6 +26,7 @@ from typing import TextIO, cast, final, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents import pane_record
 from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file, conf, urgency
@@ -86,6 +87,7 @@ class ReviewSubmissionTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issues = self.root / "issues"
         self.doc = self.root / "production.md"

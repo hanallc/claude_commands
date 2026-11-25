@@ -4,6 +4,7 @@ Every test works in a temporary git repository and a temporary list; none reads 
 """
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.production.staff_test_support import foreign_hostname
 
 import errno
@@ -28,7 +29,6 @@ from typing import TextIO, cast, override
 from unittest import mock
 
 
-from scripts.notify import review
 from scripts.production import change_review
 from scripts.lib import conf, copy_record, file_lock, main_push_lock, session_folder
 from scripts.lib.atomic_file import write_text_atomic
@@ -111,8 +111,7 @@ def setUpModule() -> None:
         copy_record.COPIES_ENV: str(folder / "copies"),
         scratch.HOLDS_ENV: str(folder / "holds.json")}, clear=True))
 
-    _ = unittest.enterModuleContext(mock.patch.object(
-        review, "review_question", return_value=review.QuestionAccepted("Fixture review passed.")))
+    unittest.enterModuleContext(accepting_console_text())
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(folder / "notify")}))
     _ = unittest.enterModuleContext(mock.patch.object(sys.modules[__name__], "PRODUCTION", home / DEMO_DOC))
     _ = fixture_member("showrunner", name="fixture")
@@ -1089,7 +1088,7 @@ class ProducerWriterTests(ProducerFixture):
                                     (self.root / "unit" / "src", self.unit.id), (self.repo, ""), (self.root, "")):
             with self.subTest(directory=directory), redirect_stdout(io.StringIO()):
                 result = change_review.main(["add", "--repo", str(directory), "--production", "top",
-                    "--list", str(self.listing), "--change", str(directory), "--check", "Read", "--see", "Proof", "--image", fixture_image()])
+                    "--list", str(self.listing), "--change", "Check the producer", "--check", "Read", "--see", "Proof", "--image", fixture_image()])
                 self.assertEqual(result, 0)
                 self.assertEqual(change_review.pending(self.listing)[-1]["Producer"], expected)
 
@@ -2891,13 +2890,13 @@ class ActionTest(unittest.TestCase):
             self.assertEqual(scratch.holds()[os.path.realpath(held)]["task"], f"row:{change_review._owner(self.path)}-{row}")  # pyright: ignore[reportPrivateUsage]
 
     def test_back_to_back_adds_in_one_shell_each_append_the_next_number(self) -> None:
-        changes = [Visible("cargo-handler nests a showrunner | inside its parent", "open `cargo-handler` on natedev",
+        changes = [Visible("cargo-handler nests a showrunner | inside its parent", "Open the handler on natedev",
                            "the showrunner tile sits inside its parent"),
                    Visible("tile titles carry the role: showrunner, unit director", "read the tile titles",
                            "each title names its role"),
                    Visible("cargo-tile no longer panics at startup", "start it in a natedev terminal",
-                           "~/.config/cargo-tile/panic.log gains nothing"),
-                   Visible("cargo-berth gives each phase its own reservation", "run `cargo-berth board | grep phase`",
+                           "The panic log gains no entries"),
+                   Visible("cargo-berth gives each phase its own reservation", "Run this command: `cargo-berth board | grep phase`",
                            "one line per phase")]
         repo, *commits = origin_commits(self.path.parent)
         script = str(Path(change_review.__file__))
@@ -2911,12 +2910,12 @@ class ActionTest(unittest.TestCase):
                                  "--change", item.change, "--check", item.check, "--see", item.see,
                                  "--merged", commits[-1][:8], "--image", fixture_image()]
                     if path == self.fresh and not numbers:
-                        result = subprocess.run([python, script, *arguments], capture_output=True,
+                        result = subprocess.run([python, "-m", "scripts.console_text.test_support", script, *arguments], capture_output=True,
                                                 text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                     else:
                         child = children.start(lambda arguments=arguments: run_review_child(arguments, environment))
                         result = child.result()
-                        result.check_returncode()
+                        self.assertEqual(result.returncode, 0, result.stderr)
                     numbers.append(result.stdout.strip())
                 self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
                 rows = [row for row in change_review.pending(path) if row["#"] in numbers]
