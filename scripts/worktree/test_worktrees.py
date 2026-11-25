@@ -13,6 +13,7 @@ import json
 import os
 import re
 from pathlib import Path
+from select import select
 import shlex
 import shutil
 import signal
@@ -311,6 +312,20 @@ class WorktreeLifecycleTests(unittest.TestCase):
 
     def register_process(self, pid: int) -> None:
         (self.proc / str(pid)).symlink_to(Path("/proc") / str(pid), target_is_directory=True)
+
+    @contextmanager
+    def process_in(self, cwd: Path) -> Generator[int]:
+        source = "import sys; print('ready', flush=True); sys.stdin.read()"
+        with subprocess.Popen([sys.executable, "-c", source], cwd=cwd, env=self.environment,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+            assert child.stdout is not None
+            self.assertTrue(select([child.stdout], [], [], 20)[0], "The fixture process did not start")
+            self.assertEqual(cast(str, child.stdout.readline()), "ready\n")
+            self.register_process(child.pid)
+            try:
+                yield child.pid
+            finally:
+                (self.proc / str(child.pid)).unlink()
 
     def finish_landed(self, *, reviewed: tuple[Path, ...] = ()) -> list[EndResult]:
         python = self.home / ".claude/scripts/lib/py"
@@ -728,10 +743,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
                         with self.assertRaisesRegex(worktree_records.Refused, f"{re.escape(str(lock))} held"):
                             _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
 
-                with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
-                                      cwd=nested, stdin=subprocess.PIPE, env=self.environment) as child:
-                    self.register_process(child.pid)
-                    with self.assertRaisesRegex(worktree_records.Refused, f"pids {child.pid}"):
+                with self.process_in(nested) as pid:
+                    with self.assertRaisesRegex(worktree_records.Refused, f"pids {pid}"):
                         _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
                 copy_source.assert_not_called()
                 self.assertTrue(old.is_dir() and not old.is_symlink())
@@ -1763,10 +1776,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = list_file.write_text(f"{busy} fixture-unit busy\n{idle} fixture-unit idle\n")
         command = self.migration_command("--all", "--list", list_file)
 
-        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
-                              cwd=nested, stdin=subprocess.PIPE, env=self.environment) as child:
-            self.register_process(child.pid)
-            reason = f"keep {busy}: in use (pids {child.pid})"
+        with self.process_in(nested) as pid:
+            reason = f"keep {busy}: in use (pids {pid})"
             dry = self.command(self.root, [*command, "--dry-run"])
             self.assertEqual(dry.returncode, 0, dry.stderr)
             self.assertIn(reason, dry.stdout)
@@ -2029,10 +2040,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             def open_then_start_process(move: worktrees.WorktreeMove, *,
                                         clone_members: tuple[Path, ...] = ()) -> worktrees.MoveJournal:
                 journal = open_move(move, clone_members=clone_members)
-                child = children.enter_context(subprocess.Popen(
-                    [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"], cwd=old, stdin=subprocess.PIPE))
-                self.register_process(child.pid)
-                pids.append(child.pid)
+                pids.append(children.enter_context(self.process_in(old)))
                 return journal
 
             with patch.object(worktrees, "_open_move", open_then_start_process), redirect_stdout(first := StringIO()):
@@ -2109,6 +2117,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
             _ = (parent / "status").write_text(f"State:\tS\nUid:\t{os.geteuid()}\t{os.geteuid()}\nThreads:\t1\n")
             _ = (parent / "stat").write_text(f"{pid} (fixture) S {ppid}\n")
             _ = (parent / "cmdline").write_bytes(argv)
+            (parent / "cwd").symlink_to(self.root)
+            (parent / "root").symlink_to("/")
+            (parent / "exe").symlink_to(sys.executable)
+            (parent / "fd").mkdir()
+            _ = (parent / "maps").write_text("")
         responses: dict[str, dict[str, object]] = {}
         for pid, (name, old) in enumerate(trees.items(), 200):
             pane = f"w1:p{pid}"
@@ -2188,9 +2201,22 @@ class WorktreeLifecycleTests(unittest.TestCase):
             self.assertIn(f"keep {trees['reused-pid']}: in use (pids {reused})", report.getvalue())
             return
 
+        command = self.migration_command("--list", list_file)
+        if "missing-fd" in cases:
+            pid = 200 + cases.index("missing-fd")
+            for flags in (["--dry-run"], []):
+                result = self.command(self.root, [*command, *flags])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for old in trees.values():
+                    self.assertIn(f"keep {old}: in use: unreadable process {pid}", result.stdout)
+                    self.assertFalse(old.is_symlink())
+            descriptors = self.proc / str(pid) / "fd"
+            descriptors.mkdir()
+            (descriptors / "7").symlink_to(trees["missing-fd"] / "code.txt")
+
         new = self.trees / "origin/fixture-unit/stopped"
         for flags in (["--dry-run"], []):
-            result = self.command(self.root, self.migration_command("--list", list_file, *flags))
+            result = self.command(self.root, [*command, *flags])
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"move {trees['stopped']} -> {new}", result.stdout)
             for pid, name in enumerate(cases[1:], 201):
