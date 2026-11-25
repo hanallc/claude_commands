@@ -245,7 +245,8 @@ class _Chrome(_Browser):
                 raise RuntimeError((self.root / "chrome.log").read_text(errors="replace"))
             self.pending.extend(chunk)
 
-    def command(self, method: str, parameters: dict[str, object], session: str = "") -> dict[str, object]:
+    def command(self, method: str, parameters: dict[str, object], session: str = "", *,
+                timeout: float = 20) -> dict[str, object]:
         self.sequence += 1
         request: dict[str, object] = {"id": self.sequence, "method": method, "params": parameters}
         if session:
@@ -253,7 +254,7 @@ class _Chrome(_Browser):
         writer = self.process.stdin
         assert writer is not None
         data = memoryview(json.dumps(request).encode() + b"\0")
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + timeout
         while data:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([], [writer], [], remaining)[1] or time.monotonic() >= deadline:
@@ -309,7 +310,8 @@ class _Chrome(_Browser):
             self.navigate(destination)
             try:
                 response = self.command("Runtime.evaluate",
-                    {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session)
+                    {"expression": "globalThis.fixtureDOM", "awaitPromise": True, "returnByValue": True}, session,
+                    timeout=TEST_HANG_GUARD_SECS)
             except TimeoutError as error:
                 raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
             result = cast(dict[str, object], response["result"])
@@ -6543,13 +6545,18 @@ window.fetch=async(_url,options)=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_undo_keeps_the_words_and_leaves_the_row_unsent(self) -> None:
         self.browser_action_sequence(r'''
- const until=async(test,label)=>{
-  const end=performance.now()+8000;
-  while(!test()){
-   if(performance.now()>end) throw new Error(label);
-   await new Promise(resolve=>setTimeout(resolve,20));
-  }
- };
+ const until=(test,label)=>new Promise((resolve,reject)=>{
+  const ready=()=>{
+   if(!test()) return;
+   observer.disconnect();clearTimeout(timer);resolve();
+  };
+  const observer=new MutationObserver(ready);
+  observer.observe(document,{subtree:true,childList:true,characterData:true});
+  const timer=setTimeout(()=>{
+   observer.disconnect();reject(new Error(label));
+  },HANG_GUARD_MS);
+  ready();
+ });
  const before={state:row.dataset.state,unread:row.dataset.unread};
  const listFetch=window.fetch;let undos=0;
  window.fetch=async(path,options={})=>{
@@ -6572,7 +6579,7 @@ window.fetch=async(_url,options)=>{
  check(row.dataset.state===before.state && row.dataset.unread===before.unread,
   'After Undo the row keeps its state and its unread mark, so it is not marked sent.');
  check(undos===1 && requests.length===1,'Undo posts once and nothing else is sent.');
-''')
+'''.replace('HANG_GUARD_MS', str(TEST_HANG_GUARD_SECS * 1000)))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_shows_saved_actions_and_refreshes_until_delivery_ends(self) -> None:
