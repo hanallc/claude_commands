@@ -185,6 +185,10 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "Keep a fixed size ceiling for each cached scan entry.",
     ),
     InternalLiteral(
+        "scripts/accounts/moves.py", "EARLIER_MOVE_LIMIT",
+        "Keep only the three most recent completed move records.",
+    ),
+    InternalLiteral(
         "scripts/agents/detached_runs.py", "LIVE_RUN_LIMIT_REACHED",
         "The detached runner returns this status when it reaches the live run limit.",
     ),
@@ -271,6 +275,10 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
     TunableLiteral(
         "scripts/direct/progress_history.py", "BOARD_NOTE_CHARS", "72",
         "direct", "board.max_note_chars", "# whole: 1..", _PRODUCTION_BATCH,
+    ),
+    InternalLiteral(
+        "scripts/hooks/context_usage.py", "ANCESTOR_LIMIT",
+        "Limit the search for the nearest Claude process to six processes.",
     ),
     InternalLiteral(
         "scripts/lib/python_startup/sitecustomize.py", "_GATE_ANCESTOR_LIMIT",
