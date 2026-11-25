@@ -1505,7 +1505,6 @@ The page reads the producer name from the staff snapshot.
 A producer without a staff row shows as its staff ID.
 The List New item button uses the configured page owner or its fallback.
 The owner corner shows that recipient.
-`/recall` sends new requests to morty.
 Ask question and Tell sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
 Clearing the box disables both buttons.
