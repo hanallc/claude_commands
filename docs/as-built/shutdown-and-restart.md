@@ -89,9 +89,8 @@ Three windows remain, and each needs a kill at one exact line:
 
 A pending resume exits non-zero and keeps its record.
 Resume starts an exited director through the shared role-account path and removes its exit record after success.
-The Claude and Codex prompt hooks read the same director hold for every prompt source.
-Each hook adds the hold instruction and preserves the message in the transcript.
-The Codex hook installer registers and trusts the director hold in each selected Codex home.
+The Claude prompt hook reads the director hold for every prompt source.
+It adds the hold instruction and preserves the message in the transcript.
 An own-pane resume resolves the agent executable before it removes the exit record.
 It executes that path directly. A missing executable retains the exit record.
 The stop hook skips the automatic continuation for that director.
