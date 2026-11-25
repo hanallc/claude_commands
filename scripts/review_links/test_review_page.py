@@ -91,7 +91,7 @@ BODY_READY_SCRIPT = r"""async function readyReviewCard(row){
 }
 """
 
-WAIT_FOR_BROWSER_STATE = r"""const until=(predicate,label,extraRoot)=>new Promise((resolve,reject)=>{
+WAIT_FOR_BROWSER_STATE = r"""const until=(predicate,label,extraRoot,timeoutMs=HANG_GUARD_MS)=>new Promise((resolve,reject)=>{
  const cleanup=()=>{
   clearTimeout(timer);
   observer.disconnect();
@@ -112,7 +112,7 @@ WAIT_FOR_BROWSER_STATE = r"""const until=(predicate,label,extraRoot)=>new Promis
  document.addEventListener('fixture-progress',ready);
  const timer=setTimeout(()=>{
   cleanup();reject(new Error('Timed out waiting for '+label+'.'));
- },HANG_GUARD_MS);
+ },timeoutMs);
  ready();
 });""".replace('HANG_GUARD_MS', str(TEST_HANG_GUARD_SECS * 1000))
 
@@ -2188,7 +2188,7 @@ window.fetch=(url,options)=>{
   await until(()=>stalled,'the stalled recovery request');
   check(form(DRAFT_KEY).querySelector('button[value=answer]').disabled,
    'The stale revision is locked during its reload.');
-  await until(()=>!form(DRAFT_KEY).querySelector('button[value=answer]').disabled,'the reload deadline');
+  await until(()=>!form(DRAFT_KEY).querySelector('button[value=answer]').disabled,'the reload deadline',undefined,8000);
   check(document.querySelector('[data-page-status]').dataset.state==='Failed' &&
    document.querySelector('[data-review]').dataset.requestTimeoutSeconds==='3',
    'The configured recovery deadline releases the stale revision.');
