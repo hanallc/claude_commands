@@ -98,13 +98,14 @@ def main(*, budgeted: bool = False) -> None:
     prompt = payload.get("prompt", "")
 
     def process_prompt() -> None:
-        from scripts.hooks import conversation_pause
+        from scripts.hooks import conversation_pause, goal_card
 
         source = conversation_pause.prompt_source(
             prompt,
             conversation_pause.scheduled_senders,
             lambda: conversation_pause.read_scheduled_prompts(session_id),
         )
+        typed = source is conversation_pause.PromptSource.TYPED
         now = conversation_pause.now_epoch()
         if source in (conversation_pause.PromptSource.PEER, conversation_pause.PromptSource.SCHEDULED):
             try:
@@ -133,7 +134,7 @@ def main(*, budgeted: bool = False) -> None:
             from scripts.direct.progress_history import finish_turn_wait
 
             finish_turn_wait(run, session_id, source=source.name, prompt=prompt)
-        if source is conversation_pause.PromptSource.TYPED:
+        if typed:
             _record_typed_prompt()
         activity_source = {conversation_pause.PromptSource.TYPED: "UserTypedPrompt",
                            conversation_pause.PromptSource.PEER: "PeerPrompt",
@@ -142,10 +143,11 @@ def main(*, budgeted: bool = False) -> None:
         if not prompt.strip():
             activity_source = "UnknownPrompt"
         _record_activity(session_id, activity_source, prompt, record)
-        idle_context = _idle_update_context(session_id, source is conversation_pause.PromptSource.TYPED, now, record)
+        goal_context = goal_card.context(record, is_typed=lambda: typed)
+        idle_context = _idle_update_context(session_id, typed, now, record)
         reply = conversation_pause.message_arrived(session_id, source, prompt, now, record=record)
         mac_context = ""
-        if source is conversation_pause.PromptSource.TYPED and "/Users/" in prompt:
+        if typed and "/Users/" in prompt:
             try:
                 from scripts.hooks import mac_files
 
@@ -157,7 +159,7 @@ def main(*, budgeted: bool = False) -> None:
         def emit(held_messages: str = "") -> None:
             nonlocal emitted
             pause_context = "" if reply is conversation_pause.NoReply.NOTHING else reply.context
-            context = "\n\n".join(filter(None, (pause_context, held_messages, mac_context, idle_context)))
+            context = "\n\n".join(filter(None, (goal_context, pause_context, held_messages, mac_context, idle_context)))
             if not context:
                 return
             result: dict[str, object] = {
@@ -175,7 +177,7 @@ def main(*, budgeted: bool = False) -> None:
         from scripts.message import review_hold
 
         try:
-            if source is conversation_pause.PromptSource.TYPED:
+            if typed:
                 review_hold.record_user_prompt(session_id, now, emit, record_keys=review_hold_delivery.record_keys)
             else:
                 review_hold.deliver_if_disabled(session_id, now, emit, record_keys=review_hold_delivery.record_keys)

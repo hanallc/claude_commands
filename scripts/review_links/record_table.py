@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import html
+import json
 import re
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import NamedTuple
 from urllib.parse import quote
 
 from scripts.lib import conf
+from scripts.review_links import page_frame
 
 
 DELIVERY_WINDOW_SECONDS = 30
@@ -47,26 +51,77 @@ class Chip:
     value: str
     label_html: str
     count: int | None = None
+    owner_name: str | None = None
+    hidden: bool = False
 
 
-def chip_row(name: str, chips: Iterable[Chip], selected: str) -> str:
+class FilterFacet(NamedTuple):
+    name: str
+    field: str
+    bit: int
+    count_mask: int
+
+
+def filter_facets(fields: Mapping[str, str]) -> tuple[FilterFacet, ...]:
+    """Give each count a mask that excludes its own filter."""
+    all_bits = (1 << len(fields)) - 1
+    return tuple(FilterFacet(name, field, 1 << index, all_bits ^ (1 << index))
+                 for index, (name, field) in enumerate(fields.items()))
+
+
+def count_filter_row(facets: tuple[FilterFacet, ...], data: Mapping[str, str],
+                     selected: Mapping[str, str], counts: Mapping[str, Counter[str]], *,
+                     staff_filters: tuple[str, ...]) -> bool:
+    """Count an eligible row for every facet and return whether it matches."""
+    excluded = sum(bit for name, field, bit, _ in facets
+                   if (choice := selected.get(name)) and choice != data[field]
+                   and (name != "show" or choice != "all"))
+    for name, field, _, count_mask in facets:
+        if excluded & count_mask:
+            continue
+        total = counts[name]
+        total["all"] += 1
+        value = f"staff:{data[field]}" if name in staff_filters else data[field]
+        if value != "all":
+            total[value] += 1
+    return not excluded
+
+
+OWNER_QUERY_KEYS = ("owner", "showrunner")
+LIST_QUERY_FIELDS = ("show", "unread", *OWNER_QUERY_KEYS, "producer", "q", "key", "item", "reveal", "state")
+
+
+def identity_attribute(value: str) -> str:
+    """Preserve identity characters that the HTML parser changes."""
+    if "%" in value or "\r" in value or "\0" in value:
+        value = value.replace("%", "%25").replace("\r", "%0D").replace("\0", "%00")
+    return html.escape(value, quote=True)
+
+
+def chip_row(name: str, chips: Iterable[Chip], selected: str, *, encode_values: bool = False,
+             label_html: str = '') -> str:
     """Render a named filter with All as its first choice."""
     key = name.lower().replace(' ', '-')
+    identity = html.escape(key, quote=True)
     choices = {chip.value: chip for chip in chips}
     all_chip = choices.pop('all', Chip('all', 'All'))
     selected = selected if selected in choices else 'all'
     buttons: list[str] = []
     for chip in (all_chip, *choices.values()):
-        value = html.escape(chip.value, quote=True)
+        value = identity_attribute(chip.value) if encode_values else html.escape(chip.value, quote=True)
         pressed = str(chip.value == selected).lower()
         count = '' if chip.count is None else str(chip.count)
-        buttons.append(f'<button type="button" id="filter-{html.escape(key, quote=True)}-{quote(chip.value, safe="")}"'
+        owner = (f' data-owner-name="{html.escape(chip.owner_name, quote=True)}"'
+                 if chip.owner_name is not None else '')
+        hidden = ' hidden' if chip.hidden else ''
+        buttons.append(f'<button type="button"{owner}{hidden} id="filter-{identity}-{quote(chip.value, safe="")}"'
                        + f' data-filter-value="{value}" aria-pressed="{pressed}" data-filter-count="{count}">'
-                       + f'{chip.label_html}<b>{count}</b></button>')
-    return labelled_chip_row(name, ''.join(buttons), filter_key=key)
+                       + f'{chip.label_html} <b>{count}</b></button>')
+    return labelled_chip_row(name, ''.join(buttons), filter_key=key, chip_id=f"list-{key}", label_html=label_html)
 
 
-def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_classes: str = '', chip_id: str = '') -> str:
+def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_classes: str = '', chip_id: str = '',
+                      label_html: str = '') -> str:
     """Render a visible label and a group of filter buttons."""
     label = html.escape(name, quote=True)
     group = f' role="group" aria-label="{label}"'
@@ -74,19 +129,21 @@ def labelled_chip_row(name: str, buttons: str, *, filter_key: str = '', chip_cla
     classes = f' class="{html.escape(chip_classes, quote=True)}"' if chip_classes else ''
     identity = f' id="{html.escape(chip_id, quote=True)}"' if chip_id else ''
     return (f'<div class="record-filter-row"{group + key if filter_key else ""}>'
-            + f'<span aria-hidden="true">{label}</span>'
+            + f'<span aria-hidden="true">{label_html or label}</span>'
             + f'<div{classes}{identity}{"" if filter_key else group}>{buttons}</div></div>')
 
 
-def words_box(element_id: str, placeholder: str) -> str:
+def words_box(element_id: str, placeholder: str, *, value: str = '') -> str:
     """Render the words box for the filters."""
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
+    initial = f' value="{html.escape(value, quote=True)}"' if value else ''
     return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
-            + f' autocomplete="off" aria-label="{words}" placeholder="{words}">'
+            + f' autocomplete="off" aria-label="{words}" placeholder="{words}"{initial}>'
             + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 
 
+WEEKDAYS = ('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
 CLOCK = re.compile(r'([01][0-9]|2[0-3]):([0-5][0-9])')
 
 
@@ -99,18 +156,47 @@ def clock_minutes(settings: conf.ConfigRead, key: str) -> int:
     return int(match[1])*60+int(match[2])
 
 
-def date_time_picker(*, field: str, action: str, value: str) -> str:
-    """Render the date and time sheet inside an action popover."""
-    return ('<div class="later-custom" data-later-custom hidden>'
+def park_settings(settings: conf.ConfigRead) -> dict[str, int]:
+    """Read the settings for the shared park control."""
+    day = settings.text('later_week_day')
+    if day not in WEEKDAYS:
+        raise ValueError(f'review_links.conf: later_week_day={day!r} is not a weekday name such as Monday')
+    return {'soon': settings.whole('later_soon_minutes'), 'morning': clock_minutes(settings, 'later_morning'),
+            'weekDay': WEEKDAYS.index(day), 'weekTime': clock_minutes(settings, 'later_week_time'),
+            'step': settings.whole('park_time_step_minutes')}
+
+
+def park_control(label: str, *, field: str, action: str, value: str, identity: str = '',
+                 allow_delivery: bool = False) -> str:
+    """Render the park menu and date picker."""
+    id_html = f' id="{html.escape(identity, quote=True)}"' if identity else ''
+    action = html.escape(action, quote=True)
+    presets: tuple[tuple[str, str], ...] = (('delivered', 'Until delivered'),) if allow_delivery else ()
+    presets += (('soon', '1 hour'), ('morning', 'Tomorrow'), ('week', 'Next week'))
+    buttons = ''.join(
+        f'<button type="submit" role="menuitem" tabindex="-1" name="{action}" value="park-until-{key}"'
+        + f' data-later-preset="{key}"><span>{text}</span><small></small></button>'
+        for key, text in presets
+    )
+    return ('<div class="later-menu"><button type="button"' + id_html
+            + f' aria-haspopup="menu" aria-expanded="false" data-later-toggle>{label}'
+            + ' <span aria-hidden="true">▾</span></button>'
+            + f'<div role="menu" aria-label="{label}" data-later-menu hidden>' + buttons + '<hr>'
+            + '<button type="button" role="menuitem" tabindex="-1" data-later-choose><span>Pick a date…</span></button>'
+            + '<div class="later-custom" data-later-custom hidden>'
             +f'<input type="hidden" name="{html.escape(field, quote=True)}">'
             +'<div class="later-month-header"><strong data-later-month aria-live="polite"></strong><div>'
             +'<button type="button" tabindex="-1" data-later-month-step="-1" aria-label="Previous month">‹</button>'
             +'<button type="button" tabindex="-1" data-later-month-step="1" aria-label="Next month">›</button></div></div>'
             +'<div role="grid" aria-label="Choose a day" data-later-grid></div>'
-            +'<label class="later-time">Time<input type="text" inputmode="numeric" autocomplete="off" data-later-time></label>'
+            # Keep Enter in the time field from submitting the first form action.
+            +'<div class="later-time"><label>Time<input type="text" inputmode="numeric" autocomplete="off" form="" '
+            +'role="combobox" aria-expanded="false" data-later-time></label>'
+            +'<button type="button" tabindex="-1" aria-label="Show suggested times" data-later-time-choices>▾</button>'
+            +'<div role="listbox" aria-label="Suggested times" data-later-times hidden></div></div>'
             +'<div class="later-save"><span data-later-summary aria-live="polite"></span>'
-            +f'<button class="primary" name="{html.escape(action, quote=True)}" value="{html.escape(value, quote=True)}">Save</button>'
-            +'</div></div>')
+            +f'<button class="primary" name="{action}" value="{html.escape(value, quote=True)}">Save</button>'
+            +'</div></div></div></div>')
 
 
 EMPTY_RESULT_STYLE = '''<style>
@@ -186,7 +272,8 @@ border:0;border-radius:8px;background:none;color:var(--ink-2);font-size:22px;cur
 .record-filter-row>span{color:var(--ink-2);font-size:13px}
 .record-filter-row>div{display:flex;flex-wrap:wrap;gap:6px}
 [data-filter-row] button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;min-height:36px;
-color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0}
+color:var(--ink);border:1px solid var(--line);border-radius:999px;background:var(--card);padding:4px 10px;margin:0;
+max-width:100%;overflow-wrap:anywhere}
 [data-filter-row] button[aria-pressed=true]{background:var(--filter-selected-bg);border-color:var(--filter-selected-bg);
 color:var(--filter-selected-ink)}
 .record-filter-row button[aria-pressed=true] .staff-name{color:inherit!important}
@@ -297,10 +384,23 @@ background:var(--card);color:var(--ink)}[data-later-menu] .primary{background:va
 [data-later-menu] [data-later-grid] [aria-selected=true]{background:var(--accent);color:#fff}
 [data-later-menu] [data-later-grid] button:disabled{opacity:.3}
 [data-later-menu] [data-later-grid] button:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
-[data-later-menu] .later-time{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:400;margin:0 0 10px}
-[data-later-menu] .later-time input{font:inherit;min-height:32px;width:120px;max-width:100%;box-sizing:border-box;padding:3px 8px;
+[data-later-menu] .later-time{position:relative;margin:0 0 10px}
+[data-later-menu] .later-time label{display:flex;align-items:center;justify-content:space-between;font-size:12px;font-weight:400}
+[data-later-menu] .later-time input{font:inherit;min-height:32px;width:120px;max-width:100%;box-sizing:border-box;padding:3px 28px 3px 8px;
 border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);color-scheme:light dark}
 [data-later-menu] .later-time input[aria-invalid=true]{border-color:var(--error);color:var(--error)}
+[data-later-menu] [data-later-time-choices]{position:absolute;right:2px;top:2px;width:26px;min-height:28px;padding:0;border:0;background:none}
+[data-later-times]{position:absolute;right:0;top:100%;z-index:1;box-sizing:border-box;width:120px;max-height:144px;overflow:auto;
+background:var(--card);border:1px solid var(--line);border-radius:6px}
+[data-later-times] [role=option]{padding:4px 8px;cursor:pointer}
+[data-later-times] [role=option]:hover,[data-later-times] [aria-selected=true]{background:var(--accent);color:#fff}
+[data-later-menu] button[role=menuitem]{display:flex;justify-content:space-between;align-items:center;gap:24px;width:100%;
+min-height:32px;padding:5px 10px;border:0;border-radius:6px;background:none;color:var(--ink);text-align:left}
+[data-later-menu] [role=menuitem]:focus{background:var(--accent);color:#fff;outline:none}
+[data-later-menu] small{font-size:12px;color:var(--ink-3)}
+[data-later-menu] [role=menuitem]:focus small{color:inherit;opacity:.85}
+[data-later-menu] hr{border:0;border-top:1px solid var(--line);margin:5px 4px}
+[data-later-menu][data-choosing]>:is([role=menuitem],hr){display:none}
 .later-save [data-later-summary]{font-size:11px;white-space:nowrap;color:var(--ink-3)}
 [data-later-menu] .later-save button{min-height:32px;padding:4px 10px;font-size:12px;flex-shrink:0}
 [data-later-menu] .later-save button:disabled{opacity:.4}
@@ -316,7 +416,26 @@ function recordFromDetail(element){
 '''
 
 
-SCRIPT = DETAIL_SCRIPT + EMPTY_RESULT_SCRIPT + r'''
+PLACE_SCRIPT = 'const listQueryFields=' + json.dumps(LIST_QUERY_FIELDS) + r''';
+function recordPlaceParams({expandFilters}={}, {search,hash}=location){
+ const params=new URLSearchParams(search);
+ expandFilters?.(params);
+ const preferred=new Set(listQueryFields.filter(key=>params.has(key)));
+ // The server cannot see the fragment, so its values apply after load.
+ const fragment=new URLSearchParams(hash.slice(1));
+ expandFilters?.(fragment);
+ for(const key of new Set(fragment.keys())) if(!preferred.has(key)) params.delete(key);
+ for(const [key,value] of fragment) if(!preferred.has(key)) params.append(key,value);
+ return params;
+}
+'''
+
+SCRIPT = (DETAIL_SCRIPT + PLACE_SCRIPT + EMPTY_RESULT_SCRIPT + page_frame.ACTION_STATUS_SCRIPT
+          + 'const ownerQueryKeys=' + json.dumps(OWNER_QUERY_KEYS) + r''';
+const staffChipPrefix='staff:';
+const encodeIdentity=value=>value.replace(/[%\r\0]/g,character=>encodeURIComponent(character));
+const staffChipId=value=>decodeURIComponent(value.slice(staffChipPrefix.length));
+const staffChipValue=id=>staffChipPrefix+encodeIdentity(id);
 let recordSpaceAbove,recordSpaceBelow,recordScrollTop,trackedRecordRow;
 const recordScrollInputs=['wheel','touchmove','keydown'];
 const recordScrollKeys=new Set(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' ']);
@@ -428,7 +547,8 @@ function trackRecordRowDuringMotion(row,top,motions){
 }
 function activeChipLabels(content,selector){
  return [...content.querySelectorAll(selector)].map(button=>{
-  const label=[...button.childNodes].filter(node=>node.nodeName!=='B').map(node=>node.textContent).join('').trim();
+  const label=[...button.childNodes].filter(node=>!node.matches?.('b,[aria-hidden="true"]'))
+   .map(node=>node.textContent).join('').trim();
   return button.closest('[role="group"]').getAttribute('aria-label')+': '+label;
  });
 }
@@ -439,13 +559,17 @@ const filterControl={
   this.wordValues.set(control,value);
   if(control.value!==value) control.value=value;
  },
+ row(root,name){return root.querySelector('[data-filter-row="'+name+'"]');},
  buttons(row){return [...row.querySelectorAll('[data-filter-value]')];},
+ value(button){return button.dataset.filterValue;},
+ ownerId(button){return this.value(button)==='all' ? '' : staffChipId(this.value(button));},
+ setCount(button,count){
+  button.dataset.filterCount=String(count);
+  button.querySelector('b').textContent=String(count);
+ },
  setCounts(row,counts){
-  for(const button of this.buttons(row)){
-   const count=Object.hasOwn(counts,button.dataset.filterValue) ? counts[button.dataset.filterValue] : 0;
-   button.dataset.filterCount=String(count);
-   button.querySelector('b').textContent=String(count);
-  }
+  for(const button of this.buttons(row))
+   this.setCount(button,Object.hasOwn(counts,this.value(button)) ? counts[this.value(button)] : 0);
  },
  setVisible(row,values){
   const visible=new Set(values),buttons=this.buttons(row);
@@ -454,11 +578,31 @@ const filterControl={
    button.hidden=button.dataset.filterValue!=='all' && !visible.has(button.dataset.filterValue);
   return this.select(row,selected?.dataset.filterValue);
  },
- select(row,value){
+ select(row,value,{allowHidden=false,fallback='all'}={}){
   const buttons=this.buttons(row);
-  const selected=buttons.some(button=>!button.hidden && button.dataset.filterValue===value) ? value : 'all';
+  const selected=buttons.some(button=>(allowHidden || !button.hidden) && button.dataset.filterValue===value) ? value : fallback;
   for(const button of buttons) button.setAttribute('aria-pressed',String(button.dataset.filterValue===selected));
   return selected;
+ },
+ updateOwners(row,owners){
+  const [all,...choices]=this.buttons(row);
+  const current=new Map(choices.map(button=>[this.ownerId(button),button]));
+  for(const [id,button] of current)
+   if(!owners.has(id) && button.getAttribute('aria-pressed')!=='true') button.remove();
+  for(const [id,{name,label}] of owners){
+   let button=current.get(id);
+   if(!button){
+    button=all.cloneNode(true);
+    button.id='filter-owner-'+encodeURIComponent(staffChipPrefix+id).replace(/[!'()*]/g,character=>
+     '%'+character.charCodeAt(0).toString(16).toUpperCase());
+    button.dataset.filterValue=staffChipValue(id);
+    button.setAttribute('aria-pressed','false');
+    all.parentElement.append(button);
+   }
+   const count=button.querySelector('b');
+   button.dataset.ownerName=name;
+   button.innerHTML=label+' ';button.append(count);
+  }
  },
  bind(control,change){
   control.addEventListener('filterchange',event=>change(event.detail));
@@ -483,18 +627,13 @@ const filterControl={
     clear();
    });
   }else{
-   for(const button of this.buttons(control))
-    button.addEventListener('click',()=>{if(!button.hidden) emit(this.select(control,button.dataset.filterValue));});
+   control.addEventListener('click',event=>{
+    const button=event.target.closest('[data-filter-value]');
+    if(button && !button.hidden) emit(this.select(control,button.dataset.filterValue));
+   });
   }
  }
 };
-function recordPlaceParams(target=location){
- const params=new URLSearchParams(target.search);
- const fragment=new URLSearchParams(target.hash.slice(1));
- for(const key of new Set(fragment.keys())) params.delete(key);
- for(const [key,value] of fragment) params.append(key,value);
- return params;
-}
 function recordItemLink(params,resolve){
  const item=params.get('jump') || params.get('item'),saved=history.state?.recordTable;
  return item && (!saved || saved.pendingItem) ? resolve(item) : item;
@@ -531,7 +670,7 @@ const detailFocus=()=>openItem?.querySelector('.list-toggle');
 const detailMissing=inlineView?.querySelector('[data-record-missing]');
 const detailError=inlineView?.querySelector('[data-record-error]');
 const detailLinkNotice=inlineView?.querySelector('[data-record-link-notice]');
-let openItem=null,openNeedsRecord=false;
+let openItem=null,openNeedsRecord=false,focusShowOnClose=false;
 // Changes when a row opens or closes; never on a remount, a snapshot or a link to the open row.
 let openSession=0;
 let shownRevision,statusError='',savedDisplayFailed=false;
@@ -609,16 +748,22 @@ function drawWindow(){
   prefix.push(prefix.at(-1)+height);
  }
  const origin=scrollY+table.getBoundingClientRect().top+table.tHead.getBoundingClientRect().height;
- if(revealKey){
-  const at=entries.findIndex(({data})=>data.key===revealKey);
-  if(at>=0){spacer(before,0);spacer(after,prefix.at(-1));const y=origin+prefix[at];if(y<scrollY || y>scrollY+innerHeight-120) scrollTo({top:y-16,behavior:'instant'});}
-  revealKey='';
+ const reveal=revealKey;
+ revealKey='';
+ const revealAt=reveal ? entries.findIndex(({data,visible})=>visible && data.key===reveal) : -1;
+ const inset=revealAt>=0 && typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom() : 0;
+ const outsideView=top=>top<inset || top>innerHeight-120;
+ let windowTop=scrollY;
+ if(revealAt>=0 && !mounted.has(reveal)){
+  const y=origin+prefix[revealAt];
+  if(outsideView(y-scrollY)) windowTop=Math.max(0,y-inset-16);
  }
- const start=Math.max(0,locate(prefix,scrollY-origin)-8);
- const end=Math.min(entries.length,start+90,Math.max(start+18,locate(prefix,scrollY-origin+innerHeight)+9));
+ const start=Math.max(0,locate(prefix,windowTop-origin)-8);
+ const end=Math.min(entries.length,start+90,Math.max(start+18,locate(prefix,windowTop-origin+innerHeight)+9));
  const focusedRow=document.activeElement?.closest('[data-list-item]');
  const focused=focusedRow?.dataset.key || options.focusKey?.();
  const ranges=[[start,end],...motionRanges];
+ if(revealAt>=0) ranges.push([Math.max(0,revealAt-1),Math.min(entries.length,revealAt+2)]);
  for(const key of new Set([focused,opened.values().next().value,openItem?.dataset.key])){
   if(!key || options.pinOpenRow?.(key)===false) continue;
   const at=entries.findIndex(({data})=>data.key===key);
@@ -660,6 +805,13 @@ function drawWindow(){
   cursor=node;
  }
  syncOpenItem();
+ if(revealAt>=0){
+  const row=mounted.get(reveal)?.querySelector('.list-row');
+  if(row){
+   const top=row.getBoundingClientRect().top;
+   if(outsideView(top)) scrollTo({top:scrollY+top-inset-16,behavior:'instant'});
+  }
+ }
  restoreLog();
  showHiddenActionResults([...mounted.values()]);
  options.mounted?.();
@@ -765,6 +917,7 @@ function returnItemDetail(){
  inlineView.remove();
  clearRecordSpace();
  openItem=null;
+ focusShowOnClose=false;
 }
 function syncOpenItem(){
  if(!inlineView) return;
@@ -773,11 +926,15 @@ function syncOpenItem(){
   if(!openItem) return;
   const previous=openItem.dataset.key;
   const focused=document.activeElement;
-  const restoreFocus=inlineView.contains(focused) && options.ownsFocus?.()!==false;
+  // A park choice hides its menu, so the page can drop focus before the row closes.
+  const keepsFocus=inlineView.contains(focused) || (focusShowOnClose && focused===document.body);
+  const restoreFocus=keepsFocus && options.ownsFocus?.()!==false;
+  const showChip=focusShowOnClose && chipRow('show')?.querySelector('[aria-pressed="true"]');
   returnItemDetail();
   if(restoreFocus){
    const row=options.mount ? mounted.get(previous) : itemWithKey(previous);
-   (row && !row.hidden ? row.querySelector('.list-toggle') : words()).focus({preventScroll:true});
+   const target=row && !row.hidden ? row.querySelector('.list-toggle') : showChip || words();
+   target.focus({preventScroll:true});
   }
   return;
  }
@@ -802,6 +959,7 @@ function syncOpenItem(){
  const incoming=recordDetails(item);
  const children=[...incoming.childNodes];
  if(keepBody){
+  options.retainDetailState?.(openItem,item);
   delete openItem.openDetails;
   }else{
   if(openItem) returnItemDetail();
@@ -866,41 +1024,31 @@ const words=()=>content.querySelector('[data-filter-words]') ?? content.querySel
 const sharedWords=()=>words().hasAttribute?.('data-filter-words');
 const currentWords=()=>sharedWords() ? filterControl.getWords(words()) : words().value;
 if(sharedWords()) addEventListener('pageshow',()=>setTimeout(()=>filterControl.setWords(words(),currentWords()),0));
-const chipRow=name=>content.querySelector('[data-filter-row="'+name+'"]');
-const staffChipPrefix='staff:';
+const chipRow=name=>filterControl.row(content,name);
 const isStaffChipFilter=name=>options.staffChipFilters?.includes(name);
 const filterChipValue=(name,value)=>value ? (isStaffChipFilter(name) ? staffChipPrefix+value : value) : 'all';
 function filterSelection(name){
  const row=chipRow(name),all=name==='show' ? 'all' : '';
  if(row){
-  const filterValue=value=>value==='all' ? all : isStaffChipFilter(name) ? value.slice(staffChipPrefix.length) : value;
+  const filterValue=value=>value==='all' ? all : isStaffChipFilter(name) ? staffChipId(value) : value;
   return {
-   set(value){return filterValue(filterControl.select(row,filterChipValue(name,value)));},
+   set(value,fallback='all'){
+    const stored=isStaffChipFilter(name) ? encodeIdentity(value) : value;
+    const allowHidden=name!=='show' || Boolean(options.selectShow);
+    return filterValue(filterControl.select(row,filterChipValue(name,stored),{allowHidden,fallback}));
+   },
    bind(change){filterControl.bind(row,value=>change(filterValue(value)));},
    setCounts(counts){filterControl.setCounts(row,counts);}
   };
  }
  const control=content.querySelector('#list-'+name);
- if(control?.matches('input[type="checkbox"]')) return {
+ return {
   set(value){control.checked=value===control.value;return control.checked ? control.value : '';},
   bind(change){control.addEventListener('change',()=>change(control.checked ? control.value : ''));}
  };
- const attribute='data-'+name+'-chip';
- return {
-  set(value){
-   control.querySelectorAll('['+attribute+']').forEach(button=>button.setAttribute('aria-pressed',String(button.getAttribute(attribute)===value)));
-   return value;
-  },
-  bind(change){
-   control.addEventListener('click',event=>{
-   const button=event.target.closest('['+attribute+']');
-   if(button) change(button.getAttribute(attribute));
-  });
-  }
- };
 }
 function placeParams(){
- const params=recordPlaceParams();
+ const params=recordPlaceParams(options);
  options.place?.(params);
  return params;
 }
@@ -915,12 +1063,13 @@ function itemWithKey(key){
 function readPlace(params,followingItemLink=false){
  placeHash=location.hash;
  keys=new Set(params.getAll('key'));
- owner=params.get('owner') || params.get('showrunner') || '';show=params.get('show') || defaultShow;query=params.get('q') || '';
+ owner=ownerQueryKeys.map(key=>params.get(key)).find(Boolean) || '';show=params.get('show') || defaultShow;query=params.get('q') || '';
  sort=params.get('sort') || '';direction=params.get('dir')==='desc' ? 'desc' : 'asc';
  type=params.get('type') || '';
  sourceOwner=params.get('source-owner') || '';
  for(const name of filterNames) filters[name]=params.get(name) || '';
  if(!options.shows.includes(show)) show=defaultShow;
+ show=options.selectShow?.(show,type) ?? show;
  if(!columns.includes(sort)) sort='';
  const item=params.get('item');
  const saved=followingItemLink ? null : history.state?.recordTable;
@@ -1049,9 +1198,7 @@ function showHiddenActionResults(items){
  for(const [key,{hiddenMessage}] of actionNotices)
   if(hiddenMessage && hidden(key)) messages.push(hiddenMessage);
  if(latestActionFailure && hidden(latestActionFailure.key)) messages.push(latestActionFailure.message);
- const text=messages.join(' ');
- if(status.textContent!==text) status.textContent=text;
- status.hidden=!text;
+ showActionFailure(status,messages.join(' '));
 }
 /** @param {{kind:'success' | 'failure' | 'undone', message:string, hiddenMessage?:string}} result */
 function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
@@ -1059,7 +1206,7 @@ function showActionResult(item,submission,label,{kind,message,hiddenMessage}){
  actionNotices.set(key,{message,hiddenMessage});
  if(kind==='failure' && submission===latestSubmission) latestActionFailure={key,message:label+': '+message};
  const status=recordDetails(item)?.querySelector('[data-send-status]');
- if(status) status.textContent=message;
+ if(status) showActionFailure(status,message);
  apply(false,{animate:true});
  const restored=mounted.get(key);
  // A refused or undone send brings its departing row back.
@@ -1073,25 +1220,31 @@ function canRevealLinked(item,selection){
 }
 function matches(item,selection,counts){
  if(selection.keys.size && !selection.keys.has(item.dataset.key)) return false;
- if(!options.filterValues) return options.visible(item.dataset,selection);
- const values=options.filterValues(item.dataset,selection.query,selection);
- if(!values) return false;
- const selected={show:selection.show,owner:selection.owner,...selection.filters};
- const excluded=Object.entries(values).filter(([name,choices])=>
-  filterChipValue(name,selected[name])!=='all' && !choices.includes(selected[name]));
- // A record counts for a row when it matches every other row.
- if(counts && excluded.length<2){
-  for(const [name,choices] of Object.entries(values)){
-   if(excluded.length && excluded[0][0]!==name) continue;
-   const chipValues=['all',...choices.map(choice=>filterChipValue(name,choice))];
-   for(const value of chipValues)
-    counts[name][value]=(counts[name][value] ?? 0)+1;
-  }
+ const data=item.dataset;
+ if(options.visible) return options.visible(data,selection);
+ const chip=options.eligibleChip(data,selection.query,selection);
+ if(!chip) return false;
+ let excluded=0;
+ const fieldValue=field=>field==='chip' ? chip : data[field];
+ for(const [name,field,bit] of options.filterFacets){
+  const chosen=selection[name] ?? selection.filters[name];
+  if(!chosen || (name==='show' && chosen==='all')) continue;
+  // A staff field holds an encoded identity; a selection holds the decoded identity.
+  const raw=fieldValue(field),actual=isStaffChipFilter(name) ? decodeURIComponent(raw) : raw;
+  if(chosen!==actual) excluded|=bit;
  }
- return excluded.length===0;
+ if(counts) for(const [name,field,,countMask] of options.filterFacets){
+  if(excluded & countMask) continue;
+  const values=counts[name];
+  values.all=(values.all ?? 0)+1;
+  const value=filterChipValue(name,fieldValue(field));
+  if(value!=='all') values[value]=(values[value] ?? 0)+1;
+ }
+ return !excluded;
 }
+const normalizeWords=value=>options.normalizeWords?.(value) ?? value.trim().toLowerCase();
 function currentSelection(overrides={}){
- return {owner,show,query:query.trim().toLowerCase(),type,sourceOwner,keys,filters:{...filters},...overrides};
+ return {owner,show,query:normalizeWords(query),type,sourceOwner,keys,filters:{...filters},...overrides};
 }
 function apply(write=true,layout={}){
  holdLog();
@@ -1121,12 +1274,14 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(normalizeOwner) owner=options.selectOwner?.(rows,currentSelection({now})) ?? owner;
  owner=filterSelection('owner').set(owner);
  if(previousOwner && !owner) sourceOwner='';
+ if(chipRow('type')) filterSelection('type').set(type,null);
+ show=options.selectShow?.(show,type) ?? show;
  show=filterSelection('show').set(show);
  if(!sharedWords()) words().value=query;
  for(const name of filterNames)
   filters[name]=filterSelection(name).set(filters[name]);
  const active=currentSelection({now});
- const counts=options.filterValues ? Object.fromEntries(['show','owner',...filterNames].map(name=>[name,Object.create(null)])) : undefined;
+ const counts=options.filterFacets && Object.fromEntries(options.filterFacets.map(([name])=>[name,Object.create(null)]));
  const column=columns.indexOf(sort);
  const windowMotions=options.mount && rowMotion.size ? motionsByKey() : null;
  const currentKeys=windowMotions && new Set(rows.map(item=>item.dataset.key));
@@ -1144,7 +1299,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
   count=visibleKeys.size;
   const openKey=opened.values().next().value;
   if(inlineView && hasKey(openKey) && !visibleKeys.has(openKey)){
-   if(dismissMissingItem) closeCard(openKey,false);
+   if(dismissMissingItem) closeCard(openKey,{write:false});
    else if(options.pinOpenRow?.(openKey)!==false) visibleKeys.add(openKey);
   }
   for(const [key,node] of mounted){
@@ -1186,7 +1341,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
    const matched=matches(item,active,counts);
    const showRow=matched || item===linked,wasShown=!item.hidden;
    if(!showRow && opened.has(item.dataset.key) && options.closeHiddenItem?.(dismissMissingItem)){
-    closeCard(item.dataset.key,false);
+    closeCard(item.dataset.key,{write:false});
     closedHiddenItem=true;
    }
    if(motion && wasShown && !showRow) animateRow(item.parentElement,item,false);
@@ -1211,8 +1366,7 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
    notice=document.createElement('p');notice.dataset.missingKeys='';notice.setAttribute('role','status');
    empty.after(notice);
   }
-  notice.textContent=missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n');
-  notice.hidden=!missing.length;
+  showActionFailure(notice,missing.map(key=>key+' is no longer on the '+table.getAttribute('aria-label')+' page.').join('\n'));
  }
  const noResults=count===0 && missing.length===0;
  if(!options.mount) syncOpenItem();
@@ -1220,12 +1374,8 @@ function applyRows(write,{animate=false,dismissMissingItem=false,normalizeOwner=
  if(missingItem){
   const message=linkedItem && missingLinkedItem && openItem?.dataset.key!==linkedItem ? options.missingItem(linkedItem) : '';
   const inside=openItem && message;
-  missingItem.textContent=inside ? '' : message;
-  missingItem.hidden=!message || Boolean(inside);
-  if(detailLinkNotice){
-   detailLinkNotice.textContent=inside || '';
-   detailLinkNotice.hidden=!inside;
-  }
+  showActionFailure(missingItem,inside ? '' : message);
+  if(detailLinkNotice) showActionFailure(detailLinkNotice,inside || '');
  }
  const group=content.querySelector('[data-clear-linked-reviews]');
  if(group) group.hidden=!keys.size;
@@ -1303,7 +1453,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
    if(!keepMatchingFilters || owner && !matches(target,{...unfiltered,owner})) owner='';
    if(!keepMatchingFilters || sourceOwner && !matches(target,{...unfiltered,sourceOwner})) sourceOwner='';
    if(!keepMatchingFilters || show!=='all' && !matches(target,{...unfiltered,show})) show='all';
-   if(query && !matches(target,{...unfiltered,query:query.trim().toLowerCase()})) query='';
+   if(query && !matches(target,{...unfiltered,query:normalizeWords(query)})) query='';
    if(type && !matches(target,{...unfiltered,type})) type='';
    for(const name of filterNames)
     if(filters[name] && !matches(target,{...unfiltered,filters:{[name]:filters[name]}})) filters[name]='';
@@ -1326,10 +1476,7 @@ function jump(key,{pushPlace=true,focusTarget=true,keepMatchingFilters=false,pre
  if(!focusTarget) return;
  highlightedRow?.removeAttribute('data-record-highlight');
  clearTimeout(highlightTimer);
- const banner=document.querySelector('[data-page-status]');
- const inset=typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom() :
-  banner && getComputedStyle(banner).position==='sticky' ? banner.getBoundingClientRect().height : 0;
- row.style.scrollMarginTop=(inset+16)+'px';
+ row.style.scrollMarginTop='16px';
  row.querySelector('.list-toggle').focus({preventScroll:true});
  row.scrollIntoView({block:'start',behavior:'instant'});
  row.dataset.recordHighlight='';
@@ -1342,9 +1489,10 @@ function openCard(key){
  opened.add(key);
  if(linkedItem!==key){linkedItem='';revealedLinkedItem='';}
 }
-function closeCard(key,write=true){
+function closeCard(key,{write=true,focusShow=false}={}){
  const wasOpen=opened.delete(key);
  if(wasOpen) openSession++;
+ if(openItem?.dataset.key===key) focusShowOnClose=focusShow;
  if(!wasOpen && linkedItem!==key) return;
  linkedItem='';revealedLinkedItem='';
  if(write && location.hash===placeHash) writePlace();
@@ -1394,6 +1542,7 @@ function bind(){
   owner=next.owner;sourceOwner=next.sourceOwner;changeFilter();
  });
  filterSelection('show').bind(value=>{if(value===show) return;show=value;changeFilter();});
+ if(chipRow('type')) filterSelection('type').bind(value=>{if(value===type) return;type=value;changeFilter();});
  for(const name of filterNames)
   filterSelection(name).bind(value=>{if(value===filters[name]) return;filters[name]=value;changeFilter();});
  if(sharedWords()) filterControl.bind(words(),value=>{if(value!==query){query=value;changePlace();}});
@@ -1406,13 +1555,9 @@ function bind(){
   const item=event.target.closest('.list-row')?.closest('[data-list-item]');if(!item) return;
   if(event.target.closest('a') || (event.target.closest('button') && !event.target.closest('.list-toggle'))) return;
   const key=item.dataset.key,expanded=!opened.has(key);
-  if(expanded) openCard(key);else closeCard(key,false);
+  if(expanded) openCard(key);else closeCard(key,{write:false});
   apply(true,{animate:true});
  });
- content.querySelectorAll('[data-type-chip]').forEach(button=>button.addEventListener('click',()=>{
-  if(type===button.dataset.typeChip) return;
-  type=button.dataset.typeChip;changeFilter();
- }));
 }
 return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updateItemDetail,presentItemRevision,
  preserveRecordRowTop,holdLog,restoreLog,
@@ -1423,7 +1568,7 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updat
  },
  revealMatchingItem(key){
   const target=itemWithKey(key);
-  const selection=currentSelection({query:currentWords().trim().toLowerCase()});
+  const selection=currentSelection({query:normalizeWords(currentWords())});
   if(!target || !matches(target,selection)) return false;
   jump(key,{preserveFilters:true});
   return true;
@@ -1445,6 +1590,8 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updat
   const submission=++latestSubmission;
   latestActionFailure=null;
   actionNotices.delete(item.dataset.key);
+  const status=recordDetails(item)?.querySelector('[data-send-status]');
+  if(status) showActionFailure(status);
   apply(false,{animate:true});
   return submission;
  },
@@ -1467,7 +1614,7 @@ return {place,apply,bind,opened,openCard,closeCard,restorePlace,drawWindow,updat
   bind();if(draw) applyRows(query!==previousQuery);
  }};
 }
-'''
+''')
 
 
 DATE_TIME_SCRIPT = r'''
@@ -1511,31 +1658,65 @@ function dateTimeDraftEpoch(zone,wall){
  const draft=parseDateTimeDraft(wall);
  return draft ? dateTimeEpoch(zone,draft.date,draft.minutes) : NaN;
 }
+function parkPresetTime(preset,now,zone,settings){
+ if(preset==='soon') return now+settings.soon*60000;
+ const today=zoneParts(zone,now);
+ const at=(days,minutes)=>zoneEpoch(zone,today.year,today.month,today.day+days,minutes);
+ if(preset==='morning') return at(1,settings.morning);
+ const weekday=new Date(Date.UTC(today.year,today.month-1,today.day)).getUTCDay();
+ return at((settings.weekDay-weekday+7)%7 || 7,settings.weekTime);
+}
+function showParkPresets(menu,settings){
+ const hours=settings.soon%60===0,count=hours ? settings.soon/60 : settings.soon;
+ const unit=hours ? 'hour' : 'minute';
+ menu.querySelector('[data-later-preset="soon"] span').textContent=count+' '+unit+(count===1 ? '' : 's');
+ menu.querySelector('[data-later-preset="morning"] small').textContent=dateTimeClock(settings.morning);
+ const weekdays=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+ menu.querySelector('[data-later-preset="week"] small').textContent=
+  weekdays[settings.weekDay]+' '+dateTimeClock(settings.weekTime);
+}
+function parkRequestTime(form,submitter,zone,settings,wall){
+ const preset=submitter?.dataset.laterPreset;
+ let until='';
+ if(preset==='delivered') until='delivered';
+ else if(preset) until=new Date(parkPresetTime(preset,Date.now(),zone,settings)).toISOString();
+ else{
+  if(/^\d{4}-\d{2}-\d{2}$/.test(wall)) until=wall;
+  else{
+   const at=dateTimeDraftEpoch(zone,wall);
+   if(at>Date.now()) until=new Date(at).toISOString();
+  }
+ }
+ if(until) closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
+ return until;
+}
 function closeDateTimePicker(menu,focus){
  menu.hidden=true;menu.querySelector('[data-later-custom]').hidden=true;delete menu.dataset.choosing;
  const toggle=menu.parentElement.querySelector('[data-later-toggle]');toggle.setAttribute('aria-expanded','false');
  if(focus) toggle.focus();
 }
-function pickerSummary(zone){
+function pickerSummary(zone,at){
  const date=new Intl.DateTimeFormat('en-GB',{timeZone:zone,weekday:'short',day:'numeric',month:'short'});
- return at=>{
-  const {hour,minute}=zoneParts(zone,at);
-  return date.format(at)+' '+dateTimeClock(hour*60+minute);
- };
+ const {hour,minute}=zoneParts(zone,at);
+ return date.format(at)+' '+dateTimeClock(hour*60+minute);
 }
-function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummary=pickerSummary(zone),
- prepareMenu=()=>{},retryTime=()=>NaN}){
+let parkTimeListId=0;
+function bindDateTimePicker(form,{zone,settings,summaryPrefix,formatSummary,retryTime=()=>NaN,
+                                  prepareMenu=()=>{},openCustom=false}){
+ const currentZone=typeof zone==='function' ? zone : ()=>zone;
  const toggle=form.querySelector('[data-later-toggle]'),menu=form.querySelector('[data-later-menu]');
  const custom=menu.querySelector('[data-later-custom]'),chooseItem=menu.querySelector('[data-later-choose]');
- const items=()=>[...menu.querySelectorAll('[role=menuitem]:not([hidden])')];
+ const items=()=>[...menu.querySelectorAll('[role=menuitem]')];
  toggle.addEventListener('click',()=>{
   if(!menu.hidden){closeDateTimePicker(menu,true);return;}
-  prepareMenu(menu);
+  showParkPresets(menu,settings());
   menu.hidden=false;toggle.setAttribute('aria-expanded','true');
-  if(chooseItem) items()[0].focus();
-  else choose();
+  if(openCustom) choose();
+  else items()[0].focus();
  });
  const grid=custom.querySelector('[data-later-grid]'),time=custom.querySelector('[data-later-time]');
+ const times=custom.querySelector('[data-later-times]'),timeChoices=custom.querySelector('[data-later-time-choices]');
+ times.id='park-times-'+(++parkTimeListId);time.setAttribute('aria-controls',times.id);
  const focusCalendar=()=> (grid.querySelector('[tabindex="0"]') ?? time).focus();
  const save=custom.querySelector('.later-save button'),month=custom.querySelector('[data-later-month]');
  const previousMonth=custom.querySelector('[data-later-month-step="-1"]');
@@ -1544,22 +1725,85 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
  const monthText=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',year:'numeric'});
  const dayLabel=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',dateStyle:'full'});
  let selected=new Date(),display=new Date();
- const today=()=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
- const update=(normalize=false)=>{
+ const today=zone=>{const now=zoneParts(zone,Date.now());return new Date(Date.UTC(now.year,now.month-1,now.day));};
+ const update=(normalize=false,edited=false)=>{
+  const zone=currentZone();
   const minutes=dateTimeMinutes(time.value),valid=Number.isFinite(minutes);
   const clock=valid ? dateTimeClock(minutes) : '';
   time.setAttribute('aria-invalid',String(!valid));
   if(valid && normalize) time.value=clock;
   field.value=valid ? dayText(selected)+'T'+clock : '';
-  field.dispatchEvent(new Event('input',{bubbles:true}));
+  field.dispatchEvent(new CustomEvent('input',{bubbles:true,detail:{edited}}));
   const retry=retryTime();
   const at=Number.isFinite(retry) ? retry : valid ? dateTimeEpoch(zone,selected,minutes) : NaN;
   custom.querySelector('[data-later-summary]').textContent=Number.isFinite(at)
-   ? summaryPrefix+formatSummary(at) : 'Choose a time';
+   ? summaryPrefix+(formatSummary ? formatSummary(at) : pickerSummary(zone,at)) : 'Choose a time';
   save.disabled=!Number.isFinite(retry) && !(at>Date.now());
  };
- const draw=()=>{
-  const current=today(),currentText=dayText(current),selectedText=dayText(selected);
+ const activeTime=()=>times.querySelector('[aria-selected="true"]');
+ const showTimes=open=>{
+  times.hidden=!open;
+  time.setAttribute('aria-expanded',String(open));
+  if(!open){
+   activeTime()?.setAttribute('aria-selected','false');
+   time.removeAttribute('aria-activedescendant');
+  }
+ };
+ const acceptTime=option=>{
+  time.value=option.textContent;
+  showTimes(false);
+  update(false,true);
+ };
+ timeChoices.addEventListener('mousedown',event=>event.preventDefault());
+ timeChoices.addEventListener('click',()=>{
+  time.focus({preventScroll:true});showTimes(times.hidden);
+ });
+ times.addEventListener('mousedown',event=>{
+  if(event.target.closest('[role=option]')) event.preventDefault();
+ });
+ times.addEventListener('click',event=>{
+  const option=event.target.closest('[role=option]');
+  if(option) acceptTime(option);
+ });
+ time.addEventListener('keydown',event=>{
+  if(event.defaultPrevented || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  if(event.key==='ArrowDown' || event.key==='ArrowUp'){
+   if(!times.firstElementChild) return;
+   event.preventDefault();
+   showTimes(true);
+   const active=activeTime();
+   const down=event.key==='ArrowDown';
+   const next=down ? active?.nextElementSibling : active?.previousElementSibling;
+   const option=next ?? active ?? (down ? times.firstElementChild : times.lastElementChild);
+   active?.setAttribute('aria-selected','false');
+   option.setAttribute('aria-selected','true');
+   time.setAttribute('aria-activedescendant',option.id);
+   option.scrollIntoView({block:'nearest'});
+  }else if(!times.hidden && (event.key==='Enter' || event.key==='Escape')){
+   event.preventDefault();
+   const option=activeTime();
+   if(event.key==='Enter' && option) acceptTime(option);
+   else showTimes(false);
+  }
+ });
+ const draw=(edited=false)=>{
+  const zone=currentZone();
+  const current=today(zone),currentText=dayText(current),selectedText=dayText(selected);
+  const step=settings().step,now=zoneParts(zone,Date.now());
+  const firstTime=(Math.floor((now.hour*60+now.minute)/step)+1)*step;
+  const clockValues=[];
+  for(let minutes=firstTime;minutes<1440;minutes+=step) clockValues.push(minutes);
+  if(selected>current) for(let minutes=0;minutes<Math.min(firstTime,1440);minutes+=step) clockValues.push(minutes);
+  showTimes(false);
+  times.replaceChildren(...clockValues.map(minutes=>{
+   const option=document.createElement('div');
+   option.id=times.id+'-'+minutes;
+   option.setAttribute('role','option');
+   option.setAttribute('aria-selected','false');
+   option.textContent=dateTimeClock(minutes);
+   return option;
+  }));
+  timeChoices.disabled=!clockValues.length;
   month.textContent=monthText.format(display);grid.replaceChildren();
   grid.setAttribute('aria-label',month.textContent);
   const header=document.createElement('div');header.setAttribute('role','row');
@@ -1584,39 +1828,43 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
    button.setAttribute('aria-selected',String(button.dataset.date===selectedText));
    button.tabIndex=button.dataset.date===tabDate ? 0 : -1;button.disabled=date<current;
    if(button.dataset.date===currentText) button.setAttribute('aria-current','date');
-   button.addEventListener('click',()=>{selected=date;draw();focusCalendar();});row.append(button);
+   button.addEventListener('click',()=>{selected=date;draw(true);focusCalendar();});row.append(button);
   }
-  update();
+  update(false,edited);
  };
  function choose(){
-  const draft=parseDateTimeDraft(field.value);
+  const zone=currentZone(),draft=parseDateTimeDraft(field.value);
   if(draft && (Number.isFinite(retryTime()) || dateTimeEpoch(zone,draft.date,draft.minutes)>Date.now())){
    selected=draft.date;time.value=dateTimeClock(draft.minutes);
   }else{
-   selected=today();selected.setUTCDate(selected.getUTCDate()+1);
-   time.value=dateTimeClock(defaultMinutes());
+   selected=today(zone);selected.setUTCDate(selected.getUTCDate()+1);
+   time.value=dateTimeClock(settings().morning);
   }
-  const current=today();
+  const current=today(zone);
   display=new Date(selected<current ? current : selected);
-  custom.hidden=false;menu.dataset.choosing='true';draw();
+  custom.hidden=false;menu.dataset.choosing='true';prepareMenu();draw();
   focusCalendar();
  }
- chooseItem?.addEventListener('click',choose);
+ chooseItem.addEventListener('click',choose);
  custom.querySelectorAll('[data-later-month-step]').forEach(button=>button.addEventListener('click',()=>{
   const hadFocus=document.activeElement===button;
   display=new Date(Date.UTC(display.getUTCFullYear(),display.getUTCMonth()+Number(button.dataset.laterMonthStep),1));
   draw();
   if(hadFocus && button.disabled) focusCalendar();
  }));
- time.addEventListener('input',()=>update());
- time.addEventListener('blur',()=>update(true));
- time.addEventListener('keydown',event=>{
-  const step={ArrowUp:15,ArrowDown:-15}[event.key];
-  if(step===undefined) return;
-  event.preventDefault();
-  const minutes=dateTimeMinutes(time.value);
-  if(!Number.isFinite(minutes)) return;
-  time.value=dateTimeClock((minutes+step+1440)%1440);update();
+ time.addEventListener('input',()=>{showTimes(false);update(false,true);});
+ time.addEventListener('blur',()=>{showTimes(false);update(true);});
+ toggle.parentElement.addEventListener('focusout',event=>{
+  if(menu.hidden) return;
+  const control=toggle.parentElement;
+  if(event.relatedTarget){
+   if(!control.contains(event.relatedTarget)) closeDateTimePicker(menu,false);
+  }else{
+   // The calendar can replace the active day before it sets focus again.
+   requestAnimationFrame(()=>{
+    if(!menu.hidden && !control.contains(document.activeElement)) closeDateTimePicker(menu,false);
+   });
+  }
  });
  grid.addEventListener('keydown',event=>{
   const days={ArrowLeft:-1,ArrowRight:1,ArrowUp:-7,ArrowDown:7}[event.key];
@@ -1625,20 +1873,22 @@ function bindDateTimePicker(form,{zone,defaultMinutes,summaryPrefix,formatSummar
   event.preventDefault();
   const date=new Date(day+'T00:00:00Z');
   date.setUTCDate(date.getUTCDate()+days);
-  if(date<today()) return;
-  selected=date;display=new Date(date);draw();focusCalendar();
+  if(date<today(currentZone())) return;
+  selected=date;display=new Date(date);draw(true);focusCalendar();
  });
  menu.addEventListener('keydown',event=>{
+  if(event.defaultPrevented || event.isComposing) return;
+  if(event.target===time &&
+     (event.repeat || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey)) return;
   if(event.key==='Escape'){event.preventDefault();closeDateTimePicker(menu,true);return;}
   if(custom.contains(event.target)){
-   if(event.key==='Enter'){
+   if(event.key==='Enter' && (event.target===time || grid.contains(event.target))){
     event.preventDefault();update(true);if(!save.disabled) form.requestSubmit(save);
    }
    return;
   }
   const list=items();
- if(!list.length) return;
- const index=list.indexOf(document.activeElement);
+  const index=list.indexOf(document.activeElement);
   const next={ArrowDown:index+1,ArrowUp:index-1+list.length,Home:0,End:list.length-1}[event.key];
   if(next===undefined) return;
   event.preventDefault();list[next%list.length].focus();

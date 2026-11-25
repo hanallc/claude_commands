@@ -48,7 +48,7 @@ class FolderSizeTests(unittest.TestCase):
 
     def set_limit(self, limit: int) -> None:
         _ = self.config.write_text(
-            f"PRODUCER_FOLDER_ROOT={self.root}\n# whole: 1..\nproducer_folder_limit_mb={limit}\n",
+            f"producer_folder_root={self.root}\n# whole: 1..\nproducer_folder_limit_mb={limit}\n",
         )
 
     def resize(self, path: Path, size: int) -> None:

@@ -14,7 +14,6 @@ from typing import Literal, cast, override
 from unittest import mock
 from unittest.mock import patch
 
-from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.lib import build_folders, build_copies, conf, copy_record, nix_env, scratch
 from scripts.lib.build_copies_test_support import private_copy_config
@@ -27,7 +26,7 @@ class GeneratedSourceTests(NixFixture):
     def test_numbered_copy_requires_copy_proof_before_home_root_trust(self) -> None:
         build = self.home / "worktrees/build"
         _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "build_folders.conf",
-            f"roots.build={build}\nroots.build.{host_name()}={build}\n"
+            f"roots.build={build}\nroots.build.{conf.local_host_key_name()}={build}\n"
             + f"roots.workspace={self.home / 'worktrees'}\n")
         numbered = build_folders.copy_path("hana", "demo", 1)
         envrc = self.envrc(numbered)
@@ -396,7 +395,7 @@ class RegisteredCopyTests(GitNixFixture):
         _ = private.settings.with_name("nix_env.conf").write_bytes(nix_settings.read_bytes())
         if kind == "trusted-numbered":
             build = self.home / "worktrees/build"
-            _ = write_config_fixture(private.settings, f"roots.build={build}\nroots.build.{host_name()}={build}\n")
+            _ = write_config_fixture(private.settings, f"roots.build={build}\nroots.build.{conf.local_host_key_name()}={build}\n")
         with (patch.dict(os.environ, private.environment), patch.dict(self.env, private.environment),
               patch.object(tempfile, "tempdir", str(self.root)),
               copies.standing("nix-env-proof", repository, copies.CommittedSource("HEAD")) as checkout):

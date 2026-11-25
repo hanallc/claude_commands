@@ -15,6 +15,8 @@ from scripts.whoami import agent_accounts
 from scripts.whoami import account
 from scripts.herdr import pane_launch, herdr_types
 
+from scripts.production import staff
+
 if TYPE_CHECKING:
     from scripts.production.staff import StaffRow
 
@@ -34,6 +36,9 @@ def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWith
     if to:
         return (accounts.CodexWorkersAccount(to, agent_accounts.codex_account_home(to).home)
                 if kind == "codex" else accounts.NamedAccount(to, accounts.account_dir(to)))
+    if not isinstance(row, SessionWithoutStaffRow) and row.kind == "session" and isinstance(row.home, staff.SessionHome):
+        return (accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(row.home.path), row.home.path)
+                if kind == "codex" else accounts.NamedAccount(accounts.claude_config_label(row.home.path), row.home.path))
     if kind == "codex":
         return accounts.role_account("workers")
     if not isinstance(row, SessionWithoutStaffRow) and row.kind == "producer":
@@ -43,10 +48,18 @@ def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWith
     return accounts.role_account("unit")
 
 
+def implicit_claude_resume(row: StaffRow | SessionWithoutStaffRow, entry: pane_launch.NativePaneLaunch,
+                           target: str | accounts.AccountSelection) -> pane_launch.ImplicitClaudeHome | pane_launch.SelectedClaudeAccount:
+    """Reuse the implicit account when a standalone Claude resumes on its saved home."""
+    if not target and isinstance(row, staff.StaffRow) and row.kind == "session" and pane_launch.saved_kind(entry) == "claude":
+        implicit = pane_launch.implicit_claude_home(entry)
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome) and row.home == staff.SessionHome(implicit.config_dir):
+            return implicit
+    return pane_launch.SelectedClaudeAccount.USE_SELECTION
+
+
 def repair_home(row: StaffRow, kind: str, pid: int) -> None:
     """Repair the member's home from its unchanged current process."""
-    from scripts.production import staff
-
     try:
         reader = cast(pane_launch.NativeProcessReader, cast(object, import_module("scripts.herdr.herdr")))
         observed = reader.native_process(pid, kind)

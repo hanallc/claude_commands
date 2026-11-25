@@ -41,7 +41,7 @@ def review(run: Path, cwd: Path, settings: conf.ConfigRead) -> int:
     tip = git(cwd, "rev-parse", tracking).stdout.strip()
     old = git(cwd, "rev-parse", "--verify", "refs/simplify/last", check=False)
     last = old.stdout.strip() if old.returncode == 0 else ""
-    base = last or git(cwd, "rev-list", "-1", "--before=" + settings.text("SIMPLIFY_FIRST_RUN_BEFORE"), tip).stdout.strip()
+    base = last or git(cwd, "rev-list", "-1", "--before=" + settings.text("simplify_first_run_before"), tip).stdout.strip()
     if not base:
         base = git(cwd, "rev-list", "--max-parents=0", tip).stdout.splitlines()[0]
     diff = git(cwd, "diff", base, tip).stdout
@@ -100,7 +100,7 @@ def review(run: Path, cwd: Path, settings: conf.ConfigRead) -> int:
             ], env=env, check=False, pass_fds=copies.COMMAND_LOCKS.get())
             report = report_path.read_text()
             log = log_path.read_text(errors="replace") if log_path.exists() else ""
-            reason = simplify_result.validate(report, log, len(settings.words("SIMPLIFY_AGENTS")))
+            reason = simplify_result.validate(report, log, len(settings.words("simplify_agents")))
             if launched.returncode and not reason:
                 reason = simplify_result.failure_reason(log, launched.returncode)
         if not reason:
@@ -124,7 +124,7 @@ def main(arguments: list[str]) -> int:
     args = parser.parse_args(arguments)
     try:
         settings = conf.read("direct")
-        if settings.text("SIMPLIFY_LENS") == "off":
+        if settings.text("simplify_lens") == "off":
             print("simplify: off")
             return 0
         return review(cast(Path, args.session_dir).expanduser().resolve(),

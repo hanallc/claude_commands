@@ -40,6 +40,7 @@ from scripts.production import staff
 PATH = "/console/build-kill"
 PROC = Path("/proc")
 CARGO_PROGRAMS = frozenset({"cargo", "cargo-nextest", "cargo-tile-real"})
+RECOVERY_THREAD = "build kill recovery"
 BUILD_STEPS = CARGO_BUILD_VERBS | {"cargo", "cargo-nextest", "fmt"}
 
 
@@ -319,8 +320,8 @@ class OutsideProcessSurvived:
 
 def stop_outside_tree(run: OutsideKillCandidate) -> OutsideTreeEmpty | OutsideIdentityUnconfirmed | OutsideProcessSurvived:
     settings = conf.read("shutdown")
-    grace = float(settings.text("STOP_GRACE_SECONDS"))
-    kill_grace = float(settings.text("KILL_GRACE_SECONDS"))
+    grace = float(settings.text("stop_grace_seconds"))
+    kill_grace = float(settings.text("kill_grace_seconds"))
     root = process_stop.ProcessLifetime(run.row_pid, run.row_start)
     try:
         with ExitStack() as pins:
@@ -832,7 +833,8 @@ class KillActions:
         """Start one recovery pass from the server maintenance cycle."""
         with self._lock:
             if self._retry and (self._worker is None or not self._worker.is_alive()):
-                self._worker = threading.Thread(target=self._recover, args=(tuple(self._retry),), daemon=True)
+                self._worker = threading.Thread(target=self._recover, args=(tuple(self._retry),),
+                                                name=RECOVERY_THREAD, daemon=True)
                 self._worker.start()
 
     def resume(self) -> None:
