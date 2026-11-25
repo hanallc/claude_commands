@@ -574,6 +574,22 @@ printf '%s\\n' "$BUILDLOG_ADMISSION_CODE_VERSION"
                         self.assertEqual(wire.parse_request_envelope(json.dumps(envelope)), (version, shaped))
                         self.assertEqual(wire.parse_record(json.dumps(data), wire.AdmitRequest), shaped)
 
+    def test_priority_set_refuses_a_target_field(self) -> None:
+        request = wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor")
+        envelope = cast(dict[str, object], json.loads(wire.encode_request(request)))
+        self.assertEqual(envelope["type"], "priority_set")
+        data = cast(dict[str, object], envelope["data"])
+        self.assertNotIn("target", data)
+        data["target"] = {"kind": "OneRun", "run": codec.snapshot_value(wire.RunIdentity(41, "900")),
+                          "step": "nextest"}
+        for name in ("priority_set", "priority_run_set"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "^priority applies to a unit$"):
+                envelope["type"] = name
+                _ = wire.parse_request(json.dumps(envelope))
+        del data["target"]
+        with self.assertRaisesRegex(ValueError, "^priority applies to a unit$"):
+            _ = wire.parse_request(json.dumps(envelope))
+
     def test_verify_metadata_is_optional_and_older_decoders_ignore_it(self) -> None:
         from scripts.build_queue.test_placement import placement_request
 

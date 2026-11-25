@@ -254,7 +254,7 @@ def consume_launch_permission(launch: GuestLaunchRecovery,
     """Consume permission after the gate syncs its launch record.
 
     The gate process is the holder, so the queue keeps the guest assignment current until the gate ends.
-    A lost consume reply leaves the permission unknown. The guest starts nothing.
+    If the reply is lost, the gate stops before it sends the arm command.
     """
     from scripts.build_queue import admission_client, admission_protocol as wire, placement
     from scripts.buildlog import store
@@ -268,11 +268,11 @@ def consume_launch_permission(launch: GuestLaunchRecovery,
         permission = admission_client.consume_permission(
             wire.ConsumePermission(admission_client.request_id(), assignment, reference, holder, guest_proof_required=True))
     except wire.AdmissionUnavailable as error:
-        raise GuestPermissionUnknown(f'the launch permission is unavailable: {error}') from error
+        raise GuestPermissionUnknown(f'the launch permission is unavailable: {error}', reference) from error
     if isinstance(permission, wire.DispatchStatus):
         reason = f'the queue refused the launch permission: {permission.reason}'
         if isinstance(permission.permission, placement.PermissionConsumed):
-            raise GuestPermissionUnknown(reason)
+            raise GuestPermissionUnknown(reason, reference)
         raise GuestTookNoRun(reason)
     return permission.claim
 
@@ -569,7 +569,11 @@ def guest_ssh_environment() -> dict[str, str]:
 def inner_connect_failure[Output: (bytes, str)](
     reply: subprocess.CompletedProcess[Output], *, bundle_stream: bool = False,
 ) -> str:
-    if reply.returncode != INNER_CONNECT_STATUS or reply.stdout:
+    if reply.returncode == INNER_CONNECT_STATUS:
+        if reply.stdout:
+            return ''
+    elif (not bundle_stream or reply.returncode != 0
+          or reply.stdout not in (b'', b'\n\n', '', '\n\n')):
         return ''
     stderr = reply.stderr.decode(errors='replace') if isinstance(reply.stderr, bytes) else reply.stderr
     if bundle_stream:
@@ -667,6 +671,10 @@ class GuestTookNoRun(GuestUnavailable):
 class GuestPermissionUnknown(GuestTookNoRun):
     """The queue may hold consumed permission without giving the gate launch authorization."""
 
+    def __init__(self, reason: str, claim: ProviderClaimReference) -> None:
+        super().__init__(reason)
+        self.claim: ProviderClaimReference = claim
+
 
 class GuestConnectAttemptsFailed(GuestTookNoRun):
     """The inner SSH connection failed before the guest received a command."""
@@ -681,14 +689,16 @@ class GuestNotStarted:
 
     reason: str
     settlement_required: bool = False
+    retry_before_settlement: bool = False
 
 
 class GuestEndUnproven(GuestUnavailable):
     """The proof wait expired for an armed guest attempt."""
 
-    def __init__(self, message: str, armed: ArmedGuestAttempt) -> None:
+    def __init__(self, message: str, armed: ArmedGuestAttempt, *, retry_before_settlement: bool = False) -> None:
         super().__init__(message)
         self.armed: ArmedGuestAttempt = armed
+        self.retry_before_settlement: bool = retry_before_settlement
 
 
 GUEST_ARM_RECORDS = '''\
@@ -804,10 +814,7 @@ def arm_guest(settings: GuestSettings, attempt: str) -> ArmedGuestAttempt:
                 raise
         return subprocess.CompletedProcess(command, process.returncode, output, errors)
 
-    try:
-        response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds)
-    except GuestConnectAttemptsFailed as error:
-        raise GuestArmNotSent(str(error)) from error
+    response = retry_guest_connect(send, monotonic() + settings.unreachable_wait_seconds)
     if response.returncode:
         diagnostic = response.stderr.decode(errors='replace').strip() or 'no diagnostic'
         raise GuestUnavailable(f'guest arm exited {response.returncode}: {diagnostic}')
@@ -1166,11 +1173,11 @@ class GuestEndWait:
             elif not self.first_failure:
                 self.first_failure = proof.detail
 
-    def unreachable(self) -> GuestEndUnproven:
+    def unreachable(self, *, retry_before_settlement: bool = False) -> GuestEndUnproven:
         guest = self.settings.ssh_hops[-1]
         error = GuestEndUnproven(f'guest unreachable: {guest} did not confirm the run ended '
                                  + f'within {self.settings.unreachable_wait_seconds} seconds ({target_config.UNREACHABLE_WAIT_KEY})',
-                                 self.armed)
+                                 self.armed, retry_before_settlement=retry_before_settlement)
         if self.first_failure:
             error.add_note(f'First cleanup failure: {self.first_failure}')
         return error
@@ -1257,6 +1264,8 @@ def bundle_refs(repo: Path, source: CheckoutSource, attempt: str) -> Generator[s
                 elif (isinstance(error, Exception) or isinstance(failure, GuestEndUnproven)
                       or not isinstance(failure, Exception)):
                     failure.add_note(f'Cannot remove bundle ref {ref}: {error}')
+                    if isinstance(failure, GuestEndUnproven):
+                        failure.retry_before_settlement = False
                 else:
                     # An interrupt must end the route, never a retry that catches the earlier error.
                     error.add_note(f'Interrupted while handling: {failure!r}')
@@ -1392,6 +1401,25 @@ def send_guest_execution(request: ExecutionReport, *, deadline: float, timeout: 
     if not isinstance(response, wire.DispatchStatus):
         raise wire.AdmissionUnavailable('invalid execution report answer')
     return response
+
+
+def guest_permission_consumed(assignment: PlacementAssignment, claim: ProviderClaimReference) -> bool:
+    """Check whether the queue saved consumed permission for this launch claim."""
+    from scripts.build_queue import admission_client, admission_protocol as wire, admission_wire, placement
+
+    query = admission_wire.PlacementStatusRequest(assignment.episode, assignment.attempt, include_permission=True,
+                                                  code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
+    try:
+        with conf.diagnostics(report=False):
+            timeout = conf.read('build_admission').number('query_timeout_seconds')
+        reply = _guest_queue_query(query, deadline=monotonic() + timeout, timeout=timeout)
+    except (wire.AdmissionUnavailable, OSError, ValueError):
+        return False
+    return (isinstance(reply, admission_wire.PlacementStatusReply)
+            and isinstance(saved := reply.status, admission_wire.KnownPlacementStatus)
+            and saved.assignment == assignment and saved.claim == claim
+            and isinstance(saved.state, placement.CurrentAssignment)
+            and isinstance(saved.permission, placement.PermissionConsumed))
 
 
 def guest_start_execution(armed: ArmedGuestAttempt, attempt: str, folder_payload: bytes
@@ -1742,30 +1770,11 @@ def settle_guest_dispatch(dispatch: GuestGateDispatch, result: AttemptCompleted 
         _start_guest_queue_report(send, math.inf, reports, warn)
 
 
-def send_guest_end_report(request: ExecutionReport) -> None:
-    from scripts.build_queue import admission_protocol as wire, placement
-
-    with conf.diagnostics(report=False):
-        timeout = conf.read('build_admission').number('query_timeout_seconds')
-    reply = send_guest_execution(request, deadline=monotonic() + timeout, timeout=timeout)
-    settlement_pending = (isinstance(reply.state, placement.CurrentAssignment)
-                          and isinstance(reply.permission, placement.PermissionConsumed))
-    if (reply.assignment != request.assignment or reply.reason
-            or not (settlement_pending or isinstance(reply.state, placement.ClosedAssignment))):
-        raise wire.AdmissionUnavailable(reply.reason or 'the queue did not accept the guest end report')
-
-
-def settle_guest_no_run(dispatch: GuestGateDispatch) -> None:
-    """Record that the gate consumed permission and the guest received no arm command."""
-    from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
-
+def save_guest_no_start(dispatch: GuestGateDispatch) -> None:
+    """Save proof that the guest received no arm command."""
     try:
         _append_guest_end(dispatch, GuestNotStartedProven(), 'The guest received no arm command')
-        request = wire.ExecutionReport(admission_client.request_id(), dispatch.assignment, dispatch.claim,
-            execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused(placement.MAC_LINUX_NO_ANSWER),
-            placement.DispatchPathSettled(), code_version=admission_client.LOADED_ADMISSION_CODE_VERSION)
-        send_guest_end_report(request)
-    except (wire.AdmissionUnavailable, OSError, ValueError) as error:
+    except (OSError, ValueError) as error:
         print(f'Mac Linux guest settlement report failed: {error}', file=sys.stderr, flush=True)
 
 
@@ -2005,8 +2014,8 @@ def stream_guest_bundle(repo: Path, command: list[str], bootstrap: bytes, timeou
             stop_ssh_process(stream)
             if isinstance(error, subprocess.TimeoutExpired):
                 stderr = error.stderr if isinstance(error.stderr, bytes) else b''
-                failure = GuestResultUnavailable if dispatch.started == armed else GuestUnavailable
-                raise failure(f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}') from error
+                detail = f'SSH or guest run exceeded {timeout} seconds: {stream_diagnostic(stderr)}'
+                raise guest_failure(dispatch.started == armed, detail) from error
             raise
     return subprocess.CompletedProcess(command, stream.returncode, output, errors)
 
@@ -2049,7 +2058,7 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
                             dispatch.arm_requested = True
                             dispatch.settled = False
                             armed = arm_guest(settings, request['attempt'])
-                        except GuestArmNotSent as error:
+                        except (GuestArmNotSent, GuestConnectAttemptsFailed) as error:
                             dispatch.arm_requested, dispatch.settled = prior_arm, prior_settlement
                             raise GuestTookNoRun(f'the gate could not send the arm request: {error}') from error
                         except (GuestUnavailable, OSError, subprocess.SubprocessError) as error:
@@ -2088,7 +2097,10 @@ def run_remote(repo: Path, settings: GuestSettings, source: CandidateSource, req
 
     assert end is not None
     if not end.proven:
-        error = end.unreachable()
+        retry_before_settlement = (dispatch.started is None
+            and (stream is None or run_start_line(request['attempt']).encode() not in stream.stderr.splitlines())
+            and (first_error is None or isinstance(first_error, GuestTookNoRun | GuestNotLocked)))
+        error = end.unreachable(retry_before_settlement=retry_before_settlement)
         if stream is not None and stream.returncode:
             error.add_note(stream_report(stream))
         if first_error is not None and isinstance(first_error.__cause__, subprocess.TimeoutExpired):
@@ -2389,22 +2401,30 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         saved, launch = launch, None
         _release_guest_launch(saved)
 
-    def refused(reason: str, *, permission_unknown: bool = False,
+    def refused(reason: str, *, uncertain_claim: ProviderClaimReference | None = None,
                 lock_refused: bool = False) -> GuestNotStarted | GuestGateBlocked:
-        if dispatch is None and not permission_unknown:
-            return GuestNotStarted(reason)
+        nonlocal dispatch
+        if dispatch is None:
+            if uncertain_claim is None:
+                return GuestNotStarted(reason)
+            if guest_permission_consumed(assignment, uncertain_claim):
+                dispatch = GuestGateDispatch(assignment, uncertain_claim)
         if dispatch is not None:
-            if dispatch.settled and dispatch.arm_requested and not lock_refused:
-                if dispatch.started is None:
+            if dispatch.arm_requested:
+                if dispatch.started is not None:
+                    return GuestGateBlocked(reason)
+                if dispatch.settled and not lock_refused:
                     reason += '. The guest did not confirm whether the run started.'
-                return GuestGateBlocked(reason)
-            if not dispatch.arm_requested:
-                settle_guest_no_run(dispatch)
+                    return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=True)
+            else:
+                save_guest_no_start(dispatch)
         try:
             release_launch()
         except OSError as error:
             return GuestGateBlocked(f'{reason}. Cannot release the Mac Linux launch holder: {error}')
-        return GuestNotStarted(reason, settlement_required=True)
+        if dispatch is None:
+            return GuestNotStarted(reason, settlement_required=True)
+        return GuestNotStarted(reason, settlement_required=True, retry_before_settlement=True)
 
     try:
         # natedev selects the modules of a targeted run once; the guest runs that list and selects none itself.
@@ -2472,7 +2492,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         return refused(str(error))
     except (GuestTookNoRun, GuestNotLocked) as error:
         notes = cast(list[str], getattr(error, '__notes__', []))
-        return refused(' '.join((str(error), *notes)), permission_unknown=isinstance(error, GuestPermissionUnknown),
+        return refused(' '.join((str(error), *notes)),
+                       uncertain_claim=error.claim if isinstance(error, GuestPermissionUnknown) else None,
                        lock_refused=isinstance(error, GuestNotLocked))
     except GuestEndUnproven as error:
         if dispatch is not None:
@@ -2486,6 +2507,11 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
                 except OSError as release_error:
                     detail = f'{error}. Cannot save the Mac Linux guest end: {journal_error}.'
                     return GuestGateBlocked(f'{detail} Cannot release the Mac Linux launch holder: {release_error}')
+            else:
+                if error.retry_before_settlement and dispatch.started is None:
+                    notes = cast(list[str], getattr(error, '__notes__', []))
+                    return GuestNotStarted(' '.join((str(error), *notes)), settlement_required=True,
+                                           retry_before_settlement=True)
         raise
     except GuestResultUnavailable as error:
         notes = cast(list[str], getattr(error, '__notes__', []))

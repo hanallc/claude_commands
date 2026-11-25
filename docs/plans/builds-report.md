@@ -1815,7 +1815,7 @@ Name each action only from the data the page has. Drop the h/day sum plots, or m
 
 #### Phase 100 — Top costs as sentences, sum plots under Details
 
-The Builds page no longer shows the Build history plots, details and moments (buildsteady, C1780); Top 3 costs remains. The as-built notes below describe the code from before that change.
+The Builds page no longer shows the Build history plots, details and moments (buildsteady, C1780); Top 3 costs remains. Top 3 costs, Swap and memory pressure, and Leftover processes now open from icon buttons in the page heading, each in a dialog (item 222). The as-built notes below describe the code from before those changes.
 
 ##### Phase 100 as-built
 

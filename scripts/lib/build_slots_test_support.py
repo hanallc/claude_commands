@@ -1,4 +1,4 @@
-"""Give slot tests private roots and explicit pool limits."""
+"""Give numbered copy tests private roots and Mac claim limits."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -19,24 +19,18 @@ class UseDefaultMaximum:
 @dataclass(frozen=True)
 class SlotTestConfiguration:
     settings: Path
-    slots: Path
-    cargo: Path
     machine: str
     environment: Mapping[str, str]
 
 
-def write_private_slot_roots(settings: Path, root: Path, machine: str) -> None:
-    """Set private slot, cargo, and build roots for the fixture."""
-    host = conf.host_key_name(machine)
+def write_private_build_roots(settings: Path, root: Path, machine: str) -> None:
+    """Set a private build root for the fixture."""
     if not settings.exists():
         _ = write_config_fixture(settings)
-    lines = [line for line in settings.read_text().splitlines()
-             if not line.startswith(("roots.slots", "roots.slot_cargo", "roots.build"))]
-    lines.extend((f"roots.slots={root / 'default-slots'}", f"roots.slots.{host}={root / 'slots'}",
-                  f"roots.slot_cargo={root / 'default-cargo'}", f"roots.slot_cargo.{host}={root / 'cargo'}",
-                  f"roots.build={root / 'build'}"))
-    for name in sorted({"natedev", host}):
-        lines.append(f"roots.build.{name}={root / 'build'}")
+    lines = [line for line in settings.read_text().splitlines() if not line.startswith("roots.build")]
+    lines.append(f"roots.build={root / 'build'}")
+    for host in sorted({"natedev", conf.host_key_name(machine)}):
+        lines.append(f"roots.build.{host}={root / 'build'}")
     _ = settings.write_text("\n".join(lines) + "\n")
 
 
@@ -45,8 +39,6 @@ def private_slot_config(root: Path, *, repository: str, maximum: int | UseDefaul
     """Give direct calls and child commands private roots without a caller session."""
     environment = config_environment(root / "config")
     settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
-    slots = root / "slots"
-    cargo = root / "cargo"
     machine = host_name()
     host = conf.host_key_name(machine)
     fixed = f"""# whole: 1..
@@ -59,15 +51,10 @@ roots.gate=/dev/shm
 roots.temporary={root / 'temporary'}
 roots.build={root / 'build'}
 roots.build.natedev={root / 'build'}
-roots.slots={root / 'default-slots'}
-roots.slots.{host}={slots}
-roots.slot_cargo={root / 'default-cargo'}
-roots.slot_cargo.{host}={cargo}
 roots.workspace={root / 'workspaces'}
 roots.session={root / 'session'}
 roots.scratch={root / 'scratch'}
 roots.copies={root / 'workspaces'}
-patterns.slot={{repository}}-slot{{slot}}
 patterns.tool={{purpose}}{{suffix}}
 patterns.named={{showrunner}}-{{unit}}/{{work}}-{{purpose}}
 patterns.legacy-unique={{purpose}}{{suffix}}
@@ -86,9 +73,7 @@ locks.probe_retry_seconds=0.005
 # whole: 1..
 slots.{host}.default_max={default_maximum}
 # whole: 1..
-folders.unused_days=2
-# range: 5e-324..
-slots.wait_seconds=30"""
+folders.unused_days=2"""
     fixed_lines = fixed.splitlines()
     if host != "natedev":
         fixed_lines.append(f"roots.build.{host}={root / 'build'}")
@@ -115,4 +100,4 @@ slots.wait_seconds=30"""
         "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
         "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
     })
-    return SlotTestConfiguration(settings, slots, cargo, machine, environment)
+    return SlotTestConfiguration(settings, machine, environment)

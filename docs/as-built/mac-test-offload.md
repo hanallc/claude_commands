@@ -47,13 +47,20 @@ The guest sends runner records on the reply descriptor.
 The route publishes each change to the module count.
 The count excludes type checks.
 Older guest gate code can return its result without sending progress records.
-If the guest run fails before the start line, the route returns `GuestNotStarted` with the cause.
-The queue can then give the gate to the next named target.
-For a placed gate, `copies.py run` keeps the copy lease and uses its original placement request again.
-The gate must exit with status 79 and write a claim failure that matches the current assignment.
-After the queue settles that attempt, the gate starts with the replacement assignment.
+If a guest attempt fails without a confirmed start, the gate exits with status 79 and reports the exact assignment.
+If the gate consumed permission and sent no arm command, it saves proof that the guest did not start.
+If the permission reply is lost, the gate checks for saved consumption with the exact launch claim.
+The queue checks that the holder ended and that the attempt has no recorded start.
+For a placed gate, `copies.py run` keeps the copy lease and submits the original placement request again.
+The queue keeps the original rank and assigns the next available candidate other than the guest.
+The queue saves the retry decision and restores it after a restart.
+The old guest attempt holds its slot until the queue reads exact end proof and checks that no start remains pending.
 If the claim failure is missing or invalid, `copies.py run` reports `Gate placement blocked` and returns status 79.
-If the guest run fails after that line, the gate fails and reports the guest and the reason.
+If a confirmed guest start has no result, the gate exits with status 80 and requests settlement.
+If the gate loses the permission reply and cannot confirm consumption, it exits with status 80.
+After consumption, a failure to release the launch holder or save the refusal also returns status 80.
+A Mac Linux gate with status 80 requests settlement without retrying.
+The queue keeps the guest slot until settlement and ends the attempt without a retry.
 A stream failure reports its status and up to 1200 characters from standard error.
 A stream timeout reports the diagnostics it received before the deadline.
 A reply that the route cannot read also names its first 200 characters.
@@ -63,13 +70,14 @@ The probe, arm, gate stream, and cleanup retry an inner SSH connect reset or ref
 The Mac gives the inner SSH client a private log and deletes it when the shell exits.
 When SSH exits 255 and the log contains only the connect error, the shell reports the error with a reserved status.
 The route checks the reserved status, the Mac marker, and empty standard output before it retries.
+The gate stream also retries status 0 with the exact connect diagnostic and no reply data.
 The probe, arm, and gate stream allow three attempts within the unreachable wait, with one second between attempts.
 The arm covers the gate stream's connect window and allows time for the arm reply and guest lock setup.
 The gate stream sends the remaining connect time to the Mac after the outer SSH hop starts the Mac shell.
 The Mac applies that time to the inner SSH hop. The sender declines the inner hop when less than one second remains.
 The local stream enforces the deadline until the guest accepts the command.
 The guest acceptance line starts the transfer timeout and the bundle upload.
-If the deadline expires before acceptance, the queue can try another target after the guest confirms cleanup.
+If the deadline expires before acceptance, the queue uses the retry rule for an unconfirmed start.
 Cleanup continues until it gets end proof or the proof deadline expires.
 It waits one second between the first three connect attempts, then uses the normal proof interval before a new group.
 An interrupt preserves the proof deadline and the count of attempts in the current group.
@@ -539,11 +547,12 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   After success, the runner sends the full output and deletes the file.
   After failure, it reports the saved path and sends a tail of `nextest_failure_tail_bytes` bytes (65,536 by default).
   It also sends the last nextest Summary line, up to `nextest_failure_summary_bytes` bytes (1,024 by default).
-  The hourly Mac `tmp_sweep.py` job removes closed, owned logs after `nextest_failure_log_days` days (seven by default).
+  The hourly Mac `tmp_sweep.py` job lists closed, owned logs for vetted manual removal after `nextest_failure_log_days` days (seven by default).
   It measures age from the failure time or, for an interrupted run, the last write time.
   On the Mac, read a saved log with `~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/nextest_log.py read PATH`.
   The reader holds a shared lock until the copy ends.
-  The sweep holds an exclusive lock during removal and also checks for open files with `lsof`.
+  The sweep checks for open files with `lsof`.
+  It takes an exclusive lock before it lists a log.
   If the log writer cannot start nextest, the runner reports a setup failure.
 - `stream_mac_run` holds a `mac_exit=<n>` marker with a status from 0 to 255.
   Later ordinary output invalidates the held marker.
@@ -684,7 +693,10 @@ The queue removes its run record and receipt after the callback confirms cleanup
 
 ### The showrunner's Mac build — `scripts/production/mac_run.sh`
 
-It claims the Mac after its reach probe (`mac_test.py claim --pid $$ --what "mac run <sha9>" --worktree $repo --wait 600`), so the claim is the repository's; claim exit 10, 11 or 12 prints the claim's line and exits 9. When the clone already holds the commit, nothing is sent and the clone checks it out. `INT`, `TERM` and `HUP` run `stop_mac_run` (one ssh call that ends the clone's builds and test processes and removes its temp files), release, and exit 128 plus the signal.
+After its reach probe, `mac_run.sh` requests a Mac placement for the repository.
+It sends a bundle if the Mac source lacks the requested commit.
+`copies.py run` holds a numbered copy for the smoke test.
+If SSH input closes during the test, the Mac helper stops the smoke process group and checks the copy.
 
 ### Which packages belong on the Mac — `scripts/mac_test/audit.py`
 
@@ -814,10 +826,25 @@ An empty configured capacity raises `ConfigError`.
 The policy supplies a fallback only when both capacity keys are absent.
 The Mac retains its single slot per repository.
 
-`mac_run.sh` creates its task-owned clone through `copies.py`.
-It preserves both registrations until process exit and scratch cleanup succeed.
-It then removes the Mac registration before the natedev registration.
-Failed clone cleanup retains both registrations.
+The Terminal launcher enters the numbered copy before it checks its per-run token.
+Cleanup removes the token before `stop-checkout` scans the copy.
+The copy stays kept if `stop-checkout` cannot confirm it is clear.
+The Mac wrapper removes any old `status` file before it starts `copies.py run`.
+The file path is `<scratch root>/mac-smoke-<episode>/status` on the Mac.
+If SSH leaves the folder behind, the hourly scratch sweep lists it for vetted manual removal after its default lifetime.
+The test and cleanup read stdin from `/dev/null`.
+After remote cleanup, the worker reports readiness and holds the copy until it receives a newline after local cleanup.
+SSH EOF before the newline stops active work and prevents a zero exit code.
+The worker uses the run's `mac_run_status_grace_seconds` limit from the Mac's `production.conf` for the release wait.
+If this limit expires, the worker returns a failure and lets the copy lease close.
+After `copies.py run` returns, the wrapper writes its exit code to a temporary file and renames it to `status`.
+The exit code includes any copy lease close failure.
+After the first SSH call ends, the queue reads the status and removes its scratch folder through a separate SSH call.
+The queue reads the file only after readiness and requires the first SSH call to finish without a connection error.
+The second SSH call uses `probe_timeout_s` from `config/mac_test.conf`.
+The queue returns 255 and keeps the run record if the connection fails or the read cannot return a valid status.
+For an old scratch run, the callback confirms checkout clearance before it ends the task and removes both registry rows.
+The queue removes the old run record and receipt after successful cleanup.
 
 [Gate checkouts](gate-checkouts.md#remote-mirrors) defines the mirror metadata, lock order, recovery, process scans, registry commands, and probe behavior.
 Candidate leases precede the shared scan, so a process that starts before lease acquisition protects its mirror.
@@ -875,7 +902,17 @@ Existing waits keep their place on natedev until then.
 `ensure_mac_disk_floor` returns `MacDiskReady`, `SweepShort`, or `SweepFailed`.
 Below the required floor, it runs one shared floor sweep and reads free space again.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
-A caller that finds a running sweep waits for its result.
+A direct caller that finds a running sweep waits for its result.
+The evidence worker reads disk space and saved mirror processes in one SSH command per Mac probe cycle.
+The same command reports setup for each required mirror.
+Each step requires a successful setup result for its mirror.
+The worker reads local claims again after SSH.
+It attaches process evidence only to claims that match the records from before SSH.
+The keys that share the reading have the same observation time.
+The worker checks repository policy, session, and claim scope for each key.
+The worker reports pending disk recovery while a separate thread runs the sweep.
+The Mac stays excluded during recovery even when a probe reports enough free space.
+When the sweep ends, the worker probes all subscribed Mac keys again.
 The sweep holds no admission or claim lock during removal.
 `floor_claims.serve()` reads claims and mirror leases under `state.lock`.
 It builds the reply under the lock and prints after the lock closes.
