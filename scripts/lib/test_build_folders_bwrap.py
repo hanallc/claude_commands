@@ -24,7 +24,7 @@ import unittest
 from unittest import mock
 
 from scripts.lib import build_folder_lock, build_folders, removal_guard
-from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox
+from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox, mac_profile
 from scripts.lint.test_removal_bwrap import CANARY, PROBE_MOUNT, PROBE_OUTSIDE
 
 
@@ -297,6 +297,17 @@ class ToolFolderRemovalTests(unittest.TestCase):
         self.assert_canary(sibling)
         self.assertTrue(sibling_lock.is_file())
         self.assertEqual(sandbox.outside.read_bytes(), outside)
+
+    def test_mac_profile_limits_writes_and_protects_the_test_root(self) -> None:
+        self.assertEqual(mac_profile(Path("/private/tmp/tool removal/fixture")), (
+            "(version 1)\n"
+            "(allow default)\n"
+            "(deny network*)\n"
+            "(deny file-write*)\n"
+            '(allow file-write* (subpath "/private/tmp/tool removal/fixture") (literal "/dev/null"))\n'
+            '(deny file-read-data (subpath "/private/tmp/tool removal"))\n'
+            '(allow file-read-data (subpath "/private/tmp/tool removal/fixture"))\n'
+        ))
 
     def test_keeps_a_symlink_at_the_tool_name(self) -> None:
         sandbox = self.sandbox()
