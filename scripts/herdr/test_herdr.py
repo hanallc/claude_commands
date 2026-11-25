@@ -3410,7 +3410,7 @@ class LaunchDestinationTests(StaffTestCase):
         _ = staff.ensure("showrunner", name="source", runtime_id=source)
         client = Mock(spec=herdr.Herdr)
         opened = cast(Mock, client.open_tab)
-        opened.return_value = "w1:p2"
+        opened.return_value = herdr.PlacedForkTab("w1:p2", "fork-terminal")
         cast(Mock, client.command_terminal).return_value = "fork-terminal"
         started = cast(Mock, client.start_agent)
         started.return_value = herdr.PromptSubmissionNotRequired()
@@ -3459,7 +3459,7 @@ class LaunchDestinationTests(StaffTestCase):
               patch.object(herdr, "shared_session", return_value="shared"),
               patch.object(herdr, "stop_session") as stop,
               patch.object(herdr, "start_agent", return_value=failure),
-              patch.object(client, "open_tab", return_value=fork),
+              patch.object(client, "open_tab", return_value=herdr.PlacedForkTab(fork, "fork-terminal")),
               patch.object(client, "pane_row", side_effect=panes.__getitem__),
               patch.object(client, "panes", side_effect=lambda: list(panes.values())),
               patch.object(client, "run_in_pane"),
@@ -3510,9 +3510,41 @@ class LaunchDestinationTests(StaffTestCase):
         setup.assert_not_called()
         self.assertEqual(list(panes), [source])
 
+    def test_failed_fork_terminal_read_after_placement_closes_the_created_pane(self) -> None:
+        client = LayoutHerdr("private")
+        client.spaces.append(("w1", "fixture"))
+        _ = client.add_tab("w1", herdr.LAYOUT_PLACEHOLDER)
+        _ = client.add_tab("w1", herdr.LAYOUT_PLACEHOLDER)
+        original = list(client.tabs)
+        source = original[0]["pane_id"]
+        command_terminal = client.command_terminal
+        captured: list[tuple[str, str]] = []
+
+        def read_terminal(pane: str) -> str:
+            if captured:
+                raise TimeoutError("terminal read timed out")
+            terminal = command_terminal(pane)
+            captured.append((pane, terminal))
+            return terminal
+
+        with (patch.object(client, "command_terminal", side_effect=read_terminal),
+              patch.object(client, "run_in_pane") as setup,
+              patch.object(client, "start_agent") as start,
+              patch.object(client, "close_terminal_pane", wraps=client.close_terminal_pane) as close):
+            result = herdr.launch_prepared_agent(client.session, herdr.ForkTab(source, "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", ["fork", "source"],
+                herdr.NoOpeningPrompt(), 1_000, agent="clone", client=client)
+        self.assertIsInstance(result.outcome, herdr.AgentNotStarted)
+        (pane, terminal), = captured
+        self.assertEqual(result.pane, pane)
+        self.assertEqual(setup.call_args.kwargs["terminal"], terminal)
+        start.assert_not_called()
+        close.assert_called_once_with(pane, terminal)
+        self.assertEqual(client.tabs, original)
+
     def test_fork_start_timeout_closes_the_verified_terminal(self) -> None:
         client = Mock(spec=herdr.Herdr)
-        cast(Mock, client.open_tab).return_value = "w1:p2"
+        cast(Mock, client.open_tab).return_value = herdr.PlacedForkTab("w1:p2", "fork-terminal")
         cast(Mock, client.command_terminal).return_value = "fork-terminal"
         cast(Mock, client.start_agent).side_effect = subprocess.TimeoutExpired("agent start", 1)
         cast(Mock, client.close_terminal_pane).return_value = True
@@ -3530,7 +3562,7 @@ class LaunchDestinationTests(StaffTestCase):
         configured = home / ".claude"
         configured.mkdir(parents=True)
         client = Mock(spec=herdr.Herdr)
-        cast(Mock, client.open_tab).return_value = "w1:p2"
+        cast(Mock, client.open_tab).return_value = herdr.PlacedForkTab("w1:p2", "fork-terminal")
         cast(Mock, client.command_terminal).return_value = "fork-terminal"
         cast(Mock, client.start_agent).return_value = herdr.PromptSubmissionNotRequired()
         for account in ({}, {"CLAUDE_CONFIG_DIR": str(configured)}):
@@ -3552,7 +3584,7 @@ class LaunchDestinationTests(StaffTestCase):
         arguments = ["fork", source]
         wrong = pane_launch.launch(fork, source, str(self.root), {}, ["codex", *arguments], kind="codex")
         with (patch.object(herdr, "Herdr", return_value=client),
-              patch.object(client, "open_tab", return_value=fork),
+              patch.object(client, "open_tab", return_value=herdr.PlacedForkTab(fork, "fork-terminal")),
               patch.object(client, "command_terminal", return_value="fork-terminal"),
               patch.object(client, "run_in_pane"),
               patch.object(client, "start_command", return_value=subprocess.CompletedProcess([], 0, "", "")) as start,
@@ -6083,7 +6115,8 @@ class HerdrTests(unittest.TestCase):
               patch.object(client, "socket_request") as move,
               patch.object(client, "save_layout"),
               patch.object(client, "order_tabs") as order):
-            self.assertEqual(client.open_tab("", "alpha-copy", "/repo", {}, after_pane="w1:p1"), "w1:p3")
+            self.assertEqual(client.open_tab("", "alpha-copy", "/repo", {}, after_pane="w1:p1"),
+                             herdr.PlacedForkTab("w1:p3", "fork-terminal"))
         listed.assert_called_once_with("tab", "--workspace", "w1")
         create.assert_called_once_with("tab", "create", "--workspace", "w1", "--label", "alpha-copy",
                                       "--cwd", "/repo", "--env", "HERDR_AGENT_PANE=1", "--no-focus")

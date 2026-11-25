@@ -48,7 +48,7 @@ from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence, Set
-from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TextIO, TypedDict, Protocol, cast, final, override
+from typing import BinaryIO, ClassVar, TYPE_CHECKING, Literal, NamedTuple, Never, NotRequired, TextIO, TypedDict, Protocol, cast, final, overload, override
 
 
 from scripts.herdr import pane_launch
@@ -2012,9 +2012,17 @@ class Herdr:
             raise HerdrFailure(f"session {target}: pane is unavailable or ambiguous")
         return matches[0]
 
+    @overload
+    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str], *,
+                 member: str = "") -> str: ...
+
+    @overload
+    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str], *,
+                 member: str = "", after_pane: str) -> PlacedForkTab: ...
+
     @pane_evidence_run()
     def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str], *,
-                 member: str = "", after_pane: str = "") -> str:
+                 member: str = "", after_pane: str | None = None) -> str | PlacedForkTab:
         """Open a named tab and pane in an existing or new workspace."""
         options = ["--label", title, "--cwd", cwd]
         for key, value in _pane_environment(environment).items():
@@ -2023,7 +2031,7 @@ class Herdr:
             saved = saved_layout(self.session)
             position = 0
             move_new_tab = False
-            if after_pane:
+            if after_pane is not None:
                 source = self.pane_row(after_pane)
                 if isinstance(source, NoPane):
                     raise HerdrFailure(f"{after_pane}: source pane is unavailable")
@@ -2050,7 +2058,7 @@ class Herdr:
             root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
             pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
             terminal = ""
-            if after_pane:
+            if after_pane is not None:
                 if pane == after_pane:
                     raise HerdrFailure(f"{pane}: the fork did not open a separate pane", "wrong_target")
                 forget_pane_evidence(self.session, pane)
@@ -2071,14 +2079,15 @@ class Herdr:
                         if not closed:
                             print(f"herdr {self.session}:{pane}: fork terminal closure is unconfirmed", file=sys.stderr)
                 raise
-            if workspace is not None and not after_pane:
+            if after_pane is not None:
+                return PlacedForkTab(pane, terminal)
+            if workspace is not None:
                 _ = self._close_placeholders(workspace)
                 try:
                     pane = self.order_tabs(workspace, saved, opening_members=((pane, member),) if member else ()).get(pane, pane)
                 except (HerdrFailure, OSError, ValueError) as error:
                     print(f"herdr {self.session}: tab order unchanged: {error}", file=sys.stderr)
-            if not after_pane:
-                self.save_layout()
+            self.save_layout()
             return pane
 
     def _workspace_named(self, space: str, *, record: staff.StaffSnapshot | ReadStaffAtUse = _READ_STAFF_AT_USE,
@@ -4842,8 +4851,13 @@ def attach_hint(space: str, tab: str) -> str:
     return f"herdr session attach {shared_session()}, workspace {space}, tab {tab}"
 
 
+class TabMemberArgument(TypedDict, total=False):
+    member: str
+
+
 def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str], *, member: str = "") -> str:
-    return Herdr(name).open_tab(space, title, cwd, environment, **({"member": member} if member else {}))
+    member_argument: TabMemberArgument = {"member": member} if member else {}
+    return Herdr(name).open_tab(space, title, cwd, environment, **member_argument)
 
 
 def save_shared_layout(running: set[str]) -> None:
@@ -6985,6 +6999,14 @@ class ForkTab:
 
 
 @dataclass(frozen=True)
+class PlacedForkTab:
+    """The pane and terminal verified during fork tab placement."""
+
+    pane: str
+    terminal: str
+
+
+@dataclass(frozen=True)
 class SplitPane:
     of_pane: str
     direction: Literal["right", "down"]
@@ -7166,16 +7188,15 @@ def _launch_prepared_agent(name: str, destination: NewTab | ForkTab | SplitPane 
         prepared = in_session_folder(prepared, folder_member, session_id)
     terminal = ""
     if isinstance(destination, ForkTab):
-        pane = client.open_tab("", destination.title, str(prepared.directory), prepared.env,
-                               after_pane=destination.source_pane)
-        if pane == destination.source_pane:
-            raise HerdrFailure(f"{pane}: the fork did not open a separate pane", "wrong_target")
-        terminal = client.command_terminal(pane)
+        placed = client.open_tab("", destination.title, str(prepared.directory), prepared.env,
+                                 after_pane=destination.source_pane)
+        pane, terminal = placed.pane, placed.terminal
     elif isinstance(destination, NewTab):
+        member_argument: TabMemberArgument = {"member": member} if member else {}
         pane = (client.open_tab(destination.space, destination.title, str(prepared.directory), prepared.env,
-                               **({"member": member} if member else {})) if reuse_client else
+                               **member_argument) if reuse_client else
                 open_tab(name, destination.space, destination.title, str(prepared.directory), prepared.env,
-                         **({"member": member} if member else {})))
+                         **member_argument))
     elif isinstance(destination, SplitPane):
         if not 0 < destination.ratio < 1 or destination.direction not in {"right", "down"}:
             print(f"herdr {name}: split direction or ratio adjusted to backend limits", file=sys.stderr)
