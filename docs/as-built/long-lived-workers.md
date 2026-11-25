@@ -1072,8 +1072,11 @@ A detached run result that arrives after the DONE needs a new matching DONE.
 Until that DONE, `end` keeps the worker and `answer` sends input with the DONE instruction.
 When the pass is open, the `end` refusal names the next step: `worker.py answer <name> --text TEXT` from the parent session.
 That command asks the worker for the DONE.
-When an ended pass still waits for DONE, `worker.py answer` checks the same receipt and queues the finished results for the director.
-The command saves each notice before it releases the result's DONE requirement.
+When an ended pass still waits for DONE, `worker.py answer` checks the same receipt.
+This includes a canceled pass without a stopped hook outcome.
+If the worker still owes a reply to a result, the command names the result and keeps the wait.
+Otherwise, the command queues undelivered results for the director before it releases the wait.
+The command releases the wait for delivered results and keeps their saved delivery records.
 The command leaves the pass ended and sends no input to the worker.
 `end` gives no `answer` step while a detached run is live, while the pass waits only for reap, or after the pass is canceled.
 `worker.py end` also checks for a late reply after recorder cancellation, even when the pane is closed.

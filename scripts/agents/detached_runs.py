@@ -149,6 +149,7 @@ class RunRecord(StopFields):
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
     delivered_at: NotRequired[float]
+    ended_pass_result_released: NotRequired[Literal[True]]
     worker_result_receipt: NotRequired[object]
     blocked_notice_accepted: NotRequired[Literal[True]]
     push_retries: NotRequired[int]
@@ -309,7 +310,7 @@ def _is_run_record(raw: dict[str, object]) -> TypeGuard[RunRecord]:
                     and ("command_slice" not in raw or process_stop.is_slice_identity(raw["command_slice"]))
                     and all(key not in raw or raw[key] is True
                             for key in ("stop_pass_requested", "self_stop", "orphan_result_superseded",
-                                        "blocked_notice_accepted", "push_alert_attempted",
+                                        "blocked_notice_accepted", "push_alert_attempted", "ended_pass_result_released",
                                         "slice_cleanup_pending", "slice_leftovers"))
                     and ("pane_dispatch_id" not in raw or isinstance(pane_dispatch, str)
                          or (isinstance(pane_dispatch, dict)
@@ -1028,7 +1029,8 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
                 delivery = deliver(record, command_result(record))
                 if _worker_result_pending(delivery) and delivery != PARKED_WORKER_RESULT:
                     return CompletionReplay.RETRY
-            if (delivery not in (OTHER_PASS_DELIVERY, ENDED_PASS_RESULT_QUEUED)
+            if (not record.get("ended_pass_result_released")
+                    and delivery not in (OTHER_PASS_DELIVERY, ENDED_PASS_RESULT_QUEUED)
                     and _complete_worker_dispatch(record) == CompletionReplay.RETRY):
                 return CompletionReplay.RETRY
             if delivery == PARKED_WORKER_RESULT and _worker_result_pending(_read_record(path).get("delivery", "")):
@@ -1729,7 +1731,7 @@ def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dis
     for record in _registered_runs(runs, worker.id):
         if record.get("staff_id") != worker.id:
             continue
-        if (record.get("delivery") == ENDED_PASS_RESULT_QUEUED
+        if (record.get("ended_pass_result_released") or record.get("delivery") == ENDED_PASS_RESULT_QUEUED
                 or result_is_from_another_pass(record, pane_dispatch_id)):
             other_passes.add(record["run_id"])
             continue
@@ -1761,10 +1763,16 @@ def worker_results(runs: Path, worker: staff.StaffRow, *, since: float, pane_dis
     return results, other_passes
 
 
+@dataclass(frozen=True)
+class EndedPassResults:
+    count: int
+    notice_keys: tuple[str, ...]
+
+
 def stage_ended_pass_results(run: Path, row: staff.StaffRow, director: staff.StaffRow, *,
-                             instance: str, started: float, ids: Collection[str],
-                             ) -> tuple[str, ...]:
-    """Queue the results before releasing their DONE requirement. The caller holds the worker lock."""
+                             instance: str, started: float, ids: Collection[str], membership: staff.StaffSnapshot,
+                             ) -> EndedPassResults:
+    """Queue pending results before releasing the DONE wait. The caller holds the worker lock."""
     from scripts.herdr import pass_notices
 
     route = pass_notices.Route(instance, director.id, row.name)
@@ -1774,6 +1782,7 @@ def stage_ended_pass_results(run: Path, row: staff.StaffRow, director: staff.Sta
     prefix = "session:" if isinstance(staff.backend(row), staff.ClaudeBackend) else "codex:"
     sender = prefix + str(row.current_session)
     keys: list[str] = []
+    count = 0
     directory = run / DETACHED_RUNS_DIR
     for saved in _registered_runs(directory, row.id):
         if saved["run_id"] not in ids:
@@ -1788,13 +1797,22 @@ def stage_ended_pass_results(run: Path, row: staff.StaffRow, director: staff.Sta
                 continue
             result = command_result(record)
             delivery = record.get("delivery", "")
-            if delivery == COVERED_BY_DONE or (record["done_message_file"] and delivery == _success_only_delivery(result)):
+            if (record.get("ended_pass_result_released") or delivery in (COVERED_BY_DONE, ENDED_PASS_RESULT_QUEUED)
+                    or (record["done_message_file"] and delivery == _success_only_delivery(result))):
                 continue
-            message = _worker_result_message(record, result) + f"\n\nThe worker pass {instance} has ended."
-            keys.extend(pass_notices.stage_diagnostics(run, route, sender, (message,)))
-            if delivery != ENDED_PASS_RESULT_QUEUED:
+            received = delivery.startswith(UNCONFIRMED_WORKER_RESULT) and _unconfirmed_result_received(
+                record, membership, delivery)
+            if received:
+                record["delivery"] = _save_delivery(path, f"already delivered: {record['run_id']}", if_current=delivery)
+            if received or delivery and not _worker_result_pending(delivery):
+                record["ended_pass_result_released"] = True
+                _ = _write_record(path, record)
+            else:
+                message = _worker_result_message(record, result) + f"\n\nThe worker pass {instance} has ended."
+                keys.extend(pass_notices.stage_diagnostics(run, route, sender, (message,)))
                 _ = _save_delivery(path, ENDED_PASS_RESULT_QUEUED)
-    return tuple(keys)
+            count += 1
+    return EndedPassResults(count, tuple(keys))
 
 
 @dataclass(frozen=True)

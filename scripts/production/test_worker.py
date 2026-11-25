@@ -4338,7 +4338,8 @@ class WorkerCommandTests(unittest.TestCase):
         row = self.agent.row(pane)
         instance = str(worker_panes.worker_pass(row, self.run_dir)["instance_id"])
         for run_id, delivery in (("delivered", f"sent: worker {row.name} at {pane}"),
-                                 ("undelivered", "deferred: worker is stopped")):
+                                 ("undelivered", "deferred: worker is stopped"),
+                                 ("another-undelivered", "deferred: worker is stopped")):
             path, record = self.detached_record(row, run_id)
             record.update(pane_dispatch_id=instance, delivery=delivery, exit_code=7, completion_pending=True)
             atomic_file.write_text_atomic(path, json.dumps(record))
@@ -4372,12 +4373,88 @@ class WorkerCommandTests(unittest.TestCase):
         self.assertNotEqual(worker_panes.worker_pass(row, self.run_dir)["instance_id"], instance)
 
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
-        for run_id in ("delivered", "undelivered"):
+        self.assertFalse(any("Detached run: delivered\n" in notice for notice in self.agent.notices))
+        for run_id in ("undelivered", "another-undelivered"):
             notice, = [notice for notice in self.agent.notices if f"Detached run: {run_id}\n" in notice]
             self.assertIn("Result: FAIL (exit 7)", notice)
         delivered_notices = self.agent.notices.copy()
         self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
         self.assertEqual(self.agent.notices, delivered_notices)
+
+    def ended_pass_with_result(self, status: str, delivery: str, *, stopped: bool = False
+                               ) -> tuple[staff.StaffRow, str, Path, tuple[str, ...]]:
+        self.assertIs(self.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        pane, _ = self.agent.submitted[-1]
+        row = self.agent.row(pane)
+        instance = str(worker_panes.worker_pass(row, self.run_dir)["instance_id"])
+        path, record = self.detached_record(row, "late-result")
+        record.update(pane_dispatch_id=instance, delivery=delivery, exit_code=7, completion_pending=True)
+        if stopped:
+            record["stop_pass_requested"] = True
+        atomic_file.write_text_atomic(path, json.dumps(record))
+        self.fixture.world.locations[pane]["agent_status"] = "idle"
+        state = self.run_dir / unit_runs.STATE_FILE
+        fields = cast(dict[str, object], json.loads(state.read_text()))
+        pass_recorder.pass_slots(fields)["impl"]["status"] = status
+        atomic_file.write_text_atomic(state, json.dumps(fields))
+        following = self.run_dir / "next-prompt.md"
+        atomic_file.write_text_atomic(following, "Start the next assignment.\n")
+        assign_next = ("assign", "impl", str(following), "--name", row.name, "--slot", "impl", "--phase", "8",
+                       "--kind", "assign", "--session-dir", str(self.run_dir), "--launcher-command", '["assign.sh"]')
+        self.assertIsInstance(progress_history.active_dispatch(row.id, self.run_dir), progress_history.NoActiveDispatch)
+        self.assertIsInstance(progress_history.hook_completion(worker_panes.worker_pass(row, self.run_dir)),
+                              progress_history.NoHookCompletion)
+        return row, pane, path, assign_next
+
+    def assert_assign_waits_for_result_reply(self, assign_next: tuple[str, ...]) -> None:
+        code, output, errors = self.command(*assign_next)
+        self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
+        self.assertIn(worker.CompletionRecovery.WAITING_ON_REPLY.value, errors)
+
+    def test_answer_releases_a_canceled_pass_without_a_stopped_hook(self) -> None:
+        row, _, path, assign_next = self.ended_pass_with_result("canceled", "deferred: worker is stopped")
+        self.assert_assign_waits_for_result_reply(assign_next)
+        code, output, errors = self.command("answer", row.name, "--text", "Report the result.")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertIn("queued 1 detached run result", output)
+        self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], detached_runs.ENDED_PASS_RESULT_QUEUED)
+        notice, = self.agent.notices
+        self.assertIn("Detached run: late-result\n", notice)
+        self.assertEqual(self.command(*assign_next), (0, "submitted\n", ""))
+
+    def test_answer_keeps_the_wait_while_the_worker_owes_a_reply(self) -> None:
+        row, pane, path, assign_next = self.ended_pass_with_result("interrupted", "deferred: worker is stopped")
+        saved = worker_lifecycle.read_json_object(path)
+        saved["delivery"] = f"sent: worker {row.name} at {pane}"
+        atomic_file.write_text_atomic(path, json.dumps(saved))
+        self.agent.append(pane, "user", "Detached run: late-result\nRun finished: private verification")
+        self.assert_assign_waits_for_result_reply(assign_next)
+        code, output, errors = self.command("answer", row.name, "--text", "Report the result.")
+        self.assertEqual((code, output), (worker.ExitCode.BUSY, ""))
+        self.assertIn("the worker still owes a reply to detached run results: late-result", errors)
+        self.assertEqual(worker_lifecycle.read_json_object(path), saved)
+        self.assertEqual(self.agent.notices, [])
+        self.assert_assign_waits_for_result_reply(assign_next)
+
+        self.agent.append(pane, "assistant", "The check failed.")
+        code, output, errors = self.command("answer", row.name, "--text", "Report the result.")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertIn("released the DONE wait", output)
+        self.assertEqual(self.agent.notices, [])
+        self.assertEqual(self.command(*assign_next), (0, "submitted\n", ""))
+
+    def test_answer_does_not_resend_a_result_delivered_to_the_holder(self) -> None:
+        delivery = "sent: holder received the result"
+        row, _, path, assign_next = self.ended_pass_with_result("interrupted", delivery, stopped=True)
+        self.assert_assign_waits_for_result_reply(assign_next)
+        code, output, errors = self.command("answer", row.name, "--text", "Report the result.")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertIn("released the DONE wait", output)
+        self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], delivery)
+        self.assertEqual(self.agent.notices, [])
+        self.assertEqual(self.command(*assign_next), (0, "submitted\n", ""))
+        self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        self.assertFalse(any("Detached run: late-result\n" in notice for notice in self.agent.notices))
 
     def test_waiting_recovery_names_reap_a_live_run_or_a_new_done(self) -> None:
         reply = worker.DispatchSubmitted()

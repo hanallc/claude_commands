@@ -186,6 +186,7 @@ class DispatchAwaitingReply:
     last_reply: str
     runs: tuple[str, ...]
     matching_done: DispatchComplete | NoMatchingDone
+    unanswered_runs: frozenset[str] = frozenset()
 
 
 DispatchReceipt = (DispatchNotSubmitted | DispatchSubmitted | DispatchComplete | DispatchEvidenceUnknown
@@ -321,10 +322,11 @@ class _TranscriptReceiptState:
             if not results:
                 return
             if isinstance(self.reply, DispatchAwaitingReply):
-                self.reply = replace(self.reply, runs=tuple(sorted(results.union(self.reply.runs))))
+                self.reply = replace(self.reply, runs=tuple(sorted(results.union(self.reply.runs))),
+                                     unanswered_runs=self.reply.unanswered_runs.union(results))
             else:
                 matching_done = self.reply if isinstance(self.reply, DispatchComplete) else NoMatchingDone.UNRECORDED
-                self.reply = DispatchAwaitingReply(self.reply.reply, tuple(sorted(results)), matching_done)
+                self.reply = DispatchAwaitingReply(self.reply.reply, tuple(sorted(results)), matching_done, frozenset(results))
 
     def assistant_message(self, text: str, timestamp: object,
                           cursor: TranscriptCursor | NoMatchingDone) -> None:
@@ -362,7 +364,8 @@ class _TranscriptReceiptState:
                 run_id = self.result_message.text.partition("\n")[0].removeprefix("Detached run: ")
                 self.result_replies.append(TranscriptResultReply(run_id, self.result_message, self.latest_reply))
         if isinstance(self.reply, DispatchAwaitingReply):
-            self.reply = replace(self.reply, last_reply=text)
+            unanswered = NO_RESULT_IDS if text.strip() else self.reply.unanswered_runs
+            self.reply = replace(self.reply, last_reply=text, unanswered_runs=unanswered)
         elif isinstance(self.completion, FinalReply) or isinstance(self.reply, DispatchSubmitted):
             turn = (TranscriptTurn(cursor, text) if self.responding and isinstance(cursor, TranscriptCursor)
                     else NoTranscriptTurn.UNRECORDED)
@@ -712,6 +715,7 @@ def _prove_result_delivery(directory: Path, row: staff.StaffRow, passed: dict[st
 
 def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
                      run: Path, require_transcript: bool = False,
+                     require_current_transcript: bool = False,
                      pane_pass: CurrentPanePass | progress_history.StoppedPassReceipt | worker_panes.PassDetachedResults = CurrentPanePass.CURRENT,
                      require_done: bool = False, verify: VerifyPassDone | ReadPassDone = ReadPassDone.READ,
                      ) -> DispatchReceipt:
@@ -740,6 +744,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
 
     previous = saved.done.cursor if isinstance(saved, SavedPassDone) else NoMatchingDone.UNRECORDED
     notice_positions = verify.notice_positions if isinstance(verify, VerifyPassDone) else NO_NOTICE_POSITIONS
+    require_transcript |= require_current_transcript
     transcript = _dispatch_transcript(row, line, done, require_transcript=require_transcript, previous=previous,
         notice_positions=notice_positions, stopped=stopped, late_result_ids=late_result_ids,
         other_pass_results=other_pass_results)
@@ -773,6 +778,9 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             verified = _select_pass_done(transcript, saved)
             reply = transcript.receipt
         other_pass_results = frozenset(other_passes)
+    if require_current_transcript and isinstance(reply, DispatchEvidenceUnknown):
+        return reply
+    unanswered = reply.unanswered_runs if isinstance(reply, DispatchAwaitingReply) else NO_RESULT_IDS
     read_extends_saved = not isinstance(saved, SavedPassDone) or transcript.extends_saved
     received = transcript.received_runs if read_extends_saved else NO_RESULT_IDS
     if isinstance(saved, SavedPassDone):
@@ -786,9 +794,10 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             pending_runs.update(saved.pending_runs)
         pending_runs.difference_update(verified.results_before_done | other_pass_results)
         if pending_runs:
-            last_reply = (reply.last_reply if read_extends_saved and isinstance(reply, DispatchAwaitingReply)
-                          else verified.reply.reply)
-            reply = DispatchAwaitingReply(last_reply, tuple(sorted(pending_runs)), verified.reply)
+            if read_extends_saved and isinstance(reply, DispatchAwaitingReply):
+                reply = replace(reply, runs=tuple(sorted(pending_runs)), matching_done=verified.reply)
+            else:
+                reply = DispatchAwaitingReply(verified.reply.reply, tuple(sorted(pending_runs)), verified.reply, unanswered)
         else:
             reply = verified.reply
     if isinstance(reply, (DispatchNotSubmitted, DispatchEvidenceUnknown)):
@@ -823,7 +832,7 @@ def dispatch_receipt(row: staff.StaffRow, line: str, dispatch_id: str, *,
             and isinstance(delivered_at := deliveries[run_id].delivered_at, (int, float))
             and delivered_at < done_at)))
         if after_done:
-            reply = DispatchAwaitingReply(reply.reply, after_done, reply)
+            reply = DispatchAwaitingReply(reply.reply, after_done, reply, unanswered)
         elif not live and not reap_required:
             reply = replace(reply, anomalies=tuple(
                 f"run {run_id} finished, but its result is not in the transcript" for run_id in sorted(unseen)))
@@ -1300,6 +1309,9 @@ def _awaiting_dispatch_hook(passed: dict[str, object], *, same_pass: bool) -> bo
             and isinstance(progress_history.hook_completion(passed), progress_history.NoHookCompletion))
 
 
+ENDED_PASS_STATUSES = ("completed", "error", "canceled", "interrupted")
+
+
 def _pending_dispatch_completion(row: staff.StaffRow, run: Path, passed: dict[str, object], *,
                                  same_pass: bool) -> CompletionRecovery:
     """Read the receipt that can prevent recovery before a new dispatch."""
@@ -1310,7 +1322,7 @@ def _pending_dispatch_completion(row: staff.StaffRow, run: Path, passed: dict[st
         return CompletionRecovery.NO_PENDING_NOTICE
     completion = progress_history.hook_completion(passed)
     saved_done = isinstance(completion, progress_history.HookCompletion) and completion.outcome in ("done", "late_done")
-    ended = passed.get("status") in ("completed", "error", "canceled", "interrupted")
+    ended = passed.get("status") in ENDED_PASS_STATUSES
     if isinstance(completion, progress_history.HookCompletion):
         if completion.outcome == "stopped" or saved_done and completion.finished:
             return CompletionRecovery.NO_PENDING_NOTICE
@@ -2293,21 +2305,33 @@ def _answer_ended_pass(row: staff.StaffRow, run: Path, passed: dict[str, object]
     delivery = pass_recorder.dispatch_delivery(passed)
     started = passed.get("started_at")
     director = record.parent_of(row)
-    if (passed.get("status") not in ("completed", "error", "interrupted") or not instance or not delivery.line
+    completion = progress_history.hook_completion(passed)
+    if (passed.get("status") not in ENDED_PASS_STATUSES or not instance or not delivery.line
+            or isinstance(completion, progress_history.HookCompletion) and completion.outcome == "stopped"
             or not isinstance(started, (int, float)) or director is None):
         return _refuse_answer(name, "no active pass")
-    receipt = dispatch_receipt(row, delivery.line, delivery.completion_id or instance, run=run, require_transcript=True)
+    receipt = dispatch_receipt(row, delivery.line, delivery.completion_id or instance, run=run,
+                               require_current_transcript=True)
     if isinstance(receipt, DispatchEvidenceUnknown):
         return _refuse_answer(name, f"completion evidence is unavailable: {receipt.reason}", ExitCode.UNCERTAIN)
     if (not isinstance(receipt, (DispatchWaitingForRuns, DispatchAwaitingReply))
             or waiting_recovery(receipt) is not CompletionRecovery.WAITING_ON_REPLY):
         return _refuse_answer(name, "no active pass")
-    keys = detached_runs.stage_ended_pass_results(run, row, director, instance=instance, started=started, ids=receipt.runs)
-    if not keys:
+    reply = receipt.reply if isinstance(receipt, DispatchWaitingForRuns) else receipt
+    if isinstance(reply, DispatchAwaitingReply) and (unanswered := reply.unanswered_runs.intersection(receipt.runs)):
+        runs = ", ".join(sorted(unanswered))
+        return _busy_dispatch(f"{row.name}: the worker still owes a reply to detached run results: {runs}")
+    released = detached_runs.stage_ended_pass_results(run, row, director, instance=instance, started=started,
+                                                     ids=receipt.runs, membership=record)
+    if not released.count:
         return _refuse_answer(name, "the ended pass has no verified finished run to forward", ExitCode.UNCERTAIN)
-    for key in keys:
+    for key in released.notice_keys:
         _ = after_unlock.callback(pass_notices.retry_result, run, instance, key)
-    print(f"{row.name}: queued {len(keys)} detached run {'result' if len(keys) == 1 else 'results'} for {director.name}")
+    if released.notice_keys:
+        count = len(released.notice_keys)
+        print(f"{row.name}: queued {count} detached run {'result' if count == 1 else 'results'} for {director.name}")
+    if released.count > len(released.notice_keys):
+        print(f"{row.name}: released the DONE wait for delivered detached run results")
     return ExitCode.OK
 
 
