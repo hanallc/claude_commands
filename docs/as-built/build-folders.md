@@ -317,9 +317,9 @@ If the command cannot read the gate root, it shows one kept row for that root an
 The command keeps a gate row that contains a `.git` file or folder at any depth.
 It also keeps a bare repository that it identifies by name.
 The standard list shows `holds a Git repository; manual review` for these rows.
-The sudo list can approve a move when a top-level Git checkout is the only reason to keep the folder.
-The sudo list keeps folders with a `.git` file because the linked worktree has a registration elsewhere.
-The removal guard keeps bare repositories and folders with nested checkout markers for manual review.
+The sudo list can approve a move for a folder with top-level or nested Git checkouts or bare repositories.
+It keeps linked worktrees because a `.git` file points to a registration elsewhere.
+It keeps folders with an `objects/info/alternates` file at any depth and shows `Git alternates; manual review`.
 The target is `/build/claude/resources/shm-moved/<entry name>`. The child refuses an existing target.
 The sudo caller must own the source entries and the target parent.
 The child copies the folder and its lock and lease files into a staging folder with mode `0700`.
@@ -328,7 +328,12 @@ It copies links as links.
 The child compares the paths, types, sizes, file hashes, and link targets.
 The child renames the verified folder to the target first. It then renames the lock and lease files.
 If publication fails, the child returns the paths it published to staging.
-The child verifies the published copy again. It compares the file and folder stamps just before source removal.
+The child verifies the published copy again.
+The removal guard compares the proof's final path with the target on the approved list.
+It walks the source and checks the published tree's path, identity, and entry stamps.
+The final live-use scan runs after these checks.
+The copy proof permits removal of the source only.
+The standard removal guard removes the lock and lease files after the source is gone.
 Cleanup can miss a write by a process with the same user ID between the entry's last check and source removal.
 A copy error keeps the source and the copy.
 The gate check uses file names and runs no Git commands.

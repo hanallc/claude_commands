@@ -275,6 +275,7 @@ GATE_IF_NAMED = removal_guard.Kept("would remove if named")
 GATE_RECOVERY = "gate recovery record"
 GATE_OTHER_OWNER = "other user's files; live use not provable"
 GATE_GIT_KEEP_REASON = "holds a Git repository; manual review"
+GATE_ALTERNATES = "Git alternates; manual review"
 GATE_MOVE_LABEL = "would move to disk"
 STANDARD_CLEANUP_ONLY = removal_guard.Kept("use the standard cleanup list to remove this folder")
 GATE_GIT_STORAGE = "Git data in the gate root; manual review"
@@ -505,35 +506,25 @@ class CheckedCleanup:
     def name(self) -> str:
         return self.path.name
 
+    @property
+    def published_copy_path(self) -> Path:
+        return gate_move_target(self.path, self.bounds)
+
     def recheck(self) -> None:
         if removal_guard.identity(self.path.parent.stat()) != self.parent_identity:
             raise removal_guard.ChangedEntry("the parent folder changed")
         removal_guard.require_identity(self.parent, self.name, removal_guard.identity(self.info))
 
 
-class SidecarBaseRemoval(Enum):
-    FINISHED = "the source folder is gone"
-
-
 @dataclass(frozen=True)
 class CheckedSidecar(CheckedCleanup):
     lease: build_folders.HeldFolderRemovalLease
     lock_stamp: build_folders.SidecarIdentity
-    base_removal: SidecarBaseRemoval | CheckedCleanup
 
     @override
     def recheck(self) -> None:
         super().recheck()
-        if self.base_removal is SidecarBaseRemoval.FINISHED:
-            require_absent_base(self.lease.folder, self.parent)
-        else:
-            try:
-                base = os.stat(self.lease.folder.name, dir_fd=self.parent, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                if not os.path.samestat(base, self.base_removal.info):
-                    raise removal_guard.ChangedEntry("the sidecars have a different folder beside them")
+        require_absent_base(self.lease.folder, self.parent)
         held = os.fstat(self.lease.descriptor)
         if ((*removal_guard.identity(held), held.st_ctime_ns) != self.lock_stamp
                 or not build_folder_lock.lock_current(self.lease.folder, self.parent, self.lease.descriptor)):
@@ -557,15 +548,14 @@ class CleanupGuard:
 
     @contextmanager
     def check_sidecar(self, path: Path, lease: build_folders.HeldFolderRemovalLease,
-                      lock_stamp: build_folders.SidecarIdentity,
-                      base_removal: SidecarBaseRemoval | CheckedCleanup) -> Generator[CheckedSidecar]:
+                      lock_stamp: build_folders.SidecarIdentity) -> Generator[CheckedSidecar]:
         base = lease.folder
         if (base not in self.paths or path.parent != base.parent or path.name not in worktree_sidecar_names(base)
                 or self.bounds.protects(path)):
             raise removal_guard.Refused(removal_guard.RefusalReason.OUTSIDE_ROOT, str(path))
         with self._open_checked(path, file=True) as checked:
             sidecar = CheckedSidecar(path, checked.parent, checked.info, checked.parent_identity, checked.mount,
-                                     checked.bounds, lease, lock_stamp, base_removal)
+                                     checked.bounds, lease, lock_stamp)
             sidecar.recheck()
             yield sidecar
 
@@ -718,6 +708,8 @@ def inspect_cleanup_tree(checked: CheckedCleanup,
                 gate_issue = GATE_OTHER_OWNER
             elif not gate_issue and not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
                 gate_issue = f"contains a link or an unknown entry type: {path}"
+            elif not gate_issue and stat.S_ISREG(info.st_mode) and path.parts[-3:] == ("objects", "info", "alternates"):
+                gate_issue = GATE_ALTERNATES
         evidence = json.dumps((str(path.relative_to(checked.path)), stamp)).encode()
         fingerprint.update(evidence)
         in_git = path.is_relative_to(dot_git)
@@ -2335,8 +2327,7 @@ def confirm_sidecars(checked: CheckedCleanup, guard: CleanupGuard, related: tupl
 
 @contextmanager
 def approved_sidecar_targets(path: Path, guard: CleanupGuard, lease: build_folders.HeldFolderRemovalLease,
-                             approved: WorktreeSidecars, base_removal: SidecarBaseRemoval | CheckedCleanup
-                             ) -> Generator[list[removal_guard.CleanupTarget]]:
+                             approved: WorktreeSidecars) -> Generator[list[removal_guard.CleanupTarget]]:
     lock_stamp = approved.stamps.get(worktree_sidecar_names(path)[1])
     if lock_stamp is None or lease.sidecar_identities() != approved.stamps:
         raise removal_guard.ChangedEntry("worktree sidecars changed")
@@ -2350,7 +2341,7 @@ def approved_sidecar_targets(path: Path, guard: CleanupGuard, lease: build_folde
             if name not in approved.stamps:
                 continue
             place = path.with_name(name)
-            checked = stack.enter_context(guard.check_sidecar(place, lease, lock_stamp, base_removal))
+            checked = stack.enter_context(guard.check_sidecar(place, lease, lock_stamp))
             stamp = entry_stamp(checked.info)
             if (stamp.device, stamp.inode, stamp.changed_ns) != approved.stamps[name]:
                 raise removal_guard.ChangedEntry(f"worktree sidecar changed: {place}")
@@ -2360,11 +2351,11 @@ def approved_sidecar_targets(path: Path, guard: CleanupGuard, lease: build_folde
 
 
 def finish_sidecars(path: Path, guard: CleanupGuard, lease: build_folders.HeldFolderRemovalLease,
-                    approved: WorktreeSidecars) -> None:
+                    approved: WorktreeSidecars, *, ignored_fds: Sequence[int] = ()) -> None:
     try:
-        with approved_sidecar_targets(path, guard, lease, approved, SidecarBaseRemoval.FINISHED) as targets:
+        with approved_sidecar_targets(path, guard, lease, approved) as targets:
             first, *other = targets
-            descriptors = (lease.descriptor, *(target.checked.parent for target in targets))
+            descriptors = (*ignored_fds, lease.descriptor, *(target.checked.parent for target in targets))
             sidecars = tuple(target.checked.path for target in targets)
             remove_reviewed_entries(first.checked, first.approval, *other, before_delete=lambda: require_no_process_use(
                 path, descriptors, sidecars=sidecars))
@@ -2435,6 +2426,8 @@ def candidate_order(candidate: Candidate) -> tuple[int, str, Path]:
 def gate_tree_refusal(kind: str, tree: CleanupTree) -> str:
     if kind in ("gate-recovery", "merge-gate-recovery") or tree.gate_issue == GATE_RECOVERY:
         return GATE_RECOVERY
+    if tree.gate_issue == GATE_ALTERNATES:
+        return GATE_ALTERNATES
     if tree.git is not CleanupGit.NONE:
         return GATE_GIT_KEEP_REASON
     if tree.gate_issue:
@@ -2473,7 +2466,7 @@ def require_vacant_move_target(target: Path, directory: int) -> None:
         raise removal_guard.ChangedEntry(f"move target already exists: {target.with_name(name)}")
 
 
-def require_movable_git(path: Path, kind: str, tree: CleanupTree, entries: dict[Path, CleanupEntry]) -> None:
+def require_movable_git(kind: str, tree: CleanupTree, entries: dict[Path, CleanupEntry]) -> None:
     if kind in ("gate-recovery", "merge-gate-recovery"):
         raise removal_guard.ChangedEntry(GATE_RECOVERY)
     if tree.gate_issue or kind == UNKNOWN_GATE_KIND:
@@ -2481,11 +2474,8 @@ def require_movable_git(path: Path, kind: str, tree: CleanupTree, entries: dict[
     if any(entry_path.name.casefold() == ".git" and stat.S_ISREG(entry.stamp.mode)
            for entry_path, entry in entries.items()):
         raise removal_guard.ChangedEntry("linked worktree; its registration is elsewhere")
-    metadata = path / ".git"
-    if (tree.git is CleanupGit.NONE or metadata not in entries or any(
-            git_metadata(tuple(name for name in entry.children if entry_path != path or name != ".git"))
-            for entry_path, entry in entries.items() if not entry_path.is_relative_to(metadata))):
-        raise removal_guard.ChangedEntry(f"{GATE_GIT_KEEP_REASON}. The removal guard requires one top-level checkout")
+    if tree.git is CleanupGit.NONE:
+        raise removal_guard.ChangedEntry("no Git repository to move")
 
 
 def gate_move_leases(path: Path, tree: CleanupTree) -> tuple[FolderLeaseReview, ...]:
@@ -2544,7 +2534,7 @@ def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessR
                 lease_statuses = tuple(lease.status for lease in leases if lease.status.state is not LeaseState.ABSENT)
                 moving = mode is CleanupMode.MOVE_GATE_GIT and tree.git is not CleanupGit.NONE
                 if moving:
-                    require_movable_git(path, kind, tree, entries)
+                    require_movable_git(kind, tree, entries)
                 elif reason := gate_tree_refusal(kind, tree):
                     raise removal_guard.ChangedEntry(reason)
                 if use_notes:
@@ -2978,34 +2968,16 @@ def move_copy_differs(source: TreeEntry, target: TreeEntry,
 
 @dataclass(frozen=True)
 class VerifiedGateCopy:
-    entries: dict[Path, EntryStamp]
+    source: removal_guard.ProvedCopyCleanup
     sidecars: dict[str, EntryStamp]
 
 
 def verify_gate_copy(checked: CheckedCleanup, source: int, target: int, target_parent: int,
-                     entries: dict[Path, CleanupEntry], sidecars: WorktreeSidecars) -> VerifiedGateCopy:
+                     entries: dict[Path, CleanupEntry], sidecars: WorktreeSidecars, *,
+                     target_path: Path) -> VerifiedGateCopy:
     from scripts.lib import session_move
 
-    original_ids: session_move.EntryIdentities = {}
-    copied_ids: session_move.EntryIdentities = {}
-    original = session_move.read_manifest(source, original_ids,
-                                          removal=session_move.SourceRemoval(checked.parent, checked.path))
-    copied = session_move.read_manifest(target, copied_ids)
-    if original.keys() != copied.keys() or len(original) != len(entries):
-        raise removal_guard.ChangedEntry("copy differs from the checked source paths")
-    source_links: dict[removal_guard.Identity, Path] = {}
-    target_links: dict[removal_guard.Identity, Path] = {}
-    for path, entry in original.items():
-        before, after = original_ids[path], copied_ids[path]
-        approved = entries.get(checked.path / path)
-        if approved is None or approved.stamp != entry_stamp(before):
-            raise removal_guard.ChangedEntry(f"source entry changed during the copy: {path}")
-        if move_copy_differs(entry, copied[path], before, after):
-            raise removal_guard.ChangedEntry(f"copy differs from the checked source: {path}")
-        if entry.kind is session_move.HashedEntry.FILE and (
-                source_links.setdefault(removal_guard.identity(before), path)
-                != target_links.setdefault(removal_guard.identity(after), path)):
-            raise removal_guard.ChangedEntry(f"copy differs in hard links: {path}")
+    proof = removal_guard.ProvedCopyCleanup(checked, source, removal_guard.CopyDestination(target_path, target), entries)
     copied_sidecars: dict[str, EntryStamp] = {}
     for name in worktree_sidecar_names(checked.path):
         expected = sidecars.stamps.get(name)
@@ -3027,22 +2999,17 @@ def verify_gate_copy(checked: CheckedCleanup, source: int, target: int, target_p
         if move_copy_differs(original_file, copied_file, before, after):
             raise removal_guard.ChangedEntry(f"copy differs from the checked sidecar: {name}")
         copied_sidecars[name] = entry_stamp(after)
-    return VerifiedGateCopy({path: entry_stamp(info) for path, info in copied_ids.items()}, copied_sidecars)
+    return VerifiedGateCopy(proof, copied_sidecars)
 
 
-def require_unchanged_gate_copy(target: Path, parent: int, destination: int, verified: VerifiedGateCopy) -> None:
-    from scripts.lib import session_move
-
-    entries = {path: entry_stamp(info) for path, _parent, info, _kind in
-               session_move.tree_entries(destination, session_move.mount_identity(destination))}
+def require_unchanged_gate_sidecars(target: Path, parent: int, verified: VerifiedGateCopy) -> None:
     sidecars: dict[str, EntryStamp] = {}
     for name in worktree_sidecar_names(target):
         try:
             sidecars[name] = entry_stamp(os.stat(name, dir_fd=parent, follow_symlinks=False))
         except FileNotFoundError:
             continue
-    entries[session_move.TREE_ROOT] = entry_stamp(os.stat(target.name, dir_fd=parent, follow_symlinks=False))
-    if entries != verified.entries or sidecars != verified.sidecars:
+    if sidecars != verified.sidecars:
         raise removal_guard.ChangedEntry("the published copy changed during verification")
 
 
@@ -3106,11 +3073,11 @@ def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, detai
                 raise removal_guard.ChangedEntry("worktree sidecars changed")
             entries: dict[Path, CleanupEntry] = {}
             tree = inspect_cleanup_tree(checked, entries)
-            require_movable_git(path, details.kind, tree, entries)
+            require_movable_git(details.kind, tree, entries)
             if sidecars.bind(tree.fingerprint) != approval.fingerprint:
                 raise removal_guard.ChangedEntry("identity or contents changed since the list was checked")
 
-            def recheck_move_source() -> None:
+            def recheck_move_source(descriptors: Sequence[int]) -> None:
                 confirm_sidecars(checked, guard, related, lease, locked_sidecars)
                 leases = gate_move_leases(path, tree)
                 for reviewed in leases:
@@ -3119,9 +3086,9 @@ def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, detai
                 states = tuple(reviewed.status for reviewed in leases if reviewed.status.state is not LeaseState.ABSENT)
                 if states != details.leases:
                     raise removal_guard.ChangedEntry("lease state changed since the list was checked")
-                require_no_process_use(path, fds, sidecars=related, gate_root=guard.bounds.gate)
+                require_no_process_use(path, descriptors, sidecars=related, gate_root=guard.bounds.gate)
 
-            recheck_move_source()
+            recheck_move_source(fds)
             with (session_move.child_directory(checked.parent, checked.name, mount=int(checked.mount)) as source,
                   gate_move_parent(target, guard.bounds, create=True) as target_parent):
                 if entry_stamp(os.fstat(source)) != entries[path].stamp:
@@ -3132,28 +3099,29 @@ def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, detai
                 os.mkdir(stage_name, mode=0o700, dir_fd=target_parent)
                 with (session_move.child_directory(target_parent, stage_name, mount=mount) as stage,
                       session_move.child_directory(stage, target.name, create=True, mount=mount) as destination):
-                    fds.append(source)
                     copy_gate_tree(source, destination)
                     for name, expected in sidecars.stamps.items():
                         copy_gate_sidecar(checked.parent, stage, name, expected)
                     sync_gate_copy(destination, stage)
-                    _ = verify_gate_copy(checked, source, destination, stage, entries, sidecars)
+                    _ = verify_gate_copy(checked, source, destination, stage, entries, sidecars,
+                                         target_path=target.parent / stage_name / target.name)
                     publish_gate_copy(target, target_parent, stage_name, stage, sidecars)
 
+                    check_protected_masks()
+                    verified = verify_gate_copy(checked, source, destination, target_parent, entries, sidecars,
+                                                target_path=target)
+
                     def before_delete() -> None:
-                        recheck_move_source()
                         require_gate_move_parent_owner(target_parent)
-                        verified = verify_gate_copy(checked, source, destination, target_parent, entries, sidecars)
-                        session_move.require_parent_path(target, destination)
                         session_move.require_parent_path(target.parent, target_parent)
                         check_protected_masks()
-                        require_unchanged_gate_copy(target, target_parent, destination, verified)
+                        require_unchanged_gate_sidecars(target, target_parent, verified)
+                        recheck_move_source((*fds, source))
 
-                    with approved_sidecar_targets(path, guard, lease, locked_sidecars, checked) as targets:
-                        fds.extend(item.checked.parent for item in targets)
-                        check_protected_masks()
-                        removal_guard.remove_cleanup(checked, removal_guard.ApprovedCleanup(
-                            entries, removal_guard.CleanupRemoval.SAVED_CHECKOUT), *targets, before_delete=before_delete)
+                    removal_guard.remove_proved_copy(checked, verified.source, approval.target,
+                                                     before_delete=before_delete)
+            if sidecars.stamps:
+                finish_sidecars(path, guard, lease, locked_sidecars, ignored_fds=fds)
 
 
 def apply(review: HostList, bounds: CleanupBounds, *, mode: CleanupMode = CleanupMode.STANDARD) -> int:

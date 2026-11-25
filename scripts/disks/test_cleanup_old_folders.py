@@ -949,6 +949,44 @@ assert not loaded, sorted(loaded)
         for path in (linked, nested):
             self.assertEqual(rows[path], removal_guard.Kept("linked worktree; its registration is elsewhere"))
 
+    def test_gate_move_keeps_a_nested_clone_with_alternates(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.candidate("t-shared", home=self.gate)
+        objects = path / "borrower/.git/objects"
+        info = objects / "info"
+        info.mkdir(parents=True)
+        alternate = path / "store/objects"
+        alternate.mkdir(parents=True)
+        (alternate.parent / "HEAD").touch()
+        (alternate.parent / "refs").mkdir()
+        alternates = info / "alternates"
+        _ = alternates.write_text(f"{alternate}\n")
+        self.write_settings(str(path))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        row = next(row for row in review.rows if row.path == path)
+        self.assertEqual(row.outcome, removal_guard.Kept("Git alternates; manual review"))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
+        self.assertEqual(alternates.read_text(), f"{alternate}\n")
+        self.assertTrue(alternate.is_dir())
+
+    def test_gate_move_keeps_a_common_directory_with_alternates_and_no_head(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        plain = self.candidate("t-common", home=self.gate)
+        for folder in (path, plain):
+            alternates = folder / "nested/common/objects/info/alternates"
+            alternates.parent.mkdir(parents=True)
+            _ = alternates.write_text("/fixture/objects\n")
+        self.write_settings(f"{path} {plain}")
+        for mode in (cleanup.CleanupMode.MOVE_GATE_GIT, cleanup.CleanupMode.STANDARD):
+            with self.subTest(mode=mode):
+                review, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+                rows = {row.path: row.outcome for row in review.rows}
+                for folder in (path, plain):
+                    self.assertEqual(rows[folder], removal_guard.Kept("Git alternates; manual review"))
+
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
     def test_gate_move_requires_the_callers_ownership_at_listing_and_removal(self) -> None:
         cleanup = cleanup_old_folders
@@ -1006,9 +1044,10 @@ assert not loaded, sorted(loaded)
         def change_after_verification(
                 checked: cleanup_old_folders.CheckedCleanup, source: int, destination: int, target_parent: int,
                 entries: dict[Path, cleanup_old_folders.CleanupEntry],
-                sidecars: cleanup_old_folders.WorktreeSidecars) -> cleanup_old_folders.VerifiedGateCopy:
+                sidecars: cleanup_old_folders.WorktreeSidecars, *, target_path: Path
+                ) -> cleanup_old_folders.VerifiedGateCopy:
             publication_states.append(target.exists())
-            verified = verify(checked, source, destination, target_parent, entries, sidecars)
+            verified = verify(checked, source, destination, target_parent, entries, sidecars, target_path=target_path)
             if len(publication_states) == 1:
                 self.assertEqual(os.fstat(target_parent).st_mode & 0o777, 0o700)
                 fd = os.open("payload", os.O_WRONLY | os.O_TRUNC, dir_fd=destination)
@@ -1127,10 +1166,21 @@ assert not loaded, sorted(loaded)
         for sidecar, contents in sidecars.items():
             _ = sidecar.write_text(contents)
         mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        remove = removal_guard.remove_cleanup
+
+        def remove_sidecars(checked: removal_guard.CheckedCleanupPath, approved: removal_guard.ApprovedCleanup,
+                            *additional: removal_guard.CleanupTarget,
+                            before_delete: Callable[[], None] | None = None) -> None:
+            self.assertFalse(path.exists())
+            self.assertEqual({checked.path, *(entry.checked.path for entry in additional)}, set(sidecars))
+            remove(checked, approved, *additional, before_delete=before_delete)
+
         with (mock.patch.object(process_start, "process_start", return_value=process_start.Gone()),
+              mock.patch.object(removal_guard, "remove_cleanup", side_effect=remove_sidecars) as finish,
               redirect_stdout(io.StringIO()) as output):
             review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
             self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
+        finish.assert_called_once()
         target = self.build / "claude/resources/shm-moved" / path.name
         self.assertFalse(path.exists())
         self.assertEqual((target / ".git/HEAD").read_text(), "ref: refs/heads/main\n")
@@ -1227,24 +1277,96 @@ assert not loaded, sorted(loaded)
         self.assertEqual((target / "existing").read_text(), "keep this\n")
         self.assertEqual((path / "payload").read_text(), "old content\n")
 
-    def test_gate_move_keeps_bare_and_nested_git_and_standard_cleanup_rows(self) -> None:
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_moves_bare_and_nested_git_and_keeps_standard_cleanup_rows(self) -> None:
         cleanup = cleanup_old_folders
         bare = self.candidate("t-bare", home=self.gate)
-        (bare / "HEAD").touch()
         (bare / "refs").mkdir()
         (bare / "objects").mkdir()
         nested = self.candidate("t-nested", home=self.gate)
         (nested / "child/.git").mkdir(parents=True)
+        for head in (bare / "HEAD", nested / "child/.git/HEAD"):
+            _ = head.write_text("ref: refs/heads/main\n")
         ordinary = self.candidate()
         self.write_settings(str(ordinary))
         preview, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV)
         self.assertIsInstance(next(row.outcome for row in preview.rows if row.path == ordinary), cleanup.WouldRemove)
-        moves, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=cleanup.CleanupMode.MOVE_GATE_GIT)
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        moves, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
         rows = {row.path: row.outcome for row in moves.rows}
         for path in (bare, nested):
-            self.assertEqual(rows[path], removal_guard.Kept(
-                "holds a Git repository; manual review. The removal guard requires one top-level checkout"))
+            self.assertIsInstance(rows[path], cleanup.WouldMove)
         self.assertEqual(rows[ordinary], removal_guard.Kept("use the standard cleanup list to remove this folder"))
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cleanup.apply(moves, bounds, mode=mode), 0, output.getvalue())
+        destination = self.build / "claude/resources/shm-moved"
+        for path, relative in ((bare, "HEAD"), (nested, "child/.git/HEAD")):
+            self.assertFalse(path.exists())
+            self.assertEqual((destination / path.name / relative).read_text(), "ref: refs/heads/main\n")
+            self.assertIn(f"moved {str(path)!r} to {str(destination / path.name)!r}", output.getvalue())
+        self.assertTrue(ordinary.is_dir())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_a_source_changed_after_copy_verification(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        metadata = path / "nested/.git"
+        metadata.mkdir(parents=True)
+        head = metadata / "HEAD"
+        _ = head.write_text("ref: refs/heads/main\n")
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        moves, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        verify = cleanup.verify_gate_copy
+
+        def change_source_after_verification(
+                checked: cleanup_old_folders.CheckedCleanup, source: int, destination: int, target_parent: int,
+                entries: dict[Path, cleanup_old_folders.CleanupEntry],
+                sidecars: cleanup_old_folders.WorktreeSidecars, *, target_path: Path
+                ) -> cleanup_old_folders.VerifiedGateCopy:
+            verified = verify(checked, source, destination, target_parent, entries, sidecars, target_path=target_path)
+            info = head.stat()
+            _ = head.write_text("ref: refs/heads/next\n")
+            os.utime(head, ns=(info.st_atime_ns, info.st_mtime_ns))
+            return verified
+
+        with (mock.patch.object(cleanup, "verify_gate_copy", side_effect=change_source_after_verification),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(cleanup.apply(moves, bounds, mode=mode), 1, output.getvalue())
+        self.assertIn("entry changed before removal", output.getvalue())
+        self.assertEqual(head.read_text(), "ref: refs/heads/next\n")
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        target = self.build / "claude/resources/shm-moved" / path.name
+        self.assertEqual((target / head.relative_to(path)).read_text(), "ref: refs/heads/main\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_a_source_opened_during_the_removal_walk(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        payload = path / "payload"
+        payload_info = payload.stat()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        proc, process = self.proc_fixture()
+        (process / "cwd").symlink_to(self.gate)
+        (process / "root").symlink_to(self.gate)
+        (process / "maps").touch()
+        opened = process / "fd/5"
+        mount_id = removal_guard.mount_id
+
+        def open_during_walk(fd: int) -> str:
+            if target.is_dir() and os.path.samestat(os.fstat(fd), payload_info) and not opened.is_symlink():
+                opened.symlink_to(payload)
+            return mount_id(fd)
+
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        with mock.patch.object(cleanup, "PROC_ROOT", str(proc)):
+            review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            self.assertIsInstance(next(row.outcome for row in review.rows if row.path == path), cleanup.WouldMove)
+            with (mock.patch.object(removal_guard, "mount_id", side_effect=open_during_walk),
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+        self.assertIn("pid 42 holds a file open", output.getvalue())
+        self.assertEqual(payload.read_text(), "old content\n")
+        self.assertEqual((target / payload.name).read_text(), "old content\n")
 
     def test_gate_listing_does_not_start_git(self) -> None:
         source, checkout = self.git_fixture()
