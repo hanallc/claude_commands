@@ -1185,11 +1185,12 @@ The notice names each region and read that AWS refused. The saved failure keeps 
 `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, and `not authorized` permit a notice.
 The first permission refusal files the **Allow AWS price reads** action with `deploy.py up --approve-resources` on natedev.
 The streak saves the action key before it files the action.
+If the store finds an open action, the streak saves that action's key before it uses the action.
 It records successful action creation separately from the notice claim.
 A later permission refusal retries a failed action creation, even after the notice goes out.
 Completing the action leaves the creation record in the streak.
-A clean read withdraws the open action and ends the streak.
-A withdrawal failure retains the streak for the next clean read.
+A clean read saves the snapshot and ends the streak before it withdraws the open action.
+A withdrawal failure sets status 1. The next clean read retries the withdrawal.
 That command updates permissions but does not replace scaler credentials.
 Credential errors, timeouts, network errors, and throttling send no phone notice.
 `deploy.py apply --approve-resources` replaces the scaler key and checks its identity.

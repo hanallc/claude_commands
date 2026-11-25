@@ -150,7 +150,8 @@ def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.Ren
     return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
 
 
-def update_price_read_action(failures: Sequence[SnapshotFailure], now: int, *, key: str = '') -> int:
+def update_price_read_action(failures: Sequence[SnapshotFailure], now: int, *, key: str = '',
+                             before_reuse: Callable[[str], None] | None = None) -> int:
     """File the action for a permission refusal or withdraw it after recovery."""
     try:
         actions = ActionStore()
@@ -164,6 +165,7 @@ def update_price_read_action(failures: Sequence[SnapshotFailure], now: int, *, k
                        + 'After 2 hours without the read, test runs on AWS try that region last. '
                        + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.',
                 waits=f'Test runs on AWS in {regions}', concerns='aws', dedupe_key=PRICE_READ_ACTION_KEY, key=key,
+                before_reuse=before_reuse,
             )
         else:
             for record in actions.list():
@@ -546,11 +548,9 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
              'gpu': quota_requests.request_record(row.gpu)}
             for row in request_readings]
         access_failures = tuple(row for row in current_failures if snapshot_permission_failure(row))
-        previous = ledger.mapping(document['failure_streak']) if 'failure_streak' in document else {}
-        withdrawal_status = update_price_read_action((), now) if not current_failures else 0
-        status |= withdrawal_status
         streak: SnapshotFailureStreak | SnapshotHealthy = SnapshotHealthy()
-        if current_failures or (previous and withdrawal_status):
+        if current_failures:
+            previous = ledger.mapping(document['failure_streak']) if 'failure_streak' in document else {}
             since = ledger.instant(previous, 'since') if previous else now
             notice_claimed = previous.get('notice_claimed', previous.get('notified')) is True
             action_key = ledger.text(previous, 'action_key') if 'action_key' in previous else ''
@@ -573,7 +573,14 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             status = 1
         if access_failures and isinstance(streak, SnapshotFailureStreak):
             if not streak.action_created:
-                action_status = update_price_read_action(access_failures, now, key=streak.action_key)
+                def save_reused_key(key: str) -> None:
+                    nonlocal streak
+                    assert isinstance(streak, SnapshotFailureStreak)
+                    streak = replace(streak, action_key=key)
+                    save_snapshot()
+
+                action_status = update_price_read_action(access_failures, now, key=streak.action_key,
+                                                         before_reuse=save_reused_key)
                 status |= action_status
                 if not action_status:
                     streak = replace(streak, action_created=True)
@@ -587,6 +594,8 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
                     streak = replace(streak, notice_claimed=False)
                     save_snapshot()
                     print('aws_target: snapshot user notice remains pending', file=sys.stderr)
+        elif not current_failures:
+            status |= update_price_read_action((), now)
         # The stamp is the last scheduled read. A forced read leaves it, so the next hourly read still runs.
         if not force:
             _ = lock.seek(0)

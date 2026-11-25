@@ -12,6 +12,7 @@ import fcntl
 import json
 import shutil
 import os
+from pathlib import Path
 import subprocess
 import sys
 from typing import cast, override
@@ -995,6 +996,45 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(actions.get(unrelated.key), unrelated)
         self.assertEqual(len(self.notices), 1)
 
+    def test_clean_snapshot_ends_the_streak_before_a_failed_withdrawal(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+
+        def fail_withdrawal(key: str, *, requested_by: str, reason: str) -> action.UserAction:
+            self.assertEqual((key, requested_by), (opened.key, opened.requested_by))
+            self.assertTrue(reason.startswith('The hourly read succeeded at '))
+            saved = aws_target.read_snapshot(self.state)
+            self.assertEqual(aws_target.snapshot_failures(saved), ())
+            self.assertNotIn('failure_streak', saved)
+            raise OSError('Fixture withdrawal failure.')
+
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        self.clock.advance(interval)
+        self.failure = ''
+        with (mock.patch.object(action.ActionStore, 'withdraw', side_effect=fail_withdrawal) as withdraw,
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.snapshot(), 1)
+        withdraw.assert_called_once()
+        self.assertIn('Fixture withdrawal failure.', errors.getvalue())
+        self.assertNotIn('failure_streak', aws_target.read_snapshot(self.state))
+        self.assertEqual(actions.list(), (opened,))
+
+        self.clock.advance(interval)
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(len(self.notices), 2)
+        self.assertNotEqual(self.notices[0][0], self.notices[1][0])
+        streak = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertEqual((streak['action_key'], streak['action_created']), (opened.key, True))
+        self.clock.advance(interval)
+        self.failure = ''
+        self.assertEqual(self.snapshot(), 0)
+        self.assertEqual(actions.get(opened.key).status, 'withdrawn')
+
     def test_timeout_keeps_the_price_read_action_open(self) -> None:
         self.failure = 'describe-spot-price-history'
         with redirect_stderr(StringIO()):
@@ -1027,7 +1067,7 @@ region_transfer_usd={"us-west-1":0.00015}
         self.assertEqual(errors.getvalue().splitlines(),
                          ['aws_target: cannot update the AWS price read action: fixture list failure'])
         self.assertEqual(aws_target.snapshot_failures(aws_target.read_snapshot(self.state)), ())
-        self.assertIn('failure_streak', aws_target.read_snapshot(self.state))
+        self.assertNotIn('failure_streak', aws_target.read_snapshot(self.state))
         self.assertEqual(len(self.notices), 1)
 
     def test_failed_price_read_action_retries_after_a_successful_notice(self) -> None:
@@ -1091,6 +1131,41 @@ region_transfer_usd={"us-west-1":0.00015}
         with redirect_stderr(StringIO()):
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(sorted(record.status for record in actions.list()), ['done', 'open'])
+
+    def test_reused_price_read_action_key_survives_a_stop_before_the_success_save(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        document = aws_target.read_snapshot(self.state)
+        streak = ledger.mapping(document['failure_streak'])
+        document['failure_streak'] = {'since': streak['since'], 'notice_claimed': True}
+        _ = (self.state / 'spot-prices.json').write_text(json.dumps(document))
+
+        def stop_before_success(path: Path, text: str) -> None:
+            output = ledger.mapping(cast(object, json.loads(text)))
+            if ledger.mapping(output['failure_streak']).get('action_created') is True:
+                raise RuntimeError('Fixture stop before the success save.')
+            atomic_file.write_text_atomic(path, text)
+
+        interval = conf.read(self.settings).whole('price_refresh_seconds')
+        self.clock.advance(interval)
+        with (mock.patch.object(aws_target, 'write_text_atomic', side_effect=stop_before_success),
+              redirect_stderr(StringIO()),
+              self.assertRaisesRegex(RuntimeError, 'Fixture stop before the success save')):
+            _ = self.snapshot()
+        pending = ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])
+        self.assertFalse(pending['action_created'])
+
+        done = actions.mark_done(opened.key, evidence='The user completed the action.')
+        self.clock.advance(interval)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (done,))
+        self.assertEqual(pending['action_key'], opened.key)
+        self.assertTrue(ledger.mapping(aws_target.read_snapshot(self.state)['failure_streak'])['action_created'])
+        self.assertEqual(len(self.notices), 1)
 
     def test_crash_after_notice_delivery_does_not_repeat_the_streak_notice(self) -> None:
         self.failure = 'describe-spot-price-history'
