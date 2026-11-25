@@ -821,7 +821,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   The line contains the folder path, lease owner identity, commit SHA, branch, and step.
   The `gate_run` line adds the same owner identity, `suite_folders`, and `end`.
   If SIGTERM starts cleanup, the gate records a `sigterm` end.
-  The gate defers SIGTERM during the end write.
+  The gate defers SIGTERM, SIGINT, and SIGHUP until it marks the end write complete.
   If SIGTERM interrupts end setup, the gate writes a `sigterm` end before it exits.
   The gate uses a `gate_folder_end` line if it cannot append a complete `gate_run` line.
   A sync error after a complete append leaves the `gate_run` line as the only end.

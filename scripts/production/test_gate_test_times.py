@@ -123,7 +123,7 @@ allocate = gate.gate_temporary
 sigmask = signal.pthread_sigmask
 
 def stop_before_mask(how, signals):
-    if how == signal.SIG_BLOCK and signals == {signal.SIGTERM}:
+    if how == signal.SIG_BLOCK and signal.SIGTERM in signals:
         signal.pthread_sigmask = sigmask
         assert signal.SIGTERM not in sigmask(signal.SIG_BLOCK, ())
         signal.raise_signal(signal.SIGTERM)
@@ -154,7 +154,7 @@ remove = build_folders._remove_build_folder
 sigmask = signal.pthread_sigmask
 
 def stop_before_mask(how, signals):
-    if how == signal.SIG_BLOCK and signals == {signal.SIGTERM}:
+    if how == signal.SIG_BLOCK and signal.SIGTERM in signals:
         signal.pthread_sigmask = sigmask
         assert signal.SIGTERM not in sigmask(signal.SIG_BLOCK, ())
         signal.raise_signal(signal.SIGTERM)
@@ -213,6 +213,34 @@ store._write_all = stop_during_timing_append
         kinds = [row.get("kind") for path in Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
                  for row in store.locked_rows(path)]
         self.assertEqual(kinds.count("gate_folder_end"), 0)
+
+    def test_sigint_during_timing_sync_writes_one_end(self) -> None:
+        preamble = """from scripts.buildlog import store
+write_all = store._write_all
+sync = os.fsync
+signal.signal(signal.SIGINT, signal.default_int_handler)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+
+def arm_after_append(descriptor, data):
+    write_all(descriptor, data)
+    if data.startswith(b'{"kind":"gate_run",'):
+        def interrupt_sync(sync_descriptor):
+            assert sync_descriptor == descriptor
+            os.fsync = sync
+            signal.raise_signal(signal.SIGINT)
+            assert signal.SIGINT in signal.sigpending()
+            sync(sync_descriptor)
+
+        os.fsync = interrupt_sync
+
+store._write_all = arm_after_append
+"""
+        result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rows = [row for path in Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
+                for row in store.locked_rows(path)]
+        ends = [(row["kind"], row.get("end")) for row in rows if row.get("kind") in ("gate_run", "gate_folder_end")]
+        self.assertEqual(ends, [("gate_run", "normal")])
 
     @gate_suites("hooks", "notify", "direct")
     def test_record_keeps_each_attempt_and_only_failed_or_slow_tests(self) -> None:

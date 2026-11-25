@@ -1788,7 +1788,9 @@ def unwind_gate_on_sigterm() -> Generator[None]:
         if interrupted_journal is not None and not interrupted_journal.end_write_finished:
             start = interrupted_journal.start
             if not isinstance(start, GateFolderAllocation):
-                gate_record.write_gate_folder_event(gate_folder_end(start, "sigterm"))
+                with cancellation.defer_cleanup_signals():
+                    gate_record.write_gate_folder_event(gate_folder_end(start, "sigterm"))
+                    interrupted_journal.end_write_finished = True
 
     try:
         _ = signal.signal(signal.SIGTERM, terminate)
@@ -1967,9 +1969,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
-        previous_signals = signal.pthread_sigmask(signal.SIG_BLOCK, ())
-        try:
-            _ = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        with cancellation.defer_cleanup_signals():
             end = gate_run_end(status)
             if ledger is None or admission is None or isinstance(selection, NamedModules) or (
                     aborted and not job_started and end != "sigterm"):
@@ -1983,8 +1983,6 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                                 reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
                                 cap_mib=admission.governor_mib, aborted=aborted, mode=mode, folder_start=journal.start)
             journal.end_write_finished = True
-        finally:
-            _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous_signals)
 
     def suite_result() -> GateRun:
         coverage = ModuleCoverage.COMPLETE if len(modules) == module_count else ModuleCoverage.SUBSET
