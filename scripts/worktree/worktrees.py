@@ -1067,9 +1067,14 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
     from scripts.production import production_doc
 
     _ = force
-    if path.exists() and git_files.at(path).common_dir != git_files.locate(repository).common_dir:
-        raise ValueError(f"{path}: worktree belongs to another repository")
-    if path == main_checkout(repository):
+    if path.exists():
+        checkout = git_files.at(path)
+        if checkout.common_dir != git_files.locate(repository).common_dir:
+            raise ValueError(f"{path}: worktree belongs to another repository")
+        is_main = checkout.git_dir == checkout.common_dir
+    else:
+        is_main = path == main_checkout(repository)
+    if is_main:
         raise ValueError(f"{path}: cannot remove the main checkout")
     layout = worktree_output(path)
     reason = "the checkout is selected for removal"
@@ -1084,9 +1089,9 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
         production_doc.require_removable_checkout(path, repository, registered.get(path, ""))
     except production_doc.ProductionPathsError as error:
         raise Refused(1, str(error)) from error
+    retain_checkout = os.path.lexists(path) or _is_registered_worktree(path, repository)
     if before_report is None:
         report_output()
-    retain_checkout = os.path.lexists(path) or path in registered
     if before_report is not None and (isinstance(output, Path) or retain_checkout):
         before_report()
         report_output()
@@ -1130,7 +1135,7 @@ def remove_named(unit: str, short_name: str) -> list[str]:
             first_line = str(error).partition("\n")[0]
             lines.append(f"{path} not removed: {first_line}")
             continue
-        command = shlex.join(["env", f"--chdir={repo}", str(Path.home() / ".claude/scripts/lib/py"),
+        command = shlex.join([str(Path.home() / ".claude/scripts/lib/py"),
                               str(Path.home() / ".claude/scripts/worktree/worktrees.py"), "remove", str(path)])
         lines.append(f"{path} kept: {state.reason}. Save the work, then run: {command}")
     return lines
@@ -2103,6 +2108,10 @@ def linked_trees(repo: Path) -> tuple[RegisteredTree, ...]:
                            if field.startswith("branch refs/heads/")), "")
             entries.append(RegisteredTree(repo, path, branch))
     return tuple(entries)
+
+
+def _is_registered_worktree(path: Path, repository: Path) -> bool:
+    return any(tree.path.resolve() == path for tree in linked_trees(repository))
 
 
 @dataclass(frozen=True)
@@ -3956,6 +3965,7 @@ def main() -> int:
     _ = repair_branch.add_argument("path", type=Path)
     remove = commands.add_parser("remove")
     _ = remove.add_argument("path", type=Path)
+    _ = remove.add_argument("--repo", metavar="WORD", help="select the repository by name (default: use the path)")
     _ = remove.add_argument("--force", action="store_true")
     retire_unit = commands.add_parser("retire")
     _ = retire_unit.add_argument("unit")
@@ -4106,8 +4116,27 @@ def main() -> int:
                     uncertainty = f"; unreadable: {', '.join(link.unreadable)}" if link.unreadable else ""
                     print(f"{status} {link.old} -> {link.new} | {users}{uncertainty}")
             case "remove":
-                remove_git_checkout(cast(Path, arguments.path).expanduser().resolve(), Path.cwd(),
-                                    force=cast(bool, arguments.force))
+                path = cast(Path, arguments.path).expanduser().resolve()
+                repo = cast(str | None, arguments.repo)
+                if repo is None and not path.exists() and (record := checkout_record(path)) is not None:
+                    repository = Path(record.repo).resolve()
+                elif repo is None:
+                    try:
+                        checkout = git_files.at(path)
+                    except git_files.GitFilesError as error:
+                        raise ValueError(
+                            f"{path}: not a Git checkout root. Give the checkout root, or use --repo WORD.") from error
+                    repository = checkout.toplevel
+                else:
+                    repository = main_checkout_for_word(repo)
+                    if not path.exists():
+                        record = checkout_record(path)
+                        if record is None:
+                            if not _is_registered_worktree(path, repository):
+                                raise ValueError(f"{path}: worktree is not registered in {repository}")
+                        elif Path(record.repo).resolve() != repository:
+                            raise ValueError(f"{path}: worktree belongs to another repository")
+                remove_git_checkout(path, repository, force=cast(bool, arguments.force))
             case "retire":
                 retire(cast(str, arguments.unit))
             case "make":
