@@ -10,6 +10,8 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 
+from scripts.agents import remote
+from scripts.agents.remote import local_machine
 from scripts.production import showrunner_parent
 from scripts.production import showrunner_tree
 from scripts.production import showrunners
@@ -154,6 +156,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
             self.assertFalse(self.parent_receipt("leaf").exists())
 
     def test_attach_with_no_parent_named_takes_the_callers_production_and_sends_the_caller_nothing(self) -> None:
+        _ = self.enterContext(mock.patch.object(remote, "local_machine", new=local_machine))
         self.showrunner("top")
         self.showrunner("mid")
         caller = staff.by_path("top")
@@ -191,6 +194,7 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
         self.assertIn("mid reports to no one", self.successful("detach", "mid"))
 
     def test_a_message_that_could_not_be_sent_is_said_and_the_edge_stands(self) -> None:
+        _ = self.enterContext(mock.patch.object(remote, "local_machine", new=local_machine))
         self.showrunner("top")
         self.showrunner("mid")
         failing = {**self.environment(), "TEST_SEND_EXIT": "3"}

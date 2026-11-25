@@ -297,6 +297,38 @@ class PageRecipient(StrEnum):
     PAGE_OWNER = "page-owner"
     LIST_OWNER = "list-owner"
     SELECTED = "selected"
+    PRODUCER = "producer"
+
+
+class DefaultSubmissionNotice(StrEnum):
+    FILED_KIND_FROM_REVIEW = "filed-kind-from-review"
+
+
+@dataclass(frozen=True)
+class SubmissionNotice:
+    kind: SubmissionKind | Literal["feedback", "efficiency", "enhancement"]
+    from_command: bool = False
+
+
+type Notice = SubmissionNotice | DefaultSubmissionNotice
+
+
+@dataclass(frozen=True)
+class ChosenAssignee:
+    id: staff.StaffId
+
+
+@dataclass(frozen=True)
+class ProducerAssigns:
+    """The producer chooses the assignee."""
+
+
+type Assignment = ChosenAssignee | ProducerAssigns
+
+
+def assignment_id(assignment: Assignment) -> staff.StaffId | None:
+    """Write the assignee ID in the existing request format."""
+    return assignment.id if isinstance(assignment, ChosenAssignee) else None
 
 
 @dataclass(frozen=True)
@@ -310,6 +342,8 @@ class NewItemRequest:
     page: str = ""
     page_state: BugPageState | None = None
     page_recipient: PageRecipient = PageRecipient.PAGE_OWNER
+    notice: Notice = DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    assignment: Assignment = ProducerAssigns()
 
 
 @dataclass(frozen=True)
@@ -330,6 +364,8 @@ class ReviewSubmission:
     capture_intent: SubmissionCaptureIntent = NoDeferredCapture.ABSENT
     reply_token_nonce: str = ""
     legacy_reply_token: str = field(default="", repr=False, compare=False)
+    notice: Notice = DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    assignment: Assignment = ProducerAssigns()
 
     def __post_init__(self) -> None:
         if reply_tokens.valid(self.reply_token_sha256):
@@ -384,6 +420,14 @@ class ScopedSubmissionKey:
 def check_recipient_id(recipient: staff.StaffId) -> None:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", recipient):
         raise SubmissionError("Invalid recipient ID.")
+
+
+def _read_assignment(value: object) -> Assignment:
+    if value is None:
+        return ProducerAssigns()
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+        raise SubmissionError("Invalid assignee ID.")
+    return ChosenAssignee(staff.StaffId(value))
 
 
 def request_recipient(kind: SubmissionKind, request_id: str) -> staff.StaffId:
@@ -625,12 +669,30 @@ def read_bug_page_state(value: object) -> BugPageState | None:
         _text(row.get("title", ""), "Page title", 240, allow_empty=True))
 
 
+def _read_notice(value: object) -> Notice:
+    if value is None or value == DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW:
+        return DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    fields = _mapping(value, "Submission notice")
+    kind = fields.get("kind")
+    from_command = fields.get("from_command", False)
+    if not isinstance(from_command, bool):
+        raise SubmissionError("Invalid submission notice source.")
+    if isinstance(kind, str) and (kind == "feedback" or kind == "efficiency" or kind == "enhancement"):
+        return SubmissionNotice(kind, from_command)
+    return SubmissionNotice(read_kind(kind), from_command)
+
+
 def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
     """Decode the JSON fields for Send."""
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
     kind_value = data.get("kind")
     kind = "enhancement" if kind_value == "enhancement" else read_kind(kind_value)
+    notice = _read_notice(data.get("notice"))
+    if isinstance(notice, SubmissionNotice):
+        notice_kind = SubmissionKind.INVESTIGATION if notice.kind in ("feedback", "efficiency") else notice.kind
+        if notice_kind != kind:
+            raise SubmissionError("The submission notice does not match the item type.")
     if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     try:
@@ -639,6 +701,9 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
         raise SubmissionError("Select a recipient from the New item dialog.") from error
     if not page and page_recipient != PageRecipient.PAGE_OWNER:
         raise SubmissionError("Select a recipient from the New item dialog.")
+    assignment = _read_assignment(data.get("assignee_id"))
+    if isinstance(assignment, ChosenAssignee) and page_recipient != PageRecipient.PRODUCER:
+        raise SubmissionError("Select a producer for the assignee.")
     try:
         evidence = read_evidence(data.get("evidence"))
     except SubmissionError:
@@ -662,7 +727,7 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
         read_request_id(data.get("request_id")), kind,
         staff.StaffId(_text(data.get("recipient_id"), "Recipient ID", 128)),
         _text(data.get("words"), "Your words", MAX_WORDS_LENGTH),
-        evidence, images, page, page_state, page_recipient)
+        evidence, images, page, page_state, page_recipient, notice, assignment)
 
 
 def read_image_reference(value: object) -> ImageReference:
@@ -681,6 +746,11 @@ def stored_submission(details: ReviewSubmission) -> dict[str, object]:
     fields = cast(dict[str, object], asdict(details))
     fields["evidence"] = evidence_fields(details.evidence)
     _ = fields.pop("legacy_reply_token")
+    if isinstance(details.notice, DefaultSubmissionNotice):
+        _ = fields.pop("notice")
+    _ = fields.pop("assignment")
+    if isinstance(details.assignment, ChosenAssignee):
+        fields["assignee_id"] = details.assignment.id
     if not details.reply_token_nonce:
         _ = fields.pop("reply_token_nonce")
     if details.page_state is None:
@@ -734,7 +804,8 @@ def read_submission(value: object) -> ReviewSubmission:
         digest, page, read_bug_page_state(row.get("page_state")), data,
         capture_intent=_read_capture_intent(row["capture_intent"]) if "capture_intent" in row else NoDeferredCapture.ABSENT,
         reply_token_nonce=nonce,
-        legacy_reply_token=legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "")
+        legacy_reply_token=legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "",
+        notice=_read_notice(row.get("notice")), assignment=_read_assignment(row.get("assignee_id")))
 
 
 def hashed_submission_fields(value: dict[str, object], details: ReviewSubmission) -> dict[str, object]:
@@ -820,9 +891,29 @@ def render() -> str:
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset data-recipient-group><legend>To</legend>
     <p data-owner-reason hidden><span id="review-new-item-owner-reason"></span>&nbsp;<span aria-hidden="true">&#x1F986;</span></p>
+    <p data-recipients-loading role="status" hidden>Loading recipients…</p>
     <p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
    </fieldset>
+   <section class="new-item-route" data-route aria-labelledby="new-item-route-title" hidden>
+    <h3 id="new-item-route-title">Where it goes</h3>
+    <div class="page-state-box">
+     <div class="route-steps">
+      <div><strong>You</strong></div>{_ROUTE_ARROW}
+      <div><strong data-route-producer></strong><small>tracks it</small></div>{_ROUTE_ARROW}
+      <div>
+       <div class="route-assignment"><strong data-route-assignee></strong>
+        <button type="button" data-route-change aria-expanded="false" hidden>Change {page_frame.icon_svg("chevron-down")}</button>
+       </div>
+       <small data-route-assigned hidden>assigned</small>
+      </div>
+     </div>
+     <p data-route-copy aria-live="polite"></p>
+     <fieldset class="route-assignees" id="new-item-assignees" aria-label="Assignee" hidden>
+      <div class="new-item-chips" data-assignees></div>
+     </fieldset>
+    </div>
+   </section>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
     placeholder="Type your words. You can paste an image." required></textarea>
    <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title">
@@ -851,13 +942,19 @@ def render() -> str:
   <footer>
    <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
-   <div><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
+   <div><span id="new-item-producer-hint" data-producer-hint hidden>Pick a producer</span>
+    <button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
   </footer>
 '''
     dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,
                                        footer=footer, form=True, body_class='new-item-body')
     return (f'<style>{STYLE}{PAGE_STATE_STYLE}</style>{dialog}'
             f'<script>{page_frame.HELD_SEND_SCRIPT}{SCRIPT.replace("__LIMITS__", limits)}</script>')
+
+
+_ROUTE_ARROW = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+                'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+                '<path d="M5 12h14m-7-7 7 7-7 7"/></svg>')
 
 
 PAGE_STATE_STYLE = '''
@@ -913,14 +1010,37 @@ STYLE = '''
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="enhancement"] { --item-icon: #efbd63; }
 :is(#review-new-item,[data-new-item-draft]) .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
-:is(#review-new-item,[data-new-item-draft]) [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
+:is(#review-new-item,[data-new-item-draft]) :is([data-recipients-status], [data-recipients-loading]) {
+ margin: 0; color: var(--ink-2, #c3c2b7);
+}
 :is(#review-new-item,[data-new-item-draft]) [data-recipient-group] { display: flow-root; }
 :is(#review-new-item,[data-new-item-draft]) [data-recipient-group] > legend { float: left; margin-right: 12px; }
 :is(#review-new-item,[data-new-item-draft]) [data-owner-reason] {
  margin: 0 0 8px; font-size: 12px; line-height: 1.2; text-align: right; text-wrap: balance; overflow-wrap: anywhere;
  color: var(--ink-3, #9a988f);
 }
-:is(#review-new-item,[data-new-item-draft]) [data-recipients-status], :is(#review-new-item,[data-new-item-draft]) [data-recipients] { clear: both; }
+:is(#review-new-item,[data-new-item-draft]) :is([data-recipients-status], [data-recipients-loading], [data-recipients]) {
+ clear: both;
+}
+.new-item-route .route-steps {
+ display: grid; gap: 8px;
+ grid-template-columns: max-content minmax(16px, 1fr) minmax(0, 1.45fr) minmax(16px, 1fr) minmax(0, 2.8fr);
+}
+.new-item-route .route-steps strong { font-weight: 650; }
+.new-item-route .route-steps small:not([hidden]) { display: block; color: var(--ink-3); font-size: 12px; }
+.new-item-route .route-steps > svg { justify-self: center; width: 16px; height: 16px; margin-top: 3px; color: var(--ink-3); }
+.new-item-route .route-assignment { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 9px; }
+:is(#review-new-item,[data-new-item-draft]) [data-route-change]:not([hidden]) {
+ display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: none;
+ color: var(--accent); font-size: 13px; text-decoration: underline; text-underline-offset: 2px;
+}
+.new-item-route [data-route-change] svg { width: 14px; height: 14px; transform: rotate(-90deg); }
+.new-item-route [data-route-change][aria-expanded="true"] svg { transform: none; }
+.new-item-route [data-route-copy] { margin: 10px 0 0; font-size: 14px; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]) .route-assignees { margin-top: 12px; max-height: 12rem; overflow: auto; }
+:is(#review-new-item,[data-new-item-draft]) [data-producer-hint] {
+ align-self: center; margin-right: 4px; color: var(--ink-2); font-size: 13px;
+}
 :is(#review-new-item,[data-new-item-draft]) textarea {
  display: block; width: 100%; min-width: 0; margin: 0; padding: 10px 12px; resize: vertical;
  border: 1px solid var(--line, #34332f); border-radius: 8px;
@@ -1023,7 +1143,7 @@ STYLE = '''
 '''
 
 
-SCRIPT = r'''(() => {
+SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
  const original = document.querySelector('#review-new-item');
@@ -1053,7 +1173,8 @@ SCRIPT = r'''(() => {
     if (!key.startsWith(listDraftPrefix)) continue;
     const id = key.slice(listDraftPrefix.length);
     if (!listDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
-    return {id, recipient: sessionStorage.getItem(key) || null};
+    const stored = sessionStorage.getItem(key) || '';
+    return stored.startsWith('{') ? {id, ...JSON.parse(stored)} : {id, recipient: stored || null};
    }
   } catch (_) {}
   return null;
@@ -1065,9 +1186,15 @@ function bindDraft(dialog, fresh = false) {
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
+ const recipientLoading = dialog.querySelector('[data-recipients-loading]');
  const recipientGroup = dialog.querySelector('[data-recipient-group]');
  const ownerReason = dialog.querySelector('[data-owner-reason]');
  const ownerReasonText = ownerReason.querySelector('span');
+ const route = dialog.querySelector('[data-route]'), changeAssignee = dialog.querySelector('[data-route-change]');
+ const routeProducer = route.querySelector('[data-route-producer]'), routeAssignee = route.querySelector('[data-route-assignee]');
+ const routeAssigned = route.querySelector('[data-route-assigned]'), routeCopy = route.querySelector('[data-route-copy]');
+ const assigneeChips = route.querySelector('[data-assignees]'), assigneeGroup = assigneeChips.closest('fieldset');
+ changeAssignee.setAttribute('aria-controls', assigneeGroup.id);
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
@@ -1079,13 +1206,15 @@ function bindDraft(dialog, fresh = false) {
  const expired = sentDetails.querySelector('[data-capture-expired]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
  const sendNotice = dialog.querySelector('[data-send-disabled]');
- const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
+ const producerHint = dialog.querySelector('[data-producer-hint]');
+ const fields = [...form.querySelectorAll('fieldset'), changeAssignee, words, includePage, dialog.querySelector('[data-close]'),
                  dialog.querySelector('[data-cancel]')];
  let launcher, opening, token, recipients, images = [], sending = false;
  let draftId, keepDraft = false, canRecoverFiling = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
+ let assignees, selectedAssignee = '';
  let captureSession, pageContext, deferredCapture, pendingItem, pendingEdited = false;
 
  let source = '', evidence = {kind: 'none'}, tipPreview = null;
@@ -1151,13 +1280,50 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function setError(reason) {
-  error.textContent = reason;
-  error.hidden = !reason;
+  showActionFailure(error, reason);
  }
 
  function updateSend() {
+  const missingProducer = !recipientChips.querySelector('input:checked');
   send.disabled = sending || !token || (!pendingItem &&
-    (!recipientChips.querySelector('input:checked') || !words.value.trim() || words.value.length > words.maxLength));
+    (missingProducer || !words.value.trim() || words.value.length > words.maxLength));
+  producerHint.hidden = !assignees || !token || !missingProducer || !!pendingItem;
+  if (producerHint.hidden) send.removeAttribute('aria-describedby');
+  else send.setAttribute('aria-describedby', producerHint.id);
+ }
+
+ function choiceChip(name, choice, selected) {
+  const chip = node('label', '', 'new-item-chip'), input = node('input');
+  input.type = 'radio';
+  input.name = name;
+  input.value = choice.id;
+  input.checked = choice.id === selected;
+  const face = node('span', choice.name);
+  face.setAttribute('data-button-face', '');
+  chip.append(input, face);
+  return chip;
+ }
+
+ function showAssigneeChoices(open) {
+  changeAssignee.setAttribute('aria-expanded', String(open));
+  assigneeGroup.hidden = !open;
+ }
+
+ function showRoute() {
+  route.hidden = !assignees;
+  if (route.hidden) return;
+  const producer = recipients.find(choice => choice.id === selectedRecipient);
+  const assignee = assignees.find(choice => choice.id === selectedAssignee);
+  const kind = form.elements.kind.value || 'item';
+  routeProducer.textContent = producer?.name || 'a producer';
+  routeAssignee.textContent = assignee?.name || 'the producer assigns it';
+  routeAssigned.hidden = !assignee;
+  changeAssignee.hidden = !producer || !assignees.length;
+  if (changeAssignee.hidden) showAssigneeChoices(false);
+  const subject = producer?.name || 'The producer';
+  routeCopy.textContent = producer && assignee
+   ? subject + ' tracks this ' + kind + ' and gives it to ' + assignee.name + '.'
+   : subject + ' tracks this ' + kind + ' and chooses who does the work.';
  }
 
  function showRecipients() {
@@ -1169,21 +1335,11 @@ function bindDraft(dialog, fresh = false) {
    storeListDraft();
   }
   recipientChips.replaceChildren();
-  for (const recipient of available) {
-   const chip = node('label', '', 'new-item-chip'), input = node('input');
-   input.type = 'radio';
-   input.name = 'recipient_id';
-   input.value = recipient.id;
-   input.checked = recipient.id === selectedRecipient;
-   const face = node('span', recipient.name);
-   face.setAttribute('data-button-face', '');
-   chip.append(input, face);
-   recipientChips.append(chip);
-  }
-  recipientStatus.textContent = selectedRecipient === null
-   ? 'The recipient you chose is not available. Choose a recipient.'
-   : available.length ? '' : 'No recipients are available.';
-  recipientStatus.hidden = !recipientStatus.textContent;
+  for (const recipient of available)
+   recipientChips.append(choiceChip('recipient_id', recipient, selectedRecipient));
+  showActionFailure(recipientStatus, selectedRecipient === null
+   ? (assignees ? 'The producer you chose is unavailable.' : 'The recipient you chose is not available. Choose a recipient.')
+   : available.length ? '' : (assignees ? 'No producers are available.' : 'No recipients are available.'));
   showOwnerReason();
  }
 
@@ -1209,7 +1365,12 @@ function bindDraft(dialog, fresh = false) {
    recipientStatus.hidden = true;
    showOwnerReason();
   }
+  if (event?.target.name === 'assignee_id') {
+   selectedAssignee = event.target.value;
+   storeListDraft();
+  }
   if (event?.target === includePage && !pendingItem) startCapture();
+  showRoute();
   showSentDetails();
   setError('');
   updateSend();
@@ -1232,11 +1393,11 @@ function bindDraft(dialog, fresh = false) {
   event.preventDefault();
   const total = [...images.map(image => image.file), ...files].reduce((sum, file) => sum + file.size, 0);
   if (files.some(file => !limits.types.includes(file.type))) {
-   setError('Paste PNG, JPEG, GIF or WebP images.'); return;
+   showActionFailure(error, 'Paste PNG, JPEG, GIF or WebP images.'); return;
   }
   if (images.length + files.length > limits.images || total > limits.totalImageBytes ||
       files.some(file => !file.size || file.size > limits.imageBytes)) {
-   setError('Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
+   showActionFailure(error, 'Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
   }
   addImagePreviews(files);
   editDraft();
@@ -1289,7 +1450,7 @@ function bindDraft(dialog, fresh = false) {
 
  async function loadOptions(signal, page = ownerPage) {
   const path = page ? endpoint + '?' + new URLSearchParams({page}) : endpoint;
-  const response = await fetch(path, {cache: 'no-store', signal});
+  const response = await fetch(path, {cache: 'no-store', signal, headers: {'X-New-Item-Route': 'producer'}});
   const data = await responseData(response, 'Could not load recipients.');
   if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || (!data.token && !data.send_disabled)) {
    throw new Error('Could not load recipients.');
@@ -1297,15 +1458,25 @@ function bindDraft(dialog, fresh = false) {
   return data;
  }
 
- function setOptions(data) {
+ function setOptions(data, newDraft = false, recipientName = '') {
   token = data.token;
   sendNotice.textContent = data.send_disabled || '';
   sendNotice.hidden = !data.send_disabled;
   includePage.closest('label').hidden = !pageContext || !sendNotice.hidden;
   recipients = data.recipients;
+  assignees = ownerPage && Array.isArray(data.assignees) ? data.assignees : null;
   pageOwner = data.page_owner || '';
   ownerReasonText.textContent = data.page_owner_reason || '';
+  if (newDraft) {
+   selectedRecipient = ownerPage ? pageOwner : recipients.find(recipient => recipient.name === recipientName)?.id || '';
+   selectedAssignee = assignees ? data.page_assignee || '' : '';
+  }
+  if (assignees && !assignees.some(choice => choice.id === selectedAssignee))
+   selectedAssignee = '';
+  assigneeChips.replaceChildren(...(assignees || []).map(choice => choiceChip('assignee_id', choice, selectedAssignee)));
   showRecipients();
+  showRoute();
+  updateSend();
  }
 
  async function post(payload, {keepalive = false, hold = false, receiver} = {}) {
@@ -1409,18 +1580,18 @@ function bindDraft(dialog, fresh = false) {
 
  function collectPageContext() {
   const filters = [];
-  for (const chip of document.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip],[data-filter-value]')) {
+  for (const chip of document.querySelectorAll('[data-filter-row] [data-filter-value]')) {
    if (chip.getAttribute('aria-pressed') !== 'true' || !visible(chip)) continue;
    const group = chip.closest('[role="group"]')?.getAttribute('aria-label');
    if (!group) continue;
    const label = chip.cloneNode(true);
    label.querySelector('b')?.remove();
-   filters.push((group === 'Show' ? 'State' : group) + ' ' + clip(label.textContent));
+   filters.push(group + ' ' + clip(label.textContent));
   }
   const search = document.querySelector('#list-search,[data-filter-words]');
   if (search?.value && visible(search)) filters.push('Search ' + clip(search.value));
   const notices = new Set();
-  const selector = '[data-review-source-notices] li,[data-review-notice],[data-missing-item],.notice,' +
+  const selector = '[data-review-source-notices] li,[data-review-notice],[data-hidden-action-status],[data-missing-item],.notice,' +
                    '[role="alert"],[data-page-status][data-state="Failed"] [data-status-reason]';
   for (const element of document.querySelectorAll(selector)) {
    if (!visible(element)) continue;
@@ -1566,7 +1737,9 @@ function bindDraft(dialog, fresh = false) {
  function storeListDraft() {
   if (ownerPage !== 'list' || !draftId || !canRecoverFiling) return;
   try {
-   sessionStorage.setItem(listDraftPrefix + draftId, selectedRecipient || '');
+   const saved = assignees ? JSON.stringify({recipient: selectedRecipient || null, assignee: selectedAssignee})
+                           : selectedRecipient || '';
+   sessionStorage.setItem(listDraftPrefix + draftId, saved);
   } catch (_) {}
  }
 
@@ -1638,14 +1811,22 @@ function bindDraft(dialog, fresh = false) {
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
+    selectedAssignee = stored.assignee || '';
     canRecoverFiling = true;
    }
   }
   const newDraft = !keepDraft && !draftId;
-  if (newDraft) selectedRecipient = '';
+  if (newDraft) {
+   selectedRecipient = '';
+   showAssigneeChoices(false);
+  }
+  // A refusal belongs to the page that sent it, so a new dialog starts without one.
   sendNotice.hidden = true;
+  sendNotice.textContent = '';
   includePage.closest('label').hidden = !pageContext;
   recipients = null;
+  assignees = null;
+  route.hidden = true;
   recipientChips.replaceChildren();
   pageOwner = '';
   showOwnerReason();
@@ -1654,8 +1835,8 @@ function bindDraft(dialog, fresh = false) {
    setError('');
    form.elements.kind.value = kind;
   }
-  recipientStatus.textContent = 'Loading recipients…';
-  recipientStatus.hidden = false;
+  showActionFailure(recipientStatus);
+  recipientLoading.hidden = false;
   showEvidence();
   showBugPage();
   showSentDetails();
@@ -1669,19 +1850,18 @@ function bindDraft(dialog, fresh = false) {
   try {
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
-   if (newDraft) {
-    selectedRecipient = (ownerPage ? data.page_owner
-     : data.recipients.find(recipient => recipient.name === recipientName)?.id) || '';
-   }
-   setOptions(data);
+   setOptions(data, newDraft, recipientName);
    startCapture();
    showSentDetails();
   } catch (failure) {
-   if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
+   if (!controller.signal.aborted) showActionFailure(recipientStatus, failure.message);
+  } finally {
+   if (!controller.signal.aborted) recipientLoading.hidden = true;
   }
  }
 
  form.addEventListener('input', editDraft);
+ changeAssignee.addEventListener('click', () => showAssigneeChoices(assigneeGroup.hidden));
  bindConsoleDialog(dialog, close);
  dialog.querySelector('[data-cancel]').addEventListener('click', () => close());
  async function submissionPayload() {
@@ -1690,7 +1870,9 @@ function bindDraft(dialog, fresh = false) {
   if (!recipient) throw new Error('Select a recipient.');
   const kind = type === 'feedback' ? 'investigation' : type;
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
-                   ...(ownerPage && {page: ownerPage, page_recipient: 'selected'})};
+                   ...(ownerPage && {page: ownerPage, page_recipient: assignees ? 'producer' : 'selected'}),
+                   ...(assignees && {assignee_id: selectedAssignee || null}),
+                   ...(type === 'feedback' && {notice: {kind: type}})};
   let key = '';
   if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
   if (!deferredCapture && !slot.hidden && !shot.hidden) {
