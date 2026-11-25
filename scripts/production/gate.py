@@ -3984,7 +3984,7 @@ def parse_gate_arguments(arguments: Sequence[str], parser: argparse.ArgumentPars
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
                             help="promote origin/<merge-branch> to main and the Mac with a collected CI verdict")
-    args = parser.parse_args(arguments, namespace=GateArguments())
+    args = parser.parse_args(arguments, namespace=GateArguments(repo=repo_default))
     if args.affected and (args.tests_only or args.nightly or args.promote_only or args.promote):
         parser.error("--affected cannot be combined with --tests-only, --nightly or promotion")
     if args.promote_only and not args.merge_branch:
