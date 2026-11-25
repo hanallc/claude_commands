@@ -477,10 +477,11 @@ window.fetch=(url,options)=>{
         snapshot = review_page.build_snapshot(self.root)
         self.assertEqual(snapshot.records[created.key].state, review_items.ReviewState.WAITING)
         card = snapshot.body(created.key).decode()
-        self.assertIn('<h4>Page state</h4>', card)
+        self.assertIn('<details><summary>Page details</summary><dl class="page-state">', card)
         self.assertIn('<dt>Page</dt><dd>Review</dd>', card)
         self.assertIn('<dt>Filters</dt><dd>Type All · State Open · Owner &lt;builds&gt;</dd>', card)
         self.assertIn('<dt>Render time</dt><dd>2.40 s</dd><dt>Errors</dt><dd>1 error line</dd>', card)
+        self.assertIn('</dl></details><figure><a data-image-zoom href="', card)
         self.assertIn(f'id={review_submissions.PAGE_SCREENSHOT.id}" loading="lazy" alt="Screenshot of Review"', card)
         self.assertIn('<figcaption>Screenshot of Review</figcaption>', card)
 
