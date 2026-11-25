@@ -193,7 +193,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": "Move at once.",
                                 "source": str(source), "date": "2026-11-23", "change": "The move waits for the current step."}]))
 
-        def accept(_key: review.QuestionKey, question: str) -> review.QuestionAccepted:
+        def accept(_key: review.QuestionKey, question: str, *, console_kind: str) -> review.QuestionAccepted:
+            self.assertEqual(console_kind, "question")
             return review.QuestionAccepted(question)
 
         with (mock.patch.object(astra_review, "run_review", return_value=0) as runner,
@@ -271,7 +272,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         second_key = "e" * 64
         keys: list[review.QuestionKey] = []
 
-        def accept(key: review.QuestionKey, text: str) -> review.QuestionAccepted:
+        def accept(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionAccepted:
+            self.assertEqual(console_kind, "question")
             keys.append(key)
             return review.QuestionAccepted(text)
 

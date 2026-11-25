@@ -144,9 +144,12 @@ def _context(session_id: str, now: float, limit: Limits) -> str:
         return head + f"This turn has no text for nate: {NO_TEXT}. The next update is due in {due} min. Rule: {RULE}."
     _write(session_id, {**record, "updated_at": now})
     if updated is None:
-        return head + ("Your text to nate this turn is one short update: what you last had on deck with him, "
-                       "in a few words, and the question whether he is willing to look at it. "
-                       f"Show it in full only after he says yes. With nothing on deck, {NO_TEXT}. Rule: {RULE}.")
-    return head + ("Your text to nate this turn is one short update with only the news since your last update, "
-                   "and the question whether he is willing to look at what you have on deck. "
+        return head + ("Your text to nate this turn is one short update: the open point you last had with him, "
+                       "in one full sentence in his words, so he knows it with no memory of the item. "
+                       'Ask one question with one answer word, for example: Say "show it". '
+                       "Never repeat the choice words of an item that is not on the screen. "
+                       f"Show it in full only after he says the word. With nothing on deck, {NO_TEXT}. Rule: {RULE}.")
+    return head + ("Your text to nate this turn is one short update with only the news since your last update. "
+                   "Then name the open point in one full sentence and ask one question with one answer word, "
+                   'for example: Say "show it". '
                    f"With no news, {NO_TEXT}. Rule: {RULE}.")

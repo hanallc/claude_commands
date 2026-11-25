@@ -53,7 +53,7 @@ Neither job collects recovery snapshots or a desktop session note.
 
 ## Producer folder sizes
 
-`Part.FOLDER_SIZE` checks active producers' recorded folders below `PRODUCER_FOLDER_ROOT`.
+`Part.FOLDER_SIZE` checks active producers' recorded folders below `producer_folder_root`.
 A recorded document file identifies its parent folder.
 `parts.folder_size` sets a 3,600-second interval and a 60-second process limit.
 Each check reads `producer_folder_limit_mb` from `staff.conf`. The limit is a whole number of at least one and defaults to 10 MB.
@@ -510,7 +510,7 @@ A closed worker without an active dispatch has nothing to move.
 An active or refused pass receives resume text through the shared target check.
 A worker with a live detached run also receives resume text when its pass has ended.
 Single moves, group moves, swaps, refusal moves, and shutdown recovery use the same run context formatter.
-`config/shutdown.conf` sets the stop deadline from `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, and `MOVE_STOP_MARGIN_SECONDS`.
+`config/shutdown.conf` sets the stop deadline from `stop_grace_seconds`, `kill_grace_seconds`, and `move_stop_margin_seconds`.
 The [quota guide](../quota_alerts.md) owns phone episodes, forecasts, routing notices, and delivery retries.
 
 Login renewal uses named success and failure results.

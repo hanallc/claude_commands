@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from scripts.production import completion_receipt, staff
+from scripts.production import completion_receipt, session_staff, staff
 from scripts.herdr import herdr_types
 from scripts.lib import models_registry
 from scripts.agents.remote import local_machine
@@ -286,7 +286,11 @@ def _main(argv: list[str]) -> int:
         doc = cast(Path | None, args.doc)
         existing = any(row.kind == "showrunner" and (row.name == name or row.id == name) for row in record.rows)
         child = read_new_production(doc, name) if doc and not existing else read_production(name, record=record)
-        where = cwd or child.checkout
+        if not existing:
+            from scripts.production.production_lifecycle import require_new_document
+
+            require_new_document(child)
+        where = session_staff.production_session_directory(child.doc, cwd or child.checkout)
         selected = account_for_launch(child, resume, cast(str, args.account), cast(str, args.config_dir))
         identity = ShowrunnerLaunch(resume or "", selected.dir, datetime.now(UTC))
         place: herdr.HerdrPlace | herdr.NotInHerdr = herdr.NotInHerdr()

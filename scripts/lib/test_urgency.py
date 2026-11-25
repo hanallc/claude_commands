@@ -243,6 +243,24 @@ class PinTest(unittest.TestCase):
             self.assertEqual(getattr(urgency.top(entries[1:], "q"), "key", None), "b")
             self.assertEqual(urgency.ended("q"), {})
 
+    def test_withdrawn_change_keeps_its_move_time_until_it_reopens(self) -> None:
+        for across in (False, True):
+            with self.subTest(across=across), tempfile.TemporaryDirectory() as folder, \
+                    mock.patch.dict(os.environ, {"NEXT_STATE_DIR": folder}):
+                queue = "change-demo"
+                withdrawn, shown, later = Entry("C1", ""), Entry("C2", ""), Entry("C3", "")
+                urgency.move_to_end(queue, withdrawn.key, at(5))
+                urgency.move_to_end(queue, later.key, at(6))
+                waiting = [shown, later]
+                if across:
+                    self.assertEqual(urgency.top_across({queue: waiting}, "next-demo"), (queue, shown))
+                    self.assertEqual(urgency.top_across({queue: waiting}, "next-demo"), (queue, shown))
+                else:
+                    self.assertEqual(urgency.top(waiting, queue), shown)
+                self.assertEqual(urgency.ended(queue), {withdrawn.key: at(5), later.key: at(6)})
+                urgency.pin(queue, "")
+                self.assertEqual(urgency.queue_order([withdrawn, *waiting], queue), [shown, withdrawn, later])
+
     def test_across_queues_level_then_age_and_the_shown_item_stays(self) -> None:
         with tempfile.TemporaryDirectory() as folder, mock.patch.dict(os.environ, {"NEXT_STATE_DIR": folder}):
             queues = {"change": [Entry("c1", "", since=at(1), value=(9.0,))],

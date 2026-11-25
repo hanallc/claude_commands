@@ -7,7 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
-from typing import cast
+from typing import cast, override
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +27,13 @@ class ValidationFixtureTests(unittest.TestCase):
 
 
 class ValidationRerunTests(ScriptRepositoryTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        record = self.write(self.root / "staff.json", '{"schema": 2, "rows": []}')
+        self.environment["STAFF_FILE"] = str(record)
+        self.environment["GIT_ALLOW_PROTOCOL"] = "file"
+
     def test_dispatch_and_poll_report_the_run_or_error(self) -> None:
         self.seed()
         _ = self.git("switch", "-c", "ci-delay")
@@ -107,14 +114,20 @@ elif args[:2] == ["pr", "view"]:
     elif "baseRefName,baseRefOid,headRefOid" in args:
         base, head = tip("main"), tip("retry-pr")
         marker = home / "pr-tip-read"
-        if marker.exists():
-            drift = os.environ.get("TEST_PR_DRIFT")
+        drift = os.environ.get("TEST_PR_DRIFT")
+        if drift == "initial head":
+            head = "a" * 40
+        elif marker.exists():
             if drift == "base":
                 base = "b" * 40
             if drift == "head":
                 head = "a" * 40
         marker.touch()
         print("main", base, head, sep="\t")
+    elif "state" in args:
+        print("MERGED")
+    elif "headRefOid" in args:
+        subprocess.run(["git", "rev-parse", "refs/heads/retry-pr"], check=True)
     else:
         print(7)
 elif args[:2] == ["pr", "checks"]:
@@ -158,19 +171,22 @@ else:
         merged = self.script(script, "retry-pr")
         self.assertEqual(merged.returncode, 0, merged.stdout + merged.stderr)
         self.assertTrue((self.home / "pr-merge-called").exists())
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/retry-pr").stdout, "")
 
-    def test_pr_refuses_a_head_or_base_that_changes_after_the_check(self) -> None:
+    def test_pr_refuses_a_different_head_or_a_base_that_changes_after_the_check(self) -> None:
         self.seed()
         _ = self.write(self.repo / "seed.txt", "PR change\n")
         _ = self.git("commit", "-am", "A change without tests")
         self.install_gh()
-        for ref in ("head", "base"):
+        for ref, reason in (("initial head", "differs from the published branch tip"),
+                            ("head", "changed during the behavior check"),
+                            ("base", "changed during the behavior check")):
             with self.subTest(ref=ref):
                 (self.home / "pr-tip-read").unlink(missing_ok=True)
                 self.environment["TEST_PR_DRIFT"] = ref
                 result = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("changed during the behavior check", result.stderr)
+                self.assertIn(reason, result.stderr)
                 self.assertFalse((self.home / "pr-merge-called").exists())
 
     def install_autofix(self) -> None:

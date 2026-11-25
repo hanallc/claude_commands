@@ -33,6 +33,7 @@ from uuid import uuid4
 
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.agents import remote
@@ -44,6 +45,8 @@ from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import mac_test
 from scripts.production import staff
+from scripts.production.production_names import CARGO_LINER_PRODUCTION
+from scripts.production.test_production_doc import enrolled_document
 from scripts.worktree import worktree_links, worktree_records, worktrees
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
@@ -252,8 +255,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.trees.mkdir()
         self.state = self.root / "worktrees-state"
         config = self.root / "staff.conf"
-        _ = config.write_text("# range: 0.001..\nOPERATION_LOCK_SECONDS=5\n"
-                              + "# range: 0.001..\nREMOTE_SECONDS=5\n")
+        _ = config.write_text("# range: 0.001..\noperation_lock_seconds=5\n"
+                              + "# range: 0.001..\nremote_seconds=5\n")
         staff_file = self.root / "staff.json"
         self.environment = {
             **config_environment(self.root / "settings"),
@@ -265,7 +268,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             "CODEX_HOME": str(self.root / "codex"),
             **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
             "HERDR_BIN": MISSING_HERDR_BIN,
-            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root)),
             "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
             "GIT_AUTHOR_NAME": "Worktree fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
             "GIT_COMMITTER_NAME": "Worktree fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
@@ -275,7 +278,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = (self.repository / "code.txt").write_text("base\n")
         document = self.repository / "docs/production.md"
         document.parent.mkdir()
-        _ = document.write_text("# Fixture production\n")
+        _ = document.write_text("# Fixture production\n- **Merge branch:** integration\n")
         _ = (self.repository / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
         _ = self.git(self.repository, "add", ".")
         _ = self.git(self.repository, "commit", "-m", "Create the fixture")
@@ -342,6 +345,79 @@ class WorktreeLifecycleTests(unittest.TestCase):
         python = self.home / ".claude/scripts/lib/py"
         return self.command(self.repository, [str(python), str(WORKTREES), "cleanup", str(tree)])
 
+    def test_cleanup_and_end_landed_keep_an_enrolled_integration_and_its_refs(self) -> None:
+        _ = self.git(self.repository, "switch", "main")
+        doc = self.repository / "docs/fixture-production-live.md"
+        enrolled_document(doc, self.repository, self.merge_tree, "integration")
+        staff_file = Path(self.environment["STAFF_FILE"])
+        fields = cast(dict[str, object], json.loads(staff_file.read_text()))
+        runner = cast(list[dict[str, object]], fields["rows"])[0]
+        cast(dict[str, object], runner["doc"])["path"] = str(doc)
+        _ = staff_file.write_text(json.dumps(fields))
+        _ = self.commit(self.merge_tree, "landed.txt", "landed\n")
+        self.publish(self.merge_tree, "integration")
+        record = self.record_path(self.merge_tree)
+        record.parent.mkdir(parents=True)
+        _ = record.write_text(json.dumps({
+            "version": 1, "path": str(self.merge_tree), "repo": str(self.repository),
+            "branch": "integration", "base": self.base, "merge_branch": "integration",
+            "owner": "fixture-production", "made_at": datetime.now(UTC).isoformat(),
+        }))
+        refs = self.git(self.repository, "for-each-ref", "--format=%(refname) %(objectname)")
+        remote = self.git(self.origin, "for-each-ref", "--format=%(refname) %(objectname)")
+        cleanup = self.cleanup_result(self.merge_tree)
+        self.assertEqual(cleanup.returncode, 1)
+        self.assertIn("protected production", cleanup.stdout)
+        kept, = self.finish_landed()
+        self.assertEqual(kept["kind"], "Kept")
+        self.assertIn("protected production", kept["detail"])
+        self.assertTrue(record.is_file())
+        self.assertEqual((self.merge_tree / "landed.txt").read_text(), "landed\n")
+        self.assertEqual(self.git(self.repository, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
+        self.assertEqual(self.git(self.origin, "for-each-ref", "--format=%(refname) %(objectname)"), remote)
+
+    def test_cargo_liner_record_update_reverses_only_the_original_main_targets(self) -> None:
+        state = self.state / "made"
+        state.mkdir(parents=True)
+        other_repo = self.root / "other"
+        _ = self.git(self.root, "init", "--initial-branch=main", str(other_repo))
+        staff_file = Path(self.environment["STAFF_FILE"])
+        fields = cast(dict[str, object], json.loads(staff_file.read_text()))
+        runner = cast(list[dict[str, object]], fields["rows"])[0]
+        runner["name"] = CARGO_LINER_PRODUCTION
+        document = Path(cast(str, cast(dict[str, object], runner["doc"])["path"]))
+        _ = document.write_text(f"- **Repository:** {self.repository}\n")
+        _ = staff_file.write_text(json.dumps(fields))
+        target_branch = f"{CARGO_LINER_PRODUCTION}-merges-integration"
+        for name, repository, target in (("cargo", self.repository, "main"),
+                                         ("integration", self.repository, target_branch),
+                                         ("other", other_repo, "main")):
+            path = self.trees / name
+            _ = self.record_path(path).write_text(json.dumps({
+                "version": 1, "path": str(path), "repo": str(repository),
+                "branch": name, "base": self.base, "merge_branch": target,
+                "owner": name, "made_at": datetime.now(UTC).isoformat(),
+            }))
+        receipt = self.root / "retarget.json"
+        python = self.home / ".claude/scripts/lib/py"
+        arguments = [str(python), str(WORKTREES), "cargo-liner-target"]
+        for repository, switches, target, count in (
+                (other_repo, [], "main", 0),
+                (self.repository, [], target_branch, 1), (self.repository, [], target_branch, 0),
+                (self.repository, ["--reverse"], "main", 1), (self.repository, ["--reverse"], "main", 0)):
+            with self.subTest(repository=repository, reverse=bool(switches), count=count):
+                result = self.command(self.repository, arguments + [str(repository), target_branch, str(receipt)] + switches)
+                if repository == other_repo:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("expected the cargo-liner production repository", result.stderr)
+                    self.assertFalse(receipt.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"updated {count}", result.stdout)
+                for name, expected in (("cargo", target), ("integration", target_branch), ("other", "main")):
+                    record = self.record(self.trees / name)
+                    self.assertEqual(record["merge_branch"], expected)
+
     def make(self, tree: Path, branch: str) -> None:
         result = self.legacy_fixture(tree, branch)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -354,10 +430,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
         build = self.root / "build"
         scratch_root = self.root / "scratch"
         session_root = self.root / "session-root"
+        host_key = conf.local_host_key_name()
         _ = write_config_fixture(config / "build_folders.conf",
-            f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{host_name()}={build}\n"
-            + f"roots.scratch={scratch_root}\nroots.scratch.{host_name()}={scratch_root}\n"
-            + f"roots.session={session_root}\nroots.session.{host_name()}={session_root}\n"
+            f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{host_key}={build}\n"
+            + f"roots.scratch={scratch_root}\nroots.scratch.{host_key}={scratch_root}\n"
+            + f"roots.session={session_root}\nroots.session.{host_key}={session_root}\n"
             + f"folders.check={mode}\n# range: 0..1\nlocks.probe_wait_seconds=0.01\n"
             + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
         copies = config / "copies.conf"
@@ -2553,7 +2630,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 root = Path(folder)
                 build = root / "build"
                 _ = write_config_fixture(config, f"roots.workspace={root}/trees\nroots.build={build}\n"
-                                         + f"roots.build.{host_name()}={build}\n")
+                                         + f"roots.build.{conf.local_host_key_name()}={build}\n")
                 scratch_root = build / "claude/scratch"
                 scratch_root.mkdir(parents=True)
                 damaged = scratch_root / "damaged"
@@ -2654,7 +2731,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 root = Path(folder)
                 build = root / "build"
                 _ = write_config_fixture(config, f"roots.workspace={root}/trees\nroots.build={build}\n"
-                                         + f"roots.build.{host_name()}={build}\n")
+                                         + f"roots.build.{conf.local_host_key_name()}={build}\n")
                 scratch_root = build / "claude/scratch"
                 scratch_root.mkdir(parents=True)
                 clone = scratch_root / "clone"
@@ -3540,7 +3617,7 @@ raise SystemExit(2)
         self.assertTrue(tree.is_dir())
         self.assertTrue(artifact.is_file())
 
-    def test_remove_reports_output_before_listing_a_missing_checkout(self) -> None:
+    def test_remove_lists_a_missing_checkout_before_reporting_output(self) -> None:
         self.layout_fixture()
         tree = self.make_layout("demo", "probe")
         output = (tree / "target").readlink()
@@ -3551,8 +3628,8 @@ raise SystemExit(2)
               redirect_stderr(notices),
               self.assertRaisesRegex(worktree_records.Refused, "Git listing failed")):
             worktrees.remove_git_checkout(tree, self.home / "rust/origin")
-        self.assertEqual(notices.getvalue(),
-                         f"kept for a manual removal list: {output} (worktrees, the checkout is selected for removal)\n")
+        self.assertEqual(notices.getvalue(), "")
+        self.assertTrue(output.is_dir())
 
     def test_retire_lists_the_unit_folders_from_each_repo(self) -> None:
         self.layout_fixture()
@@ -3835,7 +3912,8 @@ raise SystemExit(2)
                     self.assertEqual(lease["purpose"], tree.name)
 
     def test_merged_checkpoint_and_plan_shrink_end_all_recorded_items(self) -> None:
-        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config"):
+        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config",
+                       "protected-origin", "protected-origin-ahead", "protected-origin-unknown-commit"):
             with self.subTest(branch=branch):
                 if branch != "checkpoint":
                     self.setUp()
@@ -3861,9 +3939,29 @@ raise SystemExit(2)
 
                 if branch == "without-branch-config":
                     _ = self.git(self.repository, "config", "--local", "--remove-section", f"branch.{branch}")
-                cleanup = self.cleanup_result(tree)
-                self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
-                self.assertEqual(cleanup.stdout.splitlines(), ["cleanup: all work is on the target branch"])
+                protected = branch.startswith("protected-origin")
+                if branch in ("protected-origin-ahead", "protected-origin-unknown-commit"):
+                    writer = self.root / "writer"
+                    _ = self.git(self.root, "clone", "--branch", branch, str(self.origin), str(writer))
+                    advance = self.commit(writer, "remote-only.txt", "Only on origin.\n")
+                    self.publish(writer, branch)
+                    if branch == "protected-origin-ahead":
+                        _ = self.git(self.repository, "fetch", "origin", branch)
+                    else:
+                        missing = self.command(self.repository, ["git", "cat-file", "-e", f"{advance}^{{commit}}"])
+                        self.assertNotEqual(missing.returncode, 0)
+                before = self.git(self.origin, "rev-parse", f"refs/heads/{branch}")
+                if protected:
+                    document = self.root / "other-production.md"
+                    _ = document.write_text(f"- **Merge branch:** {branch}\n")
+                    with patch.dict(os.environ, self.environment, clear=True):
+                        identity = staff.StaffId(str(uuid4()))
+                        _ = staff.ensure("showrunner", name="other", runtime_id=identity,
+                                         doc=staff.LiveDoc(socket.gethostname().split(".", 1)[0], document))
+                if branch != "protected-origin-unknown-commit":
+                    cleanup = self.cleanup_result(tree)
+                    self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
+                    self.assertEqual(cleanup.stdout.splitlines(), ["cleanup: all work is on the target branch"])
                 results = self.finish_landed()
 
                 self.assertEqual(results, [{"kind": "Kept", "path": str(tree), "detail": "the checkout landed and requires manual review"}])
@@ -3873,6 +3971,7 @@ raise SystemExit(2)
                     self.assertEqual((self.merge_tree / "code.txt").read_text(), "later target work\n")
                 self.assertTrue(tree.is_dir())
                 self.assertTrue(self.record_path(tree).is_file())
+                self.assertEqual(self.git(self.origin, "rev-parse", f"refs/heads/{branch}"), before)
 
     def test_cherry_picked_content_ends_under_a_different_commit_hash(self) -> None:
         tree, branch = self.trees / "cherry", "cherry"
