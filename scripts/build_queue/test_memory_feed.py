@@ -1773,56 +1773,126 @@ process.stdout.write(JSON.stringify({
 
     def test_ci_service_lines_can_exceed_the_saved_charge(self) -> None:
         mib = 1024 ** 2
-        self.check_ci_service_ram(201 * mib, 200 * mib, saved_charge=400 * mib)
+        charge = 400 * mib
+        first = charge * 201 // 401
+        self.check_ci_service_ram(201 * mib, 200 * mib, saved_charge=charge,
+                                  expected_shares=(first, charge - first))
 
     def test_ci_service_with_unreadable_memory_keeps_its_line(self) -> None:
         unit = self.root / "github-runner-hana-linux-1.service"
-        pid = 701
+        pid, amount = 701, 200 * 1024 ** 2
+        history = memory_feed.CIRunnerHistory()
         write_scope(unit, members=(pid,))
-        write_process(self.root / "proc", pid)
+        write_process(self.root / "proc", pid, amount)
+        self.assertEqual(memory_feed.ci_runner_service_ram((unit,), (), history)[0]["bytes"], amount)
         _ = (self.root / "proc" / str(pid) / "status").write_text("VmRSS: 1024 kB\n")
-        service, = memory_feed.ci_runner_service_ram((unit,), ())
+        service, = memory_feed.ci_runner_service_ram((unit,), (), history)
         self.assertEqual(service["name"], "hana-linux-1")
         self.assertIsInstance(service["bytes"], admission_records.ReadingUnavailable)
 
+    def test_ci_service_exit_keeps_the_last_good_reading_for_two_samples(self) -> None:
+        unit = self.root / "github-runner-hana-linux-1.service"
+        pid, amount = 701, 200 * 1024 ** 2
+        proc = self.root / "proc"
+        history = memory_feed.CIRunnerHistory()
+        write_scope(unit, members=(pid,))
+        write_process(proc, pid, amount)
+        expected = {"name": "hana-linux-1", "bytes": amount}
+        self.assertEqual(memory_feed.ci_runner_service_ram((unit,), (), history), [expected])
+        process_memory = gate.process_memory
+
+        def exit_during_status_read(pids: set[int], proc_root: Path) -> admission_records.MeasuredMemory:
+            (proc_root / str(pid) / "status").unlink()
+            (proc_root / str(pid) / "stat").unlink()
+            return process_memory(pids, proc_root)
+
+        with mock.patch.object(gate, "process_memory", side_effect=exit_during_status_read):
+            self.assertEqual(memory_feed.ci_runner_service_ram((unit,), (), history), [expected])
+        self.assertEqual(memory_feed.ci_runner_service_ram((unit,), (), history), [expected])
+        service, = memory_feed.ci_runner_service_ram((unit,), (), history)
+        self.assertEqual(service["name"], expected["name"])
+        self.assertIsInstance(service["bytes"], admission_records.ReadingUnavailable)
+        write_process(proc, pid, amount * 2)
+        self.assertEqual(memory_feed.ci_runner_service_ram((unit,), (), history), [{**expected, "bytes": amount * 2}])
+
     def test_ci_tooltip_lines_add_to_the_build_tools_total(self) -> None:
         mib = 1024 ** 2
-        self.check_ci_service_ram(205 * mib, 110 * mib, saved_charge=800 * mib,
-                                  expected_tooltip=["Build tools  0.3 GiB", "RAM that build tools use now\n"
+        charge = 800 * mib
+        first = charge * 205 // 315
+        self.check_ci_service_ram(205 * mib, 110 * mib, saved_charge=charge,
+                                  expected_shares=(first, charge - first),
+                                  expected_tooltip=["Build tools  0.8 GiB", "RAM that build tools use now\n"
+                                      + "rust-analyzer  0.0 GiB\n+ sccache  0.0 GiB\n"
+                                      + "+ hana CI service hana-linux-1  0.5 GiB\n"
+                                      + "+ hana CI service hana-linux-2  0.3 GiB\n"
+                                      + "+ Python tests  0.0 GiB\n+ Waiting runs  0.0 GiB"])
+
+    def test_ci_services_use_the_saved_charge_for_the_page_cap(self) -> None:
+        mib = 1024 ** 2
+        charge = 400 * mib
+        first = charge * 205 // 315
+        self.check_ci_service_ram(205 * mib, 110 * mib, saved_charge=charge,
+                                  expected_shares=(first, charge - first))
+
+    def test_ci_service_excludes_a_compiler_that_starts_during_the_sample(self) -> None:
+        self.check_ci_service_ram(200 * 1024 ** 2, 200 * 1024 ** 2,
+                                  compiler_starts_at_table=True, check_totals=False)
+
+    def test_ci_tooltip_keeps_the_name_when_a_service_read_fails(self) -> None:
+        mib = 1024 ** 2
+        self.check_ci_service_ram(201 * mib, 200 * mib, saved_charge=400 * mib, idle_unreadable=True,
+                                  expected_shares=(201 * mib, None),
+                                  expected_tooltip=["Build tools  0.4 GiB", "RAM that build tools use now\n"
                                       + "rust-analyzer  0.0 GiB\n+ sccache  0.0 GiB\n"
                                       + "+ hana CI service hana-linux-1  0.2 GiB\n"
-                                      + "+ hana CI service hana-linux-2  0.1 GiB\n"
-                                      + "+ Python tests  0.0 GiB\n+ Waiting runs  0.0 GiB"])
+                                      + "+ hana CI service hana-linux-2  unavailable\n"
+                                      + "+ Python tests  0.0 GiB\n+ Waiting runs  0.0 GiB\n"
+                                      + "+ Other build tools  0.2 GiB"])
+
+    def test_ci_service_shares_keep_the_ratio_when_live_use_changes(self) -> None:
+        mib = 1024 ** 2
+        for busy, idle in ((300, 100), (330, 110)):
+            with self.subTest(busy=busy, idle=idle):
+                self.check_ci_service_ram(busy * mib, idle * mib, saved_charge=400 * mib,
+                                          expected_shares=(300 * mib, 100 * mib), check_totals=False)
 
     def check_ci_service_ram(self, overhead: int, idle_use: int, *, cargo_growth: int = 0,
                              growth_after_slice_read: bool = False, saved_charge: int | None = None,
-                             expected_tooltip: list[str] | None = None) -> None:
+                             expected_shares: tuple[int, int | None] | None = None,
+                             idle_unreadable: bool = False, compiler_starts_at_table: bool = False,
+                             expected_tooltip: list[str] | None = None, check_totals: bool = True) -> None:
         gib = admission_records.GIB
         cgroup = self.root / "ci"
         cargo_pid, compiler_pid = 702, 704
         cargo = 2 * gib
         inputs = reservation_reading().explanation.decided_from
         reservations = ({**inputs.reservations[0], "pid": cargo_pid, "start_time": str(cargo_pid)},)
-        for scoped in (False, True):
+        for scoped in ((False,) if compiler_starts_at_table else (False, True)):
             with self.subTest(scoped=scoped):
                 root = cgroup / ("scoped" if scoped else "process")
                 busy, idle = (root / f"github-runner-hana-linux-{index}.service" for index in (1, 2))
                 cargo_now = cargo + cargo_growth
                 # The runner counters can precede the Cargo process or scope counters.
                 runner_use = (cargo if growth_after_slice_read else cargo_now) + overhead
-                write_scope(busy, members=(701,) if scoped else (701, cargo_pid, compiler_pid),
+                busy_pids = (701,) if scoped else (701, cargo_pid)
+                if not scoped and not compiler_starts_at_table:
+                    busy_pids = (*busy_pids, compiler_pid)
+                write_scope(busy, members=busy_pids,
                             current=runner_use, anonymous=runner_use)
                 write_scope(idle, members=(703,), current=idle_use, anonymous=idle_use)
                 proc = self.root / "proc"
                 write_process(proc, 701, overhead)
                 write_process(proc, 703, idle_use)
+                if idle_unreadable:
+                    _ = (proc / "703" / "status").write_text("VmRSS: 204800 kB\n")
                 if scoped:
                     scope = busy / "cargo.scope"
                     write_scope(scope, members=(cargo_pid, compiler_pid), current=cargo_now, anonymous=cargo_now)
                     source = admission_records.ScopeSource(scope, frozenset({cargo_pid}))
                 else:
                     write_process(proc, cargo_pid, cargo)
-                    write_process(proc, compiler_pid, cargo_growth, parent=cargo_pid)
+                    if not compiler_starts_at_table:
+                        write_process(proc, compiler_pid, cargo_growth, parent=cargo_pid)
                     source = admission_records.ProcessSource((admission_records.ProcessAnonymousUse(
                         cargo_pid, admission_records.AnonymousRunUse(cargo)),))
                 running = replace(inputs.running[0], pid=cargo_pid, ci_runner="hana-linux-1", measured=admission_records.MeasuredMemory(
@@ -1834,20 +1904,43 @@ process.stdout.write(JSON.stringify({
                         owner="hana-ci.slice", pid=701, job_state=RunningServiceJob(199_000)), pid=701)
                 reading = gate.queue_read_from(replace(inputs, reservations=reservations, running=(running, service)),
                                                admission_policy_fixture())
+
+                process_table = gate.process_table
+
+                def start_compiler_after_table_sample(proc_root: Path = proc) -> dict[int, gate.ProcessIdentity]:
+                    table = process_table(proc_root)
+                    if compiler_starts_at_table and compiler_pid not in table:
+                        write_process(proc, compiler_pid, gib, parent=cargo_pid)
+                        _ = (busy / "cgroup.procs").write_text(f"701\n{cargo_pid}\n{compiler_pid}\n")
+                    return table
+
                 with (mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
-                      mock.patch.object(memory_feed, "build_tool_ram", return_value=memory_feed.BuildToolRam(0, 0, 0))):
+                      mock.patch.object(memory_feed, "build_tool_ram", return_value=memory_feed.BuildToolRam(0, 0, 0)),
+                      mock.patch.object(gate, "process_table", side_effect=start_compiler_after_table_sample)):
                     page = memory_feed.reading()
+                if compiler_starts_at_table:
+                    self.assertTrue((proc / str(compiler_pid) / "status").is_file())
                 if expected_tooltip is not None:
                     tips, _ = self.render_assignment_table(cast(dict[str, object], json.loads(memory_feed.page_json(page))))
                     self.assertEqual(tips["tools"], [expected_tooltip])
                 ram = page["ram"]
-                self.assertEqual(ram.get("ci_services"), [{"name": "hana-linux-1", "bytes": overhead},
-                                                          {"name": "hana-linux-2", "bytes": idle_use}])
-                self.assertEqual(ram["build_tools_bytes"], overhead + idle_use)
-                self.assertEqual(ram["other_build_tools_bytes"], 0)
+                if check_totals:
+                    room = reading.explanation.room
+                    assert isinstance(room, admission_records.MemoryRoom) and isinstance(room.cap, int)
+                    self.assertEqual(page["cap"], memory_feed.gib(room.cap))
+                    self.assertEqual(page["taken"], memory_feed.gib(room.cap - room.room))
+                    self.assertEqual(page["room"], memory_feed.gib(room.room))
+                first, second = expected_shares or (overhead, idle_use)
+                self.assertEqual([part["name"] for part in ram["ci_services"]], ["hana-linux-1", "hana-linux-2"])
+                self.assertEqual(ram["ci_services"][0]["bytes"], first)
+                if second is None:
+                    self.assertIsInstance(ram["ci_services"][1]["bytes"], admission_records.ReadingUnavailable)
+                else:
+                    self.assertEqual(ram["ci_services"][1]["bytes"], second)
+                self.assertEqual(ram["build_tools_bytes"], charge)
+                self.assertEqual(ram["other_build_tools_bytes"], charge - first - (second or 0))
                 self.assertEqual(ram["queued_builds_bytes"], cargo)
-                self.assertEqual(ram["cap_bytes"], cargo + overhead + idle_use + ram["build_covered_bytes"] + ram["room_bytes"])
-                self.assertAlmostEqual(page["taken"], page["used"] + memory_feed.gib(overhead + idle_use) + page["reserved"])
+                self.assertEqual(ram["cap_bytes"], cargo + charge + ram["build_covered_bytes"] + ram["room_bytes"])
                 row, = page["walk"]
                 self.assertTrue(row.get("queued"))
                 self.assertEqual(row["name"], "hana CI: nextest")

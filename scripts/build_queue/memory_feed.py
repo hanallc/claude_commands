@@ -80,7 +80,7 @@ from scripts.herdr.herdr_types import HerdrFailure
 from scripts.lint import memory_admit as gate
 from scripts.message import sessions, unit_labels
 from scripts.production import staff, staff_sources
-from scripts.lib import conf
+from scripts.lib import conf, process_start
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.proc_text import read_proc_text
 from scripts.lib.user_zone import user_zone
@@ -1381,30 +1381,55 @@ def ci_runner_name(unit: Path) -> str:
     return unit.name.removeprefix("github-runner-").removesuffix(".service")
 
 
-def read_ci_runner(unit: Path, scopes: set[Path], cargo: set[int] | admission_records.ReadingUnavailable,
-                   membership: gate.ScopeMembershipPass) -> CIRunnerServiceRam | None:
-    """Read memory from the service processes."""
-    try:
-        members = membership.read(unit)
-        if not members:
-            return None
-        if isinstance(cargo, admission_records.ReadingUnavailable):
-            amount: RamReading = cargo
-        else:
-            scoped = {pid for scope in gate.owned_scope_roots(scopes, unit) for pid in membership.read(scope)}
-            use = gate.process_memory(set(members) - scoped - cargo, PROC).anonymous
-            amount = (use.bytes if isinstance(use, admission_records.AnonymousRunUse)
-                      else admission_records.ReadingUnavailable(use.reason))
-    except (OSError, ValueError) as error:
-        amount = admission_records.ReadingUnavailable(str(error))
-    return {"name": ci_runner_name(unit), "bytes": amount}
+class CIRunnerHistory:
+    """Keep the last good reading for up to two reads after a process exits."""
+
+    def __init__(self) -> None:
+        self.last_good: dict[Path, tuple[int, int]] = {}
+
+    def current(self, unit: Path, sample: RamReading | None) -> RamReading:
+        if isinstance(sample, int):
+            self.last_good[unit] = (sample, 0)
+            return sample
+        if sample is None and (previous := self.last_good.get(unit)) is not None and previous[1] < 2:
+            amount, misses = previous
+            self.last_good[unit] = (amount, misses + 1)
+            return amount
+        _ = self.last_good.pop(unit, None)
+        return sample if sample is not None else admission_records.ReadingUnavailable("no live runner processes in the sample")
+
+
+def read_ci_runner(members: set[int], processes: Mapping[int, gate.ProcessIdentity], cargo: set[int]) -> RamReading | None:
+    """Read service process memory. An empty sample after an exit can recover on the next read."""
+    candidates = members - cargo
+    if not candidates:
+        return 0
+    pids = candidates.intersection(processes)
+    use = gate.process_memory(pids, PROC).anonymous
+    if isinstance(use, admission_records.RunUseUnavailable):
+        # A status read can fail or lack valid RssAnon or RssShmem for more than two reads.
+        return admission_records.ReadingUnavailable(use.reason)
+    if use.bytes:
+        return use.bytes
+    # The table can skip a PID with a bad stat file. A process exit can also give zero bytes.
+    identities = {pid: process_start.proc_table_start(pid, PROC) for pid in pids or candidates}
+    if any(identities[pid] == process_start.Started(processes[pid].start) for pid in pids):
+        return 0
+    for identity in identities.values():
+        if isinstance(identity, process_start.Unreadable):
+            return admission_records.ReadingUnavailable(identity.reason)
+    return None
 
 
 def ci_runner_service_ram(
     units: Sequence[Path],
     steps: Iterable[tuple[admission_records.Reservation, admission_records.ExplainedRunningStep]],
+    history: CIRunnerHistory | None = None,
 ) -> list[CIRunnerServiceRam]:
-    """Use saved Cargo identities to select live service processes."""
+    """Read cgroup membership before the process table to exclude new Cargo children."""
+    if history is not None:
+        for unit in history.last_good.keys() - set(units):
+            del history.last_good[unit]
     if not units:
         return []
     scopes: set[Path] = set()
@@ -1416,14 +1441,60 @@ def ci_runner_service_ram(
             scopes.add(source.directory)
         else:
             process_roots[reservation["pid"]] = reservation["start_time"]
-    cargo: set[int] | admission_records.ReadingUnavailable = set()
-    if process_roots:
-        try:
-            cargo = gate.process_tree(process_roots, gate.process_table(PROC))
-        except OSError as error:
-            cargo = admission_records.ReadingUnavailable(str(error))
     membership = gate.ScopeMembershipPass()
-    return [service for unit in units if (service := read_ci_runner(unit, scopes, cargo, membership)) is not None]
+    samples: dict[Path, set[int] | admission_records.ReadingUnavailable] = {}
+    for unit in units:
+        try:
+            members = membership.read(unit)
+            if members:
+                scoped = {pid for scope in gate.owned_scope_roots(scopes, unit) for pid in membership.read(scope)}
+                samples[unit] = set(members) - scoped
+            elif history is not None:
+                # A missing or empty service cgroup has no running service.
+                _ = history.last_good.pop(unit, None)
+        except (OSError, ValueError) as error:
+            # A cgroup.procs read, a directory listing, or PID parsing can fail across reads.
+            samples[unit] = admission_records.ReadingUnavailable(str(error))
+    table_error: admission_records.ReadingUnavailable | None = None
+    processes: dict[int, gate.ProcessIdentity] = {}
+    if any(isinstance(sample, set) and sample for sample in samples.values()):
+        try:
+            processes = gate.process_table(PROC)
+        except OSError as error:
+            # An inaccessible proc directory can stay inaccessible.
+            table_error = admission_records.ReadingUnavailable(str(error))
+    cargo = gate.process_tree(process_roots, processes)
+    history = history if history is not None else CIRunnerHistory()
+    services: list[CIRunnerServiceRam] = []
+    for unit, sample in samples.items():
+        if isinstance(sample, admission_records.ReadingUnavailable):
+            amount = sample
+        elif table_error is not None and sample:
+            amount = table_error
+        else:
+            amount = read_ci_runner(sample, processes, cargo)
+        services.append({"name": ci_runner_name(unit), "bytes": history.current(unit, amount)})
+    return services
+
+
+def ci_service_shares(services: Sequence[CIRunnerServiceRam], charge: int) -> tuple[list[CIRunnerServiceRam], int]:
+    """Divide the saved charge. Return the part that has no service reading."""
+    measured = sum(known_bytes(service["bytes"]) for service in services)
+    complete = all(isinstance(service["bytes"], int) for service in services)
+    assigned = charge if measured and complete else min(charge, measured)
+    if not measured or assigned == measured:
+        return list(services), charge - assigned
+    shares: list[CIRunnerServiceRam] = []
+    cumulative = previous = 0
+    for service in services:
+        amount = service["bytes"]
+        if isinstance(amount, int):
+            cumulative += amount
+            boundary = assigned * cumulative // measured
+            service = CIRunnerServiceRam(name=service["name"], bytes=boundary - previous)
+            previous = boundary
+        shares.append(service)
+    return shares, charge - assigned
 
 
 def external_ci_owners(readings: Sequence[admission_records.UnownedSliceMemory],
@@ -3334,11 +3405,9 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
                     key=lambda item: item[1], reverse=True)
     smaller = ranked[program_rows:]
     other_programs_bytes = sum(amount for _, amount in ranked)
-    service_bytes = sum(known_bytes(service["bytes"]) for service in ci_services)
-    other_tools = tools.other
-    if not ci_services or any(isinstance(service["bytes"], admission_records.ReadingUnavailable) for service in ci_services):
-        other_tools += max(0, room.ci_use - service_bytes)
-    build_tools = tools.rust_analyzer + tools.sccache + tools.python_tests + tools.waiting_runs + other_tools + service_bytes
+    service_shares, unassigned_ci = ci_service_shares(ci_services, room.ci_use)
+    other_tools = tools.other + unassigned_ci
+    build_tools = tools.rust_analyzer + tools.sccache + tools.python_tests + tools.waiting_runs + tools.other + room.ci_use
     total: RamReading = (room.total if isinstance(room.total, int)
                          else admission_records.ReadingUnavailable("total RAM is not recorded"))
     named = (room.used + build_tools + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
@@ -3358,7 +3427,7 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
         "build_missing_bytes": build - build_covered,
         "queued_builds_bytes": room.used, "build_tools_bytes": build_tools, "rust_analyzer_bytes": tools.rust_analyzer,
         "sccache_bytes": tools.sccache, "python_tests_bytes": tools.python_tests, "waiting_runs_bytes": tools.waiting_runs,
-        "other_build_tools_bytes": other_tools, "ci_services": list(ci_services),
+        "other_build_tools_bytes": other_tools, "ci_services": service_shares,
         "cap_bytes": room.used + build_tools + build_covered + room.room,
         "agents_bytes": agents, "desktop_bytes": desktop, "desktop_protection_bytes": gate.desktop_guarantee(),
         "programs": [{"id": name.lower(), "name": name, "bytes": amount} for name, amount in ranked[:program_rows]],
@@ -3434,6 +3503,7 @@ def move_fields(move: person_actions.AppliedBump | None, members: FeedStaff, zon
 def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
             report_version: str = "", holders: TokenHolders | TokenHoldersUnknown = NO_TOKEN_DUMP_YET,
             *, program_memory: program_memory_feed.ProgramMemoryFeed | None = None,
+            ci_history: CIRunnerHistory | None = None,
             outside_cpu: OutsideCpuReadings | None = None,
             outside_sampled_at: float | None = None,
             limit_source: Callable[[admission_records.QueueRead], limits_view.Background] | None = None,
@@ -3534,7 +3604,7 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
     ci_owners = external_ci_owners(ci_readings, by_owner, gate.builds_slice_cgroup())
     queued_ci = sum(hold.memory.use.bytes for hold in captured.runs if hold.memory.owner in ci_owners
                     and isinstance(hold.memory.use, admission_records.AnonymousRunUse))
-    ci_services = ci_runner_service_ram(ci_units, reservations)
+    ci_services = ci_runner_service_ram(ci_units, reservations, ci_history)
     tools = build_tool_ram(explanation.running, captured.used - queued_ci, explanation.ordered)
     ram = ram_blocks(captured, tools, explanation.now, configuration.other_rows, ci_services)
     cap = gib(ram["cap_bytes"]) if isinstance(captured.cap, int) else captured.cap
@@ -4094,6 +4164,7 @@ def main(argv: Sequence[str]) -> int:
         return page_link()
     configuration = read_configuration()
     program_memory = program_memory_feed.configured_feed()
+    ci_history = CIRunnerHistory()
     outside_cpu = OutsideCpuReadings()
     publish_page(configuration)
     target = configuration.output_folder / DATA_NAME
@@ -4145,7 +4216,7 @@ def main(argv: Sequence[str]) -> int:
                 # Count from after the request, so slow reads before it never shorten the interval.
                 next_tokens_at = time.monotonic() + configuration.token_dump_seconds
             payload: MemoryPage | RetainedReading | PageUnavailable = reading(configuration, report_version, holders,
-                program_memory=program_memory, outside_cpu=outside_cpu, outside_sampled_at=now,
+                program_memory=program_memory, ci_history=ci_history, outside_cpu=outside_cpu, outside_sampled_at=now,
                 limit_source=limit_source, mac_source=mac_source)
             last_good = payload
         except (OSError, ValueError, KeyError, RuntimeError) as error:

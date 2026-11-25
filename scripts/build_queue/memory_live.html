@@ -1229,8 +1229,9 @@ function memoryTotal(...roots) {
     node.text = formatRamAmount(node.bytes, node.tenths, node.unit);
   }
 }
-function breakdownRows(amount) {
-  return amount.parts.filter(([, child]) => recorded(child.bytes)).map(([label, child]) => field(label, child.text));
+function breakdownRows(amount, includeUnavailable = false) {
+  return amount.parts.filter(([, child]) => recorded(child.bytes) ||
+    (includeUnavailable && child.bytes?.kind === 'ReadingUnavailable')).map(([label, child]) => field(label, child.text));
 }
 function compressedSwapNote(kernel) {
   const [, swap] = kernel.parts[0];
@@ -1406,8 +1407,8 @@ function legendTip(name, bytes, caption, parts, text) {
   const title = field(name, text, 'title');
   return recorded(bytes) ? [title,field('',caption,'caption'),...groupRows(parts)] : [title];
 }
-function breakdownTip(name, amount, caption) {
-  return legendTip(name, amount.bytes, caption, breakdownRows(amount), amount.text);
+function breakdownTip(name, amount, caption, includeUnavailable = false) {
+  return legendTip(name, amount.bytes, caption, breakdownRows(amount, includeUnavailable), amount.text);
 }
 const AWS_DAY_MS = 86400000;
 const AWS_HISTORY_DAYS = 14;
@@ -1761,7 +1762,7 @@ function downloadAwsRuns(costs) {
 }
 const TIPS = {
   'g-builds': d => breakdownTip('Builds', d.memory.builds, 'RAM that builds use now'),
-  tools: d => breakdownTip('Build tools', d.memory.tools, 'RAM that build tools use now'),
+  tools: d => breakdownTip('Build tools', d.memory.tools, 'RAM that build tools use now', true),
   queued: d => breakdownTip('Queued builds', d.memory.queued, 'RAM of builds the queue started'),
   'g-free': d => breakdownTip('Free RAM', d.memory.free, 'RAM that no program holds'),
   reserved: d => reserveTip('Build reserved', 'Held for running builds to grow into', d.reserves.build, buildReserveRows(d)),
@@ -3871,8 +3872,8 @@ function fitWalkDetails() {
   const shown = shownReading(latest);
   const amountGroups = latest.walk.filter(row => row.kind !== "cloud" && (row.queued || row.kind === "mac-build"))
     .map(row => [useValue(row) > 0 ? shown.stepReadings.get(row).used.text : "", row.reserved > 0 ? shown.stepReadings.get(row).reserve.text : ""].filter(Boolean));
-  const {room, tools} = shown.memory;
-  amountGroups.push([room.text], [tools.text],
+  const {room} = shown.memory;
+  amountGroups.push([room.text],
     ...latest.waiters.filter(row => row.kind !== "cloud" && row.why !== "target").map(row => [shown.waitReadings.get(row).need.text]));
   const amountWidth = Math.max(...amountGroups.map(labels => labels.reduce((sum, label) =>
     sum + context.measureText(label).width, 0) + LABEL_GAP * Math.max(0, labels.length - 1)));

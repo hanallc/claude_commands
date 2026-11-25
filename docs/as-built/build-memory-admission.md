@@ -2716,12 +2716,14 @@ A failed or old reading replaces the Mac run rows with one short `Mac builds` st
 The feed log retains raw errors; the page shows only the status and reading age.
 CI runner records supply the `hana CI` owner for their Running and Waiting steps.
 The feed matches each step's recorded runner unit to the CI runner records.
-The feed reads anonymous RAM from live runner processes outside admitted Cargo process trees and scopes.
-The Build tools tooltip and total use the sum of these service readings.
-The page cap and taken total include the same sum.
-Admission uses the saved CI charge from its queue pass.
-If a runner reading is unavailable, its tooltip line says so.
-If service readings are missing, Other build tools includes any saved CI charge that the service lines do not cover.
+The feed reads runner and Cargo scope membership before it reads the process table.
+It reads anonymous RAM only from live runner processes outside admitted Cargo process trees and scopes.
+The Build tools bar, page cap, and taken total use the saved CI charge from admission.
+The runner lines divide the saved charge in proportion to their live readings.
+If the service processes exit during a sample, the feed can reuse the last good reading for two samples.
+A persistent failure shows the runner name and the existing `unavailable` value.
+If a reading is missing, the known readings stay within the saved charge.
+Other build tools includes any part of the saved CI charge that the runner lines do not cover.
 The terminal queue view shows a `machine` column after `min` and before `pid`.
 The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
 A narrow view omits the machine column before it reduces name space.
