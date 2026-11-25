@@ -476,3 +476,7 @@ class ToolFolderRemovalTests(unittest.TestCase):
 
     def test_keeps_a_folder_with_a_held_lock(self) -> None:
         self.assert_kept(ClaimCase.HELD_LOCK)
+
+
+if __name__ == "__main__":
+    unittest.main()
