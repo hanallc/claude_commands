@@ -1530,7 +1530,7 @@ def gate_command_source_check(command: Sequence[str], *,
         if not root or launcher.parent.resolve() / launcher.name != Path(root) / relative or not launcher.is_file():
             return None
         launcher_checkout = Path(root)
-    elif script not in (relative.as_posix(), f"{{tree}}/{relative.as_posix()}"):
+    elif launcher not in (relative, Path("{tree}") / relative):
         return None
 
     def check(source: Path) -> None:
@@ -1538,6 +1538,10 @@ def gate_command_source_check(command: Sequence[str], *,
         path = parser_root / GATE_SCRIPT
         if path.resolve() != path:
             raise CopyError(f"Use the regular {GATE_SCRIPT} file in {parser_root}.")
+        if launcher_checkout is None and launcher.name == "gate.py":
+            expanded = [part.replace("{tree}", str(source)) for part in command] if numbered_copy else command
+            if not first_step.canonical_gate_command(expanded, source):
+                return
         if not path.is_file():
             return
         try:
@@ -1551,7 +1555,7 @@ def gate_command_source_check(command: Sequence[str], *,
         result = subprocess.run(
             [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), str(GATE_CHECK_REFUSED),
              str(parser_root), launcher.name, mode, *arguments],
-            cwd=source, capture_output=True, text=True,
+            cwd=source, stdin=subprocess.DEVNULL, capture_output=True, text=True,
         )
         if result.returncode == GATE_CHECK_HELP:
             print(result.stdout, end="")

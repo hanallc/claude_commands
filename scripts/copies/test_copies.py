@@ -2564,6 +2564,18 @@ with patch.object(subprocess, 'run', pause_clone):
         self.assertIn("--module 'lib/test_fixture.py' does not name a test module", result.stderr)
         admit.assert_not_called()
 
+    def test_run_checks_both_gate_script_spellings_with_a_dot_segment(self) -> None:
+        _ = self.commit_gate_validator()
+        arguments = ("--tests-only", "--module", "lib/test_missing.py")
+        for script in ("./scripts/production/gate.py", "{tree}/./scripts/production/gate.py"):
+            with (self.subTest(script=script),
+                  mock.patch.object(first_step, "admitted_run",
+                                    side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit):
+                result = self.run_cli(command=(sys.executable, script, *arguments))
+                admit.assert_not_called()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--module 'lib/test_missing.py' does not name a test module", result.stderr)
+
     def test_run_admits_a_module_from_the_requested_commit_once(self) -> None:
         _ = self.commit_gate_validator()
         test = self.source / "scripts/lib/test_fixture.py"
@@ -2619,8 +2631,8 @@ with patch.object(subprocess, 'run', pause_clone):
 
             assert sys.argv[1:] == ["--targeted", str(Path.cwd())]
             """)
-        for script in (str(self.source / "scripts/production/gate.py"), "{tree}/./scripts/production/gate.py",
-                       "./scripts/production/gate.py"):
+        for script in (str(self.source / "scripts/production/gate.py"),
+                       "{tree}/scripts/production/../production/gate.py", "scripts/production/../production/gate.py"):
             with self.subTest(script=script):
                 run_gate = mock.Mock(side_effect=launch_copy_fixture)
                 admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)

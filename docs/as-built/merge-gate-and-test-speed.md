@@ -516,7 +516,7 @@ Use one `--module <suite>/<module>` for each module with `--tests-only` or `--af
 Give each path relative to `scripts/`, for example `lib/test_x.py`.
 `copies.py run` refuses a named gate without a test mode before placement.
 The check before placement applies to `scripts/production/gate.py` and `scripts/production/merge_gate.py`.
-Use the exact script path, with an optional `{tree}/` prefix.
+The check accepts `.` path segments and an optional `{tree}/` prefix.
 These forms use the gate parser from the prepared source.
 Absolute launchers at these paths use the gate parser from the launcher's checkout.
 An invalid explicit nightly owner receives the same refusal and status as a direct gate run.
