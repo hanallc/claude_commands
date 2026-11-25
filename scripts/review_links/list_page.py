@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, quote, unquote, urlencode
 
+from scripts.accounts import accounts
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, footer_counts, record_store, session_staff, staff, the_list
@@ -477,18 +478,27 @@ NO_FAILED_QUESTIONS: frozenset[str] = frozenset()
 
 def waiting_note(entry: ListRecord, names: staff_names.StaffNames, *, hidden: bool = False) -> str:
     item = entry.item
-    notes: dict[str, None] = {}
+    notes: dict[str, str] = {}
     for question in item.questions:
         if question.answer is not None:
             continue
-        recipient = owner_name(names.members, question.recipient_id(entry.keeper))
-        note = f"{recipient} will answer."
+        recipient = question.recipient_id(entry.keeper)
+        recipient_name = owner_name(names.members, recipient)
+        note = f"{recipient_name} will answer."
+        shown = f"{names.html(recipient, recipient_name)} will answer."
         if isinstance(question.recipient, question_record.KeeperForUnavailableProducer):
-            producer = owner_name(names.members, question.recipient.producer)
-            note = f"{producer} is not live, so {note}"
-        notes[note] = None
-    text = " ".join(notes) or f"{owner_name(names.members, item.producer)} will answer."
-    return f'<p data-waiting-note{" hidden" if hidden else ""}>{html.escape(text)}</p>'
+            producer = question.recipient.producer
+            producer_name = owner_name(names.members, producer)
+            note = f"{producer_name} is not live, so {note}"
+            shown = f"{names.html(producer, producer_name)} is not live, so {shown}"
+        _ = notes.setdefault(note, shown)
+    text = " ".join(notes.values()) or f"{names.html(item.producer, owner_name(names.members, item.producer))} will answer."
+    return f'<p data-waiting-note{" hidden" if hidden else ""}>{text}</p>'
+
+
+def producer_answering_note(names: staff_names.StaffNames) -> str:
+    label = names.role_label("producer", FIELD_LABELS["producer"])
+    return f'<small data-open-question-note>{label} answering</small>'
 
 
 def question_time_html(stamp: str, today: datetime) -> str:
@@ -549,7 +559,7 @@ def ask_boxes(entry: ListRecord, secret: str, names: staff_names.StaffNames) -> 
             + f'<dt>Why</dt><dd>{html.escape(ask.why)}</dd></dl>'
             + f'<form method="post" action="{go_ledger.GO_PATH}" data-go-form>' + hidden
             + f'<button type="submit" aria-describedby="{box_id}-note">{ASK_BUTTONS[ask.kind]}</button>'
-            + f'<small id="{box_id}-note">{html.escape(ASK_NOTES[ask.kind].format(agent=member.name))}</small>'
+            + f'<small id="{box_id}-note">{ASK_NOTES[ask.kind].format(agent=names.html(member.id, member.name))}</small>'
             + '</form></section>')
     return '<div class="list-asks">' + ''.join(boxes) + '</div>' if boxes else ''
 
@@ -711,7 +721,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
             the_list.ItemState.DONE: "room"}.get(item.state, "muted")
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
-        state += f'<small data-open-question-note>{ListChip.PRODUCER_ANSWERING.label}</small>'
+        state += producer_answering_note(names)
     state += check_row_html(item.next_check, today, parked=parked)
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
     if parking_label:
@@ -1336,7 +1346,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     card_motion = page_frame.CardMotion.read(settings)
     morning = record_table.clock_minutes(settings, "later_morning")
     log_max_height = record_table.log_max_height_rem(settings)
-    producer_property = f';--producer-label-color:{producer_color.css}' if producer_color is not None else ''
+    producer_property = f';--producer-label-color:{producer_color.css}' if isinstance(producer_color, accounts.StaffRoleColor) else ''
     counts = ''
     if include_counts:
         if defer_counts:
@@ -1363,6 +1373,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<p data-hidden-action-status role="status" hidden></p></div>'
                + '</div>'
                + '<p data-missing-item role="status" hidden></p>'
+               + '<template data-producer-answering-template>' + producer_answering_note(names) + '</template>'
                + '<div data-list-count role="status" aria-live="polite"></div>'
                + '<div class="list-table"><table aria-label="The List">' + columns + '<thead><tr>' + headers + '</tr></thead>'
                + ''.join(rows) + '</table>'
@@ -1765,12 +1776,7 @@ function bindFeedbackForm(form){
    if(['true','false'].includes(result.open_ask)) item.dataset.openAsk=result.open_ask;
    const questionNote=item.querySelector('[data-open-question-note]');
    if(item.dataset.openQuestion==='true'){
-    if(!questionNote){
-     const note=document.createElement('small');
-     note.dataset.openQuestionNote='';
-     note.textContent=''' + json.dumps(ListChip.PRODUCER_ANSWERING.label) + r''';
-     state.after(note);
-    }
+    if(!questionNote) state.after(content.querySelector('[data-producer-answering-template]').content.cloneNode(true));
    }else questionNote?.remove();
    if(typeof result.check_html==='string'){
     const check=item.querySelector('[data-list-check]');

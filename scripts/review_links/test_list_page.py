@@ -5262,7 +5262,10 @@ observer.observe(original.parentElement,{childList:true});
             delivery = list_page.submit(root, urlencode(fields), status)
             opened = list_page.render(root, status=status).decode().split('<script>', 1)[0]
             self.assertIn('data-waiting-for-answer="true"', opened)
-            self.assertIn('<p data-waiting-note>morty will answer.</p>', opened)
+            self.assertRegex(opened, r'<p data-waiting-note><span[^>]*data-color-text="role.producer"[^>]*>morty</span> will answer.</p>')
+            status_cell = opened.split('<td data-label="State">', 1)[1].split('</td>', 1)[0]
+            self.assertRegex(status_cell, r'<small data-open-question-note><span[^>]*data-color-text="role.producer"'
+                             + r' style="color:#90fe42">Producer</span> answering</small>')
             self.assertIn('Question Q1 — waiting for an answer</h3>' + asked_time, opened)
             self.assertIn("What changed in &lt;List&gt;?", opened)
             self.assertNotIn('name="action" value="question"', opened)
@@ -5681,7 +5684,9 @@ observer.observe(original.parentElement,{childList:true});
                     self.assertEqual(edited.questions[0].recipient,
                                      question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
                     note = '<p data-waiting-note>dwight is not live, so morty will answer.</p>'
-                    self.assertIn(note, saved.get("waiting_details_html", ""))
+                    waiting_html = saved.get("waiting_details_html", "")
+                    self.assertIn(note, without_role_colors(waiting_html))
+                    self.assertRegex(waiting_html, r'data-color-text="role.producer"[^>]*>morty</span> will answer.')
                 body = list_page.render(root, include_counts=False, status=status).decode().split("<script>", 1)[0]
                 self.assertNotIn('value="resend-Q1"', body)
 
@@ -5819,6 +5824,9 @@ observer.observe(original.parentElement,{childList:true});
  check(!row.hidden,'The saved row stays in All.');
  const note=row.querySelector('[data-open-question-note]');
  check(note?.getClientRects().length && note.textContent==='Producer answering' &&
+  note.firstElementChild?.textContent==='Producer' &&
+  note.firstElementChild?.dataset.colorText==='role.producer' &&
+  note.firstElementChild?.style.color==='rgb(144, 254, 66)' &&
   row.querySelector('.list-state').textContent==='Waiting for nate','The note appears below the saved state.');
  check(changes.join()==='POST','The chip changes without a refresh.');
  check(count.textContent==='2 of 2 items shown · 0 need you · 1 unread','All counts the saved row.');
@@ -7349,6 +7357,7 @@ const change=async path=>{
             markup = list_page.render(self.root / "reviews").decode()
         self.assertEqual(markup.count("data-ask="), 1)
         self.assertIn("natemerge, the merge director of sdlc", text(without_role_colors(markup)))
+        self.assertRegex(markup, r'Pressing Go sends your go to <span[^>]*data-color-text="role.unit-director"[^>]*>natemerge</span>\.')
         _ = the_list.give_go(MORTY.id, item.id, ask.ask_id, "0" * 32, source="nate")
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()

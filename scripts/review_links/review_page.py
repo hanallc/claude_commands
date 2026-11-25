@@ -937,7 +937,8 @@ def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
                       + f'data-send-receiver="{html.escape(member.name, quote=True)}"{names.style(member.id)}>'
                       +f'{html.escape(member.name)}</option>'
                       for member in review_actions.approval_assignees(names.members))
-    return page_frame.action_select('assignee', 'Assign', f'<option value="">{html.escape(shown)} decides</option>'+options)
+    return page_frame.action_select('assignee', 'Assign',
+        f'<option value=""{names.style(item.owner)}>{html.escape(shown)} decides</option>'+options)
 
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
@@ -989,12 +990,14 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         words = (f'<label for="{field}">Your words</label><textarea id="{field}" name="feedback" rows="{words_rows}" '
                  + f'placeholder="{placeholder}"></textarea>')
     if item.type == ReviewType.RESPONSE:
+        shown_owner = names.html(item.owner, owner) if names is not None else html.escape(owner)
         groups = ('<div class="review-actions"><div class="review-action-group"><span>Closes the item</span><div>'
                   +''.join(closes)+'</div></div><div class="review-action-group"><span>Sends to '
-                  +html.escape(owner)+'</span><div>'+''.join(returns)+'</div></div></div>')
+                  +shown_owner+'</span><div>'+''.join(returns)+'</div></div></div>')
     elif validator:
+        shown_validator = names.html(item.owner, validator) if names is not None else html.escape(validator)
         groups = ('<div class="review-actions"><div class="review-action-group"><span>Sends to '
-                  +html.escape(validator)+'</span><div>'+''.join(returns)+'</div></div></div>')
+                  +shown_validator+'</span><div>'+''.join(returns)+'</div></div></div>')
     else:
         heading = ''
         if item.type == ReviewType.CHANGE and returns:
@@ -1126,13 +1129,13 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         if validator:
             duration = (' · Validating for <time data-validating-age datetime="'
                         +source.handed_at.isoformat()+'"></time>') if source.handed_at is not None else ''
-            handoff = '<p class="review-handoff">With '+names.html(item.owner, validator)+duration+'</p>'
+            shown_validator = names.html(item.owner, validator)
+            handoff = '<p class="review-handoff">With '+shown_validator+duration+'</p>'
             if isinstance(question, (change_page.OpenQuestion, change_page.AnsweredQuestion)) and not isinstance(
                     question, (change_page.OpenFeedback, change_page.CompletedFeedback)):
-                escaped = html.escape(validator)
-                exchange = section('Question for '+escaped, question.text)
+                exchange = section('Question for '+shown_validator, question.text)
                 if isinstance(question, change_page.AnsweredQuestion):
-                    exchange += ('<section><h3>Answer from '+escaped+'</h3>'
+                    exchange += ('<section><h3>Answer from '+shown_validator+'</h3>'
                                  +change_browser.answer_html(question.answer)+'</section>')
         else:
             if isinstance(question, change_page.OpenQuestion) and not isinstance(question, change_page.OpenFeedback):

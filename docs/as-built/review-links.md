@@ -132,11 +132,13 @@ Feedback uses the native Investigation record.
 The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
 The Producer filter, table headers, and narrow card label use the producer color.
 The log colors Producer and Unit labels. The Go box colors the role phrase.
+The status colors Producer in Producer answering. The waiting note and Go box color staff names.
 List delivery notices and feedback log entries use role colors for the notice recipient.
 Delivery notices also color the showrunner who received an alert.
 They keep the notice words and time.
 Review colors Owner, Source, staff log names, and owner menu options.
 The Review action heading colors the word showrunner in Sends to showrunner.
+Review colors the staff names in Sends to, Question for, and Answer from headings.
 Proposal and efficiency cards show Assign next to Approve.
 The default shows the card owner's name and sends the approval to that owner.
 Assign lists current showrunners and unit directors by name in their role colors.
@@ -161,7 +163,9 @@ Old readings without marked parts stay plain.
 It renders each priority name before it joins the names.
 Target availability and Builds tooltips color explicit staff role labels.
 When a target has no unit or showrunner, the page shows the recorded holder with a plain Holder label.
-The AWS costs table colors the Unit header. The Unit group control uses the role color before selection.
+The AWS costs table colors the Unit header and recorded staff names in the Unit column.
+The Unit group control uses the role color before selection.
+An open AWS day applies Unit color changes on the next Builds data reading.
 Disks uses the same spans for slot holders, sessions, and shared tooltip fields.
 The slot tooltip colors the Showrunner label.
 Current Builds rows carry their name parts through `slotStep` to the Disks slot label.

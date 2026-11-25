@@ -1575,7 +1575,7 @@ function awsRunTable(runs, estimated, extraRows, units) {
   const columns = values => units ? values : values.filter((_, index) => index !== AWS_UNIT_COLUMN);
   const rows = runs.map(run => {
     const [job, unit, region, zone, machine, mode] = awsRunFields(run);
-    return {values:[awsDateTime(new Date(run.start * 1000)), esc(awsJob(job)), esc(awsUnit(unit)),
+    return {values:[awsDateTime(new Date(run.start * 1000)), esc(awsJob(job)), unit == null ? esc(awsUnit(unit)) : staffName(unit),
       ...[region, zone, machine, mode].map(value => value ? esc(value) : "—"),
       awsRunTime(run.seconds), awsMoney(awsCents(run.cost_usd), estimated)]};
   });
@@ -2097,7 +2097,7 @@ function tooltipRows(key, rawData) {
     const move = row?.last_move;
     if (move?.kind !== "bump") return [];
     const place = row.place ?? move.to_place;
-    return [field("Bump", `place ${place}`, "title"), field("Moved by", move.who),
+    return [field("Bump", `place ${place}`, "title"), staffField("Moved by", [move.who]),
       field("From", move.from_place > 0 ? `place ${move.from_place}` : "place not recorded"),
       field("To", "the top"), field("At", move.at)];
   }
@@ -2106,13 +2106,17 @@ function tooltipRows(key, rawData) {
     if (!row) return [];
     const unit = ownerText(row.unit);
     const match = row.match_rule ? ` (${row.match_rule})` : "";
+    const aboutUnit = (kind, lead, tail = '') => ({
+      ...field('', lead + unit + tail, kind),
+      valueParts:[{kind:'text', text:lead}, {kind:'staff', text:unit}, {kind:'text', text:tail}],
+    });
     return [field('Kept place', `place ${row.position}`, 'title'),
-      field('', `Kept for the next run of unit ${unit}`, 'caption'),
-      {...field('Unit', unit, 'field', true), labelRole:'unit'}, field('Failed run', row.failed_run),
+      aboutUnit('caption', 'Kept for the next run of unit '),
+      {...staffField('Unit', [unit], 'unit'), group:true}, field('Failed run', row.failed_run),
       field('Failed step', row.failed_step || '—'), field(row.ended === 'no_result' ? 'Ended at' : 'Failed at', row.failed_at),
       field('Kept until', row.kept_until),
-      field('', `If the next run of unit ${unit}${match} arrives before ${row.kept_until}, ` +
-        `it starts from place ${row.position}. Runs behind place ${row.position} do not wait for it.`, 'long')];
+      aboutUnit('long', 'If the next run of unit ', `${match} arrives before ${row.kept_until}, ` +
+        `it starts from place ${row.position}. Runs behind place ${row.position} do not wait for it.`)];
   }
   if (kind === 'swap' && index !== undefined) return swapTip(data.swap_by[+index], data.swapDisplay);
   if (kind === 'swap-pool') return poolTip(index, data);
@@ -2128,7 +2132,7 @@ function tooltipHtml(key, data) {
 function bumpMark(who, tip = "") {
   return `<span class="move-mark"${tip ? ` data-tip="${esc(tip)}" tabindex="0"` : ""}>` +
     '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M5 3h14M18 13l-6-6-6 6M12 7v14"/></svg>' +
-    `<span>${esc(who)}</span></span>`;
+    `<span>${tip ? staffName(who) : esc(who)}</span></span>`;
 }
 function tipRowsHtml(rows) {
   return '<dl class="tip">'+tipCellsHtml(rows)+'</dl>';
@@ -2523,11 +2527,11 @@ function restoreReportView(view) {
   }
 }
 function render(d) {
-  if (d.staff_names) globalThis.staffNames?.set(d.staff_names, d.unit_open, d.role_labels);
   if (d.error || !d.ok) {
     throw new Error("The queue did not answer.");
   }
   const view = captureReportView();
+  refreshBuildStaffNames(d);
   for (const [theme, colors] of Object.entries(d.colors)) {
     document.documentElement.style.setProperty(`--remote-memory-${theme}`, colors.remote_memory);
     for (const [machine, color] of Object.entries(colors.machines)) {
@@ -2923,6 +2927,13 @@ function renderAwsHistory() {
   const older = $("aws-older"), extra = groups.day.length - AWS_HISTORY_DAYS;
   older.hidden = awsCostView !== "day" || extra <= 0;
   older.textContent = awsShowAll ? "Show fewer days" : `Show ${extra} older ${extra === 1 ? "day" : "days"}`;
+}
+function refreshBuildStaffNames(reading) {
+  const names = globalThis.staffNames;
+  if (!reading.staff_names || !names) return;
+  const color = names.roleLabels.unit?.css;
+  names.set(reading.staff_names, reading.unit_open, reading.role_labels);
+  if (awsCostReport && color !== names.roleLabels.unit?.css) renderAwsHistory();
 }
 function renderAwsCosts(costs) {
   awsCostReport = costs?.limits && costs?.today ? costs : null;

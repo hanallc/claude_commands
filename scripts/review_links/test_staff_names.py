@@ -39,6 +39,10 @@ class StaffNameTests(unittest.TestCase):
         self.assertEqual(names.role_label("unlisted", "<Role>"), "&lt;Role&gt;")
         with patch.object(accounts, "role_colors", return_value={"role.worker": "invalid"}):
             uncolored = staff_names.StaffNames(staff.StaffSnapshot(()))
+        self.assertIsInstance(uncolored.label_color("unlisted"), accounts.NoAccountColor)
+        no_color = accounts.NoAccountColor()
+        with patch.object(accounts, "role_color", return_value=no_color):
+            self.assertIs(uncolored.label_color("worker"), no_color)
         self.assertEqual(uncolored.role_label("worker", "Worker"), "Worker")
         self.assertEqual(uncolored.role_label("unit", "Unit"), "Unit")
         self.assertEqual(uncolored.role_labels(), {})

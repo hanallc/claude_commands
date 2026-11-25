@@ -453,7 +453,7 @@ class MemoryHoverTests(unittest.TestCase):
 
     def role_setup(self) -> str:
         members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
-                        current_session=staff.StaffId(name)) for name in ("builder", "helper"))
+                        current_session=staff.StaffId(name)) for name in ("builder", "helper", "queue", "report"))
         colors = {"role.unit-director": "#ffaf02", "role.showrunner": "#a379fd", "role.worker": "#ff0404"}
         with patch.object(accounts, "role_colors", return_value=colors):
             names = staff_names.StaffNames(staff.StaffSnapshot(members))
@@ -472,6 +472,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertRegex(tip, r'<dt><span[^>]*data-color-text="role.showrunner" style="color:#a379fd">Showrunner</span></dt>')
         self.assertRegex(tip, r'<dt><span[^>]*data-color-text="role.worker" style="color:#ff0404">Worker</span></dt>')
         self.assertRegex(held, r'<dt[^>]*><span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">Unit</span></dt>')
+        self.assertEqual(held.count('style="color:#ffaf02">queue</span>'), 3)
         self.assertRegex(targets, r'data-color-text="role.unit-director"[^>]*>Unit</span> ')
         self.assertRegex(targets, r'data-color-text="role.showrunner"[^>]*>Showrunner</span> builds')
         for table in (grouped, individual):
@@ -479,6 +480,8 @@ class MemoryHoverTests(unittest.TestCase):
                              + ' style="color:#ffaf02">Unit</span></th>')
         self.assertIn('data-aws-group-by="unit" aria-pressed="false" style="--role-label-color:#ffaf02">Unit</button>',
                       individual)
+        self.assertRegex(individual, r'<td><span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">report</span></td>')
+        self.assertIn('<td>Unit not recorded</td>', individual)
         self.assertIn('"Unit"', csv.splitlines()[0])
         self.assertNotIn('data-color-text', csv)
 
@@ -572,10 +575,22 @@ class MemoryHoverTests(unittest.TestCase):
         # Runs on names machines, so its words take the machine colors and never a staff color.
         runs_on = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Runs on")
         self.assertEqual([(span.get("class"), span.text) for span in runs_on.iter("span")], [("machine", "builder")])
-        for label, name in (("Showrunner", "helper"), ("Worker", "builder")):
-            value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
-            self.assertEqual(value.findtext("span"), name)
+        for label, role, color, name in (("Showrunner", "showrunner", "#a379fd", "helper"),
+                                         ("Worker", "worker", "#ff0404", "builder")):
+            index = next(index for index, cell in enumerate(grid) if cell.tag == "dt" and "".join(cell.itertext()) == label)
+            span = grid[index].find("span")
+            assert span is not None
+            self.assertEqual((span.get("data-color-text"), span.get("style")), (f"role.{role}", f"color:{color}"))
+            self.assertEqual(grid[index + 1].findtext("span"), name)
         self.assertEqual(grid[0].findtext("span"), "builder")
+
+    def test_bump_actor_uses_the_staff_color_in_the_mark_and_tooltip(self) -> None:
+        move = {"kind": "bump", "who": "builder", "from_place": 2, "to_place": 1, "at": "12:22 PST"}
+        mark, tip = cast(list[str], self.page_expression("(()=>{" + self.role_setup()
+            + "return [bumpMark('builder', 'moved:row:fixture-run-0'), tooltipHtml('moved:row:fixture-run-0', data)];})()",
+            {"walk": [{"name": "Compile", "last_move": move}]}, walk=True))
+        for rendered in (mark, tip):
+            self.assertRegex(rendered, r'data-color-text="role.unit-director" style="color:#ffaf02">builder</span>')
 
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
@@ -2771,6 +2786,33 @@ process.stdout.write(JSON.stringify(steps));
                 fields = [(label.text or "", value.text or "") for label, value in zip(labels, values, strict=True)]
                 self.assertEqual(fields, expected)
 
+    def test_open_aws_day_refreshes_its_unit_color_with_the_same_report(self) -> None:
+        result = self.page_expression("(()=>{" + self.role_setup() + r"""
+            const day = data.days[0].day;
+            awsCostReport = data;
+            const periods = awsPeriods("day", data.days);
+            awsCostGroups = {groups:{day:periods}, largest:{day:1000}};
+            awsCostOpen.get("day").set(periods[0].id, true);
+            awsRunViews.set(day, {groupBy:"none", openGroups:new Set()});
+            renderAwsHistory();
+            const colors = () => {
+              const rendered = $("aws-history-rows").innerHTML;
+              return [
+                rendered.match(/color:(#[a-f0-9]+)">Unit<\/span>/)?.[1],
+                rendered.match(/--role-label-color:(#[a-f0-9]+)">Unit<\/button>/)?.[1],
+                rendered.includes('data-aws-group-by="none" aria-pressed="true"'),
+              ];
+            };
+            const before = colors();
+            const names = window.staffNames, unit = names.roleLabels.unit;
+            refreshBuildStaffNames({staff_names:names.values, report_version:"same-report",
+              role_labels:{...names.roleLabels, unit:{css:"#123456", opening:unit.opening.replace(unit.css,"#123456")}}});
+            const after = colors();
+            refreshBuildStaffNames({staff_names:names.values, report_version:"same-report", role_labels:{}});
+            return [before, after, colors()];
+            })()""", aws_cost_fixture(), walk=True, history=True)
+        self.assertEqual(result, [["#ffaf02", "#ffaf02", True], ["#123456", "#123456", True], [None, None, True]])
+
     def test_aws_cost_breakdowns_use_bill_day_states_and_recorded_job_and_unit_names(self) -> None:
         estimate, units, billed, no_attempt, older, zero = cast(list[str], self.page_expression(
             "[awsDayDetail(data.days[0], data.price_day, {groupBy:'job', openGroups:new Set(['[\"hana\"]'])}),"
@@ -2951,7 +2993,7 @@ process.stdout.write(JSON.stringify(steps));
         if limits:
             functions += html[html.index("function limitMarks("):html.index('$("build-limits").addEventListener')]
             constants += f"const buildLimitIcons = {json.dumps(memory_feed.build_limit_icons())};\n"
-        if walk or limits:
+        if walk or limits or history:
             functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
             constants += """
 const elements = new Map();

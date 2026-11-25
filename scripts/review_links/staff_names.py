@@ -123,24 +123,21 @@ class StaffNames:
             return label
         return _role_span_open(color) + label + "</span>"
 
-    def label_color(self, role: str) -> accounts.StaffRoleColor | None:
+    def label_color(self, role: str) -> accounts.StaffRoleColor | accounts.NoAccountColor:
         """Resolve the configured color for an explicit role label."""
         group = ROLE_GROUPS.get(role)
-        if group is None:
-            return None
-        color = accounts.role_color(group, self.colors)
-        return color if isinstance(color, accounts.StaffRoleColor) else None
+        return accounts.NoAccountColor() if group is None else accounts.role_color(group, self.colors)
 
     def role_label(self, role: str, text: str) -> str:
         """Render a role label with escaped text."""
         label = html.escape(text)
         color = self.label_color(role)
-        return _role_span_open(color) + label + "</span>" if color is not None else label
+        return _role_span_open(color) + label + "</span>" if isinstance(color, accounts.StaffRoleColor) else label
 
     def role_labels(self) -> dict[str, RoleLabel]:
         """Supply validated label colors and spans to JavaScript."""
         return {role: {"opening": _role_span_open(color), "css": color.css}
-                for role in ROLE_GROUPS if (color := self.label_color(role)) is not None}
+                for role in ROLE_GROUPS if isinstance(color := self.label_color(role), accounts.StaffRoleColor)}
 
     def source(self, identity: staff.StaffId) -> str:
         """Keep a unit's parent and name separate, with their own role colors."""
