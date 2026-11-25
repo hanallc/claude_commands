@@ -5761,6 +5761,22 @@ class HerdrTests(unittest.TestCase):
                        "".join(f"p{pid}\nfcwd\nn/work\n" for pid in (71, 72)))
         self.assertCountEqual([row.pid for row in herdr.herdr_processes()], [71, 72])
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+        self.assertEqual(herdr.herdr_places({72}).placements, {72: herdr.HerdrPlace("writing", "w1:p1")})
+
+    def test_darwin_placement_filter_reads_only_the_selected_servers(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.darwin_process_table(f"70 1 {uid} herdr server\n71 70 {uid} codex\n"
+                                  + f"80 1 {uid} herdr server\n81 80 {uid} codex\n")
+        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/herdr.sock\n"
+                            + f"p80\nf3\nn{self.root}/config/herdr/sessions/other/herdr.sock\n")
+        self.configure(["--session", "default", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "w1:p1"}]}}))
+        self.darwin_environment(71, "codex", "HERDR_PANE_ID=w1:p1")
+
+        self.assertEqual(herdr.herdr_places({71, 99}).placements, {71: herdr.HerdrPlace("default", "w1:p1")})
+        pane_lists = [command for command in self.commands() if command[2:4] == ["pane", "list"]]
+        self.assertEqual(pane_lists, [["--session", "default", "pane", "list"]])
 
     def test_report_batches_shell_pids_for_several_panes(self) -> None:
         panes: list[dict[str, object]] = [{"pane_id": f"w1:p{n}", "terminal_id": f"terminal-{n}",
@@ -6473,6 +6489,28 @@ class HerdrTests(unittest.TestCase):
         self.assertIn(self.proc / "12/environ", opened)
         self.assertNotIn(server / "environ", opened)
 
+    def test_placement_filter_ignores_pids_that_exit_before_handoff(self) -> None:
+        server = self.process(30, 1, ["herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/writing/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        _ = self.process(11, 30, ["codex"], {"HERDR_PANE_ID": "w1:p1"})
+        self.configure(["--session", "writing", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "w1:p1"}]}}))
+
+        other_server = self.process(40, 1, ["herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/other/herdr.sock", 101)
+        self.socket_fd(other_server, 101)
+        orphan = self.process(41, 1, ["sh"], {})
+        for process in (other_server, orphan):
+            _ = (process / "cgroup").write_text("0::/user.slice/session-7.scope\n")
+        # PID 13 has a stat record but its cgroup read fails after exit.
+        _ = self.process(13, 1, ["codex"], {"HERDR_PANE_ID": "w1:p2"})
+        (self.proc / "12").mkdir()
+
+        self.assertEqual(herdr.herdr_places({11, 12, 13, 99}).placements, {11: herdr.HerdrPlace("writing", "w1:p1")})
+        pane_lists = [command for command in self.commands() if command[2:4] == ["pane", "list"]]
+        self.assertEqual(pane_lists, [["--session", "writing", "pane", "list"]])
+
     def test_handoff_survivors_keep_their_unit_after_reparenting(self) -> None:
         self.configure(["--session", "writing", "pane", "list"],
                        json.dumps({"result": {"panes": [{"pane_id": "p1"}]}}))
@@ -6569,6 +6607,7 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual({row.pid: row.place for row in rows}, expected)
                     self.assertEqual(herdr.herdr_place_of(13), herdr.HerdrPlace("writing", "w1:p1"))
                     self.assertEqual(herdr.herdr_places().placements, expected)
+                    self.assertEqual(herdr.herdr_places({13}).placements, {13: expected[13]})
             # Without a handoff the parent walk explains the scope; one live read verifies its pane.
             _ = (shell / "stat").write_text("11 (zsh) S 30 0 0\n")
             _ = (unrelated / "cgroup").write_text(f"{membership}/user.slice/session-7.scope\n")

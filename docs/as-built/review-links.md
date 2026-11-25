@@ -2745,6 +2745,28 @@ If the request supplies `Origin`, it must match the HTTP origin for that `Host`.
 A Go change (`POST /console/tune`) must supply `Origin` and the token.
 The server returns 403 when the host or origin check fails.
 
+The Builds Kill action uses `GET /console/build-kill` for current handles and stop results.
+`POST /console/build-kill` requires the matching Origin and request token.
+The server limits the form to `kill.request_bytes`, initially 4096 bytes.
+Both requests require the Tailscale login in `operator_login`.
+The default admits the user ID that owns the untagged local Tailscale node.
+The server checks the socket peer with Tailscale WhoIs.
+The Builds queue verifies the detached command and its saved run slice before it offers Kill.
+The first read of the detached run record determines acceptance.
+The server requires `completion_after_slice_cleanup` to offer or accept Kill.
+The supervisor sets that field when it publishes its process identity.
+A finished or missing record on that read gives **Run already ended**.
+The server saves accepted requests under `.review-link-build-kill` in its private state.
+The live supervisor finishes the run record.
+When the supervisor is gone, the server asks the normal reaper to check the selected record.
+The reaper finishes that record when the slice is empty and recovers its pending completion.
+The server saves **Stopped** when the record confirms the stop and the saved slice is empty.
+It then sends the keyed notice.
+A change in the detached record identity ends recovery with **Stop unconfirmed**.
+After restart, the server restores saved results and resumes pending actions.
+The server retries pending actions in its existing maintenance cycle.
+The Builds page reads these results at `page_refresh_seconds` intervals through its existing refresh cycle.
+
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.
   The server uses the monotonic clock. A failed lookup prints `tailscale address gone (was <address>)`. A different address prints `tailscale address changed (was <old>, now <new>)`. In both cases the server exits 1, and the service manager starts it again on the current address. If Tailscale stops but still reports the same address, the server keeps running, because its socket stays bound to that address.
