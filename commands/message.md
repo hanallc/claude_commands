@@ -39,7 +39,12 @@ description: Read agent message rules and delivery.
   A unique name also works.
   Addresses find their machine without `--machine`.
   A `uds:<path>` always selects this machine's socket.
-- For many at once, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from "<your session name>" --all "<message>"`. Groups are `--showrunners`, `--units` (unit directors), `--agents` (workers and freestanding Claude/Codex sessions), `--workers`, `--top-level` (Claude sessions except workers and unit directors under a showrunner), and `--all` (every role). Put `--of <unit, director name, or session: address>` before `--workers` for one unit. Each recipient gets the last selecting flag's text once. The sender is excluded by `CODEX_THREAD_ID`, else `CLAUDE_CODE_SESSION_ID`.
+- For groups, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/broadcast.py --from "<your session name>" --all "<message>"`.
+  Group flags are `--producers`, `--showrunners`, `--units` (unit directors), `--agents` (workers and freestanding Claude/Codex sessions), `--workers`, `--top-level`, and `--all` (every role).
+  `--top-level` selects Claude sessions and excludes workers and unit directors under a showrunner.
+  Put `--of <unit, director name, or session: address>` before `--workers` for one unit.
+  Each recipient gets the last selecting flag's text once.
+  Broadcast excludes the sender by `CODEX_THREAD_ID`, or by `CLAUDE_CODE_SESSION_ID` if unset.
 
 Pane delivery uses the worker's current native conversation, including during a turn.
 Blocked, stopped, closed, or uncertain workers route the message to their director with the reason.

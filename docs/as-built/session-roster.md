@@ -553,18 +553,19 @@ Each evidence cell names the request id and the report, receive or transcript li
 ### `broadcast.py`: groups on both machines
 
 ```
-broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT |
+broadcast.py [--here] --from NAME (--all TEXT | --producers TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT |
              --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...
 ```
 
-`BroadcastGroup = AllRoles | Showrunners | UnitDirectors | UnitsOfProduction(address, production) | Agents | Workers | WorkersOfUnit(address, unit, machine) | TopLevel`.
+`BroadcastGroup = AllRoles | Producers | Showrunners | UnitDirectors | UnitsOfProduction(address, production) | Agents | Workers | WorkersOfUnit(address, unit, machine) | TopLevel`.
 The group type stays separate from the roster's `Role` because flags overlap.
 Every group excludes closed workers before delivery and empty-group checks.
 The roster keeps these rows for direct sends and other readers.
 
 | Flag | Members |
 |---|---|
-| `--all` | every eligible row |
+| `--all` | every eligible row, including producers |
+| `--producers` | roster rows whose session or thread matches the current session of a producer in staff |
 | `--showrunners` | role `showrunner` |
 | `--units` | every unit director; after `--production <showrunner name or session: address>`, unit directors whose `UnderShowrunner.address` matches that showrunner |
 | `--agents` | every worker and freestanding session, Claude and Codex |
@@ -580,6 +581,8 @@ The roster keeps these rows for direct sends and other readers.
   If a recipient disappears after the roster read, the delivery fails on that machine.
   Each selected `CannotReceiveMessages` row prints the refusal from `send.py`.
   These refusals do not affect the sent count or the exit status.
+- A send that saves the message for an open review reports `kept`. For a recipient selected by `--producers`, it reports `held: in a review`.
+  Both outcomes leave the sent count and exit status unchanged.
 - Without `--here`, `ssh <other machine> env -u CODEX_THREAD_ID -u CLAUDE_CODE_SESSION_ID [BROADCAST_SEND=...] BROADCAST_CLOSING_MACHINES=... broadcast.py --here --from <sender> <same groups>` runs in parallel (120 s timeout); its lines print under `<host>: `. The replay spells an all-workers group `--all-workers` (accepted by `main`, absent from `USAGE`) so it does not inherit an earlier `--of`. ssh exit 255, a timeout, or a nonzero exit with no `NOT sent` line yields `<host>: NOT sent: <why>`.
 - `--of` is resolved once across both machines before any delivery: one director gives its machine and address; several give exit 2 with `<target> matches more than one unit director:` and their addresses; none gives `unknown unit <target>; known units:`. If the other machine is not reached, `--of` sends nothing: one `NOT sent` line, exit 1. `--of` without a following `--workers` is a usage error.
 - `--production` resolves a showrunner's staff name or session address across both machines before delivery.
@@ -592,10 +595,17 @@ The roster keeps these rows for direct sends and other readers.
 - Remote replay carries the resolved address and production through the internal `--resolved-production` spelling.
   The replay also requires a roster without problems before delivery.
   The internal `--all-units` spelling keeps an unscoped group independent of an earlier production scope.
-- Output: `<shown name> [<address>] - <outcome>[: <detail>]`. The outcomes are `sent`, `no live session` and `NOT sent`. The address appears in brackets only when it differs from the shown name. The shown name includes the job, so there is no role column. A group with no member besides the sender prints `<group> - none on this machine` on each machine. The report ends with `<N> sent in <S> s` and the closing line. Exit 0 when nothing is `NOT sent`, 1 otherwise, 2 for usage. Roster problems print as `broadcast: roster: <problem>`. Without a production scope, delivery to the other rows continues.
+- The output uses `<shown name> [<address>] - <outcome>[: <detail>]`. Outcomes are `sent`, `kept`, `held`, `no live session`, and `NOT sent`.
+  The address appears in brackets when it differs from the shown name.
+  A producer's `held` line uses the staff name. Other lines use the roster name, which can include the job.
+  An empty group prints `<group> - none on this machine` on each machine.
+  If the staff read fails, `--producers` reports `producers - NOT sent` with the reason.
+  The report ends with `<N> sent in <S> s` and the closing line.
+  Exit 0 when nothing is `NOT sent`, 1 on a delivery failure, and 2 on a usage error. Roster problems print as `broadcast: roster: <problem>`.
+  Without a production scope, delivery to the other rows continues.
 - Library API: `broadcast(sender, texts: Mapping[BroadcastGroup, str], *, scope=ALL_MACHINES) -> list[Delivery]` runs the same orchestration as the command; `report(deliveries) -> bool`; `send(session, sender, text, *options) -> str` (empty on success). `codex_winddown.announce()` calls `broadcast.broadcast(sender, {Showrunners(): ..., UnitDirectors(): ...})` and `broadcast.report`.
 
-Callers: `/announce` (`--all`), `/unit:announce` (`--units`), `/showrunner:announce` (`--showrunners`), each on both machines, and `/codex_winddown`.
+The commands `/announce` (`--all`), `/producer:announce` (`--producers`), `/unit:announce` (`--units`), and `/showrunner:announce` (`--showrunners`) use both machines. `/codex_winddown` also calls broadcast.
 
 ### `top_level.py`
 
@@ -708,7 +718,7 @@ Release recalculates the priority of a kept decision.
 - `scripts/notify/user_action.py`, `scripts/notify/pushover.py` — the message-to-user gate; `scripts/notify/review.py` — the clarity review
 - `scripts/message/escalate.py`, `scripts/agents/restart_support.py`, `scripts/agents/restart.py` — held and shutdown messages
 - `scripts/agents/test_support.py` — shutdown send guard
-- `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py`, `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `commands/alert_user.md` — instructions
+- `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py`, `commands/message.md`, `commands/announce.md`, `commands/producer/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `commands/alert_user.md` — instructions
 - Tests: `scripts/message/test_{roster,send,postmaster,codex_daemon,process_table,sessions,top_level,install_codex_agents}.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_{broadcast,codex_winddown}.py`, `scripts/agents/test_*.py` (`test_send_guard.py` proves the guard); `mods/postmaster/tests/*.test.ts` exercise fake call sets and kit-loaded hooks
 
 ## Invariants
