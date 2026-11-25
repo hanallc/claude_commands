@@ -702,7 +702,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = blind_command.add_argument("run_id", help="Saved run filename, with or without .jsonl")
     _ = blind_command.add_argument("--count", type=int, default=UseConfiguredValue.CURRENT,
                                    help="Most items to write; fewer when eligible issues run out; default blind_sample_count in issue_score.conf")
-    _ = blind_command.add_argument("--seed", type=int, default=0, help="Shuffle seed; fixes item order and A/B sides for the same run and issues")
+    _ = blind_command.add_argument("--seed", type=int, default=0, help="Shuffle seed; the same run, issues, --count and seed give the same items, order and A/B sides")
     blind_score_command = commands.add_parser(
         "blind-score", help="Tally a completed A/B preference sheet",
         description=("Tally a sheet that blind wrote, after each pick is set to A, B or same. "
