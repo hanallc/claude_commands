@@ -206,3 +206,101 @@ Run `scripts/lib/py scripts/lint/sweep.py --switch-removal-list` to list the for
 The list uses the `removal_guard.py` format. Legacy paths require manual review because they do not match the templates in `removal.path_templates.<machine>`.
 
 See [Repository copies](copies.md) for the copy commands and [Worktrees](worktrees.md) for worktree removal.
+
+## Cleanup of places outside the model
+
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/disks/cleanup_old_folders.py` to list old places outside the model.
+The command reads the configured places from `config/disks.conf`.
+Only places named by the cleanup settings and their associated side files can qualify for removal.
+Other places found by the scans show `list only: no setting names it`.
+Each row shows the place, the machine, the size when measured, and the result of the checks.
+On natedev it also reads the Mac list over SSH. When SSH fails, the command shows the first error line if available.
+The Mac slot folder is list-only. Bob handles its removal by hand.
+`/build/sccache` is a shared tool cache from the system configuration. The cleanup lists it and keeps it.
+
+On natedev, the list finds `.saved-target-*` folders directly in `~/rust`.
+It also checks `~/worktrees` and its subfolders to a depth of three for saved targets.
+It checks each saved target for use and verifies the inner `target` folder.
+The check accepts known Cargo, cargo-mend, rust-analyzer, Hana test, and nextest output.
+The check reads known cargo-mend executable links without following them.
+The check reads every entry under `target`.
+It checks the entry type for each known name and requires regular files for output pairs.
+Unknown output, other links, or extra entries beside `target` keep the folder for review.
+Each configured `/build/p-*` row includes its `.lease.json` and `.lock` files.
+The Mac row for `~/worktrees/claude-prioritize-index-refresh` also includes these files.
+The command keeps the folder and both files if the lease PID is alive.
+Cleanup takes the folder lock without waiting before it removes the folder.
+The removal guard checks the held lock again before deleting each side file.
+It removes the lease file before the lock file.
+
+On natedev, the command also lists old `p-*` folders and old places directly under `~/worktrees`.
+The command reads a link's target text before it checks whether the target exists.
+It keeps links into protected paths without reading those targets.
+For a live target, the command keeps the link if a process uses it in `PWD` or a staff row names it.
+Other `PWD` read errors and staff record errors keep live links.
+Removal unlinks the checked link and leaves its target in place.
+Side files with an existing base entry stay with that entry.
+Orphan side files are list-only. Their rows show lease or lock problems.
+Discovered real folders outside the model are list-only unless a cleanup setting names them.
+The list names the process and its staff row when it finds use.
+For other real folders, it shows the Git branch, dirty file count, and unpushed commit count when available.
+
+The list checks each path, its identity, and mounts. It keeps model folders for known repositories and their parents.
+The list keeps folders with open files, a live lease, or a held lock. It also checks leases in child folders.
+The command reads `/proc` when it is available. Otherwise it uses `lsof`.
+Each machine checks processes of the user that runs the command.
+The list header names the local user and says it does not check other users' processes.
+An incomplete process scan keeps configured folders, worktree links, and orphan side files.
+Missing file descriptor or environment data keeps the scan incomplete while the process still exists.
+The list header and keep reason name each unreadable process by PID and command.
+The list shows whether a Git checkout is dirty, its unpushed commit count, and whether it has a stash.
+The command reads the checkout's Git config as text before it runs Git.
+It keeps a checkout with an include and does not run Git on it.
+The command checks Git metadata without following links. It keeps a row for review if the metadata contains a link.
+Git pointers must stay within the row and its named registration.
+Git skips system and global config during cleanup, including when it saves a checkout.
+Cleanup disables Git hooks, file monitoring, and configured ignore and attributes files.
+A local Git config value that names a protected path keeps the row for review.
+Cleanup checks that Git uses the row path as its worktree root before it runs Git status.
+The list keeps bare repositories, folders with nested Git metadata, and clones with no local source.
+The list shows a clone's local origin and keeps the clone if another repository uses its Git objects.
+The digest covers the rows, Git state, and stash reflog commit IDs.
+Cleanup skips `~/rust/hanadocs`, `/build/cargo`, and `/build/old-*` before it reads their folders or Git metadata.
+On natedev, setup reads the names in `/build` and checks each protected entry without following links.
+It stops if a protected entry is a link or is not a directory.
+The child checks files, runs Git, and removes approved rows inside a `bwrap` mount namespace.
+The namespace puts an empty, read-only filesystem over each existing protected folder.
+If `bwrap` cannot set up the namespace, the command stops before the scan.
+The child checks the names in `/build` before and after the scan. It refuses the list if a protected name has no mask.
+The child checks those names again before it starts Git or calls the removal guard.
+The parent reads the process table. It compares mapped paths and link targets as bytes.
+It checks the descriptors, working directory, and root of each live task.
+For a single folder, it stops checking a process when it finds a use of that folder.
+An unreadable task makes the process scan incomplete.
+It checks each path as printed and without a trailing ` (deleted)`.
+It checks every combination of literal `\012` and newline for each of those paths.
+More than four `\012` sequences in one path make the process scan incomplete.
+The temporary sweep and the build sweep use the same thread scan as cleanup.
+Both sweeps keep entries when the process scan is incomplete.
+The parent calls the Mac over SSH, checks the digest, and prints the list.
+The table quotes folder paths, sidecar names, and Git paths. A list-only row also shows any scan error.
+Only Nate runs the command with `--go <digest>` by hand. No timer, service, hook, or session runs it.
+The command checks the fresh list against the digest. The Mac checks its own part of the list before removal.
+The removal guard checks every approved entry under the folder locks before the first deletion.
+After this check, the child requests a fresh process check with the locks held. It keeps the row if use is found or the scan is incomplete.
+The process check includes the Git registration. It also counts processes that name a path in `PWD`.
+It removes the `.git` entry after the other checkout entries.
+The child checks side files again with the lock held before it removes them.
+It keeps the side files if a process uses one or the scan is incomplete.
+If removal stops after a deletion, the command lists each entry it deleted.
+The child sends each removal result at once. The parent prints each result even if the child stops during a later removal.
+It saves a registered linked worktree to `refs/rescue` in its source repository.
+It checks the stash reflog again after the save.
+The list and removal both keep a Git-locked worktree.
+The guard removes only the approved worktree entries and the selected worktree's registration.
+The list names the registration under the source repository's `.git/worktrees/`. The digest covers that path.
+It saves a clone and pushes the saved commit and its unpublished branches to `refs/rescue/<place>/` in the local origin.
+The command checks those refs in the origin. It keeps the clone if any save, push, or check fails.
+The clone check reads Git object alternates under `~/rust`, `~/worktrees`, and the configured build root.
+It skips absent rows before it resolves repository paths.
+The check reads the immediate children of `~/rust`. It scans the other two roots to seven levels.
