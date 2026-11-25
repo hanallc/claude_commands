@@ -761,7 +761,8 @@ class ChangePageTests(unittest.TestCase):
         configuration.mkdir()
         for stem in ("change_review", "nix_env"):
             _ = write_config_fixture(configuration / f'{stem}.conf')
-        _ = write_config_fixture(configuration / "statusline.conf", "role.showrunner=#a379fd\n")
+        _ = write_config_fixture(configuration / "statusline.conf",
+                                 f'role.showrunner=#a379fd\nrebuild.cache={self.temporary / "rebuild-cache"}\n')
         self.write_delivery_config()
         _ = self.enterContext(patch.object(unrouted_alert, "send_message"))
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
@@ -2052,7 +2053,7 @@ class ChangePageTests(unittest.TestCase):
 
             with self.subTest(rebuilds="status line comparison"):
                 configuration = Path(os.environ["CONF_DIR"]) / "statusline.conf"
-                cache = self.temporary / "rebuild-cache"
+                cache = rebuild_row.cache_path(configuration)
                 _ = configuration.write_text(f"rebuild.cache={cache}\n")
                 expected = rebuild_row.ExpectedSystems(
                     "d" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),

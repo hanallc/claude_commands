@@ -218,7 +218,6 @@ class ReviewPageTests(unittest.TestCase):
 
     def configure_review(self) -> None:
         config = self.fixture.temporary / 'config'
-        _ = write_config_fixture(config / 'statusline.conf', f'rebuild.cache={self.fixture.temporary / "rebuild-cache"}\n')
         _ = write_config_fixture(config / "production.conf", "question_title_max_chars=100\n")
         _ = write_config_fixture(config / "console.conf",
             "page.review.url=python:scripts.review_links.review_page:page_url\n"
