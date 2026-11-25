@@ -5992,6 +5992,45 @@ done
                      and (reason := PLACEMENT_REASON_TEXT.get(state.reason)) is not None else candidate
                      for candidate in candidates)
 
+    def _newer_remote_free_readings(self, queued: list[wire.PlacementRequest]
+                                   ) -> dict[tuple[str, placement.PlacementDestination], float]:
+        """Find newer free readings for higher steps whose reading says busy."""
+        free: dict[tuple[str, str], dict[placement.PlacementDestination, float]] = {}
+        shared: dict[tuple[str, placement.PlacementDestination], float] = {}
+        busy = placement.TemporaryExclusion("busy")
+        for request in reversed(queued):
+            allowed: list[placement.FreshHostEvidence] = []
+            for candidate in self.placement_eligibility.get(request.episode, ()):
+                destination = candidate.destination
+                if (destination.provider in ("local", "scaler")
+                        or not (candidate.eligibility == busy or isinstance(candidate.eligibility, placement.AllowedHost))):
+                    continue
+                pair = (request.episode, destination)
+                key = self.placement_host_keys.get(pair)
+                evidence = self.host_evidence(key) if key is not None else None
+                if not isinstance(evidence, placement.FreshHostEvidence):
+                    continue
+                if isinstance(candidate.eligibility, placement.AllowedHost):
+                    if isinstance(evidence.eligibility, placement.AllowedHost):
+                        allowed.append(evidence)
+                    continue
+                # Busy is the only place fact. A shared reading would lose the session's Mac block
+                # (blocking_claim_block), the copy give-way rule (copy_gives_way), the per-key disk floor,
+                # and command and repository support.
+                if not (evidence.eligibility == busy or isinstance(evidence.eligibility, placement.AllowedHost)):
+                    continue
+                readings = free.get((destination.provider, destination.target), {})
+                latest = max((observed_at for other, observed_at in readings.items()
+                              if observed_at > evidence.observed_at and same_remote_resource(other, destination)),
+                             default=evidence.observed_at)
+                if latest > evidence.observed_at:
+                    shared[pair] = latest
+            for evidence in allowed:
+                destination = evidence.key.destination
+                readings = free.setdefault((destination.provider, destination.target), {})
+                readings[destination] = max(readings.get(destination, evidence.observed_at), evidence.observed_at)
+        return shared
+
     def _placement_pass(self, inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],
                         policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
@@ -6002,6 +6041,8 @@ done
             return inputs
         owners = {records.waiter_owner(self._placement_row(request)): request
                   for request in self.placement_requests.values() if self._placement_waiting(request)}
+        queued = [request for _, row in ordered if (request := owners.get(records.waiter_owner(row))) is not None]
+        shared_free_at = self._newer_remote_free_readings(queued)
         local_occupied = inputs.occupied_cargo_folders
         preview_ordered: list[tuple[Path, records.Waiter]] = []
         for path, row in inputs.ordered:
@@ -6048,7 +6089,8 @@ done
                         and isinstance(inputs.build_space, records.NoBuildSpaceHold)
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
-                if not isinstance(candidate.eligibility, placement.AllowedHost):
+                shared_at = shared_free_at.get((request.episode, destination))
+                if shared_at is None and not isinstance(candidate.eligibility, placement.AllowedHost):
                     hold = self._placement_hold(request, candidate, answers)
                     if hold is not None:
                         waiting_for.append(hold)
@@ -6057,7 +6099,8 @@ done
                     if candidate.destination in held_copy_destinations:
                         continue
                     competing = [copy for copy in copies if any(
-                        choice.destination == candidate.destination and isinstance(choice.eligibility, placement.AllowedHost)
+                        choice.destination == destination and (isinstance(choice.eligibility, placement.AllowedHost)
+                            or (copy.episode, destination) in shared_free_at)
                         for choice in self.placement_eligibility.get(copy.episode, ()))]
                     newest = max(competing, key=lambda copy: placement.copy_order(
                         cast(placement.SpeculativeCopy, copy.purpose), copy.episode))
@@ -6076,9 +6119,15 @@ done
                             replace(item, eligibility=spending) if item.destination == destination else item
                             for item in self.placement_eligibility[request.episode])
                         continue
-                elif (any(same_remote_resource(other, destination) for other in taken)
-                        or self._held_for_older(request, destination, held, holds)):
-                    continue
+                else:
+                    if any(same_remote_resource(other, destination) for other in taken):
+                        continue
+                    if held:
+                        key = self.placement_host_keys.get((request.episode, destination))
+                        observed_at = (shared_at if shared_at is not None else
+                            self.host_evidence(key).observed_at if key is not None else self.clock.now())
+                        if self._held_for_older(destination, observed_at, held, holds):
+                            continue
                 mac = destination.provider == "mac"
                 with self.mac_recovery_lock if mac else nullcontext():
                     # A sweep can start after candidate selection.
@@ -6153,14 +6202,12 @@ done
             return None
         return PlacementHold(request.episode, destination, key, observed_at)
 
-    def _held_for_older(self, request: wire.PlacementRequest, destination: placement.PlacementDestination,
+    def _held_for_older(self, destination: placement.PlacementDestination, observed_at: float,
                         held: list[PlacementHold], holds: dict[tuple[str, placement.PlacementDestination], float]) -> bool:
         """Keep a destination for an older request whose last reading predates this request's reading.
 
         The older request's key is probed next. The hold ends when that probe answers, or after one probe time.
         """
-        key = self.placement_host_keys.get((request.episode, destination))
-        observed_at = self.host_evidence(key).observed_at if key is not None else self.clock.now()
         now = self.clock.now()
         for hold in held:
             if not same_remote_resource(hold.destination, destination) or hold.observed_at >= observed_at:

@@ -4587,9 +4587,9 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 constraints=replace(older.constraints, session=OwningSession("younger")))
             evidence = publish_candidate(fixture, younger)
             server.placement_host_keys[(younger.episode, destination)] = evidence.key
-            held_for_older = cast(Callable[[wire.PlacementRequest, placement.PlacementDestination, list[service.PlacementHold],
+            held_for_older = cast(Callable[[placement.PlacementDestination, float, list[service.PlacementHold],
                 dict[tuple[str, placement.PlacementDestination], float]], bool], getattr(server, "_held_for_older"))
-            self.assertFalse(held_for_older(younger, destination, [hold] if hold is not None else [], {}))
+            self.assertFalse(held_for_older(destination, evidence.observed_at, [hold] if hold is not None else [], {}))
             self.assertIsNone(hold)
 
     def client_constraints(self, request: wire.PlacementRequest) -> placement.PlacementConstraints:
@@ -5269,7 +5269,7 @@ class ManualEvidenceWorker(service.HostEvidenceWorker):
 
 @dataclass(frozen=True)
 class MacOrder:
-    """An older request with a busy Mac reading and a younger request with a newer free reading."""
+    """An older request with expired evidence and a younger request with a free reading."""
 
     older: wire.PlacementRequest
     younger: wire.PlacementRequest
@@ -5283,26 +5283,33 @@ HOLD_SECONDS = 1 + 5
 
 
 class MacOrderTests(unittest.TestCase):
-    """A younger request never takes the Mac from an older request whose busy reading is older."""
+    """Keep Mac placement in queue order as the readings change."""
+
+    def queue_pair(self, fixture: PlacementFixture, *, mac_only: bool = True
+                   ) -> tuple[wire.PlacementRequest, wire.PlacementRequest]:
+        older = placement_request(fixture, since=fixture.clock.now() - 60)
+        constraints = older.constraints
+        if mac_only:
+            constraints = replace(constraints, selection=placement.MacOnlyHost())
+        else:
+            constraints = replace(constraints, candidates=(*constraints.candidates, local_candidate(fixture)))
+        older = replace(older, constraints=constraints)
+        self.assertIsInstance(fixture.connect(older).replies()[-1], wire.PlacementWait)
+        younger = placement_request(fixture, session=OwningSession("younger-session"), since=fixture.clock.now() - 10)
+        self.assertIsInstance(fixture.connect(younger).replies()[-1], wire.PlacementWait)
+        return older, younger
 
     def mac_order(self, fixture: PlacementFixture) -> MacOrder:
         fixture.configure(waiting_pass_seconds=1)
         _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
         _ = fixture.run_pass()
-        older = placement_request(fixture, since=fixture.clock.now() - 60)
-        older_key = self.provide(fixture, older, placement.TemporaryExclusion("busy"))
-        self.assertIsInstance(fixture.connect(older).replies()[-1], wire.PlacementWait)
-        _ = fixture.run_pass()
+        older, younger = self.queue_pair(fixture)
+        older_key = self.provide(fixture, older, ALLOWED_HOST)
         worker = fixture.server.host_targets[("mac", "mac")]
         assert isinstance(worker, ManualEvidenceWorker)
         self.assertEqual(worker.probe_next(), older_key)
-        fixture.clock.advance(1)
-        # Another worktree session reads the same Mac scope under its own key.
-        younger = placement_request(fixture, session=OwningSession("younger-session"), since=fixture.clock.now() - 10)
+        fixture.clock.advance(HOLD_SECONDS + 1)
         younger_key = self.provide(fixture, younger, ALLOWED_HOST)
-        self.assertIsInstance(fixture.connect(younger).replies()[-1], wire.PlacementWait)
-        _ = fixture.run_pass()
-        # The younger key is due first: the older key was probed one second ago.
         self.assertEqual(worker.probe_next(), younger_key)
         _ = fixture.run_pass()
         self.assertEqual(self.assigned(fixture, older, younger), [])
@@ -5320,6 +5327,64 @@ class MacOrderTests(unittest.TestCase):
     @staticmethod
     def assigned(fixture: PlacementFixture, *requests: wire.PlacementRequest) -> list[str]:
         return [request.episode for request in requests if request.episode in fixture.server.current_assignments]
+
+    @mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)
+    def test_an_older_busy_step_takes_the_mac_in_the_pass_that_reads_it_free(self) -> None:
+        with PlacementFixture() as fixture:
+            order = self.mac_order(fixture)
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, order.older, placement.TemporaryExclusion("busy"))
+            fixture.server.publish_host_evidence(placement.HostEvidenceUnavailable(
+                order.younger_key, fixture.clock.now(), "no reading"))
+            _ = fixture.run_pass()
+            self.assertEqual(self.assigned(fixture, order.older, order.younger), [])
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, order.younger)
+            with mock.patch.object(order.worker, "expedite", wraps=order.worker.expedite) as expedite:
+                _ = fixture.run_pass()
+            self.assertEqual(self.assigned(fixture, order.older, order.younger), [order.older.episode])
+            expedite.assert_not_called()
+            self.assertEqual(fixture.server.placement_holds, {})
+
+    @mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)
+    def test_the_mac_free_reading_must_be_newer_than_the_busy_reading(self) -> None:
+        for free_delay in (-1, 0, 1):
+            with self.subTest(free_delay=free_delay), PlacementFixture() as fixture:
+                older, younger = self.queue_pair(fixture)
+                if free_delay < 0:
+                    _ = publish_candidate(fixture, younger)
+                    fixture.clock.advance(1)
+                _ = publish_candidate(fixture, older, placement.TemporaryExclusion("busy"))
+                if free_delay >= 0:
+                    fixture.clock.advance(free_delay)
+                    _ = publish_candidate(fixture, younger)
+                _ = fixture.run_pass()
+                winner = older if free_delay > 0 else younger
+                self.assertEqual(self.assigned(fixture, older, younger), [winner.episode])
+
+    @mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)
+    def test_a_newer_free_reading_replaces_only_busy_eligibility(self) -> None:
+        for reason in ("blocked", "disk", "busy"):
+            with self.subTest(reason=reason), PlacementFixture() as fixture:
+                older, younger = self.queue_pair(fixture)
+                _ = publish_candidate(fixture, older, placement.TemporaryExclusion(reason))
+                fixture.clock.advance(1)
+                _ = publish_candidate(fixture, younger)
+                _ = fixture.run_pass()
+                winner = older if reason == "busy" else younger
+                self.assertEqual(self.assigned(fixture, older, younger), [winner.episode])
+
+    @mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)
+    def test_a_step_that_also_allows_local_execution_keeps_its_mac_order(self) -> None:
+        with PlacementFixture() as fixture:
+            fixture.hold_starts()
+            older, younger = self.queue_pair(fixture, mac_only=False)
+            _ = publish_candidate(fixture, older, placement.TemporaryExclusion("busy"))
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, younger)
+            _ = fixture.run_pass()
+            self.assertEqual(self.assigned(fixture, older, younger), [older.episode])
+            self.assertEqual(assignment_for(fixture, older).destination, older.constraints.candidates[0].destination)
 
     def test_the_older_request_is_probed_next_and_takes_the_mac(self) -> None:
         with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
@@ -5366,7 +5431,7 @@ class MacOrderTests(unittest.TestCase):
         The tile nextest read the cargo-liner scope free. Each new tile reading started new holds for the older
         steps, and the tile reading expired before both older probes answered. The tile nextest never got the Mac.
         """
-        for refusal in ("busy", "disk"):
+        for refusal in ("blocked", "disk"):
             with (self.subTest(refusal=refusal), PlacementFixture() as fixture,
                   mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker)):
                 fixture.configure(waiting_pass_seconds=1)
