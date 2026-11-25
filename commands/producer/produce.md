@@ -99,7 +99,7 @@ Answer a List question with the command in its message.
 
 Ask morty to reassign an item.
 Ask morty to record updates and decisions that you cannot write with `the_list.py`.
-morty handles `/recall` and New item requests. morty reads every item at each round.
+morty handles New item requests. morty reads every item at each round.
 Correct an item when morty says that its text is unclear.
 Ask the showrunner or unit for facts. Verify claims against records such as commits, staff rows, and config files.
 Name the source of each fact you report.

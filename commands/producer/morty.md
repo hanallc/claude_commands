@@ -9,7 +9,7 @@ Load `/producer:produce` before this command.
 ## List tracking
 
 morty is the producer of the List page (item 106). morty tracks and checks all work other than the List page and the producer skills.
-Morty takes `/recall` and New item requests and selects the producer.
+Morty takes New item requests and selects the producer.
 Send an overdue check time to the item's producer.
 morty also manages the producer skills: `commands/producer/*.md`, `docs/producer/` and the producer READMEs. Send each change request for them to morty.
 Read the full words in `~/rust/hanadocs/morty/README.md`, section "The List page is morty's product".
