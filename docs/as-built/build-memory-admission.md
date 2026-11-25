@@ -1324,6 +1324,19 @@ Python's default SIGINT raises `KeyboardInterrupt` and runs the existing cleanup
 `defer_cleanup_signals` retains its signal mask during normal cleanup.
 It uses `pthread_sigmask` and installs no handler.
 
+### Tests outside the queue
+
+The Builds page lists live commands above the direct test CPU limit.
+It scans agent and detached scopes and excludes session launchers, agents, bare shells, and queued work.
+It also excludes commands with waiting or admitted descendants in a separate scope.
+The table shows Command, Owner, Pid, Age, Current CPU, and CPU total.
+An empty table shows “No test runs outside the queue now.”
+
+Current CPU shows a whole percent from the change in live process CPU between readings.
+The first reading shows a dash.
+CPU total shows whole seconds from live process CPU and the root command's reaped child CPU.
+Detached scopes use the cgroup CPU counter for both readings.
+
 ### Startup, cut-over, and rollback
 
 The system socket starts the system service as the user. The service runs outside `builds.slice` with `OOMScoreAdjust=-900`.
@@ -2204,7 +2217,18 @@ The detached helper keeps the original run record until the server acknowledges 
 If the server saved **Stopped**, it resumes only pending delivery.
 The server retains a verified handle for two `page_refresh_seconds` intervals.
 If the live row disappears, the retained handle can report an already ended run.
-A direct Cargo scope without a detached run record has no Kill action.
+The Tests outside the queue table offers **Kill this run** for a verified natedev command with a registered owner.
+The same confirmation shows the command, process tree, age, and recorded caller.
+The server checks the handle against the current outside queue reading when the operator confirms.
+It checks the PID and start time through a pidfd and saves the process lifetimes in the command's tree.
+The server sends the signal through pidfds for those lifetimes.
+A reused PID receives no signal.
+The page shows **Stopping** while the command is still present in the reading.
+The row leaves the table when the feed no longer lists the command.
+If the stop fails, the row shows **Not stopped** and the reason.
+The control returns if the server still verifies the command.
+The server confirms the saved processes have ended before it sends the same keyed notice.
+A direct Cargo scope without a detached run record can use Kill only if it appears in Tests outside the queue.
 Verify still has no Kill action because it creates only step scopes.
 The server retries pending actions during its existing maintenance cycle.
 It retries an unclear delivery result with the saved key.

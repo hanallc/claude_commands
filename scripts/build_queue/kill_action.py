@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Generator, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
@@ -15,11 +15,12 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import threading
 import time
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity
@@ -58,6 +59,17 @@ class KillCandidate:
         fields = (self.holder_pid, self.holder_start, self.row_pid, self.row_start,
                   self.session, self.step, self.admitted_at)
         return sha256(json.dumps(fields).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class OutsideKillCandidate:
+    row_pid: int
+    row_start: str
+    step: str
+
+    @property
+    def reference(self) -> str:
+        return sha256(json.dumps(("outside", self.row_pid, self.row_start)).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -112,6 +124,69 @@ class KillTarget:
     starter: str
     recipient_name: str
     recipient_role: str
+
+
+@dataclass(frozen=True)
+class OutsideKillTarget:
+    candidate: OutsideKillCandidate
+    recipient: staff.StaffId
+    starter: str
+    recipient_name: str
+    recipient_role: str
+
+
+def notice_recipient(members: staff.StaffSnapshot, caller: staff.StaffRow) -> tuple[staff.StaffId, str, str, str]:
+    role = "unit director" if caller.kind == "unit" else caller.kind
+    parent = members.parent_of(caller)
+    starter = f"{caller.name}, a {role}"
+    if caller.kind == "worker" and parent is not None:
+        starter += f" of {parent.name}"
+    return caller.id, starter, caller.name, role
+
+
+@dataclass(frozen=True)
+class OutsideProcessTree:
+    boot_id: str
+    processes: tuple[process_stop.ProcessLifetime, ...]
+
+
+def boot_id() -> str:
+    return (PROC / "sys/kernel/random/boot_id").read_text().strip()
+
+
+def outside_process_tree(run: OutsideKillCandidate) -> OutsideProcessTree:
+    root = process_stop.ProcessLifetime(run.row_pid, run.row_start)
+    with process_stop.pin_process(root):
+        processes = memory_admit.process_table(PROC)
+        # Exclude links to a parent PID from a later process lifetime.
+        processes = {pid: entry for pid, entry in processes.items()
+                     if entry.parent not in processes or int(processes[entry.parent].start) <= int(entry.start)}
+        tree = memory_admit.process_tree({root.pid: root.start}, processes)
+        if root.pid not in tree or os.getpid() in tree or not live(root.pid, root.start):
+            raise ProcessLookupError("the outside command changed")
+        children = tuple(process_stop.ProcessLifetime(pid, processes[pid].start) for pid in sorted(tree - {root.pid}))
+        return OutsideProcessTree(boot_id(), (root, *children))
+
+
+def stop_outside_tree(tree: OutsideProcessTree) -> bool:
+    """Signal only the saved process lifetimes. Return true when all have ended."""
+    if tree.boot_id != boot_id():
+        raise ProcessLookupError("the system restarted")
+    with ExitStack() as pins:
+        descriptors: list[int] = []
+        for process in tree.processes:
+            try:
+                descriptors.append(pins.enter_context(process_stop.pin_process(process)))
+            except ProcessLookupError:
+                if isinstance(process_start.proc_table_start(process.pid, PROC), process_start.Unreadable):
+                    raise
+        for descriptor in descriptors:
+            try:
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+    return not descriptors
+
 
 
 def live(pid: int, started: str) -> bool:
@@ -232,12 +307,7 @@ def live_targets() -> dict[str, KillTarget]:
             continue
         route = stop_route(run, caller.id, processes)
         if not isinstance(route, NoStopRoute):
-            role = "unit director" if caller.kind == "unit" else caller.kind
-            parent = members.parent_of(caller)
-            starter = f"{caller.name}, a {role}"
-            if caller.kind == "worker" and parent is not None:
-                starter += f" of {parent.name}"
-            result[run.reference] = KillTarget(run, route, caller.id, starter, caller.name, role)
+            result[run.reference] = KillTarget(run, route, *notice_recipient(members, caller))
     return result
 
 
@@ -273,6 +343,7 @@ class KillResult(TypedDict):
     time: str
     recipient_name: str
     recipient_role: str
+    reason: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -295,15 +366,15 @@ class FinishedStop:
 @dataclass(frozen=True)
 class SavedKillAction:
     id: str
-    run: KillCandidate
+    run: KillCandidate | OutsideKillCandidate
     result: KillResult
     recipient: staff.StaffId
     message: str
     stage: StopRequested | SendingNotice | FinishedStop
-    route: DetachedCommand
+    route: DetachedCommand | OutsideProcessTree
 
 
-def notification(run: KillCandidate, at: datetime) -> str:
+def notification(run: KillCandidate | OutsideKillCandidate, at: datetime) -> str:
     return f'nate killed your run "{run.step}" (pid {run.row_pid}) from the Builds page at {at:%H:%M %Z}'
 
 
@@ -350,13 +421,17 @@ def detached_run_state(
 
 def request_stop(action: SavedKillAction) -> bool:
     """Ask the detached run stop path to stop the saved command."""
+    route, run = action.route, action.run
+    if not isinstance(route, DetachedCommand) or not isinstance(run, KillCandidate):
+        return False
+
     def can_stop() -> bool:
-        state = detached_run_state(action.route, action.recipient, notice_id=action.id)
+        state = detached_run_state(route, action.recipient, notice_id=action.id)
         return isinstance(state, RunningDetachedRun) and (
             state.stop_committed
-            or stop_route(action.run, action.recipient, memory_admit.process_table(PROC)) == action.route)
+            or stop_route(run, action.recipient, memory_admit.process_table(PROC)) == route)
 
-    return detached_runs.stop_command(action.route.record, action.message.partition("\n")[0], check=can_stop,
+    return detached_runs.stop_command(route.record, action.message.partition("\n")[0], check=can_stop,
                                       stop_notice_id=action.id)
 
 
@@ -389,25 +464,28 @@ def deliver(action: SavedKillAction) -> DeliveryState | RetryNotice:
 
 
 @dataclass(frozen=True)
-class DetachedKillOffer:
-    target: KillTarget
+class CachedKillOffer:
+    target: KillTarget | OutsideKillTarget
     expires_at: float
 
 
 class KillActions:
     """Persist each stop, recover its notice, and publish recent results."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path,
+                 outside_targets: Callable[[], dict[str, OutsideKillTarget]] | None = None) -> None:
+        self._outside_targets: Callable[[], dict[str, OutsideKillTarget]] | None = outside_targets
         self._folder: Path = root / ".review-link-build-kill"
         self._key: bytes = secrets.token_bytes(32)
         self._lock: threading.Lock = threading.Lock()
         self._actions: dict[str, SavedKillAction] = {}
-        self._offers: dict[str, DetachedKillOffer] = {}
+        self._offers: dict[str, CachedKillOffer] = {}
         self._retry: set[str] = set()
         self._worker: threading.Thread | None = None
 
-    def handle(self, target: KillTarget) -> str:
-        data = repr((target.candidate.reference, target.route, target.recipient)).encode()
+    def handle(self, target: KillTarget | OutsideKillTarget) -> str:
+        identity = target.route if isinstance(target, KillTarget) else target.candidate
+        data = repr((target.candidate.reference, identity, target.recipient)).encode()
         return hmac.new(self._key, data, sha256).hexdigest()
 
     def _cache(self, action: SavedKillAction) -> None:
@@ -433,6 +511,7 @@ class KillActions:
         return self._folder / f"{reference}.{notice_id}.notice"
 
     def _track_notice(self, action: SavedKillAction) -> None:
+        assert isinstance(action.route, DetachedCommand)
         # Save the run path before the stop commit. The action file can disappear later.
         path = self._notice_path(action.run.reference, action.id)
         if not path.exists():
@@ -485,65 +564,52 @@ class KillActions:
                     del self._actions[reference]
             actions = dict(self._actions)
             self._offers = {reference: offer for reference, offer in self._offers.items() if offer.expires_at > now}
+        targets: dict[str, KillTarget | OutsideKillTarget] = {}
         try:
-            targets = live_targets()
+            targets.update(live_targets())
+            if self._outside_targets is not None:
+                targets.update(self._outside_targets())
         except (OSError, ValueError, admission_wire.AdmissionUnavailable):
-            targets = {}
+            pass
         now_in_zone = datetime.now(user_zone())
         offers: dict[str, KillOffer] = {
             reference: {"handle": self.handle(target), "pid": target.candidate.row_pid,
                         "started_by": target.starter, "recipient_name": target.recipient_name,
                         "step": target.candidate.step, "message": notification(target.candidate, now_in_zone)}
             for reference, target in targets.items()
-            if reference not in actions
+            if reference not in actions or (
+                isinstance(target, OutsideKillTarget) and actions[reference].result["stop"] == StopState.UNCONFIRMED)
         }
         if offers:
             deadline = now + 2 * refresh_seconds
             with self._lock:
-                self._offers.update({reference: DetachedKillOffer(targets[reference], deadline) for reference in offers})
+                self._offers.update({reference: CachedKillOffer(targets[reference], deadline) for reference in offers})
         return offers, [action.result for action in actions.values()]
 
     def _finish(self, action: SavedKillAction, result: KillResult) -> SavedKillAction:
         finished = replace(action, result=result, stage=FinishedStop(time.time()))
         self._save(finished)
-        if isinstance(action.stage, StopRequested):
+        if isinstance(action.stage, StopRequested) and isinstance(action.route, DetachedCommand):
             self._acknowledge_notice(action.route.record, action.run.reference, action.id)
         return finished
 
     def _advance(self, action: SavedKillAction, *, recover_orphan: bool = False) -> SavedKillAction:
-        """Use the run record to advance to the notice."""
         if isinstance(action.stage, StopRequested):
-            if action.result["stop"] != StopState.STOPPING:
-                action = replace(action, result={**action.result, "stop": StopState.STOPPING})
-                self._save(action)
-            self._track_notice(action)
-            state = detached_run_state(action.route, action.recipient, notice_id=action.id)
-            if isinstance(state, RunningDetachedRun):
-                retry = False
+            route = action.route
+            if isinstance(route, OutsideProcessTree):
                 try:
-                    _ = request_stop(action)
-                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    ended = stop_outside_tree(route)
+                except OSError as error:
                     print(f"review-links build kill {action.run.reference}: {error}", file=sys.stderr)
-                    retry = True
-                state = detached_run_state(action.route, action.recipient, notice_id=action.id)
-                route = action.route
-                if recover_orphan and isinstance(state, RunningDetachedRun) and state.stop_committed:
-                    detached_runs.reap_orphan(route.record)
-                    state = detached_run_state(route, action.recipient, notice_id=action.id)
-                if isinstance(state, RunningDetachedRun):
-                    if not state.stop_committed and not retry:
-                        return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED})
-                    return action
-            if isinstance(state, ChangedDetachedRun):
-                return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED})
-            if not state.stop_committed:
-                return self._finish(action, {**action.result, "stop": StopState.ALREADY_ENDED})
-            if not process_stop.slice_has_ended(action.route.run_slice):
-                return action
-            action = replace(action, stage=SendingNotice(), result={**action.result, "stop": StopState.STOPPED})
-            self._save(action)
+                    return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED,
+                                                 "reason": "The command could not be stopped."})
+                if ended:
+                    action = self._stopped(action)
+            else:
+                action = self._advance_detached(action, route, recover_orphan=recover_orphan)
         if isinstance(action.stage, SendingNotice):
-            self._acknowledge_notice(action.route.record, action.run.reference, action.id)
+            if isinstance(action.route, DetachedCommand):
+                self._acknowledge_notice(action.route.record, action.run.reference, action.id)
             try:
                 delivery = deliver(action)
             except (OSError, ValueError, subprocess.SubprocessError):
@@ -552,6 +618,41 @@ class KillActions:
                 return action
             return self._finish(action, {**action.result, "delivery": delivery})
         return action
+
+    def _stopped(self, action: SavedKillAction) -> SavedKillAction:
+        action = replace(action, stage=SendingNotice(), result={**action.result, "stop": StopState.STOPPED})
+        self._save(action)
+        return action
+
+    def _advance_detached(self, action: SavedKillAction, route: DetachedCommand, *,
+                          recover_orphan: bool) -> SavedKillAction:
+        if action.result["stop"] != StopState.STOPPING:
+            action = replace(action, result={**action.result, "stop": StopState.STOPPING})
+            self._save(action)
+        self._track_notice(action)
+        state = detached_run_state(route, action.recipient, notice_id=action.id)
+        if isinstance(state, RunningDetachedRun):
+            retry = False
+            try:
+                _ = request_stop(action)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(f"review-links build kill {action.run.reference}: {error}", file=sys.stderr)
+                retry = True
+            state = detached_run_state(route, action.recipient, notice_id=action.id)
+            if recover_orphan and isinstance(state, RunningDetachedRun) and state.stop_committed:
+                detached_runs.reap_orphan(route.record)
+                state = detached_run_state(route, action.recipient, notice_id=action.id)
+            if isinstance(state, RunningDetachedRun):
+                if not state.stop_committed and not retry:
+                    return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED})
+                return action
+        if isinstance(state, ChangedDetachedRun):
+            return self._finish(action, {**action.result, "stop": StopState.UNCONFIRMED})
+        if not state.stop_committed:
+            return self._finish(action, {**action.result, "stop": StopState.ALREADY_ENDED})
+        if not process_stop.slice_has_ended(route.run_slice):
+            return action
+        return self._stopped(action)
 
     def _recover(self, references: tuple[str, ...]) -> None:
         for reference in references:
@@ -627,15 +728,27 @@ class KillActions:
             else:
                 if previous.result["stop"] != StopState.UNCONFIRMED or not isinstance(previous.stage, FinishedStop):
                     return NoStopRoute()
-            state = detached_run_state(target.route, target.recipient)
-            if isinstance(state, ChangedDetachedRun):
-                return NoStopRoute()
-            if isinstance(state, RunningDetachedRun):
-                current = live_targets().get(reference)
+            if isinstance(target, OutsideKillTarget):
+                current = self._outside_targets().get(reference) if self._outside_targets is not None else None
                 if current is None or self.handle(current) != handle:
-                    state = detached_run_state(target.route, target.recipient)
-                    if not isinstance(state, EndedDetachedRun):
-                        return NoStopRoute()
+                    return NoStopRoute()
+                try:
+                    route = outside_process_tree(target.candidate)
+                except ProcessLookupError:
+                    return NoStopRoute()
+                ended = False
+            else:
+                state = detached_run_state(target.route, target.recipient)
+                if isinstance(state, ChangedDetachedRun):
+                    return NoStopRoute()
+                if isinstance(state, RunningDetachedRun):
+                    current = live_targets().get(reference)
+                    if current is None or self.handle(current) != handle:
+                        state = detached_run_state(target.route, target.recipient)
+                        if not isinstance(state, EndedDetachedRun):
+                            return NoStopRoute()
+                route = target.route
+                ended = isinstance(state, EndedDetachedRun)
             at = datetime.now(user_zone())
             message = notification(run, at)
             result: KillResult = {"reference": reference, "step": run.step, "pid": run.row_pid,
@@ -644,8 +757,8 @@ class KillActions:
                                   "recipient_role": target.recipient_role}
             body = f"{message}\n{words}" if words else message
             action = SavedKillAction(secrets.token_hex(16), run, result, target.recipient, body, StopRequested(),
-                                     target.route)
-            if isinstance(state, EndedDetachedRun):
+                                     route)
+            if ended:
                 return self._finish(action, {**result, "stop": StopState.ALREADY_ENDED}).result
             self._save(action)
             try:

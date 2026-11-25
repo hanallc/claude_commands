@@ -409,12 +409,18 @@ body:has(.queue-lift) #tip { visibility: hidden; }
   stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .move-mark[data-tip] { cursor: help; }
 .walk-table .move-mark { vertical-align: middle; }
-.kill-run { display: inline-flex; vertical-align: middle; align-items: center; justify-content: center;
+.kill-run { position: relative; display: inline-flex; vertical-align: middle; align-items: center; justify-content: center;
   width: 26px; height: 26px; margin-left: 4px; padding: 0; border: 0; border-radius: 6px;
   color: var(--ink-3); background: transparent; cursor: pointer; }
 .kill-run svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2;
   stroke-linecap: round; stroke-linejoin: round; }
 .kill-run:hover, .kill-run:focus-visible { color: #e5675c; background: var(--track); }
+.kill-run[aria-expanded="false"]:is(:hover, :focus-visible)::after {
+  content: attr(aria-label); position: absolute; z-index: 1; bottom: calc(100% + 2px); right: 0;
+  padding: 2px 6px; border-radius: 4px; background: var(--ink); color: var(--bg);
+  font: 12px/1.4 system-ui, sans-serif; white-space: nowrap; pointer-events: none;
+}
+#outside-queue td:last-child { text-align: right; }
 .kill-run[aria-expanded="true"] { color: white; background: #8f2a21; }
 .kill-state, #kill-results { color: var(--ink-2); font-size: .82rem; }
 .kill-state { display: block; white-space: nowrap; }
@@ -529,8 +535,14 @@ body.queue-unavailable [data-page-action^="builds-"] { display: none; }
 .leftover-row { display: grid; grid-template-columns: minmax(0, 1fr) max-content max-content; gap: 4px 16px; padding: 5px 0; }
 .leftover-row .age { white-space: nowrap; }
 .leftover-row .detail { color: var(--ink-2); overflow-wrap: anywhere; }
-.outside-queue-row { grid-template-columns: minmax(0, 1fr) max-content; }
-.outside-queue-row + .outside-queue-row { border-top: 1px solid var(--line); }
+.outside-queue-table { overflow-x: auto; }
+.outside-queue-table table { width: 100%; border-collapse: collapse; }
+.outside-queue-table :is(th, td) { padding: 6px 12px; text-align: left; }
+.outside-queue-table :is(th, td):first-child { padding-left: 0; overflow-wrap: anywhere; }
+.outside-queue-table :is(th, td):last-child { padding-right: 0; }
+.outside-queue-table th { font-weight: 600; }
+.outside-queue-table tbody tr { border-top: 1px solid var(--line); }
+.outside-queue-table .num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .report-window { color: var(--ink-2); font-size: 0.85rem; }
 .report-top-row { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .report-top-row:last-child { border-bottom: 0; }
@@ -759,9 +771,9 @@ small .aws-point { cursor: help; }
     <div id="build-limits-content"></div>
   </details>
 
-  <section class="card" id="outside-queue" hidden>
-    <div class="section-head">Tests outside the queue</div>
-    <div id="outside-queue-rows"></div>
+  <section class="card" id="outside-queue" hidden aria-labelledby="outside-queue-heading">
+    <div class="section-head" id="outside-queue-heading">Tests outside the queue</div>
+    <div class="outside-queue-table" id="outside-queue-rows"></div>
   </section>
 
   <section class="card" id="aws-costs" aria-label="AWS costs">
@@ -779,8 +791,8 @@ __BUILDS_PAGE_DIALOGS__
     <h2 id="kill-heading">Kill this run?</h2>
     <dl>
       <dt>Run</dt><dd id="kill-name"></dd>
-      <dt>PID</dt><dd id="kill-pid"></dd>
-      <dt>Progress</dt><dd id="kill-progress"></dd>
+      <dt>Pid</dt><dd id="kill-pid"></dd>
+      <dt id="kill-progress-label">Progress</dt><dd id="kill-progress"></dd>
       <dt>Started by</dt><dd id="kill-starter"></dd>
     </dl>
     <p>The work in this run will be lost. This message goes to <span id="kill-recipient"></span>:</p>
@@ -2469,6 +2481,12 @@ function programMemoryHtml(memory, amounts) {
 }
 let displayedQueue = null;
 function pageTooltipHtml(key, data) {
+  if (key.startsWith("outside:")) {
+    const row = (data.outside_queue || []).find(row => outsideQueueKey(row) === key);
+    return row ? tipRowsHtml([field(row.command, "", "title"), field("PID", String(row.pid)),
+      field("Age", outsideQueueAge(row)), field("Current CPU", outsideQueueCpu(row)),
+      field("CPU total", outsideQueueTotal(row))]) : "";
+  }
   if (!key.startsWith("limit:")) {
     const queueTip = key.startsWith("held:") || key.startsWith("wait:");
     return tooltipHtml(key, queueTip && displayedQueue ? displayedQueue : data);
@@ -2874,15 +2892,39 @@ function renderLeftovers(d) {
   $("leftover-rows").innerHTML = rows.length ? rows.join("") : "No leftover processes.";
 }
 
+function outsideQueueKey(row) { return `outside:${row.pid}:${row.start_time}`; }
+function validOutsideQueuePid(pid) { return Number.isInteger(pid) && pid > 1 && pid <= 2147483647; }
+function outsideQueueAge(row) {
+  if (!Number.isFinite(row.age_seconds) || row.age_seconds < 0) return "—";
+  return row.age_seconds < 60 ? `${Math.floor(row.age_seconds)} s` : durationMinutes(row.age_seconds / 60);
+}
+function outsideQueueCpu(row) { return row.current_cpu == null ? "—" : `${row.current_cpu.toFixed(0)}%`; }
+function outsideQueueTotal(row) { return `${row.cpu_seconds.toFixed(0)} s`; }
+
 function renderOutsideQueue(d) {
   const rows = d.outside_queue || [];
-  $("outside-queue").hidden = rows.length === 0;
-  $("outside-queue-rows").innerHTML = rows.map(row => {
+  $("outside-queue").hidden = false;
+  const target = $("outside-queue-rows");
+  if (!rows.length) {
+    target.textContent = "No test runs outside the queue now.";
+    showKillResults();
+    return;
+  }
+  const body = rows.map(row => {
     const owner = row.owner || "Owner unknown";
     const names = row.unit && row.unit !== owner
       ? `${staffName(row.unit)} · ${staffName(owner)}` : staffName(owner);
-    return `<div class="leftover-row outside-queue-row"><span class="detail">${names} · ${esc(row.command)}</span><span class="num">${row.cpu_seconds.toFixed(1)} s CPU</span></div>`;
+    const kill = row.kill_ref ? ` data-kill-ref="${esc(row.kill_ref)}"` : "";
+    return `<tr class="outside-queue-row" data-tip="${esc(outsideQueueKey(row))}">` +
+      `<th scope="row" class="outside-command">${esc(row.command)}</th><td>${names}</td><td class="num">${validOutsideQueuePid(row.pid) ? row.pid : "—"}</td>` +
+      `<td class="num">${outsideQueueAge(row)}</td><td class="num">${outsideQueueCpu(row)}</td>` +
+      `<td class="num">${outsideQueueTotal(row)}</td><td${kill}></td></tr>`;
   }).join("");
+  target.innerHTML = `<table aria-labelledby="outside-queue-heading"><thead><tr>` +
+    `<th scope="col">Command</th><th scope="col">Owner</th><th scope="col" class="num">Pid</th>` +
+    `<th scope="col" class="num">Age</th><th scope="col" class="num">Current CPU</th>` +
+    `<th scope="col" class="num">CPU total</th><th scope="col"></th></tr></thead><tbody>${body}</tbody></table>`;
+  showKillResults();
 }
 
 function reportCost(value, unit = "h/day") {
@@ -3372,6 +3414,7 @@ let killRead = false;
 let killRefreshSeconds = SECONDS;
 let killConfirmation = null;
 const pendingKills = new Map();
+const outsideKillFailures = new Map();
 
 function showKillResults() {
   const visible = new Set();
@@ -3387,33 +3430,40 @@ function showKillResults() {
       : "Message pending";
     return `Killed by you at ${result.time} · ${delivery}`;
   };
-  for (const cell of document.querySelectorAll("td.pid[data-kill-ref]")) {
+  for (const cell of document.querySelectorAll("td[data-kill-ref]")) {
     const reference = cell.dataset.killRef;
     const offer = killInfo.offers[reference], status = statuses.get(reference);
+    const outside = cell.closest(".outside-queue-row");
+    const failure = outside && (status?.stop === "Stop unconfirmed" ? status.reason || status.stop
+      : !status ? outsideKillFailures.get(reference) : "");
     visible.add(reference);
     const oldControl = cell.querySelector("button");
-    const available = offer && !status;
-    cell.querySelector(".kill-state")?.remove();
+    const available = offer && (!status || failure);
+    const statusCell = outside ? outside.querySelector(".outside-command") : cell;
+    statusCell.querySelector(".kill-state")?.remove();
     if (!available) {
       oldControl?.remove();
     } else if (!oldControl) {
       const control = document.createElement("button");
       control.className = "kill-run";
       control.type = "button";
-      control.title = "Kill this run";
-      control.setAttribute("aria-label", control.title);
+      control.setAttribute("aria-label", "Kill this run");
       control.setAttribute("aria-haspopup", "dialog");
       control.setAttribute("aria-expanded", String(reference === killConfirmation?.reference));
       control.innerHTML = KILL_ICON;
       cell.append(control);
     }
-    if (status) {
+    if (status || failure) {
       const label = document.createElement("span");
       label.className = "kill-state";
-      label.textContent = statusText(status);
-      cell.append(label);
+      label.textContent = failure ? `Not stopped: ${failure}` : statusText(status);
+      statusCell.append(label);
     }
     cell.title = offer || status ? "" : "Kill is not available for this run yet";
+  }
+  const outsideRefs = new Set(latest?.outside_queue?.map(row => row.kill_ref));
+  for (const reference of outsideKillFailures.keys()) {
+    if (!outsideRefs.has(reference)) outsideKillFailures.delete(reference);
   }
   const strip = $("kill-results");
   const text = [...statuses.values()].filter(result => !visible.has(result.reference))
@@ -3458,20 +3508,29 @@ document.addEventListener("click", event => {
   const control = event.target.closest?.(".kill-run");
   if (!control) return;
   const reference = control.closest("td").dataset.killRef;
-  const offer = killInfo.offers[reference], row = latest?.walk.find(item => item.kill_ref === reference);
-  if (!offer || !row || killConfirmation) return;
-  const duration = row.started_at ? ago(row.started_at, latest.read_at) : "";
-  const done = doneText(row);
-  $("kill-name").textContent = [queueRowLabels(row).unit, offer.step].filter(Boolean).join(" · ");
+  const offer = killInfo.offers[reference];
+  const running = latest?.walk.find(row => row.kill_ref === reference);
+  const outside = latest?.outside_queue?.find(row => row.kill_ref === reference);
+  if (!offer || (!running && !outside) || killConfirmation) return;
+  const unit = running ? queueRowLabels(running).unit : outside.unit;
+  $("kill-name").textContent = [unit, offer.step].filter(Boolean).join(" · ");
   $("kill-pid").textContent = `${offer.pid} and its child processes`;
-  $("kill-progress").textContent = done !== "—"
-    ? `${done} done${duration ? ` after ${duration}` : ""}`
-    : duration ? `Running for ${duration}` : "Progress unavailable";
+  $("kill-progress-label").textContent = running ? "Progress" : "Age";
+  if (running) {
+    const duration = running.started_at ? ago(running.started_at, latest.read_at) : "";
+    const done = doneText(running);
+    $("kill-progress").textContent = done !== "—"
+      ? `${done} done${duration ? ` after ${duration}` : ""}`
+      : duration ? `Running for ${duration}` : "Progress unavailable";
+  } else {
+    $("kill-progress").textContent = outsideQueueAge(outside);
+  }
   $("kill-starter").textContent = offer.started_by;
   $("kill-recipient").textContent = offer.recipient_name;
   $("kill-message").textContent = offer.message;
   $("kill-words").value = "";
-  killConfirmation = {reference, offer, token: killInfo.token, step: row.name};
+  killConfirmation = {reference, offer, token: killInfo.token, step: running?.name ?? outside.command,
+    outside: Boolean(outside)};
   control.setAttribute("aria-expanded", "true");
   hideTip();
   $("kill-dialog").showModal();
@@ -3488,24 +3547,38 @@ $("kill-dialog").addEventListener("close", () => {
 $("kill-form").addEventListener("submit", async event => {
   event.preventDefault();
   if (!killConfirmation || pendingKills.has(killConfirmation.reference)) return;
-  const {reference, offer, token, step} = killConfirmation;
+  const {reference, offer, token, step, outside} = killConfirmation;
   const body = new URLSearchParams({reference, token, handle: offer.handle, words: $("kill-words").value});
   const stopping = {reference, pid: offer.pid, step, stop: "Stopping", delivery: ""};
   pendingKills.set(reference, stopping);
+  outsideKillFailures.delete(reference);
+  if (outside) killInfo.results = killInfo.results.filter(row => row.reference !== reference);
   $("kill-dialog").close();
   showKillResults();
+  const failed = reason => {
+    if (outside) outsideKillFailures.set(reference, reason);
+    else killInfo.results = [...killInfo.results.filter(row => row.reference !== reference),
+      {...stopping, stop: "Stop unconfirmed"}];
+  };
   try {
     const response = await fetch(KILL_PATH, {method: "POST", body});
     const payload = await response.json();
-    const result = response.ok && payload.result ? payload.result : {...stopping, stop: "Stop unconfirmed"};
-    killInfo.results = [...killInfo.results.filter(row => row.reference !== reference), result];
+    if (response.ok && payload.result) {
+      killInfo.results = [...killInfo.results.filter(row => row.reference !== reference), payload.result];
+    } else {
+      failed(payload.reason || "The request failed.");
+    }
   } catch {
-    killInfo.results = [...killInfo.results.filter(row => row.reference !== reference), {...stopping, stop: "Stop unconfirmed"}];
+    failed("The request failed.");
   } finally {
     ++killRequest;
     delete killInfo.offers[reference];
     pendingKills.delete(reference);
     showKillResults();
+    if (outside && (outsideKillFailures.has(reference)
+        || killInfo.results.some(row => row.reference === reference && row.stop === "Stop unconfirmed"))) {
+      void refreshKill();
+    }
   }
 });
 
@@ -4097,7 +4170,7 @@ async function tick(supersede=false,current=()=>true) {
   if (!current() || paused) return;
   if (!d.ok || d.error) throw new Error(d.error || "The queue did not answer.");
   render(d);
-  if (performance.now() >= nextKillRead && (!killRead || d.walk.some(row => row.kill_ref)
+  if (performance.now() >= nextKillRead && (!killRead || d.walk.some(row => row.kill_ref) || d.outside_queue?.some(row => row.kill_ref)
       || killInfo.results.length || pendingKills.size)) void refreshKill();
   if (d.report_version !== reportVersion) await loadReport(d.report_version,current);
   if (!current() || paused) return;

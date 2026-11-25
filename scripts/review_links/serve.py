@@ -39,7 +39,7 @@ STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions, slots
 from scripts.aws_target import aws_page, machines_page
-from scripts.build_queue import admission_client, admission_protocol as admission, kill_action, memory_files
+from scripts.build_queue import admission_client, admission_protocol as admission, kill_action, memory_feed, memory_files
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
@@ -2691,7 +2691,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE,
             staff_scope=self.staff_read_scope)
         self.new_item_token: str = secrets.token_urlsafe()
-        self.kill_actions: kill_action.KillActions = kill_action.KillActions(self.store_folder)
+        self.kill_actions: kill_action.KillActions = kill_action.KillActions(
+            self.store_folder, memory_feed.live_outside_kill_targets)
         self.capture_slot: threading.BoundedSemaphore = threading.BoundedSemaphore()
         self.page_captures: PageCaptures = PageCaptures(self.root / PAGE_CAPTURE_FOLDER)
         self.next_attachment_retry: float = time.monotonic() + PAGE_ATTACHMENT_RETRY_SECONDS

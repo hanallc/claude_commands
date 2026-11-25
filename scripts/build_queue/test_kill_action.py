@@ -3,13 +3,14 @@ from __future__ import annotations
 
 from argparse import Namespace
 from collections.abc import Callable
-from contextlib import nullcontext, redirect_stdout
+from contextlib import nullcontext, redirect_stdout, suppress
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 import fcntl
 from io import StringIO
 import json
 import os
+import select
 from pathlib import Path
 import signal
 import socket
@@ -133,6 +134,76 @@ class KillActionTests(unittest.TestCase):
             offers, (result,) = recovered.options(15)
             self.assertEqual(offers, {})
         return result
+
+    def outside_target(self, pid: int, *, replaced: bool = False) -> kill_action.OutsideKillTarget:
+        started = process_start.process_start(pid)
+        assert isinstance(started, process_start.Started)
+        start = str(int(started.start) + 1) if replaced else started.start
+        run = kill_action.OutsideKillCandidate(pid, start, "direct_test.py")
+        return kill_action.OutsideKillTarget(run, staff.StaffId("fixture"), "impl3, a worker", "impl3", "worker")
+
+    @unittest.skipUnless(process_stop.supported(), "The test needs Linux pidfds")
+    def test_outside_kill_stops_only_the_live_command_tree_and_informs_the_owner(self) -> None:
+        reader, ready = socket.socketpair()
+        with reader, ready:
+            reader.settimeout(TEST_HANG_GUARD_SECS)
+            sibling = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
+            command = subprocess.Popen([sys.executable, "-c", """
+import os, signal, sys
+if os.fork() == 0:
+    os.setsid()
+    os.write(int(sys.argv[1]), str(os.getpid()).encode())
+signal.pause()
+""", str(ready.fileno())], pass_fds=(ready.fileno(),))
+            child_fd: IO[bytes] | None = None
+            try:
+                child_fd = os.fdopen(os.pidfd_open(int(reader.recv(32))), "rb")
+                target = self.outside_target(command.pid)
+                reference = target.candidate.reference
+                actions = kill_action.KillActions(self.root, lambda: {reference: target})
+                with (patch.object(kill_action, "live_targets", return_value={}),
+                      patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.SENT) as deliver):
+                    offers, _ = actions.options(15)
+                    outcome = actions.stop(reference, offers[reference]["handle"], "Run it again tomorrow.")
+                    assert not isinstance(outcome, kill_action.NoStopRoute)
+                    self.assertEqual(outcome["stop"], kill_action.StopState.STOPPING)
+                    deliver.assert_not_called()
+                    self.assertEqual(command.wait(TEST_HANG_GUARD_SECS), -signal.SIGKILL)
+                    self.assertEqual(select.select([child_fd], [], [], TEST_HANG_GUARD_SECS)[0], [child_fd])
+                    result = self.resume()
+                    deliver.assert_called_once()
+                    action = cast(kill_action.SavedKillAction, deliver.call_args.args[0])
+                    self.assertEqual(action.recipient, target.recipient)
+                    self.assertTrue(action.message.endswith("\nRun it again tomorrow."))
+                    self.assertEqual(action.result["stop"], kill_action.StopState.STOPPED)
+                    self.assertEqual(result["delivery"], kill_action.DeliveryState.SENT)
+                    self.assertIsNone(sibling.poll())
+            finally:
+                if child_fd is not None:
+                    with child_fd, suppress(ProcessLookupError):
+                        signal.pidfd_send_signal(child_fd.fileno(), signal.SIGKILL)
+                for process in (command, sibling):
+                    process.kill()
+                    _ = process.wait(TEST_HANG_GUARD_SECS)
+
+    @unittest.skipUnless(process_stop.supported(), "The test needs Linux pidfds")
+    def test_outside_kill_refuses_a_reused_pid(self) -> None:
+        with subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"]) as process:
+            try:
+                target = self.outside_target(process.pid, replaced=True)
+                reference = target.candidate.reference
+                actions = kill_action.KillActions(self.root, lambda: {reference: target})
+                with (patch.object(kill_action, "live_targets", return_value={}),
+                      patch.object(signal, "pidfd_send_signal") as send,
+                      patch.object(kill_action, "deliver") as deliver):
+                    offers, _ = actions.options(15)
+                    self.assertIsInstance(actions.stop(reference, offers[reference]["handle"], ""), kill_action.NoStopRoute)
+                    self.assertIsNone(process.poll())
+                    self.assertFalse(list(self.root.rglob("*.json")))
+                    send.assert_not_called()
+                    deliver.assert_not_called()
+            finally:
+                process.kill()
 
     def test_only_local_running_cargo_is_a_candidate(self) -> None:
         reading = reservation_reading()
@@ -347,7 +418,6 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
                 stderr=subprocess.STDOUT, start_new_session=True)
             supervisors.append(process)
             self.addCleanup(process.wait, TEST_HANG_GUARD_SECS)
-            self.addCleanup(process.kill)
             return process
 
         with patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
