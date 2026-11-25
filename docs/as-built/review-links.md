@@ -692,7 +692,9 @@ Questions without an owner remain visible under Owner unavailable.
 These questions have the state Open and retain their previous count totals.
 They have no answer control until an owner becomes available.
 
-The page shows Questions, Responses, Changes, Investigations, Proposals, Efficiencies and Bugs.
+The Type row has All, For you, Questions, Responses, Changes, Investigations, Proposals and Efficiencies.
+Legacy Bug records remain visible under All and in searches by ID.
+Review opens old Bug filter links with All types selected.
 Only a Question filed through the dialog appears as a Response after an answer.
 The Response uses the Question's existing key, owner, exchanges and log.
 The Question stays in its native store during the complete exchange.
@@ -733,7 +735,8 @@ An unknown owner returns to All and clears both owner and source-owner constrain
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The Show row offers All, Open, Waiting, Done, and Validating below the Type row.
+The Show row offers All, Open, and Done below the Type row.
+Old Waiting and Validating links select Open.
 Review expands legacy filter names in the query and fragment before it combines them.
 The query wins for names in LIST_QUERY_FIELDS that both sources supply.
 The fragment wins for other names, including sort and dir.
@@ -768,7 +771,7 @@ If List filing fails, the verdict stays available for retry.
 **Ask question** sends the question through the native reply path.
 The change leaves Open and its counts when the request starts.
 A failed save restores the row and its counts.
-An unmoved Validating change opens from its row in Validating and All.
+An unmoved Validating change opens from its row in All.
 The row and card show **With <validator> · Validating for <duration>**.
 The validation record stores the validator’s staff ID.
 The page resolves the name from that ID.

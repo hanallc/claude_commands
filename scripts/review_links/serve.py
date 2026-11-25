@@ -1044,8 +1044,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 else:
                     filters = parse_qs(route.query, keep_blank_values=True)
                     show = filters.get('show', filters.get('state', ['open']))[0]
-                    kind = filters.get('type', [''])[0]
-                    content = snapshot.render(show=show or 'open', kind=kind)
+                    content = snapshot.render(show=show or 'open')
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))

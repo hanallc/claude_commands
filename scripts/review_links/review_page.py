@@ -44,21 +44,17 @@ CARD_COLUMNS = ('<colgroup><col style="width:17%"><col style="width:13%"><col st
 TYPES = tuple(ReviewType)
 WIRE_TYPES = tuple(kind for kind in TYPES if kind != ReviewType.RESPONSE)
 TYPE_CHIPS = (ReviewType.FOR_YOU, *review_items.QUESTION_TYPES,
-              *(kind for kind in TYPES if kind not in (*review_items.QUESTION_TYPES, ReviewType.FOR_YOU)))
+              *(kind for kind in TYPES
+                if kind not in (*review_items.QUESTION_TYPES, ReviewType.FOR_YOU, ReviewType.BUG)))
 ICONS = {ReviewType.QUESTION: 'circle-help', ReviewType.CHANGE: 'diff', ReviewType.INVESTIGATION: 'microscope',
          ReviewType.PROPOSAL: 'lamp', ReviewType.EFFICIENCY: 'zap', ReviewType.BUG: 'bug', ReviewType.RESPONSE: 'inbox',
          ReviewType.FOR_YOU: 'inbox'}
 INDEX_STATES = (ReviewState.OPEN, ReviewState.WAITING, ReviewState.VALIDATING, ReviewState.DONE)
-SHOWS = (('all', 'All'), ('open', 'Open'), (ReviewState.WAITING, 'Waiting'), (ReviewState.DONE, 'Done'),
-         (ReviewState.VALIDATING, 'Validating'))
+SHOWS = (('all', 'All'), ('open', 'Open'), (ReviewState.DONE, 'Done'))
 SHOW_VALUES = tuple(value for value, _ in SHOWS)
-SHOWS_BY_TYPE: dict[str, tuple[str, ...]] = {
-    ReviewType.FOR_YOU: tuple(value for value in SHOW_VALUES if value != ReviewState.VALIDATING),
-    ReviewType.RESPONSE: tuple(value for value in SHOW_VALUES if value != ReviewState.VALIDATING),
-}
 SHOW_CHIPS = tuple(record_table.Chip(value, label) for value, label in SHOWS)
 LABELS = {ReviewType.QUESTION: 'Questions', ReviewType.CHANGE: 'Changes', ReviewType.INVESTIGATION: 'Investigations',
-          ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies', ReviewType.BUG: 'Bugs',
+          ReviewType.PROPOSAL: 'Proposals', ReviewType.EFFICIENCY: 'Efficiencies',
           ReviewType.RESPONSE: 'Responses', ReviewType.FOR_YOU: 'For you'}
 FRONT_MATTER = re.compile(r'\A\ufeff?---[ \t]*\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)', re.DOTALL)
 CARD_ERROR = b'<p role="status" data-review-card-unavailable>This card is not available.</p>'
@@ -215,9 +211,8 @@ class ReviewSnapshot:
     def index_response(self) -> bytes:
         return self.full_index.body
 
-    def render(self, *, show: str = 'open', kind: str = '') -> bytes:
-        allowed = SHOWS_BY_TYPE.get(kind, SHOW_VALUES)
-        selected = next((value for value in allowed if value.lower() == show.lower()), 'open')
+    def render(self, *, show: str = 'open') -> bytes:
+        selected = next((value for value in SHOW_VALUES if value.lower() == show.lower()), 'open')
         if selected == 'open':
             return self.page
         return self.page.replace(b'data-show="open"', f'data-show="{selected}"'.encode(), 1).replace(
@@ -1313,6 +1308,7 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
         +page_frame.title('Review', 'review', status_companion=search)
         +'<div class="review-queue">'
         +record_table.chip_row('Type', type_chips, 'all')
+        +'<template data-review-bug-icon>'+icon(ReviewType.BUG)+'</template>'
         +record_table.chip_row('Show', SHOW_CHIPS, show)
         +record_table.chip_row('Owner', owner_chips, 'all', encode_values=True)
         +'<div class="list-filters">'
@@ -2116,11 +2112,10 @@ function reviewQueue(entry,now){
 function rowShows(entry){
  if(entry.actionStatus==='withdrawn') return [];
  const queue=questionQueue(reviewQueues[entry.state],entry.unreadAnswer,false,false,false);
- const show=showsForQueue[queue];
- return entry.state==='Validating' && show==='open' ? ['open','Validating'] : [show];
+ return [showsForQueue[queue]];
 }
 function typeChipShow(show,type){
- return type==='for-you' || type==='response' && show==='Validating' ? 'open' : show;
+ return type==='for-you' ? 'open' : show;
 }
 function availableForFilters(entry,{query,keys,now=Date.now()}){
  const linked=keys?.has(entry.key);
@@ -2180,7 +2175,6 @@ function updateReviewChips(rows,filters,matches,shown){
   filterControl.setCount(button,id===owner ? shown : owners.get(id) ?? 0);
  }
  const showCounts=owner && !ownerTypes.has(type) ? anyOwnerShowCounts : shows;
- filterControl.setVisible(showRow,showChoices(type));
  for(const button of filterControl.buttons(showRow)){
   const value=filterControl.value(button);
   filterControl.setCount(button,value===show ? shown : showCounts.get(value) ?? 0);
@@ -2224,11 +2218,10 @@ try{
 storeSavedVerdicts();
 const filterRow=name=>filterControl.row(content,name);
 const showValues=filterControl.buttons(filterRow('show')).map(button=>filterControl.value(button));
-const showsByType=new Map(''' + json.dumps(tuple(SHOWS_BY_TYPE.items())) + r''');
-const showChoices=type=>showsByType.get(type) ?? showValues;
 const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
  entries:allEntries,mount:entry=>reviewCardSummary(entry,Number(content.dataset.titleLimit),
-  filterRow('type').querySelector('[data-filter-value="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
+  entry.type==='bug' ? content.querySelector('[data-review-bug-icon]').innerHTML :
+   filterRow('type').querySelector('[data-filter-value="'+entry.type+'"] .review-icon').outerHTML),mounted:()=>loadBodies(),
  focusKey:()=>focusAfterLoad?.key,
  pinOpenRow:key=>{
   const pending=pendingSaves.get(key);
@@ -2238,10 +2231,11 @@ const view=createRecordTable({...reviewPlaceOptions,content:()=>content,
  rememberItem,
  place:params=>{
   reviewPlace(params);
+  if(params.get('type')==='bug') params.delete('type');
   const show=showValues.find(value=>value.toLowerCase()===params.get('show')?.toLowerCase());
   if(show) params.set('show',show);
  },
- selectShow:(show,type)=>showChoices(type).includes(show) ? show : 'open',
+ selectShow:show=>showValues.includes(show) ? show : 'open',
  persistLinkedTarget:true,
  missingItem:()=> 'This review is no longer on the Review page.',
  resolveOwner:owner=>{
