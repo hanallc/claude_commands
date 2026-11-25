@@ -2,6 +2,7 @@
 """Tests for tidy_wrapped.py: only a wrapped production with no update timer loses its state files."""
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents import remote
 
 import json
@@ -52,6 +53,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state = self.root / "showrunner"

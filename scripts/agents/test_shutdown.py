@@ -56,7 +56,7 @@ class EnrolledProductionShutdownTests(StaffTestCase):
         super().setUp()
         self.repository = self.root / "main"
         self.integration = self.root / "integration"
-        self.environment = {**fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
+        self.environment = {**os.environ, **fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
                             "XDG_STATE_HOME": str(self.root / "state"),
                             "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner")}
         self.enterContext(patch.dict(os.environ, self.environment, clear=True))

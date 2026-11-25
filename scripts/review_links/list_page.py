@@ -18,12 +18,13 @@ from functools import cache
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
+from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import change_review, delivery_state, footer_counts, record_store, session_staff, staff, the_list
+from scripts.production import change_review, delivery_state, footer_counts, record_store, repeat_rule, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, page_question, question_path
@@ -55,6 +56,7 @@ class ListChip(StrEnum):
     WORKING = "working"
     BLOCKED = "blocked"
     PARKED = "parked"
+    SCHEDULED = "scheduled"
 
     @property
     def label(self) -> str:
@@ -86,7 +88,8 @@ CHIP_BY_QUEUE = {
 FILTER_FIELDS = {"show": "chip", "owner": "owner", "producer": "producer"}
 FILTER_FACETS = record_table.filter_facets(FILTER_FIELDS)
 STAFF_FILTERS = ("owner", "producer")
-SEARCH_FIELDS = {"number": r"^#?l?(?=[0-9])", "ownerName": "", "title": "", "state": "", "parkingLabel": ""}
+SEARCH_FIELDS = {"number": r"^#?l?(?=[0-9])", "ownerName": "", "title": "", "state": "",
+                 "parkingLabel": "", "requestWords": ""}
 PARKED_SEARCH_LABEL = search_fold.fold("Parked")
 STATE_SEARCH_TEXT = {state: search_fold.fold(state.value) for state in the_list.ItemState}
 UNREAD_FILTER = ("unread", "1", "true")
@@ -109,6 +112,7 @@ def normalize_search_text(text: str) -> str:
 class SearchText(NamedTuple):
     owner: str
     title: str
+    request: str
 
 
 def show_aliases() -> dict[str, dict[str, ListChip]]:
@@ -131,6 +135,8 @@ SHOW_ALIASES = show_aliases()
 def list_chip(state: the_list.ItemState, *, parked: bool, open_question: bool,
               unread_delivery: bool = False, unread_answer: bool = False, open_ask: bool = False) -> ListChip:
     """Find the one status chip for this item."""
+    if state is the_list.ItemState.SCHEDULED:
+        return ListChip.SCHEDULED
     queue = question_path.queue(QUEUE_BY_STATE[state], unread_answer=unread_answer or open_ask, later=parked,
                                 unread_delivery=unread_delivery, waiting_for_answer=open_question)
     return CHIP_BY_QUEUE[queue]
@@ -164,7 +170,7 @@ class TopPriorityMark(Enum):
 
 STATE_TONES = {the_list.ItemState.WAITING_FOR_NATE: "warning", the_list.ItemState.BLOCKED: "error",
                the_list.ItemState.WORKING: "accent", the_list.ItemState.DELIVERED: "room",
-               the_list.ItemState.DONE: "room"}
+               the_list.ItemState.DONE: "room", the_list.ItemState.SCHEDULED: "scheduled"}
 TOP_FLAG = ('<svg class="list-top-flag" viewBox="0 0 16 16" aria-hidden="true" focusable="false">'
             '<path d="M3 1v14h1.7V9.6h3.1l.6 1.4H13V3.4H9.2L8.6 2H4.7V1z"/></svg>')
 
@@ -205,7 +211,8 @@ def parked_for_delivery(item: the_list.ListItem) -> bool:
 def waiting_updates(_request: console.NewsRequest) -> frozenset[str]:
     """Identify each unread update by its record and time."""
     return frozenset(f"{entry.key}/{entry.item.unread_since.isoformat()}" for entry in records()
-                     if isinstance(entry.item.unread_since, datetime)
+                     if entry.item.state is not the_list.ItemState.SCHEDULED
+                     and isinstance(entry.item.unread_since, datetime)
                      and (not parked_for_delivery(entry.item) or the_list.unread_answer_ids(entry.item)))
 
 
@@ -225,6 +232,55 @@ def eta_text(eta: the_list.Eta, today: datetime) -> str:
 def short_list_time(moment: datetime, zone: tzinfo | None) -> str:
     local = moment.astimezone(zone)
     return f"{local:%b} {local.day} {local:%H:%M %Z}"
+
+
+@dataclass(frozen=True)
+class UpcomingSeriesRun:
+    selected: the_list.SeriesRun
+    series: the_list.ScheduledSeries
+
+
+@dataclass(frozen=True)
+class ExhaustedSeries:
+    series: the_list.ScheduledSeries
+
+
+type DisplayedSchedule = the_list.NoSchedule | the_list.ScheduledRun | UpcomingSeriesRun | ExhaustedSeries
+
+
+def schedule_display(item: the_list.ListItem) -> DisplayedSchedule:
+    schedule = item.schedule
+    if item.state is the_list.ItemState.SCHEDULED:
+        if isinstance(schedule, the_list.ScheduledRun):
+            return schedule
+        if isinstance(schedule, the_list.ScheduledSeries):
+            run = schedule.next_run()
+            if isinstance(run, the_list.SeriesRun):
+                return UpcomingSeriesRun(run, schedule)
+            return ExhaustedSeries(schedule)
+    return the_list.NoSchedule.UNSET
+
+
+def schedule_label(schedule: DisplayedSchedule, today: datetime) -> str:
+    if isinstance(schedule, the_list.ScheduledRun):
+        return "Starts " + short_list_time(schedule.start, today.tzinfo)
+    if isinstance(schedule, (UpcomingSeriesRun, ExhaustedSeries)):
+        series = schedule.series
+        words = series.describe()
+        if isinstance(schedule, UpcomingSeriesRun):
+            return words + " · next " + short_list_time(schedule.selected.run.start, today.tzinfo)
+        return words + " · No next run"
+    return ""
+
+
+def displayed_work(item: the_list.ListItem, schedule: DisplayedSchedule) -> tuple[the_list.Eta, str]:
+    if isinstance(schedule, the_list.ScheduledRun):
+        return schedule.start, schedule.words
+    if isinstance(schedule, UpcomingSeriesRun):
+        return schedule.selected.run.start, schedule.selected.run.words
+    if isinstance(schedule, ExhaustedSeries):
+        return the_list.EtaStatus.NO_TIME_YET, schedule.series.first.words
+    return item.eta, item.next_step
 
 
 def check_row_html(check: the_list.NextCheck, today: datetime, *, parked: bool) -> str:
@@ -329,12 +385,22 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
     if isinstance(content, the_list.FieldChange):
         heading = content.action + by
         body = f'<strong>{heading}</strong>'
-        if fields:
-            details: list[str] = []
-            for field, value in fields.items():
-                label = names.role_label(field, FIELD_LABELS[field])
-                details.append(f'<dt>{label}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>')
-            body += '<dl>' + ''.join(details) + '</dl>'
+        visible_fields = [(field, value) for field, value in fields.items() if field != "schedule"]
+        if isinstance(schedule := fields.get("schedule"), (the_list.ScheduledRun, the_list.ScheduledSeries)):
+            run = schedule.first if isinstance(schedule, the_list.ScheduledSeries) else schedule
+            body += f'<p>Starts {html.escape(short_list_time(run.start, today.tzinfo))}</p>'
+            if isinstance(schedule, the_list.ScheduledSeries):
+                body += '<p>' + html.escape(schedule.rule.describe(run.start)) + '</p>'
+            body += change_browser.question_paragraphs(run.words)
+            if isinstance(schedule, the_list.ScheduledSeries):
+                for exception in schedule.exceptions:
+                    if isinstance(exception.run, the_list.ScheduledRun):
+                        body += f'<p>Run {exception.number} · {html.escape(short_list_time(exception.run.start, today.tzinfo))}</p>'
+                        body += change_browser.question_paragraphs(exception.run.words)
+        if visible_fields:
+            body += '<dl>' + ''.join(
+                f'<dt>{names.role_label(field, FIELD_LABELS[field])}</dt><dd>{log_field_html(field, value, today, names, evidence_id)}</dd>'
+                for field, value in visible_fields) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
         label = {"pending": "Feedback for", "sent": "Feedback sent to", "alerted": "Feedback could not reach"}[content.state]
         recipient = content.recipient_id(keeper)
@@ -363,6 +429,8 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
         body = content.action + ": " + html.escape(", ".join(content.keys)) + by
     elif isinstance(content, the_list.EvidenceCopyRemoved):
         body = f"Removed the migration copy of {content.copy} from {FIELD_LABELS['evidence']}" + by
+    elif isinstance(content, the_list.AskWithdrawn):
+        body = f"Ask {html.escape(content.ask.ask_id)} withdrawn" + by + " " + html.escape(content.reason)
     elif isinstance(content, (the_list.AskOpened, the_list.GoGiven)):
         ask = content.ask
         target = names.html(ask.target, owner_name(names.members, ask.target))
@@ -494,33 +562,89 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
                    for name, value in fields.items())
 
 
+REPEAT_CHOICES = (
+    ("none", "Does not repeat"), ("daily", "Daily"), ("weekly", "Weekly"),
+    ("monthly", "Monthly"), ("yearly", "Annually"),
+    ("weekdays", "Every weekday (Monday to Friday)"), ("custom", "Custom…"),
+)
+
+
+def schedule_fields(entry: ListRecord, schedule: DisplayedSchedule,
+                    members: staff.StaffSnapshot, key: str, zone: ZoneInfo) -> str:
+    owner = html.escape(owner_name(members, entry.item.owner))
+    producer = html.escape(owner_name(members, entry.item.producer))
+    options = ''.join(f'<option value="{value}">{label}</option>' for value, label in REPEAT_CHOICES)
+    attributes = f' data-revision="{the_list.schedule_revision(entry.item.schedule)}"'
+    words = ""
+    if isinstance(schedule, (UpcomingSeriesRun, ExhaustedSeries)):
+        series = schedule.series
+        first = series.first.start
+        origin = first.strftime("%Y-%m-%dT%H:%M")
+        attributes += f' data-rule="{html.escape(series.rule.rrule, quote=True)}" data-repeat-start="{origin}"'
+        attributes += f' data-repeat-text="{html.escape(series.rule.describe(first), quote=True)}"'
+        if isinstance(first.tzinfo, ZoneInfo):
+            attributes += f' data-repeat-zone="{html.escape(first.tzinfo.key, quote=True)}"'
+        else:
+            offset = first.utcoffset()
+            assert offset is not None
+            attributes += f' data-repeat-offset="{offset.total_seconds():g}"'
+        words = series.first.words
+    if isinstance(schedule, UpcomingSeriesRun):
+        attributes += f' data-run="{schedule.selected.number}"'
+        if schedule.series.finished_runs:
+            attributes += ' data-following'
+        schedule = schedule.selected.run
+    if isinstance(schedule, the_list.ScheduledRun):
+        start = schedule.start.astimezone(zone).strftime("%Y-%m-%dT%H:%M")
+        attributes += f' data-start="{start}"'
+        words = schedule.words
+    return (f'<div class="list-schedule-fields" data-schedule-fields{attributes}>'
+            + f'<label for="schedule-words-{key}">At that time, do this</label>'
+            + f'<textarea id="schedule-words-{key}" rows="3" maxlength="10000" data-schedule-words>'
+            + html.escape(words) + '</textarea>'
+            + f'<small>Goes to {owner}, the owner. A copy goes to {producer}, the producer.</small>'
+            + f'<label data-repeat-field for="repeat-{key}" hidden>Repeat</label>'
+            + f'<select id="repeat-{key}" data-repeat hidden>{options}</select>'
+            + '<button type="button" data-edit-custom hidden>Edit custom repeat</button>'
+            + '<p role="status" data-schedule-status></p></div>')
+
+
 def top_button(mark: TopPriorityMark) -> str:
     """Render the Make top priority button of an item panel."""
     return '<button name="action" value="top">Make top priority</button>' if mark is TopPriorityMark.MAKE_TOP else ''
 
 
-def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapshot, parking_label: str = "",
-                  mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
+def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapshot, parking_label: str,
+                  schedule: DisplayedSchedule, today: datetime, mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
     hidden = signed_form_fields(entry, secret)
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     top = top_button(mark)
     key = html.escape(entry.key.replace('/', '-'), quote=True)
-    parked = '' if parking_label else ' hidden'
-    note = 'Parked until ' + parking_label if parking_label else ''
+    scheduled = not isinstance(schedule, the_list.NoSchedule)
+    label = html.escape(schedule_label(schedule, today))
+    parked = '' if parking_label or scheduled else ' hidden'
+    note = label if scheduled else ('Parked until ' + parking_label if parking_label else '')
+    picker_label = "Edit schedule" if scheduled else "Park"
+    start_now = ('<button name="action" value="start-now">Start now</button>'
+                 if isinstance(schedule, (the_list.ScheduledRun, UpcomingSeriesRun)) else '')
+    zone = user_zone()
+    schedule_editor = schedule_fields(entry, schedule, members, key, zone)
     producer_name = owner_name(members, entry.item.producer)
     producer_label = html.escape(producer_name, quote=True)
     words_label = html.escape(f"Your words for {producer_name} about this item", quote=True)
     return (f'<form method="post" data-feedback-form data-recipient-name="{producer_label}">' + hidden
             + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read + top
-            + f'<div class="list-parking-actions"><button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
-            + record_table.park_control("Park", field="until", action="action", value="park",
-                                        identity="park-" + key, allow_delivery=True) + '</div></div>'
+            + f'<div class="list-parking-actions">{start_now}<button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
+            + '<div class="list-park">' + record_table.park_control(
+                picker_label, field="until", action="action", value="park", identity="park-" + key, allow_delivery=True)
+            + '</div></div></div>'
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + f'placeholder="{words_label}" aria-label="{words_label}"></textarea>'
             + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
-            + '<button name="action" value="question" disabled>Ask question</button>'
-            + f'<button name="action" value="tell" disabled>Tell {producer_label}</button></div></form>')
+            + ('' if scheduled else '<button name="action" value="question" disabled>Ask question</button>')
+            + f'<button name="action" value="tell" disabled>Tell {producer_label}</button></div>'
+            + '<template data-schedule-template>' + schedule_editor + '</template></form>')
 
 
 def review_card_link(key: str, label: str) -> str:
@@ -612,6 +736,7 @@ ASK_BUTTONS = {the_list.AskKind.GO: "Go", the_list.AskKind.APPROVAL: "Approved"}
 ASK_NOTES = {the_list.AskKind.GO: "Pressing Go sends your go to {agent}.",
              the_list.AskKind.APPROVAL: "Pressing Approved sends your approval to {agent}."}
 UNIT_ROLES = {"direct": ("a", "unit director"), "merge": ("the", "merge director"), "style": ("the", "style director")}
+KIND_ROLES = {"unit": "unit director", "session": "standalone session"}
 
 
 def staff_role_html(member: staff.StaffRow, names: staff_names.StaffNames) -> str:
@@ -619,7 +744,7 @@ def staff_role_html(member: staff.StaffRow, names: staff_names.StaffNames) -> st
     if member.kind == "producer" and member.name == "morty":
         return "the " + names.role_label("producer", "List producer")
     article, role = (UNIT_ROLES[member.unit_type.value] if isinstance(member.unit_type, staff.UnitDetails)
-                     else ("a", "unit director" if member.kind == "unit" else member.kind))
+                     else ("a", KIND_ROLES.get(member.kind, member.kind)))
     parent = names.members.by_id(member.parent.id) if isinstance(member.parent, staff.ReportsTo) else None
     return article + " " + names.role_label(role, role) + (" of " + names.html(parent.id, parent.name) if parent is not None else "")
 
@@ -650,18 +775,20 @@ def ask_boxes(entry: ListRecord, secret: str, names: staff_names.StaffNames) -> 
 
 
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
-                 unread_answers: frozenset[str], asks: str = "") -> str:
+                 unread_answers: frozenset[str], asks: str = "",
+                 schedule: DisplayedSchedule = the_list.NoSchedule.UNSET) -> str:
     log = item_log_html(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     item = entry.item
     status_time = item.latest_status_time
     status_stamp = " · " + time_html(status_time, today) if item.latest_status and isinstance(status_time, datetime) else ""
+    eta, next_step = displayed_work(item, schedule)
     fields = ''.join(
         f'<section class="list-field-{field}"><h3>{FIELD_LABELS[field]}'
         + (status_stamp if field == "latest_status" else "") + '</h3>'
         + field_html(field, value, today, names) + '</section>'
-        for field, value in (("state", item.state), ("eta", item.eta), ("latest_status", item.latest_status),
-                             ("next_step", item.next_step), ("done_when", item.done_when)))
+        for field, value in (("state", item.state), ("eta", eta), ("latest_status", item.latest_status),
+                             ("next_step", next_step), ("done_when", item.done_when)))
     return ('<div class="list-panel"><div>' + asks + '<div class="list-item-fields">' + fields
             + '</div><div data-list-item-content>' + sections + '</div>'
             + '</div>' + record_table.log_panel(log_id, log) + '</div>')
@@ -753,7 +880,8 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
-            unread_answers: frozenset[str], *, parking_label: str, mark: TopPriorityMark) -> str:
+            unread_answers: frozenset[str], *, parking_label: str,
+            schedule: DisplayedSchedule, mark: TopPriorityMark) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer):
         return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark)
@@ -763,25 +891,36 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
                  for number in item.related_to)
     sections = '<section><h3>Links</h3><ul>' + ''.join(links) + '</ul></section>' if links else ''
     sections += review_links(item, reviews, today)
-    questions = panel_questions(item, today, unread_answers, visibility.failed)
-    form = feedback_form(entry, secret, members=names.members, parking_label=parking_label, mark=mark)
+    questions = panel_questions(item, today, unread_answers, visibility.failed) if isinstance(schedule, the_list.NoSchedule) else ''
+    form = feedback_form(entry, secret, members=names.members, parking_label=parking_label,
+                         schedule=schedule, today=today, mark=mark)
     return waiting_note(entry, names, hidden=True) + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers, ask_boxes(entry, secret, names))
+        entry, sections + questions + form, today, names, unread_answers, ask_boxes(entry, secret, names), schedule)
+
+
+def original_request_words(item: the_list.ListItem) -> str:
+    for change in item.log:
+        event = change.what
+        if isinstance(event, the_list.FieldChange) and event.action == "Added":
+            return event.fields.get("latest_status", "")
+    return ""
 
 
 def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime, index: int, secret: str,
               reviews: ReviewDisplay, *, owner_cell: str, owner_sort: str, search_text: SearchText, parked: bool,
               open_question: bool, open_ask: bool, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
               unread_answers: frozenset[str],
-              mark: TopPriorityMark, hidden: bool = False) -> str:
+              schedule: DisplayedSchedule, mark: TopPriorityMark, hidden: bool = False) -> str:
     item = entry.item
     producer = owner_name(names.members, item.producer)
     unread = isinstance(item.unread_since, datetime)
     waiting = isinstance(visibility, the_list.WaitingForAnswer)
-    due = the_list.eta_due(item.eta)
-    eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(item.eta, today).casefold())
+    scheduled = not isinstance(schedule, the_list.NoSchedule)
+    eta, next_step = displayed_work(item, schedule)
+    due = the_list.eta_due(eta)
+    eta_sort: tuple[int, float | str] = (0, due.timestamp()) if due is not None else (1, eta_text(eta, today).casefold())
     values = (item.number, owner_sort, producer.casefold(), item.title.casefold(), item.state.value.casefold(),
-              item.next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
+              next_step.casefold(), eta_sort, item.unread_since.timestamp() if isinstance(item.unread_since, datetime) else 0)
     parking = (the_list.ParkUntilDelivered.DELIVERED.value
                if item.parked_until is the_list.ParkUntilDelivered.DELIVERED else str(parked).lower())
     key = entry.key
@@ -791,7 +930,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         "unread": str(unread).lower(), "parked": parking, "waiting-for-answer": str(waiting).lower(),
         "open-question": str(open_question).lower(), "unread-delivery": str(the_list.unread_delivery(item)).lower(),
         "unread-answer": str(bool(unread_answers)).lower(), "open-ask": str(open_ask).lower(),
-        "title": search_text.title, "owner-name": search_text.owner,
+        "title": search_text.title, "owner-name": search_text.owner, "request-words": search_text.request,
         "order": str(index), "sort-values": json.dumps(values, ensure_ascii=False),
     }
     keeper = names.members.by_id(entry.keeper)
@@ -817,7 +956,9 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
         state += producer_answering_note(names)
-    state += check_row_html(item.next_check, today, parked=parked)
+    state += check_row_html(item.next_check, today, parked=parked or scheduled)
+    if scheduled:
+        state += '<small data-scheduled-note>' + html.escape(schedule_label(schedule, today)) + '</small>'
     parking_label = field_html("parked_until", item.parked_until, today, names) if parked else ""
     if parking_label:
         state += '<small data-parked-note>Parked until ' + parking_label + '</small>'
@@ -839,20 +980,20 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
             alert = names.html(feedback.alerted_to) + " told" if feedback.alerted_to else "no showrunner for alert"
             notice = f"not sent to {recipient}; {alert}"
             update += '<small>' + notice + ", " + html.escape(list_time(sent, today)) + '</small>'
-    overdue = due is not None and due < today and item.state != the_list.ItemState.CLOSED
+    overdue = not scheduled and due is not None and due < today and item.state != the_list.ItemState.CLOSED
     eta_class = "list-eta warning" if overdue else "list-eta"
-    full_eta = field_html("eta", item.eta, today, names)
-    short_eta = html.escape(eta_cell_text(item.eta, today))
+    full_eta = field_html("eta", eta, today, names)
+    short_eta = html.escape(eta_cell_text(eta, today))
     eta_cell = (f'<span class="{eta_class}" id="list-eta-{row_id}" tabindex="0" title="{full_eta}">'
                 + f'<span class="list-eta-text">{short_eta}</span>'
                 + f'<span class="list-eta-full" aria-hidden="true">{full_eta}</span></span>')
     cells = (number, owner_cell, field_html("producer", item.producer, today, names),
-             title, state, field_html("next_step", item.next_step, today, names), eta_cell, update)
+             title, state, field_html("next_step", next_step, today, names), eta_cell, update)
     row = ''.join(f'<td' + (' class="record-id"' if label == '#' else '')
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden_attr = ' hidden' if hidden else ''
     body = details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label,
-                   mark=mark)
+                   schedule=schedule, mark=mark)
     revision = detail_revision(item, body)
     return (f'<tbody data-list-item{attrs} data-detail-revision="{revision}"{hidden_attr}><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
@@ -920,6 +1061,13 @@ class SavedActionState(TypedDict):
     detail_html: NotRequired[str]
     detail_revision: NotRequired[str]
     detail_closed: NotRequired[bool]
+    remove_request_saved: NotRequired[bool]
+    scheduled_note: NotRequired[str]
+    next_step_html: NotRequired[str]
+    next_step_sort: NotRequired[str]
+    eta_short: NotRequired[str]
+    eta_full: NotRequired[str]
+    eta_sort: NotRequired[tuple[int, float | str]]
 
 
 def saved_action_state(keeper: str, identity: str, *, status: change_page.DeliveryStatus | None = None,
@@ -940,25 +1088,37 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     today = the_list.now()
     local_today = today.astimezone(zone)
     parking = item.parked_until
-    parked = the_list.parking_active(parking, today)
-    parked_until = parked_label(parking, zone) if parked and parking is not the_list.NoTimestamp.UNSET else ""
+    parked_until = (parked_label(parking, zone)
+                    if parking is not the_list.NoTimestamp.UNSET and the_list.parking_active(parking, today) else "")
+    parked = bool(parked_until)
+    schedule = schedule_display(item)
+    scheduled = not isinstance(schedule, the_list.NoSchedule)
     unread = item.unread_since
     unread_answers = the_list.unread_answer_ids(item)
     reading = status if status is not None else change_page.DeliveryStatus(review_link.review_root())
-    open_question = item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
-    visibility = the_list.question_visibility(owner, item, reading)
+    open_question = not scheduled and item.state != the_list.ItemState.CLOSED and the_list.has_open_question(item)
+    visibility = the_list.QuestionAttention() if scheduled else the_list.question_visibility(owner, item, reading)
     waiting = open_question and isinstance(visibility, the_list.WaitingForAnswer)
     open_ask = bool(the_list.answerable_asks(item, staff.snapshot()))
     saved: SavedActionState = {"unread": str(isinstance(unread, datetime)).lower(),
                                "unread_sort": unread.timestamp() if isinstance(unread, datetime) else 0,
                                "item_state": item.state.value,
                                "parked": str(parked).lower(), "parked_until": parked_until,
-                               "check_html": check_row_html(item.next_check, local_today, parked=parked),
+                               "check_html": check_row_html(item.next_check, local_today, parked=parked or scheduled),
                                "waiting_for_answer": str(waiting).lower(),
                                "open_question": str(open_question).lower(),
                                "open_ask": str(open_ask).lower(),
                                "unread_delivery": str(the_list.unread_delivery(item)).lower(),
                                "unread_answer": str(bool(unread_answers)).lower()}
+    if scheduled:
+        saved["scheduled_note"] = schedule_label(schedule, local_today)
+    if include_detail:
+        eta, next_step = displayed_work(item, schedule)
+        due = the_list.eta_due(eta)
+        saved.update(next_step_html=change_browser.question_paragraphs(next_step or "Not recorded"),
+                     next_step_sort=next_step.casefold(), eta_short=eta_cell_text(eta, local_today),
+                     eta_full=eta_text(eta, local_today),
+                     eta_sort=(0, due.timestamp()) if due is not None else (1, eta_text(eta, local_today).casefold()))
     if park_request:
         try:
             prefix, retry = ListFormRequestPrefix.parse(park_request)
@@ -968,6 +1128,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         else:
             park_request = prefix.format() + retry
         saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
+        notice = the_list.feedback_requests(item).get(park_request)
+        saved["remove_request_saved"] = notice is not None and notice.action == "remove"
     if waiting or include_detail and item.state != the_list.ItemState.CLOSED:
         members = staff.snapshot()
         names = staff_names.StaffNames(members)
@@ -983,7 +1145,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         secret = form_secret(reading.root)
         body = details(ListRecord(owner, item), local_today, secret, reviews, names,
                        visibility, unread_answers, parking_label=parked_until,
-                       mark=top_priority_mark(top_priority, members, item))
+                       schedule=schedule, mark=top_priority_mark(top_priority, members, item))
         if waiting:
             saved["waiting_details_html"] = body
         if include_detail:
@@ -1046,13 +1208,70 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus | None = No
     return save_action(root, body, status)[0]
 
 
+class KeepRepeat(Enum):
+    UNCHANGED = "keep the saved repeat rule"
+
+
+@dataclass(frozen=True)
+class SchedulePageAction:
+    """The schedule fields submitted with a signed List action."""
+
+    scope: the_list.ScheduleScope
+    run_number: int
+    words: str
+    repeat: str | KeepRepeat
+    revision: str = ""
+
+    @classmethod
+    def parse(cls, fields: Mapping[str, list[str]]) -> SchedulePageAction:
+        scope = the_list.ScheduleScope(fields.get("scope", [""])[0])
+        number = fields.get("run", ["0"])[0]
+        if re.fullmatch(r"[0-9]{1,10}", number) is None:
+            raise question_record.AnswerRefused("use the run shown on the List page")
+        words = fields.get("schedule_words", [""])[0].strip()
+        if len(words) > 10000:
+            raise question_record.AnswerRefused("Use at most 10000 characters for the instruction.")
+        revision = fields.get("schedule_revision", [""])[0]
+        if revision and re.fullmatch(r"[0-9a-f]{64}", revision) is None:
+            raise question_record.AnswerRefused("Use the schedule shown on the List page.")
+        return cls(scope, int(number), words, fields["repeat"][0] if "repeat" in fields else KeepRepeat.UNCHANGED,
+                   revision)
+
+    def receipt_words(self, action: str, until: str) -> str:
+        rule = self.repeat if isinstance(self.repeat, str) else None
+        fields = (action, self.scope, self.run_number, self.words, rule, until)
+        return json.dumps((*fields, self.revision) if self.revision else fields)
+
+
+def save_schedule(keeper: staff.StaffId, identity: str, request: str, operation: the_list.ScheduleOperation,
+                  until: str, submitted: SchedulePageAction, expected: the_list.ScheduleExpectation) -> None:
+    zone = user_zone()
+    edits: the_list.ScheduleChanges = {}
+    if until:
+        if the_list.ISO_TIME.fullmatch(until) is None or "T" not in until:
+            raise question_record.AnswerRefused("Choose a start time with a UTC offset.")
+        moment = datetime.fromisoformat(until)
+        if moment.utcoffset() is None:
+            raise question_record.AnswerRefused("Choose a start time with a UTC offset.")
+        edits["start"] = moment.astimezone(zone)
+    if submitted.words:
+        edits["words"] = submitted.words
+    if isinstance(submitted.repeat, str):
+        edits["repeat"] = repeat_rule.parse(submitted.repeat) if submitted.repeat else the_list.RemoveRepeat.KEEP_ONE_RUN
+    receipt = the_list.PageRequest(request, "park", submitted.receipt_words(operation, until))
+    _ = the_list.save_page_schedule(keeper, identity, operation, edits, scope=submitted.scope, expected=expected,
+                                    repeat_zone=zone, receipt=receipt)
+
+
 def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None = None, *,
                 review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
                 include_detail: bool = False,
                 top_priority: TopPriority = TopPriority.HIDDEN) -> tuple[ListActionSubmission, SavedActionState | None]:
     """Accept signed item actions and save their notices."""
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
-    if (set(fields) != {"keeper", "id", "request", "token", "action", "words", "until"}
+    required = {"keeper", "id", "request", "token", "action", "words", "until"}
+    if (not required <= fields.keys()
+            or fields.keys() - required - {"scope", "run", "schedule_words", "repeat", "schedule_revision"}
             or any(len(values) != 1 for values in fields.values())):
         raise question_record.AnswerRefused("use the form on this page")
     keeper, identity = staff.StaffId(fields["keeper"][0]), fields["id"][0]
@@ -1071,12 +1290,18 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
     if action == "top" and top_priority is TopPriority.HIDDEN:
         raise question_record.AnswerRefused("this page has no top priority items")
     read_edit = None
+    if action in {"schedule", "unschedule", "start-now", "remove", "park"}:
+        submitted = SchedulePageAction.parse(fields)
+    else:
+        if fields.keys() != required:
+            raise question_record.AnswerRefused("use the form on this page")
+        submitted = SchedulePageAction(the_list.ScheduleScope.UNSPECIFIED, 0, "", KeepRepeat.UNCHANGED)
     if action == "read":
         read_edit = the_list.mark_read_edit(keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
                                            page_request=the_list.PageRequest(request, "read", words))
         delivery = _notice_delivery(keeper, read_edit.item, request)
     else:
-        delivery = _submit_action(root, keeper, identity, request, prefix, action, words, until, status)
+        delivery = _submit_action(root, keeper, identity, request, prefix, action, words, until, status, submitted)
     if not include_detail:
         return delivery, None
     try:
@@ -1091,9 +1316,16 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
 
 def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: str,
                    prefix: ListFormRequestPrefix, action: str, words: str, until: str,
-                   status: change_page.DeliveryStatus | None) -> ListActionSubmission:
+                   status: change_page.DeliveryStatus | None, submitted: SchedulePageAction) -> ListActionSubmission:
+    run_number = submitted.run_number or repeat_rule.NoNextRun.REMAINING
+    expected = the_list.ScheduleExpectation(submitted.revision, run_number)
+    if action in the_list.ScheduleOperation:
+        save_schedule(keeper, identity, request, the_list.ScheduleOperation(action), until, submitted, expected)
+        return change_page.NoMessageDelivery()
     item = the_list.load(keeper, identity)
     if action == "question":
+        if item.state is the_list.ItemState.SCHEDULED:
+            raise question_record.AnswerRefused("Ask the question after the item starts.")
         status = change_page.DeliveryStatus(root) if status is None else status
         question = _submit_ask(keeper, identity, the_list.PageRequest(request, "question", words), status)
         if isinstance(question, change_page.MessageDelivery):
@@ -1101,8 +1333,14 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
             return ListQuestionDelivery(question, status)
         return question
     if action == "remove":
-        notice = the_list.PageItemNotice(request, f"List page: nate removed item {item.number}.", "remove", words)
-        changed = the_list.close(keeper, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE, notice=notice)
+        one_run = submitted.scope is the_list.ScheduleScope.THIS
+        target = f"run {submitted.run_number} of item {item.number}" if one_run else f"item {item.number}"
+        saved_words = submitted.receipt_words(action, words) if submitted.scope else words
+        recipient = prefix.recipient if item.state is the_list.ItemState.SCHEDULED else the_list.LegacyFeedbackRecipient.KEEPER
+        notice = the_list.PageItemNotice(request, f"List page: nate removed {target}.", "remove", saved_words,
+                                        recipient=recipient)
+        changed = the_list.close(keeper, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE,
+                                 notice=notice, schedule_scope=submitted.scope, expected_schedule=expected)
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
             raise question_record.AnswerRefused("choose Until delivered, a parking date, or a time with a UTC offset")
@@ -1111,9 +1349,13 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         def save_park(parked_until: datetime | the_list.ParkUntilDelivered,
                       check_deadline: Callable[[datetime], None] | None = None) -> the_list.ListItem:
             label = parking_notice_label(parked_until, zone)
-            notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} {label}.", "park", words)
+            saved_words = submitted.receipt_words(action, words) if submitted.scope else words
+            recipient = prefix.recipient if item.state is the_list.ItemState.SCHEDULED else the_list.LegacyFeedbackRecipient.KEEPER
+            notice = the_list.PageItemNotice(request, f"List page: nate parked item {item.number} {label}.", "park",
+                                            saved_words, recipient=recipient)
             return the_list.park(keeper, identity, parked_until, source=the_list.PAGE_SOURCE,
-                                 notice=notice, check_deadline=check_deadline)
+                                 notice=notice, check_deadline=check_deadline,
+                                 schedule_scope=submitted.scope, expected_schedule=expected)
 
         changed = (save_park(the_list.ParkUntilDelivered.DELIVERED) if until == the_list.ParkUntilDelivered.DELIVERED
                    else review_actions.save_timed_park(until, zone, save_park, require_offset=len(until) != 10))
@@ -1473,7 +1715,7 @@ class ListQuery:
         if search:
             search_values = {"number": str(item.number), "ownerName": text.owner, "title": text.title,
                              "state": STATE_SEARCH_TEXT[item.state],
-                             "parkingLabel": PARKED_SEARCH_LABEL if parked else ""}
+                             "parkingLabel": PARKED_SEARCH_LABEL if parked else "", "requestWords": text.request}
             if not any((re.sub(pattern, "", search) if pattern else search) in search_values[field]
                        for field, pattern in SEARCH_FIELDS.items()):
                 return False
@@ -1593,9 +1835,17 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                                        defer_missing=include_counts and defer_counts))
     zone = user_zone()
     today = datetime.fromtimestamp(read_at, zone)
-    ordered_items = [(entry, the_list.parking_active(entry.item.parked_until, today)) for entry in items]
-    ordered_items.sort(key=lambda pair: pair[1])
-    park_deadline = min((deadline.timestamp() for entry, parked in ordered_items
+    ordered_items = [(entry, the_list.parking_active(entry.item.parked_until, today),
+                      schedule_display(entry.item)) for entry in items]
+    def row_order(row: tuple[ListRecord, bool, DisplayedSchedule]) -> tuple[int, float]:
+        entry, parked, schedule = row
+        if isinstance(schedule, the_list.NoSchedule):
+            return int(parked), 0
+        eta, _ = displayed_work(entry.item, schedule)
+        return (2, eta.timestamp()) if isinstance(eta, datetime) else (3, 0)
+
+    ordered_items.sort(key=row_order)
+    park_deadline = min((deadline.timestamp() for entry, parked, _ in ordered_items
                          if parked and isinstance(deadline := entry.item.parked_until, datetime)), default=None)
     deadline_attr = f' data-park-deadline="{park_deadline}"' if park_deadline is not None else ''
     secret = form_secret(root)
@@ -1617,19 +1867,22 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             f'<span>{names.html(identity, part[0])}</span>' for part in re.finditer(r"[^-]*-|[^-]+", owner)) + '</span>')
         return cell, owner.casefold(), normalize_search_text(owner)
 
-    for index, (entry, parked) in enumerate(ordered_items):
+    for index, (entry, parked, schedule) in enumerate(ordered_items):
+        scheduled = not isinstance(schedule, the_list.NoSchedule)
         owners.add(entry.item.owner)
         mark = top_priority_mark(view.top_priority, members, entry.item)
         if mark is TopPriorityMark.TOP_ITEM:
             top_items.append(entry)
-        open_question = the_list.has_open_question(entry.item)
-        visibility = the_list.question_visibility(entry.keeper, entry.item, status)
+        open_question = not scheduled and the_list.has_open_question(entry.item)
+        visibility = (the_list.QuestionAttention() if scheduled
+                      else the_list.question_visibility(entry.keeper, entry.item, status))
         unread_answers = the_list.unread_answer_ids(entry.item)
         open_ask = bool(the_list.answerable_asks(entry.item, members))
         chip = list_chip(entry.item.state, parked=parked, open_question=open_question, open_ask=open_ask,
                          unread_delivery=the_list.unread_delivery(entry.item), unread_answer=bool(unread_answers))
         owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
-        search_text = SearchText(owner_search, normalize_search_text(entry.item.title))
+        search_text = SearchText(owner_search, normalize_search_text(entry.item.title),
+                                 normalize_search_text(original_request_words(entry.item)))
         visible = selection.eligible(entry, search_text, search, parked=parked) and record_table.count_filter_row(
             FILTER_FACETS, {"chip": chip, "owner": entry.item.owner, "producer": entry.item.producer},
             selection.selected, chip_totals, staff_filters=STAFF_FILTERS)
@@ -1645,7 +1898,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         row = item_rows(entry, names, today, index, secret, row_reviews, owner_cell=owner_cell, owner_sort=owner_sort,
                         search_text=search_text, parked=parked, open_question=open_question, open_ask=open_ask, visibility=visibility,
-                        unread_answers=unread_answers, mark=mark, hidden=not (visible or linked))
+                        unread_answers=unread_answers, schedule=schedule, mark=mark, hidden=not (visible or linked))
         if linked:
             linked_row = row
         else:
@@ -1730,8 +1983,62 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<dialog data-list-review-dialog aria-label="Review card">'
                + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
                + record_table.render_inline_detail()
-               + '<script>' + SCRIPT + '</script>')
+               + SCHEDULE_TEMPLATES + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, view.title), started, read_at)
+
+
+SCHEDULE_TEMPLATES = """
+<template id="list-custom-repeat">
+<dialog class="list-schedule-dialog" aria-label="Custom recurrence" data-custom-repeat>
+<h3>Custom recurrence</h3>
+<div class="list-repeat-line">
+<label>Repeat every <input data-repeat-interval type="number" min="1" max="2147483647" value="1"></label>
+<select data-repeat-frequency aria-label="Repeat unit">
+<option value="DAILY">day</option><option value="WEEKLY">week</option>
+<option value="MONTHLY">month</option><option value="YEARLY">year</option>
+</select>
+</div>
+<div data-repeat-week class="list-repeat-line" role="group" aria-label="Repeat on" hidden>
+<span>Repeat on</span>
+""" + ''.join(
+    f'<button type="button" data-weekday="{day}" aria-label="{day.name.title()}" aria-pressed="false">'
+    + day.name[0] + '</button>'
+    for day in (repeat_rule.Weekday.SUNDAY, *tuple(repeat_rule.Weekday)[:6])
+) + """
+</div>
+<label data-repeat-month hidden>Repeat on
+<select data-repeat-month-day><option value="date"></option><option value="weekday"></option></select></label>
+<fieldset><legend>Ends</legend>
+<label><input type="radio" name="repeat-end" value="never" checked> Never</label>
+<div class="list-repeat-line">
+<label><input type="radio" name="repeat-end" value="date"> On a date</label>
+<input type="date" aria-label="End date" data-repeat-end-date>
+</div>
+<div class="list-repeat-line">
+<label><input type="radio" name="repeat-end" value="count"> After</label>
+<label><input type="number" min="1" max="2147483647" value="13" data-repeat-count aria-label="Occurrences"> occurrences</label>
+</div>
+</fieldset>
+<p role="status" data-repeat-start-status></p>
+<p role="status" data-dialog-status></p>
+<div class="list-repeat-buttons"><button type="button" data-change-start hidden>Change start date</button>
+<button type="button" data-cancel>Cancel</button>
+<button type="button" class="primary" data-done>Done</button></div>
+</dialog></template>
+<template id="list-repeat-scope">
+<dialog class="list-schedule-dialog" aria-labelledby="list-scope-title">
+<h3 id="list-scope-title">Change the repeated item</h3>
+<fieldset aria-label="Which runs">
+<label data-scope-this><input type="radio" name="scope-choice" value="this"> This run</label>
+<label data-scope-following><input type="radio" name="scope-choice" value="following"> This and following runs</label>
+<label><input type="radio" name="scope-choice" value="all"> All runs</label>
+</fieldset>
+<p data-scope-rule hidden>To change the repeat rule, select future runs or all runs.</p>
+<p id="list-scope-park" data-scope-park hidden>Parking applies to the item.</p>
+<div class="list-repeat-buttons"><button type="button" data-cancel>Cancel</button>
+<button type="button" class="primary" data-done>OK</button></div>
+</dialog></template>
+"""
 
 
 STYLE = record_table.STYLE + record_table.DATE_TIME_STYLE + '<style>' + review_page.QUESTION_COLOR_RULE + '''
@@ -1792,7 +2099,7 @@ background:var(--ink-2);border-radius:50%}
 .list-item-fields section{grid-column:span 2}
 .list-item-fields :is(.list-field-state,.list-field-eta){grid-column:auto}
 .list-actions{position:relative}
-:is(.list-tell,.list-actions,.list-parking-actions)>button,.list-park>[data-later-toggle]{
+:is(.list-tell,.list-actions,.list-parking-actions)>button,.list-park [data-later-toggle]{
  border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink);cursor:pointer
 }
 .list-tell>[data-send-status]:empty{display:none}
@@ -1807,7 +2114,50 @@ font-weight:600;cursor:pointer}
 .list-ask small{color:var(--ink-3)}
 .list-parking-actions{display:flex;gap:inherit;margin-inline-start:auto}
 .list-table [data-parked]:not([data-parked="false"]) [data-list-check]{display:none}
-.list-table .list-row.open [data-parked-note]{display:none}
+.list-table .list-row.open :is([data-parked-note],[data-scheduled-note]){display:none}
+.list-state.scheduled{color:light-dark(#12666d,#62d7dd);background:light-dark(#e7f7f8,#103238)}
+.list-park [data-later-menu]{width:min(34rem,calc(100vw - 32px));max-height:calc(100dvh - 32px);overflow:auto;
+ transform:translate(var(--list-picker-x,0px),var(--list-picker-y,0px))}
+.list-park [data-later-menu] [data-later-preset]{display:block;width:calc(50% - 12px);margin:6px 6px 4px}
+.list-park [data-later-custom]:not([hidden]){display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px 12px;align-items:start}
+.list-park .later-save{grid-column:1 / -1}
+.list-schedule-fields{display:grid;gap:6px;min-width:0}
+.list-schedule-fields small{color:var(--ink-2)}
+.list-schedule-fields textarea{width:100%;box-sizing:border-box;margin:0;resize:vertical}
+:is(.list-schedule-fields,.list-schedule-dialog) :is(select,input:not([type=radio])){
+ font:inherit;padding:5px 7px;min-width:0;max-width:100%;border:1px solid var(--line);
+ border-radius:8px;background:var(--bg);color:var(--ink)
+}
+.list-schedule-dialog{width:min(26rem,calc(100vw - 32px));max-height:calc(100dvh - 32px);
+ box-sizing:border-box;overflow:auto;padding:16px;border:1px solid var(--line);
+ border-radius:12px;color:var(--ink);background:var(--card);box-shadow:0 10px 32px #0006}
+.list-schedule-dialog::backdrop{background:#0005}
+@media(min-width:1100px){
+ .list-schedule-dialog[data-beside-picker]{margin:0;inset:auto;left:var(--schedule-left);top:var(--schedule-top)}
+}
+.list-table [data-state="Scheduled"] .list-eta-text{white-space:normal;overflow:visible}
+.list-schedule-dialog [hidden]{display:none!important}
+.list-schedule-dialog h3{margin:0 0 12px;font-size:1rem}
+.list-schedule-dialog fieldset{display:grid;gap:8px;margin:12px 0;padding:0;border:0}
+.list-schedule-dialog [data-scope-this]:has(input:disabled){opacity:.6}
+.list-schedule-dialog legend{padding:0 0 6px;color:var(--ink-2)}
+.list-repeat-line,.list-repeat-buttons{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+.list-repeat-buttons{justify-content:flex-end;margin-top:12px}
+.list-schedule-dialog button{font:inherit;border:1px solid var(--line);border-radius:8px;min-height:34px;
+ padding:4px 10px;background:var(--bg);color:var(--ink);cursor:pointer}
+.list-schedule-dialog :is(.primary,[aria-pressed=true]){background:var(--accent);color:#fff}
+.list-schedule-dialog [type=number]{width:4rem}
+.list-schedule-dialog [data-weekday]{border-radius:50%;min-width:34px}
+:is([data-schedule-status],[data-dialog-status],[data-repeat-start-status]):empty{display:none}
+@media(max-width:1100px){
+ .list-park [data-later-menu]{width:min(20rem,calc(100vw - 32px))}
+ .list-park [data-later-custom]:not([hidden]){grid-template-columns:minmax(0,1fr)}
+ .list-park [data-later-menu] [data-later-preset]{width:calc(100% - 12px)}
+}
+@media(max-width:620px){
+ .list-park [data-later-menu]{position:fixed;inset:16px;bottom:auto;width:auto;max-width:none;transform:none}
+ .list-parking-actions{flex-wrap:wrap;justify-content:flex-end}
+}
 .list-table:has([data-later-menu]:not([hidden]),.list-eta:focus-visible),
 .list-table tbody:has([data-later-menu]:not([hidden]),.list-eta:focus-visible){overflow:visible}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
@@ -1877,6 +2227,7 @@ const deliveryParking=''' + json.dumps(the_list.ParkUntilDelivered.DELIVERED) + 
 const isParked=data=>data.parked==='true' || data.parked===deliveryParking;
 const chipFor=data=>{
  if(data.state==='Closed' || data.undoPending==='true' || data.sendHeld!==undefined) return;
+ if(data.state==='Scheduled') return 'scheduled';
  const parked=isParked(data);
  return chipsByQueue[questionQueue(queuesByState[data.state],data.openAsk==='true' || data.unread==='true' && data.unreadAnswer==='true',
   parked,data.unreadDelivery==='true',data.openQuestion==='true')];
@@ -2124,6 +2475,304 @@ function listPickerSummary(zone){
   return parts.month+' '+parts.day+' '+parts.hour+':'+parts.minute+' '+parts.timeZoneName;
  };
 }
+const weekdays=['SU','MO','TU','WE','TH','FR','SA'];
+const ordinalNames=['','first','second','third','fourth'];
+const weekdayName=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',weekday:'long'});
+const monthDayName=new Intl.DateTimeFormat('en-US',{timeZone:'UTC',month:'long',day:'numeric'});
+function scheduleDate(wall){
+ const date=parseDateTimeDraft(wall)?.date;
+ if(!date) return null;
+ const day=date.getUTCDate(),weekday=weekdays[date.getUTCDay()];
+ const last=new Date(date);last.setUTCDate(day+7);
+ const ordinal=last.getUTCMonth()!==date.getUTCMonth() ? -1 : Math.ceil(day/7);
+ return {date,day,weekday,ordinal,monthly:(ordinal===-1 ? 'last' : ordinalNames[ordinal])+' '+weekdayName.format(date)};
+}
+function repeatChoices(start){
+ return {
+  none:['Does not repeat',''],
+  daily:['Daily','FREQ=DAILY'],
+  weekly:['Weekly on '+weekdayName.format(start.date),'FREQ=WEEKLY;BYDAY='+start.weekday],
+  monthly:['Monthly on the '+start.monthly,'FREQ=MONTHLY;BYDAY='+start.ordinal+start.weekday],
+  yearly:['Annually on '+monthDayName.format(start.date),'FREQ=YEARLY'],
+  weekdays:['Every weekday (Monday to Friday)','FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR'],
+ };
+}
+function repeatParts(rule){
+ return Object.fromEntries(rule.split(';').filter(Boolean).map(part=>part.split('=')));
+}
+function repeatEndEpoch(until){
+ return Date.parse(until.replace(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/,'$1-$2-$3T$4:$5:$6Z'));
+}
+function dateInZone(zone,epoch){
+ const {year,month,day}=zoneParts(zone,epoch);
+ return [year,month,day].map((value,index)=>String(value).padStart(index===0 ? 4 : 2,'0')).join('-');
+}
+function listScheduleDialog(template,parent){
+ const dialog=document.getElementById(template).content.firstElementChild.cloneNode(true);
+ parent.append(dialog);
+ dialog.addEventListener('close',()=>dialog.remove(),{once:true});
+ dialog.addEventListener('keydown',event=>{
+  event.stopPropagation();
+  if(event.key==='Enter' && event.target.matches('input')){
+   event.preventDefault();dialog.querySelector('[data-done]').click();
+  }
+ });
+ dialog.querySelector('[data-cancel]').onclick=()=>dialog.close();
+ return dialog;
+}
+function customRepeat(parent,start,rule,zone){
+ const dialog=listScheduleDialog('list-custom-repeat',parent);
+ const field=name=>dialog.querySelector('[data-repeat-'+name+']');
+ const parts=repeatParts(rule),frequency=field('frequency'),interval=field('interval');
+ const days=[...field('week').querySelectorAll('button')],monthDay=field('month-day');
+ const endDate=field('end-date'),count=field('count');
+ const endRadio=value=>dialog.querySelector('[name=repeat-end][value="'+value+'"]');
+ frequency.value=parts.FREQ ?? 'WEEKLY';interval.value=parts.INTERVAL ?? '1';
+ const weeklyDays=parts.FREQ==='WEEKLY' && parts.BYDAY ? parts.BYDAY.split(',') : [start.weekday];
+ for(const button of days) button.setAttribute('aria-pressed',String(weeklyDays.includes(button.dataset.weekday)));
+ monthDay.options[0].textContent='Monthly on day '+start.day;
+ monthDay.options[1].textContent='Monthly on the '+start.monthly;
+ monthDay.value=parts.FREQ==='MONTHLY' && parts.BYDAY ? 'weekday' : 'date';
+ const startDate=start.date.toISOString().slice(0,10);
+ endDate.value=startDate;
+ if(parts.UNTIL){
+  endDate.value=dateInZone(zone,repeatEndEpoch(parts.UNTIL));
+  endRadio('date').checked=true;
+ }else if(parts.COUNT){
+  count.value=parts.COUNT;endRadio('count').checked=true;
+ }
+ const end=()=>dialog.querySelector('[name=repeat-end]:checked').value;
+ const done=dialog.querySelector('[data-done]'),changeStart=dialog.querySelector('[data-change-start]');
+ const startStatus=dialog.querySelector('[data-repeat-start-status]');
+ const selectedDays=()=>days.filter(button=>button.getAttribute('aria-pressed')==='true').map(button=>button.dataset.weekday);
+ const showFields=()=>{
+  field('week').hidden=frequency.value!=='WEEKLY';
+  field('month').hidden=frequency.value!=='MONTHLY';
+  endDate.disabled=end()!=='date';count.disabled=end()!=='count';
+  const selected=selectedDays(),weekly=frequency.value==='WEEKLY';
+  done.disabled=weekly && !selected.includes(start.weekday);
+  changeStart.hidden=!done.disabled || !selected.length;
+  startStatus.textContent=!weekly ? '' : !selected.length ? 'Select at least one repeat day.'
+   : done.disabled ? 'The start date must fall on a selected repeat day.' : '';
+ };
+ for(const button of days) button.onclick=()=>{
+  button.setAttribute('aria-pressed',String(button.getAttribute('aria-pressed')==='false'));
+  showFields();
+ };
+ dialog.addEventListener('change',showFields);
+ showFields();
+ return new Promise(resolve=>{
+  let result=null;
+  dialog.addEventListener('close',()=>resolve(result),{once:true});
+  const save=changeDate=>{
+   const status=dialog.querySelector('[data-dialog-status]');
+   const rule=['FREQ='+frequency.value];
+   if(!interval.value || !interval.validity.valid || end()==='count' && (!count.value || !count.validity.valid)){
+    status.textContent='Enter a positive whole number.';return;
+   }
+   if(interval.valueAsNumber!==1) rule.push('INTERVAL='+interval.valueAsNumber);
+   if(frequency.value==='WEEKLY'){
+    const order=[...weekdays.slice(1),weekdays[0]];
+    const selected=selectedDays();
+    rule.push('BYDAY='+order.filter(day=>selected.includes(day)).join(','));
+   }
+   if(frequency.value==='MONTHLY') rule.push(monthDay.value==='date' ? 'BYMONTHDAY='+start.day : 'BYDAY='+start.ordinal+start.weekday);
+   if(end()==='count') rule.push('COUNT='+count.valueAsNumber);
+   if(end()==='date'){
+    if(!endDate.value || endDate.value<startDate){status.textContent='Choose an end date on or after the start.';return;}
+    const date=new Date(endDate.value+'T00:00:00Z');
+    const local=zoneEpoch(zone,date.getUTCFullYear(),date.getUTCMonth()+1,date.getUTCDate(),24*60)-1000;
+    rule.push('UNTIL='+new Date(local).toISOString().replace(/[-:]|\.\d{3}/g,''));
+   }
+   result={rule:rule.join(';'),changeDate};
+   dialog.close();
+  };
+  done.onclick=()=>save(false);
+  changeStart.onclick=()=>save(true);
+  dialog.showModal();
+  const picker=parent.getBoundingClientRect(),box=dialog.getBoundingClientRect();
+  if(innerWidth-picker.right>=box.width+32){
+   dialog.dataset.besidePicker='';
+   dialog.style.setProperty('--schedule-left',(picker.right+16)+'px');
+   dialog.style.setProperty('--schedule-top',Math.max(16,Math.min(picker.top,innerHeight-box.height-16))+'px');
+  }
+ });
+}
+function chooseScheduleScope(parent,{number,canEditFollowing,removing,parking,changingRule}){
+ const dialog=listScheduleDialog('list-repeat-scope',parent);
+ if(removing) dialog.querySelector('h3').textContent='Remove the repeated item';
+ const thisRun=dialog.querySelector('[data-scope-this] input');
+ const following=dialog.querySelector('[data-scope-following] input');
+ const all=dialog.querySelector('[value=all]');
+ thisRun.disabled=!number || parking || changingRule;
+ following.disabled=following.closest('label').hidden=!canEditFollowing;
+ dialog.querySelector('[data-scope-rule]').hidden=!changingRule;
+ dialog.querySelector('[data-scope-park]').hidden=!parking;
+ if(parking) dialog.querySelector('fieldset').setAttribute('aria-describedby','list-scope-park');
+ [thisRun,following,all].find(choice=>!choice.disabled).checked=true;
+ return new Promise(resolve=>{
+  dialog.addEventListener('close',()=>resolve(dialog.returnValue || null),{once:true});
+  dialog.querySelector('[data-done]').onclick=()=>dialog.close(dialog.querySelector('[name=scope-choice]:checked').value);
+  dialog.showModal();
+ });
+}
+function bindScheduleFields(form,until,zone,draft,edit){
+ const panel=form.querySelector('[data-schedule-template]').content.firstElementChild.cloneNode(true);
+ const words=panel.querySelector('[data-schedule-words]'),select=panel.querySelector('[data-repeat]');
+ const menu=form.querySelector('[data-later-menu]'),status=panel.querySelector('[data-schedule-status]');
+ const picker=menu.querySelector('[data-later-custom]'),save=picker.querySelector('.later-save');
+ const calendar=document.createElement('div');
+ calendar.append(...[...picker.children].filter(child=>child!==save));
+ picker.prepend(calendar);
+ const anchor=menu.closest('.list-actions');
+ const fitPicker=()=>{
+  if(!menu.offsetWidth){pickerSize.disconnect();return;}
+  const width=document.documentElement.clientWidth;
+  const {top,right}=anchor.getBoundingClientRect();
+  const baseLeft=right-menu.offsetWidth,baseTop=top-menu.offsetHeight-6;
+  const left=Math.max(16,Math.min(baseLeft,width-menu.offsetWidth-16));
+  const pickerTop=Math.max(16,Math.min(baseTop,innerHeight-menu.offsetHeight-16));
+  menu.style.setProperty('--list-picker-x',left-baseLeft+'px');
+  menu.style.setProperty('--list-picker-y',pickerTop-baseTop+'px');
+ };
+ const pickerSize=new ResizeObserver(fitPicker);
+ const observer=new MutationObserver(()=>{
+  if(menu.hidden){panel.remove();pickerSize.disconnect();}
+  else{
+   fitPicker();
+   pickerSize.observe(anchor);
+   pickerSize.observe(menu);
+  }
+ });
+ observer.observe(menu,{attributes:true,attributeFilter:['hidden']});
+ const custom=panel.querySelector('[data-edit-custom]');
+ const label=panel.querySelector('[for="'+select.id+'"]');
+ const {start='',rule='',repeatStart,repeatText,repeatZone,repeatOffset,revision}=panel.dataset;
+ const number=Number(panel.dataset.run || 0);
+ const savedWords=words.value;
+ const currentDraft=draft?.revision===revision && draft.number===number ? draft : undefined;
+ until.value=currentDraft?.until ?? start;
+ words.value=currentDraft?.words ?? savedWords;
+ let pickerUntil=until.value,editedUntil=currentDraft?.until;
+ const draftUntil=()=>until.value===pickerUntil ? editedUntil : until.value;
+ const startChanged=()=>!start || (draftUntil()!==undefined && start!==until.value);
+ const initialDay=scheduleDate(start)?.date.getTime();
+ const savedChoices=repeatStart ? repeatChoices(scheduleDate(repeatStart)) : {};
+ const savedPreset=Object.keys(savedChoices).find(key=>savedChoices[key][1]===rule);
+ let choice=currentDraft?.repeat?.choice ?? (savedPreset || (rule==='FREQ=WEEKLY' ? 'weekly' : rule ? 'custom' : 'none'));
+ let customRule=currentDraft?.repeat?.rule ?? rule;
+ let repeatEdited=Boolean(currentDraft?.repeat);
+ const preset=(at,value)=>repeatChoices(at)[value]?.[1];
+ const datePreset=()=>['weekly','monthly','yearly'].includes(choice);
+ const savedOption=new Option(repeatText,'saved');
+ savedOption.disabled=true;
+ const customOption=select.querySelector('[value=custom]');
+ function repeatChange(at){
+  if(!at) return undefined;
+  const candidate=choice==='custom' ? customRule : preset(at,choice);
+  const dateRuleChanged=datePreset() && repeatChoices(at)[choice][0]!==repeatText;
+  if(repeatEdited){
+   if(candidate!==rule || (rule && repeatZone!==zone) || dateRuleChanged) return candidate;
+  }else if(dateRuleChanged && startChanged() && at.date.getTime()!==initialDay){
+   return candidate;
+  }
+ }
+ function repeatStartError(repeat,changedStart){
+  if(!changedStart && repeat===undefined) return '';
+  const nextRule=repeatParts(repeat ?? rule);
+  if(!nextRule.BYDAY && !nextRule.BYMONTHDAY && !nextRule.UNTIL) return '';
+  const epoch=dateTimeDraftEpoch(zone,changedStart ? until.value : start);
+  if(!Number.isFinite(epoch)) return '';
+  if(nextRule.UNTIL && epoch>repeatEndEpoch(nextRule.UNTIL))
+   return 'Choose an end date on or after the start.';
+  const day=repeat!==undefined ? dateInZone(zone,epoch)
+   : repeatZone ? dateInZone(repeatZone,epoch)
+   : new Date(epoch+Number(repeatOffset)*1000).toISOString().slice(0,10);
+  const at=scheduleDate(day+'T00:00');
+  if(nextRule.FREQ==='WEEKLY' && nextRule.BYDAY && !nextRule.BYDAY.split(',').includes(at.weekday))
+   return 'The start date must fall on a selected repeat day.';
+  if(nextRule.FREQ==='MONTHLY'){
+   const ordinal=nextRule.BYDAY?.startsWith('-') ? at.ordinal : Math.ceil(at.day/7);
+   if((nextRule.BYMONTHDAY && Number(nextRule.BYMONTHDAY)!==at.day) ||
+      (nextRule.BYDAY && nextRule.BYDAY!==ordinal+at.weekday))
+    return 'The start date must match the monthly repeat day.';
+  }
+  return '';
+ }
+ function update(){
+  const at=scheduleDate(until.value);
+  select.hidden=label.hidden=!words.value.trim() || !at;
+  custom.hidden=select.hidden || choice!=='custom';
+  const repeat=repeatChange(at);
+  status.textContent=select.hidden ? '' : repeatStartError(repeat,startChanged());
+  if(!at) return;
+  const choices=repeatChoices(at);
+  for(const [value,[label]] of Object.entries(choices)) select.querySelector('[value='+value+']').textContent=label;
+  customOption.textContent=choice==='custom' && rule && customRule===rule ? 'Custom · '+repeatText : 'Custom…';
+  const showSaved=datePreset() && repeat===undefined && choices[choice][0]!==repeatText;
+  if(showSaved) select.prepend(savedOption);
+  else savedOption.remove();
+  select.value=showSaved ? 'saved' : choice;
+  select.querySelector('[value=weekdays]').disabled=['SU','SA'].includes(at.weekday) && choice!=='weekdays';
+ }
+ update();
+ words.addEventListener('input',()=>{
+  update();edit();
+  const summary=menu.querySelector('[data-later-summary]');
+  summary.textContent=summary.textContent.replace(/^(Starts|Parks until) /,words.value.trim() ? 'Starts ' : 'Parks until ');
+ });
+ until.addEventListener('input',event=>{
+  if(event.detail?.edited!==false && until.value!==pickerUntil) editedUntil=until.value;
+  pickerUntil=until.value;
+  update();
+ });
+ const openCustom=async()=>{
+  const at=scheduleDate(until.value);
+  const saved=await customRepeat(menu,at,choice==='custom' ? customRule : preset(at,choice),zone);
+  if(saved){choice='custom';customRule=saved.rule;repeatEdited=true;edit();}
+  update();
+  if(saved?.changeDate) calendar.querySelector('[tabindex="0"]').focus();
+  else select.focus({preventScroll:true});
+ };
+ custom.addEventListener('click',openCustom);
+ select.addEventListener('change',()=>{
+  status.textContent='';
+  if(select.value==='custom') void openCustom();
+  else{choice=select.value;repeatEdited=true;update();edit();}
+ });
+ return {
+  attach:()=>save.before(panel),
+  draft:()=>{
+   const date=draftUntil();
+   const changes={};
+   if(date!==undefined && date!==start) changes.until=date;
+   if(words.value!==savedWords) changes.words=words.value;
+   if(repeatEdited) changes.repeat={choice,rule:customRule};
+   if(Object.keys(changes).length) return {revision,number,...changes};
+  },
+  retainDate:()=>{pickerUntil=editedUntil=until.value;},
+  data:(action)=>{
+   const repeat=action==='schedule' ? repeatChange(scheduleDate(until.value)) : undefined;
+   return {number,revision,scope:'',repeat,words:words.value.trim(),startChanged:startChanged()};
+  },
+  applySeriesRepeat:data=>{
+   if(data.scope==='this'){
+    data.repeat=undefined;
+    return true;
+   }
+   status.textContent=repeatStartError(data.repeat,data.startChanged);
+   return !status.textContent;
+  },
+  scheduled:!!(start || rule),
+  repeating:!!rule,
+  words:()=>words.value.trim(),
+  scope:(action,data)=>chooseScheduleScope(menu.hidden ? form : menu,
+   {number,canEditFollowing:panel.hasAttribute('data-following'),removing:action==='remove',
+    parking:action==='park' || action==='park-until-delivered',
+    changingRule:action==='schedule' && repeatEdited && data.repeat!==undefined}),
+  showError:message=>{status.textContent=message;},
+ };
+}
 function bindFeedbackForm(form){
   let item=recordFromDetail(form);
   const key=item.dataset.key;
@@ -2131,6 +2780,7 @@ function bindFeedbackForm(form){
   const unpark=form.querySelector('[value="unpark"]'),parkedDetail=form.querySelector('[data-parked-detail]');
   showActionFailure(notice,tableView.actionNotice(item));
   const waitingForm=form.hasAttribute('data-waiting-actions');
+  const zone=content.dataset.zone;
   const confirmation=()=>({state:item.dataset.state,parked:item.dataset.parked,
    unread:item.dataset.unread==='true',unreadDelivery:item.dataset.unreadDelivery,unreadAnswer:item.dataset.unreadAnswer,
    unreadSort:JSON.parse(item.dataset.sortValues)[7]});
@@ -2140,7 +2790,7 @@ function bindFeedbackForm(form){
    item.dataset.parked=confirmed.parked;
    item.dataset.unreadDelivery=confirmed.unreadDelivery;
    item.dataset.unreadAnswer=confirmed.unreadAnswer;
-   if(!metadataOnly) unpark.hidden=!isParked(confirmed) || confirmed.state==='Closed';
+   if(!metadataOnly) unpark.hidden=confirmed.state!=='Scheduled' && (!isParked(confirmed) || confirmed.state==='Closed');
    syncUnread(item,metadataOnly ? null : form,confirmed.unread,confirmed.unreadSort);
   };
   const applySavedState=(result,{keepDetailFocus=false,hasDetail=false,metadataOnly=false}={})=>{
@@ -2165,14 +2815,31 @@ function bindFeedbackForm(form){
    }
    syncConfirmed(metadataOnly);
    const state=item.querySelector('.list-state');state.textContent=item.dataset.state;
-   state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room'}[item.dataset.state] || 'muted');
-   const sortValues=JSON.parse(item.dataset.sortValues);sortValues[4]=item.dataset.state.toLowerCase();item.dataset.sortValues=JSON.stringify(sortValues);
+   state.className='list-state '+({'Waiting for nate':'warning',Blocked:'error',Working:'accent',Delivered:'room',Done:'room',Scheduled:'scheduled'}[item.dataset.state] || 'muted');
+   const sortValues=JSON.parse(item.dataset.sortValues);sortValues[4]=item.dataset.state.toLowerCase();
+   let scheduledNote=item.querySelector('[data-scheduled-note]');
+   if(typeof result.scheduled_note==='string'){
+    if(!scheduledNote){scheduledNote=document.createElement('small');scheduledNote.dataset.scheduledNote='';state.after(scheduledNote);}
+    scheduledNote.textContent=result.scheduled_note;
+   }else if(confirmed.state!=='Scheduled') scheduledNote?.remove();
+   if(typeof result.next_step_html==='string'){
+    const eta=item.querySelector('.list-eta');
+    eta.title=result.eta_full;
+    eta.querySelector('.list-eta-full').textContent=result.eta_full;
+    eta.querySelector('.list-eta-text').textContent=result.eta_short;
+    eta.classList.toggle('warning',!result.scheduled_note && confirmed.state!=='Closed' &&
+     result.eta_sort[0]===0 && result.eta_sort[1]*1000<Date.now());
+    item.querySelector('[data-label="Next step"]').innerHTML=result.next_step_html;
+    sortValues[5]=result.next_step_sort;
+    sortValues[6]=result.eta_sort;
+   }
+   item.dataset.sortValues=JSON.stringify(sortValues);
    if(typeof result.parked_until==='string'){
     let note=item.querySelector('[data-parked-note]');
     const text=result.parked_until ? 'Parked until '+result.parked_until : '';
     if(!metadataOnly){
-     parkedDetail.hidden=!result.parked_until;
-     parkedDetail.textContent=text;
+     parkedDetail.textContent=result.scheduled_note ?? text;
+     parkedDetail.hidden=!parkedDetail.textContent;
     }
     if(result.parked_until){
      if(!note){note=document.createElement('small');note.dataset.parkedNote='';state.parentElement.append(note);}
@@ -2212,13 +2879,14 @@ function bindFeedbackForm(form){
   const words=form.elements.words,until=form.elements.until;
   const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
   const syncTell=()=>{
-   if(!ask || !tell) return;
+   if(!tell) return;
    const name=matching('tell')?.recipientName ?? signed.recipientName;
    const wordsLabel='Your words for '+name+' about this item';
    tell.textContent='Tell '+name;
    words.placeholder=wordsLabel;
    words.setAttribute('aria-label',wordsLabel);
-   ask.disabled=tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();
+   tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();
+   if(ask) ask.disabled=tell.disabled;
   };
   // Keep the signed update and recipient from the rendered form.
   const signed={request:form.elements.request.value,token:form.elements.token.value,recipientName:form.dataset.recipientName};
@@ -2227,29 +2895,37 @@ function bindFeedbackForm(form){
    ...signed,
    request:signed.request+'.'+Array.from(crypto.getRandomValues(new Uint8Array(16)),byte=>byte.toString(16).padStart(2,'0')).join(''),
   });
-  const draft=drafts.get(key);if(draft && !waitingForm){words.value=draft.words;until.value=draft.until;}
+  const draft=drafts.get(key);if(draft && !waitingForm) words.value=draft.words;
   let draftStamp=draft?.stamp ?? 0;
   const unconfirmed=draft?.unconfirmed ?? new Set();
-  const matching=action=>[...unconfirmed].findLast(attempt=>
-   attempt.words===words.value && attempt.until===until.value && (action===undefined || attempt.action===action));
-  const identity=request=>{form.elements.request.value=request.request;form.elements.token.value=request.token;};
-  const zone=content.dataset.zone;
   const parkSettings=()=>JSON.parse(content.dataset.parking);
-  const parkToggle=form.querySelector('[data-later-toggle]');
-  const parkSummary=waitingForm ? null : listPickerSummary(zone);
+  const edit=()=>{draftStamp++;retain();};
+  const scheduleEditor=waitingForm ? null : bindScheduleFields(form,until,zone,draft?.schedule,edit);
+  const matching=(action,scheduleKey)=>[...unconfirmed].findLast(attempt=>attempt.words===words.value &&
+   (attempt.action==='park-until-delivered' || attempt.until===until.value) &&
+   (scheduleKey===undefined || attempt.scheduleKey===scheduleKey) &&
+   (action===undefined || attempt.action===action));
+  const identity=request=>{form.elements.request.value=request.request;form.elements.token.value=request.token;};
+  let retiredDraft=false;
   const retainDraft=()=>{
+   if(retiredDraft) return;
    drafts.set(key,{words:waitingForm ? draft?.words ?? '' : words.value,
-    until:waitingForm ? draft?.until ?? '' : until.value,stamp:draftStamp,unconfirmed});
+    stamp:draftStamp,unconfirmed,schedule:waitingForm ? draft?.schedule : scheduleEditor.draft()});
    identity(matching() ?? fresh);
   };
   const retain=()=>{retainDraft();syncTell();};
   form.retainDraft=retainDraft;
   form.applySavedState=applySavedState;
   retain();
-  const edit=()=>{draftStamp++;retain();};
   words.addEventListener('input',edit);until.addEventListener('input',edit);
-  if(!waitingForm) bindDateTimePicker(form,{zone,settings:parkSettings,summaryPrefix:'Parks until ',
-   formatSummary:parkSummary,retryTime:()=>Date.parse(matching('park')?.parkingTime ?? '')});
+  const parkToggle=form.querySelector('[data-later-toggle]');
+  const formatParkingTime=listPickerSummary(zone);
+  if(!waitingForm) bindDateTimePicker(form,{zone,settings:parkSettings,summaryPrefix:'',
+   prepareMenu:scheduleEditor.attach,openCustom:scheduleEditor.scheduled,
+   formatSummary:at=>(scheduleEditor.words() ? 'Starts ' : 'Parks until ')+formatParkingTime(at),
+   retryTime:()=>Date.parse((scheduleEditor.words() ?
+    [...unconfirmed].findLast(attempt=>attempt.action==='schedule' && attempt.until===until.value &&
+      JSON.parse(attempt.scheduleKey).words===scheduleEditor.words()) : matching('park'))?.parkingTime ?? '')});
   form.addEventListener('submit',async event=>{
    event.preventDefault();
    const formKey=form.elements.keeper.value+'/'+form.elements.id.value;
@@ -2257,31 +2933,68 @@ function bindFeedbackForm(form){
    if(!tableView.canSubmit(form,formKey) || current!==tableView.openItem || !content.contains(current) ||
     cardSubmitBlocked(form,tableView.rowFading(key))) return;
    if(item!==current){item=current;confirmed=confirmation();}
-   const submitter=event.submitter,action=submitter?.value || 'tell';
-   const parkForDelivery=action==='park-until-delivered',parks=action==='park' || parkForDelivery || Boolean(submitter?.dataset.laterPreset);
+   const submitter=event.submitter,buttonAction=submitter?.value || 'tell';
+   const parkForDelivery=buttonAction==='park-until-delivered',preset=Boolean(submitter?.dataset.laterPreset);
+   const parks=buttonAction==='park' || parkForDelivery || preset;
+   const action=buttonAction==='park' && scheduleEditor?.words() ? 'schedule'
+    : buttonAction==='unpark' && scheduleEditor?.scheduled ? 'unschedule' : preset ? 'park' : buttonAction;
+   const scheduleWrite=['schedule','unschedule','start-now'].includes(action);
+   const parkingReceipt=parks || scheduleWrite;
+   const changesParking=parks || action==='unpark' || scheduleWrite;
    const closeSavedCard=()=>tableView.closeCard(key,{focusShow:parkForDelivery});
-   const changesParking=parks || action==='unpark';
-   const focusUnpark=action==='unpark' && document.activeElement===unpark;
+   const focusUnpark=buttonAction==='unpark' && document.activeElement===unpark;
    const usesWords=action==='tell' || action==='question';
    const saveAction=changesParking || action==='read' || action==='remove';
    const heldSave=saveAction && content.dataset.undoEnabled==='true';
    const asksQuestion=action==='question';
    if(usesWords && !words.value.trim()) return;
-   const retry=submitter?.dataset.laterPreset ? undefined : matching(parks ? 'park' : action);
-   const parkingTime=parks ? retry?.parkingTime ?? parkRequestTime(form,submitter,zone,parkSettings(),until.value) : '';
-   if(parks && !parkingTime){showActionFailure(notice,'Choose a future parking time.');return;}
-   if(!waitingForm && action==='unpark') closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
-   const attempt=retry ?? {...fresh,action:parks ? 'park' : action,words:words.value,until:until.value,parkingTime};
-   identity(attempt);
-   const data=new URLSearchParams(new FormData(form));data.set('action',parks ? 'park' : action);
-   if(parks){data.set('until',parkingTime);data.set('words','');}
-   if(parks && retry) closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
-   if(!retry){
-    if(!submitter?.dataset.laterPreset) unconfirmed.add(attempt);
-    fresh=newRequest();
+   if(parkForDelivery && scheduleEditor?.words()){
+    scheduleEditor.showError('Clear the instruction to park until delivery.');return;
    }
+   const schedule=scheduleEditor?.data(action);
+   if(scheduleEditor?.repeating && (changesParking || action==='remove')){
+    schedule.scope=action==='start-now' ? 'this' : await scheduleEditor.scope(action,schedule);
+    if(!schedule.scope || !tableView.canSubmit(form,formKey) || !form.isConnected) return;
+   }
+   if(action==='schedule' && !scheduleEditor.applySeriesRepeat(schedule)) return;
+   const scopedRemove=action==='remove' && Boolean(schedule?.scope);
+   const scheduleKey=scheduleWrite || schedule?.scope ? JSON.stringify(schedule) : '';
+   const retry=preset && !parkForDelivery ? undefined : matching(action,scheduleKey);
+   let parkingTime=parkForDelivery ? deliveryParking : retry?.parkingTime ?? until.value;
+   if(action==='schedule' && !schedule.startChanged) parkingTime='';
+   else if(action==='park' && !parkForDelivery && !retry && (preset || !/^\d{4}-\d{2}-\d{2}$/.test(parkingTime))){
+    parkingTime=parkRequestTime(form,submitter,zone,parkSettings(),until.value);
+    if(!parkingTime){showActionFailure(notice,'Choose a future parking time.');return;}
+   }else if(action==='schedule'){
+    if(!retry && (action==='schedule' || !/^\d{4}-\d{2}-\d{2}$/.test(parkingTime))){
+     const at=dateTimeDraftEpoch(zone,parkingTime);
+     if(!(at>Date.now())){showActionFailure(notice,'Choose a future start time.');return;}
+     parkingTime=new Date(at).toISOString();
+    }
+   }
+   if(!waitingForm && changesParking) closeDateTimePicker(form.querySelector('[data-later-menu]'),false);
+   const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime,scheduleKey};
+   identity(attempt);
+   const data=new URLSearchParams(new FormData(form));data.set('action',parkForDelivery ? 'park' : action);
+   if(parks || scheduleWrite){data.set('until',parks ? parkingTime : '');data.set('words','');}
+   if(schedule?.scope){data.set('scope',schedule.scope);data.set('run',schedule.number);}
+   if(scheduleWrite || schedule?.scope) data.set('schedule_revision',schedule.revision);
+   if(action==='schedule'){
+    data.set('schedule_words',schedule.words);
+    if(schedule.repeat!==undefined) data.set('repeat',schedule.repeat);
+   }
+   if(!retry){if(!preset || parkForDelivery) unconfirmed.add(attempt);fresh=newRequest();}
+   if(action==='park' || (action==='schedule' && schedule.startChanged)) scheduleEditor?.retainDate();
    retainDraft();
    const stampAtSubmit=draftStamp;
+   const clearConfirmedScheduleDraft=()=>{
+    if(!scheduleWrite && !schedule?.scope) return;
+    unconfirmed.delete(attempt);
+    const latest=drafts.get(key);
+    if(draftStamp!==stampAtSubmit || latest?.stamp!==stampAtSubmit) return;
+    drafts.set(key,{...latest,schedule:undefined});
+    retiredDraft=true;
+   };
    const request=tableView.startItemRequest(key);
    item.listRequest=request;
    startListSave();
@@ -2291,17 +3004,17 @@ function bindFeedbackForm(form){
    if(hadFocus) document.addEventListener('focusin',trackFocus);
    let saved=false,refused=false,retried=false,stale=false,focusParkedAfterClose=false,focusDraft=false,nextForm;
    const clearsUnread=action==='read' || usesWords,unreadBefore=item.dataset.unread,wasVisible=!item.hidden;
-   const releasesLink=action==='read' || parks || action==='remove' || (action==='unpark' && heldSave);
+   const releasesLink=action==='read' || parks || scheduleWrite || action==='remove' || (action==='unpark' && heldSave);
    let restoreLink;
    const submission=tableView.preserveRecordRowTop(()=>{
     setCardSubmitting(form,true,recordDetails(item));
     showActionFailure(notice);
-    if(action==='remove'){
+    if(action==='remove' && schedule?.scope!=='this'){
      item.dataset.state='Closed';
      unpark.hidden=true;
      syncUnread(item,form,false,0);
     }
-    if(parks) item.dataset.parked=parkForDelivery ? deliveryParking : 'true';
+    if(parks && action!=='schedule') item.dataset.parked=parkForDelivery ? deliveryParking : 'true';
     if(clearsUnread) item.dataset.unread='false';
     if(heldSave) item.dataset.undoPending='true';
     if(releasesLink) restoreLink=tableView.releaseLink(key);
@@ -2317,13 +3030,13 @@ function bindFeedbackForm(form){
     tableView.showActionResult(item,submission,label,{kind:'success',message,hiddenMessage});
    };
    const post=async()=>{
-    const options={method:'POST',body:data,signal:parks ? listRequestSignal() : undefined};
+    const options={method:'POST',body:data,signal:parkingReceipt ? listRequestSignal() : undefined};
     const receiver=action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
     const response=await (usesWords || heldSave
      ? hold.post(actionPath,options,saveAction ? null : receiver)
      : fetch(actionPath,options));
-    refused=!response.ok && (response.status<500 || (!asksQuestion && !parks && action!=='remove'));
-    if(!parks) saved=response.ok;
+    refused=!response.ok && (response.status<500 || (!asksQuestion && !parkingReceipt && action!=='remove'));
+    if(!parkingReceipt) saved=response.ok;
     if(saved && tableView.currentItemRequest(request) && usesWords &&
        draftStamp===stampAtSubmit && words.value===attempt.words) words.value='';
     const result=await response.json();
@@ -2337,13 +3050,14 @@ function bindFeedbackForm(form){
     let result;
     try{result=await post();}
     catch(error){
-     if(!parks || refused || error instanceof SendUndone) throw error;
+     if(!parkingReceipt || refused || error instanceof SendUndone) throw error;
      await new Promise(resolve=>setTimeout(resolve,Number(content.dataset.parkRetrySeconds)*1000));
      retried=true;
      result=await post();
     }
     if(item.listRequest!==request) return;
     saved=true;
+    clearConfirmedScheduleDraft();
     if(stale){
      if(tableView.openItem?.dataset.key===key) return;
      hold.restore();
@@ -2354,10 +3068,12 @@ function bindFeedbackForm(form){
      });
      return;
     }
-    const closes=parks || action==='remove' || result.detail_closed;
+    const closes=parks || scheduleWrite || action==='remove' || result.detail_closed;
     if(closes){
      hold.restore();
      tableView.preserveRecordRowTop(()=>{
+      if((scheduleWrite || schedule?.scope) && result.detail_html && result.detail_revision)
+       presentListDetail(item,result);
       nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail:true});
       closeSavedCard();
       tableView.applyAction();
@@ -2384,13 +3100,16 @@ function bindFeedbackForm(form){
     hold.restore();
     tableView.preserveRecordRowTop(()=>{
      nextForm=applySavedState(result,{keepDetailFocus:changesParking,hasDetail});
+     if(action==='unpark' && result.unpark_outcome==='cleared'){
+      until.value='';
+      scheduleEditor?.retainDate();
+     }
      if(hasDetail){
       unconfirmed.delete(attempt);
       retainDraft();
       installSavedListDetail(request,revision,text);
      }
      if(action==='unpark'){
-      if(result.unpark_outcome==='cleared') until.value='';
       showUnparkResult(result);
      }else if(action==='tell'){
       const message='sent to '+attempt.recipientName+(result.unread==='true' ? '; update remains unread' : '');
@@ -2413,11 +3132,12 @@ function bindFeedbackForm(form){
     focusDraft=undone;
     if(undone) refused=true;
     if(saved){
+     clearConfirmedScheduleDraft();
      if(stale) return;
      if(hold.restore()) tableView.applyAction();
      tableView.preserveRecordRowTop(()=>{
-      if(parks || action==='remove'){
-       if(action==='remove') closedKeys.add(key);
+      if(parkingReceipt || action==='remove'){
+       if(action==='remove' && schedule?.scope!=='this') closedKeys.add(key);
        closeSavedCard();
        tableView.showActionResult(item,submission,'Item '+item.dataset.number,
         {kind:'failure',message:'Saved; the item could not refresh.'});
@@ -2427,10 +3147,10 @@ function bindFeedbackForm(form){
     }
     const wasHidden=item.hidden;
     let current;
-    if(retried || (!refused && (parks || action==='remove'))){
+    if(retried || (!refused && (parkingReceipt || action==='remove'))){
      try{
       const query=new URLSearchParams({'item-state':data.get('id'),keeper:data.get('keeper')});
-      if(parks) query.set('park-request',attempt.request);
+      if(parkingReceipt || scopedRemove) query.set('park-request',attempt.request);
       const response=await fetch(actionPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
       if(!response.ok) throw new Error('HTTP '+response.status);
       current=await response.json();
@@ -2443,19 +3163,22 @@ function bindFeedbackForm(form){
     hold.restore();
     tableView.preserveRecordRowTop(()=>{
      let restore=refused || releasesLink,confirmedByReadback=false;
-     if(current){
-      applySavedState(current,{metadataOnly:true});
-      restore=confirmed.state!=='Closed' && (!parks || current.park_request_saved===false);
-      confirmedByReadback=confirmed.state==='Closed' || current.park_request_saved===true;
-      if(confirmedByReadback){
-       saved=true;
-       if(!stale) closeSavedCard();
-       tableView.applyAction();
-      }else if(!stale) presentListDetail(item,current);
-     }else if(refused) syncConfirmed(stale);
-     else if(parks || action==='remove'){
-      syncConfirmed(stale);
-      restore=confirmed.state!=='Closed';
+     if(parkingReceipt || action==='remove'){
+      if(current){
+       applySavedState(current,{metadataOnly:true});
+       const receipt=scopedRemove ? current.remove_request_saved : current.park_request_saved;
+       confirmedByReadback=receipt===true || !scopedRemove && confirmed.state==='Closed';
+       restore=!confirmedByReadback && confirmed.state!=='Closed';
+       if(confirmedByReadback){saved=true;clearConfirmedScheduleDraft();}
+       if(!stale){
+        presentListDetail(item,current);
+        if(confirmedByReadback) closeSavedCard();
+       }
+       if(confirmedByReadback) tableView.applyAction();
+      }else{
+       syncConfirmed(stale);
+       restore=confirmed.state!=='Closed';
+      }
      }else if(clearsUnread) item.dataset.unread=unreadBefore;
      if(restore) restoreLink?.();
      if(!confirmedByReadback){
@@ -2522,7 +3245,7 @@ function bindFeedbackForm(form){
     }
     refreshAfterListSave(stale || Boolean(tableView.deliveryRequest()) ||
       (saved && (changesParking || action==='remove' || action==='top' || item.dataset.waitingForAnswer!=='true')) ||
-      (!saved && !refused && (parks || action==='remove')));
+      (!saved && !refused && (parkingReceipt || action==='remove')));
    }
   });
 }
@@ -2634,7 +3357,7 @@ function updateLinkedRows(rows,updates){
  }
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving || parkPickerBlocksRefresh()) return;
+ if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh()) return;
  const signal=listRequestSignal();
  const delivery=tableView.deliveryRequest();
  const query=delivery ? '?'+new URLSearchParams({delivery:delivery.delivery}) : '';
@@ -2646,7 +3369,7 @@ async function refresh(_supersede=false,current=()=>true){
  if(!fresh) throw new Error('The page has no list.');
  decodeListKeys(fresh);
  await tableView.settled();
- if(!current() || saving || parkPickerBlocksRefresh()) return;
+ if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh() || !current()) return;
  refreshNeeded=false;
  tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
  reviewRefreshError.textContent='';

@@ -95,6 +95,8 @@ Use `the_list.py update --id L<n>` to update your items in morty's folder.
 For a legacy item, use `the_list.py update --keeper <keeper> --id L<n> --next-step "<step>"`.
 Run an `update` command from a List message as it is.
 Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
+Set Scheduled with `--state Scheduled --start <zoned ISO time> --do <words>`. Add `--repeat <RRULE>` for a series.
+Say the repeat rule in plain words before saving it. Use `--scope this|following|all` to change or remove a repeat.
 Write no time in `--source`.
 
 Name your top priority item with `the_list.py top-priority --id L<n>`.
@@ -110,7 +112,7 @@ Answer a List question with the command in its message.
 
 Ask morty to reassign an item.
 Ask morty to record updates and decisions that you cannot write with `the_list.py`.
-morty handles `/recall` and New item requests. morty reads every item at each round.
+morty handles New item requests. morty reads every item at each round.
 Correct an item when morty says that its text is unclear.
 Ask the showrunner or unit for facts. Verify claims against records such as commits, staff rows, and config files.
 Name the source of each fact you report.

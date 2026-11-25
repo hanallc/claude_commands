@@ -4,6 +4,7 @@ Every test works in a temporary git repository and a temporary list; none reads 
 """
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.production.staff_test_support import foreign_hostname
 
 import errno
@@ -109,6 +110,9 @@ def setUpModule() -> None:
         "UNIT_HISTORY_DIR": str(folder / "history"), copy_record.ROOT_ENV: str(folder / "scratch"),
         copy_record.COPIES_ENV: str(folder / "copies"),
         scratch.HOLDS_ENV: str(folder / "holds.json")}, clear=True))
+
+    unittest.enterModuleContext(accepting_console_text())
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(folder / "notify")}))
     _ = unittest.enterModuleContext(mock.patch.object(sys.modules[__name__], "PRODUCTION", home / DEMO_DOC))
     _ = fixture_member("showrunner", name="fixture")
     _ = fixture_member("showrunner", name="demo", runtime_id=DEMO_ID,
@@ -1084,7 +1088,7 @@ class ProducerWriterTests(ProducerFixture):
                                     (self.root / "unit" / "src", self.unit.id), (self.repo, ""), (self.root, "")):
             with self.subTest(directory=directory), redirect_stdout(io.StringIO()):
                 result = change_review.main(["add", "--repo", str(directory), "--production", "top",
-                    "--list", str(self.listing), "--change", str(directory), "--check", "Read", "--see", "Proof", "--image", fixture_image()])
+                    "--list", str(self.listing), "--change", "Check the producer", "--check", "Read", "--see", "Proof", "--image", fixture_image()])
                 self.assertEqual(result, 0)
                 self.assertEqual(change_review.pending(self.listing)[-1]["Producer"], expected)
 
@@ -2777,6 +2781,22 @@ class ActionTest(unittest.TestCase):
         _ = self.path.write_text(LIST, encoding="utf-8")
         self.fresh = root / "change-review" / "change-review - natedev.md"
 
+    def test_add_and_edit_hold_a_draft_and_store_the_revision(self) -> None:
+        for action in ("add", "edit"):
+            with self.subTest(action=action):
+                command = (action, "--production", DOC, "--list", str(self.path),
+                           "--change", "Keep the icons visible", "--see", "Both icons stay visible.")
+                if action == "edit":
+                    command += ("--row", "C76")
+                before = self.path.read_bytes()
+                code, _, errors = run_with_image(*command, "--check", "Read /tmp/icons.png.")
+                self.assertEqual(code, 1)
+                self.assertIn("Revise the change draft. omit-file-path: /tmp/icons.png", errors)
+                self.assertEqual(self.path.read_bytes(), before)
+                code, _, errors = run_with_image(*command, "--check", "Open the panel.")
+                self.assertEqual(code, 0, errors)
+                self.assertIn("Keep the icons visible", self.path.read_text())
+
     def test_add_requires_an_image_and_adds_the_image_column_to_a_list(self) -> None:
         original = """## To review
 
@@ -2870,13 +2890,13 @@ class ActionTest(unittest.TestCase):
             self.assertEqual(scratch.holds()[os.path.realpath(held)]["task"], f"row:{change_review._owner(self.path)}-{row}")  # pyright: ignore[reportPrivateUsage]
 
     def test_back_to_back_adds_in_one_shell_each_append_the_next_number(self) -> None:
-        changes = [Visible("cargo-handler nests a showrunner | inside its parent", "open `cargo-handler` on natedev",
+        changes = [Visible("cargo-handler nests a showrunner | inside its parent", "Open the handler on natedev",
                            "the showrunner tile sits inside its parent"),
                    Visible("tile titles carry the role: showrunner, unit director", "read the tile titles",
                            "each title names its role"),
                    Visible("cargo-tile no longer panics at startup", "start it in a natedev terminal",
-                           "~/.config/cargo-tile/panic.log gains nothing"),
-                   Visible("cargo-berth gives each phase its own reservation", "run `cargo-berth board | grep phase`",
+                           "The panic log gains no entries"),
+                   Visible("cargo-berth gives each phase its own reservation", "Run this command: `cargo-berth board | grep phase`",
                            "one line per phase")]
         repo, *commits = origin_commits(self.path.parent)
         script = str(Path(change_review.__file__))
@@ -2890,12 +2910,12 @@ class ActionTest(unittest.TestCase):
                                  "--change", item.change, "--check", item.check, "--see", item.see,
                                  "--merged", commits[-1][:8], "--image", fixture_image()]
                     if path == self.fresh and not numbers:
-                        result = subprocess.run([python, script, *arguments], capture_output=True,
+                        result = subprocess.run([python, "-m", "scripts.console_text.test_support", script, *arguments], capture_output=True,
                                                 text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                     else:
                         child = children.start(lambda arguments=arguments: run_review_child(arguments, environment))
                         result = child.result()
-                        result.check_returncode()
+                        self.assertEqual(result.returncode, 0, result.stderr)
                     numbers.append(result.stdout.strip())
                 self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
                 rows = [row for row in change_review.pending(path) if row["#"] in numbers]
@@ -3077,7 +3097,9 @@ class ActionTest(unittest.TestCase):
         _ = change_review.hold_for_row(self.path, "C76", [str(folder)])
         held = os.path.realpath(folder)
         self.assertIn(held, scratch.holds())
-        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+        caller = showrunners.owner_for("fixture")
+        with (mock.patch.object(change_review, "now", return_value=ADD_TIME),
+              mock.patch.object(staff, "runtime_id", return_value=caller.current_session)):
             with mock.patch.object(scratch, "end", side_effect=scratch.ScratchError("fixture cleanup failed")):
                 code, output, error = run(*arguments)
             self.assertEqual((code, error), (0, ""))
@@ -3102,11 +3124,12 @@ class ActionTest(unittest.TestCase):
         self.assertEqual((row["Verdict"], row["Date"], row["Merged"]), ("withdrawn", "2026-11-13", "2026-10-14"))
         self.assertIn("café", row["Review log"])
         self.assertEqual(review_events.decode(row["Review log"]),
-                         (review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"),))
+                         (review_events.ReviewLog(ADD_TIME, "fixture", f"Withdrawn: {words}"),))
 
     def test_withdraw_a_reviewed_row_and_keep_its_previous_verdict(self) -> None:
         words = "The change was reverted"
-        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+        with (mock.patch.object(change_review, "now", return_value=ADD_TIME),
+              mock.patch.object(staff, "runtime_id", return_value=DEMO_ID)):
             code, _, error = run("withdraw", "--production", DOC, "--list", str(self.path),
                                  "--row", "C70", "--reason", words)
             self.assertEqual(code, 0, error)
@@ -3115,8 +3138,133 @@ class ActionTest(unittest.TestCase):
         row, = snapshot.reviewed
         self.assertEqual((row["#"], row["Verdict"], row["Date"]), ("C70", "withdrawn", "2026-11-13"))
         previous, withdrawal = review_events.decode(row["Review log"])
-        self.assertEqual((previous.words, previous.time.date()), ("works", date(2026, 10, 13)))
-        self.assertEqual(withdrawal, review_events.ReviewLog(ADD_TIME, "nate", f"Withdrawn: {words}"))
+        self.assertEqual((previous.who, previous.words, previous.time.date()), ("nate", "works", date(2026, 10, 13)))
+        self.assertEqual(withdrawal, review_events.ReviewLog(ADD_TIME, "demo", f"Withdrawn: {words}"))
+
+    def test_reopen_restores_the_queue_place_and_appends_one_event(self) -> None:
+        _ = self.path.write_text(LIST
+            .replace("How to check |\n", "How to check | Urgency | Production |\n")
+            .replace("| --- | --- | --- | --- | --- |\n", "| --- | --- | --- | --- | --- | --- | --- |\n")
+            .replace("Launch Hana |\n", f"Launch Hana | later | {DEMO_ID} |\n")
+            .replace("Change a font |\n", "Change a font | | |\n"), encoding="utf-8")
+        target = ("--production", DOC, "--list", str(self.path), "--row", "C76")
+        change_review.record_review_log(self.path, "C76", "A previous note", PRODUCTION, event_time=ADD_TIME)
+        before = change_review.pending(self.path)
+        self.assertEqual([row["#"] for row in before], ["C77", "C76"])
+        reason = "The change is ready again"
+        with (mock.patch.object(change_review, "now", return_value=ADD_TIME),
+              mock.patch.object(staff, "runtime_id", return_value=DEMO_ID)):
+            self.assertEqual(run("withdraw", *target, "--reason", "Check the new result"),
+                             (0, "demo/C76 withdrawn\n", ""))
+            withdrawn = next(row for row in change_review.review_snapshot(self.path).reviewed if row["#"] == "C76")
+            self.assertEqual(run("reopen", *target, "--reason", reason), (0, "demo/C76 reopened\n", ""))
+        snapshot = change_review.review_snapshot(self.path)
+        rows = [dict(row) for row in snapshot.pending]
+        log = rows[-1].pop("Review log")
+        _ = before[-1].pop("Review log")
+        self.assertEqual(rows, before)
+        self.assertEqual([row["#"] for row in snapshot.reviewed], ["C70"])
+        self.assertEqual(review_events.decode(log), (
+            *review_events.decode(withdrawn["Review log"]),
+            review_events.ReviewLog(ADD_TIME, "demo", f"Reopened: {reason}"),
+        ))
+
+    def test_reopen_requires_a_reason_and_refuses_an_open_row(self) -> None:
+        before = self.path.read_bytes()
+        arguments = ("reopen", "--production", DOC, "--list", str(self.path), "--row", "C76")
+        self.assertEqual(run(*arguments), (1, "", "--reason needs one line of words\n"))
+        self.assertEqual(run(*arguments, "--reason", "Try again"), (1, "", "C76 is not withdrawn\n"))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_reopen_keeps_the_withdrawn_rows_unit_staff_id(self) -> None:
+        runner = showrunners.owner_for(DOC)
+        unit = fixture_member("unit", name="withdrawal-owner", parent=runner.id)
+        _ = self.path.write_text(LIST
+            .replace("How to check |\n", "How to check | Production |\n")
+            .replace("| --- | --- | --- | --- | --- |\n", "| --- | --- | --- | --- | --- | --- |\n")
+            .replace("Launch Hana |\n", f"Launch Hana | {unit.id} |\n")
+            .replace("Change a font |\n", "Change a font | |\n"), encoding="utf-8")
+        before = change_review.pending(self.path)[0]
+        self.assertTrue(change_review.withdraw_row(self.path, "C76", "Fix the result", ADD_TIME, PRODUCTION))
+        withdrawn = next(row for row in change_review.review_snapshot(self.path).reviewed if row["#"] == "C76")
+        self.assertEqual(withdrawn["Production"], unit.id)
+        shown = change_review.describe(withdrawn)
+        self.assertIn(f"  Production: {DOC}", shown)
+        self.assertNotIn(unit.id, shown)
+        self.assertNotIn("Saved blank fields", shown)
+
+        change_review.reopen_row(self.path, "C76", "The result is ready", ADD_TIME, PRODUCTION)
+        reopened = change_review.pending(self.path)[0]
+        _ = reopened.pop("Review log")
+        self.assertEqual(reopened, before)
+
+    def test_reopen_uses_saved_fields_and_names_missing_fields_on_old_rows(self) -> None:
+        target = ("--production", DOC, "--list", str(self.path), "--row", "C76")
+        for rank, check, missing in (
+            ("later", "Launch Hana", ""),
+            ("", "Launch Hana", "Urgency"),
+            ("later", "", "How to check"),
+            ("", "", "Urgency, How to check"),
+        ):
+            with self.subTest(missing=missing):
+                original = f"""## To review
+
+| # | Change | Merged | How to check |
+| --- | --- | --- | --- |
+
+## Reviewed
+
+| # | Change | Verdict | Date | Merged | Urgency | How to check |
+| --- | --- | --- | --- | --- | --- | --- |
+| C76 | Panels keep shields | withdrawn | 2026-11-13 | 2026-10-14 | {rank} | {check} |
+"""
+                _ = self.path.write_text(original, encoding="utf-8")
+                code, output, error = run("reopen", *target, "--reason", "Check the result")
+                if missing:
+                    self.assertEqual((code, output, error), (
+                        1, "", f"C76: exact restoration is unavailable. Missing fields: {missing}.\n"))
+                    self.assertEqual(self.path.read_text(encoding="utf-8"), original)
+                else:
+                    self.assertEqual((code, error), (0, ""))
+                    restored, = change_review.pending(self.path)
+                    self.assertEqual((restored["Urgency"], restored["How to check"]), (rank, check))
+
+    def test_correct_withdraw_who_changes_only_the_selected_event(self) -> None:
+        target = ("--production", DOC, "--list", str(self.path), "--row", "C70")
+        with mock.patch.object(change_review, "now", return_value=ADD_TIME):
+            self.assertEqual(run("withdraw", *target, "--reason", "It was replaced")[0], 0)
+        before, = change_review.review_snapshot(self.path).reviewed
+        events = review_events.decode(before["Review log"])
+        arguments = ("correct-withdraw-who", *target, "--who", "natedev")
+        text = self.path.read_bytes()
+        self.assertEqual(run(*arguments, "--at", events[0].time.isoformat())[0], 1)
+        self.assertEqual(self.path.read_bytes(), text)
+        self.assertEqual(run(*arguments, "--at", ADD_TIME.isoformat()),
+                         (0, "change-review/C70 withdrawal author set to natedev\n", ""))
+        after, = change_review.review_snapshot(self.path).reviewed
+        self.assertEqual(review_events.decode(after.pop("Review log")),
+                         (events[0], replace(events[1], who="natedev")))
+        _ = before.pop("Review log")
+        self.assertEqual(after, before)
+
+    def test_correct_withdraw_who_finds_a_past_event_after_reopen(self) -> None:
+        row = "C76"
+        reopen_time = ADD_TIME.replace(minute=ADD_TIME.minute + 1)
+        second_time = ADD_TIME.replace(minute=ADD_TIME.minute + 2)
+        change_review.record_review_log(self.path, row, "Keep this note", PRODUCTION, event_time=ADD_TIME)
+        self.assertTrue(change_review.withdraw_row(self.path, row, "First reason", ADD_TIME, PRODUCTION))
+        change_review.reopen_row(self.path, row, "Check again", reopen_time, PRODUCTION)
+        self.assertTrue(change_review.withdraw_row(self.path, row, "Second reason", second_time, PRODUCTION))
+        change_review.correct_withdraw_who(self.path, row, second_time.isoformat(), "fixture", PRODUCTION)
+        change_review.reopen_row(self.path, row, "Check again", second_time, PRODUCTION)
+        before = change_review.pending(self.path)[0]
+        events = review_events.decode(before.pop("Review log"))
+        self.assertEqual(events[3].who, "fixture")
+        change_review.correct_withdraw_who(self.path, row, ADD_TIME.isoformat(), "demo", PRODUCTION)
+        after = change_review.pending(self.path)[0]
+        self.assertEqual(review_events.decode(after.pop("Review log")),
+                         (events[0], replace(events[1], who="demo"), *events[2:]))
+        self.assertEqual(after, before)
 
     def test_edit_and_verdict_replacement_failures_keep_the_list_and_rerun_once(self) -> None:
         for action in ("edit", "verdict"):
@@ -3284,15 +3432,16 @@ class ActionTest(unittest.TestCase):
         remove.assert_called_once_with(tree, repo)
 
     def test_a_verdict_keeps_a_dirty_try_folder_and_names_the_command(self) -> None:
-        tree, repo = self.try_folder()
+        tree = self.try_folder()[0]
         _ = (tree / "notes.txt").write_text("work")
         with mock.patch.object(worktrees, "remove_git_checkout") as remove:
             code, output, _ = run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
                                   "--verdict", "no")
         remove.assert_not_called()
         self.assertEqual(code, 0)
-        self.assertIn(f"{tree} kept: dirty worktree: ?? notes.txt. Save the work, then run: env --chdir={repo} ", output)
-        self.assertIn(f"worktrees.py remove {tree}\n", output)
+        command = shlex.join([str(Path.home() / ".claude/scripts/lib/py"),
+                              str(Path.home() / ".claude/scripts/worktree/worktrees.py"), "remove", str(tree)])
+        self.assertIn(f"{tree} kept: dirty worktree: ?? notes.txt. Save the work, then run: {command}\n", output)
         self.assertTrue((tree / "notes.txt").is_file())
 
     def test_an_empty_producer_removes_the_list_showrunners_try_folder_without_a_staff_read(self) -> None:

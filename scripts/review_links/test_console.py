@@ -17,6 +17,7 @@ import unittest
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents.remote import local_machine
 from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import memory_feed
@@ -54,6 +55,7 @@ class ConsoleTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="console-test-")))
         self.configuration = self.root / "config"
         self.configuration.mkdir()

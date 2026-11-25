@@ -39,13 +39,13 @@ STARTED_NS = time.time_ns()
 
 from scripts.disks import disks_page, sessions
 from scripts.aws_target import aws_page, machines_page
-from scripts.build_queue import admission_client, admission_protocol as admission, memory_files
+from scripts.build_queue import admission_client, admission_protocol as admission, kill_action, memory_feed, memory_files
 from scripts.lib import atomic_file, conf, scratch
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
 from scripts.production import change_routing, change_review, staff, the_list, tidy_wrapped
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
-from scripts.review_links import console_tune, go_ledger, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names, studio_page
+from scripts.review_links import console_tune, go_ledger, new_item, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names, studio_page
 from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
 from scripts.whoami import usage_store
 
@@ -1004,6 +1004,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == QUEUE_MOVE_PATH:
             self.queue_move_token(route.query)
             return None
+        if route.path == kill_action.PATH:
+            self.build_kill_options(route.query)
+            return None
         if route.path == go_ledger.GO_CHECK_PATH:
             self.go_check(route.query)
             return None
@@ -1291,6 +1294,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == QUEUE_MOVE_PATH:
             self.queue_move_post(route.query)
             return
+        if route.path == kill_action.PATH:
+            self.build_kill_post(route.query)
+            return
         refusal = self.tailscale_refusal()
         if refusal:
             if route.path == console_tune.PAGE_PATH or route.path.startswith(send_hold.HOLD_PATH + "/"):
@@ -1552,6 +1558,74 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         server = cast(ReviewLinksServer, self.server)
         return isinstance(token, str) and token.isascii() and secrets.compare_digest(token, server.new_item_token)
 
+    def build_kill_options(self, query: str) -> None:
+        if query or self.command != "GET":
+            self.json_response(400, {"reason": "Open Kill from the Builds page."})
+            return
+        if not self.build_kill_allowed():
+            self.json_response(403, {"reason": "The Kill control requires the operator's Tailscale account."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            refresh_seconds = conf.read_or_repository("review_links").number("page_refresh_seconds")
+            offers, results = server.kill_actions.options(refresh_seconds)
+        except (OSError, ValueError, admission.AdmissionUnavailable) as error:
+            print(f"review-links build kill: {error}", file=sys.stderr)
+            self.json_response(503, {"reason": "The current runs are unavailable."})
+        else:
+            self.json_response(200, {"token": server.new_item_token, "offers": offers, "results": results,
+                                     "refresh_seconds": refresh_seconds})
+
+    def build_kill_allowed(self, *, required_origin: bool = False) -> bool:
+        if not self.same_origin(required=required_origin) or self.tailscale_refusal():
+            return False
+        server = cast(ReviewLinksServer, self.server)
+        return server.mode is ServerMode.LIVE and builds_operator(self.client_address)
+
+    def build_kill_post(self, query: str) -> None:
+        if not self.same_origin(required=True):
+            self.json_response(403, {"reason": "Open Kill from the Builds page."})
+            return
+        try:
+            lengths = self.headers.get_all("Content-Length", [])
+            if (query or self.headers.get_content_type() != "application/x-www-form-urlencoded"
+                    or self.headers.get_all("Transfer-Encoding") or len(lengths) != 1):
+                raise ValueError
+            limit = conf.read_or_repository("review_links").whole("kill.request_bytes")
+            length = int(lengths[0])
+            if not 0 < length <= limit:
+                raise ValueError
+            body = self.rfile.read(length)
+            if len(body) != length:
+                raise ValueError
+            fields = parse_qs(body.decode(), keep_blank_values=True, max_num_fields=4, errors="strict")
+            if (set(fields) != {"token", "reference", "handle", "words"}
+                    or any(len(values) != 1 for values in fields.values())):
+                raise ValueError
+            reference, handle = fields["reference"][0], fields["handle"][0]
+            if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in (reference, handle)):
+                raise ValueError
+            words = fields["words"][0]
+            if "\0" in words:
+                raise ValueError
+        except (OSError, ValueError):
+            self.json_response(400, {"reason": "The Kill request is invalid or too large."})
+            return
+        if not self.valid_request_token(fields["token"][0]) or not self.build_kill_allowed(required_origin=True):
+            self.json_response(403, {"reason": "The Kill request is not authorized. Confirm again."})
+            return
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            outcome = server.kill_actions.stop(reference, handle, words)
+        except (OSError, ValueError, admission.AdmissionUnavailable) as error:
+            print(f"review-links build kill: {error}", file=sys.stderr)
+            self.json_response(503, {"reason": "The current run is unavailable."})
+            return
+        if isinstance(outcome, kill_action.NoStopRoute):
+            self.json_response(409, {"reason": "The run or its stop route changed."})
+        else:
+            self.json_response(200, {"result": outcome})
+
     def new_item_options(self) -> BinaryIO | None:
         """Return a New item token and current recipients."""
         server = cast(ReviewLinksServer, self.server)
@@ -1649,6 +1723,28 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             fields = cast(dict[str, object], payload)
             token = fields.get("token")
             valid_token = self.valid_request_token(token)
+            if fields.get("kind") == new_item_dialog.SCHEDULED_KIND:
+                if not valid_token:
+                    self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+                    return
+                scheduled = new_item_dialog.read_scheduled_request(fields)
+                self.scheduled_item_post(server, scheduled)
+                return
+        except new_item_dialog.ScheduledDraftRequired as error:
+            self.json_response(409, {"code": "wrong_draft_kind", "error": str(error)})
+            return
+        except (ValueError, RecursionError) as error:
+            reason = str(error) if isinstance(error, new_item_dialog.SubmissionError) else "Invalid New item JSON."
+            self.json_response(400, {"error": reason})
+            return
+        except OSError:
+            self.json_response(400, {"error": "Could not read the New item request."})
+            return
+        self.review_item_post(server, fields, token, valid_token)
+
+    def review_item_post(self, server: ReviewLinksServer, fields: dict[str, object], token: object,
+                         valid_token: bool) -> None:
+        try:
             draft = fields.get("request_id")
             list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
                              and review_submissions.is_draft_id(draft) else "")
@@ -1743,6 +1839,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             authorization = (review_submissions.CurrentBrowserDraftToken(digest) if valid_token
                              else review_submissions.BrowserDraftRecoveryToken(digest))
         try:
+            if request is not None and new_item_dialog.SCHEDULED_DRAFT_ID.fullmatch(request.request_id):
+                with server.list_store_access(), server.staff_read_scope():
+                    new_item.refuse_scheduled_draft_reuse(request.request_id)
             if key and valid_token and legacy_page_draft:
                 server.resume_page_capture(key)
             has_deferred = isinstance(deferred, new_item_dialog.DeferredCaptureIntent)
@@ -1802,6 +1901,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 details = saved.details
                 edited = isinstance(saved, review_submissions.EditedSubmission)
                 response: dict[str, object] = {"id": saved.id, "key": created.key, "version": created.version}
+                if isinstance(saved.attachments, review_submissions.UnavailableAttachments):
+                    if not valid_token:
+                        self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
+                        return
+                    warnings = list(dict.fromkeys(
+                        "The saved screenshot is missing or damaged." if reference == review_submissions.PAGE_SCREENSHOT
+                        else "A saved pasted image is missing or damaged."
+                        for reference in saved.attachments.references))
+                    if edited:
+                        warnings.append("The item keeps the values from the first Send.")
+                    response["attachment_warning"] = "\n".join(warnings)
                 on_list = bool(list_draft_id) or isinstance(request, new_item_dialog.NewItemRequest) and request.page == "list"
                 if list_draft_id and edited:
                     request = None
@@ -1852,6 +1962,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 # The dialog refreshes the token and retries the same draft.
                 self.json_response(403, {"code": "stale_token", "error": STALE_NEW_ITEM_TOKEN})
             return
+        except review_submissions.DraftAlreadyFiled as error:
+            self.new_item_saved({"id": error.id}, error.id, True)
+            return
+        except review_submissions.DraftPending:
+            self.pending_draft_response()
+            return
         except new_item_dialog.SubmissionConflict as error:
             self.json_response(409, {"error": str(error)})
             return
@@ -1894,8 +2010,42 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                                  attached=review_submissions.PAGE_SCREENSHOT in details.images,
                                                  limit=limits.active_captures)
 
+    def scheduled_item_post(self, server: ReviewLinksServer, request: new_item_dialog.ScheduledSubmission) -> None:
+        """File or recover a Scheduled item under the shared draft lock."""
+        try:
+            with server.list_store_access(), server.staff_read_scope():
+                saved = new_item.submit_scheduled(request)
+        except review_submissions.DraftAlreadyFiled as error:
+            self.new_item_saved({"id": error.id}, error.id, True)
+            return
+        except review_submissions.DraftPending:
+            self.pending_draft_response()
+            return
+        except new_item.FilingRefused as error:
+            status = 400 if error.reason is new_item.FilingRefusal.INVALID_SCHEDULE else 409
+            self.json_response(status, {"error": str(error)})
+            return
+        except new_item_dialog.SubmissionConflict as error:
+            self.json_response(409, {"error": str(error)})
+            return
+        except new_item_dialog.SubmissionError as error:
+            self.json_response(400, {"error": str(error)})
+            return
+        except (OSError, ValueError, TypeError, staff.StaffRefused) as error:
+            print(f"review-links Scheduled Send: {error}", file=sys.stderr)
+            self.json_response(503, {"error": "Could not confirm the Scheduled save. Try again to recover this draft."})
+            return
+        claim = saved.claim
+        response = {"id": saved.id, "list_key": f"{claim.keeper}/{saved.id}",
+                    "receipt": new_item.filing_receipt(claim.assignment, saved.id), "readback": claim.readback,
+                    "notice_warning": claim.notice_warning}
+        self.new_item_saved(response, saved.id, False)
+
+    def pending_draft_response(self) -> None:
+        self.json_response(409, {"code": "draft_pending", "error": "Retry the original Send for this draft."})
+
     def new_item_saved(self, response: Mapping[str, object], identity: str, edited: bool) -> None:
-        if edited:
+        if edited and "attachment_warning" not in response:
             self.json_response(409, {
                 **response, "code": "already_filed",
                 "error": f"This item was already filed as {identity}. Any change after that Send was not sent.",
@@ -2688,6 +2838,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             self.root, start_worker=False, initialize_on_start=initialize_review and mode is ServerMode.LIVE,
             staff_scope=self.staff_read_scope)
         self.new_item_token: str = secrets.token_urlsafe()
+        self.kill_actions: kill_action.KillActions = kill_action.KillActions(
+            self.store_folder, memory_feed.live_outside_kill_targets)
         self.capture_slot: threading.BoundedSemaphore = threading.BoundedSemaphore()
         self.page_captures: PageCaptures = PageCaptures(self.root / PAGE_CAPTURE_FOLDER)
         self.next_attachment_retry: float = time.monotonic() + PAGE_ATTACHMENT_RETRY_SECONDS
@@ -2705,6 +2857,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.send_holds.recover()
         if mode is ServerMode.LIST_FIXTURE:
             return
+        self.kill_actions.resume()
         recover_changes = change_page.recover_pending
         recover_list = list_page.recover_pending
         recover_goes = list_page.recover_goes
@@ -3041,6 +3194,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         if now >= self.next_attachment_retry:
             self.next_attachment_retry = now + PAGE_ATTACHMENT_RETRY_SECONDS
             self.retry_page_attachments()
+            self.kill_actions.retry_pending()
         if now >= self.next_tailscale_check:
             settings = conf.read("review_links")
             self.next_tailscale_check = now + settings.number("tailscale_check_seconds")

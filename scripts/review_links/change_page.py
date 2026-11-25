@@ -31,6 +31,8 @@ from typing import IO, Literal, NotRequired, TypedDict, cast, overload
 from urllib.parse import parse_qs, urlsplit
 from weakref import WeakSet, WeakValueDictionary, finalize
 
+from scripts.console_text import check as console_text
+
 from scripts.agents import remote
 from scripts.lib import build_folders, process_start
 from scripts.lib.boot_identity import boot_identity
@@ -1703,13 +1705,15 @@ class DeliveryStatus:
         if not text.strip():
             raise question_record.AnswerRefused("enter an answer")
         text = text.strip()
+        if isinstance(self.question_for_reply(self.slots(page, row), question_id, text), AnsweredQuestion):
+            return NO_ANSWER_TIME
+        console_text.require(text, "reply", identity=f"{page.review_list}/{row}/{question_id}",
+                             refusal=question_record.AnswerRefused)
         with self.locked():
             slots = self.slots(page, row)
-            question = self.question_for_reply(page, row, question_id, text)
-            if isinstance(question, AnsweredQuestion) and question.answer == text:
+            question = self.question_for_reply(slots, question_id, text)
+            if isinstance(question, AnsweredQuestion):
                 return NO_ANSWER_TIME
-            if not isinstance(question, OpenQuestion):
-                raise question_record.AnswerRefused("this row has no open question")
             record = answer_row(page, row)
             if record.get("Verdict"):
                 raise question_record.AnswerRefused("this row already has a saved answer")
@@ -1726,11 +1730,11 @@ class DeliveryStatus:
                              answered_at=answered_at)
             return answered_at
 
-    def question_for_reply(self, page: ReviewPage, row: str, question_id: str, text: str) -> OpenQuestion | AnsweredQuestion:
-        """Apply the existing exchange identity rule to each Review type."""
-        question = self.slots(page, row).question
+    @staticmethod
+    def question_for_reply(slots: DeliverySlots, question_id: str, text: str) -> OpenQuestion | AnsweredQuestion:
+        """Check the exchange ID and answer against the saved delivery slots."""
         try:
-            return delivery_state.question_exchange_for_reply(question, question_id, text)
+            return delivery_state.question_exchange_for_reply(slots.question, question_id, text)
         except delivery_state.StaleQuestionExchange as error:
             raise question_record.AnswerRefused(str(error)) from error
 
@@ -3348,31 +3352,41 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
             row = source.record.id
         else:
             path, row = efficiency_reviews.path(source.path), decision_store.efficiency_identity(item)
-        page = status.metadata_page(ReviewPage(path, path.parent, (row,), ''))
-        row = page.rows[0]
+        page = ReviewPage(path, path.parent, (row,), '')
+        text = words.strip()
+        slots = status.slots(page, row)
+        selected = slots.question
+        tracked = not isinstance(selected, NoQuestion) or bool(question_id)
+        if tracked and isinstance(status.question_for_reply(slots, question_id, text), AnsweredQuestion):
+            return False
+
+        save: Callable[[], bool | investigation.Investigation | None]
+        if isinstance(source, review_items.QuestionSource):
+            save = update_registration.prepare_reply_record(
+                source.record, words, who, identities=update_registration.QuestionStaff.read(), question_id=question_id)
+        elif isinstance(source, review_items.InvestigationSource):
+            save = investigation.prepare_answer(
+                source.record.owner, source.record.id, words, question_id=question_id)
+        else:
+            save = decision_store.prepare_answer(item, words, who)
+            console_text.require(words, "reply", identity=f"{path}/{row}/{question_id}",
+                                 refusal=question_record.AnswerRefused)
+
         with status.locked():
             slots = status.slots(page, row)
-            tracked = not isinstance(slots.question, NoQuestion) or bool(question_id)
-            if tracked:
-                question = status.question_for_reply(page, row, question_id, words.strip())
-                if isinstance(question, AnsweredQuestion):
-                    return False
-            if isinstance(source, review_items.QuestionSource):
-                identities = update_registration.QuestionStaff.read()
-                update_registration.reply_record(source.record,words,who,identities=identities,question_id=question_id)
-                changed = True
-            elif isinstance(source, review_items.InvestigationSource):
-                _ = investigation.answer(source.record.owner,source.record.id,words,question_id=question_id)
-                changed = True
-            else:
-                try:
-                    changed = decision_store.answer(item,words,who)
-                except decision_store.NoOpenQuestion as error:
-                    raise question_record.AnswerRefused(str(error)) from error
-            if tracked:
-                question = slots.question
-                assert isinstance(question, OpenQuestion)
-                status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id, question.text, words.strip())))
+            question = slots.question
+            if tracked and isinstance(status.question_for_reply(slots, question_id, text), AnsweredQuestion):
+                return False
+            if question != selected:
+                raise question_record.AnswerRefused("The current question changed.")
+            page = status.metadata_page(page)
+            try:
+                changed = save() is not False
+            except decision_store.NoOpenQuestion as error:
+                raise question_record.AnswerRefused(str(error)) from error
+            if isinstance(question, OpenQuestion):
+                status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id,
+                                                                                       question.text, text)))
             return changed
     if isinstance(source,review_items.ChangeSource):
         assert isinstance(source.assignment.production,Path)
@@ -3387,10 +3401,11 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
 
 
 def _forward_reply(machine: str, key: str, words: str, token: str) -> int:
+    from scripts.notify.review import review_timeout_seconds
     arguments = shlex.join(["answer-question", "--item=" + key, "--question=" + token, "--text=" + words])
     command = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" ' + arguments
     result = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command], stdin=subprocess.DEVNULL,
-                            capture_output=True, text=True, timeout=30, check=False)
+                            capture_output=True, text=True, timeout=30 + review_timeout_seconds(), check=False)
     if result.stdout:
         print(result.stdout, end="")
     if result.stderr:

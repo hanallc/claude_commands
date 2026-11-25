@@ -1,6 +1,7 @@
 """Tests for statusline.sh and statusline.jq: the role, the usage line, its reset times, and their zone."""
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -1792,6 +1793,7 @@ class CountsRowTests(ConfiguredShellTests):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.configuration = self.home / "counts-config"
         self.configure_review_sources(self.configuration)

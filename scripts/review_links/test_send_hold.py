@@ -428,7 +428,9 @@ UNDO_CORNER_PROBE = r"""<script>
   const gutter = __GUTTER__;
   if (stack().parentElement !== parent) failures.push('The toast stack is outside the ' + label + '.');
   const toasts = [...stack().children];
-  if (toasts[0].offsetWidth === toasts[1].offsetWidth)
+  const short = toasts.find(toast => toast.querySelector('span')?.textContent === 'Saved.');
+  const shortWidth = short?.offsetWidth || 0;
+  if (!shortWidth || toasts.some(toast => toast !== short && toast.offsetWidth <= shortWidth))
    failures.push('The ' + label + ' stack must show a short and a long toast.');
   const bounds = stack().getBoundingClientRect();
   if (bounds.top < 23)
@@ -451,11 +453,14 @@ UNDO_CORNER_PROBE = r"""<script>
   }
  };
  try {
-  const receivers = [null, 'Name'.repeat(160)];
-  if (__SHORT__) receivers.push(...Array(4).fill('Name'.repeat(160)));
-  const shown = waitFor(() => stack()?.children.length === receivers.length);
-  const sends = receivers.map(receiver => heldFetch('/send', {method:'POST'}, receiver).catch(error => error));
-  await shown;
+  const longReceivers = Array(__SHORT__ ? 5 : 1).fill('Name'.repeat(160));
+  const send = receiver => heldFetch('/send', {method:'POST'}, receiver).catch(error => error);
+  const longShown = waitFor(() => stack()?.children.length === longReceivers.length);
+  const sends = longReceivers.map(send);
+  await longShown;
+  const allShown = waitFor(() => stack()?.children.length === sends.length);
+  sends.push(send(null));
+  await allShown;
   checkCorner(host.body);
   const dialog = host.createElement('dialog');
   host.body.append(dialog);

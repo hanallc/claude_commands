@@ -924,9 +924,29 @@ Existing waits keep their place on natedev until then.
 ### Disk floor recovery
 
 `ensure_mac_disk_floor` returns `MacDiskReady`, `SweepShort`, or `SweepFailed`.
-Below the required floor, it runs one shared floor sweep and reads free space again.
+Below the required floor, it runs one shared floor sweep.
+It reads free space again after a successful sweep.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
 A direct caller that finds a running sweep waits for its result.
+The sweep uses a dedicated SSH terminal. The terminal sends `SIGHUP` when the SSH connection closes.
+Natedev uses the full `floor_sweep_timeout_s` for SSH.
+Natedev reserves the smaller of half that timeout and the sum of its `connect_timeout_s` and `probe_timeout_s`.
+It sends the resulting deadline as a Unix time when it starts SSH.
+The Mac supervisor uses the time that remains at startup. It skips the sweep if the deadline has passed.
+This deadline relies on the two clocks agreeing. The reserve estimates time for SSH setup and the reply.
+Slow setup, clock differences, or a transport failure can prevent natedev from receiving the result in time.
+On disconnect or timeout, the supervisor stops the sweep process group and waits for the sweep process to exit.
+The supervisor sends a cleanup record after the worker exits. It also sends one if the deadline passed before startup.
+If `SIGKILL` ends the worker, the supervisor exits with status 137 and sends no record.
+Natedev reports an unsuccessful sweep without that record as unconfirmed cleanup.
+Natedev also reports unconfirmed cleanup if SSH times out, loses the connection, or leaves no result.
+An SSH retry waits for `floor.lock` within its deadline before it reads mirror leases and claims.
+A standalone sweep skips an occupied floor lock and returns status 0.
+The sweep publishes a complete review file with an atomic rename.
+A later publication removes temporary files from writers that have exited.
+Both scans report a temporary file removal error and continue with publication, including when the list path stays the same.
+If the rename succeeds and the directory sync fails, a later publication by the same list keeps that path. A new SSH attempt starts a new list with a new path.
+Floor rows require manual review. The removal command refuses those rows.
 The evidence worker reads disk space and saved mirror processes in one SSH command per Mac probe cycle.
 The same command reports setup for each required mirror.
 Each step requires a successful setup result for its mirror.
@@ -937,7 +957,7 @@ The worker checks repository policy, session, and claim scope for each key.
 The worker reports pending disk recovery while a separate thread runs the sweep.
 The Mac stays excluded during recovery even when a probe reports enough free space.
 When the sweep ends, the worker probes all subscribed Mac keys again.
-The sweep holds no admission or claim lock during removal.
+The sweep holds no admission or claim lock while it lists output.
 `floor_claims.serve()` reads claims and mirror leases under `state.lock`.
 It builds the reply under the lock and prints after the lock closes.
 It exits without reading stdin.
@@ -946,16 +966,19 @@ A lost SSH session cannot retain the state lock while the sweep runs.
 An unavailable or unreadable claim reply protects all output.
 
 `mirror_sweep_leases()` reports acquired leases separately from busy mirrors.
-The sweep keeps busy mirrors and holds acquired leases through removal.
-For output outside those leases, it reads claims again immediately before each removal group.
+Discovery still walks all three configured roots.
+The alert still measures folders under those roots when a disk alert is due.
+Mirror leases and the claim snapshot protect busy mirrors during candidate selection.
+The sweep holds acquired leases while it lists output.
+For output outside those leases, it reads claims again before it adds each group to the list.
 A new claim or an unreadable reply keeps that output.
 Cargo locks, scratch busy locks, and process checks retain their existing roles.
 
-| Path class | Protection during removal |
+| Path class | Protection during listing or removal |
 | --- | --- |
-| Mirror build units, orphan files, and whole targets | The sweep holds the Mac-side mirror lease. |
-| Registered mirror clones outside the mirror root | The sweep holds their registered Mac-side mirror leases. |
-| Marked gate caches and other output outside acquired leases | The sweep reads claims again before each removal group and retains existing output locks. |
+| Mirror build units, orphan files, and whole targets | The sweep holds the Mac-side mirror lease while it lists output. |
+| Registered mirror clones outside the mirror root | The sweep holds their registered Mac-side mirror leases while it lists output. |
+| Marked gate caches and other output outside acquired leases | The sweep reads claims again before listing each group and holds existing output locks. |
 | `mirror-remove` payload, metadata, and removal authority | `local_mirror_lease` covers the operation; the record lock serializes metadata changes. |
 | A registered task clone's parent folder | An outside mirror lease survives parent removal and blocks concurrent `mirror-use`. No parent busy lock applies. |
 | `mirror-receive` cleanup of interrupted removal | The mirror lease and record lock cover the old payload and metadata. |

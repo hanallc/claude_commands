@@ -25,7 +25,7 @@ A browser leaves helper processes after its own exit or a timeout, and a plain `
 
 The `/agents` skill uses the `agents` program.
 `agents` and `agents help` print the same usage and return status 0.
-The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.
+The public commands include `help`, `status`, `pause`, `exit`, `resume`, `clone`, `restart`, and `stop`.
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
 SESSION is a staff id, a session id, a unique name, or a staff path.
@@ -36,6 +36,26 @@ A path that matches more than one staff row stops nothing and returns status 2 w
 Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.
+
+`agents clone NAME --as NEW` forks a live conversation on the source machine.
+Use a staff name, saved launch name, staff ID, or native session ID.
+The command refuses a saved launch name that matches multiple sessions on this machine.
+The command requires one proved pane and opens the clone after its source tab on the same Herdr server.
+The live pane must show the current model and effort.
+For Codex, show Model with Reasoning in the status line.
+Claude uses `--resume --fork-session`.
+Codex uses `codex fork`.
+The first prompt names both sessions and asks the clone to wait for a request addressed to it.
+The command refuses occupied names and reserved message addresses.
+The fork uses the source account environment.
+An absent `CLAUDE_CONFIG_DIR` stays absent.
+Resume and restart keep the saved implicit Claude home unless an explicit account is selected.
+The command verifies the fork before it saves the launch or adds a root `session` row.
+It saves the launch before the staff write.
+A definite refusal closes only the fork terminal.
+The staff owner checks the name and ID together before it creates the row.
+The row stores the launch folder and account for ordinary restart and resume.
+Messages to each name resolve to that session's native ID.
 
 `agents pause NAME [--keep-workers] --why TEXT` pauses a director.
 The director finishes its current turn and holds at the prompt.
@@ -475,6 +495,12 @@ A block is one user message, assistant message, tool call or tool result. A tool
 A Claude compaction summary is one block. A Codex compaction summary is encrypted, so only its time shows.
 The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
 `config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
+
+`scripts/agents/catch_up.py NATIVE_ID --user-prompts --near ISO_TIME [--minutes N]` reads typed prompts from the saved transcript.
+`near_minutes` in `config/catch_up.conf` sets the default window on each side of `ISO_TIME` to 10 minutes.
+If `ISO_TIME` has no offset, the reader uses the user's time zone.
+The reader prints each prompt in full with its time in the user's zone, in `%m-%d %H:%M:%S` format.
+It skips tool results, hook text, system reminders and messages from other sessions.
 
 ### Create a producer
 

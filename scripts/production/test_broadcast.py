@@ -19,6 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from scripts.production import broadcast
 from scripts.message import codex_daemon
@@ -108,7 +109,7 @@ class BroadcastTests(unittest.TestCase):
             + "names.load_names = lambda: fixture_names()\n"
             + "broadcast.SEND = Path(os.environ.get('BROADCAST_SEND') or os.environ['SAFE_PEER_SEND'])\n"
             + "roster.machine_name = lambda: 'mac'\n"
-            + "roster.roster = lambda environment, scope: roster.RosterSnapshot.decode(os.environ['SSH_SNAPSHOT']).result\n"
+            + "roster.roster = lambda environment, scope, **kwargs: roster.RosterSnapshot.decode(os.environ['SSH_SNAPSHOT']).result\n"
             + "raise SystemExit(broadcast.main(arguments[index + 1:]))\n",
             encoding="utf-8",
         )
@@ -158,7 +159,11 @@ class BroadcastTests(unittest.TestCase):
             codex_daemon, "loaded_sessions", side_effect=AssertionError("use the fake roster"),
         ))
 
-    def fixture_roster(self, environment: Mapping[str, str], scope: roster.RosterScope) -> roster.Roster:
+    def fixture_roster(
+        self, environment: Mapping[str, str], scope: roster.RosterScope, *,
+        membership: staff.StaffSnapshot | None = None,
+    ) -> roster.Roster:
+        _ = membership
         local = roster.Roster(self.rows, self.problems, self.warnings)
         if isinstance(scope, roster.AllMachines):
             peer = roster.peer_roster(environment)
@@ -203,6 +208,78 @@ class BroadcastTests(unittest.TestCase):
         addresses = [command[1] for command in commands]
         self.assertEqual(len(addresses), len(set(addresses)), "an address was sent twice")
         return {command[1]: command[6] for command in commands}
+
+    def producer_staff_file(self, members: Mapping[str, str]) -> str:
+        record = staff.StaffSnapshot(tuple(
+            staff.StaffRow(staff.native_id(str(uuid4())), "producer", name, staff.StaffRoot(),
+                           current_session=staff.native_id(session))
+            for name, session in members.items()
+        ))
+        path = self.root / "staff.json"
+        _ = path.write_text(record.encode(), encoding="utf-8")
+        return str(path)
+
+    def test_producers_reach_both_machines_by_current_staff_session(self) -> None:
+        sender, local, peer, offline = (str(uuid4()) for _ in range(4))
+        self.rows.extend([
+            entry("natedev", f"session:{sender}"),
+            entry("local", f"session:{local}"),
+            entry("peer", "session:unregistered"),
+        ])
+        peer_row = replace(entry("peer", f"codex:{peer}", kind="codex", thread=roster.CodexThread(peer)),
+                           machine="mac")
+        self.peer_rows = [peer_row, peer_row]
+        staff_file = self.producer_staff_file({
+            "natedev": sender, "local": local, "peer": peer, "offline": offline,
+        })
+        message = "From the user (via natedev): Keep these words."
+        result, output, errors = self.run_main("--producers", message, here=False,
+                                              STAFF_FILE=staff_file, CLAUDE_CODE_SESSION_ID=sender)
+        self.assertEqual((result, errors), (0, ""), output)
+        expected = f"{message}\n\nSent directly to producers on fixture and mac; do not pass it on."
+        self.assertEqual(self.sent_texts(), {f"session:{local}": expected})
+        self.assertEqual([(command[1], command[-1]) for command in self.peer_sends()], [(f"codex:{peer}", expected)])
+        self.assertRegex(output.splitlines()[-2], r"^2 sent in \d+ s$")
+
+    def test_producer_broadcast_uses_one_staff_snapshot(self) -> None:
+        session = staff.native_id(str(uuid4()))
+        address = f"session:{session}"
+        member = staff.StaffRow(staff.native_id(str(uuid4())), "producer", "local", staff.StaffRoot(),
+                                current_session=session)
+        membership = staff.StaffSnapshot((member,))
+        unreadable = staff.StaffUnreadable("cannot read the staff fixture")
+        local = roster.Roster([entry(member.name, address)], [])
+        for first_read in (unreadable, membership):
+            with self.subTest(first_read=first_read):
+                output, errors = io.StringIO(), io.StringIO()
+                with (patch.object(staff, "initial_snapshot", side_effect=[first_read, membership]) as read,
+                      patch.object(roster, "_local_roster", return_value=local) as build,
+                      redirect_stdout(output), redirect_stderr(errors)):
+                    result = broadcast.main(["--here", "--from", "natedev", "--producers", "Review update."])
+                read.assert_called_once_with()
+                self.assertNotIn("producers - none on this machine", output.getvalue())
+                if isinstance(first_read, staff.StaffUnreadable):
+                    self.assertEqual(result, 1, output.getvalue())
+                    self.assertIn(f"producers - NOT sent: staff membership: {unreadable}", output.getvalue())
+                    build.assert_not_called()
+                    self.assertEqual(self.sends(), [])
+                else:
+                    self.assertEqual((result, errors.getvalue()), (0, ""), output.getvalue())
+                    build.assert_called_once()
+                    supplied = cast(staff.StaffSnapshot, build.call_args.kwargs["membership"])
+                    self.assertIs(supplied, membership)
+                    self.assertEqual([command[1] for command in self.sends()], [address])
+
+    def test_producer_with_open_review_reports_held_on_the_peer(self) -> None:
+        peer = str(uuid4())
+        self.peer_rows = [replace(entry("registry name", f"session:{peer}"), machine="mac")]
+        staff_file = self.producer_staff_file({"reviewing": peer})
+        result, output, errors = self.run_main("--producers", "Review update.", here=False,
+                                              STAFF_FILE=staff_file, KEPT_FOR=f"session:{peer}")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertIn(f"mac: reviewing [session:{peer}] - held: in a review", output)
+        self.assertEqual([command[1] for command in self.peer_sends()], [f"session:{peer}"])
+        self.assertRegex(output.splitlines()[-2], r"^0 sent in \d+ s$")
 
     def test_all_reaches_every_role_at_once_and_never_the_sender(self) -> None:
         worker = self.rows[4]

@@ -158,6 +158,33 @@ class DeletionRerunTests(unittest.TestCase):
         self.assert_retained(self.script("perform_deletion.sh", self.repo, self.worktree,
                                          BRANCH, preview_id), tip, origin=False)
 
+    def test_confirmed_removal_refuses_a_missing_checkout(self) -> None:
+        tip = self.git("rev-parse", f"refs/heads/{BRANCH}", directory=self.repo)
+        preview_id = self.confirmed_preview(self.repo, self.worktree)
+        _ = self.git("worktree", "remove", str(self.worktree), directory=self.repo)
+
+        result = self.script("perform_deletion.sh", self.repo, self.worktree, BRANCH, preview_id)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("No such file or directory", result.stderr)
+        self.assertNotIn("kept for a manual removal list", result.stderr)
+        self.assertEqual((self.output / "artifact").read_text(), "keep\n")
+        self.assertEqual(self.git("rev-parse", f"refs/heads/{BRANCH}", directory=self.repo), tip)
+
+    def test_confirmation_does_not_allow_removal_from_another_repository(self) -> None:
+        preview_id = self.confirmed_preview(self.repo, self.worktree)
+        other = self.root / "other"
+        _ = self.git("clone", "-q", str(self.repo), str(other))
+        _ = self.git("branch", BRANCH, directory=other)
+
+        result = self.script("perform_deletion.sh", other, self.worktree, BRANCH, preview_id)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("the worktree belongs to a different repository", result.stderr)
+        self.assertNotIn("kept for a manual removal list", result.stderr)
+        self.assertTrue(self.worktree.is_dir())
+
     def test_branch_lookup_error_stops_before_reporting_folders(self) -> None:
         tip = self.git("rev-parse", "HEAD", directory=self.worktree)
         preview_id = self.confirmed_preview(self.repo, self.worktree)

@@ -13,7 +13,8 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
-// Use --outside-queue as the third argument for the CPU time proof.
+// Use --outside-queue after the output folder to check the outside command table.
+// Add a published page from main to save the before image.
 // Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
 // Use the fourth argument to select the older page.
 // Use --guest-tip after the output folder for the guest row tooltip screenshot.
@@ -24,6 +25,8 @@
 // Use <output-folder> --aws-cost-shots to capture the approved AWS costs example.
 // Add a folder with live memory.json, report.json, and memory_live.html for the Day images.
 // Add --awscosts as the fourth argument for the AWS costs proof and images.
+// Use --kill-shot or --kill-control as the third argument for the Kill fixture.
+// Use --kill-both-shot with an output PNG path for the full Builds page.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -75,8 +78,12 @@ const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
 const guestTipProof = previousPage === '--guest-tip';
 const standingProof = previousPage === '--standing-orders';
+const killShot = previousPage === '--kill-shot';
+const killControlProof = previousPage === '--kill-control';
+const killBothShot = previousPage === '--kill-both-shot';
+const killProof = killShot || killControlProof || killBothShot;
 const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof
-  || standingProof || outsideQueueProof;
+  || standingProof || outsideQueueProof || killProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
@@ -268,7 +275,7 @@ try {
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const systemTemporaryRoot = focusedProof || awsCostShots ? tmpdir() : fixtureOutput;
   const page = await readFile(join(liveAwsCostSource ?? folder, 'memory_live.html'));
-  const beforePath = queueRowsProof || standingProof ? comparison : focusedProof ? null : previousPage;
+  const beforePath = queueRowsProof || standingProof || outsideQueueProof ? comparison : focusedProof ? null : previousPage;
   const beforePage = beforePath ? (await readFile(beforePath, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
   const swapBeforePage = !gateMode && process.env.SWAP_BEFORE_PAGE
@@ -414,6 +421,41 @@ try {
 
   let servedReading = base;
   let currentFixture = base;
+  const killTime = killProof ? execFileSync(process.env.PYTHON || 'python3', ['-c', [
+    'from datetime import datetime',
+    'from scripts.lib.user_zone import user_zone',
+    'print(datetime.fromisoformat("2026-11-19T00:41:00+00:00").astimezone(user_zone()).strftime("%H:%M %Z"))',
+  ].join('\n')], {cwd:repo, encoding:'utf8'}).trim() : '';
+  const killMessage = (step, pid) => `nate killed your run "${step}" (pid ${pid}) from the Builds page at ${killTime}.`;
+  const killWarning = name => `The run stops at once and its work is lost. This message goes to ${name}:`;
+  const killWordsLabel = 'Your own words, added to the message (optional)';
+  const killPath = '/console/build-kill';
+  const killRef = 'a'.repeat(64);
+  const killOffer = {handle:'b'.repeat(64),pid:2712994,started_by:'impl3, a worker of unit-board',
+    recipient_name:'impl3',step:'check',
+    message:killMessage('check', 2712994)};
+  const researchRef = 'c'.repeat(64);
+  const researchOffer = {handle:'e'.repeat(64),pid:2637799,started_by:'test, a worker of research',
+    recipient_name:'test',step:'nextest',
+    message:killMessage('nextest', 2637799)};
+  const killedResult = {reference:killRef,step:'check',pid:killOffer.pid,stop:'Stopped',delivery:'Message sent',
+    time:killTime,recipient_role:'worker',recipient_name:'impl3'};
+  const killToken = 'fixture-token';
+  const killRefreshSeconds = 17;
+  const stoppingResult = {...killedResult,stop:'Stopping',delivery:''};
+  const outsideRows = readings.outside_queue?.outside_queue ?? [];
+  const outsideRow = outsideRows.find(row => row.pid === 8102);
+  const outsideRef = outsideRow?.kill_ref;
+  const outsideOffers = Object.fromEntries(outsideRows.map(row => [row.kill_ref, {
+    handle:'d'.repeat(64), pid:row.pid, started_by:row.pid === 8102 ? 'test, a worker of queue' : 'builds, a showrunner',
+    recipient_name:row.owner, step:row.command,
+    message:killMessage(row.command, row.pid),
+  }]));
+  const outsideStopped = {reference:outsideRef,step:outsideRow?.command,pid:outsideRow?.pid,
+    stop:'Stopped',delivery:'Message sent',time:killTime,recipient_role:'worker',recipient_name:outsideRow?.owner};
+  let killPost;
+  let killPostReply;
+  let killResults = [];
   let submittedItem;
   let queueFixture = null;
   let unnamedPlace = -1;
@@ -493,6 +535,40 @@ try {
       queueFixture.move_revision += '1';
       confirmedQueueLine = line();
       return json(200, {line:confirmedQueueLine});
+    }
+    if (req.url === killPath) {
+      res.setHeader('Content-Type','application/json');
+      if (!killProof) {
+        res.writeHead(403).end('{}');
+      } else if (req.method === 'POST') {
+        if (killShot || killBothShot) {
+          res.writeHead(405).end('{}');
+          return;
+        }
+        const fields = [];
+        req.setEncoding('utf8');
+        req.on('data', part => fields.push(part));
+        req.on('end', () => {
+          killPost = Object.fromEntries(new URLSearchParams(fields.join('')));
+          killPostReply = (reason, accepted) => {
+            if (reason) {
+              res.writeHead(409).end(JSON.stringify({reason}));
+              return;
+            }
+            const result = accepted ?? (killPost.reference === outsideRef
+              ? {...outsideStopped,stop:'Stopping',delivery:''} : stoppingResult);
+            killResults = [result];
+            res.end(JSON.stringify({result}));
+          };
+          server.emit('kill-post');
+        });
+      } else {
+        const offers = {[killRef]:killOffer, ...(killShot ? {} : outsideOffers)};
+        if (killBothShot) offers[researchRef] = researchOffer;
+        for (const result of killResults) if (result.stop !== 'Stop unconfirmed') delete offers[result.reference];
+        res.end(JSON.stringify({token:killToken,offers,results:killResults,refresh_seconds:killRefreshSeconds}));
+      }
+      return;
     }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
@@ -587,7 +663,7 @@ try {
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
         const desktopWidth = gateMode ? 1400 : 1600;
         await call('Emulation.setDeviceMetricsOverride', {width:desktopWidth,height:1200,deviceScaleFactor:1,mobile:false});
-        const navigate = async path => {
+        const navigate = async (path, freezeRender = true) => {
           currentFixture = servedReading;
           const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
           await Promise.all([loaded, call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/${path}`})]);
@@ -600,7 +676,7 @@ try {
           window.proofRun = index => latest.walk[index].key;
           window.renderReading = render;
           window.proofData = structuredClone(latest);
-          window.render = () => {};
+          if (${freezeRender}) window.render = () => {};
           await document.fonts.ready;
           const legend = document.querySelector('.legend-box');
           if (${JSON.stringify(path)} === 'memory_live.html' && legend.open) throw new Error('The legend starts open.');
@@ -617,49 +693,313 @@ try {
           console.log(JSON.stringify({shots,output:folder}));
           break browserProof;
         }
-        if (outsideQueueProof || !focusedProof) {
-          servedReading = readings.outside_queue;
+        if (killProof) {
+          const source = structuredClone(base.walk.find(row => row.queued && !row.ci));
+          source.progress = {kind:'RowProgress',phase:'testing',done:13,total:200,percent:6.5,unit:'tests'};
+          const local = {...source,key:'kill-fixture',machine:'natedev',pid:killOffer.pid,
+            name:'unit-board check',unit:'unit-board',kill_ref:killRef,started_at:fixtureTime - 660};
+          const other = {...source,key:'research-fixture',machine:'natedev',pid:researchOffer.pid,
+            name:'research nextest',unit:'research',kill_ref:researchRef,started_at:fixtureTime - 1200};
+          servedReading = {...(killBothShot ? readings.outside_queue : base),
+            psi:{some:0,full:0}, pressure:'none',
+            walk:[other,local], waiters:[], queued_priority_units:[], outside_queue:killShot ? [] : outsideRows};
+          await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
           await navigate('memory_live.html');
-          const result = await evaluate(`(() => {
+          if (killBothShot) {
+            const width = 1600;
+            const height = await evaluate(`(async () => {
+              document.querySelector('.legend-box').open = false;
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+              return Math.max(1400, document.documentElement.scrollHeight);
+            })()`);
+            await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+            await evaluate('scrollTo(0, 0)');
+            // The modal blocks pointer input. Force the hover style for the comparison image.
+            await call('DOM.enable');
+            await call('CSS.enable');
+            const {root} = await call('DOM.getDocument');
+            const hoverTarget = 'tr[data-tip="row:kill-fixture"] .kill-run';
+            const {nodeId} = await call('DOM.querySelector', {nodeId:root.nodeId, selector:hoverTarget});
+            await call('CSS.forcePseudoState',{nodeId,forcedPseudoClasses:['hover']});
+            const shown = await evaluate(`(() => {
+              const queue = document.querySelectorAll('.walk-table .kill-run');
+              const outside = document.querySelectorAll('#outside-queue .kill-run');
+              const dialog = document.querySelector('#kill-dialog');
+              const box = dialog.getBoundingClientRect();
+              return {queue:queue.length,outside:outside.length,open:dialog.open,
+                belowTable:box.top >= document.querySelector('#outside-queue table').getBoundingClientRect().bottom,
+                fits:box.top >= 0 && box.bottom <= innerHeight && dialog.scrollHeight <= dialog.clientHeight,
+                label:getComputedStyle(document.querySelector(${JSON.stringify(hoverTarget)}),'::after').content,
+                dark:matchMedia('(prefers-color-scheme: dark)').matches,
+                pressure:document.querySelector('#pill-t').textContent,height:document.documentElement.scrollHeight};
+            })()`);
+            assert.deepEqual(shown,{queue:servedReading.walk.length,outside:outsideRows.length,open:true,
+              belowTable:true,fits:true,label:'"Kill this run"',dark:true,pressure:'no memory pressure',height});
+            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
+              clip:{x:0,y:0,width,height,scale:1}});
+            const path = comparison ? resolve(comparison) : join(folder,'kill-both-tables-dark.png');
+            await writeFile(path,Buffer.from(shot.data,'base64'));
+            console.log(JSON.stringify({pass:true,path,width,height}));
+            break browserProof;
+          }
+          const confirmation = await evaluate(`(async () => {
+            document.querySelector('.legend-box').open = false;
+            for (const section of document.querySelectorAll('#leftovers, #swap, #report-charts')) section.hidden = true;
+            document.body.style.paddingBottom = '520px';
+            await refreshKill();
+            document.querySelector('#walk-title').scrollIntoView({block:'start'});
+            const control = document.querySelector('.kill-run');
+            control.click();
+            document.querySelector('#kill-words').value = 'Start it again after 21:50.';
+            const rect = document.querySelector('#walk').getBoundingClientRect();
+            const top = document.querySelector('#walk-title').getBoundingClientRect();
+            const dialog = document.querySelector('#kill-dialog');
+            const pop = dialog.getBoundingClientRect();
+            const unit = dialog.querySelector('#kill-name strong [data-color-text="role.unit-director"]');
+            return {
+              icons:document.querySelectorAll('.walk-table .kill-run').length, icon:control.innerHTML,
+              unavailable:document.querySelector('tr[data-tip="row:research-fixture"] .pid').title,
+              labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
+              fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
+              unit:unit?.textContent, unitWeight:unit ? getComputedStyle(unit).fontWeight : '',
+              preview:document.querySelector('#kill-message').textContent,
+              warning:document.querySelector('#kill-warning').textContent,
+              wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
+              clip:{x:Math.max(0,rect.left-8)+scrollX,y:Math.max(0,Math.min(top.top,pop.top)-8)+scrollY,
+                width:Math.min(innerWidth,rect.right+8)-Math.max(0,rect.left-8),
+                height:Math.max(rect.bottom,pop.bottom)+8-Math.max(0,Math.min(top.top,pop.top)-8),scale:1}
+            };
+          })()`);
+          if (killShot) {
+            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:confirmation.clip});
+            await writeFile(join(folder,'kill-dark.png'),Buffer.from(shot.data,'base64'));
+            killResults = [killedResult];
+            const killedClip = await evaluate(`(async () => {
+              document.querySelector('#kill-dialog').close();
+              await refreshKill();
+              const walk = document.querySelector('#walk').getBoundingClientRect();
+              const heading = document.querySelector('#walk-title').getBoundingClientRect();
+              const left = Math.max(0,walk.left-8), top = Math.max(0,heading.top-8);
+              return {x:left+scrollX,y:top+scrollY,width:Math.min(innerWidth,walk.right+8)-left,
+                height:walk.bottom+8-top,scale:1};
+            })()`);
+            const killed = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:killedClip});
+            await writeFile(join(folder,'killed-row-dark.png'),Buffer.from(killed.data,'base64'));
+            console.log(join(folder,'kill-dark.png'));
+            console.log(join(folder,'killed-row-dark.png'));
+          } else {
+            assert.equal(confirmation.icons,1);
+            assert.equal(confirmation.unavailable,'Kill is not available for this run yet');
+            assert.deepEqual(confirmation.labels,['Run','Pid','Progress','Started by']);
+            assert.deepEqual(confirmation.fields,
+              ['unit-board · check','2712994 and its child processes','6.5% done after 11 min','impl3, a worker of unit-board']);
+            assert.equal(confirmation.unit,'unit-board');
+            assert.equal(confirmation.unitWeight,'700');
+            assert.equal(confirmation.preview,killOffer.message);
+            assert.equal(confirmation.warning,killWarning(killOffer.recipient_name));
+            assert.equal(confirmation.wordsLabel,killWordsLabel);
+            killResults = [{...killedResult,stop:'Run already ended',delivery:''}];
+            assert.deepEqual(await evaluate(`(async () => {
+              await refreshKill();
+              return [document.querySelector('.kill-state').textContent, document.querySelectorAll('.walk-table .kill-run').length];
+            })()`),['Run already ended',0]);
+            killResults = [{...killedResult,delivery:''}];
+            assert.equal(await evaluate(`(async () => {
+              await refreshKill();
+              return document.querySelector('.kill-state').textContent;
+            })()`),`Killed by you at ${killTime} · Message pending`);
+            killResults = [];
+            await evaluate(`refreshKill()`);
+            await evaluate(`document.querySelector('#kill-submit').click()`);
+            assert.equal(await evaluate(`document.querySelector('.kill-state').textContent`),'Stopping');
+            // Remove the fixture row while the action is pending.
+            await evaluate(`renderReading({...latest,walk:latest.walk.filter(row => !row.kill_ref)})`);
+            assert.match(await evaluate(`document.querySelector('#kill-results').textContent`),/Stopping/);
+            const received = await new Promise(resolve => {
+              if (killPostReply) resolve(killPost);
+              else server.once('kill-post', () => resolve(killPost));
+            });
+            assert.deepEqual(received,{reference:killRef,token:killToken,handle:killOffer.handle,
+              words:'Start it again after 21:50.'});
+            killPostReply();
+            servedReading = {...servedReading,walk:servedReading.walk.filter(row => !row.kill_ref)};
+            const refresh = await evaluate(`(async () => {
+              await refreshKill();
+              return {interval:killRefreshSeconds,text:document.querySelector('#kill-results').textContent};
+            })()`);
+            assert.deepEqual(refresh,{interval:killRefreshSeconds,text:'check (pid 2712994) · Stopping'});
+            killResults = [killedResult];
+            const returned = await evaluate(`(async () => {
+              await tick();
+              const early = document.querySelector('#kill-results').textContent;
+              const read = refreshKill;
+              let reply;
+              refreshKill = () => reply = read();
+              try {
+                nextKillRead = performance.now();
+                await tick();
+                await reply;
+                return {early,finished:document.querySelector('#kill-results').textContent};
+              } finally {
+                refreshKill = read;
+              }
+            })()`);
+            assert.deepEqual(returned,{early:'check (pid 2712994) · Stopping',
+              finished:`check (pid 2712994) · Killed by you at ${killTime} · worker impl3 informed`});
+            assert.ok(outsideRef, 'The outside feed must publish a Kill reference for a registered owner.');
+            killResults = [];
+            killPost = killPostReply = undefined;
+            const outside = await evaluate(`(async () => {
+              await refreshKill();
+              const control = document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run');
+              control.click();
+              const dialog = document.querySelector('#kill-dialog');
+              const box = dialog.getBoundingClientRect();
+              const table = document.querySelector('#outside-queue table').getBoundingClientRect();
+              const unit = dialog.querySelector('#kill-name strong [data-color-text="role.unit-director"]');
+              return {icons:document.querySelectorAll('#outside-queue .kill-run').length, icon:control.innerHTML,
+                pid:control.closest('.outside-pid')?.firstChild.textContent,
+                label:control.getAttribute('aria-label'), fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
+                unit:unit?.textContent, unitWeight:unit ? getComputedStyle(unit).fontWeight : '',
+                labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
+                warning:document.querySelector('#kill-warning').textContent,
+                wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
+                belowTable:box.top >= table.bottom, fits:box.top >= 0 && box.bottom <= innerHeight,
+                preview:document.querySelector('#kill-message').textContent, submit:document.querySelector('#kill-submit').textContent};
+            })()`);
+            assert.deepEqual(outside,{icons:2,icon:confirmation.icon,pid:'8102',label:'Kill this run',
+              fields:['queue · targeted_test.py','8102 and its child processes','5 min','test, a worker of queue'],
+              unit:'queue',unitWeight:'700',
+              labels:['Run','Pid','Age','Started by'],warning:killWarning(outsideRow.owner),wordsLabel:killWordsLabel,
+              belowTable:true,fits:true,preview:outsideOffers[outsideRef].message,submit:'Kill the run'});
+            const outsideState = () => evaluate(`document.querySelector('[data-kill-ref="${outsideRef}"]')
+              ?.closest('tr').querySelector('.kill-state')?.textContent`);
+            const submitOutside = async () => {
+              await evaluate("document.querySelector('#kill-submit').click()");
+              assert.equal(await outsideState(),'Stopping');
+              const request = await new Promise(resolve => {
+                if (killPostReply) resolve(killPost);
+                else server.once('kill-post', () => resolve(killPost));
+              });
+              assert.deepEqual(request,{reference:outsideRef,token:killToken,handle:outsideOffers[outsideRef].handle,words:''});
+            };
+            await submitOutside();
+            killPostReply('The run or its stop route changed.');
+            await evaluate(`(async () => {
+              while (pendingKills.size) await new Promise(resolve => setTimeout(resolve, 10));
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+            })()`);
+            assert.equal(await outsideState(),'Not stopped: The run or its stop route changed.');
+            killPost = killPostReply = undefined;
+            await submitOutside();
+            killPostReply(undefined, {...outsideStopped,stop:'Stop unconfirmed',delivery:'',
+              reason:'Still running after Kill: pid 8105'});
+            await evaluate(`(async () => {
+              while (pendingKills.size) await new Promise(resolve => setTimeout(resolve, 10));
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+            })()`);
+            assert.equal(await outsideState(),'Not stopped: Still running after Kill: pid 8105');
+            killPost = killPostReply = undefined;
+            await submitOutside();
+            killPostReply();
+            await evaluate('refreshKill()');
+            assert.equal(await outsideState(),'Stopping');
+            killResults = [outsideStopped];
+            await evaluate('refreshKill()');
+            assert.equal(await outsideState(),`Killed by you at ${killTime} · worker test informed`);
+            servedReading = {...servedReading,outside_queue:outsideRows.filter(row => row.kill_ref !== outsideRef)};
+            await evaluate('(async () => { window.render = renderReading; await pageRefresh.refresh(true); })()');
+            assert.equal(await outsideState(),undefined);
+            const unavailable = await evaluate(`(() => {
+              const rows = latest.outside_queue.map(row => ({...row,kill_ref:undefined}));
+              renderReading({...latest,outside_queue:rows});
+              const row = document.querySelector('.outside-queue-row');
+              return {label:row.querySelector('.outside-pid').title, icon:!!row.querySelector('.kill-run')};
+            })()`);
+            assert.deepEqual(unavailable,{label:'Kill is not available for this run yet',icon:false});
+            console.log(JSON.stringify({pass:true,proof:'Kill control'}));
+          }
+          break browserProof;
+        }
+        if (outsideQueueProof || !focusedProof) {
+          const inspectOutside = () => evaluate(`(() => {
             const section = document.querySelector('#outside-queue');
             section.scrollIntoView({block:'center'});
-            const bounds = section.getBoundingClientRect();
-            const rows = Array.from(section.querySelectorAll('.outside-queue-row'), row => ({
-              cells:Array.from(row.children, cell => cell.textContent),
-              color:row.querySelector('.detail [data-color-text]')?.getAttribute('data-color-text'),
-            }));
             return {heading:section.querySelector('.section-head').textContent,
-              previousCard:section.previousElementSibling?.id,
-              nextCard:section.nextElementSibling?.id,
-              rows, visible:!section.hidden, clip:{x:bounds.left+scrollX,y:bounds.top+scrollY,
-              width:bounds.width,height:bounds.height,scale:1}};
+              previousCard:section.previousElementSibling?.id, nextCard:section.nextElementSibling?.id,
+              headers:Array.from(section.querySelectorAll('thead th'), cell => cell.textContent),
+              rows:Array.from(section.querySelectorAll('.outside-queue-row'), row => ({
+                cells:Array.from(row.children, cell => cell.textContent),
+                color:row.querySelector('[data-color-text]')?.getAttribute('data-color-text'),
+                clipped:Array.from(row.children).some(cell => cell.scrollWidth > cell.clientWidth),
+              })),
+              emptyText:section.querySelector('#outside-queue-rows').textContent,
+              visible:!section.hidden};
           })()`);
+          const saveOutside = async name => {
+            await evaluate("scrollTo(0, 0); document.querySelector('.legend-box').open = false;");
+            const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:false});
+            await writeFile(join(folder, name), Buffer.from(shot.data, 'base64'));
+          };
+          servedReading = readings.outside_first;
+          await navigate('memory_live.html');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells[4]), ['—', '—']);
+          servedReading = readings.outside_queue;
+          await navigate('memory_live.html', false);
+          const result = await inspectOutside();
           assert.equal(result.visible, true);
           assert.equal(result.heading, 'Tests outside the queue');
           assert.equal(result.previousCard, 'build-limits', 'Tests outside the queue must follow Build limits.');
           assert.equal(result.nextCard, 'aws-costs', 'AWS costs must follow Tests outside the queue.');
-          assert.deepEqual(result.rows, [{cells:['queue · test · targeted_test.py', '136.0 s CPU'],
-            color:'role.unit-director'}]);
-          const output = join(folder, 'cpumark-dark.png');
-          const pageOutput = join(folder, 'cpumark-page-dark.png');
-          if (outsideQueueProof) {
-            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:result.clip});
-            await writeFile(output, Buffer.from(shot.data, 'base64'));
-            await evaluate(`(() => {
-              document.querySelector('.legend-box').open = false;
-              scrollTo(0, 0);
-            })()`);
-            const {cssContentSize: {height}} = await call('Page.getLayoutMetrics');
-            const pageShot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,
-              clip:{x:0,y:0,width:desktopWidth,height,scale:1}});
-            await writeFile(pageOutput, Buffer.from(pageShot.data, 'base64'));
-          }
+          assert.deepEqual(result.headers, ['Command', 'Owner', 'Pid', 'Age', 'Current CPU', 'CPU total']);
+          assert.deepEqual(result.rows, [
+            {cells:['verify_cache_test.py', 'builds', '8112', '5 min', '25%', '153 s'],
+              color:'role.showrunner', clipped:false},
+            {cells:['targeted_test.py', 'queue · test', '8102', '5 min', '75%', '139 s'],
+              color:'role.unit-director', clipped:false},
+          ]);
           assert.equal(await evaluate(`(() => {
-            renderReading({...proofData, outside_queue:[]});
-            return document.querySelector('#outside-queue').hidden;
+            const row = document.querySelector('.outside-queue-row');
+            const box = row.getBoundingClientRect();
+            row.dispatchEvent(new PointerEvent('pointermove', {bubbles:true, pointerType:'mouse',
+              clientX:box.left + 10, clientY:box.top + 10}));
+            const values = [...document.querySelectorAll('#tip dd:not(.title)')];
+            return values.length === 4 && values.every(cell => getComputedStyle(cell).textAlign === 'right');
           })()`), true);
           if (outsideQueueProof) {
-            console.log(JSON.stringify({pass:true, views:2, output, pageOutput}));
+            await evaluate('hideTip()');
+            await saveOutside('i390-page-after-dark.png');
+          }
+          servedReading = {...readings.outside_queue, outside_queue:readings.outside_queue.outside_queue
+            .filter(row => row.pid !== 8102)};
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells[2]), ['8112']);
+          servedReading = readings.outside_empty;
+          await evaluate('pageRefresh.refresh(true)');
+          const empty = await inspectOutside();
+          assert.equal(empty.visible, true);
+          assert.equal(empty.emptyText, 'No test runs outside the queue now.');
+          assert.deepEqual(empty.rows, []);
+          servedReading = {...readings.outside_queue, outside_queue:[
+            {command:'older_test.py', owner:'builds', pid:8112, cpu_seconds:153},
+            {command:'missing_pid.py', owner:'builds', cpu_seconds:139},
+          ]};
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells.slice(2)),
+            [['8112', '—', '—', '153 s'], ['—', '—', '—', '139 s']]);
+          if (outsideQueueProof) {
+            if (beforePage) {
+              servedReading = readings.outside_queue;
+              await navigate('before.html');
+              const before = await inspectOutside();
+              assert.equal(before.rows.length, result.rows.length);
+              assert.deepEqual(before.headers, []);
+              await saveOutside('i390-page-before-dark.png');
+            }
+            console.log(JSON.stringify({pass:true, rows:result.rows.length}));
             break browserProof;
           }
         }
@@ -1233,8 +1573,12 @@ try {
           await checkPage(navigate, evaluate, call);
         }
       } finally {
-        if(ws) ws.close();
-        chrome.kill('SIGTERM');
+        if (killProof && ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({id:0,method:'Browser.close'}));
+        } else {
+          if (ws) ws.close();
+          chrome.kill('SIGTERM');
+        }
         await exited;
       }
 

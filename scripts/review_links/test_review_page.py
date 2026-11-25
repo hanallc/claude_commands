@@ -1,5 +1,6 @@
 """Check the shared review records, signed actions and table behavior."""
 from __future__ import annotations
+from scripts.console_text.test_support import accepting_console_text
 from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.production.change_review_test_support import pictured_changes
@@ -209,6 +210,7 @@ class ReviewPageTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.fixture = test_change_page.ChangePageTests('runTest')
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.set_up_review(changes=3)
@@ -5312,16 +5314,16 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             child_record = next(item.source.record for item in review_items.read(self.root)
                                 if item.key == child_key and isinstance(item.source, review_items.QuestionSource))
             child_before = child_record.path.read_bytes()
-            for key in (question, child_key):
+            for key, answer in ((question, "The parent layout is ready."), (child_key, "The child layout is ready.")):
                 item = next(item for item in review_items.read(self.root) if item.key == key)
                 page = review_actions.delivery_page(item, self.status)
                 pending = self.status.slots(page, page.rows[0]).question
                 assert isinstance(pending, change_page.OpenQuestion)
-                self.assertEqual(change_page.main(['answer-question','--item',key,'--question',pending.question_id,'--text','Answer for '+key]),0,
+                self.assertEqual(change_page.main(['answer-question','--item',key,'--question',pending.question_id,'--text',answer]),0,
                                  'F022: the exact item selects its record despite identical subtree text')
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(returned.state,review_items.ReviewState.OPEN)
-                self.assertIn('Answer for '+key, returned.log[-1].words)
+                self.assertIn(answer, returned.log[-1].words)
                 if key == question:
                     self.assertEqual(change_page.main(['answer-question','--item',key,'--question',pending.question_id,'--text','Repeat parent answer']),1,
                                      'F022: a repeated parent answer cannot select the child')
