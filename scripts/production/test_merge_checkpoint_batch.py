@@ -1138,6 +1138,42 @@ raise SystemExit(1)
                 _ = self.assert_landed(start, [beta])
                 self.assertFalse(record.exists())
 
+    def test_crash_resume_of_partial_batch_red_stops_all_rows(self) -> None:
+        start, alpha, beta, rows = self.prepare_row_drop()
+        runs: list[RowDropRun] = []
+        merge = merge_checkpoint.merge
+
+        def interrupt(
+            request: merge_checkpoint.MergeRequest, *,
+            batch_checkout: merge_checkpoint.ResetBatchCheckout | merge_checkpoint.KeepBatchCheckout,
+        ) -> str:
+            assert isinstance(batch_checkout, merge_checkpoint.ResetBatchCheckout)
+            if batch_checkout.dropped_commit:
+                self.assertEqual(batch_checkout.dropped_commit, alpha)
+                self.assertEqual(request.commit, beta)
+                self.assertEqual(self.git("rev-parse", "HEAD"), start)
+                self.assertFalse((self.checkout / ".git/MERGE_HEAD").exists())
+                raise KeyboardInterrupt
+            return merge(request, batch_checkout=batch_checkout)
+
+        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
+            with (patch.object(merge_checkpoint, "merge", side_effect=interrupt),
+                  self.assertRaises(KeyboardInterrupt)):
+                _ = self.land_batch(rows)
+            record = self.batch_record()
+            saved = record.read_text() if record.exists() else ""
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
+            runs.clear()
+            resend = self.land_batch(rows)
+
+        self.assertEqual(resend.returncode, 1, resend.stdout + resend.stderr)
+        self.assertEqual(saved.splitlines(), [f"{alpha}\t{rows[0]}", f"{beta}\t{rows[1]}", "in-flight\t-"])
+        self.assertIn("send alpha:", resend.stdout)
+        self.assertIn("send beta:", resend.stdout)
+        self.assertNotIn("batch: dropped", resend.stdout)
+        self.assertEqual(runs, [RowDropRun(False, True, True, False)])
+        self.assert_rolled_back(start)
+
     def test_dropped_row_gets_result_send_line_and_kept_log(self) -> None:
         _, alpha, beta, rows = self.prepare_row_drop()
         with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate([])):

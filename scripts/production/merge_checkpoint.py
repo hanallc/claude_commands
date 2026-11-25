@@ -2009,6 +2009,7 @@ class BatchResumeRecord:
     merge_state: LegacyBatchMerge | NoBatchMerge | InFlightBatchMerge = NO_BATCH_MERGE
     retirement_attempted: bool = False
     resuming: bool = False
+    awaiting_survivor_result: bool = False
 
     def checkpoint_rows(self) -> str:
         return "".join(f"{item.commit}\t{item.batch_argument_line}\n" for item in self.checkpoints)
@@ -2517,7 +2518,8 @@ def batch_resume_record(requests: tuple[MergeRequest, ...], upstream: str) -> Ge
     try:
         yield record
     finally:
-        if not record.retirement_attempted and not unpushed_checkpoint_sources(production, upstream):
+        if (not record.retirement_attempted and not record.awaiting_survivor_result
+                and not unpushed_checkpoint_sources(production, upstream)):
             if isinstance(record.merge_state, NoBatchMerge) or isinstance(
                     read_open_merge(merge_head_path(checkout)), NoOpenMerge):
                 record.retire()
@@ -2569,6 +2571,15 @@ def drop_batch_row(red: BatchRed) -> int:
         return finish_batch_stop(red, red.notices, red.rollback)
 
     record = red.rollback.record
+    record.awaiting_survivor_result = True
+    result = rebuild_batch_survivors(red, owner, kept_log, rows)
+    record.awaiting_survivor_result = False
+    return result
+
+
+def rebuild_batch_survivors(red: BatchRed, owner: MergeRequest, kept_log: Path,
+                            rows: tuple[MergeRequest, ...]) -> int:
+    """Roll back the original batch and run the survivors."""
     warnings: list[str] = []
     try:
         reset_batch(red.rollback, warnings)
@@ -2591,7 +2602,7 @@ def drop_batch_row(red: BatchRed) -> int:
         land_runs.update_landing([item.commit for item in survivors], [f"{item.unit.name} {item.phase}" for item in survivors])
     except (OSError, ValueError, TypeError) as error:
         checkpoint_gate.report("batch", "warning", f"could not update the running land: {error}")
-    return run_pending_batch(survivors, record, dropped_commit=owner.commit)
+    return run_pending_batch(survivors, red.rollback.record, dropped_commit=owner.commit)
 
 
 def run_pending_batch(requests: tuple[MergeRequest, ...], resume_record: BatchResumeRecord, *,
