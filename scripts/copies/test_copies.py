@@ -141,7 +141,7 @@ class StandingTests(unittest.TestCase):
         temporary = self.base / "temporary"
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
-        slot_configuration = private_slot_config(self.base, repository="origin", maximum=2, default_maximum=2)
+        slot_configuration = private_slot_config(self.base)
         configuration = Path(slot_configuration.environment["CONF_DIR"])
         home = self.base / "home"
         home.mkdir()

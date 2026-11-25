@@ -53,7 +53,7 @@ class HanaPlacementTests(CostFixture):
         self.provider = FakeProvider(Path(), TestClock())
         self.controller = box.HanaController(Path(), Path(), Path(), self.provider)
         self.assignment = placement.PlacementAssignment('', '', placement.PlacementDestination(
-            'ssh', 'fixture', 'fixture-hana', claim_state.RepositoryScope('hana', KEY, 1), 1),
+            'ssh', 'fixture', 'fixture-hana', claim_state.RepositoryScope('hana', KEY), 1),
             execution_identity.SourceKeyKnown('source'), placement.SubmittingOwner('', 0, ''), OwningSession('fixture-session'), 0)
 
     @override
@@ -406,6 +406,18 @@ with hana_command_lock(directory) as access:
         self.assertEqual(repeated.reserved.claim.generation, hana.generation_text(adopted.generation))
         self.assertNotEqual(hana.generation_text(replace(adopted.generation, boot_id='another')), repeated.reserved.claim.generation)
 
+    def test_assigned_adoption_reads_only_the_repository_claim_paths(self) -> None:
+        adopted = self.ready()
+        paths = claim_state.state_paths(self.assignment.destination.target)
+        scope = self.assignment.destination.scope
+        claim = mac_test.claim_path(paths, scope)
+        _ = (paths.claims / 'unrelated.json').write_text('{')
+        transport = hana.HanaControlTransport(self.workload, self.assignment.destination.host)
+        self.assertEqual(adapter.read_assigned_adoption(self.assignment, self.holder, transport), adopted.reserved.claim)
+
+        _ = claim.rename(claim.with_name(f'{claim.stem}.slot-1.json'))
+        self.assertEqual(adapter.read_assigned_adoption(self.assignment, self.holder, transport), adopted.reserved.claim)
+
     def test_evidence_never_calls_provider_or_ssh(self) -> None:
         adopted = self.ready()
         before = len(self.provider.calls)
@@ -658,7 +670,7 @@ class HanaGpuPlacementTests(CostFixture):
         process = process_start.process_start(pid)
         assert isinstance(process, process_start.Started)
         self.assignment = placement.PlacementAssignment('episode', 'attempt',
-            placement.PlacementDestination('ssh', 'hana-gpu', 'hana-gpu', claim_state.RepositoryScope('hana', KEY, 1), 1),
+            placement.PlacementDestination('ssh', 'hana-gpu', 'hana-gpu', claim_state.RepositoryScope('hana', KEY), 1),
             execution_identity.SourceKeyKnown('source'), placement.SubmittingOwner(store.host_name(), pid, process.start),
             OwningSession('fixture-session'), 0)
 

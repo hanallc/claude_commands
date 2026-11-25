@@ -452,7 +452,7 @@ source() {
         _ = write_config_fixture(self.root / "mac_test.conf", "offload=off\n")
         for name in ("linux_target", "spare"):
             _ = write_config_fixture(self.root / f"{name}.conf",
-                "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc\nslots=1\nslots.hana=1\n"
+                "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc\n"
                 + "devshell=default\nshell_cache=fixture-shells\nshell_timeout_s=2\n"
                 + "build_budget_gib=32\ntarget_budget_gib=24\nversion_pin_file=nixos hosts/linux-build.nix\n"
                 + "parity.rustc=rustc fixture\nparity.nextest=nextest fixture\n"
