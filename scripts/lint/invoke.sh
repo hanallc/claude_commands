@@ -241,6 +241,13 @@ buildlog_end() {
     return 0
 }
 
+# EOF on the stop pipe ends the sampler. A timeout starts the next tick.
+buildlog_wait_sample_tick() {
+    local status=0
+    IFS= read -r -t 1 _ || status=$?
+    (( status > 128 ))
+}
+
 buildlog_sample_anon() {
     local sidecar=$1 maximum=$2 parent=${3:-$$} scope="" line anon shmem use peak=0
     local temporary="$maximum.tmp.${BASHPID:-$$}"
@@ -336,7 +343,7 @@ buildlog_sample_anon() {
                 fi
             fi
         fi
-        sleep 1
+        buildlog_wait_sample_tick || return 0
     done
 }
 
@@ -352,9 +359,11 @@ buildlog_token_phase_context() {
 }
 
 buildlog_finish_memory() {
-    local status=$1 sampler_pid=$2
+    local status=$1 sampler_pid=$2 sampler_input=$3
+    if [[ "$sampler_input" =~ ^[0123456789]+$ ]]; then
+        eval "exec $sampler_input>&-"
+    fi
     if [[ -n "$sampler_pid" ]]; then
-        kill "$sampler_pid" 2>/dev/null || true
         wait "$sampler_pid" 2>/dev/null || true
     fi
     buildlog_release_memory "$status"
@@ -419,7 +428,9 @@ run_step_attempt() {
         buildlog_begin "$@" || true
     fi
     BUILDLOG_PLACEMENT_PREPARED=0
-    local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
+    local sampler_pid="" sampler_input="" parent_pid=$BASHPID status=0 memory_wait=0
+    local -a BUILDLOG_SAMPLER=()
+    local BUILDLOG_SAMPLER_PID
     if buildlog_step_compiles "$@"; then
         while :; do
             buildlog_wait_for_memory "$@" || {
@@ -477,9 +488,12 @@ run_step_attempt() {
     if [[ "${1:-}" == cargo && "${2:-}" == nextest && "${3:-}" == run ]]; then lint_prebuild_prefix; fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
-        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
-            "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" &
-        sampler_pid=$!
+        coproc BUILDLOG_SAMPLER {
+            [[ -z "${VERIFY_EXIT_STDERR_FD:-}" ]] || close_verify_exit_stderr
+            buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
+                "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@"
+        } >/dev/null
+        sampler_pid=$! sampler_input=${BUILDLOG_SAMPLER[1]:-}
     fi
     if [[ -n "${BUILDLOG_START:-}" ]]; then
         buildlog_now
@@ -514,7 +528,7 @@ run_step_attempt() {
         nextest_token_width "$LINT_NEXTEST_WIDTH_FILE"
         [[ -z "$LINT_NEXTEST_TOKEN_WIDTH" ]] || set -- "${@:1:4}" "$LINT_NEXTEST_TOKEN_WIDTH" "${@:6}"
     fi
-    buildlog_finish_memory "$status" "$sampler_pid"
+    buildlog_finish_memory "$status" "$sampler_pid" "$sampler_input"
     if [[ -n "${BUILDLOG_PEAK:-}" ]]; then
         rm -f -- "$BUILDLOG_PEAK.progress.log"
     fi
