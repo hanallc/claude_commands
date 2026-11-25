@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.console_text.test_support import real_review_question
 from scripts.production.update_registration_test_support import RegistrationFixture, registration, showrunners, read_production, review
 from scripts.production.cli_fixture import production_paths
 from scripts.production import showrunner_tree
@@ -87,9 +88,8 @@ class RegistrationTests(RegistrationFixture):
                 return subprocess.CompletedProcess(argv, 0, "agent=sonnet effort=high", "")
             self.assertEqual(Path(argv[0]).name, "claude")
             return subprocess.CompletedProcess(argv, 0, json.dumps(next(responses)), "")
-        real_review = review.review_question
         def question_review(key: review.QuestionKey, question: str, *, console_kind: str) -> review.QuestionOutcome:
-            return real_review(key, question, runner=runner, console_kind=console_kind)
+            return real_review_question(key, question, runner=runner, console_kind=console_kind)
         with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.state / "notify")}),
               mock.patch.object(review, "GUIDE", self.root),
               mock.patch.object(review, "reviewer_environment", return_value=({}, "claude2")),
@@ -150,7 +150,6 @@ class RegistrationTests(RegistrationFixture):
     def test_blank_reviewer_rewrite_holds_the_original_draft(self) -> None:
         question = "Retry build 42?"
         state = self.question_state([{"text": "Retry build", "question": question}])
-        real_review = review.review_question
         for body in ("", " \n\t"):
             with self.subTest(body=body):
                 self.write_open_for("example")
@@ -169,7 +168,7 @@ class RegistrationTests(RegistrationFixture):
                     return subprocess.CompletedProcess(argv, 0, json.dumps(decision), "")
 
                 def question_review(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
-                    return real_review(key, text, runner=runner, console_kind=console_kind)
+                    return real_review_question(key, text, runner=runner, console_kind=console_kind)
 
                 with (mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.state / "notify")}),
                       mock.patch.object(review, "GUIDE", self.root),

@@ -8,6 +8,9 @@ from unittest.mock import patch
 from scripts.notify import review
 
 
+real_review_question = review.review_question
+
+
 def _accept(_key: review.QuestionKey, words: str, *_args: object, **_options: object) -> review.QuestionAccepted:
     return review.QuestionAccepted(words)
 

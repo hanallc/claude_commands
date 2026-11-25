@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.console_text.test_support import accepting_console_text
+from scripts.console_text.test_support import accepting_console_text, real_review_question
 from scripts.notify import review
 from scripts.production import investigation, staff
 from scripts.review_links import change_page, new_item_dialog, reply_tokens, review_page, test_review_page
@@ -59,6 +59,7 @@ class InvestigationTests(unittest.TestCase):
         before = investigation.load(OWNER.id, "I1")
         directory = self.root / "notify"
         with (patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(directory)}),
+              patch.object(review, "review_question", new=real_review_question),
               patch.object(review, "_review", return_value=review.Unreviewed("reviewer unavailable")) as reader):
             code, _, errors = self.command("answer", "--id", "I1", "--text", "Read /tmp/result.txt.")
             self.assertEqual(code, 1)
