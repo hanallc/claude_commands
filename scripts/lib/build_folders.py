@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 
 from scripts.lib import build_folder_lock, git_files, process_start
 from scripts.lib.boot_identity import boot_identity
-from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.conf import HostOverride, Unusable, UseConfiguredValue
 
 if TYPE_CHECKING:
     from scripts.lib.conf import ConfigRead
@@ -318,7 +318,7 @@ def _check_name(name: str) -> None:
 
 
 BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "main", "mirror", "target",
-                          "scratch", "legacy-unique", "legacy-stable", "tool", "copy"]
+                          "scratch", "legacy-unique", "legacy-stable", "tool", "copy", "fixed-repository"]
 
 
 @dataclass(frozen=True)
@@ -495,6 +495,42 @@ def build_root(*, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue
     return Path(settings.text("roots.build")).expanduser()
 
 
+@final
+@dataclass(frozen=True)
+class PerUnitBuildFolders:
+    """Use numbered build copies for each unit."""
+
+
+@final
+@dataclass(frozen=True)
+class FixedRepositoryBuildFolders:
+    """Use one build folder for each repository on this machine."""
+
+    machine: str
+
+
+def build_folder_form(machine: str, *, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
+                      ) -> PerUnitBuildFolders | FixedRepositoryBuildFolders:
+    """Read the build folder form for the named machine."""
+    _ = _form_name(machine)
+    if isinstance(settings, UseConfiguredValue):
+        settings = _settings()
+    key = f"forms.build.{machine}"
+    try:
+        value = settings.value(key, str, default="", recover_invalid=False, host_override=HostOverride.IGNORED)
+    except Unusable as error:
+        raise InvalidFolderForm(str(error)) from error
+    match value:
+        case "per-unit":
+            return PerUnitBuildFolders()
+        case "per-repository":
+            return FixedRepositoryBuildFolders(machine)
+        case "":
+            raise InvalidFolderForm(f"{key}: the build folder form is missing")
+        case _:
+            raise InvalidFolderForm(f"{key}: unknown build folder form {value!r}")
+
+
 def repo_word(repository: Path) -> str:
     """Read the repository name from origin and apply its configured alias."""
     try:
@@ -509,7 +545,12 @@ def repo_word(repository: Path) -> str:
             location = re.sub(r"^(?:[^/:]+@)?(?:\[[^\]]+\]|[^/:]+):", "", origin, count=1)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise InvalidFolderForm(f"{repository}: cannot read the origin URL") from error
-    word = _form_name(location.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git"))
+    return build_repository_name(location.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git"))
+
+
+def build_repository_name(name: str) -> str:
+    """Apply the configured alias to a repository name."""
+    word = _form_name(name)
     key = f"repo_word.{word}"
     return _form_name(_settings().values(key).get(key, word))
 
@@ -777,6 +818,8 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     """Apply the configured name rule without creating a folder."""
     if spec.kind == "main":
         return spec.parent / _form_name(spec.repository) / "main"
+    if spec.kind == "fixed-repository":
+        return spec.parent / _form_name(spec.repository) / _form_name(spec.machine)
     settings = _settings()
     if spec.kind == "copy":
         return copy_path(spec.repository, spec.unit, spec.number)
@@ -845,18 +888,25 @@ def _copy_is_kept(path: Path, directory: int | None = None) -> bool:
     return not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 0
 
 
-def _kept_build_copy(path: Path, directory: int | None = None) -> bool:
-    return (_DECIMAL_NAME.fullmatch(path.name) is not None and _copy_is_kept(path, directory)
-            and isinstance(parse_form(path), BuildCopy))
+def _folder_is_kept(path: Path, directory: int | None = None) -> bool:
+    if not _copy_is_kept(path, directory):
+        return False
+    if _DECIMAL_NAME.fullmatch(path.name) is not None:
+        return isinstance(parse_form(path), BuildCopy)
+    try:
+        fields = folder_lease_fields(path) if directory is None else _read_folder_lease(path, directory)
+    except (OSError, ValueError):
+        return False
+    return fields.get("machine") == path.name and fields.get("repository") == path.parent.name
 
 
 BuildFolderState = Literal["held", "free", "kept"]
 
 
 def build_folder_state(path: Path) -> BuildFolderState:
-    """Check the lock and the numbered copy keep file."""
+    """Check the lock and the folder's keep file."""
     state = build_folder_lock.probe(path, path.parent, _probe_timing)
-    if state == "free" and _kept_build_copy(path):
+    if state == "free" and _folder_is_kept(path):
         return "kept"
     return state
 
@@ -1152,6 +1202,12 @@ def _recorded_path(fields: dict[str, object], key: str) -> Path:
     if not isinstance(value, str) or not Path(value).is_absolute():
         raise ValueError(f"missing {key} path")
     return Path(value)
+
+
+def linked_build_checkout(path: Path, source: Path) -> git_files.Checkout:
+    """Verify that a build checkout links to its source repository."""
+    repository = git_files.at(source)
+    return _copy_git_checkout(path, repository.common_dir, CopyDirectoryIdentity.from_stat(repository.common_dir_status))
 
 
 def _copy_git_checkout(path: Path, common: Path, common_identity: CopyDirectoryIdentity) -> git_files.Checkout:
@@ -1806,6 +1862,8 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
     record: dict[str, object] = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
               "work": spec.work, "purpose": spec.purpose, "pid": spec.owner_pid or os.getpid(),
               "start_time": now}
+    if spec.kind == "fixed-repository":
+        record.update(machine=spec.machine, repository=spec.repository)
     if spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout):
         if released:
             record = _read_folder_lease(path, directory)
@@ -1855,10 +1913,28 @@ class _TemporaryFolderRequest:
     cleanup: ExitStack
 
 
-def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest) -> BuildFolderSpec:
+@dataclass(frozen=True)
+class _FixedRepositoryFolder:
+    """Request a fixed folder with a form from the settings reader."""
+
+    form: FixedRepositoryBuildFolders
+    parent: Path
+    repository: str
+    unit: str
+
+
+_AllocationRequest = BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest | _FixedRepositoryFolder
+
+
+def _request_spec(request: _AllocationRequest) -> BuildFolderSpec:
     if isinstance(request, _TemporaryFolderRequest):
         return _request_spec(request.request)
+    if isinstance(request, _FixedRepositoryFolder):
+        return BuildFolderSpec(kind="fixed-repository", parent=request.parent, suffix_length=0,
+                               repository=request.repository, machine=request.form.machine, owner=request.unit)
     if isinstance(request, BuildFolderSpec):
+        if request.kind == "fixed-repository":
+            raise InvalidFolderForm("a fixed repository folder needs a configured build folder form")
         return request
     if isinstance(request, MainOutput):
         return BuildFolderSpec(kind="main", parent=build_root(), repository=request.repo, suffix_length=0)
@@ -1879,13 +1955,14 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
 
 
 def _stable_folder(spec: BuildFolderSpec) -> bool:
-    return spec.kind in ("standing", "editable", "main", "mirror", "target", "legacy-stable", "copy")
+    return spec.kind in ("standing", "editable", "main", "mirror", "target", "legacy-stable", "copy",
+                         "fixed-repository")
 
 
 FolderCreationNotice = Callable[[Path, os.stat_result], None] | Literal["untracked"]
 
 
-def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest, *,
+def create_build_folder(request: _AllocationRequest, *,
                         on_create: FolderCreationNotice = "untracked") -> Path:
     """Allocate a unique folder or retain an owner's folder."""
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
@@ -1897,7 +1974,7 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
         return _create_build_folder(request, spec, descriptors, on_create)
 
 
-def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFolderRequest,
+def _create_build_folder(request: _AllocationRequest,
                          spec: BuildFolderSpec, source_descriptors: tuple[int, ...],
                          on_create: FolderCreationNotice) -> Path:
     original = request.request if isinstance(request, _TemporaryFolderRequest) else request
@@ -1910,6 +1987,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
             raise ValueError(f"existing worktree branch {original.branch.name!r} does not exist in {original.source}")
     editable_repository = isinstance(original, (LinkedEditableRepository, RemoteEditableRepository))
     stable = _stable_folder(spec)
+    exclusive_copy = spec.kind in ("copy", "fixed-repository")
     # Only a name with a random part gets a new name on a clash; a tool name is fixed per request.
     renamed = not stable and not (spec.suffix or spec.work) and spec.kind != "tool"
     descriptor = -1
@@ -1950,8 +2028,8 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 allocated: os.stat_result | None = None
                 new_folder = False
                 try:
-                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind != "copy" and not editable_repository else fcntl.LOCK_EX,
-                                      wait=spec.kind != "copy" and not isinstance(original, UniqueBuildFolder)):
+                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and not exclusive_copy and not editable_repository else fcntl.LOCK_EX,
+                                      wait=not exclusive_copy and not isinstance(original, UniqueBuildFolder)):
                         if renamed:
                             continue
                         raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
@@ -1964,9 +2042,13 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                         continue
                     retry_parent = False
                     if not build_folder_lock.lock_current(path, directory, descriptor):
+                        if spec.kind == "fixed-repository":
+                            raise BlockingIOError(errno.EWOULDBLOCK, "the build folder lock changed", str(path))
                         if spec.kind == "copy":
                             del directories[path.parent]
                         continue
+                    if spec.kind == "fixed-repository" and _copy_is_kept(path, directory):
+                        raise BlockingIOError(errno.EWOULDBLOCK, "the build folder is kept for cleanup", str(path))
                     try:
                         existing = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
                     except FileNotFoundError:
@@ -2011,7 +2093,7 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             os.mkdir(path.name, mode=mode, dir_fd=directory)
                             made_inode = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
                         except FileExistsError:
-                            if not stable or editable_repository or spec.kind == "copy":
+                            if not stable or editable_repository or exclusive_copy:
                                 raise
                             if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                                 raise
@@ -2469,7 +2551,7 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
     except FileNotFoundError:
         if create and check_parent and not build_folder_lock.parent_current(path, directory):
             raise BuildFolderParentChanged(str(path.parent)) from None
-        if _kept_build_copy(path, directory):
+        if _folder_is_kept(path, directory):
             return KeptCopyRemovalLease()
         return UnreservedRemovalFolder()
     with ExitStack() as opened:
@@ -2486,7 +2568,7 @@ def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool
         if not acquired:
             return RemovalLockHeld(path.with_name(path.name + ".lock"))
         lease = HeldFolderRemovalLease(path, directory, descriptor, created=created)
-        if _kept_build_copy(path, directory):
+        if _folder_is_kept(path, directory):
             if created:
                 _unlink_transient_lock(lease)
             return KeptCopyRemovalLease()
@@ -2604,7 +2686,7 @@ def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool 
             links: set[str] = set()
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if entry.name.endswith(".keep") and _kept_build_copy(
+                    if entry.name.endswith(".keep") and _folder_is_kept(
                             path / entry.name.removesuffix(".keep"), directory):
                         return KeptCopyRemovalLease()
                     if entry.is_dir(follow_symlinks=False):
@@ -2730,7 +2812,7 @@ def collector_lease(path: Path, *, children: bool = False, wait: bool = True) ->
 
 
 @contextmanager
-def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | MainOutput, *,
+def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | MainOutput | _FixedRepositoryFolder, *,
                         on_create: FolderCreationNotice = "untracked") -> Generator[Path]:
     """Hold the maker lease while a persistent folder is in use."""
     path = create_build_folder(spec, on_create=on_create)
@@ -2738,6 +2820,92 @@ def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | MainOutput, 
         yield path
     finally:
         _release_build_folder(path)
+
+
+@contextmanager
+def fixed_repository_build_folder(repo: str, *, machine: str, unit: str) -> Generator[Path]:
+    """Hold the fixed repository folder on the machine that runs the build."""
+    settings = _settings()
+    form = build_folder_form(machine, settings=settings)
+    if not isinstance(form, FixedRepositoryBuildFolders):
+        raise InvalidFolderForm(f"forms.build.{machine}: the build folder form must be per-repository")
+    request = _FixedRepositoryFolder(form, build_root(settings=settings), _form_name(repo), _unit_name(unit))
+    with leased_build_folder(request) as path:
+        yield path
+
+
+def cargo_target_argument(words: Sequence[str]) -> str:
+    """Read the last Cargo target directory before the test arguments."""
+    target = "target"
+    boundary = words.index("--") if "--" in words else len(words)
+    for index, word in enumerate(words[:boundary]):
+        if word == "--target-dir" and index + 1 < boundary:
+            target = words[index + 1]
+        elif word.startswith("--target-dir="):
+            target = word.partition("=")[2]
+    return target
+
+
+def fixed_cargo_folder(checkout: Path, output: Path | str = "target") -> Path:
+    """Keep the Cargo output in the fixed folder."""
+    root = checkout.resolve()
+    candidate = root / output
+    target = candidate.resolve()
+    if (candidate.is_symlink() or target == root or not target.is_relative_to(root)
+            or (target.exists() and not target.is_dir())):
+        raise InvalidFolderForm(f"{target}: the Cargo output must be a directory inside the build folder")
+    return target
+
+
+@dataclass(frozen=True)
+class HeldFixedFolderCleanup:
+    """The saved attempt owns the keep file while this lease is held."""
+    checkout: Path
+    directory: int
+
+    def clear_keep(self) -> None:
+        os.unlink(copy_keep_file(self.checkout).name, dir_fd=self.directory)
+
+
+@dataclass(frozen=True)
+class FixedFolderKeepAbsent:
+    """This attempt has no keep file to clear."""
+
+
+@contextmanager
+def fixed_folder_cleanup_lease(path: Path, record: Path) -> Generator[HeldFixedFolderCleanup | FixedFolderKeepAbsent]:
+    """Lock the exact folder of a saved attempt for cleanup."""
+    with ExitStack() as locks:
+        try:
+            directory = locks.enter_context(build_folder_lock.open_folder_parent(path, path.parent, create=False))
+            descriptor = build_folder_lock.open_lock(path, directory, create=False)
+        except FileNotFoundError:
+            try:
+                _ = copy_keep_file(path).lstat()
+            except FileNotFoundError:
+                yield FixedFolderKeepAbsent()
+                return
+            raise
+        _ = locks.callback(os.close, descriptor)
+        if (not _take_lock(descriptor, fcntl.LOCK_EX, wait=False)
+                or not build_folder_lock.lock_current(path, directory, descriptor)):
+            raise BlockingIOError(errno.EWOULDBLOCK, "the build folder is still held", str(path))
+        try:
+            owner = _read_kept_copy(path, directory).reason.partition("\n")[0]
+        except FileNotFoundError:
+            owner = ""
+        if owner == str(record):
+            _ = locks.enter_context(inherit_build_lock(descriptor))
+            yield HeldFixedFolderCleanup(path, directory)
+        else:
+            yield FixedFolderKeepAbsent()
+
+
+def clear_fixed_folder_keep(path: Path, record: Path) -> None:
+    """Clear the keep file after proof for its exact run."""
+    with fixed_folder_cleanup_lease(path, record) as lease:
+        if isinstance(lease, HeldFixedFolderCleanup):
+            lease.clear_keep()
 
 
 @contextmanager
@@ -3265,6 +3433,8 @@ def _command(argv: Sequence[str]) -> int:
     _ = remove.add_argument("path", type=Path)
     run_temp = commands.add_parser("run-temp-path")
     _ = run_temp.add_argument("run", type=Path)
+    per_unit = commands.add_parser("require-per-unit")
+    _ = per_unit.add_argument("machine")
     run = commands.add_parser("run")
     _ = run.add_argument("--owner", default="")
     _ = run.add_argument("--showrunner", default="")
@@ -3276,6 +3446,11 @@ def _command(argv: Sequence[str]) -> int:
     request: BuildFolderRequest
     command = cast(str, args.command)
     try:
+        if command == "require-per-unit":
+            machine = cast(str, args.machine)
+            if not isinstance(build_folder_form(machine), PerUnitBuildFolders):
+                raise InvalidFolderForm(f"forms.build.{machine}: the build folder form must be per-unit")
+            return 0
         if command == "editable-repository":
             path = cast(Path, args.path)
             source_path = cast(Path | None, args.source)

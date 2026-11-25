@@ -63,6 +63,7 @@ class FolderFormTests(unittest.TestCase):
         _ = self.config.write_text(
             "roots.workspace=~/worktrees\nroots.build=~/build\n"
             + f"roots.build.natedev=~/{machine_root}\nrepo_word.claude_commands={alias}\n"
+            + "forms.build.natedev=per-unit\nforms.build.mac=per-repository\n"
             + "# whole: 1..\nfolders.unused_days=2\n# range: 0..60\nlocks.probe_wait_seconds=0.25\n"
             + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n",
             encoding="utf-8",
@@ -818,6 +819,59 @@ class FolderFormTests(unittest.TestCase):
         self.write_config(machine_root="new-disk")
         self.assertEqual(folders.unit_folder("hana", "demo"), self.root / "new-disk/hana/demo")
         self.assertIsInstance(folders.parse_form(self.root / "disk/hana/demo/try-2"), folders.OutsideFolderLayout)
+
+    def test_build_folder_form_reads_the_named_machine(self) -> None:
+        self.assertIsInstance(folders.build_folder_form("natedev"), folders.PerUnitBuildFolders)
+        self.assertEqual(folders.build_folder_form("mac"), folders.FixedRepositoryBuildFolders("mac"))
+
+    def test_fixed_repository_allocator_refuses_an_unknown_form(self) -> None:
+        _ = self.config.write_text(self.config.read_text().replace("per-repository", "pooled"), encoding="utf-8")
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "forms.build.mac.*pooled"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted an unknown form.")
+        self.assertFalse((self.root / "disk").exists())
+
+    def test_fixed_repository_allocator_refuses_a_missing_machine(self) -> None:
+        _ = self.config.write_text(self.config.read_text().replace("forms.build.mac=per-repository\n", ""),
+                                   encoding="utf-8")
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "forms.build.mac.*missing"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted a missing machine.")
+        self.assertFalse((self.root / "disk").exists())
+
+    def test_generic_allocator_refuses_a_raw_fixed_repository_spec(self) -> None:
+        _ = self.config.write_text(self.config.read_text().replace("per-repository", "pooled"), encoding="utf-8")
+        spec = folders.BuildFolderSpec(kind="fixed-repository", parent=self.root / "disk",
+                                       repository="hana", machine="mac", suffix_length=0)
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "configured build folder form"):
+            _ = folders.create_build_folder(spec)
+        self.assertFalse(spec.parent.exists())
+
+    def test_fixed_repository_allocator_refuses_an_unlinked_lock(self) -> None:
+        with mock.patch.object(build_folder_lock, "lock_current", return_value=False) as current:
+            with self.assertRaisesRegex(BlockingIOError, "lock changed"):
+                with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                    self.fail("The allocator accepted a stale descriptor.")
+        current.assert_called_once()
+        self.assertFalse((self.root / "disk/hana/mac").exists())
+
+    def test_fixed_repository_allocator_holds_and_reuses_the_mac_folder(self) -> None:
+        with mock.patch("socket.gethostname", return_value="Nates-MacBook-Pro-2023.local"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo") as path:
+                self.assertEqual(path, self.root / "build/hana/mac")
+                self.assertTrue(path.is_dir())
+                self.assertEqual(build_folder_lock.probe(path, path.parent, lambda: build_folder_lock.NO_WAIT), "held")
+                fields = folders.folder_lease_fields(path)
+                self.assertEqual((fields["machine"], fields["repository"], fields["unit"]), ("mac", "hana", "demo"))
+                with self.assertRaises(BlockingIOError):
+                    with folders.fixed_repository_build_folder("hana", machine="mac", unit="verify"):
+                        self.fail("A second unit acquired the held folder.")
+                _ = (path / "proof").write_text("saved", encoding="utf-8")
+            self.assertEqual(folders.build_folder_state(path), "free")
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="verify") as reused:
+                self.assertEqual(reused, path)
+                self.assertEqual((reused / "proof").read_text(encoding="utf-8"), "saved")
+                self.assertEqual(folders.folder_lease_fields(reused)["unit"], "verify")
 
     def test_mac_uses_the_common_build_root(self) -> None:
         with mock.patch("socket.gethostname", return_value="Nates-MacBook-Pro-2023.local"):

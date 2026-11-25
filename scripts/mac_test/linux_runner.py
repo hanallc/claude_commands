@@ -264,10 +264,12 @@ def tool_version_filter() -> str:
 
 def probe_script(mirror: str, *, shell_environment: bool = False) -> str:
     """Read Linux disk capacity and the public tool versions."""
+    absolute = Path(mirror).is_absolute()
+    path = shlex.quote(mirror) if absolute else '"$HOME"/' + shlex.quote(mirror)
     return '\n'.join((
         ':' if shell_environment else 'export PATH="$HOME/.cargo/bin:$PATH"',
-        copies.mirror_probe_setup(mirror),
-        f'checkout="$HOME"/{shlex.quote(mirror)}',
+        ':' if absolute else copies.mirror_probe_setup(mirror),
+        f'checkout={path}',
         'disk_usage=$(df -Pk "$checkout") || exit 1',
         'free_gib=$(printf \'%s\\n\' "$disk_usage" | awk \'NR > 1 {if (!seen || $4 < free) free=$4; seen=1} END {printf "%.6f", free / 1048576}\') || exit 1',
         'printf \'free_gib=%s\\nhost=%s\\n\' "$free_gib" "$(hostname -s)"',
@@ -524,8 +526,9 @@ def mirror_selector_script(mirror: str, *, require_boot_identity: bool = False) 
     code = ("import sys; from pathlib import Path; "
             + "from scripts.mac_test.linux_runner import print_slot_processes; "
             + f"sys.exit(print_slot_processes(Path(sys.argv[1]), require_boot_identity={require_boot_identity!r}))")
+    path = shlex.quote(mirror) if Path(mirror).is_absolute() else '"$HOME"/' + shlex.quote(mirror)
     return ('select_leftovers() {\n'
-            + f'    "$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)} "$HOME"/{shlex.quote(mirror)}\n'
+            + f'    "$HOME/.claude/scripts/lib/py" -c {shlex.quote(code)} {path}\n'
             + '}\n')
 
 
@@ -578,14 +581,15 @@ def probe_command_script(mirror: str, values: dict[str, str], repository: str) -
 def probe_shell(mirror: Path, values: dict[str, str], repository: str) -> int:
     """Read parity inside the same cached environment as the work."""
     try:
-        with slot_run(mirror):
+        fixed = values.get('fixed_folder') == '1'
+        with slot_run(mirror, require_boot_identity=fixed):
             shell = prepare_shell(mirror, Path.home() / values['shell_cache'],
                                   policy_setting(values, 'devshell', repository),
                                   positive_setting(values, 'shell_timeout_s'),
                                   pass_fds=execution_descriptors())
             command = (shell_environment_script(shell)
                        + f'cd -- {shlex.quote(str(mirror))} || exit 75\n'
-                       + probe_script(str(mirror.relative_to(Path.home())), shell_environment=True))
+                       + probe_script(str(mirror if fixed else mirror.relative_to(Path.home())), shell_environment=True))
             return subprocess.run(['bash', '-c', command], cwd=mirror, check=False,
                                    pass_fds=execution_descriptors()).returncode
     except SlotStartupRefused:
@@ -598,7 +602,7 @@ def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
         test_environment: tuple[tuple[str, str], ...] = (),
         clear_environment: str = '') -> int:
     try:
-        with slot_run(mirror):
+        with slot_run(mirror, require_boot_identity=values.get('fixed_folder') == '1'):
             return execute_slot(mirror, values, repository, verb, words, call_id, tree_key, repo_identity, test_environment, clear_environment)
     except SlotStartupRefused:
         print(STARTUP_REFUSAL_RECORD, flush=True)
@@ -724,14 +728,9 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     if not math.isfinite(budget) or not 0 < budget <= build_budget:
         raise ValueError('repository budget exceeds the build budget')
     floor = positive_setting(values, 'free_floor_gib')
-    target = mirror / 'target'
-    boundary = words.index('--') if '--' in words else len(words)
-    for index, word in enumerate(words[:boundary]):
-        if word == '--target-dir' and index + 1 < boundary:
-            target = mirror / words[index + 1]
-        elif word.startswith('--target-dir='):
-            target = mirror / word.partition('=')[2]
-    target = target.resolve()
+    selected = Path(build_folders.cargo_target_argument(words))
+    fixed = values.get('fixed_folder') == '1'
+    target = build_folders.fixed_cargo_folder(mirror, selected) if fixed else (mirror / selected).resolve()
     if target == mirror.resolve() or mirror.resolve() not in target.parents:
         raise ValueError('the Linux build folder must stay inside its slot')
     # Finish the recorder write before the completion marker lets natedev pull the records.
@@ -746,6 +745,10 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
     }
     if verb == 'nextest':
         environment.update(test_environment)
+    if fixed:
+        environment.update(CARGO_TARGET_DIR=str(target), CARGO_BUILD_BUILD_DIR=str(target))
+    if run_id := values.get('run_id'):
+        environment['BUILDLOG_RUN'] = run_id
     if tree_key:
         environment['BUILDLOG_SENT_TREE_KEY'] = tree_key
     if repo_identity:

@@ -8,6 +8,7 @@ import os
 import shlex
 import signal
 import time
+from pathlib import Path
 from typing import cast
 from unittest import mock
 
@@ -35,6 +36,13 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertEqual((values["mac"], values["reason"], values["fetch"]), (mac, reason, word))
         self.assertGreaterEqual(float(values["seconds"]), 0)
 
+    def remote_nextest_command(self) -> str:
+        command, = (
+            event["args"][-1] for event in self.events_for("ssh")
+            if "run_nextest_logged ~/.claude/scripts/lint/lint nextest" in event["args"][-1]
+        )
+        return command
+
     def test_named_environment_reaches_the_remote_test_command(self) -> None:
         self.environment["SHOT_OUTPUT"] = "target/shots"
         answer = self.command(
@@ -42,7 +50,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-        remote = self.events_for("ssh")[-1]["args"][-1]
+        remote = self.remote_nextest_command()
         self.assertIn("SHOT_OUTPUT=target/shots", shlex.split(remote))
 
     def test_named_environment_reaches_the_remote_copy_command(self) -> None:
@@ -52,7 +60,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-        remote = self.events_for("ssh")[-1]["args"][-1]
+        remote = self.remote_nextest_command()
         self.assertIn("SHOT_OUTPUT=target/shots", shlex.split(remote))
 
     def test_values_keep_their_bytes_and_only_named_variables_are_forwarded(self) -> None:
@@ -63,7 +71,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-        remote = self.events_for("ssh")[-1]["args"][-1]
+        remote = self.remote_nextest_command()
         words = shlex.split(remote)
         forwarded_start = words.index(f"SHOT_OUTPUT={value}")
         self.assertEqual(words[forwarded_start:forwarded_start + 3], [f"SHOT_OUTPUT={value}", f"PATH={self.environment['PATH']}", f"SHOT_OUTPUT={value}"])
@@ -192,7 +200,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             subprocess_cli=True, separate_stderr=True,
         )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
-        self.assertIn("SHOT_OUTPUT=", shlex.split(self.events_for("ssh")[-1]["args"][-1]))
+        self.assertIn("SHOT_OUTPUT=", shlex.split(self.remote_nextest_command()))
 
     def test_fetch_publishes_files_before_releasing_claim(self) -> None:
         self.configure_fetch(fetch_contents="PNG bytes\n", fetch_answer="fetch_kib=12\nrc=0")
@@ -215,15 +223,20 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertFalse((self.state_directory / "fetched/call-forward.partial").exists())
         self.assert_fetch_wire("fetched")
         self.assertIn(f"mac_test: fetched target/shots from the Mac to {landing} (12 KiB)", answer.stdout)
-        events = self.events()
+        *events, release = self.events()
         self.assertEqual([event["command"] for event in events], ["ssh", "rsync", "ssh", "ssh", "rsync", "ssh"])
         self.assertTrue(all(event["claimed"] for event in events))
+        self.assertEqual(release["command"], "ssh")
+        self.assertTrue(release["claimed"])
+        self.assertIn("dispatch_start_settled=", release["args"][-1])
         self.assertFalse(self.claim_file.exists())
         self.assertIn("du -sk target/shots", events[-3]["args"][-1])
         self.assertIn("sweep.sweep_workspace", events[-1]["args"][-1])
         pull = events[-2]["args"]
         self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(eligibility.read_config(self.config_path).connection)])])
-        self.assertEqual(pull[-2], "mac:.local/state/mac-test/test-mirror/hana/target/shots/")
+        checkout = Path((self.stub_directory / "fixed-checkout").read_text().strip())
+        self.assertTrue(checkout.is_relative_to(self.root))
+        self.assertEqual(pull[-2], f"mac:{shlex.quote(str(checkout / 'target/shots'))}/")
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
         rows = [cast(dict[str, object], json.loads(line))
                 for path in (self.root / "buildlog").glob("*/*.jsonl")
@@ -283,13 +296,22 @@ class OffloadForwardTests(OffloadCommandFixture):
                 self.assertEqual(len(self.events_for("rsync")), 1)
 
     def test_size_probe_uses_its_deadline_and_releases_the_claim(self) -> None:
-        self.config["probe_timeout_s"] = "0.5"
-        self.sync_config()
+        fetch_folder = offload.fetch_folder
+
+        def fetch_with_short_probe_deadline(
+            controller: offload.ProcessController, config: eligibility.OffloadConfig,
+            request: offload.OffloadRequest, repository: eligibility.KnownRepository,
+            *, fence_setup: str = "",
+        ) -> offload.FetchResult:
+            return fetch_folder(controller, replace(config, probe_timeout_s=0.5), request, repository,
+                                fence_setup=fence_setup)
+
         self.configure_fetch(hold_fetch_probe=True)
-        answer = self.command(
-            "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
-            subprocess_cli=True, separate_stderr=True, assigned_adapter=True,
-        )
+        with mock.patch.object(offload, "fetch_folder", fetch_with_short_probe_deadline):
+            answer = self.command(
+                "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
+                separate_stderr=True, assigned_adapter=True,
+            )
         self.assertEqual(answer.returncode, 0, answer.stdout + answer.stderr)
         self.assertTrue((self.stub_directory / "fetch-probe-started").exists())
         self.assert_fetch_wire("failed")
@@ -312,6 +334,7 @@ class OffloadForwardTests(OffloadCommandFixture):
 
     def test_lost_and_declined_runs_do_not_fetch(self) -> None:
         self.fixture["run_status_reported"] = False
+        self.fixture["cleanup_lines"] = ["leftovers=1", "rc=0"]
         self.sync_fixture()
         answer = self.command(
             "--workspace", runner_options=("--fetch", "target/shots"), call_id="call-forward",
@@ -321,6 +344,7 @@ class OffloadForwardTests(OffloadCommandFixture):
         # The launch was authorized and its start never settled, so its cleanup is unconfirmed.
         self.assert_fetch_wire("not_run", "lost", "cleanup_unconfirmed")
         self.assertFalse((self.stub_directory / "pull-started").exists())
+        self.assert_claim_is_kept()
         self.config["offload"] = "off"
         self.sync_config()
         self.clear_events()

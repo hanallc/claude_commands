@@ -287,6 +287,7 @@ signal.pause()
 
 
 GATE_FIXTURE = '''from dataclasses import replace
+import json
 import fcntl
 import os
 from pathlib import Path
@@ -317,12 +318,18 @@ class WholeMachine:
 def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_limit_s, time_limit):
     assert os.environ['FIXTURE_SANDBOX'] == 'bwrap'
     guest = Path(os.environ['FIXTURE_GUEST_HOME'])
-    assert repo == guest / 'build/claude' / os.environ['FIXTURE_EXPECTED_UNIT'] / '1', repo
+    build = os.environ.get('FIXTURE_BUILD_ROOT', 'build')
+    assert repo == guest / build / 'claude/mac-linux', repo
+    lease = json.loads(repo.with_suffix('.lease.json').read_text())
+    assert lease['unit'] == os.environ['FIXTURE_EXPECTED_UNIT']
+    assert lease['machine'] == 'mac-linux'
     assert Path.home().is_relative_to(repo / 'target')
     assert Path(os.environ['XDG_RUNTIME_DIR']).is_relative_to(repo / 'target')
     assert isinstance(machine, WholeMachine)
     assert (Path.home() / '.claude/config').resolve() == repo / 'config'
     assert os.environ['CARGO_TARGET_DIR'] == str(repo / 'target')
+    assert checked_git(repo, 'check-ignore', 'target', '.lint-sweep-used').splitlines() == [
+        'target', '.lint-sweep-used']
     assert Path(os.environ['RUSTUP_HOME']).is_relative_to(repo / 'target')
     with repo.with_suffix('.lock').open('r') as lock:
         descriptor, run_descriptor = copies.COMMAND_LOCKS.get()
@@ -332,7 +339,7 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
         except BlockingIOError:
             pass
         else:
-            raise AssertionError('The numbered copy is not locked.')
+            raise AssertionError('The guest build folder is not locked.')
     with (guest / '.claude/.git/mac-linux-run.lock').open() as lock:
         assert os.path.samestat(os.fstat(run_descriptor), os.fstat(lock.fileno()))
         assert int(lock.read().split()[0]) == os.getpgrp()
@@ -1092,8 +1099,12 @@ fi
         self.assertLessEqual(set(self.guest_home.iterdir()), {main, build})
         self.assertFalse((main / '.git/mac-linux').exists())
         claim_locks = build / '.build-claim-locks'
-        self.assertEqual([path for path in build.rglob('mac-linux*')
-                          if not (path.name == 'mac-linux.lock' and path.is_relative_to(claim_locks))], [])
+        checkout = build / 'claude/mac-linux'
+        persistent = {checkout, checkout.with_suffix('.lock'), build_folders.lease_path(checkout),
+                      claim_locks / 'claude/mac-linux'}
+        self.assertEqual([path for path in build.rglob('mac-linux*') if path not in persistent
+                          and not (path.name == 'mac-linux.lock' and path.is_relative_to(claim_locks))], [])
+        self.assertEqual(list((main / '.git').glob('mac-linux-folder.*')), [])
         self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), list(events))
 
     def assert_bundle(self, run: mac_linux.MacLinuxGateRun, form: mac_linux.BundleForm,
@@ -2421,7 +2432,7 @@ fi
         decoded = wire.parse_request(wire.encode_request(reported))
         assert isinstance(decoded, wire.ExecutionReport)
         self.assertEqual(decoded.evidence, execution_identity.ObservedExecution(execution_identity.GuestExecution(
-            mac_linux.TARGET, self.placed.attempt, str(self.guest_home / 'build/claude/caller/1'), str(self.guest_home))))
+            mac_linux.TARGET, self.placed.attempt, str(self.guest_home / 'build/claude/mac-linux'), str(self.guest_home))))
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def check_folder_report_stream(self, *, arm_requested: bool = False) -> None:
@@ -3924,6 +3935,74 @@ with (patch.object(conf, 'read', read_config),
         self.assertTrue(retry.passed)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'probe', 'arm', 'run', 'cleanup', 'probe', 'arm', 'run', 'cleanup')
 
+    def test_run_guest_uses_the_configured_fixed_folder_and_recovers_its_saved_path(self) -> None:
+        name = 'fixture-build'
+        config = self.repo / 'config/build_folders.conf'
+        _ = write_config_fixture(config, f'roots.build=~/{name}\n')
+        _ = self.git('commit', '-qam', 'configure the guest build root')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        checkout = self.guest_home / name / 'claude/mac-linux'
+        marker = build_folders.copy_keep_file(checkout)
+        guest_config = self.guest_home / '.claude/config/build_folders.conf'
+        finish = mac_linux.GuestEndWait.run
+
+        def change_root_before_proof(wait: mac_linux.GuestEndWait) -> None:
+            record = self.guest_home / '.claude/.git' / f'{mac_linux.GUEST_FOLDER_RECORD_PREFIX}.{wait.armed.attempt}'
+            try:
+                self.assertEqual(record.read_text(encoding='utf-8').strip(), str(checkout))
+                self.assertEqual(marker.read_text(encoding='utf-8').strip(), str(record))
+                _ = write_config_fixture(guest_config, 'roots.build=~/other-build\n')
+            finally:
+                finish(wait)
+            self.assertFalse(record.exists())
+
+        with (patch.dict(os.environ, {'FIXTURE_BUILD_ROOT': name}),
+              patch.object(mac_linux.GuestEndWait, 'run', change_root_before_proof)):
+            result = self.route()
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        self.assertTrue((checkout / 'target').is_dir())
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.guest_home / 'other-build').exists())
+        self.assertFalse((self.guest_home / 'build').exists())
+
+    def test_run_guest_keeps_output_in_a_folder_without_a_worktree(self) -> None:
+        checkout = self.guest_home / 'build/claude/mac-linux'
+        output = checkout / 'target/fixture-output'
+        output.parent.mkdir(parents=True)
+        _ = output.write_text('warm output\n', encoding='utf-8')
+        inode = output.stat().st_ino
+
+        result = self.route()
+
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        self.assertEqual(output.read_text(encoding='utf-8'), 'warm output\n')
+        self.assertEqual(output.stat().st_ino, inode)
+        self.assertEqual(self.git_at(checkout, 'rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD'))
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
+    def test_guest_gate_replaces_offload_source_and_keeps_its_cargo_output(self) -> None:
+        checkout = self.guest_home / 'build/claude/mac-linux'
+        output = checkout / 'target/fixture-output'
+        output.parent.mkdir(parents=True)
+        _ = output.write_text('offload output\n', encoding='utf-8')
+        inode = output.stat().st_ino
+        _ = (checkout / 'history.txt').write_text('offload source\n', encoding='utf-8')
+        extra = checkout / 'offload-only.txt'
+        _ = extra.write_text('offload source\n', encoding='utf-8')
+
+        result = self.route()
+
+        assert isinstance(result, GateRun), result
+        self.assertTrue(result.passed)
+        self.assertEqual(output.read_text(encoding='utf-8'), 'offload output\n')
+        self.assertEqual(output.stat().st_ino, inode)
+        self.assertEqual((checkout / 'history.txt').read_text(encoding='utf-8'), 'old source\n')
+        self.assertFalse(extra.exists())
+        self.assertEqual(self.git_at(checkout, 'rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD'))
+        self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
+
     def test_copy_uses_the_job_unit(self) -> None:
         with patch.dict(os.environ, {'FIXTURE_EXPECTED_UNIT': 'checkpoint-owner'}):
             result = self.route(gate_job=StepJob('integrate', unit='checkpoint-owner'))
@@ -4021,13 +4100,13 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(self.git_at(self.runner_repo, 'status', '--porcelain'), '')
         self.assert_guest_clean()
 
-    def test_delta_updates_main_and_reuses_the_numbered_copy(self) -> None:
+    def test_delta_updates_main_and_reuses_the_fixed_folder(self) -> None:
         main = self.guest_home / '.claude'
-        numbered = self.guest_home / 'build/claude/caller/1'
+        checkout = self.guest_home / 'build/claude/mac-linux'
         first = self.route()
         assert isinstance(first, mac_linux.MacLinuxGateRun), first
         old_main = self.git('rev-parse', 'origin/main')
-        use_stamp = numbered / 'target/fixture-output'
+        use_stamp = checkout / 'target/fixture-output'
         use_stamp.touch()
         (self.repo / 'scripts/fixture/test_first.py').unlink()
         _ = self.git('commit', '-qam', 'advance main')
@@ -4042,12 +4121,12 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD', 'origin/main').splitlines(),
                          [self.git('rev-parse', 'origin/main')] * 2)
         self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD^'), old_main)
-        self.assertEqual(self.git_at(numbered, 'rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD'))
+        self.assertEqual(self.git_at(checkout, 'rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD'))
         self.assertFalse((main / 'scripts/fixture/test_first.py').exists())
         self.assertFalse((main / 'scripts/fixture/test_added.py').exists())
-        self.assertTrue((numbered / 'scripts/fixture/test_added.py').exists())
+        self.assertTrue((checkout / 'scripts/fixture/test_added.py').exists())
         self.assertTrue(use_stamp.is_file())
-        self.assertTrue(numbered.with_suffix('.lease.json').is_file())
+        self.assertTrue(checkout.with_suffix('.lease.json').is_file())
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup', 'probe', 'arm', 'run', 'cleanup')
 
     def test_empty_guest_repository_takes_first_bundle_and_then_empty_delta(self) -> None:
@@ -4120,7 +4199,7 @@ with (patch.object(conf, 'read', read_config),
     def test_copy_rescues_edits_after_main_moves(self) -> None:
         self.assertIsInstance(self.route('leave-edit'), GateRun)
         main = self.guest_home / '.claude'
-        numbered = self.guest_home / 'build/claude/caller/1'
+        checkout = self.guest_home / 'build/claude/mac-linux'
         _ = (self.repo / 'scripts/fixture/test_added.py').touch()
         result = self.route()
         assert isinstance(result, GateRun), result
@@ -4128,7 +4207,7 @@ with (patch.object(conf, 'read', read_config),
                                           'refs/rescue/'], text=True).strip()
         saved = subprocess.check_output(['git', '-C', str(main), 'show', f'{rescue}:history.txt'], text=True)
         self.assertEqual(saved, 'copy edit\n')
-        self.assertEqual((numbered / 'history.txt').read_text(encoding='utf-8'), 'old source\n')
+        self.assertEqual((checkout / 'history.txt').read_text(encoding='utf-8'), 'old source\n')
 
     def test_selected_modules_keep_subset_coverage(self) -> None:
         tree = self.git('rev-parse', 'HEAD^{tree}')
@@ -4236,7 +4315,7 @@ with (patch.object(conf, 'read', read_config),
         release.assert_called_once_with(gate.LocalGateAssignment(local.grant, guest.owner, sidecar), 1)
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
-    def test_command_request_runs_the_argv_in_the_numbered_copy_and_proves_the_end(self) -> None:
+    def test_command_request_runs_the_argv_in_the_fixed_folder_and_proves_the_end(self) -> None:
         settings = mac_linux.read_settings(conf.read(self.registry))
         for status in (0, 4):
             program = f'import os, sys\nprint("guest ran in", os.getcwd(), flush=True)\nsys.exit({status})\n'
@@ -4252,7 +4331,7 @@ with (patch.object(conf, 'read', read_config),
             finally:
                 command.finish()
             self.assertEqual(process.returncode, status, output)
-            self.assertTrue(output.decode().endswith(f'guest ran in {self.guest_home / "build/claude/caller/1"}\n'),
+            self.assertTrue(output.decode().endswith(f'guest ran in {self.guest_home / "build/claude/mac-linux"}\n'),
                             output)
             # start reads the start line, so the process output does not hold it.
             self.assertNotIn(mac_linux.RUN_START.encode(), output)
@@ -4272,7 +4351,7 @@ with (patch.object(conf, 'read', read_config),
         finally:
             command.finish()
         self.assertEqual(process.returncode, 0, output)
-        # The numbered copy keeps target/, so the guest has the file and natedev has none.
+        # The guest retains the file in target/ between runs.
         command = mac_linux.GuestCommand(settings)
         with self.assertRaisesRegex(mac_linux.GuestRefusedCommand, 'The guest refuses the command word target/run.sh: '
                                     + r'the guest has a file at /\S+/target/run\.sh, and natedev read no file there\.'):

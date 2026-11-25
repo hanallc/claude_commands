@@ -2472,9 +2472,12 @@ def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
     return "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py " + shlex.join([*arguments, *tail])
 
 
-def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: list[str]) -> list[str]:
+def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: list[str],
+                 *, receiver_setup: str = "") -> list[str]:
     """Refresh a leased mirror through the remote copy owner."""
     receiver = remote_copies_command("mirror-receive", mirror, "--", "rsync")
+    if receiver_setup:
+        receiver = receiver_setup + "exec " + receiver
     # Keep the existing command order while metadata removal keeps the record last.
     exclusions = floor_claims.MIRROR_METADATA[1:] + floor_claims.MIRROR_METADATA[:1]
     return ["rsync", RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", "--delete", f"--rsync-path={receiver}",
@@ -3203,9 +3206,7 @@ def mirror_run(args: CopyArguments) -> int:
         command = command_tail(args.command)
         if not command:
             raise CopyError("remote mirror requires a command")
-        descriptors = COMMAND_LOCKS.get()
-        if args.action == "mirror-use":
-            descriptors = tuple(dict.fromkeys((*descriptors, *floor_claims.inherited_mirror_descriptors())))
+        descriptors = tuple(dict.fromkeys((*COMMAND_LOCKS.get(), *floor_claims.inherited_mirror_descriptors())))
         environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, descriptors))}
         answer = subprocess.run(command, pass_fds=descriptors, env=environment)
         return answer.returncode

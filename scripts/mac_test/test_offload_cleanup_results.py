@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import unittest
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
@@ -99,8 +100,9 @@ class OffloadCommandTests(SeededCleanupFixture):
                 self.assert_wire("passed" if status == 0 else "failed", "")
                 self.assertNotIn("mac_exit=", result.stdout)
                 self.assertNotIn("mac_cleanup=", result.stdout)
+                checkout = Path((self.stub_directory / "fixed-checkout").read_text().strip())
                 self.assertEqual(result.stdout.count(
-                    "Mac build output removed: ~/.local/state/mac-test/test-mirror/hana/target, "
+                    f"Mac build output removed: {checkout / 'target'}, "
                     + "31.2 GiB; Mac free 59 GiB under the 60 GiB floor\n"), 1)
 
     def test_cleanup_failure_reports_once_without_changing_test_result(self) -> None:

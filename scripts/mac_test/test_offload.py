@@ -10,13 +10,14 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
 from dataclasses import fields, replace
 import io
 from pathlib import Path
@@ -30,7 +31,7 @@ from scripts.lint.memory_test_support import (UNREACHABLE_WAIT_FIXTURE, UNREACHA
                                               write_config_fixture,
                                               write_config_fault, commit_config_fixture)
 
-from scripts.mac_test import eligibility, fix_return, floor_claims, nextest_log, offload, claim_state
+from scripts.mac_test import eligibility, fix_return, floor_claims, mac_queue_run, nextest_log, offload, claim_state
 from scripts.build_queue import admission_client, admission_protocol as wire, placement, queue_snapshot
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_hold.owning_session import NoOwningSession
@@ -47,7 +48,8 @@ else:
     from scripts.buildlog import health as buildlog_health
     from scripts.buildlog import record as buildlog_record
     from scripts.buildlog import store as buildlog_store
-from scripts.lib import conf, conf_reads, session_folder
+from scripts.lib import build_folders, conf, conf_reads, session_folder
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.production.cli_fixture import invoke_cli
 from scripts.copies import copies
 from scripts.copies.copies_test_support import copies_environment
@@ -982,6 +984,25 @@ class OffloadSettingsTests(unittest.TestCase):
         mirror = claim_state.ResolvedMacMirror("fixture-hana", "hana", "hana.json", "hana", str(self.root))
         history_key = "https://fixture.invalid/hana"
         saved = mirror.claim_repository(history_key=claim_state.KnownMacHistoryKey(history_key))
+        checkout = self.root / "mac"
+        checkout.mkdir()
+        holder = """
+import json
+import sys
+
+print("build_folder=" + json.dumps(sys.argv[1]), flush=True)
+if sys.stdin.read(1) != "+":
+    sys.exit(1)
+print("build_folder_confirmed", flush=True)
+sys.exit(0 if sys.stdin.read(1) == "\\n" else 1)
+"""
+
+        def start_holder(arguments: Sequence[str], *, stdin: int, stdout: int, text: bool) -> subprocess.Popen[bytes]:
+            self.assertEqual(arguments[0], "ssh")
+            self.assertIn("mac_queue_run.py hold-offload-folder mac ", arguments[-1])
+            self.assertFalse(text)
+            return START_SUBPROCESS([sys.executable, "-I", "-S", "-c", holder, str(checkout)],
+                                    cwd=self.root, stdin=stdin, stdout=stdout)
 
         def complete_claim(controller: offload.ProcessController, arguments: Sequence[str],
                            attempt: offload.LocalClaimAttempt) -> None:
@@ -998,12 +1019,17 @@ class OffloadSettingsTests(unittest.TestCase):
              mock.patch.object(claim_state, "mac_repository_identity", return_value=mirror), \
              mock.patch.object(buildlog_repository, "repository_key", return_value=history_key), \
              mock.patch.object(offload.ProcessController, "complete_claim", autospec=True, side_effect=complete_claim), \
+             mock.patch.object(subprocess, "Popen", side_effect=start_holder) as start_process, \
              mock.patch.object(offload.ProcessController, "capture", side_effect=responses) as capture, \
              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(offload.main(), 75)
         self.assertEqual(output.getvalue(), "mac_test: not running on the Mac (unreachable)\n")
         self.assertRegex(errors.getvalue(), r"^mac_test: could not reach the Mac: .*could not start.*2\.5.*\n$")
+        start_process.assert_called_once()
         self.assertEqual(capture.call_count, 2)
+        arguments, deadline = cast(tuple[list[str], offload.CommandDeadline], capture.call_args_list[0].args)
+        self.assertIn(f"test -d {shlex.quote(str(checkout))}", arguments[-1])
+        self.assertEqual(deadline, offload.CommandTimeLimit(2.5))
         self.assertEqual(destination.read_text().splitlines()[:2], ["mac=declined", "reason=unreachable"])
         self.assertTrue((self.root / "state" / "unreachable_until").exists())
 
@@ -1169,7 +1195,562 @@ fi
         self.assertEqual(self.local_runs(), [])
 
 
+class FixedFolderRouteTests(unittest.TestCase):
+    root: Path = Path()
+    checkout: Path = Path()
+    environment: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        home = self.root / "home"
+        home.mkdir()
+        self.environment = {**os.environ, **copies_environment(self.root), "HOME": str(home), "CONF_DIR": str(self.root),
+                            "TMPDIR": str(self.root), "GIT_CONFIG_GLOBAL": os.devnull,
+                            "GIT_CONFIG_NOSYSTEM": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+        _ = write_config_fixture(self.root / "build_folders.conf", "roots.build=~/build\nroots.build.natedev=~/build\n")
+        _ = write_config_fixture(self.root / "copies.conf")
+        # The fixture runs the Mac entry point on Linux.
+        _ = (self.root / "machines.conf").write_text("aliases=mac\nmac.platform=linux\nmac.hosts=fixture\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True)))
+        self.checkout = home / "build/hana/mac"
+
+    def test_lost_offload_recovers_the_recorded_folder_without_allocating(self) -> None:
+        state = Path("state/claim.folder")
+        with mock.patch.object(sys, "stdin", io.StringIO("+")), redirect_stdout(io.StringIO()):
+            self.assertEqual(mac_queue_run.hold_offload_folder("mac", "hana", "demo", state), 1)
+        record = Path.home() / state
+        self.assertEqual(offload.read_fixed_folder_record(offload.SavedOffloadFolder(record)).path, self.checkout)
+        self.assertEqual(build_folders.build_folder_state(self.checkout), "kept")
+        with self.assertRaises(BlockingIOError):
+            with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="other"):
+                self.fail("The retained folder accepted a second run.")
+        _ = write_config_fixture(self.root / "build_folders.conf", "roots.build=~/other\nroots.build.natedev=~/other\n")
+        offload.clear_fixed_folder_record(offload.SavedOffloadFolder(record))
+        self.assertFalse(record.exists())
+        self.assertEqual(build_folders.build_folder_state(self.checkout), "free")
+        self.assertFalse((Path.home() / "other").exists())
+
+    def test_offload_recovery_waits_for_delayed_folder_registration(self) -> None:
+        identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        state = offload.fixed_folder_record(identity, "mac", "run").path
+        record = Path.home() / state
+        marker = build_folders.copy_keep_file(self.checkout)
+        settle = offload.start_fence_command(identity, "mac", settle=True)
+        observations: list[str] = []
+
+        def observe_recovery() -> str:
+            return RUN_SUBPROCESS(["sh", "-c", settle], cwd=self.root, check=True,
+                                  capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout
+
+        def delayed_write(path: Path, value: str, *, new_file_mode: int | None = None) -> None:
+            if path == record:
+                self.assertFalse(marker.exists())
+                observations.append(observe_recovery())
+            write_text_atomic(path, value, new_file_mode=new_file_mode)
+
+        with (mock.patch.object(mac_queue_run, "write_text_atomic", side_effect=delayed_write),
+              mock.patch.object(sys, "stdin", io.StringIO("+")), redirect_stdout(io.StringIO())):
+            self.assertEqual(mac_queue_run.hold_offload_folder("mac", "hana", "demo", state), 1)
+
+        key = offload.pending_start_key(identity)
+        self.assertEqual(observations, [f"dispatch_start_pending={key}\n"])
+        self.assertEqual(observe_recovery(), f"dispatch_start_settled={key}\n")
+        offload.clear_fixed_folder_record(offload.SavedOffloadFolder(record))
+        self.assertFalse(record.exists())
+        self.assertFalse(marker.exists())
+
+    def test_smoke_recovery_removes_an_interrupted_bundle_retirement(self) -> None:
+        episode = "d" * 32
+        record = mac_queue_run.smoke_folder_record(episode)
+        upload = self.root / f"smoke.bundle.{episode}" / "smoke.bundle"
+        upload.parent.mkdir()
+        _ = upload.write_text("fixture bundle")
+        write_text_atomic(record, json.dumps({"checkout": str(self.checkout), "launch": "", "bundle": str(upload)}))
+
+        with mock.patch.object(shutil, "rmtree", side_effect=OSError("interrupted removal")):
+            with self.assertRaisesRegex(OSError, "interrupted removal"):
+                mac_queue_run.clear_smoke_bundle(upload, episode)
+
+        self.assertFalse(upload.parent.exists())
+        retired, = self.root.glob(f"*{episode}*")
+        self.assertEqual((retired / upload.name).read_text(), "fixture bundle")
+        self.assertEqual(mac_queue_run.recover_smoke_folder(episode), 0)
+        self.assertFalse(record.exists())
+        self.assertFalse(retired.exists())
+
+    def test_delayed_offload_recovery_cannot_scan_the_next_build(self) -> None:
+        state = Path("state/claim.folder")
+        with mock.patch.object(sys, "stdin", io.StringIO("+")), redirect_stdout(io.StringIO()):
+            self.assertEqual(mac_queue_run.hold_offload_folder("mac", "hana", "demo", state), 1)
+        record = offload.SavedOffloadFolder(Path.home() / state)
+        read_record = offload.read_fixed_folder_record
+
+        with ExitStack() as next_run:
+            def delayed_read(saved: offload.SavedOffloadFolder) -> offload.RecordedOffloadCheckout:
+                folder = read_record(saved)
+                with mock.patch.object(offload, "read_fixed_folder_record", read_record):
+                    offload.clear_fixed_folder_record(saved)
+                checkout = next_run.enter_context(
+                    build_folders.fixed_repository_build_folder("hana", machine="mac", unit="next-run"))
+                self.assertEqual(checkout, folder.path)
+                return folder
+
+            with (mock.patch.object(offload, "read_fixed_folder_record", side_effect=delayed_read),
+                  mock.patch.object(offload, "mirror_selector_script", wraps=offload.mirror_selector_script) as select):
+                with self.assertRaises(BlockingIOError):
+                    _ = offload.recover_fixed_offload_folder(record, eligibility.KnownRepository("hana"),
+                                                             "mac", 1, "", observe=False)
+            select.assert_not_called()
+            self.assertFalse(record.path.exists())
+
+    def test_offload_recovery_holds_the_folder_through_the_scan(self) -> None:
+        state = Path("state/claim.folder")
+        with mock.patch.object(sys, "stdin", io.StringIO("+")), redirect_stdout(io.StringIO()):
+            self.assertEqual(mac_queue_run.hold_offload_folder("mac", "hana", "demo", state), 1)
+        record = offload.SavedOffloadFolder(Path.home() / state)
+        existing = set(build_folders.held_build_folder_descriptors())
+
+        def selector(*_args: object, **_kwargs: object) -> str:
+            descriptor, = set(build_folders.held_build_folder_descriptors()) - existing
+            with self.assertRaises(BlockingIOError):
+                offload.clear_fixed_folder_record(record)
+            self.assertTrue(record.path.exists())
+            return f"test -e /dev/fd/{descriptor} || exit 1"
+
+        checks = "printf 'leftovers=0\\nrc=0\\n'\n"
+        with mock.patch.object(offload, "mirror_selector_script", side_effect=selector), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(offload.recover_fixed_offload_folder(record, eligibility.KnownRepository("hana"),
+                                                                 "mac", 1, checks, observe=False), 0)
+        self.assertEqual(output.getvalue(), "leftovers=0\nrc=0\n")
+        self.assertFalse(record.path.exists())
+        self.assertEqual(build_folders.build_folder_state(self.checkout), "free")
+
+    def test_smoke_recovery_cannot_leave_a_late_keep_file(self) -> None:
+        source = self.root / "source"
+        _ = RUN_SUBPROCESS(["git", "init", "-q", str(source)], check=True)
+        _ = RUN_SUBPROCESS(["git", "-C", str(source), "remote", "add", "origin",
+                            "https://example.invalid/team/hana.git"], check=True)
+        episode = "c" * 32
+        record = mac_queue_run.smoke_folder_record(episode)
+        marker = build_folders.copy_keep_file(self.checkout)
+        runner = Path(mac_queue_run.__file__).resolve()
+        self.assertEqual(mac_queue_run.recover_smoke_folder(episode), 0)
+
+        with START_SUBPROCESS([sys.executable, str(runner), "smoke-folder", str(source), "demo",
+                               "unused", "", "", str(self.root / "launch"), "--", "true"],
+                              env={**self.environment, "MAC_PLACEMENT": episode + "/attempt"},
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as child:
+            assert child.stdin is not None and child.stdout is not None
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+            try:
+                with closing(offload.bounded_output_lines(child.stdout, lambda: deadline - time.monotonic())) as lines:
+                    self.assertEqual(next(lines, b""), f"mac_smoke_register={episode}\n".encode())
+                self.assertTrue(record.exists())
+                self.assertFalse(marker.exists())
+                with self.assertRaises(BlockingIOError):
+                    _ = mac_queue_run.recover_smoke_folder(episode)
+                child.stdin.close()
+                self.assertEqual(child.wait(timeout=TEST_HANG_GUARD_SECS), 4)
+            finally:
+                child.stdin.close()
+                if child.poll() is None:
+                    child.kill()
+
+        self.assertFalse(record.exists())
+        self.assertFalse(marker.exists())
+        self.assertEqual(build_folders.build_folder_state(self.checkout), "free")
+
+    def test_smoke_holds_the_fixed_checkout_through_shutdown(self) -> None:
+        source = self.root / "source"
+        _ = RUN_SUBPROCESS(["git", "init", "-q", str(source)], check=True)
+        _ = RUN_SUBPROCESS(["git", "-C", str(source), "remote", "add", "origin",
+                            "https://example.invalid/team/hana.git"], check=True)
+        incoming = self.root / "incoming"
+        _ = RUN_SUBPROCESS(["git", "init", "-q", str(incoming)], check=True)
+        _ = (incoming / "source-file").write_text("fixed source\n")
+        _ = RUN_SUBPROCESS(["git", "-C", str(incoming), "add", "source-file"], check=True)
+        _ = RUN_SUBPROCESS(["git", "-C", str(incoming), "-c", "user.name=Fixture",
+                            "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Fixture",
+                            "--no-gpg-sign"], check=True)
+        commit = subprocess.check_output(["git", "-C", str(incoming), "rev-parse", "HEAD"], text=True).strip()
+        ref = subprocess.check_output(["git", "-C", str(incoming), "symbolic-ref", "HEAD"], text=True).strip()
+        source_bundle = self.root / "source bundle"
+        episode = "a" * 32
+        bundle = self.root / f"remote bundle.{episode}" / "remote bundle"
+        _ = RUN_SUBPROCESS(["git", "-C", str(incoming), "bundle", "create", str(source_bundle), ref], check=True)
+        target = self.checkout / "target"
+        target.mkdir(parents=True)
+        warm = target / "warm"
+        _ = warm.write_text("warm output\n")
+        warm_inode = warm.stat().st_ino
+        path = Path(mac_queue_run.__file__).resolve()
+        work = 'git rev-parse HEAD && test -r "$CARGO_TARGET_DIR/warm" && cat source-file'
+        cleanup = 'rm -- "$MAC_SMOKE_LAUNCH_TOKEN" "$COPIES_KEEP_FILE"'
+        _ = write_config_fixture(self.root / "production.conf")
+        environment = {**self.environment, "MAC_PLACEMENT": episode + "/attempt"}
+        with START_SUBPROCESS([sys.executable, str(path), "smoke-folder", str(source), "demo", commit,
+                               str(bundle), ref, str(self.root / "launch"), "--",
+                               sys.executable, str(path), "smoke-work", work, cleanup],
+                              env=environment, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False) as child:
+            assert child.stdout is not None and child.stdin is not None
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+            try:
+                output: list[bytes] = []
+                with closing(offload.bounded_output_lines(child.stdout, lambda: deadline - time.monotonic())) as lines:
+                    for line in lines:
+                        output.append(line)
+                        if line == f"mac_smoke_register={episode}\n".encode():
+                            _ = child.stdin.write(b"+")
+                            child.stdin.flush()
+                        elif line == f"mac_smoke_upload={episode}\n".encode():
+                            self.assertEqual(build_folders.build_folder_state(self.checkout), "held")
+                            self.assertFalse(bundle.exists())
+                            _ = shutil.copyfile(source_bundle, bundle)
+                            _ = child.stdin.write(b"\n")
+                            child.stdin.flush()
+                        elif line == f"mac_smoke_ready={episode}\n".encode():
+                            break
+                self.assertIn(f"mac_smoke_upload={episode}\n".encode(), output, b"".join(output))
+                self.assertIn(f"mac_smoke_ready={episode}\n".encode(), output, b"".join(output))
+                self.assertIn(commit.encode() + b"\n", output)
+                self.assertIn(b"fixed source\n", output)
+                self.assertEqual(build_folders.build_folder_state(self.checkout), "held")
+                self.assertEqual(build_folders.folder_lease_fields(self.checkout)["unit"], "demo")
+                _ = child.stdin.write(b"\n")
+                child.stdin.flush()
+                self.assertEqual(child.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+            finally:
+                child.stdin.close()
+                if child.poll() is None:
+                    child.kill()
+        self.assertEqual(build_folders.build_folder_state(self.checkout), "free")
+        self.assertEqual(warm.read_text(), "warm output\n")
+        self.assertEqual(warm.stat().st_ino, warm_inode)
+        self.assertFalse(bundle.exists())
+        self.assertFalse(bundle.parent.exists())
+        self.assertFalse(mac_queue_run.smoke_folder_record(episode).exists())
+
+
+    def test_smoke_recovers_the_exact_folder_after_checkout_clearance_fails(self) -> None:
+        source = self.root / "source"
+        _ = RUN_SUBPROCESS(["git", "init", "-q", str(source)], check=True)
+        _ = RUN_SUBPROCESS(["git", "-C", str(source), "remote", "add", "origin",
+                            "https://example.invalid/team/hana.git"], check=True)
+        _ = RUN_SUBPROCESS(["git", "-C", str(source), "-c", "user.name=Fixture",
+                            "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Fixture",
+                            "--allow-empty", "--no-gpg-sign"], check=True)
+        commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        _ = write_config_fixture(self.root / "production.conf")
+        _ = write_config_fixture(self.root / "scratch.conf")
+        episode = "b" * 32
+        launch = self.root / "launch"
+        launch.touch()
+        runner = Path(mac_queue_run.__file__).resolve()
+        command = [sys.executable, str(runner), "smoke-copy", sys.executable, str(runner), "smoke-folder",
+                   str(source), "demo", commit, "", "", str(launch), "--", sys.executable, str(runner),
+                   "smoke-work", "true", "exit 4"]
+        with START_SUBPROCESS(command, env={**self.environment, "MAC_PLACEMENT": episode + "/attempt"},
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as child:
+            assert child.stdout is not None and child.stdin is not None
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+            try:
+                with closing(offload.bounded_output_lines(child.stdout, lambda: deadline - time.monotonic())) as lines:
+                    self.assertEqual(next(lines, b""), f"mac_smoke_register={episode}\n".encode())
+                    _ = child.stdin.write(b"+")
+                    child.stdin.flush()
+                    self.assertIn(f"mac_smoke_ready={episode}\n".encode(), lines)
+                _ = child.stdin.write(b"\n")
+                child.stdin.flush()
+                status = child.wait(timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(status, 0, child.stdout.read())
+            finally:
+                child.stdin.close()
+                if child.poll() is None:
+                    child.kill()
+        self.assertEqual(mac_queue_run.smoke_status_path(episode).read_text(), "4\nretained\n")
+        self.assertEqual(build_folders.build_folder_state(self.checkout), "kept")
+        self.assertTrue(mac_queue_run.smoke_launch_token(self.checkout, episode).exists())
+
+        installed = self.root / "installed/scripts"
+        (installed / "production").mkdir(parents=True)
+        _ = shutil.copy2(runner.parents[1] / "production/mac_run.sh", installed / "production/mac_run.sh")
+        (installed / "lib").mkdir()
+        proof = installed / "lib/py"
+        _ = proof.write_text('#!/bin/sh\n[ "$2" = stop-checkout ] && [ "$3" = "$FIXTURE_CHECKOUT" ] || exit 4\n'
+                             + 'printf "%s\\n" "hana-instances: checkout clear"\n')
+        proof.chmod(0o755)
+        _ = write_config_fixture(self.root / "build_folders.conf", "roots.build=~/other\nroots.build.natedev=~/other\n")
+        with (mock.patch.object(mac_queue_run, "__file__", str(installed / "mac_test/mac_queue_run.py")),
+              mock.patch.dict(os.environ, {"FIXTURE_CHECKOUT": str(self.checkout)})):
+            self.assertEqual(mac_queue_run.recover_smoke_folder(episode), 0)
+        self.assertFalse(mac_queue_run.smoke_folder_record(episode).exists())
+        self.assertFalse(mac_queue_run.smoke_launch_token(self.checkout, episode).exists())
+        self.assertFalse(launch.exists())
+        self.assertFalse((Path.home() / "other").exists())
+        self.assertEqual(build_folders.build_folder_state(self.checkout), "free")
+
+
 class OffloadCommandTests(OffloadCommandFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = write_config_fixture(self.root / "build_folders.conf", "forms.build.mac=per-unit\n",
+                                 template="build_folders")
+
+    def install_real_fixed_folder_transport(self, *, hold_receiver: bool = False, delay_cleanup: bool = False) -> None:
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 "forms.build.mac=per-repository\nroots.build=~/build\nroots.build.natedev=~/build\n")
+        _ = (self.root / "machines.conf").write_text("aliases=mac\nmac.platform=linux\nmac.hosts=fixture\n")
+        home = Path(self.environment["HOME"])
+        installed = home / ".claude"
+        installed.mkdir(parents=True, exist_ok=True)
+        (installed / "scripts").symlink_to(Path(offload.__file__).resolve().parents[1])
+        source = self.repository / "source.txt"
+        _ = source.write_text("fixture source\n")
+        fixture = self.stub_directory
+        workload = fixture / "workload.py"
+        self.write_executable(workload, rf"""
+from pathlib import Path
+checkout = Path(Path({str(fixture / "checkout-path")!r}).read_text())
+assert Path({str(self.claim_file)!r}).exists()
+assert (checkout / 'source.txt').read_text() == 'fixture source\n'
+(checkout / 'report').mkdir()
+(checkout / 'report/result.txt').write_text('fixture result\n')
+(checkout / 'target').mkdir()
+(checkout / 'target/old-build').touch()
+print('mac_exit=0', flush=True)
+print('mac_cleanup=0 32715571 59', flush=True)
+""")
+        cleanup_bin = fixture / "cleanup-bin"
+        cleanup_bin.mkdir()
+        self.write_executable(cleanup_bin / "df", 'print("Filesystem 1G-blocks Used Available\\nfixture 10 9 1")\n')
+        replacements = self.root / "legacy-bin"
+        replacements.mkdir()
+        (replacements / "ssh").symlink_to(self.bin_directory / "command-stub")
+        ssh = self.bin_directory / "ssh"
+        ssh.unlink()
+        self.write_executable(ssh, f"""
+import os, shlex, sys
+from pathlib import Path
+command = sys.argv[-1]
+shell = "/bin/bash"
+if "hold-offload-folder" in command or "fetch_kib=" in command:
+    os.execv(shell, [shell, "-c", command])
+if "sweep.sweep_workspace" in command and "~/.claude/scripts/lint/lint " not in command:
+    Path({str(fixture / "post-fetch-command")!r}).write_text(command)
+    if {delay_cleanup!r}:
+        sys.exit(255)
+    os.environ["PATH"] = {str(cleanup_bin)!r} + os.pathsep + os.environ["PATH"]
+    os.execv(shell, [shell, "-c", command])
+if "copies.py mirror-use " in command and "\\ndispatch_status=$?\\n" in command:
+    prefix, separator, body = command.partition("~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-use ")
+    mirror, end, suffix = body.rpartition("\\n)\\ndispatch_status=$?\\n")
+    words = shlex.split(mirror)
+    assert words[-3:-1] == ["sh", "-c"], words
+    words[-1] = shlex.join([sys.executable, {str(workload)!r}])
+    command = prefix + separator + shlex.join(words) + end + suffix
+    os.execv(shell, [shell, "-c", command])
+fallback = {str(replacements / "ssh")!r}
+os.execv(fallback, [fallback, *sys.argv[1:]])
+""")
+        rsync = self.bin_directory / "rsync"
+        rsync.unlink()
+        self.write_executable(rsync, f"""
+import fcntl, os, shutil, subprocess, sys
+from pathlib import Path
+fixture = Path({str(fixture)!r})
+claim = Path({str(self.claim_file)!r})
+dispatch = Path.home() / ".local/state/mac-test/dispatch-fences"
+arguments = sys.argv[1:]
+if arguments == ["--server", "--sender"]:
+    record, = dispatch.rglob("*.folder")
+    assert os.path.samestat(os.fstat(8), record.with_suffix(".lock").stat())
+elif arguments == ["--server"]:
+    record, = dispatch.rglob("*.folder")
+    checkout = Path(record.read_text().strip())
+    assert checkout.is_relative_to(Path.home()), checkout
+    (fixture / "checkout-path").write_text(str(checkout))
+    assert claim.exists()
+    if {hold_receiver!r}:
+        (fixture / "receiver-started").touch()
+        with (fixture / "continue-copy").open() as gate:
+            assert gate.readline() == "continue\\n"
+        (fixture / "receiver-had-claim").write_text(str(claim.exists()))
+    else:
+        fences = tuple(dispatch.rglob("*.lock"))
+        assert len(fences) == 1, fences
+        with fences[0].open() as fence:
+            try:
+                fcntl.flock(fence, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                sys.exit("source receiver did not hold the dispatch fence")
+    shutil.copyfile({str(source)!r}, checkout / "source.txt")
+elif any(argument.startswith("--rsync-path=") and "mirror-receive" in argument for argument in arguments):
+    remote = next(argument.removeprefix("--rsync-path=") for argument in arguments
+                  if argument.startswith("--rsync-path=") and "mirror-receive" in argument)
+    with subprocess.Popen(["/bin/bash", "-c", remote + " --server"], start_new_session=True) as receiver:
+        sys.exit(receiver.wait())
+else:
+    for argument in arguments:
+        if argument.startswith("--rsync-path="):
+            remote = argument.removeprefix("--rsync-path=")
+            subprocess.run(["/bin/bash", "-c", remote + " --server --sender"], check=True)
+    checkout = Path((fixture / "checkout-path").read_text())
+    assert claim.exists()
+    assert checkout.with_name(checkout.name + ".keep").exists()
+    shutil.copyfile(checkout / "report/result.txt", Path(arguments[-1]) / "result.txt")
+""")
+
+    def test_real_fixed_holder_releases_after_copy_test_and_fetch(self) -> None:
+        self.install_real_fixed_folder_transport()
+
+        result = self.command(runner_options=("--fetch", "report"), call_id="fixed-holder")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        checkout = Path((self.stub_directory / "checkout-path").read_text())
+        self.assertEqual((self.state_directory / "fetched/fixed-holder/report/result.txt").read_text(),
+                         "fixture result\n")
+        self.assertFalse((checkout / "target/old-build").exists(), result.stdout)
+        self.assertFalse(self.claim_file.exists())
+        self.assertFalse(build_folders.copy_keep_file(checkout).exists())
+        dispatch = Path(self.environment["HOME"]) / ".local/state/mac-test/dispatch-fences"
+        self.assertEqual(list(dispatch.rglob("*.folder")), [])
+
+    def test_delayed_post_fetch_cleanup_cannot_remove_the_next_build_output(self) -> None:
+        self.install_real_fixed_folder_transport(delay_cleanup=True)
+        self.fixture["cleanup_lines"] = ["leftovers=1", "rc=0"]
+        result = self.command(runner_options=("--fetch", "report"))
+        self.assertIn("the fixed build folder clearance is unconfirmed", result.stdout)
+        self.assertEqual((self.state_directory / "fetched/call-17/report/result.txt").read_text(), "fixture result\n")
+        delayed = (self.stub_directory / "post-fetch-command").read_text()
+        dispatch = Path(self.environment["HOME"]) / ".local/state/mac-test/dispatch-fences"
+        record, = dispatch.rglob("*.folder")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            saved = offload.SavedOffloadFolder(record)
+            old_checkout = offload.read_fixed_folder_record(saved).path
+            offload.clear_fixed_folder_record(saved)
+            with build_folders.fixed_repository_build_folder(old_checkout.parent.name, machine="mac",
+                                                             unit="next-run") as checkout:
+                self.assertEqual(checkout, old_checkout)
+                next_output = checkout / "target/next-build"
+                next_output.parent.mkdir(exist_ok=True)
+                _ = next_output.write_text("new build")
+                environment = {**self.environment,
+                               "PATH": str(self.stub_directory / "cleanup-bin") + os.pathsep + self.environment["PATH"]}
+                replay = RUN_SUBPROCESS(["/bin/bash", "-c", delayed], cwd=self.root, env=environment,
+                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(replay.returncode, os.EX_TEMPFAIL, replay.stdout + replay.stderr)
+                self.assertEqual(next_output.read_text(), "new build")
+
+    def test_term_during_source_transfer_keeps_the_claim_for_a_live_receiver(self) -> None:
+        self.install_real_fixed_folder_transport(hold_receiver=True)
+        gate = os.open(self.stub_directory / "continue-copy", os.O_WRONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, gate)
+        process = self.start_command()
+        try:
+            self.wait_for_path(self.stub_directory / "receiver-started")
+            checkout = Path((self.stub_directory / "checkout-path").read_text())
+            process.send_signal(signal.SIGTERM)
+            output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
+            self.assertTrue(self.claim_file.exists())
+            self.assertTrue(build_folders.copy_keep_file(checkout).exists())
+            claim = claim_state.read_run(self.claim_file)
+            assert not isinstance(claim, claim_state.NoRun)
+            paths = claim_state.StatePaths(self.state_directory, "mac")
+            self.assertTrue(claim_state.claim_pending_start(paths, self.claim_file, claim).exists())
+            home = Path(self.environment["HOME"])
+            state = offload.fixed_folder_record(claim_state.claim_identity(claim), "mac",
+                                               claim_state.claim_fence_scope_key(self.claim_file, claim))
+            with self.assertRaises(BlockingIOError):
+                offload.clear_fixed_folder_record(offload.SavedOffloadFolder(home / state.path))
+        finally:
+            _ = os.write(gate, b"continue\n")
+            if process.poll() is None:
+                process.kill()
+            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        self.wait_for_path(checkout / "source.txt")
+        self.assertEqual((self.stub_directory / "receiver-had-claim").read_text(), "True")
+
+    def install_fixed_folder_ssh(self, *, drop_clearance: bool) -> tuple[Path, Path]:
+        _ = write_config_fixture(self.root / "build_folders.conf", "forms.build.mac=per-repository\n",
+                                 template="build_folders")
+        checkout = self.root / "remote build/hana/mac"
+        holder = self.stub_directory / "holder"
+        real_ssh = self.root / "legacy-bin/ssh"
+        real_ssh.parent.mkdir()
+        real_ssh.symlink_to(self.bin_directory / "command-stub")
+        ssh = self.bin_directory / "ssh"
+        ssh.unlink()
+        self.write_executable(ssh, f"""
+import json, os, sys
+from pathlib import Path
+if "hold-offload-folder" not in sys.argv[-1]:
+    os.execv({str(real_ssh)!r}, [{str(real_ssh)!r}, *sys.argv[1:]])
+print("build_folder=" + json.dumps({str(checkout)!r}), flush=True)
+if sys.stdin.read(1) != "+":
+    sys.exit(1)
+Path({str(holder)!r}).write_text("held")
+print("build_folder_confirmed", flush=True)
+if sys.stdin.read(1) != "\\n":
+    sys.exit(1)
+if not Path({str(self.claim_file)!r}).exists():
+    sys.exit("the provider claim disappeared before clearance")
+Path({str(holder)!r}).write_text("clearance lost" if {drop_clearance!r} else "released")
+sys.exit(255 if {drop_clearance!r} else 0)
+""")
+        return checkout, holder
+
+    def test_lost_fixed_folder_clearance_keeps_the_offload_claim(self) -> None:
+        _, holder = self.install_fixed_folder_ssh(drop_clearance=True)
+
+        result = self.command()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assert_wire("passed", "")
+        self.assertIn("the fixed build folder clearance is unconfirmed", result.stdout)
+        self.assertEqual(holder.read_text(), "clearance lost")
+        self.assertTrue(self.claim_file.exists())
+        claim = cast(claim_state.RunRecord, json.loads(self.claim_file.read_text()))
+        self.assertTrue(claim_state.claim_pending_start(
+            claim_state.StatePaths(self.state_directory, "mac"), self.claim_file, claim).exists())
+
+    def test_fixed_mac_offload_uses_one_folder_for_copy_run_and_fetch(self) -> None:
+        checkout, holder = self.install_fixed_folder_ssh(drop_clearance=False)
+        result = self.command(runner_options=("--fetch", "report"))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(holder.read_text(), "released")
+        copied, fetched = self.events_for("rsync")
+        self.assertIn(f":{shlex.quote(str(checkout))}/", copied["args"][-1])
+        self.assertIn(shlex.quote(str(checkout / "report")), fetched["args"][-2])
+        ran = next(event["args"][-1] for event in self.events_for("ssh") if "lint nextest" in event["args"][-1])
+        self.assertIn(f"cd {shlex.quote(str(checkout))}", ran)
+        self.assertIn(f"CARGO_BUILD_BUILD_DIR={shlex.quote(str(checkout / 'target'))}", ran)
+
+    def test_source_copy_interrupt_releases_claim_after_fixed_folder_clearance(self) -> None:
+        _, holder = self.install_fixed_folder_ssh(drop_clearance=False)
+        capture = offload.ProcessController.capture_copy
+
+        def interrupt_copy(controller: offload.ProcessController, arguments: Sequence[str],
+                           deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT
+                           ) -> offload.CapturedCommandResult:
+            if arguments[0] == "rsync":
+                self.assertEqual(holder.read_text(), "held")
+                self.assertTrue(self.claim_file.exists())
+                raise offload.OffloadInterrupted(signal.SIGTERM)
+            return capture(controller, arguments, deadline)
+
+        with mock.patch.object(offload.ProcessController, "capture_copy", interrupt_copy):
+            result = self.command()
+
+        self.assertEqual(result.returncode, 128 + signal.SIGTERM, result.stdout)
+        self.assertEqual(holder.read_text(), "released")
+        self.assertFalse(self.claim_file.exists())
+
     def test_waiter_hands_relative_path_claim_to_runner_for_cleanup_only(self) -> None:
         assignment = self.assignment_options(self.repository, "nextest", self.config_path, ())
         retained = self.write_kept_claim(legacy=True)
@@ -1939,13 +2520,14 @@ class OffloadCommandTests(OffloadCommandFixture):
 
     def test_remote_test_command_sets_development_deployment_target_before_nextest(self) -> None:
         words = ("--no-fail-fast", "unit_case")
-        result = self.command(*words)
+        result = self.command(*words, runner_options=("--run-id", "123:456"))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assert_wire("passed", "")
         remote = self.events_for("ssh")[-1]["args"][-1]
         remote_words, _ = split_mac_run_command(remote)
         lint_index = remote_words.index("~/.claude/scripts/lint/lint")
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=14.0", remote_words)
+        self.assertIn("BUILDLOG_RUN=123:456", remote_words)
         self.assertLess(remote_words.index("MACOSX_DEPLOYMENT_TARGET=14.0"), lint_index)
         self.assertEqual(remote_words[lint_index + 1 :], ["nextest", *words])
 

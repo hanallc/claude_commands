@@ -48,6 +48,40 @@ FILTER = "package(hana) & (test(a) | test(b))"
 
 WORKING_TREE_SOURCE = offload.RepositoryWorkingTree()
 
+FIXED_FOLDER_HOLDER = r'''
+import os
+from pathlib import Path
+import shlex
+import sys
+from unittest.mock import patch
+
+from scripts.agents import remote
+from scripts.mac_test import mac_queue_run
+
+_, _, _, machine, repository, unit, record_name = shlex.split(sys.argv[1])
+record = Path(record_name)
+fixture = Path(os.environ["MAC_TEST_STUB_DIR"])
+write_text_atomic = mac_queue_run.write_text_atomic
+
+def record_checkout(path, text, **kwargs):
+    write_text_atomic(path, text, **kwargs)
+    if path == Path.home() / record:
+        (fixture / "fixed-checkout").write_text(text)
+
+with patch.object(remote, "this_machine", return_value=machine), \
+     patch.object(mac_queue_run, "write_text_atomic", side_effect=record_checkout):
+    sys.exit(mac_queue_run.hold_offload_folder(machine, repository, unit, record))
+'''
+
+SETTLE_FENCE_STUB = """        python3 - "$claim_file" <<'SETTLE_FENCE'"""
+OFFLOAD_COMMAND_STUB = r'''
+if [[ ${0##*/} == ssh && ${!#} == *'mac_queue_run.py hold-offload-folder '* ]]; then
+    exec "$MAC_TEST_STUB_DIR/fixed-folder-holder" "${!#}"
+fi
+''' + COMMAND_STUB.replace(SETTLE_FENCE_STUB, r'''        # The fixed folder holder retires its own fence.
+        if [[ $remote == *$'\ntest -f "$HOME"/'*'.folder || exit 75'* ]]; then exit "$run_ssh_status"; fi
+''' + SETTLE_FENCE_STUB, 1)
+
 
 def write_mac_target_registry(directory: Path, settings_name: str) -> None:
     _ = (directory / "build_targets.conf").write_text(
@@ -347,7 +381,9 @@ class OffloadCommandFixture(unittest.TestCase):
         self.claim_file = paths.claims / repository.claim_file
         legacy_claim_file = mac_test.claim_path(paths, claim_state.RepositoryScope(repository.mirror_name))
         stub = self.bin_directory / "command-stub"
-        write_shell(stub, COMMAND_STUB)
+        write_shell(stub, OFFLOAD_COMMAND_STUB)
+        (self.stub_directory / "scripts").symlink_to(SCRIPT.resolve().parent.parent, target_is_directory=True)
+        self.write_executable(self.stub_directory / "fixed-folder-holder", FIXED_FOLDER_HOLDER)
         for name in ("ssh", "rsync", "gh", "systemd-run"):
             (self.bin_directory / name).symlink_to(stub)
         self.config = {
@@ -401,6 +437,7 @@ class OffloadCommandFixture(unittest.TestCase):
         self.sync_config()
         self.sync_fixture()
         write_mac_target_registry(self.root, self.config_path.name)
+        _ = write_config_fixture(self.root / "build_folders.conf", "roots.build=~/build\nroots.build.natedev=~/build\n")
         _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         self.environment = {
             **os.environ, **interpreter_cache_environment(self.root / "cache"),
