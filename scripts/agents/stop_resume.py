@@ -2627,7 +2627,7 @@ def _alert_pending_moves(batch: MoveBatch, entries: Mapping[str, pane_record.Pan
                   action=f"Retry pending moves on {machine} with `{moves.RETRY_COMMAND}`.",
                   body=f"These sessions did not finish their move {destination}: " + ", ".join(names) + ".")
     try:
-        needs_shorter_body = push.phone_message_length > pushover.phone_message_limit(push.sender, push.id)
+        needs_shorter_body = len(push.message) > pushover.phone_message_limit(push.sender, push.id)
     except conf.Unusable:
         needs_shorter_body = False
     if needs_shorter_body:

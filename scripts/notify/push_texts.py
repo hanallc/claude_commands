@@ -12,7 +12,6 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Literal, NotRequired, TypedDict, cast
 
-from scripts.lib import conf
 from scripts.lib.conf import UseConfiguredValue
 from scripts.lib.display_text import display_field
 from scripts.message import session_send
@@ -22,8 +21,6 @@ from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAc
                          NoSessionLine, NO_SESSION_LINE, SessionLine, first_line)
 
 Need = Literal["note", "decision", "blocked"]
-MESSAGE_MAX = 1024
-FREE_TEXT = "none (free text)"
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
 TEMPLATE_REQUIRED = "phone pushes require --text-id: decision.choices for choices, alert.blocked for emergencies, or nate.adhoc for notes"
 
@@ -84,80 +81,6 @@ class PushText:
 
 
 @dataclass(frozen=True)
-class KnownActionEnd:
-    index: int
-
-
-@dataclass(frozen=True)
-class NoHeader:
-    pass
-
-
-@dataclass(frozen=True)
-class UnknownActionEnd:
-    pass
-
-
-ActionEnd = KnownActionEnd | NoHeader | UnknownActionEnd
-
-
-def read_action_end(value: object, message: str) -> ActionEnd:
-    """Read the header state from a delivery or log record."""
-    if type(value) is int:
-        if value == 0:
-            return NoHeader()
-        if 0 < value < len(message) and message[value] == "\n":
-            return KnownActionEnd(value)
-    return UnknownActionEnd()
-
-
-def sender_name(source: str) -> str:
-    """Return the sender on one line. Use the session name for a send.py source."""
-    limit = conf.read("notify").whole("pushover.max_source_chars")
-    return " ".join(source.removeprefix("send.py in ").split())[:limit]
-
-
-def phone_footer(sender: str, text_id: str) -> str:
-    return f"\n\nSent by: {sender} · Template: {text_id or FREE_TEXT}"
-
-
-def phone_message_limit(source: str, text_id: str) -> int:
-    """Return the message space before the phone footer."""
-    return MESSAGE_MAX - len(phone_footer(sender_name(source), text_id))
-
-
-@dataclass(frozen=True)
-class PhoneBudget:
-    characters: int
-
-
-@dataclass(frozen=True)
-class FullPhoneMessage:
-    pass
-
-
-FULL_PHONE_MESSAGE = FullPhoneMessage()
-
-
-def format_phone_body(message: str, action_end: ActionEnd, *, length: PhoneBudget | FullPhoneMessage) -> str:
-    """Use one empty line before the body when the action end is known."""
-    if isinstance(length, PhoneBudget):
-        message = message[:MESSAGE_MAX]
-    if not isinstance(action_end, KnownActionEnd):
-        return (message[:length.characters] if isinstance(length, PhoneBudget) else message).rstrip()
-    index = action_end.index
-    header = message[:index]
-    body = message[index + 1:].lstrip("\r\n").rstrip()
-    separator = "\n\n" if body else ""
-    if isinstance(length, PhoneBudget):
-        prefix_length = index + len(separator)
-        if prefix_length > length.characters:
-            raise ValueError("Session and action exceed the message space before the footer")
-        body = body[:length.characters - prefix_length].rstrip()
-    return header + separator + body if body else header
-
-
-@dataclass(frozen=True)
 class RenderedPush:
     id: str
     sender: str
@@ -188,23 +111,6 @@ class RenderedPush:
             return self.body
         header = first_line(self.action, self.session)
         return f"{header}\n{self.body}" if self.body else header
-
-    @property
-    def action_end(self) -> KnownActionEnd | NoHeader:
-        if self.header and not self.one_line:
-            return KnownActionEnd(len(first_line(self.action, self.session)))
-        return NoHeader()
-
-    @property
-    def phone_message(self) -> str:
-        """The phone message before the sender and template footer."""
-        budget = PhoneBudget(phone_message_limit(self.sender, self.id))
-        return format_phone_body(self.message, self.action_end, length=budget)
-
-    @property
-    def phone_message_length(self) -> int:
-        """The phone message length before any cut or footer."""
-        return len(format_phone_body(self.message, self.action_end, length=FULL_PHONE_MESSAGE))
 
 
 def catalog() -> tuple[PushText, ...]:
@@ -322,8 +228,8 @@ def shown(entry: PushText) -> str:
     example = entry.examples[0]
     filled = render_entry(entry, example.values)
     return (f"{entry.id}  {entry.purpose}\n\n"
-            + f"Template:\n{shown_title(template)}\n{template.phone_message}\n\n"
-            + f"Example ({example.name}):\n{shown_title(filled)}\n{filled.phone_message}")
+            + f"Template:\n{shown_title(template)}\n{template.message}\n\n"
+            + f"Example ({example.name}):\n{shown_title(filled)}\n{filled.message}")
 
 
 def shown_title(rendered: RenderedPush) -> str:
