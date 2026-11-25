@@ -722,6 +722,7 @@ class MemoryFeedTests(unittest.TestCase):
             "changes.default=no branch\nchanges.integrate={branch} branch\n"
             + "names.integrate=integrate\nnames.test-affected=test affected\nnames.test=test\n"
             + "names.gate=gate\n")
+        _ = write_config_fixture(self.root / "review_links.conf")
         self.configure()
         self.configure_console()
         _ = (self.root / "mac-builds.json").write_text(json.dumps({"read_at": ADMISSION_NOW, "builds": [], "error": ""}))
@@ -5793,6 +5794,7 @@ class BuildsPageProofTests(unittest.TestCase):
         for setting in ("MEMORY_PAGE_SHOT", "SWAP_BEFORE_PAGE", "STEADY_BASELINE"):
             _ = environment.pop(setting, None)
         write_private_build_roots(directory / "build_folders.conf", directory, FIXTURE_MACHINE)
+        _ = write_config_fixture(directory / "review_links.conf")
         result = run_process_group(command,
             env={**environment, "CONF_DIR": str(directory), "TMPDIR": str(directory)},
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS)

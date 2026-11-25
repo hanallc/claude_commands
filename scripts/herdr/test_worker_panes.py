@@ -143,7 +143,7 @@ class PaneWorld(herdr.Herdr):
         _ = write_config_fixture(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
         _ = write_config_fixture(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
-        for name in ("detached_runs.conf", "postmaster.conf"):
+        for name in ("detached_runs.conf", "postmaster.conf", "user_zone.conf"):
             _ = write_config_fixture(config / name)
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {

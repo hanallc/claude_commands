@@ -1509,7 +1509,8 @@ class DialogFixture:
 
 def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: dict[int, bytes] | None = None) -> None:
     for fixture in fixtures.values():
-        _ = write_config_fixture(fixture.root / "config/review_links.conf")
+        for name in ("review_links.conf", "user_zone.conf"):
+            _ = write_config_fixture(fixture.root / "config" / name)
     if pages is None:
         pages = {width: fixture_page(width, photo=False) for width in fixtures}
     documents = pages
@@ -1858,6 +1859,7 @@ class NewItemDialogTests(unittest.TestCase):
     def test_build_step_retry_uses_a_receipt_from_before_display_text(self) -> None:
         fixture = DialogFixture(Path(self.enterContext(tempfile.TemporaryDirectory())))
         (fixture.root / "config").mkdir()
+        _ = write_config_fixture(fixture.root / "config/review_links.conf")
         recipient = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
         members = staff.StaffSnapshot((recipient,))
         memory = replace(EVIDENCE.memory, queue_cap_gib=None)

@@ -446,10 +446,10 @@ def _read_cache(config: str | Path, clock: Callable[[], float], *,
                 watch: Callable[[Path], None] | None = None) -> RebuildAnswer:
     """Read the configured comparison cache without evaluating systems."""
     try:
+        source = conf.path(config)
         if watch is not None:
-            watch(conf.path(config))
-        settings = conf.read(config)
-        cache = _configured_cache_path(settings)
+            watch(source)
+        cache = cache_path(config)
     except (OSError, ValueError, KeyError):
         return RebuildAnswer((), False)
     try:
@@ -459,7 +459,7 @@ def _read_cache(config: str | Path, clock: Callable[[], float], *,
         if len(lines) < 2 or not lines[1].isascii() or not lines[1].isdecimal():
             return RebuildAnswer((), True)
         deadline = int(lines[1])
-        refresh_due = deadline <= clock() or settings.source.stat().st_mtime_ns > cache.stat().st_mtime_ns
+        refresh_due = deadline <= clock() or source.stat().st_mtime_ns > cache.stat().st_mtime_ns
         items = lines[0].split(", ") if lines[0] else []
         if any(item not in ("rebuild natedev", "rebuild mac") for item in items):
             return RebuildAnswer((), True)
