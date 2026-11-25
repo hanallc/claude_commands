@@ -4,8 +4,8 @@ The hook also points the method compile of `dataclasses` at a shared code cache.
 dataclasses compiles the generated methods of each class from source at import.
 On 2026-11-14 that compile was 45-80% of the import CPU of the hot CLIs
 (direct.assign 278 of 428 ms). The cache keeps the marshal code of each source
-in /var/tmp/dataclass-code-<uid>/<cache tag>. tmp_sweep.py prunes the entries that no
-process read in lint.conf `dataclass_code_days` days.
+in /var/tmp/dataclass-code-<uid>/<cache tag>.
+The tmp sweep lists entries for vetted manual removal after `dataclass_code_days` days without a read.
 """
 
 from __future__ import annotations
@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 STARTUP_FILES = ("scripts/lib/py", "scripts/lib/package_root.py", "scripts/lib/python_startup/sitecustomize.py")
 TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "scripts/lib/descendants.py",
                      "scripts/lib/conf_reads.py", "scripts/lib/build_folders.py", "scripts/lib/build_folder_lock.py",
+                     "scripts/lib/removal_guard.py", "scripts/buildlog/repository.py", "scripts/buildlog/store.py",
+                     "scripts/production/staff.py",
                      "scripts/lib/boot_identity.py", "scripts/lib/process_start.py",
                      "scripts/lib/conf.py", "scripts/lib/git_files.py", "scripts/lib/testing_folders.py",
                      "scripts/lib/session_folder.py", "scripts/lib/unit_runs.py",

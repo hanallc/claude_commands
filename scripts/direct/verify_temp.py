@@ -71,11 +71,7 @@ def claim(path: Path) -> None:
 def remove(path: Path) -> None:
     """Release Verify's flock and remove the folder when its locks are free."""
     fcntl.flock(0, fcntl.LOCK_UN)
-    with build_folders.folder_removal_lease(path, children=True, wait=False) as lease:
-        if isinstance(lease, build_folders.HeldFolderRemovalLease):
-            sidecars = lease.sidecar_identities()
-            build_folders.remove_folder(path, lease.directory)
-            lease.unlink_sidecars(sidecars)
+    _ = build_folders.remove_build_folder(path, wait=False, repair_access=True)
 
 
 def wait_step_group(group: int) -> None:
