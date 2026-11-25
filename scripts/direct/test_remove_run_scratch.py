@@ -19,6 +19,7 @@ from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
 from scripts.lib import scratch
+from scripts.lib.build_slots_test_support import private_slot_config
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -29,13 +30,15 @@ SCRIPT = Path(__file__).parent / "remove_run_scratch.py"
 
 class RemoveRunScratchTests(unittest.TestCase):
     owner_id: str = ""
+    fixture_root: Path = Path()
 
     @override
     def setUp(self) -> None:
-        root = Path(tempfile.mkdtemp(prefix="run-scratch-fixture-")).resolve()
-        self.addCleanup(shutil.rmtree, root)
+        root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="run-scratch-fixture-"))).resolve()
+        self.fixture_root = root / "fixture"
+        self.fixture_root.mkdir()
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
-        environment = fixture_git_environment(root)
+        environment = {**fixture_git_environment(root), **private_slot_config(root).environment}
         _ = environment.pop("STAFF_CONFIG", None)
         environment["HOME"] = str(root / "home")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
@@ -44,8 +47,7 @@ class RemoveRunScratchTests(unittest.TestCase):
 
     def make_run(self) -> tuple[Path, Path]:
         """A run folder with copies at several depths, and a folder outside it."""
-        root = Path(tempfile.mkdtemp(prefix="run-scratch-fixture-")).resolve()
-        self.addCleanup(shutil.rmtree, root)
+        root = self.fixture_root
         run = root / "run"
         (run / "verify_cache").mkdir(parents=True)
         _ = (run / "progress_history_state.json").write_text(json.dumps({"owner_staff_id": self.owner_id}))
@@ -228,8 +230,7 @@ class RemoveRunScratchTests(unittest.TestCase):
 
     def worktree_run(self) -> tuple[Path, Path, Path]:
         """A source repo, and a run folder holding a linked worktree of its branch copy."""
-        root = Path(tempfile.mkdtemp(prefix="run-scratch-fixture-")).resolve()
-        self.addCleanup(shutil.rmtree, root)
+        root = self.fixture_root
         source, run = root / "source", root / "run"
         def git(*arguments: str) -> None:
             _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
