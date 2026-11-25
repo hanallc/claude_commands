@@ -217,6 +217,19 @@ class SharedReviewTests(unittest.TestCase):
         self.processes[PIDS[OWNER]] = sessions.LiveSessionProcess(PIDS[OWNER], self.process_start(PIDS[OWNER]))
         self.assertEqual(json.loads(self.cli(OWNER, "claim", *handle))["item"], 1)
 
+    def test_returning_owner_without_a_verified_start_allows_joined_claims(self) -> None:
+        review = self.start("first", "second")
+        handle = (review["owner"], review["review"])
+        _ = self.cli(OWNER, "claim", *handle)
+        _ = self.cli(OWNER, "decide", *handle, "1", "Accept")
+        self.liveness[OWNER] = sessions.LiveSessionProcess(126)
+        self.processes[PIDS[OWNER]] = sessions.SessionNotLive()
+        self.assertEqual(json.loads(self.cli(CLONE, "join", "bob"))["remaining"], 1)
+        self.assertIn("1. first → Accept", self.cli(CLONE, "show", *handle))
+        self.assertEqual(json.loads(self.cli(CLONE, "next", *handle))["item"], 2)
+        self.processes[PIDS[OWNER]] = sessions.LiveSessionProcess(PIDS[OWNER], self.process_start(PIDS[OWNER]))
+        self.assertIn("Cannot confirm your process", self.cli(OWNER, "resume", expected=2))
+
     def test_solo_command_keeps_its_document_announcement_todos_and_wrap_up(self) -> None:
         text = self.command_text()
         for line in (

@@ -191,14 +191,14 @@ class ReviewStore:
 
     def session_state(self, review: ActiveReview, identity: str) -> SessionLiveness:
         observed = self.liveness(identity)
-        if isinstance(observed, sessions.LiveSessionProcess):
-            if isinstance(observed.started, str):
-                return observed
-            observed = sessions.SessionLivenessUnknown("The registry has no verified process start.")
         saved = review["participants"].get(identity)
         if saved is None:
-            return (observed if isinstance(observed, sessions.SessionLivenessUnknown)
-                    else sessions.SessionLivenessUnknown("No saved process identity."))
+            return (sessions.SessionLivenessUnknown("No saved process identity.")
+                    if isinstance(observed, sessions.SessionNotLive) else observed)
+        if isinstance(observed, sessions.LiveSessionProcess) and (
+            isinstance(observed.started, str) or observed.pid != saved["pid"]
+        ):
+            return observed
         process = sessions.process_liveness(saved["pid"], saved["started"])
         if isinstance(process, sessions.LiveSessionProcess) or isinstance(observed, sessions.SessionNotLive):
             return process
