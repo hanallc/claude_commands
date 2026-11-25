@@ -49,7 +49,7 @@ fake ones.
   chips, or any questionnaire UI — not for the items, not for any step of the
   workflow. Keep the technical content, drop the widget.
 - Mark the recommendation as `(recommended — <one-line reason>)`.
-- Include the discussion choices `elaborate / simplify`.
+- Include the discussion choices `elaborate / simplify / read messages`.
 - One decision per turn. Split an item that contains independent questions.
 
 ## When it does not land

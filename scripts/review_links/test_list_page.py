@@ -28,6 +28,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts
 from scripts.agents.remote import local_machine
@@ -39,7 +40,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result, sessions
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
-from scripts.production import (change_review, change_routing, delivery_state, investigation,
+from scripts.production import (change_review, change_routing, delivery_state, investigation, record_store, repeat_rule,
                                 session_pane, session_staff, showrunners, staff, the_list, unrouted_alert)
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names
@@ -431,6 +432,7 @@ class ListPageTests(unittest.TestCase):
         cls._firefox = None
         config = cls.browser_root / "config"
         config.mkdir()
+        _ = (config / "the_list.conf").write_text("# whole: 1..\nseries_run_limit=730\n")
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
         _ = (config / "statusline.conf").write_text(
             "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
@@ -2546,7 +2548,8 @@ document.body.append(result);
         shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
         self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+)<b>', shows),
                          [("all", "All"), ("needs-me", "Needs me"), ("producer-answering", "Producer answering"),
-                          ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked")])
+                          ("working", "Working"), ("blocked", "Blocked"), ("parked", "Parked"),
+                          ("scheduled", "Scheduled")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
         owners = controls.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
         producers = controls.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
@@ -2819,7 +2822,8 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
 
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", members=staff.snapshot())
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", members=staff.snapshot(),
+                                       parking_label="", schedule=the_list.NoSchedule.UNSET, today=NOW)
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
@@ -3825,21 +3829,29 @@ window.fetch=(url,options)=>{
         root = self.root / "reviews"
         fields = self.fields(item, "park", until="2026-12-03")
         midnight = datetime(2026, 12, 3, 5, tzinfo=UTC)
-        park = the_list.park
-
-        def at_midnight(keeper: staff.StaffId, identity: str, until: the_list.Timestamp, *,
-                        source: str, notice: the_list.PageItemNotice) -> the_list.ListItem:
-            with patch.object(the_list, "now", return_value=midnight):
-                return park(keeper, identity, until, source=source, notice=notice)
-
-        with patch.object(the_list, "park", side_effect=at_midnight):
+        with self.list_clock_after_lock(midnight):
             with self.assertRaisesRegex(ValueError, "Choose a future parking date"):
                 _ = list_page.submit(root, urlencode(fields))
         self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
+    @staticmethod
+    @contextmanager
+    def list_clock_after_lock(moment: datetime) -> Generator[None]:
+        @contextmanager
+        def lock_at_time(path: Path) -> Generator[file_lock.LockResult]:
+            with file_lock.exclusive(path) as lock, patch.object(the_list, "now", return_value=moment):
+                yield lock
+
+        with patch.object(record_store, "exclusive", lock_at_time):
+            yield
+
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_item_actions_unread_sync_and_words_fields(self) -> None:
         _ = self.fixture_items()
+        request = the_list.add(MORTY.id, "Report the result", owner=OWNER.id, number=107, source="nate",
+                               changes={"state": the_list.ItemState.BLOCKED,
+                                        "latest_status": 'Please Tell Morty & confirm the "release result".'})
+        _ = the_list.update(MORTY.id, request.id, {"latest_status": "The result is ready."}, source="morty")
         with patch.object(list_page, "counts_strip", return_value=""):
             markup = list_page.render(self.root / "reviews").decode()
         setup = '''<script>
@@ -3865,7 +3877,8 @@ window.fetch=async(_path,options={})=>{
  const submit=(number,action)=>{const form=recordDetails(row(number)).querySelector('form');form.requestSubmit(form.querySelector('[value="'+action+'"]'));return form;};
  try{
   for(const [query,expected] of [['105','105'],['L105','105'],['#105','105'],['BUILDS','105'],
-    ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed','']]){
+    ['Straße','106'],['WORKING','105,106'],['Waiting','58'],['Parked','41'],['Closed',''],
+    ['tELL mORTY','107'],['& confirm the "release result"','107'],['missing request phrase','']]){
    await choose('all',query);check(visible()===expected,'words filter: '+query);
   }
   await choose('working','106');row('106').querySelector('.list-toggle').click();
@@ -3919,6 +3932,692 @@ window.fetch=async(_path,options={})=>{
 })();
 </script>'''
         self.browser_actions(markup, setup, probe)
+
+    @staticmethod
+    def finish_next_scheduled_run(identity: str) -> the_list.ListItem:
+        store = record_store.NumberedRecords(MORTY.id, "list", "L", "list item", the_list.ListError)
+        with store.locked():
+            schedule = the_list.load(MORTY.id, identity).schedule
+            assert isinstance(schedule, the_list.ScheduledSeries)
+            selected = schedule.next_run()
+            assert isinstance(selected, the_list.SeriesRun)
+            finished = schedule.finish_runs((selected.number,))
+            fields, body = store.read(identity)
+            saved = cast(dict[str, object], json.loads(fields["schedule"]))
+            saved.update(runs_used=finished.runs_used, finished_runs=sorted(finished.finished_runs))
+            fields["schedule"] = json.dumps(saved)
+            store.write(identity, fields, body)
+            return the_list.load(MORTY.id, identity)
+
+    def test_schedule_saves_the_instruction_and_applies_repeat_scopes(self) -> None:
+        root = self.root / "reviews"
+        first = datetime(2026, 11, 30, 14, tzinfo=UTC)
+        item = self.add("Check the account predictions")
+        create = self.fields(item, "schedule", until=first.isoformat(),
+                             schedule_words="Compare the predictions.", repeat="FREQ=WEEKLY;BYDAY=MO;COUNT=5")
+        _ = list_page.submit(root, urlencode(create))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertIs(saved.state, the_list.ItemState.SCHEDULED)
+        self.assertIs(saved.parked_until, the_list.NoTimestamp.UNSET)
+        schedule = saved.schedule
+        assert isinstance(schedule, the_list.ScheduledSeries)
+        self.assertEqual((schedule.first.start, schedule.first.words), (first, create["schedule_words"]))
+        _ = list_page.submit(root, urlencode(create))
+        self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+        self.assertTrue(list_page.saved_action_state(MORTY.id, item.id, park_request=create["request"]).get("park_request_saved"))
+
+        second = first + timedelta(days=7)
+        saved = self.finish_next_scheduled_run(item.id)
+        with patch.object(the_list, "now", return_value=first + timedelta(days=1)):
+            revision = the_list.schedule_revision(saved.schedule)
+            for action, scope, run, reason in (
+                ("park", "this", "2", "to park a repeated item"),
+                ("schedule", "this", "1", "The next run changed"),
+            ):
+                with self.subTest(action=action, run=run):
+                    fields = self.fields(saved, action, scope=scope, run=run, until=second.isoformat(),
+                                         schedule_words="Check the second run.", schedule_revision=revision)
+                    with self.assertRaisesRegex(ValueError, reason):
+                        _ = list_page.submit(root, urlencode(fields))
+                    self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+            change = self.fields(saved, "schedule", scope="this", run="2", schedule_words="Check the second run.")
+            _ = list_page.submit(root, urlencode(change))
+            next_run = the_list.load(MORTY.id, item.id).schedule
+            assert isinstance(next_run, the_list.ScheduledSeries)
+            self.assertEqual(next_run.exceptions[0].run, the_list.ScheduledRun(second, change["schedule_words"]))
+            self.assertEqual(next_run.first.words, create["schedule_words"])
+            current = the_list.load(MORTY.id, item.id)
+            for action, scope in (("schedule", "all"), ("unschedule", "all"), ("remove", "this"), ("park", "following")):
+                with self.subTest(action=action, scope=scope):
+                    until = second.isoformat() if action == "park" else ""
+                    fields = self.fields(saved, action, scope=scope, run="2", schedule_words="Use the old schedule.",
+                                         schedule_revision=revision, until=until)
+                    with self.assertRaisesRegex(the_list.ScheduleSelectionChanged, "The schedule changed"):
+                        _ = list_page.submit(root, urlencode(fields))
+                    self.assertEqual(the_list.load(MORTY.id, item.id), current)
+            change = self.fields(saved, "schedule", scope="following", run="2",
+                                 schedule_words="Check the remaining runs.")
+            _ = list_page.submit(root, urlencode(change))
+            remaining = the_list.load(MORTY.id, item.id).schedule
+            assert isinstance(remaining, the_list.ScheduledSeries)
+            self.assertEqual((remaining.first.start, remaining.first.words, remaining.rule.rrule),
+                             (second, change["schedule_words"], "FREQ=WEEKLY;BYDAY=MO;COUNT=4"))
+            remove = self.fields(saved, "remove", scope="this", run="2",
+                                 schedule_revision=the_list.schedule_revision(remaining))
+            _ = list_page.submit(root, urlencode(remove))
+            _ = list_page.submit(root, urlencode(remove))
+            skipped = the_list.load(MORTY.id, item.id).schedule
+            assert isinstance(skipped, the_list.ScheduledSeries)
+            self.assertEqual(skipped.exceptions, (the_list.RunException(
+                2, the_list.SkippedRun("Removed by nate on the List page.")),))
+            other = self.fields(saved, "remove", scope="this", run="3")["request"]
+            for request, expected in ((remove["request"], True), (create["request"], False), (other, False)):
+                with self.subTest(request=request):
+                    state = list_page.saved_action_state(MORTY.id, item.id, park_request=request)
+                    self.assertEqual(state.get("remove_request_saved"), expected)
+            _ = list_page.submit(root, urlencode(self.fields(saved, "remove", scope="all", run="3")))
+        self.assertIs(the_list.load(MORTY.id, item.id).state, the_list.ItemState.CLOSED)
+
+        exhausted = the_list.add(
+            MORTY.id, "Review a finished series", owner=OWNER.id, source="nate",
+            changes={"state": the_list.ItemState.SCHEDULED, "schedule": the_list.ScheduledSeries(
+                the_list.ScheduledRun(first, "Review the result."), repeat_rule.parse("FREQ=DAILY;COUNT=1"),
+                the_list.series_run_limit())},
+        )
+        for today, short_eta, note in (
+            (NOW, "Nov 30 09:00 EST", " · next Nov 30 09:00 EST"),
+            (first + timedelta(days=1), "No time yet", " · No next run"),
+        ):
+            with self.subTest(today=today), patch.object(the_list, "now", return_value=today):
+                if today > first:
+                    _ = self.finish_next_scheduled_run(exhausted.id)
+                state = list_page.saved_action_state(MORTY.id, exhausted.id, include_detail=True)
+                self.assertEqual(state.get("eta_short"), short_eta)
+                self.assertTrue(state.get("scheduled_note", "").endswith(note))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_schedule_filters_repeat_menu_and_scopes(self) -> None:
+        root = self.root / "reviews"
+        start = the_list.ScheduledRun(datetime(2026, 11, 30, 14, tzinfo=UTC), "Compare the account predictions.")
+        one_time = the_list.ScheduledRun(datetime(2026, 11, 27, 21, tzinfo=UTC), "Set the time zone to Eastern time.")
+        limit = the_list.series_run_limit()
+        sequence = the_list.ScheduledSeries(start, repeat_rule.parse("FREQ=WEEKLY;BYDAY=MO"), limit,
+                                             run_number_offset=1, runs_used=1, finished_runs=frozenset({1}))
+        _ = the_list.add(MORTY.id, "Check the account predictions", owner=OWNER.id, source="nate",
+                         changes={"state": the_list.ItemState.SCHEDULED, "schedule": sequence})
+        _ = the_list.add(MORTY.id, "Set the time zone to Eastern time", owner=OTHER.id, source="nate",
+                         changes={"state": the_list.ItemState.SCHEDULED, "schedule": one_time})
+        first = the_list.ScheduledSeries(start, repeat_rule.parse("FREQ=DAILY"), limit)
+        _ = the_list.add(MORTY.id, "Check the first run", owner=OWNER.id, source="nate",
+                         changes={"state": the_list.ItemState.SCHEDULED, "schedule": first})
+        _ = self.add("Give the result", the_list.ItemState.WAITING_FOR_NATE)
+        for title in ("Park this item", "Start once", "Repeat daily", "Repeat weekly", "Repeat monthly",
+                      "Repeat annually", "Repeat on weekdays", "Repeat with custom settings",
+                      "Repeat on Thursday"):
+            _ = self.add(title)
+
+        finish_next_run = self.finish_next_scheduled_run
+        advanced = False
+
+        class FixtureList(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                url = urlsplit(self.path)
+                if url.path != list_page.PAGE_PATH:
+                    self.send_error(404)
+                    return
+                query = parse_qs(url.query)
+                if "item-state" in query:
+                    state = list_page.saved_action_state(query["keeper"][0], query["item-state"][0],
+                                                         park_request=query["park-request"][0], include_detail=True)
+                    mime, content = "application/json", json.dumps(state).encode()
+                else:
+                    mime, content = "text/html; charset=utf-8", list_page.render(root, include_counts=False)
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.end_headers()
+                _ = self.wfile.write(content)
+
+            def do_POST(self) -> None:
+                body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+                nonlocal advanced
+                if self.headers.get("X-Test-Advance-Run") and not advanced:
+                    _ = finish_next_run("L1")
+                    advanced = True
+                try:
+                    _, state = list_page.save_action(root, body, include_detail=True)
+                    code, result = 200, state
+                except ValueError as error:
+                    code, result = 400, {"reason": str(error)}
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                _ = self.wfile.write(json.dumps(result).encode())
+
+            @override
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        browser = self.chrome()
+        with ThreadingHTTPServer(("127.0.0.1", 0), FixtureList) as server:
+            server.daemon_threads = False
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                session = browser.session
+                _ = browser.command("Emulation.setDeviceMetricsOverride",
+                                    {"width": 1440, "height": 1024, "deviceScaleFactor": 1, "mobile": False}, session)
+                _ = browser.command("Emulation.setEmulatedMedia", {"features": [
+                    {"name": "prefers-color-scheme", "value": "dark"},
+                    {"name": "prefers-reduced-motion", "value": "reduce"}]}, session)
+                browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}")
+                proof = os.environ.get("LIST_SCHEDULE_PROOF")
+
+                def evaluate(expression: str) -> None:
+                    answer = browser.command("Runtime.evaluate", {"expression": expression, "awaitPromise": True,
+                                             "returnByValue": True}, session)
+                    self.assertNotIn("exceptionDetails", answer, answer)
+
+                def capture_proof(selector: str, path: Path) -> None:
+                    clip = browser.command("Runtime.evaluate", {"returnByValue": True, "expression": """
+(() => {
+ const box=document.querySelector(""" + json.dumps(selector) + """).getBoundingClientRect();
+ return {x:box.left+scrollX,y:box.top+scrollY,width:box.width,height:box.height,scale:1};
+})()
+"""}, session)
+                    rect = cast(dict[str, object], clip["result"])["value"]
+                    result = cast(dict[str, str], browser.command(
+                        "Page.captureScreenshot", {"format": "png", "clip": rect}, session))
+                    _ = path.write_bytes(base64.b64decode(result["data"]))
+
+                evaluate(r"""
+(() => {
+ Date.now=()=>Date.parse('2026-11-16T18:00:00Z');
+ window.check=(ok,message)=>{if(!ok) throw new Error(message);};
+ window.row=number=>document.querySelector('[data-number="'+number+'"]');
+ window.show=value=>document.getElementById('filter-show-'+value).click();
+ window.openItem=number=>{
+  row(number).querySelector('.list-toggle').click();
+  return recordDetails(row(number)).querySelector('form');
+ };
+ window.showParkScope=number=>{
+  const form=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
+  const picker=form.querySelector('[data-later-menu]');
+  if(picker.hidden) form.querySelector('[data-later-toggle]').click();
+  const words=picker.querySelector('[data-schedule-words]');
+  words.value='';
+  words.dispatchEvent(new Event('input',{bubbles:true}));
+  picker.querySelector('[value=park]').click();
+  const dialog=document.querySelector('.list-schedule-dialog[open]');
+  return {dialog,closePicker:()=>form.querySelector('[data-later-toggle]').click(),cancel:async()=>{
+   const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+   dialog.querySelector('[data-cancel]').click();
+   await closed;
+   words.value=words.defaultValue;
+   words.dispatchEvent(new Event('input',{bubbles:true}));
+  }};
+ };
+ show('needs-me');
+ check(row(1).hidden && row(2).hidden && row(3).hidden && !row(4).hidden,'Needs me hides scheduled items.');
+ show('scheduled');
+ check(!row(1).hidden && !row(2).hidden && !row(3).hidden && row(4).hidden,'Scheduled lists only scheduled items.');
+ check(document.getElementById('filter-show-scheduled').dataset.filterCount==='3','The Scheduled chip counts its rows.');
+ check(row(2).compareDocumentPosition(row(1)) & Node.DOCUMENT_POSITION_FOLLOWING,'The earliest start is first.');
+ check(row(2).querySelector('.list-state').textContent==='Scheduled','The row has a Scheduled state mark.');
+ check(row(2).querySelector('[data-scheduled-note]').textContent==='Starts Nov 27 16:00 EST','The one-time row shows its start.');
+ check(row(1).querySelector('[data-scheduled-note]').textContent==='Weekly on Monday · next Nov 30 09:00 EST',
+  'The repeated row shows the rule and next start.');
+})();
+""")
+                evaluate(r"""
+(() => {
+ const form=openItem(1);
+ form.querySelector('[data-later-toggle]').click();
+ const select=form.querySelector('[data-repeat]');
+ check(select.value==='weekly','The saved weekly rule selects the weekly preset.');
+ select.value='custom';select.dispatchEvent(new Event('change'));
+ const dialog=document.querySelector('.list-schedule-dialog[open]');
+ check(dialog?.getAttribute('aria-label')==='Custom recurrence','Custom opens the editor.');
+ dialog.querySelector('[data-repeat-interval]').value='2';
+ dialog.querySelector('[data-weekday="TH"]').click();
+})();
+""")
+                _ = browser.command("Emulation.setDeviceMetricsOverride",
+                                    {"width": 1024, "height": 1024, "deviceScaleFactor": 1, "mobile": False}, session)
+                evaluate(r"""
+(async () => {
+ const dialog=document.querySelector('.list-schedule-dialog[open]');
+ const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+ dialog.querySelector('[data-cancel]').click();
+ await closed;
+ const picker=recordDetails(row(1)).querySelector('[data-later-menu]');
+ window.checkPicker=picker=>{
+  const box=picker.getBoundingClientRect();
+  check(box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight &&
+   picker.scrollWidth<=picker.clientWidth,'The schedule picker fits the viewport.');
+  const instruction=picker.querySelector('[data-schedule-words]');
+  const calendar=picker.querySelector('[data-later-grid]');
+  const save=picker.querySelector('[value=park]');
+  check(calendar.getBoundingClientRect().bottom<instruction.getBoundingClientRect().top,
+   'The picker stacks the fields at this width.');
+  check(instruction.getBoundingClientRect().bottom<save.getBoundingClientRect().top &&
+   picker.querySelector('[data-repeat]').getBoundingClientRect().bottom<save.getBoundingClientRect().top,
+   'Save is below the instruction and Repeat.');
+ };
+ checkPicker(picker);
+})();
+""")
+                if proof:
+                    capture_proof("[data-later-menu]:not([hidden])", Path(proof) / "scheduled-picker-dark.png")
+                scope_proof = os.environ.get("LIST_PARK_SCOPE_PROOF")
+                if scope_proof:
+                    evaluate("window.parkScopeProof=showParkScope(1);")
+                    capture_proof(".list-schedule-dialog[open]", Path(scope_proof))
+                    evaluate("parkScopeProof.cancel();")
+                evaluate(r"""
+(() => {
+ const select=recordDetails(row(1)).querySelector('[data-repeat]');
+ select.value='custom';select.dispatchEvent(new Event('change'));
+})();
+""")
+                _ = browser.command("Emulation.setDeviceMetricsOverride",
+                                    {"width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": True}, session)
+                _ = browser.command("Emulation.setEmulatedMedia", {"features": [
+                    {"name": "prefers-color-scheme", "value": "light"},
+                    {"name": "prefers-reduced-motion", "value": "reduce"}]}, session)
+                evaluate(r"""
+(async () => {
+ let dialog=document.querySelector('.list-schedule-dialog[open]');
+ const box=dialog.getBoundingClientRect();
+ check(box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight &&
+  dialog.scrollWidth<=dialog.clientWidth,'The Custom dialog fits a phone.');
+ const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+ dialog.querySelector('[data-cancel]').click();
+ await closed;
+ const form=recordDetails(row(1)).querySelector('form');
+ const picker=form.querySelector('[data-later-menu]');
+ const pickerBox=picker.getBoundingClientRect();
+ check(pickerBox.left>=0 && pickerBox.right<=innerWidth && pickerBox.top>=0 && pickerBox.bottom<=innerHeight &&
+  picker.scrollWidth<=picker.clientWidth,'The schedule picker fits a phone.');
+ checkPicker(picker);
+ form.querySelector('[data-later-toggle]').click();
+ form.querySelector('[value=remove]').click();
+ dialog=document.querySelector('.list-schedule-dialog[open]');
+ check([...dialog.querySelectorAll('label:not([hidden])')].map(label=>label.textContent.trim()).join(',')===
+  'This run,This and following runs,All runs','A later run offers all three scopes.');
+ const cancelled=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+ dialog.querySelector('[data-cancel]').click();
+ await cancelled;
+ openItem(3).querySelector('[value=remove]').click();
+ dialog=document.querySelector('.list-schedule-dialog[open]');
+ check(dialog.querySelector('[data-scope-following]').hidden,'The first run omits the following scope.');
+ const firstRunClosed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+ dialog.querySelector('[data-cancel]').click();
+ await firstRunClosed;
+ for(const [number,scope] of [[1,'following'],[3,'all']]){
+  const park=showParkScope(number);
+  const reason=park.dialog.querySelector('[data-scope-park]');
+  check(park.dialog.querySelector('[value=this]').disabled &&
+   park.dialog.querySelector('[name=scope-choice]:checked').value===scope &&
+   !reason.hidden && reason.textContent==='Parking applies to the item.',
+   'Park explains why This run is unavailable and selects the first allowed scope.');
+  await park.cancel();
+  park.closePicker();
+ }
+})();
+""")
+                for control, expected in (("data-schedule-words", "Read the result.\n"), ("data-repeat", None)):
+                    with self.subTest(control=control):
+                        evaluate(r"""
+(() => {
+ const form=openItem(1);
+ form.querySelector('[data-later-toggle]').click();
+ const field=form.querySelector('['+""" + json.dumps(control) + r"""+']');
+ window.keySubmissions=0;
+ window.parkKeySubmit=event=>{event.preventDefault();event.stopImmediatePropagation();keySubmissions++;};
+ form.addEventListener('submit',parkKeySubmit,{capture:true});
+ if(field.matches('textarea')){
+  field.value='Read the result.';
+  field.focus();
+  check(document.activeElement===field,'The instruction field has focus.');
+  field.setSelectionRange(field.value.length,field.value.length);
+ }else{
+  field.focus();
+  const enter=new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true});
+  field.dispatchEvent(enter);
+  check(!enter.defaultPrevented,'Repeat receives Enter.');
+ }
+})();
+""")
+                        if expected is not None:
+                            key = {"key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13}
+                            _ = browser.command("Input.dispatchKeyEvent", {**key, "type": "keyDown", "text": "\r"}, session)
+                            _ = browser.command("Input.dispatchKeyEvent", {**key, "type": "keyUp"}, session)
+                        evaluate(r"""
+(() => {
+ const form=recordDetails(row(1)).querySelector('form');
+ const instruction=form.querySelector('[data-schedule-words]');
+ const expected=""" + json.dumps(expected) + r""";
+ check(keySubmissions===0,'Enter in the schedule fields does not submit.');
+ if(expected!==null){
+  check(instruction.value===expected,'Enter inserts a newline in the instruction.');
+  instruction.value=instruction.defaultValue;
+  instruction.dispatchEvent(new Event('input',{bubbles:true}));
+ }
+ form.removeEventListener('submit',parkKeySubmit,{capture:true});
+ form.querySelector('[data-later-toggle]').click();
+ row(1).querySelector('.list-toggle').click();
+})();
+""")
+                for number in (14, 15):
+                    _ = the_list.add(MORTY.id, f"Review the schedule draft for item {number}", owner=OWNER.id, source="nate",
+                                     changes={"state": the_list.ItemState.SCHEDULED, "schedule": one_time})
+                tokyo = the_list.ScheduledRun(datetime(2026, 12, 1, 0, 30, tzinfo=ZoneInfo("Asia/Tokyo")),
+                                              "Review the weekly figures.")
+                tokyo_item = the_list.add(MORTY.id, "Review the Tokyo schedule", owner=OWNER.id, source="nate",
+                                          changes={"state": the_list.ItemState.SCHEDULED, "schedule": tokyo})
+                tokyo_series = replace(sequence, first=tokyo, rule=repeat_rule.parse("FREQ=WEEKLY;BYDAY=TU"))
+                for number in range(17, 21):
+                    _ = the_list.add(MORTY.id, f"Edit the Tokyo series for item {number}", owner=OWNER.id, source="nate",
+                                     changes={"state": the_list.ItemState.SCHEDULED, "schedule": tokyo_series})
+                for number, rule in (
+                    (21, "FREQ=WEEKLY;BYDAY=MO"),
+                    (22, "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO"),
+                    (23, "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO"),
+                    (24, "FREQ=MONTHLY;BYDAY=-1MO"),
+                    (25, "FREQ=YEARLY"),
+                    (26, "FREQ=MONTHLY;BYMONTHDAY=30"),
+                    (27, "FREQ=DAILY;UNTIL=20261130T140000Z"),
+                ):
+                    series = replace(sequence, rule=repeat_rule.parse(rule))
+                    _ = the_list.add(MORTY.id, f"Move the series for item {number}", owner=OWNER.id, source="nate",
+                                     changes={"state": the_list.ItemState.SCHEDULED, "schedule": series})
+                evaluate(r"""
+(async () => {
+ window.refreshSchedules=()=>new Promise(resolve=>{
+  const list=document.querySelector('[data-list]');
+  const observer=new MutationObserver(()=>{
+   if(!list.isConnected){observer.disconnect();resolve();}
+  });
+  observer.observe(list.parentElement,{childList:true});
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ });
+ await refreshSchedules();
+ show('all');
+ const cases=[
+  [5,'','none'],[6,'Start once','none'],[7,'Run daily','daily'],[8,'Run weekly','weekly'],
+  [9,'Run monthly','monthly'],[10,'Run annually','yearly'],[11,'Run each weekday','weekdays'],
+  [12,'Run a custom rule','custom'],[13,'Run every other Thursday','custom','2026-12-03'],
+ ];
+ const words=form=>form.querySelector('[data-schedule-words]');
+ const edit=control=>control.dispatchEvent(new Event('input',{bubbles:true}));
+ const pickDate=(form,date)=>{
+  form.querySelector('[data-later-month-step="1"]').click();
+  form.querySelector('[data-date="'+date+'"]').click();
+ };
+ const waitForSave=async(form,save,scope,{lost=false,date,instruction,rule,repeatZone,refusal,advanceRun=false}={})=>{
+  let posted;
+  let sentPost=false;
+  let readback;
+  const send=window.fetch;
+  const response=new Promise(resolve=>{
+   window.fetch=async(...args)=>{
+    if(args[1]?.method==='POST'){
+     sentPost=true;
+     if(advanceRun) args[1].headers={'X-Test-Advance-Run':'1'};
+    }
+    const reply=await send(...args);
+    if(args[1]?.method==='POST'){
+     posted=new URLSearchParams(args[1].body);
+     resolve(await reply.clone().json());
+     if(lost) throw new Error('Response lost.');
+    }
+    if(new URL(args[0],location.href).searchParams.has('item-state')) readback=await reply.clone().json();
+    return reply;
+   };
+  });
+  save.click();
+  if(scope){
+   const dialog=document.querySelector('.list-schedule-dialog[open]');
+   const selected=dialog.querySelector('[value='+scope+']');
+   check(!selected.disabled,'The requested scope is available.');
+   selected.click();
+   const status=form.querySelector('[data-schedule-status]');
+   const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+   dialog.querySelector('[data-done]').click();
+   await closed;
+   if(refusal){
+    window.fetch=send;
+    check(status.textContent===refusal && !sentPost && !form.querySelector('[data-later-menu]').hidden,
+     'The picker shows the refusal without sending the edit.');
+    return;
+   }
+   if(rule || date) check(!status.textContent,status.textContent);
+  }
+  const result=await response;
+  if(!advanceRun) check(!result.reason,result.reason);
+  if(scope) check(posted.get('scope')===scope,'The selected scope is sent.');
+  if(date) check(posted.get('until')===date,'The edit sends the selected instant.');
+  if(date && !rule) check(!posted.has('repeat'),'The move keeps the saved repeat rule.');
+  if(instruction) check(posted.get('schedule_words')===instruction && !posted.get('until') && !posted.has('repeat'),
+   'The edit sends only the instruction for the selected scope.');
+  if(rule) check(posted.get('repeat')===rule && (date || !posted.get('until')),
+   'The edit sends the new repeat rule and only the selected date.');
+  if(repeatZone){
+   const detail=new DOMParser().parseFromString(result.detail_html,'text/html');
+   const fields=detail.querySelector('[data-schedule-template]').content.firstElementChild;
+   check(fields.dataset.repeatZone===repeatZone,'The saved rule uses the expected time zone.');
+  }
+  await new Promise(resolve=>{
+   const sent=()=>!form.dataset.sending;
+   const observer=new MutationObserver(()=>{if(sent()){observer.disconnect();resolve();}});
+   observer.observe(form,{attributes:true});
+   if(sent()){observer.disconnect();resolve();}
+  });
+  window.fetch=send;
+  if(advanceRun){
+   const reason='The next run changed. Open the item again.';
+   check(result.reason===reason && recordIsOpen(row(1)) &&
+    form.querySelector('[data-send-status]').textContent.includes(reason),'The page shows why the stale action was refused.');
+  }
+  if(lost) check(readback?.remove_request_saved && readback.item_state==='Scheduled' &&
+   !recordIsOpen(row(1)),'The removal receipt confirms the save and closes the detail.');
+ };
+ for(const [number,task,repeat,newStart] of cases){
+  const form=openItem(number);
+  form.querySelector('[data-later-toggle]').click();
+  form.elements.until.value='2026-11-30T09:00';edit(form.elements.until);
+  words(form).value=task;edit(words(form));
+  if(task){
+   const select=form.querySelector('[data-repeat]');
+   check([...select.options].map(option=>option.textContent).join('|')===
+    'Does not repeat|Daily|Weekly on Monday|Monthly on the last Monday|Annually on November 30|Every weekday (Monday to Friday)|Custom…',
+    'The repeat options follow the picked date.');
+   select.value=repeat;select.dispatchEvent(new Event('change'));
+   if(repeat==='custom'){
+    const dialog=document.querySelector('.list-schedule-dialog[open]');
+    const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+    dialog.querySelector('[data-repeat-interval]').value='2';
+    dialog.querySelector('[data-weekday="TH"]').click();
+    dialog.querySelector('[value=count]').click();
+    dialog.querySelector('[data-repeat-count]').value='5';
+    if(newStart){
+     dialog.querySelector('[data-weekday="MO"]').click();
+     check(dialog.querySelector('[data-done]').disabled &&
+      dialog.querySelector('[data-repeat-start-status]').textContent.includes('selected repeat day'),
+      'Custom explains why the selected days require a new start.');
+     dialog.querySelector('[data-change-start]').click();
+     await closed;
+     check(document.activeElement.matches('[data-later-grid] [tabindex="0"]'),
+      'Change start date returns focus to the calendar.');
+     pickDate(form,newStart);
+    }else{
+     dialog.querySelector('[data-done]').click();
+     await closed;
+    }
+   }
+  }
+  await waitForSave(form,form.querySelector('[value=park]'));
+ }
+ for(const [number,action,scope,options] of [
+  [1,'park','this',{date:'2026-12-01T14:00:00.000Z'}],
+  [1,'park','all',{instruction:'Compare the revised predictions.'}],
+  [1,'park','following',{instruction:'Compare the remaining predictions.'}],
+  [1,'park','following',{repeat:'custom',rule:'FREQ=WEEKLY;BYDAY=TU',note:'Weekly on Tuesday · next Dec 1 09:00 EST'}],
+  [16,'park',null,{repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',note:'Weekly on Monday · next Nov 30 10:30 EST'}],
+  [17,'park','following',{instruction:'Use the updated figures.',repeatZone:'Asia/Tokyo',
+   savedLabel:'Weekly on Tuesday',label:'Weekly on Tuesday',
+   note:'Weekly on Tuesday · next Nov 30 10:30 EST'}],
+  [18,'park','following',{wall:'2026-11-30T11:00',date:'2026-11-30T16:00:00.000Z',repeatZone:'Asia/Tokyo',
+   savedLabel:'Weekly on Tuesday',label:'Weekly on Tuesday',
+   note:'Weekly on Tuesday · next Nov 30 11:00 EST'}],
+  [19,'park','following',{repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',repeatZone:'America/New_York',
+   note:'Weekly on Monday · next Nov 30 10:30 EST'}],
+  [20,'park','following',{wall:'2026-11-30T11:00',date:'2026-11-30T16:00:00.000Z',
+   repeat:'weekly',rule:'FREQ=WEEKLY;BYDAY=MO',repeatZone:'America/New_York',
+   note:'Weekly on Monday · next Nov 30 11:00 EST'}],
+  [21,'park','following',{date:'2026-12-01T14:00:00.000Z',savedLabel:'Weekly on Monday',
+   label:'Weekly on Tuesday',rule:'FREQ=WEEKLY;BYDAY=TU',repeatZone:'America/New_York',
+   note:'Weekly on Tuesday · next Dec 1 09:00 EST'}],
+  [22,'park','following',{wall:'2026-12-07T09:00',date:'2026-12-07T14:00:00.000Z',
+   savedLabel:'Custom · Every 2 weeks on Monday',label:'Custom · Every 2 weeks on Monday',
+   note:'Every 2 weeks on Monday · next Dec 7 09:00 EST'}],
+  [23,'park','following',{date:'2026-12-01T14:00:00.000Z',
+   savedLabel:'Custom · Every 2 weeks on Monday',label:'Custom · Every 2 weeks on Monday',
+   refusal:'The start date must fall on a selected repeat day.',
+   note:'Every 2 weeks on Monday · next Nov 30 09:00 EST'}],
+  [24,'park','following',{date:'2026-12-01T14:00:00.000Z',savedLabel:'Monthly on the last Monday',
+   label:'Monthly on the first Tuesday',rule:'FREQ=MONTHLY;BYDAY=1TU',repeatZone:'America/New_York',
+   note:'Monthly on the first Tuesday · next Dec 1 09:00 EST'}],
+  [25,'park','following',{date:'2026-12-01T14:00:00.000Z',savedLabel:'Annually on November 30',
+   label:'Annually on December 1',rule:'FREQ=YEARLY',repeatZone:'America/New_York',
+   note:'Annually on December 1 · next Dec 1 09:00 EST'}],
+  [26,'park','following',{date:'2026-12-01T14:00:00.000Z',
+   savedLabel:'Custom · Monthly on day 30',label:'Custom · Monthly on day 30',
+   refusal:'The start date must match the monthly repeat day.',
+   note:'Monthly on day 30 · next Nov 30 09:00 EST'}],
+  [27,'park','following',{date:'2026-12-01T14:00:00.000Z',
+   refusal:'Choose an end date on or after the start.',
+   note:'Daily until 2026-11-30 14:00:00 UTC · next Nov 30 09:00 EST'}],
+  [2,'unpark',null,{}],
+  [1,'remove','this',{lost:true}],
+  [1,'park','all',{repeat:'daily',rule:'FREQ=DAILY',advanceRun:true}],
+  [1,'park','following',{advanceRun:true}],
+  [1,'remove','this',{advanceRun:true}],
+  [3,'remove','all',{}],
+  [1,'remove','following',{refresh:true}],
+ ]){
+  if(options.refresh) await refreshSchedules();
+  const form=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
+  if(options.date || options.instruction || options.repeat || (action==='park' && options.advanceRun)){
+   form.querySelector('[data-later-toggle]').click();
+   const select=form.querySelector('[data-repeat]');
+   if(options.savedLabel)
+    check(select.selectedOptions[0].textContent===options.savedLabel,'Repeat shows the saved rule.');
+   if(options.wall){form.elements.until.value=options.wall;edit(form.elements.until);}
+   else if(options.date) pickDate(form,'2026-12-01');
+   if(options.label)
+    check(select.selectedOptions[0].textContent===options.label,'Repeat shows the rule for the selected start.');
+   if(options.refusal)
+    check(form.querySelector('[data-schedule-status]').textContent===options.refusal,
+     'The picker explains the invalid start before Save.');
+   if(options.instruction){words(form).value=options.instruction;edit(words(form));}
+   if(options.repeat){
+    select.value=options.repeat;select.dispatchEvent(new Event('change'));
+    if(options.repeat==='custom'){
+     const dialog=document.querySelector('.list-schedule-dialog[open]');
+     const closed=new Promise(resolve=>dialog.addEventListener('close',resolve,{once:true}));
+     dialog.querySelector('[data-done]').click();
+     await closed;
+    }
+   }else if(options.advanceRun){
+    words(form).value='';edit(words(form));
+    form.elements.until.value='2026-12-23T09:00';edit(form.elements.until);
+   }
+  }
+  try{await waitForSave(form,form.querySelector('[value='+action+']'),scope,options);}
+  catch(error){throw new Error('Item '+number+', '+action+', '+scope+': '+error.message);}
+  if(number===1 && options.instruction && scope==='following')
+   check(row(number).querySelector('[data-scheduled-note]').textContent.endsWith('Dec 1 09:00 EST'),
+    'The instruction edit keeps the moved start.');
+  if(options.note)
+   check(row(number).querySelector('[data-scheduled-note]').textContent===options.note,
+    'The changed rule keeps the displayed start.');
+  if(action==='unpark'){
+   const current=openItem(number);
+   current.querySelector('[data-later-toggle]').click();
+   check(words(current).value==='','Unpark clears the saved instruction from the next editor.');
+   current.querySelector('[data-later-toggle]').click();
+  }
+ }
+})();
+""")
+                evaluate(r"""
+(async () => {
+ for(const [number,edited] of [[14,false],[15,true]]){
+  const form=openItem(number);
+  form.querySelector('[data-later-toggle]').click();
+  check(form.elements.until.value==='2026-11-27T16:00','The editor opens at the saved start.');
+  if(edited){
+   const words=form.querySelector('[data-schedule-words]');
+   words.value='Use this draft.';
+   words.dispatchEvent(new Event('input',{bubbles:true}));
+   form.querySelector('[data-date="2026-11-28"]').click();
+  }
+  form.querySelector('[data-later-toggle]').click();
+ }
+})();
+""")
+                _ = the_list.update(MORTY.id, "L15", {"latest_status": "The schedule did not change."}, source="nate")
+                evaluate(r"""
+(async () => {
+ await refreshSchedules();
+ const form=recordDetails(row(15)).querySelector('form');
+ form.querySelector('[data-later-toggle]').click();
+ check(form.elements.until.value==='2026-11-28T16:00' &&
+  form.querySelector('[data-schedule-words]').value==='Use this draft.',
+  'Refresh preserves edits against the same schedule revision.');
+ form.querySelector('[data-later-toggle]').click();
+})();
+""")
+                for number in (14, 15):
+                    changed = the_list.ScheduledRun(one_time.start + timedelta(days=3), "Use the current schedule.")
+                    _ = the_list.update(MORTY.id, f"L{number}", {"schedule": changed}, source="nate")
+                evaluate(r"""
+(async () => {
+ await refreshSchedules();
+ for(const number of [15,14]){
+  const form=recordIsOpen(row(number)) ? recordDetails(row(number)).querySelector('form') : openItem(number);
+  form.querySelector('[data-later-toggle]').click();
+  check(form.elements.until.value==='2026-11-30T16:00' &&
+   form.querySelector('[data-schedule-words]').value==='Use the current schedule.',
+   'Refresh uses the new start and instruction for item '+number+'.');
+  form.querySelector('[data-later-toggle]').click();
+ }
+})();
+""")
+            finally:
+                try:
+                    browser.navigate("about:blank")
+                finally:
+                    server.shutdown()
+                    thread.join()
+
+        parked, single = (the_list.load(MORTY.id, f"L{number}") for number in (5, 6))
+        self.assertEqual(parked.parked_until, start.start)
+        self.assertIs(parked.state, the_list.ItemState.WORKING)
+        self.assertEqual(single.schedule, the_list.ScheduledRun(start.start, "Start once"))
+        saved_tokyo = the_list.load(MORTY.id, tokyo_item.id).schedule
+        assert isinstance(saved_tokyo, the_list.ScheduledSeries)
+        self.assertEqual(saved_tokyo.first.start, tokyo.start)
+        self.assertEqual(saved_tokyo.first.start.tzinfo, ZoneInfo("America/New_York"))
+        for number, rule in enumerate(("FREQ=DAILY", "FREQ=WEEKLY;BYDAY=MO", "FREQ=MONTHLY;BYDAY=-1MO",
+                                       "FREQ=YEARLY", "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+                                       "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH;COUNT=5",
+                                       "FREQ=WEEKLY;INTERVAL=2;BYDAY=TH;COUNT=5"), 7):
+            with self.subTest(number=number):
+                schedule = the_list.load(MORTY.id, f"L{number}").schedule
+                assert isinstance(schedule, the_list.ScheduledSeries)
+                self.assertEqual(schedule.rule.rrule, rule)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_park_opens_the_shared_picker_and_submits_the_chosen_time(self) -> None:
