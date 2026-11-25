@@ -13,7 +13,10 @@ it changes, and say so in one line.
 
 ## Steps
 
-1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py <position|session|folder>` for a waiting step of the bumped unit. The queue applies the bump on its next pass. Clear it in step 5. Make the work the production's top priority.
+1. **Top priority at once.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py <position|session|folder> --words "<the user's words>"` for a waiting step of the unit.
+   The queue applies the bump on its next pass.
+   Clear the priority in step 5.
+   Make the work the production's top priority.
    Log it in `LOG` as `bump: <unit> <what>`. Tell every other unit director in
    one line: the bumped unit's merge goes first, and a build hold may come.
 2. **Checkpoint now.** Tell the owning unit director: "Bump: checkpoint and
@@ -38,7 +41,7 @@ it changes, and say so in one line.
    and the showrunner with the failed step, tip and log; green goes to the
    showrunner. With a merge unit, use its full run. Keep the work top priority
    until the tip is green; red fixes come as follow-up checkpoints.
-5. **Tell the user.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py clear`. When the demo build is installed, tell the user what to
+5. **Tell the user.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py clear --words "<the user's words>"`. Pass the user's bump request as `--words`. When the demo build is installed, tell the user what to
    run and where, in one line, and send a `note` (<Notify/>). Then log
    `bump done: <unit>` once the tip is green, and return to the normal order.
 

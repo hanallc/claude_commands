@@ -20,6 +20,13 @@ SourceIdentity = SourceKeyKnown | SourceKeyUnavailable
 
 
 @dataclass(frozen=True)
+class RunIdentity:
+    """Identify a build run by its process identifier and start time."""
+    pid: int
+    start_time: str
+
+
+@dataclass(frozen=True)
 class ProcessExecution:
     """The execution identity holds a host, generation, process identifier, and start time."""
     host: str

@@ -12,23 +12,23 @@ in nixos modules/darwin/tmp-sweep.nix runs `tmp_sweep.py` every hour.
 For hand cleanup use `tmp_sweep.py --plan <new-plan.json>` first; it lists every
 candidate with keep/remove and a reason, writes the plan, and removes nothing.
 This diagnostic plan requires evidence that the work ended.
-Use removal_guard.py to remove entries from a reviewed removal list.
+Review the removal_guard.py list before manual removal.
 The timed sweep keeps top-level /tmp/claude entries and direct unit/delegate run
 folders without that end evidence until nothing in them changed for 7 days.
 Files and links at the top level also wait 7 days. Tempfile-named entries and
 invoke/verify logs keep their existing rules. Every process and ownership check
 still applies; the log distinguishes an ended owner from the 7-day fallback.
-The timed sweep also prunes the dataclass code cache of the startup hook
-(scripts/lib/python_startup/sitecustomize.py): an entry goes when no process
-read it in lint.conf `dataclass_code_days` days, and an emptied cache tag folder goes with it.
+The timed sweep checks the startup hook's dataclass code cache (scripts/lib/python_startup/sitecustomize.py).
+It lists an entry for vetted manual removal after lint.conf `dataclass_code_days` days without a change.
 
 An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
 folder of each /tmp/claude-<uid> this user owns, or a scratch root of scripts/lib/scratch.py
 (build_folders.conf roots.scratch, and /tmp/claude/scratch, which natedev used before /build),
-where each task's folder is an entry: it stays while its task is open, goes
-when its until: time passes, and goes after TASK_IDLE_SECONDS whatever its task. Each running
-session's temp root (SESSION_TEMP_ROOT/<session id>, its TMPDIR) stays, as does each run's tmp/ (its TMPDIR).
+where each task's folder is an entry. After its until: deadline or TASK_IDLE_SECONDS of inactivity,
+the sweep lists it for vetted manual removal if the other checks pass.
+Each running session's temp root (SESSION_TEMP_ROOT/<session id>, its TMPDIR) stays.
+Each run's tmp/ folder (its TMPDIR) also stays.
 Run keep reasons keep the run folder. Its tmp/ entries use the 4 h and process-use rules.
 A director or session worktree guard permits the same checks for closed phases. Open runs and open phases stay.
 Unreadable ownership or phase state keeps the affected entries. Each session temp entry also uses the 4 h rule.
@@ -38,13 +38,13 @@ and the Mac's per-user temp folder) only a tempfile folder is an entry, the
 name a tempfile maker gives (TEMPFILE_NAME: Rust's tempfile crate, mktemp and
 Python's tempfile), which test runs leave behind, and a lint/invoke.sh log
 file (INVOKE_TEMP_NAME). A direct/verify.sh run folder (verify_temp_name()) is an entry
-too: it stays while the run whose pid it names runs, and goes at once after. In /tmp alone (the
+too. The sweep checks it for vetted manual removal after its named run ends. In /tmp alone (the
 wide root) every other empty folder this user owns, also one that holds only folders, is an entry
 too, whatever its name, and uses the configured folder removal age instead. A folder a system tool owns (SYSTEM_TEMP_NAMES,
 SYSTEM_TEMP_PREFIXES; an empty EMPTY_PREFIXES one aside), another root and a
 folder that holds one stay. A folder in /tmp that holds something is
-folder_audit.py's, which checks it for unsaved git work first. Roots are real paths on both machines. An entry is deleted when
-both are true:
+folder_audit.py's, which checks it for unsaved git work first. Roots are real paths on both machines.
+The sweep lists an entry for vetted manual removal only if both conditions apply:
 
   * nothing in it changed for IDLE_SECONDS. A change is the newer of mtime and
     ctime (a `cp -a` copy keeps its mtime but sets ctime), over every file,
@@ -56,9 +56,9 @@ both are true:
 These stay too: runs named by staff rows, runs with any worker not ended (including
 paused workers), and runs using a live or paused session worktree. These runs also keep folders named by cwd in their
 detached_runs/*.json records. Empty detached_runs files are not records. Pending files are not read.
-A worker thread not ended keeps its session temp parent, but its old temp entries can go.
+A live or paused worker thread keeps its session temp parent. The sweep checks old temp entries inside it.
 An unreadable worker record keeps scratch entries and top-level /tmp/claude entries, and names
-the record in the log. Before an idle entry can go, a git check searches
+the record in the log. Before the sweep lists an idle entry, a git check searches
 three folder levels without following links. Uncommitted work, a stash, commits absent from remote
 and clone-source refs, or a failed git check keep it. Git commands have a timeout and never fetch.
 Timed and manual cleanup use the same checks. The roots stay.
@@ -66,22 +66,15 @@ Staff records each director's open run.
 A run also stays when its ownership record identifies a running director.
 The `unit_runs.director` reader resolves that owner through staff.
 A session folder stays when its name identifies a running session.
-An entry of SESSION_ENTRY_MIN_BYTES or more in
-its folders (scratchpad/, tasks/) is judged like any other: a live session
-keeps small files there that it only reads, and a read does not move mtime;
-each of those when a session record cannot be read; a scratch folder of a change review
-row, which its verdict removes (the user can take days to check a row);
-and an entry that cannot be read. Links are never followed, a read-only folder
-is made writable and deleted, and a project folder left empty goes. With
-neither /proc nor lsof nothing goes.
+The sweep checks entries of at least SESSION_ENTRY_MIN_BYTES in its scratchpad/ and tasks/ folders.
+A live session keeps smaller entries there. Reads do not change mtime.
+The sweep keeps entries when it cannot read the session record or the entry.
+A change review verdict ends the scratch task and keeps its folder for vetted manual removal.
+The sweep does not follow links.
+If neither /proc nor lsof can show which processes use an entry, the sweep keeps it.
 
-Each run appends one JSON line to LOG_NAME in the lint-sweep state folder: the
-entries deleted, the GiB freed, the count kept for each reason, and a sample of
-the paths kept for each reason except UNLISTED_REASONS, which hold most entries.
-lint.conf `tmp_sweep_log_sample` sets the sample size. Lines older than
-LOG_KEEP_SECONDS drop off, and the oldest lines also drop off while the log is
-larger than lint.conf `tmp_sweep_log_max_mib`. This replaced the 24-hour session scratch step (2026-10-21), whose
-folders it also covers.
+Each timed run prints the entries for review and a summary.
+This sweep replaced the 24-hour session scratch step (2026-10-21) and covers the same folders.
 """
 
 from __future__ import annotations
@@ -129,7 +122,7 @@ delete_tree = delete_sweep_tree
 GIB = 1 << 30
 HOUR_SECONDS = 3600
 IDLE_SECONDS = 4 * HOUR_SECONDS
-# A scratch folder whose task is open goes after this long anyway: an ender can fail.
+# List eligible scratch folders after this many idle seconds, even for open tasks.
 TASK_IDLE_SECONDS = 7 * 24 * HOUR_SECONDS
 # Inside a running session's folders only an entry this large can go (showrunner, 2026-10-25).
 SESSION_ENTRY_MIN_BYTES = GIB
@@ -179,8 +172,8 @@ INVOKE_TEMP_NAME = re.compile(r"lint_invoke\.\d+\.\d+\.log|buildlog\.\d+\.\d+\.(
 TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}|tmp\.[A-Za-z0-9]{8,10}|tmp" + build_folders.MKDTEMP_SUFFIX_PATTERN)
 # direct/verify.sh's run folder (its copy folders sit inside it), named with the run's pid. Its EXIT
 # trap removes it, but a killed run leaves it (47 hold and 6 copy folders in natedev /tmp, 2026-10-27).
-# A named pid that is no verify.sh run started before the folder ends the folder at once; an old name
-# with no pid waits out the 4 h rule.
+# If the named run ended, list the eligible folder for vetted manual removal.
+# A folder name without a PID uses the 4 h rule.
 def verify_temp_name() -> re.Pattern[str]:
     """Read the current prefixes for verify run folders."""
     return re.compile(
@@ -329,7 +322,7 @@ class Roots:
         lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
         scratch_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     ) -> Limit:
-        """How long entry must be idle to go, and how a change in it counts."""
+        """Return the idle limit and the time fields used to assess the entry."""
         if isinstance(lint_settings, UseConfiguredValue):
             lint_settings = conf.read("lint")
         if isinstance(scratch_settings, UseConfiguredValue):
