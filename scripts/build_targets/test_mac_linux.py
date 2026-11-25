@@ -2524,6 +2524,7 @@ import sys
 from threading import Event
 from unittest.mock import patch
 
+from scripts.build_targets import mac_linux
 from scripts.build_targets.test_mac_linux import MacLinuxRouteTests
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -2539,7 +2540,8 @@ def read_config(file):
 
 case = MacLinuxRouteTests('runTest')
 case.repo, case.guest_home = map(Path, sys.argv[1:])
-with patch.object(conf, 'read', read_config):
+with (patch.object(conf, 'read', read_config),
+      patch.object(mac_linux, 'SSH_CONNECT_TIMEOUT_SECONDS', 0)):
     case.check_folder_report_stream(timeout=TEST_HANG_GUARD_SECS)
     read_started.wait()
     print('The guest result returned and the config read is still blocked.', flush=True)
