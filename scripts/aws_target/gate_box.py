@@ -435,7 +435,8 @@ def restore_private_source(root: Path, links: Mapping[str, str], request: dict[s
         _ = git(repo, 'update-ref', 'refs/gate-source/base', base)
         if 'source_delta' in links:
             import_bundle('source_delta', 'refs/cloud-gates/*:refs/gate-source/delta/*')
-        _ = git(repo, 'update-ref', 'refs/remotes/origin/main', str(request['origin_main']))
+        origin_main = str(request['origin_main'])
+        _ = git(repo, 'update-ref', 'refs/remotes/origin/main', origin_main)
         if request.get('task') == 'paired':
             for variant in ('base', 'changed'):
                 revision = request[variant]
@@ -444,7 +445,13 @@ def restore_private_source(root: Path, links: Mapping[str, str], request: dict[s
                 identity = cast(dict[str, object], revision)
                 checkout = root / variant
                 commit = str(identity['commit'])
-                _ = git(repo, 'worktree', 'add', '--detach', str(checkout), commit)
+                checkout.mkdir()
+                _ = git(checkout, 'init', '-q')
+                # Share the verified objects for the life of the trial.
+                alternates = checkout / '.git/objects/info/alternates'
+                _ = alternates.write_text(str(repo.resolve() / '.git/objects') + '\n')
+                _ = git(checkout, 'update-ref', 'refs/remotes/origin/main', origin_main)
+                _ = git(checkout, 'checkout', '--detach', commit)
                 verify(checkout, commit, str(identity['tree']))
             return root / 'changed'
         _ = git(repo, 'checkout', '--detach', links['commit'])

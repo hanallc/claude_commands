@@ -90,6 +90,7 @@ SCENARIOS = {
         'test_stopped_instance_reports_a_confirmed_spot_interruption',
         'test_reconcile_closes_the_missing_box_in_a_batch',
         'test_delta_upload_failure_uses_the_other_region_and_an_uncertain_retry_keeps_its_pin',
+        'test_a_newer_regional_base_contains_the_entire_captured_source',
     ),
     'test_teardown.SourceBucketRemovalTests': (
         'test_down_retries_home_and_regional_stack_deletion_after_a_late_source_write',),

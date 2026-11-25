@@ -1003,6 +1003,10 @@ os.execv({git_path!r}, [{git_path!r}, *sys.argv[1:]])
         self.assertEqual(len(traces), 8)
         self.assertEqual(trial.checked_git(self.root / 'box/base', 'rev-parse', 'HEAD'), self.base)
         self.assertEqual(trial.checked_git(self.root / 'box/changed', 'rev-parse', 'HEAD'), self.changed)
+        for variant in ('base', 'changed'):
+            checkout = self.root / 'box' / variant
+            self.assertTrue((checkout / '.git/index').is_file())
+            self.assertEqual(trial.checked_git(checkout, 'rev-parse', 'refs/remotes/origin/main'), self.base)
 
     def test_private_guest_boot_error_names_the_missing_delta_and_http_status(self) -> None:
         reply, traces = self.guest(private=True, missing_delta=True)

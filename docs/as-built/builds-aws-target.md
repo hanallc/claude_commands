@@ -1068,6 +1068,7 @@ The private boot uses those paths and reports `GateToolsUnavailable` if tool pre
 
 Older deployment records and saved launches keep the public clone path.
 Private paired trials use bundles for both revisions and create no remote trial branches.
+The two checkouts share the verified Git objects and keep separate indexes.
 The cold proof run with GitHub access denied is pending.
 The repository visibility and `clone_url` remain as before.
 

@@ -748,6 +748,9 @@ class GatePlanTests(CostFixture):
         _ = conf.path('cloud_gate').write_text(f'''\
 regions={' '.join(self.regions)}
 instance_types=m7a.8xlarge
+packages=git
+# range: 0.01..300
+git_network_timeout_s=60
 credential_file={self.credentials_path}
 hana_gpu_instance_types={GATE_HANA_GPU_TYPE}
 hana_gpu_spot_max_usd_per_hour={json.dumps({GATE_HANA_GPU_TYPE: '0.5'})}
@@ -1182,6 +1185,7 @@ shared_usd_per_month=1
                     stack['StackId'] = self.stack_id(GATE_HOME)
                     outputs = {'GateBucket': GATE_BUCKET, 'GateLaunchTemplate': 'lt-fixture',
                                'GateLaunchVersion': str(images.version), 'GateSecurityGroup': 'sg-fixture',
+                               'GateSourceBucket': gate_source.bucket_name(DEPLOYMENT, GATE_HOME),
                                'GateRoleId': 'fixture-role', 'ScalerUserName': 'fixture-scaler'}
                     stack['Outputs'] = [{'OutputKey': key, 'OutputValue': value} for key, value in outputs.items()]
                     reply.stdout = json.dumps(body)
@@ -1192,6 +1196,9 @@ shared_usd_per_month=1
             with (mock.patch.object(subject.admin, 'get', return_value=credentials), redirect_stdout(StringIO())):
                 if command == 'gate-up':
                     with (mock.patch.object(aws_trial, 'host_nixpkgs_revision', return_value='fixture-revision'),
+                          mock.patch.object(gate_source, 'prepare_tools',
+                                            return_value=('/nix/store/' + 'a' * 32 + '-fixture',)),
+                          mock.patch.object(gate_source, 'refresh_bases', return_value=()),
                           mock.patch.object(deploy, 'gate_subnets', return_value=[{'id': 'subnet-fixture', 'zone': GATE_HOME + 'a'}]),
                           mock.patch.object(subject, '_fill_prices'),
                           mock.patch.object(subject, '_probe_gate_gpu', return_value=True)):
