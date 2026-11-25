@@ -298,11 +298,29 @@ sys.meta_path.insert(0, NoRepositoryModules())
                       result.stderr)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
-        with self.subTest(config="merge_gate.conf"):
-            _ = (self.unit / "config/gate.conf").rename(self.unit / "config/merge_gate.conf")
-            older = self.commit(self.unit, "use the old gate config path")
-            self.assertIn("cannot read live state: state_reader: stderr: stored rows need conversion; run its conversion",
-                          gate.live_state_refusal(self.unit, older))
+
+    def test_promotion_refuses_a_target_with_only_the_old_gate_config(self) -> None:
+        (self.unit / "config/gate.conf").unlink()
+        self.write(self.unit / "config/merge_gate.conf",
+                   "# text:\nlive_state_checks=state_reader\n# whole: 1..\nlive_state_check_seconds=60\n")
+        self.write(self.unit / "state_reader.py", "import sys\nsys.exit(0)\n")
+        self.checkpoint = self.commit(self.unit, "use only the old gate config path")
+        args = self.publish_for_promotion()
+        with mock.patch.dict(os.environ, self.environment):
+            with self.assertRaisesRegex(GateRefused, r"has only config/merge_gate\.conf"):
+                gate.promote(args)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertFalse(any(call["tool"] == "ssh" for call in self.calls()))
+
+    def test_promotion_allows_a_target_without_either_gate_config(self) -> None:
+        (self.unit / "config/gate.conf").unlink()
+        self.checkpoint = self.commit(self.unit, "remove gate config")
+        args = self.publish_for_promotion()
+        with mock.patch.dict(os.environ, self.environment), redirect_stdout(io.StringIO()):
+            gate.promote(args)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
 
     def test_promotion_runs_the_target_tree_state_check(self) -> None:
         self.write(self.unit / "config/gate.conf",

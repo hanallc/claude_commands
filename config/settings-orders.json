@@ -30,7 +30,7 @@
     "offload": 21,
     "probe_timeout_s": 26
   },
-  "merge_gate": {
+  "gate": {
     "GATE_TIME_LIMIT_FACTOR": 5
   },
   "send": {

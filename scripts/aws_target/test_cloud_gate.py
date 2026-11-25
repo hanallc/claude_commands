@@ -4296,11 +4296,17 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
         _ = runner.write_text(source.replace(mapping, '{}'))
         _ = gate.checked_git(self.repo, 'commit', '-qam', 'Write the old values without reading them')
         writes_only = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
+        _ = runner.write_text(source)
+        _ = runner.rename(runner.with_name('merge_gate.py'))
+        _ = gate.checked_git(self.repo, 'add', '.')
+        _ = gate.checked_git(self.repo, 'commit', '-qm', 'Define legacy modes in the removed entry point')
+        legacy_entry = gate.checked_git(self.repo, 'rev-parse', 'HEAD')
         for mode in gate.SuiteMode:
             with self.subTest(mode=mode):
                 self.assertTrue(cloud_gate.accepts_suite_mode(self.repo, head, mode))
                 self.assertFalse(cloud_gate.accepts_suite_mode(self.repo, new_only, mode))
                 self.assertFalse(cloud_gate.accepts_suite_mode(self.repo, writes_only, mode))
+                self.assertFalse(cloud_gate.accepts_suite_mode(self.repo, legacy_entry, mode))
                 self.assertIs(gate.SuiteMode(mode.wire), mode)
                 self.assertEqual(gate.SuiteMode.step(mode.wire), mode.value)
                 self.assertEqual(gate.SuiteMode.step(mode.value), mode.value)

@@ -163,10 +163,9 @@ subprocess.run = fail_log_put
         self.assertIs(aws_trial.GUEST, gate_box.GUEST)
         _ = compile(gate_box.GUEST, '<gate guest>', 'exec')
         self.assertNotIn('basedpyright', gate_box.GUEST)
-        # The embedded startup hook names merge_gate.py to recognize a gate parent; the guest itself never runs it.
         startup = repr(inspect.getsource(python_startup))
         self.assertIn(startup, gate_box.GUEST)
-        self.assertNotIn('merge_gate', gate_box.GUEST.replace(startup, ''))
+        self.assertNotIn('merge_gate', gate_box.GUEST)
         self.assertIn('gate_runner.SelectedModules', gate_box.CANDIDATE_GUEST)
         self.assertIn("'HEAD^{tree}'", gate_box.GUEST)
         self.assertIn("'update-ref', 'refs/remotes/origin/main', gate_request['origin_main']", gate_box.GUEST)

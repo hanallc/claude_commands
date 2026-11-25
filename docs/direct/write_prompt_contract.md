@@ -132,7 +132,7 @@ Codex review prompts also include section 3's command block.
     ```
 
     For a `claude_commands` unit, use the `copies.py run` command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
-    Run `merge_gate.py` for a merge. Require each worker's listed tests before its checkpoint.
+    Run `gate.py` for a merge. Require each worker's listed tests before its checkpoint.
 </WritePromptContract>
 
 <MergeWorkerCommands>

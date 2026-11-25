@@ -614,7 +614,7 @@ Follow `~/.claude/docs/style_production.md`, section Sync, for the Style showrun
   After delivery, `acknowledge_sync_wait` clears the wait by its token.
   If the message goes to the queue, the next merge sends a notice to the director's current roster address.
 
-**Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges.
+**Sync trigger.** `merge_checkpoint.notify_style` and `gate.notify_style` call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges.
 Both callers use a 30 s subprocess timeout and print one line on failure.
 When branch `b` has a style production, `send.py --timeout 10` sends `branch point <b> moved to <sha7>; sync.`
 The send uses the key `style-sync:<showrunner name>` and has a 35 s limit.

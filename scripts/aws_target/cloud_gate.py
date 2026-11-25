@@ -1719,7 +1719,7 @@ def accepts_suite_mode(repo: Path, commit: str, mode: gate.SuiteMode) -> bool:
 
     The commit must read the wire value that prepare sends, as a member value or in its _missing_ mapping.
     """
-    for path in ('scripts/production/gate_routes.py', 'scripts/production/gate.py', 'scripts/production/merge_gate.py'):
+    for path in ('scripts/production/gate_routes.py', 'scripts/production/gate.py'):
         source = subprocess.run(['git', 'show', f'{commit}:{path}'], cwd=repo,
                                 capture_output=True, text=True, check=False)
         if source.returncode:
