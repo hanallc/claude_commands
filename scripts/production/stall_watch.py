@@ -1123,7 +1123,7 @@ def tool_request(pending: PendingTool) -> str | None:
         return None
     verb, key = FILE_TOOLS[pending.name]
     path = arguments.get(key)
-    return f"{verb} {file_name(path)}" if isinstance(path, str) else None
+    return f"{verb} {' '.join(file_name(path).split())}" if isinstance(path, str) else None
 
 
 def bash_paragraphs(above: list[str]) -> list[list[str]] | None:

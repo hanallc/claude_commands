@@ -1167,12 +1167,6 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(len(error.getvalue().splitlines()), 1)
                     read.assert_not_called()
 
-    def test_review_watch_gets_a_reference_without_a_new_caller_argument(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "review_watch.acknowledge")
-        options = send.parse(["--to", "user", "--text-id", entry.id,
-                              *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))])
-        self.assertEqual(options.reference, {"kind": "review_watch"})
-
     def test_outcome_parser_preserves_first_header_payload_and_acknowledgement(self) -> None:
         acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
         self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")
@@ -7640,14 +7634,16 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_paid_credits_template_takes_its_sender_from_this_session_else_the_script_name(self) -> None:
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         # The session record wins over a name the caller gives.
         options = local_options(self.paid_credits_arguments("--value", "sender=quota_alert"))
-        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.summary, "codex2 now spends paid credits: 25,345 left")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=natedev", options.values)
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
-        self.assertTrue((options.text or "").startswith("codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT."))
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(options.text, "")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
@@ -7655,9 +7651,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=natedev", command)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
             script = local_options(self.paid_credits_arguments("--from", "quota_alert"))
-            self.assertEqual(script.summary, "quota_alert: codex2 now uses paid credits")
+            self.assertEqual(script.summary, "codex2 now spends paid credits: 25,345 left")
             self.assertEqual(local_options(self.paid_credits_arguments("--value", "sender=quota_alert")).summary,
-                             "quota_alert: codex2 now uses paid credits")
+                             "codex2 now spends paid credits: 25,345 left")
             with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = local_options(self.paid_credits_arguments())
             self.assertIn("needs a sender", errors.getvalue())
@@ -7668,12 +7664,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                      *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         options = local_options([*arguments, "--value", "sender=quota_alert"])
-        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.summary, "codex2 uses credits until move: 25,345 left")
         self.assertEqual(options.need, "decision")
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
-        self.assertTrue((options.text or "").endswith("Turn off: workers stop and wait for your queued move."))
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(options.text, "")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
@@ -7681,13 +7679,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=natedev", command)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
             self.assertEqual(local_options([*arguments, "--from", "quota_alert"]).summary,
-                             "quota_alert: codex2 now uses paid credits")
+                             "codex2 uses credits until move: 25,345 left")
             with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = local_options(arguments)
             self.assertIn("quota.paid_credits_queued needs a sender", errors.getvalue())
 
     def test_a_free_text_paid_credit_push_is_held_with_the_template_call(self) -> None:
         self.writer_session()
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         for title, text, action in (("codex2 now spends paid credits", "It refills Tue.", "Choose in natedev terminal."),
                                     ("Codex workers", "They spend credits now.", "Remove codex2 from codex_credit_accounts"),
                                     ("Codex workers", "They now use Paid-Credit time.", "Choose in natedev terminal.")):

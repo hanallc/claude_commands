@@ -441,7 +441,6 @@ Reports read local evidence without an AWS call or a coordination file.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
 Target status separates confirmed results from slots retained for cleanup.
-Slot counts apply to each repository. They do not describe one global capacity.
 
 Positive numeric settings use the readable lower bound `# range: 0.001..`.
 Zero-permitted settings retain `# range: 0..`. Whole-number settings retain their existing limits.
@@ -537,10 +536,10 @@ The runner reports `aws_interrupted=<generation>` after interruption. The sender
 Confirmed stopping, stopped, or terminated evidence releases only unchanged claims captured for that target and generation.
 A retained `.linux-run.json` marker includes boot identity. Recovery preserves new processes that reuse an earlier PID.
 
-The SSH, retry, storage, slot, hold and claim settings apply when each command reads this file.
+Commands read the SSH, retry, storage, hold and claim settings from this file.
 Block and claim settings use the same units as `mac_test.conf`.
 `build_budget_gib`, `target_budget_gib` and `free_floor_gib` use GiB.
-`slots.<repo>` and `target_budget_gib.<repo>` replace the corresponding target values for that repository.
+`target_budget_gib.<repo>` sets the storage budget for one repository.
 
 Configured SSH targets use `~/.local/state/build-targets/<target>/` for claims, locks, blocks and retry records.
 The Mac retains `~/.local/state/mac-test/` and its existing fixture overrides.
@@ -552,18 +551,14 @@ Repository claims use the normalized origin identity from memory admission.
 Local clones and linked worktrees use the source repository identity.
 The readable name remains the source directory name from `sweep.repo_name`.
 The origin name does not change legacy Mac mirror or claim paths.
-Linux targets allocate slots under the target lock.
-`slots` sets the repository capacity. `slots.<repo>` replaces that value for one repository.
-The Mac keeps one claim per repository name and preserves its mirror paths.
 Origins with the same repository name take turns on the Mac.
-The AWS values are two slots by default and four slots for `hana` and `cargo-liner`.
-Each Linux slot uses `.local/state/build-target/mirror/<encoded-origin>/<slot>` and its own `target` folder.
-The target state directory retains the last slot for each existing worktree.
-Each affinity write removes paths that no longer exist.
-An occupied slot remains unavailable until its claim ends.
-Takeover retries retain the cleanup requirement until the owner releases the claim.
+Each SSH target permits one claim per repository.
+Mac and mac-linux work share this limit.
+Linux runs use the first mirror and its `target` folder.
+Cleanup uses the saved mirror for each old numbered claim.
+Takeover retries require cleanup until the owner releases the claim.
 Another worktree of the same repository can take over a lost run.
-The configured platform selects the mirror layout and slot protocol.
+The configured platform selects the mirror layout.
 
 ## build_targets.conf
 
@@ -740,7 +735,7 @@ Files that the `/orphans` command should ignore when checking for unreferenced s
 
 ## Linux development shells
 
-Linux SSH targets use the admission repository name for `slots.<repo>`, `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
+Linux SSH targets use the admission repository name for `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
 The source directory name still selects the legacy Mac mirror and claim.
 `kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds on Linux targets.
 

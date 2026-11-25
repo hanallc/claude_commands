@@ -361,7 +361,7 @@ times=(1000 1059 1060 1120 1121 1122 1182 1183)
 values=(100 50 50 49 50 200 99 100)
 index=0
 date() { printf "%s\\n" "${times[index]}"; }
-sleep() {
+buildlog_wait_sample_tick() {
     printf "%s:%s\\n" "$(cat "$maximum_path")" "$(cat "$near_peak_path")"
     index=$((index + 1))
     (( index < ${#times[@]} )) || exit 0
@@ -403,7 +403,7 @@ mv() {
     fi
 }
 rm() { return 1; }
-sleep() {
+buildlog_wait_sample_tick() {
     printf '%s\n' "$(cat "$maximum_path")"
     index=$((index + 1))
     (( index < ${#values[@]} )) || exit 0
@@ -430,8 +430,9 @@ buildlog_sample_anon "$1" "$2" "$$"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             shell: subprocess.Popen[str] = subprocess.Popen(
-                ["bash", "-c", 'source "$1"; parent=$BASHPID; buildlog_sample_anon "$2" "$3" "$parent" & printf "%s\\n" "$!"; wait',
-                 "sampler-test", str(INVOKE), str(root / "scope.cgroup"), str(root / "maximum")],
+                ["bash", "-c", 'source "$1"; ' +
+                 'coproc { buildlog_sample_anon "$2" "$3" "$4"; } >/dev/null; printf "%s\\n" "$!"; wait',
+                 "sampler-test", str(INVOKE), str(root / "scope.cgroup"), str(root / "maximum"), str(os.getpid())],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                 env={**invoke_test_environment(),
                      "BUILD_HOLD_DIR": str(root / "holders"),

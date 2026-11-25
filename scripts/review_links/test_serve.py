@@ -5540,18 +5540,15 @@ class ReviewLinksServerTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_the_disks_measure_answers_at_once_with_the_measure_state_the_slots_and_the_sessions(self) -> None:
-        from scripts.disks import disks_page, sessions, slots
+    def test_the_disks_measure_returns_its_state_and_sessions(self) -> None:
+        from scripts.disks import disks_page, sessions
 
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
         start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 7)))
-        report: slots.SlotReport = {"root": "/build/slot", "machine": "natedev", "unused_days": 3, "groups": []}
-        _ = self.enterContext(patch.object(slots, "slot_report", return_value=report))
         folders: sessions.SessionReport = {"root": "/session", "sessions": []}
         _ = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
-        answer = (b'{"state": "started", "target": 7, "slots": {"root": "/build/slot", "machine": "natedev", "unused_days": 3, "groups": []}, '
-                  + b'"sessions": {"root": "/session", "sessions": []}}')
+        answer = b'{"state": "started", "target": 7, "sessions": {"root": "/session", "sessions": []}}'
         self.assertEqual(self.post("/disks/measure", ""), (200, answer))
         self.assertEqual(start.call_count, 1)
         start.assert_called_once_with(ANY, force=False)
@@ -5560,6 +5557,17 @@ class ReviewLinksServerTests(unittest.TestCase):
         start.reset_mock()
         self.assertEqual(self.post("/disks/measure", "force=1"), (200, answer))
         start.assert_called_once_with(ANY, force=True)
+
+    def test_the_disks_measure_returns_its_state_when_sessions_are_unavailable(self) -> None:
+        from scripts.disks import disks_page, sessions
+
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(disks_page, "output_folder", return_value=self.root / "disks"),
+              patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(
+                  disks_page.MeasureStart.STARTED, 7)),
+              patch.object(sessions, "session_report", side_effect=OSError("The sessions are unavailable."))):
+            status, response = self.post("/disks/measure", "")
+        self.assertEqual((status, response), (200, b'{"state": "started", "target": 7, "sessions": null}'))
 
     def test_review_records_signed_for_you_completion_once(self) -> None:
         case = self.review_fixture()

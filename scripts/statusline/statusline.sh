@@ -57,36 +57,33 @@ newline='
 tab='	'
 
 sources_match() {
-  rows=$1
-  shift
-  expected=
-  missing=0
-  implementation=
-  while IFS= read -r source; do
-    case $source in /*"$tab"*) ;; *) return 1 ;; esac
-    source_path=${source%%"$tab"*}
-    set -- "$@" "$source_path"
-    if [ "${source#*"$tab"}" = missing ]; then
-      [ ! -e "$source_path" ] && [ ! -L "$source_path" ] || return 1
-      missing=$((missing + 1))
-    else
-      expected=$expected$newline$source
-      [ "$source_path" != "$statusline/assignment.py" ] || implementation=1
-    fi
-  done
-  [ -z "$source" ] && [ -n "$implementation" ] && [ "$#" = "$rows" ] || return 1
-  observed=$(LC_ALL=C TZ=UTC0 stat -L --printf='%n\t%d:%i:%y:%z\n' -- "$@" 2>&1) || :
-  present=
-  while IFS= read -r source; do
-    case $source in
-      /*"$tab"*) present=$present$newline$source ;;
-      stat:\ cannot\ stat*": No such file or directory") missing=$((missing - 1)) ;;
-      *) return 1 ;;
-    esac
-  done <<EOF
-$observed
-EOF
-  [ "$missing" -eq 0 ] && [ "$present" = "$expected" ]
+  sources=$(cat && printf '.') || return 1
+  case $sources in *"$newline.") ;; *) return 1 ;; esac
+  sources=${sources%"$newline."}
+
+  expected=$(printf '%s\n' "$sources" | LC_ALL=C STATUSLINE_ASSIGNMENT="$statusline/assignment.py" \
+    STATUSLINE_SOURCE_ROWS="$1" awk -F "$tab" '
+    $0 !~ /^\// || NF < 2 { exit 1 }
+    NF != 2 || $2 != "missing" {
+      print
+      if ($1 == ENVIRON["STATUSLINE_ASSIGNMENT"]) implementation = 1
+    }
+    END { if ("x" NR != "x" ENVIRON["STATUSLINE_SOURCE_ROWS"] || !implementation) exit 1 }
+  ') || return 1
+  observed=$(printf '%s\n' "$expected" | cut -f1 |
+    LC_ALL=C TZ=UTC0 xargs -d '\n' stat -L --printf='%n\t%d:%i:%y:%z\n' -- 2>/dev/null) || return 1
+  [ "$observed" = "$expected" ] || return 1
+
+  missing_paths=$(printf '%s\n' "$sources" | LC_ALL=C awk -F "$tab" 'NF == 2 && $2 == "missing" { print $1 }') || return 1
+  [ -n "$missing_paths" ] || return 0
+  missing_count=$(printf '%s\n' "$missing_paths" | wc -l) || return 1
+  # Do not follow links when checking for absent paths.
+  observed=$(printf '%s\n' "$missing_paths" |
+    LC_ALL=C xargs -d '\n' stat --printf='present\n' -- 2>&1) && return 1
+  printf '%s\n' "$observed" | LC_ALL=C awk -v count="$missing_count" '
+    !/^stat: cannot stat.*: No such file or directory$/ { exit 1 }
+    END { if (NR != count) exit 1 }
+  '
 }
 
 render_fresh() {

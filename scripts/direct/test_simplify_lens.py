@@ -94,7 +94,7 @@ class DailySimplifyTests(NixFixture):
         registry = write_registry(self.root / "models.conf", base_text=conf.test_config_path("models").read_text())
         self.env.update({"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
                          "CODEX_CATALOG_SYNC_STATE_FILE": str(registry)})
-        self.env.update(private_slot_config(self.root, repository="origin").environment)
+        self.env.update(private_slot_config(self.root).environment)
         settings = Path(self.env["CONF_DIR"])
         _ = shutil.copytree(ROOT / "config/review", settings / "review", dirs_exist_ok=True)
         _ = write_config_fixture(settings / "direct.conf", "SIMPLIFY_LENS=on\nSIMPLIFY_FIRST_RUN_BEFORE=2026-11-05T22:50:00-05:00\n")

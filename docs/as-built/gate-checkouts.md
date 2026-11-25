@@ -363,10 +363,8 @@ The lsof scanner accepts output only with exit status 0 or 1.
 Every other status makes the scan unavailable.
 The Linux scanner reports unreadable working directories during its single process scan.
 
-`target_config.slot_capacity` reads the slot capacity for claims and offload admission.
-Both callers raise `ConfigError` for a bad configured value, including an empty value.
-The required `missing` policy applies only when both capacity keys are absent.
-Mac claims still use one slot.
+Each SSH target permits one claim per repository.
+The claim reader keeps the saved file for each old numbered claim until release.
 Offload records use `owning_session.owning_session()` before the shell session fallback.
 Busy refusals can therefore name the unit director's session.
 

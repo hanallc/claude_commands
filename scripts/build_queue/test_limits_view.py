@@ -899,7 +899,7 @@ class BuildLimitsTests(unittest.TestCase):
             "remote_host": transport.host, "submitting_session": "", "pid": 5, "proc_start": "start",
             "what": "check", "since": "", "repo_name": "hana", "repo_key": origin, "worktree": "",
             "instance_generation": generation}
-        claim = claim_state.HeldClaim(claim_state.RepositoryScope("hana", origin, 1), Path("claim"), record)
+        claim = claim_state.HeldClaim(claim_state.RepositoryScope("hana", origin), Path("claim"), record)
         controller = mock.Mock(spec=hana_box.HanaController, read_saved_lifecycle=mock.Mock(return_value=lifecycle))
         with (mock.patch.object(hana_placement, "controller_for", return_value=controller),
               mock.patch.object(claim_state, "state_paths"),

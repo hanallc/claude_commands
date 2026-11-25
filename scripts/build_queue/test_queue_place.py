@@ -1,13 +1,14 @@
 """A queued program owns one reservation from before launch through finalization."""
 from __future__ import annotations
 
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, cancellation
 
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import replace
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+import fcntl
 import functools
 import io
 import json
@@ -402,6 +403,24 @@ class QueuePlaceFixture(ExitStack):
 
 
 class QueuePlaceTests(unittest.TestCase):
+    def test_dead_queue_place_keeps_an_active_child_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            place = root / (build_folders.FOLDER_PREFIXES["queue-place"] + "123-456-test")
+            child = place / "child"
+            child.mkdir(parents=True)
+            with ((place / "child.lock").open("wb") as lock,
+                  mock.patch.object(build_folders, "inherited_temporary_parent", return_value=root),
+                  mock.patch.object(records, "process_start_time", return_value=None)):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                queue.cleanup_queue_place_folders(set())
+                self.assertTrue(child.is_dir())
+                self.assertTrue((place / "child.lock").is_file())
+            with (mock.patch.object(build_folders, "inherited_temporary_parent", return_value=root),
+                  mock.patch.object(records, "process_start_time", return_value=None)):
+                queue.cleanup_queue_place_folders(set())
+            self.assertFalse(place.exists())
+
     def test_wait_for_placement_uses_the_timer_after_queue_json_changes(self) -> None:
         from scripts.build_queue.test_placement import placement_request
 
@@ -1217,6 +1236,27 @@ with queue_place('rust-analyzer', Path(sys.argv[1])) as place:
             self.assertEqual(events, ["hold", "wait", "hold"])
             self.assertEqual(stdout.getvalue(), "")
             self.assertFalse(fixture.admission.server.waiters)
+
+    def test_cleanup_mask_is_restored_when_blocking_is_interrupted(self) -> None:
+        change_mask = signal.pthread_sigmask
+        previous = change_mask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        expected = previous | {signal.SIGUSR1}
+
+        def interrupted_block(how: int, numbers: Iterable[int]) -> set[int | signal.Signals]:
+            mask = set(numbers)
+            result = change_mask(how, mask)
+            if how == signal.SIG_BLOCK and signal.SIGINT in mask:
+                raise KeyboardInterrupt
+            return result
+
+        try:
+            with mock.patch.object(signal, "pthread_sigmask", side_effect=interrupted_block):
+                with self.assertRaises(KeyboardInterrupt):
+                    with cancellation.defer_cleanup_signals():
+                        self.fail("The block step must interrupt entry")
+            self.assertEqual(change_mask(signal.SIG_BLOCK, set()), expected)
+        finally:
+            _ = change_mask(signal.SIG_SETMASK, previous)
 
     def test_release_leaves_cancellation_signals_unblocked(self) -> None:
         def release(_reservation: str, _status: int, _timing: records.MemoryConfig | wire.CleanupTiming,

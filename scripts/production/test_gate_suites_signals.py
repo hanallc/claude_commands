@@ -467,6 +467,8 @@ sys.stdin.read(1)
         self.assertEqual(prefix, [f"--slice={scope.name}", "--"])
         self.assertEqual(json.loads(record.read_text())["scope"], str(scope))
         self.assertEqual(sidecar.with_name(build_folders.RECOVERY_MARKER).readlink(), record)
+        self.assertEqual(recovery.folders, [str(sidecar.parent)])
+        self.assertTrue(reservation.keep_folder)
 
     def test_cpu_wait_ends_at_the_gate_deadline_or_when_a_slot_arrives(self) -> None:
         self.configure_gate("program_stop_seconds=0.25\nprogram_sample_seconds=1")
@@ -635,6 +637,7 @@ sys.stdin.read(1)
             save(record)
 
         with mock.patch.dict(os.environ, self.environment, clear=True), lock.open("xb") as holder:
+            build_folder_lock.mark_lock(holder.fileno())
             directory = gate.gate_run_directory(self.checkout)
             recovery = gate.GateRecovery(directory / "dead.json", str(self.checkout),
                                          os.getpid(), "ended-owner", folders=[str(folder)])
@@ -828,7 +831,7 @@ gate.run_suites(Path.cwd(), full=True)
                                       else gate.private_gate_recovery(self.checkout, parent))
                     with (self.assertRaisesRegex(gate.GateRecoveryUnresolved, "UNRESOLVED: could not remove"),
                           recovery_scope as recovery,
-                          mock.patch.object(build_folders, "remove_build_folder", return_value=False) as remove,
+                          mock.patch.object(build_folders, "may_remove_build_path", return_value=False) as remove,
                           gate.gate_temporary(recovery, "merge-gate", parent) as folder):
                         self.assertTrue(folder.is_dir())
                     remove.assert_called_once()
@@ -890,6 +893,7 @@ gate.run_suites(Path.cwd(), full=True)
             def lock_before_allocation(job: gate.RunningGateJob, status: int) -> gate.GateJobResult:
                 lock = job.log.parent / "allocating.lock"
                 stream = holder.enter_context(lock.open("xb"))
+                build_folder_lock.mark_lock(stream.fileno())
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 locks.append(lock)
                 return finish(job, status)

@@ -1595,9 +1595,10 @@ class ReclamationTests(SweepCase):
         self.assertTrue(payload.samefile(retained))
         self.assertEqual(self.trim_rows(), [])
         rmdir = os.rmdir
+        root = folder.stat()
 
         def refuse_root(name: str, *, dir_fd: int | None = None) -> None:
-            if name == folder.name and dir_fd is not None:
+            if dir_fd is not None and os.path.samestat(root, os.stat(name, dir_fd=dir_fd, follow_symlinks=False)):
                 raise PermissionError("fixture refuses the final directory removal")
             rmdir(name, dir_fd=dir_fd)
 

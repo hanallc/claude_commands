@@ -113,7 +113,7 @@ class HanaRecordTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / 'assignment.json'
             local = placement.PlacementAssignment('episode', 'local-attempt',
-                placement.PlacementDestination('local', 'natedev', 'natedev', RepositoryScope('fixture', 'fixture-repo', 1), 1),
+                placement.PlacementDestination('local', 'natedev', 'natedev', RepositoryScope('fixture', 'fixture-repo'), 1),
                 execution_identity.SourceKeyKnown('edited-live-source'), placement.SubmittingOwner('natedev', 123, 'start'),
                 NoOwningSession(), 100.0)
             grant = wire.LocalPlacementGranted(local, wire.Admitted('reservation', 1, 'fixture', 'max', 'wave', {}))

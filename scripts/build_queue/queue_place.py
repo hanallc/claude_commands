@@ -260,7 +260,7 @@ def queue_place_folder(*, keep: Callable[[], bool] | None = None) -> Generator[P
 
 
 def remove_program_folder(path: Path) -> None:
-    if not build_folders.remove_build_folder(path, lambda: build_folders.remove_folder(path), wait=False):
+    if not build_folders.remove_build_folder(path, wait=False, repair_access=True):
         raise CleanupUnresolved(f"could not remove {path}")
 
 
@@ -419,6 +419,7 @@ class QueuePlace:
     reservation: HeldReservation | UnreservedProgram = field(default_factory=UnreservedProgram, kw_only=True)
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     keep_reservation: bool = field(default=False, init=False)
+    keep_folder: bool = field(default=False, init=False)
 
     def publish_sample(self, suffix: str, value: str) -> None:
         path = self.path.with_suffix(suffix)
@@ -779,7 +780,7 @@ class PlaceSetup:
             raise
         finally:
             place.finish(failed=failed)
-            self.keep_folder = place.keep_reservation
+            self.keep_folder = place.keep_reservation or place.keep_folder
             if isinstance(grant, HeldReservation):
                 grant.status = place.status
                 grant.keep = place.keep_reservation

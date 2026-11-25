@@ -150,7 +150,7 @@ class StandingTests(unittest.TestCase):
         temporary = self.base / "temporary"
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
-        slot_configuration = private_slot_config(self.base, repository="origin", maximum=2, default_maximum=2)
+        slot_configuration = private_slot_config(self.base)
         configuration = Path(slot_configuration.environment["CONF_DIR"])
         home = self.base / "home"
         home.mkdir()
@@ -1194,9 +1194,11 @@ with patch.object(subprocess, 'run', pause_clone):
 
         remove = scratch.remove
 
+        original = clone.stat()
+
         def check_retry(path: Path) -> None:
-            self.assertEqual(path, clone)
-            with busy.open("rb") as other, self.assertRaises(BlockingIOError):
+            self.assertTrue(os.path.samestat(path.stat(), original))
+            with (path / busy.relative_to(clone)).open("rb") as other, self.assertRaises(BlockingIOError):
                 fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
             with self.assertRaises(BlockingIOError):
                 _ = build_folders.create_build_folder(request)
@@ -1338,7 +1340,7 @@ with patch.object(subprocess, 'run', pause_clone):
         remove = scratch.remove
 
         def delete(folder: Path) -> None:
-            self.assertTrue(scratch.removal_mark(folder).exists())
+            self.assertTrue(scratch.removal_mark(checkout).exists())
             self.assert_clone_project_removed(checkout, paths)
             remove(folder)
 

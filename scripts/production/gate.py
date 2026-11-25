@@ -23,7 +23,8 @@ A green nightly sends a result push unless gate.conf disables it.
 A red nightly records its result and notifies sdlc.
 The nightly run sends type diagnostics to the units that changed the code.
 The user receives a push after the nightly run or after sdlc assigns the fix.
-A failure before the checks start sends the reason. Silence keeps the newest result.
+A failure before the checks start sends the reason and the next run time.
+Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
 the production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
@@ -88,7 +89,8 @@ from scripts.lib.build_steps import (
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
-    affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
+    affected_modules, change_review, land_runs, nightly_schedule, session_staff, showrunners, staff,
+    unit_config, unit_lookup, unit_names,
 )
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_routes import (
@@ -1044,7 +1046,7 @@ def check_gate_folder_leases(recovery: GateRecovery, leases: ExitStack) -> None:
                            for marker in gate_folder_markers(path))):
                 raise GateRecoveryUnresolved(f"gate recovery kept held folder {path}")
             refusal = build_folders._hold_child_leases(  # pyright: ignore[reportPrivateUsage]
-                path, leases, wait=False, separately_checked=paths)
+                path, parent, leases, wait=False, separately_checked=paths, own_recovery=True)
             if refusal is not None:
                 raise GateRecoveryUnresolved(f"gate recovery kept held leases or recovery records in {path}")
         except (OSError, ValueError) as error:
@@ -1146,11 +1148,10 @@ def recover_private_gate_runs(root: Path) -> None:
             recover_gate_record(path)
             if path.exists():
                 return False
-            shutil.rmtree(folder)
             return True
 
         try:
-            _ = build_folders.remove_build_folder(folder, recover_folder, wait=False)
+            _ = build_folders.remove_build_folder(folder, prepare=recover_folder, expected=status, wait=False)
         except (GateRecoveryIdentityUnreadable, OSError) as error:
             report_gate_recovery(folder, error)
 
@@ -1440,7 +1441,9 @@ def publish_gate_scope(recovery: GateRecovery, reservation: QueuePlace, prefix: 
     parts = unit.removesuffix(".slice").split("-")
     for length in range(2, len(parts) + 1):
         scope /= "-".join(parts[:length]) + ".slice"
+    reservation.keep_folder = True
     recovery.scope = str(scope)
+    recovery.folders.append(str(reservation.sidecar.parent))
     recovery.save()
     reservation.sidecar.with_name(build_folders.RECOVERY_MARKER).symlink_to(recovery.path.absolute())
     sync_folder(reservation.sidecar.parent)
@@ -1798,12 +1801,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         captured += f"\n{job.module}: a test attempted to read or write live configuration at {path or '(path unavailable)'}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
-    recovery = ACTIVE_GATE_RECOVERY.get()
-    if isinstance(recovery, GateRecovery) and str(job.log.parent) in recovery.folders:
-        job.folder_cleanup.close()
-    else:
-        build_folders.remove_folder(job.log.parent)
-        job.folder_cleanup.close()
+    job.folder_cleanup.close()
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
@@ -2620,8 +2618,17 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     config = admission_records.read_memory_config()
                     prove_scope_empty(Path(recovery.scope), time.monotonic() + config.program_stop_seconds,
                                       config.program_sample_seconds)
+                    assert reservation is not None
+                    folder = reservation.sidecar.parent
+                    marker = folder / build_folders.RECOVERY_MARKER
+                    if marker.readlink() != recovery.path.absolute():
+                        raise GateRecoveryUnresolved(f"the recovery marker changed in {folder}")
+                    marker.unlink()
+                    sync_folder(folder)
+                    recovery.folders.remove(str(folder))
                     recovery.scope = ""
                     recovery.save()
+                    reservation.keep_folder = False
             except BaseException:
                 recovery.unresolved = True
                 raise
@@ -3176,19 +3183,19 @@ def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> Non
     try:
         from scripts.message import send_budget
         from scripts.notify import push_texts, review
-        from scripts.notify.pushover import MESSAGE_MAX
+        from scripts.notify.pushover import phone_message_limit
         config = conf.read("gate")
         if config.text("nightly_result_push") == "off":
             return
-        values = {"branch": args.merge_branch, "time": datetime.now(user_zone()).strftime("%H:%M %Z")}
         if isinstance(result, Exception):
-            values["action"] = "None. The next nightly run tries again."
-            values["reason"] = ""
+            values = {"action": "", "reason": "", "next_run": nightly_schedule.nightly_next_run()}
             empty = push_texts.render("nightly.not_run", **values)
             reason = " ".join(str(result).split()).rstrip(".") or type(result).__name__
-            values["reason"] = reason[:max(0, MESSAGE_MAX - len(empty.message))].rstrip(".")
+            room = phone_message_limit(empty.sender, empty.id) - len(empty.message)
+            values["reason"] = reason[:max(0, room)].rstrip(" .")
             rendered = push_texts.render("nightly.not_run", **values)
         else:
+            values = {"branch": args.merge_branch, "time": datetime.now(user_zone()).strftime("%H:%M %Z")}
             values.update(nightly_check_values(result))
             rendered = push_texts.render("nightly.result", **values)
         sent = subprocess.run(push_texts.user_send_argv(rendered, key="nightly-result"),
