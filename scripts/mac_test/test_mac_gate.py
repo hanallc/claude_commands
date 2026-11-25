@@ -1,8 +1,8 @@
 """Exercise the Mac gate route and the module list with private fixtures."""
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import fcntl
 from dataclasses import replace
 from io import StringIO
@@ -25,7 +25,7 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
-from scripts.lib import scratch
+from scripts.lib import build_folders, scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
@@ -75,7 +75,11 @@ if case in ('attempt', 'commit', 'tree'):
 if case == 'modules':
     row['gate']['jobs'][0]['module'] = 'test_wrong.py'
 print('mac_gate_result=' + json.dumps(row))
-print('mac_exit=0')
+if case != 'cleanup-refused-before-exit':
+    print('mac_exit=0')
+if case in ('completed-cleanup-refused', 'cleanup-refused-before-exit'):
+    print(f'mac_gate_cleanup_error={folder.name}:The Mac kept its gate folder')
+    sys.exit(2)
 """
 
 
@@ -272,7 +276,8 @@ class MacGateTests(unittest.TestCase):
         path.parent.mkdir(exist_ok=True, parents=True)
         _ = path.write_text('# fixture\n')
 
-    def run_case(self, case: str, job: gate.GateJobResult) -> gate.GateRun | str:
+    @contextmanager
+    def queue_case(self, case: str, job: gate.GateJobResult) -> Generator[None]:
         command = self.root / 'queue.py'
         _ = command.write_text(FAKE_QUEUE)
         payload = self.root / 'gate.json'
@@ -281,6 +286,10 @@ class MacGateTests(unittest.TestCase):
         with (mock.patch.dict(os.environ, {'MAC_GATE_CASE': case, 'MAC_GATE_RESULT': str(payload)}),
               mock.patch.object(mac_gate, 'QUEUE_COMMAND', (sys.executable, str(command))),
               mock.patch.object(mac_gate, 'MAC_TIME_LIMIT_S', timeout)):
+            yield
+
+    def run_case(self, case: str, job: gate.GateJobResult) -> gate.GateRun | str:
+        with self.queue_case(case, job):
             selection = gate.TreeSelection((module_path(job),), self.tree)
             return mac_gate.route(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                   module_time_limit_s=30, selected=selection)
@@ -329,6 +338,30 @@ class MacGateTests(unittest.TestCase):
     def test_queue_cleanup_failure_preserves_the_last_nonblank_line(self) -> None:
         self.assertEqual(self.run_case('cleanup-refused', module_job('one')),
                          'The Mac kept its gate folder: mac queue: the Mac run may still be live')
+
+    def test_cleanup_refusal_preserves_the_completed_result(self) -> None:
+        job = replace(module_job('one', status=1), output='Ran 10 tests\nFAILED (failures=1)\n')
+        refusal = 'The Mac kept its gate folder'
+        with redirect_stderr(StringIO()) as route_errors:
+            result = self.run_case('completed-cleanup-refused', job)
+        assert isinstance(result, gate.GateRun), result
+        self.assertEqual(result.jobs, (job,))
+        self.assertFalse(result.passed)
+        self.assertIn(refusal, route_errors.getvalue())
+
+        output = self.root / 'result.json'
+        words = ['mac_gate.py', 'run', str(self.repo), str(output), '--module', module_path(job)]
+        with (self.queue_case('completed-cleanup-refused', job), mock.patch.object(sys, 'argv', words),
+              redirect_stderr(StringIO()) as cli_errors):
+            self.assertEqual(mac_gate.main(), 2)
+        row = cloud_gate.read(output)
+        self.assertEqual(row['cleanup_error'], refusal)
+        self.assertEqual(gate_box.decode_run(row['gate']).jobs, (job,))
+        self.assertIn(refusal, cli_errors.getvalue())
+
+    def test_cleanup_refusal_requires_the_guest_exit_before_accepting_a_result(self) -> None:
+        self.assertEqual(self.run_case('cleanup-refused-before-exit', module_job('one')),
+                         'The Mac kept its gate folder')
 
     def test_uploaded_entry_point_starts_with_the_installed_scripts(self) -> None:
         entry = self.root / 'uploaded/mac_gate.py'
@@ -538,6 +571,48 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                 mac_gate.stop_guest(journal, 0)
             self.assertTrue(child.is_dir())
             self.assertTrue((temporary / "child.lock").is_file())
+
+    def test_dead_guest_cleanup_releases_only_the_free_gate_folder_lease(self) -> None:
+        guest = self.sleeping_process()
+        guest.kill()
+        _ = guest.wait(timeout=TEST_HANG_GUARD_SECS)
+        temporary = self.root.resolve() / 'gate-temporary'
+        child = temporary / 'child'
+        child.mkdir(parents=True)
+        journal = self.root / 'run.json'
+        cloud_gate.save(journal, {'pid': guest.pid, 'start': 'past', 'groups': {}, 'folders': [str(temporary)]})
+        lease = build_folders.lease_path(temporary)
+        cloud_gate.save(lease, {'pid': guest.pid})
+        lock = temporary.with_suffix('.lock')
+        child_lock = child.with_suffix('.lock')
+        with child_lock.open('wb') as child_holder:
+            fcntl.flock(child_holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with lock.open('wb') as holder:
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(GateRefused, 'kept its gate folder'):
+                    mac_gate.stop_guest(journal, 0)
+                self.assertTrue(lock.is_file())
+                self.assertEqual(cloud_gate.read(lease)['pid'], guest.pid)
+            with self.assertRaisesRegex(GateRefused, 'kept its gate folder'):
+                mac_gate.stop_guest(journal, 0)
+        self.assertTrue(child.is_dir())
+        self.assertTrue(child_lock.is_file())
+        self.assertTrue(journal.is_file())
+        self.assertFalse(lock.exists())
+        self.assertFalse(lease.exists())
+
+    def test_retained_gate_folder_keeps_unverified_leases(self) -> None:
+        path = self.root.resolve() / 'gate-temporary'
+        path.mkdir()
+        lock = path.with_suffix('.lock')
+        lock.touch()
+        lease = build_folders.lease_path(path)
+        for pid in (os.getpid(), os.getpid() + 1, 'unknown'):
+            with self.subTest(pid=pid):
+                cloud_gate.save(lease, {'pid': pid})
+                mac_gate.release_gate_folder_lease(path, path.lstat(), os.getpid())
+                self.assertEqual(cloud_gate.read(lease), {'pid': pid})
+                self.assertTrue(lock.exists())
 
     def test_dead_guest_cleanup_requires_group_identity(self) -> None:
         root = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'

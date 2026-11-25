@@ -15,6 +15,7 @@ from pathlib import Path
 import select
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,7 +32,7 @@ from scripts.buildlog import store
 from scripts.copies import copies
 from scripts.lib import build_folders, conf, copy_record, process_group, scratch
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
+from scripts.lib.process_start import Gone, Started, Unreadable, Zombie, process_start
 from scripts.production import gate
 from scripts.production.affected_modules import GraphError
 from scripts.production.gate_modules import GateRefused, discover_test_modules
@@ -59,6 +60,7 @@ class CheckoutCleanup(StrEnum):
 class MacGateResult:
     row: dict[str, object]
     run: gate.GateRun
+    cleanup_error: str = ''
 
 
 @dataclass(frozen=True)
@@ -140,6 +142,44 @@ def stop_inline_checkout(repo: Path) -> None:
         raise GateRefused('Test processes still use the Mac checkout')
 
 
+def release_gate_folder_lease(path: Path, retained: os.stat_result, owner_pid: int) -> None:
+    """Release the dead guest's lease while the original folder stays in place."""
+    if not path.is_absolute() or not stat.S_ISDIR(retained.st_mode) or owner_pid <= 1:
+        return
+    with suppress(OSError, ValueError), build_folders.folder_removal_lease(path, wait=False) as lease:
+        if not isinstance(lease, build_folders.HeldFolderRemovalLease) or lease.folder != path:
+            return
+        lease_name = build_folders.lease_path(path).name
+        lock_name = path.name + '.lock'
+        sidecars = lease.sidecar_identities()
+        if lock_name not in sidecars:
+            return
+        try:
+            descriptor = os.open(lease_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=lease.directory)
+        except FileNotFoundError:
+            if lease_name in sidecars:
+                return
+        else:
+            with os.fdopen(descriptor, encoding='utf-8') as record:
+                info = os.fstat(record.fileno())
+                if (info.st_dev, info.st_ino, info.st_ctime_ns) != sidecars.get(lease_name):
+                    return
+                pid = ledger.mapping(cast(object, json.load(record))).get('pid')
+                if type(pid) is not int or pid != owner_pid:
+                    return
+        if not isinstance(process_start(owner_pid), (Gone, Zombie)):
+            return
+        for name in (lease_name, lock_name):
+            if (path.parent.resolve() != path.parent
+                    or not os.path.samestat(path.parent.stat(), os.fstat(lease.directory))
+                    or not os.path.samestat(retained, os.stat(path.name, dir_fd=lease.directory, follow_symlinks=False))
+                    or lease.sidecar_identities() != sidecars):
+                return
+            if name in sidecars:
+                os.unlink(name, dir_fd=lease.directory)
+                del sidecars[name]
+
+
 def stop_guest(journal: Path, deadline: float, *, task_ended: bool = False) -> None:
     """Recover the guest's recorded resources or check the groups after task cleanup."""
     try:
@@ -176,10 +216,17 @@ def stop_guest(journal: Path, deadline: float, *, task_ended: bool = False) -> N
     folders = record['folders']
     if not isinstance(folders, list):
         raise GateRefused('The Mac gate journal has no folder list')
+    owner_pid = ledger.instant(record, 'pid')
     for name in cast(list[str], folders):
         path = Path(name)
+        try:
+            retained = path.lstat()
+        except FileNotFoundError:
+            retained = None
         with suppress(FileNotFoundError):
-            if not build_folders.remove_build_folder(path, wait=False):
+            if not build_folders.remove_build_folder(path, wait=False, expected=retained):
+                if retained is not None:
+                    release_gate_folder_lease(path, retained, owner_pid)
                 raise GateRefused(f'The Mac kept its gate folder {path}')
 
 
@@ -527,25 +574,33 @@ def run_remote(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limi
             was_cancelled = bool(cancelled.poll(0))
             status = process.returncode
             assert status is not None
-            if status or was_cancelled:
+            cleanup_error = queue_cleanup_error(lines, folder)
+            if was_cancelled or (status and not (cleanup_error and 'mac_exit=0' in lines)):
                 return queue_failure(lines, folder, status, cancelled=was_cancelled)
             results = [line.removeprefix(RESULT_PREFIX) for line in lines if line.startswith(RESULT_PREFIX)]
             if len(results) != 1:
+                if status:
+                    return queue_failure(lines, folder, status, cancelled=False)
                 return 'The Mac returned no unique gate result'
             row = ledger.mapping(cast(object, json.loads(results[0])))
             run = cloud_gate.decode_requested_run(row, request)
             cloud_gate.validate_run_modules(run, request)
-            return MacGateResult(row, run)
+            return MacGateResult(row, run, cleanup_error)
     except subprocess.TimeoutExpired:
         return f'The Mac queue call exceeded {MAC_TIME_LIMIT_S:g} seconds'
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError, copies.CopyError, scratch.ScratchError) as error:
         return f'The Mac gate could not finish: {error}'
 
 
-def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: bool) -> str:
+def queue_cleanup_error(lines: list[str], folder: Path) -> str:
     prefix = f'{CLEANUP_ERROR_PREFIX}{folder.name}:'
-    cleanup = next((line.removeprefix(prefix).strip() for line in reversed(lines) if line.startswith(prefix)), '')
+    return next((line.removeprefix(prefix).strip() for line in reversed(lines) if line.startswith(prefix)), '')
+
+
+def queue_failure(lines: list[str], folder: Path, status: int, *, cancelled: bool) -> str:
+    cleanup = queue_cleanup_error(lines, folder)
     reason = cleanup or ('The Mac gate was cancelled' if cancelled else f'The Mac queue call ended with status {status}')
+    prefix = f'{CLEANUP_ERROR_PREFIX}{folder.name}:'
     detail = next((line.strip().removeprefix(prefix).strip() for line in reversed(lines) if line.strip()), '')
     return f'{reason}: {detail}' if detail and detail != reason and not detail.startswith(RESULT_PREFIX) else reason
 
@@ -556,7 +611,11 @@ def route(repo: Path, *, mode: gate.SuiteMode, full: bool, module_time_limit_s: 
     """Return the observed module results or a reason to run them on natedev."""
     outcome = run_remote(repo, mode=mode, full=full, module_time_limit_s=module_time_limit_s,
                          selected=selected, cancellation=cancellation)
-    return outcome if isinstance(outcome, str) else outcome.run
+    if isinstance(outcome, str):
+        return outcome
+    if outcome.cleanup_error:
+        print(f'Mac gate: {outcome.cleanup_error}', file=sys.stderr, flush=True)
+    return outcome.run
 
 
 @dataclass(frozen=True)
@@ -682,7 +741,10 @@ def main() -> int:
                                 cancellation=USE_CALLER_PROCESS_LIFETIME)
             if isinstance(result, str):
                 raise GateRefused(result)
-            cloud_gate.save(args.output, result.row)
+            cleanup = {'cleanup_error': result.cleanup_error} if result.cleanup_error else {}
+            cloud_gate.save(args.output, result.row | cleanup)
+            if result.cleanup_error:
+                raise GateRefused(result.cleanup_error)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, GateRefused, GraphError, copies.CopyError, scratch.ScratchError) as error:
         print(f'Mac gate: {error}', file=sys.stderr)
         return 2
