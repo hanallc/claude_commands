@@ -30,6 +30,7 @@ from scripts.aws_target.aws_cli import AwsCli as AwsCli, AwsExecutor as AwsExecu
 from scripts.aws_target.config import AwsOff, AwsOn, aws_switch, read_settings
 from scripts.aws_target.controller_lock import control_lock as control_lock
 from scripts.build_targets.target_config import ssh_target_state_directory
+from scripts.for_you.action import ActionStore, ActionStoreError
 from scripts.lib import conf
 from scripts.message import send_budget, send_result
 from scripts.message.session_send import send_argv
@@ -50,6 +51,8 @@ SNAPSHOT_DUMP_LINE = re.compile(
     r'(?i)^(?:(?:request|response|headers?)\b|'
     + r'(?:[a-z0-9]+(?:-[a-z0-9]+)+|authorization|host|date|connection|cookie)\s*:|[{\[<])')
 HOURS_GAP_RECIPIENT = 'staff:a898cb38-dbac-4751-b72b-d0b14ab9c38d'
+PRICE_READ_REQUESTER = 'aws-unit'
+PRICE_READ_ACTION_KEY = 'aws-price-read'
 
 
 def machine_settings() -> tuple[conf.ConfigRead, conf.ConfigRead]:
@@ -136,6 +139,36 @@ def snapshot_failure_push(failures: Sequence[SnapshotFailure]) -> push_texts.Ren
     for failure in failures:
         lines.append(f'AWS refused the {failure.region} {failure.read} read.')
     return push_texts.render('aws.snapshot_failed', failures='\n'.join(lines))
+
+
+def update_price_read_action(failures: Sequence[SnapshotFailure], now: int) -> int:
+    """File the action for a permission refusal or withdraw it after recovery."""
+    try:
+        actions = ActionStore()
+        if failures:
+            regions = ', '.join(failure.region for failure in failures)
+            _ = actions.add(
+                title='Allow AWS price reads',
+                command='~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources',
+                machine='natedev', cwd='/home/natepiano', requested_by=PRICE_READ_REQUESTER,
+                reason=f'AWS refused the price read in {regions}. '
+                       + 'After 2 hours without the read, test runs on AWS try that region last. '
+                       + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.',
+                waits=f'Test runs on AWS in {regions}', concerns='aws', dedupe_key=PRICE_READ_ACTION_KEY,
+            )
+        else:
+            for record in actions.list():
+                if (record.status == 'open' and record.requested_by == PRICE_READ_REQUESTER
+                        and record.dedupe_key == PRICE_READ_ACTION_KEY):
+                    stamp = datetime.fromtimestamp(now, UTC).isoformat()
+                    _ = actions.withdraw(record.key, requested_by=PRICE_READ_REQUESTER,
+                                         reason=f'The hourly read succeeded at {stamp}.')
+                    break
+    except (ActionStoreError, OSError) as error:
+        detail = ' '.join(str(error).split())
+        print(f'aws_target: cannot update the AWS price read action: {detail}', file=sys.stderr)
+        return 1
+    return 0
 
 
 def gpu_price_sizes(values: conf.ConfigRead) -> tuple[str, ...]:
@@ -522,11 +555,14 @@ def snapshot(settings_path: Path, directory: Path, *, execute: AwsExecutor = exe
             # Save the claim before delivery because note keys alone do not suppress repeats.
             output['failure_streak'] = {'since': streak.since, 'notice_claimed': True}
             write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
+            status |= update_price_read_action(access_failures, now)
             if not notify(f'aws-spot-snapshot:{streak.since}', snapshot_failure_push(access_failures),
                           configuration.number('snapshot_notification_timeout_s')):
                 output['failure_streak'] = {'since': streak.since, 'notice_claimed': False}
                 write_text_atomic(directory / 'spot-prices.json', json.dumps(output, sort_keys=True) + '\n')
                 print('aws_target: snapshot user notice remains pending', file=sys.stderr)
+        elif not access_failures:
+            status |= update_price_read_action((), now)
         # The stamp is the last scheduled read. A forced read leaves it, so the next hourly read still runs.
         if not force:
             _ = lock.seek(0)

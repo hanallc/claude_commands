@@ -25,6 +25,7 @@ from scripts.aws_target import plan_identity, quota_requests
 from scripts.aws_target.control_test_support import TestClock
 from scripts.aws_target.ledger_test_support import CostFixture, git_only, text_setting
 from scripts.buildlog import aws_report
+from scripts.for_you import action
 from scripts.lib import atomic_file, conf
 from scripts.message import send_budget
 from scripts.notify import push_texts
@@ -88,6 +89,7 @@ region_transfer_usd={"us-west-1":0.00015}
             'AWS_SESSION_TOKEN': 'fixture-token', 'AWS_CONFIG_FILE': '/fixture/admin-config',
             'AWS_PROFILE': 'fixture-admin', 'AWS_DEFAULT_PROFILE': 'fixture-admin',
             'AWS_SHARED_CREDENTIALS_FILE': str(self.root / 'private-scaler'),
+            'FOR_YOU_ACTIONS_DIR': str(self.root / 'actions'),
         }))
         _ = self.enterContext(mock.patch.object(plan_identity, 'plan_credentials',
                                                 side_effect=plan_identity.PlanIdentityRefused('The AWS plan key is missing.')))
@@ -949,6 +951,70 @@ region_transfer_usd={"us-west-1":0.00015}
             self.assertEqual(self.snapshot(), 1)
         self.assertEqual(len(self.notices), 2)
         self.assertNotEqual(self.notices[-1][0], key)
+
+    def test_permission_refusal_files_one_price_read_action(self) -> None:
+        self.configure_gate('spot_candidate_regions=us-west-1 us-east-1 us-west-1\n')
+        self.failure = 'all'
+        self.notice_accepted = False
+        actions = action.ActionStore()
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        opened, = actions.list()
+        self.assertEqual(opened.title, 'Allow AWS price reads')
+        self.assertEqual(opened.command,
+                         '~/.claude/scripts/lib/py ~/.claude/scripts/aws_target/deploy.py up --approve-resources')
+        self.assertEqual((opened.machine, opened.cwd), ('natedev', '/home/natepiano'))
+        self.assertEqual((opened.status, opened.requested_by, opened.concerns, opened.dedupe_key),
+                         ('open', 'aws-unit', 'aws', 'aws-price-read'))
+        self.assertEqual(opened.reason, 'AWS refused the price read in us-west-1, us-east-1. '
+                         + 'After 2 hours without the read, test runs on AWS try that region last. '
+                         + 'The command allows the read, costs nothing, and asks for your AWS admin passphrase.')
+        self.assertEqual(opened.waits, 'Test runs on AWS in us-west-1, us-east-1')
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.notice_accepted = True
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(actions.list(), (opened,))
+        self.assertEqual(len(self.notices), 2)
+
+    def test_clean_read_withdraws_the_price_read_action(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.snapshot(), 1)
+        actions = action.ActionStore()
+        opened, = actions.list()
+        unrelated = actions.add(title='Other action', command='true', machine='natedev', cwd='/fixture',
+                                requested_by='other-unit', reason='Fixture.', waits='Fixture',
+                                concerns='aws', dedupe_key=opened.dedupe_key)
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.failure = ''
+        self.assertEqual(self.snapshot(), 0)
+        withdrawn = actions.get(opened.key)
+        stamp = datetime.fromtimestamp(self.clock.now, UTC).isoformat()
+        self.assertEqual((withdrawn.status, withdrawn.withdraw_reason),
+                         ('withdrawn', f'The hourly read succeeded at {stamp}.'))
+        self.assertEqual(actions.get(unrelated.key), unrelated)
+        self.assertEqual(len(self.notices), 1)
+
+    def test_action_store_errors_keep_the_snapshot_and_push(self) -> None:
+        self.failure = 'describe-spot-price-history'
+        with (mock.patch.object(action.ActionStore, 'add', side_effect=action.ActionStoreError('fixture\nadd failure')),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(aws_target.snapshot(self.settings, self.state, execute=self.execute, clock=self.clock,
+                                                 notify=self.notify, allow_aws_unavailable=True), 1)
+        self.assertEqual([line for line in errors.getvalue().splitlines() if 'action:' in line],
+                         ['aws_target: cannot update the AWS price read action: fixture add failure'])
+        self.assertTrue(aws_target.snapshot_failures(aws_target.read_snapshot(self.state)))
+        self.assertEqual(len(self.notices), 1)
+        self.clock.advance(conf.read(self.settings).whole('price_refresh_seconds'))
+        self.failure = ''
+        with (mock.patch.object(action.ActionStore, 'list', side_effect=OSError('fixture list failure')),
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(self.snapshot(), 1)
+        self.assertEqual(errors.getvalue().splitlines(),
+                         ['aws_target: cannot update the AWS price read action: fixture list failure'])
+        self.assertEqual(aws_target.snapshot_failures(aws_target.read_snapshot(self.state)), ())
+        self.assertEqual(len(self.notices), 1)
 
     def test_crash_after_notice_delivery_does_not_repeat_the_streak_notice(self) -> None:
         self.failure = 'describe-spot-price-history'
