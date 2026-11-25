@@ -490,18 +490,6 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(len(ssh), 1)
         self.assertEqual(ssh[0]["args"][-2], "previous-mac")
 
-    def test_signal_during_linux_takeover_checks_reply_host_and_releases_claim_when_check_is_clean(self) -> None:
-        self.assert_linux_takeover_signal_checks_reply_host("clean")
-
-    def test_signal_during_linux_takeover_checks_reply_host_and_keeps_claim_when_leftovers_remain(self) -> None:
-        self.assert_linux_takeover_signal_checks_reply_host("remaining")
-
-    def test_signal_during_linux_takeover_checks_reply_host_and_keeps_claim_when_check_fails(self) -> None:
-        self.assert_linux_takeover_signal_checks_reply_host("ssh_error")
-
-    def test_signal_during_linux_takeover_with_no_reply_host_keeps_claim_without_ssh(self) -> None:
-        self.assert_linux_takeover_signal_checks_reply_host("clean", reply_host="")
-
     def test_signal_during_takeover_with_no_reply_host_keeps_claim_without_ssh(self) -> None:
         self.assert_takeover_signal_keeps_claim_for_leased_cleanup("")
 

@@ -1744,20 +1744,24 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         self.assertEqual(controller.attempt_evidence.repository_key, key)
         self.assertEqual(claim_state.read_run(held.path), held.record)
 
-    def test_plain_ssh_linux_command_sends_the_source_repository_key(self) -> None:
-        self.add_linux_target()
+    def test_mac_command_sends_the_source_repository_key(self) -> None:
+        with (self.root / "mac_test.conf").open("a") as settings:
+            _ = settings.write("mirror_root=~/.local/state/mac-test/mirror\n")
         origin = "https://github.com/Team/Hana"
-        source = self.repository("hana", origin=origin + ".git")
+        source = self.checkout
+        _ = subprocess.run(["git", "-C", str(source), "remote", "set-url", "origin", origin + ".git"], check=True)
         main_identity = eligibility.repository_identity(source)
         assert isinstance(main_identity, eligibility.KnownRepository)
         self.assertEqual(main_identity.key, origin)
         request = offload.OffloadRequest(source, "", "check", offload.NO_RESULT_FILE, (), "verify", "",
-                                         target="linux", verb="check")
+                                         target="mac", verb="check")
         controller = offload.ProcessController()
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_STATE_DIR": str(self.root / "target-state")}):
-            words = self.offload_history_command(controller, request)
-        self.assertEqual(words.count("--repo-identity"), 1)
-        self.assertEqual(words[words.index("--repo-identity") + 1], main_identity.key)
+        mirror = claim_state.mac_repository_identity(str(source))
+        assert isinstance(mirror, claim_state.ResolvedMacMirror), mirror
+        controller.mac_repository = mirror.claim_repository()
+        words = self.offload_history_command(controller, request)
+        fields = [word for word in words if word.startswith("BUILDLOG_REPO_IDENTITY=")]
+        self.assertEqual(fields, [f"BUILDLOG_REPO_IDENTITY={main_identity.key}"])
         self.assertEqual(controller.attempt_evidence.repository_key, main_identity.key)
 
     def offload_history_command(self, controller: offload.ProcessController,

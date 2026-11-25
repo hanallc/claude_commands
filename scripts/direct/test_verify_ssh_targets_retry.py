@@ -45,13 +45,7 @@ class VerifySshRetryTests(VerifySshTargetsFixture):
         self.assertEqual(self.local_runs(), [])
 
     def test_named_mac_retry_reserves_its_target_while_the_default_mac_has_backoff(self) -> None:
-        self.configure("natedev,mac,mac2")
-        self.enable_mac()
-        registry = self.root / "build_targets.conf"
-        _ = registry.write_text(registry.read_text()
-                                + "kind.mac2=ssh\nplatform.mac2=macos\nsettings.mac2=mac2.conf\n")
-        _ = write_config_fixture(self.root / "mac2.conf", (self.root / "mac_test.conf").read_text(),
-                                 template="mac_test")
+        self.configure_two_macs("natedev,mac,mac2")
         state = Path(self.environment["MAC_TEST_STATE_DIR"])
         state.mkdir(parents=True, exist_ok=True)
         _ = (state / "unreachable_until").write_text(str(10**12))
@@ -77,11 +71,19 @@ class VerifySshRetryTests(VerifySshTargetsFixture):
         self.assertEqual((attempt["outcome"], attempt["completion"]), ("no_tests", "confirmed"))
 
     def test_permanent_mac_refusal_keeps_other_ssh_retry_candidates(self) -> None:
-        self.configure("mac,natedev,linux")
-        self.enable_mac()
+        self.configure_two_macs("mac,natedev,mac2")
         self.release_memory_after_hook()
         result = self.verify("test", "sample", "--no-cache", extra={"TEST_SSH_MODES": '{"mac":"no-tests"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([event["target"] for event in self.ssh_events()], ["mac", "linux"])
+        self.assertEqual([event["target"] for event in self.ssh_events()], ["mac", "mac2"])
         self.assertEqual(self.local_runs(), [])
-        self.assertEqual(self.routing_record()["target"], "linux")
+        self.assertEqual(self.routing_record()["target"], "mac2")
+
+    def configure_two_macs(self, order: str) -> None:
+        self.configure(order)
+        self.enable_mac()
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text()
+                                + "kind.mac2=ssh\nplatform.mac2=macos\nsettings.mac2=mac2.conf\n")
+        _ = write_config_fixture(self.root / "mac2.conf", (self.root / "mac_test.conf").read_text(),
+                                 template="mac_test")

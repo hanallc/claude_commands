@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 from typing import cast, override
+from unittest import mock
 
 from scripts.lib.helper_tree_test_support import verify_test_environment
+from scripts.aws_target.hana_placement import HanaControlTransport
+from scripts.build_queue import admission_client, admission_protocol as wire, placement
+from scripts.build_queue.admission_test_support import caller_admission, caller_provider_controls
 from scripts.build_targets import build_targets, targets
+from scripts.mac_test import eligibility, offload
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.direct.verify_step_routes_test_support import VerifyStepRoutesFixture
 from scripts.direct.verify_mac_offload_test_support import (
@@ -120,39 +126,25 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         return [cast(list[str], json.loads(line))
                 for line in (self.runner_state / "received-arguments").read_text().splitlines()]
 
-    def test_check_uses_the_first_eligible_linux_target(self) -> None:
-        self.configure("linux,natedev")
+    def test_check_uses_the_first_eligible_mac_target(self) -> None:
+        self.configure("mac,natedev")
+        self.enable_mac()
         result = self.verify("check", "sample", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([event["target"] for event in self.ssh_events()], ["linux"])
+        self.assertEqual([event["target"] for event in self.ssh_events()], ["mac"])
         self.assertIn("run", self.ssh_events()[0]["actions"])
         words, = self.received_arguments()
         self.assertEqual(words[words.index("--verb") + 1], "check")
         self.assertEqual(words[words.index("--kind") + 1], "check")
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["check"]], [])
 
-    def test_example_uses_linux_when_its_private_settings_permit_examples(self) -> None:
-        self.configure("linux,natedev")
-        settings = self.root / "linux_target.conf"
-        _ = settings.write_text(settings.read_text().replace("kinds=test,check,doc", "kinds=test,check,doc,example"))
-        reader = Path(self.environment["LINT_CONFIG_READER"])
-        _ = reader.write_text(reader.read_text() + '\nlint_config_enabled() { [[ "$1" == clippy ]]; }\n')
-        result = self.verify("example", "sample")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([event["target"] for event in self.ssh_events()], ["linux"])
-        self.assertIn("run", self.ssh_events()[0]["actions"])
-        words, = self.received_arguments()
-        self.assertEqual(words[words.index("--verb") + 1], "clippy")
-        self.assertEqual(words[words.index("--kind") + 1], "example")
-        self.assertIn("--examples", words[words.index("--") + 1:])
-        self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["clippy"]], [])
-
     def test_pinned_final_sends_both_steps_to_the_target_without_a_saved_pass(self) -> None:
-        self.configure("linux,natedev")
+        self.configure("mac,natedev")
+        self.enable_mac()
         git = self.bin_directory / "git"
         _ = git.write_text(git.read_text().replace("wanted=ls-files", "wanted=HEAD\n"
             + "if has \"$@\"; then printf 'fixture-commit\\n'; exit 0; fi\nwanted=ls-files"))
-        result = self.verify("final", "sample", "--target", "linux")
+        result = self.verify("final", "sample", "--target", "mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         arguments = self.received_arguments()
         self.assertEqual(len(arguments), 2)
@@ -167,28 +159,26 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.assertEqual(list((state / "final_pass").glob("*.json")), [])
 
     def test_pinned_build_reports_the_remote_binary(self) -> None:
-        self.configure("linux,natedev")
-        settings = self.root / "linux_target.conf"
-        _ = settings.write_text(settings.read_text().replace("kinds=test,check,doc", "kinds=test,check,doc,build"))
+        self.configure("mac,natedev")
+        self.enable_mac()
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
         metadata["target_directory"] = str(self.root / "target")
         packages = cast(list[dict[str, object]], metadata["packages"])
         targets = cast(list[dict[str, object]], packages[0]["targets"])
         targets.append({"name": "sample-cli", "kind": ["bin"], "src_path": str(self.root / "src/main.rs")})
         self.environment["TEST_METADATA"] = json.dumps(metadata)
-        result = self.verify("build", "sample", "--target", "linux", "--attached")
+        result = self.verify("build", "sample", "--target", "mac", "--attached")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual([event["target"] for event in self.ssh_events()], ["linux"])
+        self.assertEqual([event["target"] for event in self.ssh_events()], ["mac"])
         words, = self.received_arguments()
         self.assertEqual(words[words.index("--verb") + 1], "build")
         self.assertEqual(words[words.index("--kind") + 1], "build")
-        self.assertIn("binary: linux:target/debug/sample-cli", result.stdout)
+        self.assertIn("binary: mac:target/debug/sample-cli", result.stdout)
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["build"]], [])
 
     def test_pinned_build_uses_the_runner_target_directory(self) -> None:
-        self.configure("linux,natedev")
-        settings = self.root / "linux_target.conf"
-        _ = settings.write_text(settings.read_text().replace("kinds=test,check,doc", "kinds=test,check,doc,build"))
+        self.configure("mac,natedev")
+        self.enable_mac()
         metadata = cast(dict[str, object], json.loads(self.environment["TEST_METADATA"]))
         metadata["target_directory"] = str(self.root / "local-target")
         packages = cast(list[dict[str, object]], metadata["packages"])
@@ -197,34 +187,69 @@ class RemoteCommandTests(VerifySshTargetsFixture):
         self.environment["TEST_METADATA"] = json.dumps(metadata)
         _ = self.runner.write_text(self.runner.read_text().replace(
             'build_target_directory=target', 'build_target_directory=/remote/cargo output'))
-        result = self.verify("build", "sample", "--target", "linux")
+        result = self.verify("build", "sample", "--target", "mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("binary: linux:/remote/cargo output/debug/sample-cli", result.stdout)
+        self.assertIn("binary: mac:/remote/cargo output/debug/sample-cli", result.stdout)
         self.assertEqual([event for event in self.cargo_events() if event["args"][:1] == ["build"]], [])
 
 
 def add_peer_target(root: Path) -> None:
-    """Register a linux SSH target named peer, with its settings file."""
-    _ = write_config_fixture(root / "linux.conf", "offload=on\nhost=fake-linux\nkinds=test,check,doc\n",
+    """Register a second Mac target."""
+    _ = write_config_fixture(root / "linux.conf", "offload=on\nhost=fake-peer\nlinux_only.case=\nlinux_only.hana=\n",
                              template="mac_test")
     targets_file = root / "build_targets.conf"
     _ = targets_file.write_text(targets_file.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
-        + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=linux.conf\n")
+        + "kind.peer=ssh\nplatform.peer=macos\nsettings.peer=linux.conf\n")
 
 
 class RemoteWaitStateTests(VerifyMacOffloadFixture):
     """The machine watch counts a waiting_ssh step only for the target that the state names."""
 
     def declined_states(self, mode: str, reason: str) -> list[str]:
-        """Run try_mac_test on peer with a runner answer, and return each published step state."""
-        add_peer_target(self.root)
+        """Read the states for a Hana check with the given runner result."""
+        settings = self.root / "hana_aws.conf"
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text().replace("targets=mac,natedev", "targets=mac,natedev,peer")
+            + "kind.peer=ssh\nplatform.peer=linux\nsettings.peer=hana_aws.conf\n")
         states = self.root / "step-states"
-        assigned = self.assigned_remote("peer", "nextest")
+        _ = (self.root / ".git/config").write_text("[remote \"origin\"]\nurl=https://example.com/team/hana\n")
+        git = self.bin_directory / "git"
+        _ = git.write_text(git.read_text().replace("wanted=ls-files",
+            "wanted=get-url\nif has \"$@\"; then printf 'https://example.com/team/hana\\n'; exit 0; fi\nwanted=ls-files"))
+        assigned = self.runner_state / "hana.assignment"
+        admission = caller_admission(self, self.root, self.environment)
+        caller_provider_controls(self, admission).set_host("peer", placement.AllowedHost())
+        self.write_executable(self.runner, """
+import os
+from pathlib import Path
+import sys
+
+if os.environ["TEST_RUNNER_MAC"] == "declined":
+    result = Path(sys.argv[sys.argv.index("--result") + 1])
+    reason = os.environ["TEST_RUNNER_REASON"]
+    result.write_text(f"outcome=declined\\ntarget=peer\\nreason={reason}\\nseconds=0\\n")
+raise SystemExit(75)
+""")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            repository = eligibility.repository_identity(self.root)
+            assert isinstance(repository, eligibility.KnownRepository), repository
+            _ = write_config_fixture(settings,
+                f"enabled=on\nexecution_transport=hana-control\nhost=fake-hana\n"
+                + f"repository_identity={repository.key}\nkinds=check,lint\nstep_memory_gib=24\n", template="hana_aws")
+            args = offload.parser().parse_args(["run", "--repo-root", str(self.root),
+                "--package", "sample", "--settings", str(settings), "--target", "peer",
+                "--verb", "check", "--kind", "check", "--call-id", f"fixture-{os.getpid()}-hana",
+                "--result", str(assigned.with_suffix(".result"))], namespace=offload.CliArguments())
+            request = offload.submit_direct_placement(offload.request_from_arguments(args), 1.0,
+                                                       HanaControlTransport(settings, "fake-hana"))
+            assert isinstance(request.placement, offload.AssignedOffloadRequest)
+            admission_client.write_assignment(assigned, wire.Assignment(request.placement.assignment))
         result = self.call_mac_functions('step_state() { printf "%s\\n" "$*" >> "$TEST_STEP_STATES"; }\n'
             + 'PLACEMENT_ASSIGNMENT_FILE="$TEST_DIRECT_ASSIGNMENT"\n'
+            + 'CMD=check MAC_VERB=check\n'
             + 'STEP_ASSIGNED_TARGET=peer STEP_ASSIGNED_PLATFORM=linux\n'
             + 'try_mac_test "$MAC_TEST_CONFIG" || true\n',
-            extra={"MAC_TEST_CONFIG": str(self.root / "linux.conf"), "TEST_DIRECT_ASSIGNMENT": str(assigned),
+            extra={"MAC_TEST_CONFIG": str(settings), "TEST_DIRECT_ASSIGNMENT": str(assigned),
                    "TEST_STEP_STATES": str(states), "TEST_RUNNER_MAC": mode, "TEST_RUNNER_REASON": reason})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return states.read_text().splitlines()
@@ -290,7 +315,7 @@ with Path(os.environ["TEST_RUNNER_STATE"], "remote-commands").open("a") as outpu
         values = {"NO_COLOR": "1", "RUST_LOG": "sample=trace", **FIXED_ENVIRONMENT}
         entries = " ".join(shlex.quote(name + "=" + value) for name, value in values.items())
         for target, platform, settings in (("mac", "macos", self.environment["MAC_TEST_CONFIG"]),
-                                           ("peer", "linux", str(self.root / "linux.conf"))):
+                                           ("peer", "macos", str(self.root / "linux.conf"))):
             with self.subTest(target=target):
                 (self.runner_state / "remote-commands").unlink(missing_ok=True)
                 # Unpinned final stays local. Call its remote boundary without changing that rule.

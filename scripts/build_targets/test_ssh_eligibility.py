@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -26,6 +27,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import unittest
 from unittest import mock
 
+from scripts.build_queue import admission_protocol as wire, admission_service, execution_identity, placement
+from scripts.build_queue.test_placement import PlacementFixture, placement_request
 from scripts.build_targets import build_targets as build_targets, target_config, targets
 from scripts.build_targets.test_targets import fixture_mac_mirror
 from scripts.mac_test import eligibility, claim_state, mac_test as mac_test, offload as offload
@@ -109,7 +112,14 @@ class SshEligibilityTests(unittest.TestCase):
     def capture_mac_probe(self, arguments: Sequence[str], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
         self.commands.append(list(arguments))
         self.assertEqual(arguments[0], "ssh")
-        self.assertEqual(arguments[-1], offload.probe_script(eligibility.KnownRepository("hana")))
+        script = arguments[-1]
+        self.assertNotIn("nix print-dev-env", script)
+        self.assertNotIn("dev-shell.py", script)
+        self.assertIn('test -f "$HOME"/', script)
+        self.assertIn("copies.probe_remote_folder(sys.argv[1])", script)
+        self.assertIn('df -g "$HOME"', script)
+        self.assertIn('$(hostname -s)', script)
+        self.assertIn(r"free_gib=%s\nhost=%s\nrc=0\n", script)
         return offload.CommandOutput(0, "free_gib=100\nhost=fixture\nrc=0\n", "") if self.reachable else (
             offload.CommandOutput(255, "", "fixture connection failed"))
 
@@ -297,6 +307,41 @@ class SshEligibilityTests(unittest.TestCase):
         self.assertEqual(mac_test.read_claims(paths), ())
 
 
+    def test_assignment_file_refuses_an_exact_live_linux_ssh_claim(self) -> None:
+        scope = claim_state.RepositoryScope("hana", "https://github.com/team/hana")
+        session = NoOwningSession()
+        assignment = placement.PlacementAssignment("episode", "attempt",
+            placement.PlacementDestination("ssh", "linux", "fake-linux", scope),
+            execution_identity.SourceKeyKnown("fixture-tree"),
+            placement.SubmittingOwner("natedev", 501, "start-501"), session, 1.0)
+        identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id("episode", "attempt"),
+                                             "episode", "attempt")
+        paths = mac_test.state_paths("linux")
+        claim = mac_test.CliArguments()
+        claim.target, claim.worktree, claim.pid = "linux", str(self.root), 501
+        claim.what = "nextest linux-part"
+        claim.claim_id, claim.episode, claim.attempt = identity.claim_id, identity.episode, identity.attempt
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(mac_test.command_claim(claim, paths, watch_claim=False, session=session), 0)
+        held, = mac_test.read_claims(paths)
+        self.assertEqual(build_targets.wait_claim_identity(paths, str(self.root), 501, session=session), identity)
+
+        args = build_targets.CliArguments()
+        args.kind, args.repo_root, args.package = "test", str(self.root), "linux-part"
+        args.pid = 501
+        args.assignment_file = str(self.root / "assignment")
+        args.reservation_file = str(self.root / "reservation.tsv")
+        args.claim_identity_file = str(self.root / "reservation.identity")
+        _ = Path(args.assignment_file).write_text(wire.encode_reply(wire.Assignment(assignment)))
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(build_targets.command_reserve(args), 1)
+        self.assertEqual(errors.getvalue(), "target does not permit this command\n")
+        self.assertFalse(Path(args.reservation_file).exists())
+        self.assertFalse(Path(args.claim_identity_file).exists())
+        self.assertEqual(mac_test.read_claims(paths), (held,))
+        self.assertEqual(self.commands, [])
+
     def test_recovery_only_does_not_create_a_new_claim(self) -> None:
         self.assertEqual(self.reserve(recover_only=True), 1)
         self.assertFalse((self.root / "reservation.tsv").exists())
@@ -374,9 +419,27 @@ class SshEligibilityTests(unittest.TestCase):
 
     def test_occupied_repository_excludes_target_before_ssh(self) -> None:
         self.enable_mac_for_tests()
-        self.occupy(71, "mac")
-        target = target_config.configured_ssh_target("mac")
-        self.assertEqual(mac_test.free_now(mac_test.state_paths("mac"), target.settings, self.root), "busy")
+        self.assertEqual(self.reserve("mac"), 0)
+        self.commands.clear()
+        with (mock.patch.object(admission_service, "loaded_git_revision", return_value="fixture"),
+              PlacementFixture() as fixture, fixture.loop_turn()):
+            target = target_config.configured_ssh_target("mac")
+            _ = write_config_fixture(target.settings, "offload=on\nlinux_only.hana=\n")
+            self.assertEqual(mac_test.free_now(mac_test.state_paths("mac"), target.settings, self.root), "busy")
+            with mock.patch.object(subprocess, "Popen", new=REAL_POPEN):
+                request = placement_request(fixture, session=NoOwningSession(),
+                    scope=claim_state.RepositoryScope("hana", "https://github.com/team/hana"))
+            request = replace(request, constraints=replace(request.constraints, repository=str(self.root)))
+            destination = request.constraints.candidates[0].destination
+            key = fixture.server.host_evidence_key(request, destination)
+            fixture.server.host_requests[key] = request
+            with mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "fixture")):
+                fixture.server.publish_host_evidence(fixture.read_host_evidence(key))
+            reply, = fixture.server.handle_request(request)
+            assert isinstance(reply, wire.PlacementWait), reply
+            candidate, = reply.eligibility
+            self.assertEqual(candidate.destination, destination)
+            self.assertEqual(candidate.eligibility, placement.TemporaryExclusion("busy"))
         self.assertEqual(self.commands, [])
 
     def test_unreachable_host_is_excluded_without_shell_evaluation(self) -> None:

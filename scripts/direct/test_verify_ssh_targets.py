@@ -17,15 +17,15 @@ from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.build_targets import build_targets
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 from scripts.mac_test import mac_test, claim_state
 
 from scripts.lib import process_start as process_identity
 
 
 class VerifySshTargetsTests(VerifySshTargetsFixture):
-    def test_local_only_request_never_reserves_or_runs_linux_work(self) -> None:
-        self.configure("linux,natedev")
+    def test_local_only_request_never_reserves_or_runs_mac_work(self) -> None:
+        self.configure("mac,natedev")
+        self.enable_mac()
         result = self.verify("test", "sample", "--local", "requires local files", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.ssh_events(), [])
@@ -74,21 +74,22 @@ class SshReservationTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = set_up_fixture(self.addCleanup, self.fixture)
-        _ = write_config_fixture(self.fixture.root / "linux.conf", "offload=on\n")
+        self.fixture.enable_mac_for_tests()
 
     def reserve(self, pid: int) -> tuple[int, Path]:
         path = self.fixture.root / f"reservation-{pid}"
         args = build_targets.CliArguments()
         args.repo_root, args.package, args.kind = str(self.fixture.root), "linux-part", "test"
         args.pid, args.reservation_file = pid, str(path)
+        args.target = "mac"
         args.claim_identity_file = str(path.with_suffix(".identity"))
         return build_targets.command_reserve(args), path
 
     def test_retry_recovers_its_claim_when_the_reservation_file_was_not_published(self) -> None:
-        state = mac_test.state_paths("linux")
+        state = mac_test.state_paths("mac")
         args = mac_test.CliArguments()
-        args.target, args.repo_root, args.pid = "linux", str(self.fixture.root), 71
-        args.settings, args.package, args.verb = str(self.fixture.root / "linux.conf"), "linux-part", "nextest"
+        args.target, args.repo_root, args.pid = "mac", str(self.fixture.root), 71
+        args.settings, args.package, args.verb = str(self.fixture.root / "mac_test.conf"), "linux-part", "nextest"
         with redirect_stdout(io.StringIO()):
             self.assertEqual(mac_test.command_claim_wait(args, state), 0)
         claim, = mac_test.read_claims(state)
@@ -96,15 +97,15 @@ class SshReservationTests(unittest.TestCase):
         self.assertFalse(destination.exists())
         status, answer = self.reserve(71)
         self.assertEqual(status, 0)
-        self.assertEqual(answer.read_text().split("\t")[0], "linux")
+        self.assertEqual(answer.read_text().split("\t")[0], "mac")
         recovered, = mac_test.read_claims(state)
         self.assertEqual(recovered.path, claim.path)
         self.assertEqual(recovered.record, claim.record)
-        self.assertEqual(self.reserve(72)[0], 1)
+        self.assertEqual(self.reserve(72)[0], 11)
 
     def test_wait_release_keeps_a_claim_from_an_earlier_process_with_the_same_pid(self) -> None:
         self.assertEqual(self.reserve(71)[0], 0)
-        state = mac_test.state_paths("linux")
+        state = mac_test.state_paths("mac")
         claim, = mac_test.read_claims(state)
         identity = claim_state.claim_identity(claim.record)
         with mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("reused-start")):
@@ -117,23 +118,23 @@ class SshReservationTests(unittest.TestCase):
     def test_reservation_race_keeps_the_loser_queued_without_an_answer(self) -> None:
         status, first = self.reserve(71)
         self.assertEqual(status, 0)
-        self.assertEqual(first.read_text().split("\t")[0], "linux")
+        self.assertEqual(first.read_text().split("\t")[0], "mac")
         with mock.patch.object(mac_test, "free_now", return_value="free"):
             status, losing = self.reserve(72)
-        self.assertEqual(status, 1)
+        self.assertEqual(status, 11)
         self.assertFalse(losing.exists())
-        claims = mac_test.read_claims(mac_test.state_paths("linux"))
+        claims = mac_test.read_claims(mac_test.state_paths("mac"))
         self.assertEqual([claim.record["pid"] for claim in claims], [71])
         self.assertNotIn("remote_host", claims[0].record)
 
     def test_runner_adopts_the_reserved_slot_without_an_unclaimed_interval(self) -> None:
         self.assertEqual(self.reserve(71)[0], 0)
-        paths = mac_test.state_paths("linux")
+        paths = mac_test.state_paths("mac")
         original, = mac_test.read_claims(paths)
         identity = claim_state.claim_identity(original.record)
         args = mac_test.CliArguments()
-        args.target, args.worktree, args.what = "linux", str(self.fixture.root), "check hana"
-        args.pid, args.from_pid, args.remote = 91, 71, "fake-linux"
+        args.target, args.worktree, args.what = "mac", str(self.fixture.root), "check hana"
+        args.pid, args.from_pid, args.remote = 91, 71, "fake-mac"
         args.claim_id, args.episode, args.attempt = identity.claim_id, identity.episode, identity.attempt
         unlink = Path.unlink
 
@@ -147,18 +148,18 @@ class SshReservationTests(unittest.TestCase):
         self.assertEqual(transferred.path, original.path)
         self.assertEqual(transferred.scope, original.scope)
         self.assertEqual(transferred.record["pid"], 91)
-        self.assertEqual(transferred.record.get("remote_host"), "fake-linux")
+        self.assertEqual(transferred.record.get("remote_host"), "fake-mac")
         self.assertEqual(build_targets.command_release_wait(71, identity=identity, session=NoOwningSession()), 0)
         self.assertEqual(build_targets.command_release_wait(91, identity=identity, session=NoOwningSession()), 0)
         self.assertTrue(original.path.exists())
-        self.assertEqual(self.reserve(72)[0], 1)
+        self.assertEqual(self.reserve(72)[0], 11)
 
     def test_exit_releases_only_an_untransferred_local_reservation(self) -> None:
         self.assertEqual(self.reserve(71)[0], 0)
-        claim, = mac_test.read_claims(mac_test.state_paths("linux"))
+        claim, = mac_test.read_claims(mac_test.state_paths("mac"))
         self.assertEqual(build_targets.command_release_wait(71,
             identity=claim_state.claim_identity(claim.record), session=NoOwningSession()), 0)
-        self.assertEqual(mac_test.read_claims(mac_test.state_paths("linux")), ())
+        self.assertEqual(mac_test.read_claims(mac_test.state_paths("mac")), ())
         self.assertEqual(self.reserve(72)[0], 0)
 
 
@@ -201,7 +202,7 @@ class SshResultBoundaryTests(unittest.TestCase):
                 self.assertEqual(destination.read_text(), f"mac={outcome}\nreason=\nseconds=4.500000\n")
 
 
-class VerifyLinuxStagedDocTests(doc_support.VerifyDocFixture):
+class VerifyMacStagedDocTests(doc_support.VerifyDocFixture):
     @override
     def start_admission(self) -> None:
         super().start_admission()
@@ -210,13 +211,13 @@ class VerifyLinuxStagedDocTests(doc_support.VerifyDocFixture):
         with admission.loop_turn():
             admission.free(0)
 
-    def test_linux_doc_judges_the_staged_tree_without_a_local_hold(self) -> None:
-        self.linux_doc_case(pinned=False)
+    def test_mac_doc_judges_the_staged_tree_without_a_local_hold(self) -> None:
+        self.mac_doc_case(pinned=False)
 
-    def test_pinned_linux_doc_keeps_the_staged_tree_and_skips_local_admission(self) -> None:
-        self.linux_doc_case(pinned=True)
+    def test_pinned_mac_doc_keeps_the_staged_tree_and_skips_local_admission(self) -> None:
+        self.mac_doc_case(pinned=True)
 
-    def linux_doc_case(self, *, pinned: bool) -> None:
+    def mac_doc_case(self, *, pinned: bool) -> None:
         self.enable_held_mac_doc()
         for holder in Path(self.environment["BUILD_HOLD_DIR"]).iterdir():
             holder.unlink()
@@ -229,33 +230,28 @@ from pathlib import Path
 import sys
 import runpy
 words = sys.argv[1:]
-settings = str(Path(os.environ["CONF_DIR"]) / "linux_target.conf")
+settings = os.environ["MAC_TEST_CONFIG"]
 if words[0] in ("constraints", "submitting-session", "source-key", "assigned-info", "reserve", "recover-reservation", "release-wait"):
     source = Path(os.environ["TEST_SOURCE_REPO"])
     runpy.run_path(str(source / "scripts/build_targets/build_targets.py"), run_name="__main__")
     raise SystemExit(0)
 if words[0] == "eligible":
     print("any_target")
-    print("linux\teligible\t-\t" + settings + "\tlinux")
+    print("mac\teligible\t-\t" + settings + "\tmacos")
 elif words[0] == "reserve":
-    Path(words[words.index("--reservation-file") + 1]).write_text("linux\t" + settings + "\n")
+    Path(words[words.index("--reservation-file") + 1]).write_text("mac\t" + settings + "\n")
     Path(words[words.index("--claim-identity-file") + 1]).write_text("doc-claim\tdoc-episode\tdoc-attempt\t\n")
 elif words[0] in ("register-local", "check-local") and os.environ.get("TEST_PINNED_DOC") == "1":
     raise AssertionError("pinned doc requested local admission")
 elif words[0] not in ("release-wait", "register-local", "check-local"):
     raise AssertionError(words)
 ''')
-        config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
-        _ = config.write_text("targets=linux,natedev\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux_target.conf\n"
-                              + "kind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
-        _ = write_config_fixture(config.parent / "linux_target.conf", "offload=on\nkinds=doc\n", template="mac_test")
         runner = Path(self.environment["VERIFY_MAC_RUNNER"])
-        self.environment["TEST_LINUX_DOC_RUN"] = str(self.root / "linux-doc-run")
+        self.environment["TEST_MAC_DOC_RUN"] = str(self.root / "mac-doc-run")
         self.environment["TEST_PINNED_DOC"] = "1" if pinned else "0"
-        runner_source = runner.read_text().replace('"mac=" + result', '"outcome=" + result + "\\ntarget=linux"')
-        runner_source = runner_source.replace('words = sys.argv[1:]', '''words = sys.argv[1:]
-assert words[words.index("--target") + 1] == "linux"
-Path(os.environ["TEST_LINUX_DOC_RUN"]).touch()''')
+        runner_source = runner.read_text().replace('words = sys.argv[1:]', '''words = sys.argv[1:]
+assert words[words.index("--target") + 1] == "mac"
+Path(os.environ["TEST_MAC_DOC_RUN"]).touch()''')
         self.executable(runner, runner_source)
         staged = self.repo / "alpha/src/lib.rs"
         _ = staged.write_text("pub fn staged() {}\n")
@@ -264,10 +260,10 @@ Path(os.environ["TEST_LINUX_DOC_RUN"]).touch()''')
         _ = (self.repo / "notes.md").write_text("private fixture")
         original_index = (self.repo / ".git/index").read_bytes()
 
-        result = self.verify("--target", "linux") if pinned else self.verify()
+        result = self.verify("--target", "mac") if pinned else self.verify()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(Path(self.environment["TEST_LINUX_DOC_RUN"]).exists())
+        self.assertTrue(Path(self.environment["TEST_MAC_DOC_RUN"]).exists())
         call, = self.cargo_calls()
         self.assertEqual(call["sources"]["alpha/src/lib.rs"], "pub fn staged() {}\n")
         self.assertFalse(call["notes_present"])

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -163,10 +165,41 @@ if output_size:
         result = self.verify_with_memory_hook({"left": True, "clock": "", "attempts": 0})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def retain_slots(self) -> list[Path]:
+    def configure_mac_pair(self, order: str) -> None:
+        self.configure(order)
+        self.enable_mac()
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text().replace("platform.spare=linux", "platform.spare=macos"))
+        settings = self.root / "spare.conf"
+        settings.unlink()
+        _ = write_config_fixture(settings, "offload=on\nhost=fake-spare\nlinux_only.case=\nlinux_only.hana=\n",
+                                 template="mac_test")
+
+
+    @contextmanager
+    def spare_after_mac_refusal(self) -> Generator[None]:
+        controls = caller_provider_controls(self, self.admission)
+        controls.set_host("spare", placement.TemporaryExclusion("starting"))
+        server = self.admission.server
+        previous = server.handle_request
+
+        def observe(request: wire.Request, connection: service.Connection | service.NoConnection = service.NO_CONNECTION
+                    ) -> list[wire.Reply]:
+            replies = previous(request, connection)
+            if (isinstance(request, wire.ClaimFailure) or isinstance(request, wire.ExecutionReport)
+                    and isinstance(request.outcome, placement.PrelaunchRefused)):
+                if request.assignment.destination.target == "mac":
+                    controls.set_host("spare", placement.AllowedHost())
+            return replies
+
+        with mock.patch.object(server, "handle_request", side_effect=observe):
+            yield
+
+    def retain_mac_claims(self) -> list[Path]:
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(Path, "home", return_value=self.home):
-            state = mac_test.state_paths("linux")
-            scope = mac_test.RepositoryScope("hana", "https://example.com/team/hana")
+            state = mac_test.state_paths("mac")
+            scope = claim_state.target_claim_scope(state, str(self.root))
+            assert isinstance(scope, claim_state.RepositoryScope), scope
             claim_path = mac_test.claim_path(state, scope)
             claim_path.parent.mkdir(parents=True, exist_ok=True)
             paths = [claim_path.with_name(f"{claim_path.stem}.slot-{number}.json") for number in (1, 2)]
@@ -176,20 +209,23 @@ if output_size:
                     "claim_id": f"saved-claim-{number}", "episode": f"saved-episode-{number}",
                     "attempt": f"saved-attempt-{number}", "submitting_session": "", "pid": pid,
                     "proc_start": f"start-{pid}", "worktree": str(self.root), "what": "test hana",
-                    "since": f"2026-11-01T00:00:0{number}+00:00", "remote_host": "fake-linux",
+                    "since": f"2026-11-01T00:00:0{number}+00:00", "remote_host": "test-mac",
                     "repo_name": scope.name, "repo_key": scope.key, "slot": number,
                 })
         return paths
 
     def test_queue_retry_cleans_retained_slots_after_their_owners_exit(self) -> None:
-        self.configure("natedev,linux")
-        claims = self.retain_slots()
+        self.configure("natedev,mac")
+        self.enable_mac()
+        claims = self.retain_mac_claims()
         controls = caller_provider_controls(self, self.admission)
-        old_claims = {held.record["claim_id"] for held in controls.claims("linux")}
+        old_claims = {held.record["claim_id"] for held in controls.claims("mac")}
         _ = self.hold_memory()
         result = self.verify("test", "sample", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        first_cleanup, second_cleanup, run = self.ssh_events()
+        events = self.ssh_events()
+        self.assertEqual(len(events), 3, result.stdout + result.stderr + repr(events) + repr(old_claims))
+        first_cleanup, second_cleanup, run = events
         released: set[str] = set()
         for cleanup in (first_cleanup, second_cleanup):
             self.assertEqual(cleanup["actions"], ["claim:13", "cleanup", "release"])
@@ -201,17 +237,17 @@ if output_size:
         self.assertEqual(released, old_claims)
         self.assertEqual(run["actions"][0], "claim:0")
         self.assertIn("run", run["actions"])
-        self.assertEqual(run["result_type"], "PassedOnTarget")
+        self.assertEqual(run["result_type"], "PassedOnMac")
         replacement, = run["adopted_claim_ids"]
         self.assertNotIn(replacement, old_claims)
         self.assertIn(replacement, run["entry_claim_ids"])
         self.assertEqual(self.local_runs(), [])
         self.assertFalse(any(path.exists() for path in claims))
-        self.assertEqual(controls.claims("linux"), ())
+        self.assertEqual(controls.claims("mac"), ())
 
     def test_retained_slots_stay_owned_when_retry_cannot_confirm_cleanup(self) -> None:
-        self.configure("natedev,linux,spare")
-        claims = self.retain_slots()
+        self.configure_mac_pair("natedev,mac,spare")
+        claims = self.retain_mac_claims()
         _ = self.hold_memory()
         pressure = Path(self.environment["BUILDLOG_MEMORY_PRESSURE"])
         _ = pressure.write_text("some avg10=100 avg60=0 avg300=0 total=0\n"
@@ -219,26 +255,26 @@ if output_size:
         before_attempt = r'''
 steps_path = root / "memory-steps.json"
 steps = json.loads(steps_path.read_text()) if steps_path.exists() else []
-if request.target == "linux":
+if request.target == "mac":
     assert steps == [], steps
-    steps.append("linux_attempt")
+    steps.append("mac_attempt")
 else:
     assert request.target == "spare", request.target
-    assert steps == ["linux_attempt", "linux_cleanup_failed"], steps
+    assert steps == ["mac_attempt", "mac_cleanup_failed"], steps
     prior = json.loads((root / "ssh-events.jsonl").read_text().splitlines()[-1])
-    assert prior["target"] == "linux" and "cleanup" in prior["actions"], prior
+    assert prior["target"] == "mac" and "cleanup" in prior["actions"], prior
     assert prior["holder"] == "LostRunLeftovers", prior
     steps.append("spare_retry")
 steps_path.write_text(json.dumps(steps))
 '''
         after_attempt = r'''
-if request.target == "linux":
+if request.target == "mac":
     assert isinstance(result, offload.BusyMacDecline), result
     assert isinstance(result.holder, offload.LostRunLeftovers), result
     assert "cleanup" in actions and "run" not in actions, actions
-    steps.append("linux_cleanup_failed")
+    steps.append("mac_cleanup_failed")
 else:
-    assert isinstance(result, offload.PassedOnTarget), result
+    assert isinstance(result, offload.PassedOnMac), result
     steps.append("spare_completed")
     Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
     Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text(
@@ -248,12 +284,12 @@ steps_path.write_text(json.dumps(steps))
         self.write_executable(self.runner, support.SSH_RUNNER.replace(
             "started = time.monotonic()", before_attempt + "\nstarted = time.monotonic()").replace(
             "\nconfigured_mode = ", after_attempt + "\nconfigured_mode = "))
-        with self.spare_after_linux_refusal():
+        with self.spare_after_mac_refusal():
             result = self.verify("test", "sample", "--no-cache", extra={
-                "TEST_SSH_MODES": '{"linux":"retained-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
+                "TEST_SSH_MODES": '{"mac":"retained-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         first, second = self.ssh_events()
-        self.assertEqual((first["target"], second["target"]), ("linux", "spare"))
+        self.assertEqual((first["target"], second["target"]), ("mac", "spare"))
         self.assertEqual(first["result_type"], "BusyMacDecline")
         self.assertEqual(first["holder"], "LostRunLeftovers")
         self.assertIn("cleanup", first["actions"])
@@ -261,13 +297,13 @@ steps_path.write_text(json.dumps(steps))
         self.assertNotIn("release", first["actions"])
         self.assertTrue(all(path.exists() for path in claims))
         self.assertEqual(first["queued_at"], second["queued_at"])
-        self.assertFalse((self.target_state("linux") / "unreachable_until").exists())
+        self.assertFalse((Path(self.environment["MAC_TEST_STATE_DIR"]) / "unreachable_until").exists())
         self.assertEqual(json.loads((self.runner_state / "memory-steps.json").read_text()),
-                         ["linux_attempt", "linux_cleanup_failed", "spare_retry", "spare_completed"])
+                         ["mac_attempt", "mac_cleanup_failed", "spare_retry", "spare_completed"])
         requests = [wire.parse_request(json.dumps(cast(dict[str, object], json.loads(line))["request"]))
                     for line in (self.runner_state / "queue-events.jsonl").read_text().splitlines()]
         refusal, = [request for request in requests if isinstance(request, wire.ClaimFailure)
-                    and request.assignment.destination.target == "linux"]
+                    and request.assignment.destination.target == "mac"]
         self.assertIsInstance(refusal.claim, placement.ProviderClaimReference)
         assert isinstance(refusal.claim, placement.ProviderClaimReference)
         self.assertEqual(refusal.claim.claim_id, first["adopted_claim_ids"][0])

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from decimal import Decimal
 import fcntl
 import io
 import json
@@ -22,7 +21,6 @@ from unittest import mock
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers, verify_test_environment
 
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.aws_target import ledger
 from scripts.build_queue import admission_protocol as wire, admission_service as service
 from scripts.build_queue.admission_test_support import caller_admission
 from scripts.build_targets import build_targets, target_config, targets
@@ -36,20 +34,20 @@ VERIFY = Path(__file__).resolve().parents[1] / "direct/verify.sh"
 
 
 class FailedProbeTests(OffloadCommandFixture):
-    linux_settings: Path = Path()
+    box_settings: Path = Path()
 
     @override
     def setUp(self) -> None:
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, verify_test_environment(), clear=True)))
         super().setUp()
-        self.linux_settings = self.root / "box.conf"
-        _ = write_config_fixture(self.linux_settings,
-            "offload=on\nhost=fake-box\nkinds=test,check,lint,doc,build\n"
+        self.box_settings = self.root / "box.conf"
+        _ = write_config_fixture(self.box_settings,
+            "offload=on\nhost=fake-box\nlinux_only.hana=\n"
             + "shell_timeout_s=2\nparity.rustc=fixture\nparity.nextest=fixture\n"
             + "parity.mend=fixture\nparity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
             "targets=mac,natedev,box\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\nkind.box=ssh\nplatform.box=macos\nsettings.box=box.conf\n"
             + UNREACHABLE_WAIT_FIXTURE)
         self.environment.update({name: "" for name in (
             "UNIT_RUN_DIR", "UNIT_SESSION_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")})
@@ -64,7 +62,7 @@ class FailedProbeTests(OffloadCommandFixture):
 
     def probe(self, target: str = "box") -> offload.ProbeResult:
         self.sync_fixture()
-        config = eligibility.read_config(self.config_path if target == "mac" else self.linux_settings)
+        config = eligibility.read_config(self.config_path if target == "mac" else self.box_settings)
         return offload.probe_mac(offload.ProcessController(), config, self.identity, target)
 
     def healthy(self) -> None:
@@ -80,7 +78,7 @@ class FailedProbeTests(OffloadCommandFixture):
         args = mac_test.CliArguments()
         args.target = target
         args.repo_root = str(self.repository if repository is None else repository)
-        args.settings = str(self.config_path if target == "mac" else self.linux_settings)
+        args.settings = str(self.config_path if target == "mac" else self.box_settings)
         output = io.StringIO()
         with redirect_stdout(output):
             status = mac_test.command_free_now(args, mac_test.state_paths(target))
@@ -142,14 +140,10 @@ class FailedProbeTests(OffloadCommandFixture):
 
     def test_version_decline_stays_repository_specific_after_backoff_expires(self) -> None:
         self.healthy()
-        self.fixture["probe_lines"][-3] = "nextest=wrong"
-        with redirect_stderr(io.StringIO()):
-            probe = self.probe()
-        self.assertIsInstance(probe, offload.UnavailableProbe)
+        offload.write_version_decline("box", self.identity.name)
         self.assertIsInstance(eligibility.read_backoff(time.time(), "box"), eligibility.NoBackoff)
         self.assertEqual(self.free(), "bad")
         offload.write_backoff(time.time() - 1, "box")
-        _ = eligibility.linux_version_decline_path("box", "hana").write_text("0")
         self.assertEqual(self.free(), "bad")
         other = self.root / "other"
         _ = subprocess.run(["git", "init", "-q", str(other)], check=True, capture_output=True)
@@ -184,7 +178,7 @@ class FailedProbeTests(OffloadCommandFixture):
         claim = next(claim for claim in mac_test.read_claims(mac_test.state_paths("box"))
                      if claim.record["pid"] == os.getpid())
         self.assertEqual(claim.record["what"], "nextest hana")
-        self.assertEqual((self.root / "reservation").read_text(), f"box\t{self.linux_settings}\n")
+        self.assertEqual((self.root / "reservation").read_text(), f"box\t{self.box_settings}\n")
         self.assertGreater(len(self.events()), before)
         self.assertEqual(self.release_reservation(), 0)
 
@@ -220,7 +214,7 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertEqual(len(probes), 1, probes)
         self.assertEqual(probes[0]["args"][-1], "true")
         self.assertFalse(probes[0]["claimed"], "the probe must precede the claim")
-        self.assertEqual((self.root / "ssh-reservation").read_text(), f"box\t{self.linux_settings}\n")
+        self.assertEqual((self.root / "ssh-reservation").read_text(), f"box\t{self.box_settings}\n")
         self.assertEqual(self.release_reservation(), 0)
 
     def test_bad_mark_preserves_busy_blocked_and_off_precedence(self) -> None:
@@ -237,7 +231,7 @@ class FailedProbeTests(OffloadCommandFixture):
             "session": None, "showrunner": None,
             "state": "active", "ci": "not_configured", "free_message": {"kind": "not_needed"}}))
         self.assertEqual(self.free(), "blocked")
-        _ = write_config_fixture(self.linux_settings, "offload=off\n", template="mac_test")
+        _ = write_config_fixture(self.box_settings, "offload=off\n", template="mac_test")
         self.assertEqual(self.free(), "off")
 
     def test_reach_error_prints_only_the_last_nonempty_stderr_line(self) -> None:
@@ -252,13 +246,13 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertEqual(self.free("mac"), "bad")
 
 
-    def test_failed_mark_precedes_aws_status_and_mac_status_then_clears(self) -> None:
+    def test_failed_mark_precedes_status_on_both_macs_then_clears(self) -> None:
         self.fixture["probe_status"] = 255
         for name in ("mac", "box"):
             with redirect_stderr(io.StringIO()):
                 self.assertIsInstance(self.probe(name), offload.UnavailableProbe)
-        linux = target_config.SshTarget("box", "linux", self.root / "linux.conf")
-        self.assertIsInstance(targets.target_state(linux), targets.Unreachable)
+        box = target_config.configured_ssh_target("box")
+        self.assertIsInstance(targets.target_state(box), targets.Unreachable)
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(mac_test.command_target_status(mac_test.state_paths("mac")), 0)
@@ -366,7 +360,7 @@ class FailedProbeTests(OffloadCommandFixture):
 
     def test_new_pinned_step_reserves_before_recovery_can_take_its_claim(self) -> None:
         self.healthy()
-        self.fixture["probe_lines"][-3] = "nextest=wrong"
+        self.fixture["probe_status"] = 255
         with redirect_stderr(io.StringIO()):
             self.assertIsInstance(self.probe(), offload.UnavailableProbe)
         self.assertEqual(self.free(), "bad")
@@ -409,10 +403,10 @@ class FailedProbeTests(OffloadCommandFixture):
                 self.assertEqual(build_targets.command_pinned_eligible(args, targets.ANY_ELIGIBLE_TARGET), 0)
             self.assertEqual(mac_test.read_claims(mac_test.state_paths("box")), ())
             self.assertEqual(build_targets.command_reserve(args), 0)
-            self.assertIn(f"box\teligible\t-\t{self.linux_settings}\tlinux\n", output.getvalue())
+            self.assertIn(f"box\teligible\t-\t{self.box_settings}\tmacos\n", output.getvalue())
             claim, = mac_test.read_claims(mac_test.state_paths("box"))
             self.assertEqual(claim.record["pid"], os.getpid())
-            self.assertEqual(Path(args.reservation_file).read_text(), f"box\t{self.linux_settings}\n")
+            self.assertEqual(Path(args.reservation_file).read_text(), f"box\t{self.box_settings}\n")
         finally:
             if recovery_started:
                 with (self.stub_directory / "continue-probe").open("w") as release:
@@ -439,6 +433,8 @@ class FailedProbeTests(OffloadCommandFixture):
         self.assertEqual(self.free(), "bad")
 
     def test_mac_version_decline_clears_when_the_next_run_matches(self) -> None:
+        offload.write_version_decline("mac", self.identity.name)
+        self.assertEqual(self.free("mac"), "bad")
         self.fixture["run_lines"] = [{"stream": "stdout", "text": "mac version mismatch: nextest differs"}]
         self.fixture["run_status_reported"] = False
         self.fixture["run_ssh_status"] = 1
@@ -463,10 +459,11 @@ class FailedProbeTests(OffloadCommandFixture):
         self.healthy()
         self.assertEqual(self.reserve(new_step=True), 0)
         count = len(self.events())
+        self.assertEqual(self.free(), "busy")
         target = target_config.configured_ssh_target("box")
-        result = build_targets.ssh_target_eligibility(target, self.repository, "hana", "test",
-                                                     targets.ANY_ELIGIBLE_TARGET, new_step=True)
-        self.assertIsInstance(result, targets.ExcludedTarget)
+        build_targets.start_probe_recovery(target, self.repository, "hana", "test")
+        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         self.assertEqual(len(self.events()), count)
         self.assertIsInstance(eligibility.read_failed_probe("box"), eligibility.FailedProbe)
         self.assertEqual(self.release_reservation(), 0)
@@ -575,26 +572,7 @@ fi
             fcntl.flock(lock, fcntl.LOCK_EX)
         self.assertEqual(self.free("mac"), "free")
 
-    def test_recovery_preserves_the_repository_decline_when_tools_still_differ(self) -> None:
-        self.fixture["probe_status"] = 255
-        with redirect_stderr(io.StringIO()):
-            self.assertIsInstance(self.probe(), offload.UnavailableProbe)
-        offload.write_version_decline("box", "hana")
-        record = eligibility.linux_version_decline_path("box", "hana")
-        previous = record.read_text()
-        self.healthy()
-        self.fixture["probe_lines"][-3] = "nextest=wrong"
-        self.sync_fixture()
-        self.install_script_copy_tools()
-        result = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("box"),
-            self.repository, "hana", "test", targets.ANY_ELIGIBLE_TARGET, new_step=True)
-        self.assertIsInstance(result, targets.EligibleTarget)
-        with (eligibility.state_directory("box") / "recovery-probe.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-        self.assertEqual(record.read_text(), previous)
-        self.assertIsInstance(eligibility.read_failed_probe("box"), eligibility.FailedProbe)
-
-    def test_recovery_copies_an_absent_mirror_before_the_real_linux_shell_probe(self) -> None:
+    def test_recovery_copies_an_absent_mirror_before_the_real_mac_probe(self) -> None:
         self.fixture["probe_status"] = 255
         with redirect_stderr(io.StringIO()):
             self.assertIsInstance(self.probe(), offload.UnavailableProbe)
@@ -602,24 +580,16 @@ fi
         self.install_script_copy_tools()
         _ = (self.repository / "flake.nix").write_text("{ outputs = _: {}; }\n")
         _ = (self.repository / "flake.lock").write_text("{}\n")
-        _ = write_config_fixture(self.linux_settings,
-            "shell_cache=.local/state/probe-shells\ndevshell=default\n", template="mac_test")
         home = Path(self.environment["HOME"])
         _ = copy_helpers(home, *COPY_HELPERS)
-        for name, program in {
-            "nix": '#!/bin/sh\nprintf "export IN_NIX_SHELL=1\\n"\n',
-            "cargo-nextest": '#!/bin/sh\nprintf "fixture\\n"\n',
-            "cargo-mend": '#!/bin/sh\nprintf "fixture\\n"\n',
-        }.items():
-            path = self.bin_directory / name
-            _ = path.write_text(program)
-            path.chmod(0o755)
+        df = self.bin_directory / "df"
+        _ = df.write_text('#!/bin/sh\nprintf "Filesystem GiB Used Avail\nfixture 128 8 120\n"\n')
+        df.chmod(0o755)
         ssh = self.bin_directory / "ssh"
         ssh.unlink()
         self.write_executable(ssh, r'''
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 command = sys.argv[-1]
@@ -627,10 +597,9 @@ if command == "true":
     raise SystemExit(0)
 if command.startswith("printf"):
     raise SystemExit(subprocess.run(["bash", "-c", command], check=False).returncode)
-words = shlex.split(command)
 if "dispatch_start_settled=" in command and "leftovers=0" in command:
     raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
-if "probe" in words and any("linux_runner.py" in word for word in words):
+if 'df -g "$HOME"' in command:
     raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
 raise SystemExit("Unexpected remote command: " + command)
 ''')
@@ -691,33 +660,30 @@ class StepRecoveryTests(VerifyLintScopeFixture):
         self.assertEqual([request for request in requests if "taplo" in request.constraints.command], [])
         self.assertEqual(list((self.root / "mac-state/claims").glob("*.json")), [])
 
-    def test_local_work_finishes_while_a_new_step_recovers_linux(self) -> None:
-        _ = write_config_fixture(self.root / "mac_test.conf", f"offload=on\nlinux_only.{self.root.name}=\n")
-        _ = write_config_fixture(self.root / "linux.conf",
-            "offload=on\nhost=fake-linux\nci_repo=\nkinds=test,check,doc,lint\n"
-            + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n"
+    def test_local_work_finishes_while_a_new_step_recovers_mac(self) -> None:
+        _ = write_config_fixture(self.root / "mac_test.conf",
+            "offload=on\nhost=fake-mac\nci_repo=\n"
+            + f"linux_only.{self.root.name}=\n"
             + "parity.rustc=fixture\nparity.nextest=fixture\nparity.mend=fixture\n"
             + "parity.scripts_commit=fixture\n", template="mac_test")
         _ = (self.root / "build_targets.conf").write_text(
-            "targets=mac,natedev,linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
-            + "kind.natedev=local\nplatform.natedev=linux\nkind.linux=ssh\nplatform.linux=linux\nsettings.linux=linux.conf\n"
-            + UNREACHABLE_WAIT_FIXTURE)
-        state = Path(self.environment["HOME"]) / ".local/state/build-targets/linux"
+            "targets=natedev,mac\nkind.natedev=local\nplatform.natedev=linux\n"
+            + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+        state = self.root / "mac-state"
         state.mkdir(parents=True)
-        book = ledger.CostLedger(state)
-        observed = int(time.time())
-        book.record_inventory(ledger.ResourceInventory(observed, (
-            ledger.PricedResource("retained-storage", Decimal("1")),), "private priced inventory"))
-        book.observe(ledger.InstanceObservation(observed, "stopped", "fake DescribeInstances"))
+        self.environment["MAC_TEST_STATE_DIR"] = str(state)
         _ = (state / "failed_probe").write_text("failed\n")
         _ = (self.root / "remote-stamp").write_text("old")
         gate = self.root / "probe-release"
         os.mkfifo(gate)
         descriptor = os.open(gate, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, descriptor)
+        _ = (self.root / ".git/config").write_text("[remote \"origin\"]\nurl=https://example.com/team/hana\n")
         git = self.root / "bin/git"
         source = git.read_text()
         prefix = ('case " $* " in\n'
+            + '    *" remote get-url origin "*) printf "https://example.com/team/hana\\n"; exit 0 ;;\n'
+            + '    *" config "*--get-regexp*) printf "local\\0remote.origin.url\\nhttps://example.com/team/hana\\0"; exit 0 ;;\n'
             + '    *" ls-files -z scripts config "*) printf "scripts/mac_test/linux_runner.py\\0"; exit 0 ;;\n'
             + '    *" rev-parse HEAD "*) printf "fixture\\n"; exit 0 ;;\n'
             + '    *" diff HEAD --quiet -- scripts/mac_test/linux_runner.py "*) exit 0 ;;\nesac\n')
@@ -742,35 +708,38 @@ if command.startswith("printf") and ".build-target-script-commit" in command:
     raise SystemExit(0)
 if "dispatch_start_settled=" in command and "leftovers=0" in command:
     raise SystemExit(subprocess.run(["bash", "-c", command], cwd=Path.home(), check=False).returncode)
-if "linux_runner.py" in command and "probe" in command:
+if 'df -g "$HOME"' in command and "probe_status=" in command:
     with (root / "recovery-probes").open("a") as output:
         output.write(json.dumps(sys.argv[1:]) + "\n")
     with (root / "probe-release").open() as release:
         assert release.readline() == "continue\n"
-    print("free_gib=1000\nhost=fake-linux\nnextest=fixture\nmend=fixture\nrc=0")
+    print("free_gib=1000\nhost=fake-mac\nnextest=fixture\nmend=fixture\nrc=0")
     print("scripts_commit=" + (root / "remote-stamp").read_text())
+    (root / "recovery-finished").touch()
     raise SystemExit(0)
-print("fake Mac unavailable", file=sys.stderr)
+if 'df -g "$HOME"' in command and (root / "recovery-finished").exists():
+    print("free_gib=1000\nhost=fake-mac\nrc=0")
+    raise SystemExit(0)
+print("Unexpected Mac command", file=sys.stderr)
 raise SystemExit(255)
 ''')
         self.write_config(clippy="on")
         self.environment["BUILD_TARGETS_SCRIPT"] = str(Path(build_targets.__file__))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True)))
-        admission = caller_admission(self, self.root, self.environment)
-        admission.server.host_probe = admission.server.read_provider_evidence
+        build_targets.start_probe_recovery(target_config.configured_ssh_target("mac"), self.root, "sample", "lint")
         result = self.verify("lint", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(args[:1] == ["clippy"] for args in self.cargo_calls()))
         # The remote probe remains blocked after local work finishes.
         with mock.patch.dict(os.environ, self.environment):
-            self.assertIsInstance(eligibility.read_failed_probe("linux"), eligibility.FailedProbe)
+            self.assertIsInstance(eligibility.read_failed_probe("mac"), eligibility.FailedProbe)
         _ = os.write(descriptor, b"continue\n")
         with (state / "recovery-probe.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
         with mock.patch.dict(os.environ, self.environment):
-            self.assertEqual(mac_test.free_now(mac_test.state_paths("linux"),
-                self.root / "linux.conf", self.root), "free")
-            answer = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("linux"),
+            self.assertEqual(mac_test.free_now(mac_test.state_paths("mac"),
+                self.root / "mac_test.conf", self.root), "free")
+            answer = build_targets.ssh_target_eligibility(target_config.configured_ssh_target("mac"),
                 self.root, "sample", "lint", targets.ANY_ELIGIBLE_TARGET)
         self.assertIsInstance(answer, targets.EligibleTarget)
         probes = (self.root / "recovery-probes").read_text().splitlines()

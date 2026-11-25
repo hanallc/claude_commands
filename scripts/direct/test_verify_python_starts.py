@@ -132,10 +132,13 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
 
             with self.subTest(fixture="nested SSH"):
                 routing = set_up_fixture(self.addCleanup, VerifySshTargetsFixture())
-                routing.configure("linux,natedev")
-                result = routing.verify("test", "sample", "--target", "linux")
+                routing.configure("mac,natedev")
+                routing.enable_mac()
+                with (routing.root / "mac_test.conf").open("a") as settings:
+                    _ = settings.write(f"linux_only.{routing.root.name}=\n")
+                result = routing.verify("test", "sample", "--target", "mac")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual([event["target"] for event in routing.ssh_events()], ["linux"])
+                self.assertEqual([event["target"] for event in routing.ssh_events()], ["mac"])
                 self.assertEqual(routing.local_runs(), [])
                 self.assertFalse(variables.keys() & routing.environment.keys())
         self.assertFalse(hook.with_suffix(".sh.ran").exists())

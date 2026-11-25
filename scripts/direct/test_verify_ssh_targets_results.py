@@ -60,27 +60,28 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
         self.assertEqual((attempt["cleanup"], attempt["unresolved_count"]), ("unconfirmed", 2))
 
     def test_no_matching_tests_have_a_distinct_durable_outcome(self) -> None:
-        self.configure("natedev,linux")
-        result = self.verify_after_ssh_result("linux", extra={"TEST_SSH_MODES": '{"linux":"no-tests"}'})
+        self.configure("natedev,mac")
+        self.enable_mac()
+        result = self.verify_after_ssh_result("mac", extra={"TEST_SSH_MODES": '{"mac":"no-tests"}'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         attempt = self.only_attempt()
         self.assertEqual((attempt["outcome"], attempt["completion"], attempt["cleanup"]),
                          ("no_tests", "confirmed", "confirmed"))
         self.assertEqual(len(self.local_runs()), 1)
 
-    def test_linux_loss_keeps_the_attempt_and_queue_age_after_local_success(self) -> None:
-        self.check_linux_loss()
+    def test_mac_loss_keeps_the_attempt_and_queue_age_after_local_success(self) -> None:
+        self.check_mac_loss()
 
-    def test_delayed_linux_probe_still_records_the_loss_before_local_success(self) -> None:
+    def test_delayed_mac_probe_still_records_the_loss_before_local_success(self) -> None:
         controls = caller_provider_controls(self, self.admission)
         read_provider = controls.reader
         reply_filter = self.admission.server.reply_filter
         release_probe = Event()
-        guard = LauncherHangGuard("the pending Linux probe reply")
+        guard = LauncherHangGuard("the pending Mac probe reply")
         received_pending_probe = False
 
         def read_after_wait(key: placement.HostEvidenceKey) -> placement.HostEvidence:
-            if key.destination.target == "linux":
+            if key.destination.target == "mac":
                 guard.event(release_probe)
             return read_provider(key)
 
@@ -89,7 +90,7 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
             if isinstance(reply, wire.PlacementWait):
                 eligibility = {candidate.destination.target: candidate.eligibility for candidate in reply.eligibility}
                 if (eligibility.get("natedev") == placement.TemporaryExclusion("blocked")
-                        and isinstance(eligibility.get("linux"), placement.EvidenceNeeded)):
+                        and isinstance(eligibility.get("mac"), placement.EvidenceNeeded)):
                     received_pending_probe = True
                     release_probe.set()
             elif isinstance(reply, wire.LocalPlacementGranted):
@@ -100,33 +101,35 @@ class VerifySshResultsTests(VerifySshTargetsFixture):
             self.admission.server, "reply_filter", side_effect=observe,
         ):
             try:
-                self.check_linux_loss()
+                self.check_mac_loss()
             finally:
                 release_probe.set()
         self.assertTrue(received_pending_probe)
 
-    def check_linux_loss(self) -> None:
-        self.configure("natedev,linux")
+    def check_mac_loss(self) -> None:
+        self.configure("natedev,mac")
+        self.enable_mac()
         first, wait_environment = self.first_wait()
-        result = self.verify_after_ssh_result("linux", extra={
-            "TEST_SSH_MODES": '{"linux":"lost"}', **wait_environment})
+        result = self.verify_after_ssh_result("mac", extra={
+            "TEST_SSH_MODES": '{"mac":"lost"}', **wait_environment})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.local_runs()), 1)
         events = self.ssh_events()
         self.assertEqual(len(events), 1, json.dumps(events) + result.stdout + result.stderr)
         attempt = self.only_attempt()
         self.assertEqual((attempt["target"], attempt["slot"], attempt["outcome"], attempt["queued_at"]),
-                         ("linux", 1, "lost", 100.25))
+                         ("mac", 1, "lost", 100.25))
         self.assertEqual(attempt["repo_identity"], "https://example.com/team/hana")
         self.assertEqual(self.routing_record()["target"], "natedev")
         self.assertEqual(first.read_text().strip(), "100.25")
 
-    def test_confirmed_linux_failure_never_repeats_the_test_locally(self) -> None:
-        self.configure("natedev,linux")
-        result = self.verify_after_ssh_result("linux", extra={"TEST_SSH_MODES": '{"linux":"failed"}'})
+    def test_confirmed_mac_failure_never_repeats_the_test_locally(self) -> None:
+        self.configure("natedev,mac")
+        self.enable_mac()
+        result = self.verify_after_ssh_result("mac", extra={"TEST_SSH_MODES": '{"mac":"failed"}'})
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(self.local_runs(), [])
         attempt = self.only_attempt()
-        self.assertEqual(self.ssh_events()[0]["result_type"], "FailedOnTarget")
+        self.assertEqual(self.ssh_events()[0]["result_type"], "FailedOnMac")
         self.assertEqual((attempt["outcome"], attempt["completion"], attempt["cleanup"]),
                          ("failed", "confirmed", "confirmed"))

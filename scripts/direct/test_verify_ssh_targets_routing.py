@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
-import io
 import json
 import os
 from pathlib import Path
@@ -12,13 +10,13 @@ from unittest import mock
 
 from scripts.aws_target import hana_placement_adapter as hana
 from scripts.build_queue import execution_identity
-from scripts.build_hold.owning_session import OwningSession
 from scripts.direct.verify_dev_features_test_support import add_dev_features
 from scripts.direct import verify_ssh_targets_test_support as support
 from scripts.build_queue import admission_protocol as wire, admission_service as service, placement
 from scripts.direct.verify_ssh_targets_test_support import VerifySshTargetsFixture
 from scripts.mac_test import claim_state, mac_test
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
+from scripts.lib import process_start
 
 
 class VerifySshRoutingTests(VerifySshTargetsFixture):
@@ -237,27 +235,30 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
                 self.assertEqual(self.ssh_events(), [])
                 self.assertEqual(self.local_runs(), [])
 
-    def test_held_local_target_does_not_block_linux_check(self) -> None:
+    def test_held_local_target_does_not_block_mac_check(self) -> None:
+        self.configure("mac,natedev")
+        self.enable_mac()
         _ = self.routing_fixture()
         result = self.verify("check", "sample", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         event, = self.ssh_events()
-        self.assertEqual(event["target"], "linux")
+        self.assertEqual(event["target"], "mac")
         self.assertIn("run", event["actions"])
         self.assertFalse(any(event["args"][:1] == ["check"] for event in self.cargo_events()))
-        self.assertEqual(self.routing_record()["target"], "linux")
+        self.assertEqual(self.routing_record()["target"], "mac")
 
-    def test_pinned_linux_test_skips_free_natedev_and_its_admission(self) -> None:
-        self.configure("natedev,linux")
-        result = self.verify("test", "sample", "--target", "linux")
+    def test_pinned_mac_test_skips_free_natedev_and_its_admission(self) -> None:
+        self.configure("natedev,mac")
+        self.enable_mac()
+        result = self.verify("test", "sample", "--target", "mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         event, = self.ssh_events()
-        self.assertEqual((event["target"], event["pinned"]), ("linux", "linux"))
+        self.assertEqual((event["target"], event["pinned"]), ("mac", "mac"))
         self.assertFalse(event["token_held"])
         self.assertEqual(event["memory_reservation"], "")
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.admission.history(), [])
-        self.assertEqual(self.routing_record()["target"], "linux")
+        self.assertEqual(self.routing_record()["target"], "mac")
         self.assertTrue(self.attempts()[0]["pinned"])
 
     def test_pinned_remote_step_records_the_target_host_and_selection(self) -> None:
@@ -277,58 +278,51 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         self.assertEqual((step["target"], step["host"], step["pinned"]), ("linux", "linux-build", True))
 
     def test_pinned_check_skips_the_initial_local_token(self) -> None:
-        self.configure("natedev,linux")
-        result = self.verify("check", "sample", "--target", "linux")
+        self.configure("natedev,mac")
+        self.enable_mac()
+        result = self.verify("check", "sample", "--target", "mac")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         event, = self.ssh_events()
-        self.assertEqual(event["target"], "linux")
+        self.assertEqual(event["target"], "mac")
         self.assertFalse(event["token_held"])
         self.assertFalse(any(row["args"][:1] == ["check"] for row in self.cargo_events()))
         self.assertEqual(self.admission.history(), [])
 
     def test_pinned_target_refusal_keeps_the_reason_and_never_runs_locally(self) -> None:
-        self.configure("natedev,linux")
-        settings = self.root / "linux_target.conf"
-        _ = settings.write_text(settings.read_text() + "version_pin_file=nixos hosts/linux-build.nix\n")
-        # Each decline reason takes the same pinned refusal branch; the offload tests check how each reason is found.
-        # These runs keep a one-word reason after the run, a long reason with spaces and a busy reason from the probe.
-        for mode, reason, detail in (
-            ("completed-decline", "state", "not running on the linux (state)"),
-            ("runtime-version-mismatch", "linux version mismatch: rustc box=rustc other natedev=rustc fixture; "
-             + "nextest box=nextest other natedev=nextest fixture; move the box pins in nixos hosts/linux-build.nix",
-             "nextest box=nextest other"),
-            ("probe-leftovers", "busy", "2 leftover processes"),
-        ):
-            with self.subTest(mode=mode):
-                self.clear_observations()
-                (self.home / ".local/state/build-targets/linux/unreachable_until").unlink(missing_ok=True)
-                result = self.verify("test", "sample", "--target", "linux",
-                                     extra={"TEST_SSH_MODES": json.dumps({"linux": mode})})
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("target linux refused: " + reason, result.stderr)
-                self.assertIn(detail, result.stdout + result.stderr)
-                self.assertEqual(self.local_runs(), [])
-                self.assertEqual(self.admission.history(), [])
-                self.assertEqual(self.attempts()[-1]["reason"], reason)
+        self.configure("natedev,mac")
+        self.enable_mac()
+        self.write_executable(self.runner, support.SSH_RUNNER.replace(
+            '    elif mode == "runtime-version-mismatch":',
+            '    elif mode == "nextest-setup-failed":\n'
+            + '        wire, status = offload.MAC_NEXTTEST_SETUP_FAILURE + "\\nmac_cleanup=0\\n", 101\n'
+            + '    elif mode == "runtime-version-mismatch":'))
+        result = self.verify("test", "sample", "--target", "mac",
+                             extra={"TEST_SSH_MODES": '{"mac":"nextest-setup-failed"}'})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("target mac refused: state", result.stderr)
+        self.assertIn("not running on the mac (state)", result.stdout + result.stderr)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.admission.history(), [])
+        self.assertEqual(self.attempts()[-1]["reason"], "state")
 
-                if mode == "completed-decline":
-                    with self.admission.loop_turn():
-                        saved = [saved for saved in self.admission.server.assignments.values()
-                                 if isinstance(saved.permission, placement.PermissionConsumed)]
-                        self.assertTrue(saved)
-                        for attempt in saved:
-                            if isinstance(attempt.state, placement.CurrentAssignment):
-                                submitted = self.admission.server.placement_requests[attempt.assignment.episode]
-                                key = self.admission.server.host_evidence_key(submitted, attempt.assignment.destination)
-                                self.admission.server.publish_host_evidence(self.admission.server.host_probe(key))
-                    _ = self.admission.run_pass()
-                    with self.admission.loop_turn():
-                        self.assertTrue(all(isinstance(self.admission.server.assignments[execution_identity.attempt_key(
-                            attempt.assignment.episode, attempt.assignment.attempt)].state, placement.ClosedAssignment)
-                            for attempt in saved), repr(saved) + result.stdout + result.stderr)
+        with self.admission.loop_turn():
+            saved = [saved for saved in self.admission.server.assignments.values()
+                     if isinstance(saved.permission, placement.PermissionConsumed)]
+            self.assertTrue(saved)
+            for attempt in saved:
+                if isinstance(attempt.state, placement.CurrentAssignment):
+                    submitted = self.admission.server.placement_requests[attempt.assignment.episode]
+                    key = self.admission.server.host_evidence_key(submitted, attempt.assignment.destination)
+                    self.admission.server.publish_host_evidence(self.admission.server.host_probe(key))
+        _ = self.admission.run_pass()
+        with self.admission.loop_turn():
+            self.assertTrue(all(isinstance(self.admission.server.assignments[execution_identity.attempt_key(
+                attempt.assignment.episode, attempt.assignment.attempt)].state, placement.ClosedAssignment)
+                for attempt in saved), repr(saved) + result.stdout + result.stderr)
 
     def test_prelaunch_failure_ends_pinned_and_placed_builds_after_one_attempt(self) -> None:
-        self.configure("natedev,linux")
+        self.configure("natedev,mac")
+        self.enable_mac()
         _ = self.hold_memory()
         self.write_executable(self.runner, r'''
 import os
@@ -339,22 +333,44 @@ assert "--assignment-file" in sys.argv
 with (Path(os.environ["TEST_RUNNER_STATE"]) / "source-captures").open("a") as attempts:
     attempts.write("capture\n")
 Path(sys.argv[sys.argv.index("--result") + 1]).write_text(
-    "outcome=prelaunch_failed\ntarget=linux\nreason=\nseconds=0\n")
-print("The build did not run on linux. Fix the source refusal (IgnoredInput).")
-raise SystemExit(1)
+    "mac=prelaunch_failed\nreason=history_key_unavailable\nseconds=0\n")
+print("The build did not run on mac. Fix the source refusal (IgnoredInput).")
+raise SystemExit(15)
 ''')
         captures = self.runner_state / "source-captures"
-        for target in (("--target", "linux"), ()):
+        for target in (("--target", "mac"), ()):
             with self.subTest(pinned=bool(target)):
                 captures.unlink(missing_ok=True)
                 result = self.verify("check", "sample", *target)
-                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.returncode, 15, result.stdout + result.stderr)
                 self.assertEqual(captures.read_text().splitlines(), ["capture"])
-                self.assertEqual(result.stdout.count("The build did not run on linux."), 1)
+                self.assertEqual(result.stdout.count("The build did not run on mac."), 1)
                 self.assertEqual(self.local_runs(), [])
 
     def test_pinned_hana_command_admission_refusal_prints_one_cause(self) -> None:
         self.configure("natedev,linux")
+        settings = self.root / "hana_aws.conf"
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text().replace("settings.linux=linux_target.conf", "settings.linux=hana_aws.conf"))
+        _ = write_config_fixture(settings,
+            "enabled=on\nexecution_transport=hana-control\nhost=fake-hana\n"
+            + "repository_identity=https://example.com/team/hana\nkinds=check,lint\n", template="hana_aws")
+        helper = self.root / "hana-targets.py"
+        self.write_executable(helper, r'''
+import os
+from pathlib import Path
+import sys
+
+source = Path(os.environ["TEST_SOURCE_REPO"])
+arguments = sys.argv[1:]
+''' + support.BUILD_TARGETS_STATUS + r'''
+from unittest import mock
+from scripts.aws_target import hana_placement
+
+transport = hana_placement.HanaControlTransport(Path(os.environ["TEST_HANA_SETTINGS"]), "fake-hana")
+with mock.patch.object(hana_placement, "validate_assignment", return_value=transport):
+    raise SystemExit(build_targets_status())
+''')
         self.write_executable(self.runner, r'''
 import os
 from pathlib import Path
@@ -372,11 +388,13 @@ raise SystemExit(75)
                       "Hana command admission is disabled on the guest"):
             with self.subTest(cause=cause):
                 attempts.unlink(missing_ok=True)
-                result = self.verify("check", "sample", "--target", "linux", extra={"TEST_GUEST_REFUSAL": cause})
+                result = self.verify("check", "sample", "--target", "linux", extra={
+                    "TEST_GUEST_REFUSAL": cause, "BUILD_TARGETS_SCRIPT": str(helper),
+                    "TEST_HANA_SETTINGS": str(settings)})
                 output = result.stdout + result.stderr
                 self.assertEqual(result.returncode, 2, output)
                 self.assertEqual([line for line in output.splitlines() if "target linux refused:" in line],
-                                 [f"verify.sh: target linux refused: {cause}"])
+                                 [f"verify.sh: target linux refused: {cause}"], output)
                 self.assertEqual(output.count(cause), 1)
                 self.assertEqual(attempts.read_text().splitlines(), ["attempt"])
                 self.assertEqual(self.local_runs(), [])
@@ -478,48 +496,25 @@ raise SystemExit(75)
                          [f"verify.sh: target hana-gpu refused: admission service unavailable: {reason}"], output)
         self.assertEqual(self.local_runs(), [])
 
-    def test_pinned_toolchain_mismatch_records_a_repository_decline(self) -> None:
-        from scripts.mac_test import eligibility, offload
-
-        self.configure("natedev,linux")
-        state = self.target_state("linux")
-        _ = (state / "box-tools.json").write_text(json.dumps({"versions": {"rustc": "rustc other"}}))
-        reason = ("linux version mismatch: rustc box=rustc other natedev=rustc fixture; "
-                  "move the box pins in nixos hosts/linux-build.nix")
-        with mock.patch.object(eligibility, "state_directory", return_value=state):
-            path = eligibility.linux_version_decline_path("linux", self.root.name)
-            self.assertFalse(path.exists())
-            result = self.verify("test", "sample", "--target", "linux")
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("target linux refused: " + reason, result.stderr)
-            self.assertIn("rustc box=rustc other natedev=rustc fixture", result.stdout + result.stderr)
-            recorded_at = float(path.read_text())
-            self.assertTrue(offload.linux_version_declined_recently("linux", self.root.name, 60, recorded_at + 1))
-            self.assertFalse(offload.linux_version_declined_recently("linux", "other-repository", 60, recorded_at + 1))
-        self.assertEqual(self.attempts()[-1]["reason"], reason)
-        self.assertNotIn("probe", self.ssh_events()[-1]["actions"])
-        self.assertNotIn("run", self.ssh_events()[-1]["actions"])
-        self.assertEqual(self.local_runs(), [])
-        self.assertEqual(self.admission.history(), [])
-
-
-    def test_pinned_test_keeps_its_live_record_until_linux_becomes_available(self) -> None:
+    def test_pinned_test_keeps_its_live_record_until_mac_becomes_available(self) -> None:
         self.assert_pinned_wait_keeps_its_live_record("test")
 
-    def test_pinned_check_keeps_its_live_record_until_linux_becomes_available(self) -> None:
+    def test_pinned_check_keeps_its_live_record_until_mac_becomes_available(self) -> None:
         self.assert_pinned_wait_keeps_its_live_record("check")
 
     def assert_pinned_wait_keeps_its_live_record(self, kind: str) -> None:
-        self.configure("natedev,linux")
-        paths = claim_state.StatePaths(self.target_state("linux"), "linux",
-                                       registry_selected=True, platform="linux")
-        args = mac_test.CliArguments()
-        args.target, args.worktree, args.pid = "linux", str(self.root), os.getpid()
-        args.what = "private fixture work"
-        owner = OwningSession("86c49103-6143-4766-a2d8-f8041f7a9174")
-        with mock.patch.object(mac_test, "target_claim_scope", return_value=claim_state.WHOLE_MAC), \
-             redirect_stdout(io.StringIO()):
-            self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, session=owner), 0)
+        self.configure("natedev,mac")
+        self.enable_mac()
+        paths = claim_state.StatePaths(Path(self.environment["MAC_TEST_STATE_DIR"]), "mac", platform="macos")
+        start = process_start.process_start(os.getpid())
+        assert isinstance(start, process_start.Started)
+        owner = "86c49103-6143-4766-a2d8-f8041f7a9174"
+        paths.directory.mkdir(parents=True, exist_ok=True)
+        mac_test.write_json(paths.run, {
+            "claim_id": "fixture-busy-claim", "episode": "fixture-busy-episode", "attempt": "fixture-busy-attempt",
+            "pid": os.getpid(), "proc_start": start.start, "submitting_session": owner, "holder_session": owner,
+            "worktree": str(self.root), "what": "private fixture work", "since": "2026-11-01T00:00:01+00:00",
+        })
         waiter = self.root / "capture-pinned-wait.py"
         self.write_executable(waiter, r'''
 import json
@@ -538,7 +533,7 @@ if not snapshot.exists():
     Path(os.environ["TEST_BUSY_CLAIM"]).unlink()
 runpy.run_path(str(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/direct/local_release_wait.py"), run_name="__main__")
 ''')
-        result = self.verify(kind, "sample", "--target", "linux", extra={
+        result = self.verify(kind, "sample", "--target", "mac", extra={
             "TEST_BUSY_CLAIM": str(paths.run), "VERIFY_LOCAL_RELEASE_WAIT_SCRIPT": str(waiter)})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         replies = [wire.parse_reply(json.dumps(reply))
@@ -547,13 +542,13 @@ runpy.run_path(str(Path(os.environ["TEST_SOURCE_REPO"]) / "scripts/direct/local_
         waits = [reply.wait for reply in replies if isinstance(reply, wire.PlacementWait)
                  and isinstance(reply.wait, wire.PlacementResourceWait)]
         self.assertTrue(waits)
-        self.assertTrue(all(wait.resource == "linux" and wait.reason == "busy" for wait in waits))
+        self.assertTrue(all(wait.resource == "mac" and wait.reason == "busy" for wait in waits))
         self.assertIn("busy: private fixture work since ", result.stderr)
         row = cast(dict[str, object], json.loads((self.runner_state / "waiting-step.json").read_text()))
-        self.assertEqual((row["pinned_target"], row["state"]), ("linux", "waiting_ssh"))
+        self.assertEqual((row["pinned_target"], row["state"]), ("mac", "waiting_ssh"))
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.admission.history(), [])
-        self.assertEqual([event["target"] for event in self.ssh_events()], ["linux"])
+        self.assertEqual([event["target"] for event in self.ssh_events()], ["mac"])
 
     def test_pinned_target_rejects_unknown_names_and_accepts_natedev(self) -> None:
         result = self.verify("test", "sample", "--target", "unknown")

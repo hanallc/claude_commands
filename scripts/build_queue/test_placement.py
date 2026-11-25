@@ -4253,12 +4253,12 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                 repository = fixture.root / "hana"
                 (repository / ".git").mkdir(parents=True)
                 _ = (fixture.root / "build_targets.conf").write_text(
-                    "targets=box\nkind.box=ssh\nplatform.box=linux\nsettings.box=box.conf\n" + UNREACHABLE_WAIT_FIXTURE)
+                    "targets=box\nkind.box=ssh\nplatform.box=macos\nsettings.box=box.conf\n" + UNREACHABLE_WAIT_FIXTURE)
                 _ = write_config_fixture(fixture.root / "box.conf",
-                    "offload=on\nhost=fixture-box\nkinds=test,lint,check,doc,build\n", template="mac_test")
+                    "offload=on\nhost=fixture-box\nlinux_only.hana=\n", template="mac_test")
                 request = placement_request(fixture)
                 assert isinstance(request.profile, records.StepProfile)
-                destination = placement.PlacementDestination("ssh", "box", "fixture-box", RepositoryScope("hana"))
+                destination = placement.PlacementDestination("mac", "box", "fixture-box", RepositoryScope("hana"))
                 request = replace(request, profile=replace(request.profile, step=step), constraints=replace(
                     request.constraints, repository=str(repository), candidates=(placement.PlacementCandidate(destination),)))
                 key = fixture.server.host_evidence_key(request, destination)
@@ -4266,9 +4266,11 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
                 def ssh_reply(arguments: Sequence[str],
                               deadline: offload.CommandDeadline = offload.NO_COMMAND_TIME_LIMIT) -> offload.CommandOutput:
-                    self.assertEqual((arguments[0], arguments[-2], arguments[-1]), ("ssh", "fixture-box", "true"))
+                    self.assertEqual(arguments[0], "ssh")
+                    self.assertEqual(arguments[-2], "fixture-box")
+                    self.assertIn('df -g "$HOME"', arguments[-1])
                     self.assertIsInstance(deadline, offload.CommandTimeLimit)
-                    return offload.CommandOutput(0, "", "")
+                    return offload.CommandOutput(0, "free_gib=1000\nhost=fixture-box\nrc=0\n", "")
 
                 with mock.patch.object(offload.ProcessController, "capture", side_effect=ssh_reply):
                     evidence = fixture.read_host_evidence(key)
@@ -4313,12 +4315,13 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
     def test_bad_needed_key_uses_the_committed_value_with_one_anomaly(self) -> None:
         with PlacementFixture() as fixture, fixture.loop_turn():
-            settings, request, destination = self.target_settings_fixture(fixture)
+            settings, request, destination = self.target_settings_fixture(fixture, platform="macos")
+            _ = write_config_fixture(settings, "offload=on\nlinux_only.hana=\n", template="mac_test")
             self.commit_settings(settings)
             _ = settings.write_text(settings.read_text().replace("execution_transport=ssh", "execution_transport=broken"))
             warnings = io.StringIO()
             with (redirect_stderr(warnings), mock.patch.object(offload.ProcessController, "capture",
-                                                               return_value=offload.CommandOutput(0, "", ""))):
+                                                               return_value=offload.CommandOutput(0, "free_gib=1000\nhost=fixture\nrc=0\n", ""))):
                 evidence = self.read_target(fixture, request)
                 fixture.server.publish_host_evidence(evidence)
                 self.assertEqual(assignment_for(fixture, request).destination, destination)
@@ -4326,8 +4329,10 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
     def test_bad_needed_key_only_excludes_its_target(self) -> None:
         with PlacementFixture() as fixture, fixture.loop_turn():
-            settings, request, destination = self.target_settings_fixture(fixture)
+            settings, request, destination = self.target_settings_fixture(fixture, platform="macos")
             _ = settings.write_text(settings.read_text().replace("probe_timeout_s=10", "probe_timeout_s=broken"))
+            registry = fixture.root / "build_targets.conf"
+            _ = registry.write_text(registry.read_text().replace("platform.healthy=linux", "platform.healthy=macos"))
             healthy = replace(destination, target="healthy")
             healthy_only = replace(request, constraints=replace(request.constraints,
                 candidates=(placement.PlacementCandidate(healthy),)))

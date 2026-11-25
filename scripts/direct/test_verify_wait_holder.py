@@ -20,7 +20,7 @@ from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY, VerifyT
 from scripts.direct.verify_hold_wait_test_support import VerifyHoldWaitFixture, recorded_holders, wait_for_verify_state, wait_rows
 from scripts.direct.verify_lint_scope_test_support import CARGO_STUB, SCRIPTS, TAPLO_STUB
 from scripts.build_queue.admission_test_support import PrivateHostEvidence, caller_admission, caller_provider_controls
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.shell_test_support import shell_functions
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import FixtureHang, TEST_HANG_GUARD_SECS
@@ -633,9 +633,7 @@ def main():
     if inject:
         if os.environ["TEST_RACE_WITH_CLAIM"] == "0":
             return 1
-        paths = mac_test.state_paths("linux-box")
-        scope = mac_test.target_claim_scope(paths, str(root))
-        claim = mac_test.claim_path(paths, scope)
+        claim = mac_test.state_paths("mac").run
         claim.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(claim, os.environ["TEST_RACE_CLAIM_JSON"])
         (root / "reservation-raced").write_text(str(claim))
@@ -644,8 +642,7 @@ def main():
         with (root / "reservation-results").open("a") as output:
             output.write(str(status) + "\\n")
     if inject and status == 11:
-        # Temporary hold; queue 44ds (A busy Linux reservation gets no second assignment from old evidence) removes it.
-        # See verify.sh:3174 and admission_service.py:4250.
+        # Wait for the queue to read the claim before the caller returns to placement.
         wait_for_file(root / "reservation-observed")
     return status
 
@@ -741,16 +738,9 @@ if "--assignment-file" in arguments:''', 1)
             self.assertEqual(started, finished, snapshot)
         return snapshots
 
-    def test_pinned_linux_reservation_race_waits_only_with_a_live_claim(self) -> None:
+    def test_pinned_mac_reservation_race_waits_only_with_a_live_claim(self) -> None:
         _ = self.prepare_target_wait(pauses=1)
         root = self.fixture.root
-        settings = root / "linux-box.conf"
-        _ = write_config_fixture(settings, "offload=on\nhost=fake-linux\nkinds=test,check\n"
-                                 + f"probe_timeout_s={TARGET_PROBE_TIMEOUT_SECONDS}\n",
-                                 template="mac_test")
-        _ = (root / "build_targets.conf").write_text(
-            "targets=linux-box,natedev\nkind.linux-box=ssh\nplatform.linux-box=linux\n"
-            + "settings.linux-box=linux-box.conf\nkind.natedev=local\nplatform.natedev=linux\n" + UNREACHABLE_WAIT_FIXTURE)
         wrapper = root / "reservation-race.py"
         _ = wrapper.write_text(RESERVATION_RACE_TOOL)
         owner = self.claim(root / "race-owner.json", NEXT_SESSION)
@@ -758,15 +748,15 @@ if "--assignment-file" in arguments:''', 1)
                                          "TEST_RACE_CLAIM_JSON": json.dumps(owner)})
         with self.subTest(reservation="no live claim"):
             self.fixture.environment["TEST_RACE_WITH_CLAIM"] = "0"
-            refused = self.start("check", "sample", "--target", "linux-box", "--no-cache")
+            refused = self.start("check", "sample", "--target", "mac", "--no-cache")
             code, output = self.finish(refused)
             self.assertEqual(code, 2, output)
-            self.assertIn("target linux-box refused: admission changed", output)
+            self.assertIn("target mac refused: state", output)
             self.assertEqual(wait_rows(Path(self.fixture.environment["UNIT_RUN_DIR"])), [])
             self.assertEqual(self.fixture.runner_events(), [])
         with self.subTest(reservation="live claim"):
             self.fixture.environment["TEST_RACE_WITH_CLAIM"] = "1"
-            process = self.start("check", "sample", "--target", "linux-box", "--no-cache")
+            process = self.start("check", "sample", "--target", "mac", "--no-cache")
             admission = caller_admission(self.fixture, root, self.fixture.environment)
 
             def claim_observed() -> bool:
@@ -775,11 +765,11 @@ if "--assignment-file" in arguments:''', 1)
                                and isinstance(evidence.holder_claim, placement.ProviderClaimReference)
                                and evidence.holder_claim.claim_id == owner["claim_id"]
                                for key, reader in admission.server.host_readers.items()
-                               if key.destination.target == "linux-box")
+                               if key.destination.target == "mac")
 
             wait_for_verify_state(claim_observed, admission.state_dir, process, "the provider reading for the new claim")
             (root / "reservation-observed").touch()
-            expected = named_holder("slot", "linux-box", NEXT_SESSION)
+            expected = named_holder("slot", "mac", NEXT_SESSION)
             rows = self.pause(process, 1, expected)
             self.assertEqual(recorded_holders(rows), [expected])
             self.assertEqual((root / "reservation-results").read_text().splitlines(), ["11"])

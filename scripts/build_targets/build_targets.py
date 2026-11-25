@@ -32,7 +32,7 @@ from scripts.build_hold import owning_session as session_owner
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
 from scripts.build_hold import override_guard
 from scripts.mac_test import claim_state
-from scripts.build_targets.execution_transport import HanaGpuNextestTransport
+from scripts.build_targets.execution_transport import HanaGpuNextestTransport, SshCommandTransport
 from scripts.lib import conf
 from scripts.lib.display_text import display_field
 from scripts.build_queue.placement import (
@@ -1174,7 +1174,13 @@ def reserve_assigned(args: CliArguments) -> int:
     assignment = saved.assignment
     target = target_config.configured_ssh_target(assignment.destination.target)
     from scripts.aws_target import hana_placement
+    from scripts.mac_test import eligibility
+
     transport = target_config.read_execution_transport(target)
+    if (target.platform == "linux" and target.name != eligibility.MAC_LINUX_TARGET
+            and isinstance(transport, SshCommandTransport)):
+        print(eligibility.LINUX_SSH_OFFLOAD_REFUSED, file=sys.stderr)
+        return 1
     if isinstance(transport, hana_placement.HanaControlTransport):
         from scripts.buildlog import store
         from scripts.lib import process_start
