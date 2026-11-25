@@ -222,6 +222,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/hooks/stop-direct-continue.py` | read | local_by_current_session, unit_command, local_snapshot; active_dispatch reads the worker's fixed staff ID |
 | `scripts/hooks/user-prompt-submit-conversation-pause.py` | read | StaffSnapshot (type); conversation_pause.session_staff reads the row |
 | `scripts/lib/build_copies.py` | read | local_snapshot, RemovedWorktree, StaffUnreadable |
+| `scripts/lib/python_startup/sitecustomize.py` | read | `TEST_RUNNER_FILES` lists `staff.py` for the removal guard in test checkouts. |
 | `scripts/lib/relaunch.py` | read | snapshot, by_current_session |
 | `scripts/lib/removal_guard.py` | read | snapshot, all_rows, StaffRefused, PresentWorktree, RemovedWorktree; known_names reads unit and repository names |
 | `scripts/lib/resume_message.py` | read | StaffId |
@@ -385,7 +386,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 228 accessor rows (41 write, 186 read, and 1 owner).
+The table has 241 accessor rows (41 write, 199 read, and 1 owner).
 
 ## Approved copies
 

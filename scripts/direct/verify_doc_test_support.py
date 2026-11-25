@@ -195,7 +195,7 @@ class VerifyDocFixture(unittest.TestCase):
             "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
-        private = private_copy_config(self.root, repository=self.repo.name)
+        private = private_copy_config(self.root)
         copy_settings = private.settings.read_text().splitlines(keepends=True)
         for key, value in (("locks.probe_wait_seconds", "0.25"), ("locks.probe_retry_seconds", "1")):
             line, _ = conf.editable_line(private.settings, key)

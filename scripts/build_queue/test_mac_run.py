@@ -1607,8 +1607,8 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
             run.assert_not_called()
 
             def take_over_then_claim(current: offload.ProcessController, _config: eligibility.OffloadConfig,
-                                     _request: offload.OffloadRequest, _repo: eligibility.RepositoryIdentity, *,
-                                     retire_wait: bool,
+                                     _request: offload.OffloadRequest, _repo: eligibility.RepositoryIdentity,
+                                     *, retire_wait: bool,
                                      mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository,
                                      ) -> offload.TakenOverMacClaim | offload.FreshMacClaim:
                 self.assertFalse(retire_wait)

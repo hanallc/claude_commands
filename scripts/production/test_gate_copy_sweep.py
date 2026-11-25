@@ -101,7 +101,7 @@ class NightlyCopySweepTests(unittest.TestCase):
     def test_local_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
         for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
-                config = private_copy_config(Path(temporary), repository="fixture")
+                config = private_copy_config(Path(temporary))
                 events: list[str] = []
                 notices: list[str] = []
 
@@ -148,7 +148,7 @@ class NightlyCopySweepTests(unittest.TestCase):
     def test_mac_sweep_failure_reports_once_and_keeps_the_nightly_result(self) -> None:
         for status in (0, 1, 75):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
-                config = private_copy_config(Path(temporary), repository="fixture")
+                config = private_copy_config(Path(temporary))
                 notices: list[str] = []
 
                 def run(argv: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
@@ -177,7 +177,7 @@ class NightlyCopySweepTests(unittest.TestCase):
 
     def test_gate_failure_still_sweeps_both_pools(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            config = private_copy_config(Path(temporary), repository="fixture")
+            config = private_copy_config(Path(temporary))
             events: list[str] = []
 
             def nightly(args: gate.GateArguments, target: gate.GateTarget) -> int:

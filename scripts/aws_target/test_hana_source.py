@@ -78,7 +78,7 @@ class HanaSourceTests(unittest.TestCase):
             'wait_seconds=1\ngit_timeout_seconds=60\nguard_timeout_seconds=10\n')
         _ = (config_dir / 'build_targets.conf').write_text(
             '# range: 0.001..\nloopback.shell_timeout_s=120\n')
-        private = private_copy_config(self.root, repository='hana')
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.enterContext(mock.patch.dict(os.environ, {'HOME': str(self.root / 'home')}))
 

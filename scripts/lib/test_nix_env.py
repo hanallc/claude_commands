@@ -391,7 +391,7 @@ class RegisteredCopyTests(GitNixFixture):
             self.register(repository, checkout)
             yield checkout
             return
-        private = private_copy_config(self.root, repository=repository.name)
+        private = private_copy_config(self.root)
         nix_settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         _ = private.settings.with_name("nix_env.conf").write_bytes(nix_settings.read_bytes())
         if kind == "trusted-numbered":
@@ -450,7 +450,7 @@ class RegisteredCopyTests(GitNixFixture):
 
     def test_ensure_holds_an_idle_copy_during_proof_and_refuses_a_busy_copy(self) -> None:
         repository = self.repository(self.home / "rust/repo")
-        private = private_copy_config(self.root, repository=repository.name)
+        private = private_copy_config(self.root)
         nix_settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         _ = private.settings.with_name("nix_env.conf").write_bytes(nix_settings.read_bytes())
         with patch.dict(os.environ, private.environment):

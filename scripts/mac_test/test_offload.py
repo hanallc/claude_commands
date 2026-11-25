@@ -626,7 +626,8 @@ class OffloadSettingsTests(unittest.TestCase):
               mock.patch.object(offload, "check_taken_over_claim", return_value=offload.LeftoversEnded()),
               mock.patch.object(offload, "release_claim", return_value=offload.ClaimReleaseConfirmed()) as release,
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, lease)
+            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, lease,
+                                            admission_slot=1)
             assert isinstance(result, offload.DeclinedMacRun)
             self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
 

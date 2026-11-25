@@ -614,7 +614,7 @@ class MemoryFeedTests(unittest.TestCase):
             with self.subTest(expected=expected), mock.patch.object(subprocess, "run", return_value=result):
                 self.assertEqual(REQUEST_TOKEN_DUMP(), expected)
 
-    def test_running_rows_report_folders_and_matching_homes(self) -> None:
+    def test_running_rows_keep_the_natedev_and_mac_run_folders(self) -> None:
         local_home = self.root / "local-home"
         mac_home = self.root / "remote-home"
         local_folder = str(local_home / "build/hana/unit/2")
@@ -632,13 +632,15 @@ class MemoryFeedTests(unittest.TestCase):
                       mock.patch.object(memory_feed, "host_name", return_value="natedev"),
                       mock.patch.object(queue_view, "read_mac_builds", return_value=mac)):
                     page = memory_feed.reading()
-                rows = {row.get("machine"): row for row in page["walk"]}
-                self.assertEqual(rows["natedev"].get("run_folder"),
-                                 memory_feed.RecordedRunFolder(local_folder, str(local_home)))
-                self.assertEqual(rows["mac"].get("run_folder"), memory_feed.RecordedRunFolder(mac_folder, home))
-                for row in (rows["natedev"], rows["mac"], *page["waiters"]):
+                for machine, folder, folder_home in (("natedev", local_folder, str(local_home)),
+                                                     ("mac", mac_folder, home)):
+                    row, = [row for row in page["walk"] if row.get("machine") == machine]
+                    self.assertEqual(row.get("run_folder"), memory_feed.RecordedRunFolder(folder, folder_home))
                     self.assertEqual(staff_names.parts_text(row.get("name_parts", [])), row["name"])
-                self.assertTrue(all("run_folder" not in row for row in page["waiters"]))
+                self.assertTrue(page["waiters"])
+                for waiter in page["waiters"]:
+                    self.assertEqual(staff_names.parts_text(waiter.get("name_parts", [])), waiter["name"])
+                    self.assertNotIn("run_folder", waiter)
 
     def test_mac_reading_collects_and_preserves_the_remote_home(self) -> None:
         mac_home = str(self.root / "remote-home")

@@ -274,7 +274,7 @@ function render(){}
 function renderCards(){}
 const fetch=async(url)=>{
  if(url==='measure') return {ok:true,json:async()=>({state:'started',target:1})};
- if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
+ if(stalled) return new Promise(()=>pendingReads.push(url.split('?')[0]));
  return {ok:true,json:async()=>({measured_at:fileAt,render_seconds:.03,drives:[]})};
 };
 START
@@ -285,7 +285,7 @@ START
  check(!parts.age.hidden && parts.age.textContent==='70 min ago',
   'The first measure must record the old data age.');
  stalled=true;void pageRefresh.refresh();
- check(pendingReads.length===1,'The Disks read must remain pending.');
+ check(pendingReads.length===1 && pendingReads[0]===DATA_FILE,'Only the Disks data read must be pending.');
  const ageLimit=JSON.parse(line.dataset.statusOptions).ageLimit;
  now+=(Math.max(settings.wait_seconds,ageLimit)+1)*1000;pageRefresh.changed();
  check(line.dataset.state==='Late' && parts.reason.textContent==='The feed has stopped.',

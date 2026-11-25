@@ -3868,7 +3868,8 @@ def run_offload(
                 write_mirror_busy(config, repository.name, request.target)
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
             result = leased_offload(controller, config, request, repository, started, linux, admission_leases,
-                                    admission_slot=admission_slot, mac_repository=mac_repository, retire_wait=retire_wait,
+                                    admission_slot=admission_slot,
+                                    mac_repository=mac_repository, retire_wait=retire_wait,
                                     cleanup_takeover=cleanup_takeover)
         if isinstance(result, ClaimReleaseConfirmed):
             if isinstance(request.placement, AssignedOffloadRequest):
@@ -3967,7 +3968,7 @@ def claim_refusal(controller: ProcessController, request: OffloadRequest, claim:
 
 def leased_offload(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
                    repository: KnownRepository, started: float, linux: bool,
-                   lease: ExitStack, *, admission_slot: int = 1,
+                   lease: ExitStack, *, admission_slot: int,
                    mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository
                    = claim_state.NO_SAVED_MAC_REPOSITORY,
                    retire_wait: bool = False,

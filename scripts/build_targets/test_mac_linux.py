@@ -963,7 +963,7 @@ class MacLinuxRouteTests(unittest.TestCase):
         _ = (config / 'machines.conf').write_text(
             'aliases=natedev mac\nnatedev.platform=linux\nnatedev.hosts=natedev\n'
             + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
-        _ = write_config_fixture(config / 'build_folders.conf', '# whole: 1..\nslots.fixture-mac.default_max=1\n')
+        _ = write_config_fixture(config / 'build_folders.conf')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'GATE_STATE_DIR': str(self.root / 'gate-state'),
             'GATE_PASSED_DIR': str(self.root / 'gate-passes'),

@@ -36,7 +36,7 @@ from uuid import UUID
 
 
 from scripts.lib import (
-    build_folders, build_copies, cancellation, conf, copy_record, file_lock, git_index, git_rescue,
+    build_copies, build_folder_lock, build_folders, cancellation, conf, copy_record, file_lock, git_index, git_rescue,
     process_start, scratch, session_folder,
 )
 from scripts.lib.copy_record import (
@@ -2463,7 +2463,8 @@ def mirror_has_process(tree: Path, processes: MirrorProcessScan) -> bool:
 
 
 @contextmanager
-def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Generator[None]:
+def local_mirror_lease(tree: Path, session: str, *, create: bool = True,
+                       create_tree: bool = True) -> Generator[None]:
     """Lock the mirror before any claim or record operation."""
     if not create and not tree.parent.exists():
         yield
@@ -2494,7 +2495,7 @@ def local_mirror_lease(tree: Path, session: str, *, create: bool = True) -> Gene
             except OSError:
                 held = "unreadable"
             raise CopyError(f"{tree}: busy; held by session {held} ({check})")
-        if create:
+        if create and create_tree:
             tree.mkdir(parents=True, exist_ok=True)
             write_text_atomic(tree / floor_claims.MIRROR_SESSION, session + "\n")
         token = COMMAND_LOCKS.set((*COMMAND_LOCKS.get(), *claims, *(lease.fileno() for lease in lease_files)))
@@ -2604,17 +2605,37 @@ def remove_remote_mirror(mirror: RemoteMirror) -> None:
     unregister_remote(mirror.host, mirror.path)
 
 
-def clear_mirror_content(tree: Path) -> None:
-    """Remove the payload before the mirror metadata."""
-    for child in tree.iterdir():
-        if child.name in floor_claims.MIRROR_METADATA:
-            continue
-        if child.is_dir() and not child.is_symlink():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
-    for name in floor_claims.MIRROR_METADATA:
-        (tree / name).unlink(missing_ok=True)
+def _remove_mirror_tree(tree: Path, pending: dict[str, object]) -> None:
+    def delete(staged: build_folders.CheckedRemovalTree) -> None:
+        staged.remove(metadata_last=floor_claims.MIRROR_METADATA)
+
+    def record_stage(staged: build_folders.CheckedRemovalTree) -> None:
+        if not build_folder_lock.parent_current(tree, staged.parent):
+            raise CopyError(f"{tree}: the mirror parent changed")
+        stage = build_folders.StagedRemoval.from_tree(staged)
+        write_text_atomic(floor_claims.removal_authority_path(tree), json.dumps({**pending, **stage.fields()}) + "\n")
+
+    if not build_folders.remove_build_folder(tree, wait=False, delete=delete, before_stage=record_stage):
+        raise CopyError(f"{tree}: guarded removal refused")
+
+
+def recover_mirror_stage(tree: Path, pending: dict[str, object]) -> None:
+    """Remove the saved stage before using or clearing the authority."""
+    try:
+        stage = build_folders.StagedRemoval.read(pending)
+    except ValueError as error:
+        raise CopyError(f"{tree}: {error}") from error
+    if stage is not None:
+        if not stage.recover(tree):
+            raise CopyError(f"{tree}: the staged mirror could not be removed")
+        for key in stage.fields():
+            _ = pending.pop(key)
+
+
+def clear_mirror_content(tree: Path, pending: dict[str, object]) -> None:
+    """Remove the mirror under its lease and make an empty mirror."""
+    _remove_mirror_tree(tree, pending)
+    tree.mkdir()
 
 
 @contextmanager
@@ -2640,6 +2661,9 @@ def mirror_remove(args: CopyArguments) -> int:
             raw = floor_claims.read_mirror_record(record if record.exists() else authority)
             if copy_owner(str(raw.get("owner", ""))) != copy_owner(args.owner) or raw.get("repo") != args.repository:
                 raise CopyError(f"{tree}: remote mirror belongs to another owner or repository")
+            if authority.exists():
+                pending = floor_claims.read_mirror_record(authority) if record.exists() else raw
+                recover_mirror_stage(tree, pending)
             if tree.exists():
                 task_record = copy_record.record_path(tree)
                 clone_path = (args.host == "localhost" and OWNER.fullmatch(args.owner) is not None
@@ -2669,8 +2693,7 @@ def mirror_remove(args: CopyArguments) -> int:
                         for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
                             lock.unlink(missing_ok=True)
                 else:
-                    clear_mirror_content(tree)
-                    tree.rmdir()
+                    _remove_mirror_tree(tree, raw)
             if scratch.removal_mark(tree).exists() or scratch.cargo_removal_mark(tree).exists():
                 scratch.remove_marked(tree)
             authority.unlink(missing_ok=True)
@@ -3040,11 +3063,13 @@ def receive_metadata(tree: Path, args: CopyArguments) -> None:
     previous = floor_claims.read_mirror_record(record) if record.exists() else {}
     if authority.exists():
         pending = floor_claims.read_mirror_record(authority)
+        recover_mirror_stage(tree, pending)
         # A different record identifies a complete replacement. Keep its content.
-        if not record.exists() or previous == pending:
-            clear_mirror_content(tree)
+        if tree.exists() and (not record.exists() or previous == pending):
+            clear_mirror_content(tree, pending)
         if not previous:
             previous = pending
+    tree.mkdir(exist_ok=True)
     mark_mirror(tree, cast(str, previous.get("owner", args.owner)),
                 cast(str, previous.get("repo", args.repository)), args.session,
                 last_use=time.time(), process_group=os.getpgrp())
@@ -3053,7 +3078,7 @@ def receive_metadata(tree: Path, args: CopyArguments) -> None:
 
 def mirror_run(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
-    with local_mirror_lease(tree, args.session):
+    with local_mirror_lease(tree, args.session, create_tree=args.action != "mirror-receive"):
         with mirror_metadata_locks(tree):
             if args.action == "mirror-receive":
                 receive_metadata(tree, args)

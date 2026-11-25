@@ -31,7 +31,9 @@ def stop_before_copy(test: unittest.TestCase, copy_root: Path) -> Generator[None
 
 
 def copies_environment(root: Path, *, repository: str = "fixture") -> dict[str, str]:
-    private = private_copy_config(root, repository=repository, default_maximum=2)
+    # Keep the keyword for callers that still pass it.
+    del repository
+    private = private_copy_config(root)
     configuration = Path(private.environment["COPIES_CONFIG"])
     _ = memory_test_support.write_config_fixture(configuration,
         "git_timeout_seconds=10\nguard_timeout_seconds=10\n")

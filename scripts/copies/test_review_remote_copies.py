@@ -32,7 +32,7 @@ from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
 from scripts.lint import sweep
-from scripts.lib import conf, scratch
+from scripts.lib import build_folders, conf, scratch
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.fork_test_support import ForkChildren
@@ -44,6 +44,20 @@ from scripts.mac_test import mac_test, claim_state
 from scripts.mac_test import floor_claims
 from scripts.build_targets import target_config
 from scripts.production.cli_fixture import ImmutableGitSeed
+
+
+@contextmanager
+def interrupt_descriptor_removal(moment: str, payload: str) -> Generator[None]:
+    operation, name = ("rmdir", payload) if moment == "payload" else ("unlink", floor_claims.MIRROR_RECORD)
+    remove = os.rmdir if operation == "rmdir" else os.unlink
+
+    def remove_then_stop(path: str | Path, *, dir_fd: int | None = None) -> None:
+        remove(path, dir_fd=dir_fd)
+        if dir_fd is not None and path == name:
+            raise InterruptedError("removal stopped")
+
+    with mock.patch.object(os, operation, side_effect=remove_then_stop):
+        yield
 
 
 @final
@@ -72,7 +86,7 @@ class RemoteEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
-        private = private_copy_config(self.root, repository="repository", maximum=2)
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(warm_claim_servers())
@@ -264,21 +278,8 @@ class RemoteEntryTests(unittest.TestCase):
                 folder.mkdir()
                 _ = (folder / "file").write_text("data")
                 args = mirror_arguments(mirror, "mirror-remove")
-                remove = shutil.rmtree
-                unlink = Path.unlink
-
-                def remove_payload(path: Path) -> None:
-                    remove(path)
-                    raise InterruptedError("removal stopped")
-
-                def remove_record(path: Path, missing_ok: bool = False) -> None:
-                    unlink(path, missing_ok=missing_ok)
-                    if path == self.mirror / ".copy-record.json":
-                        raise InterruptedError("removal stopped")
-
-                patch = (mock.patch.object(shutil, "rmtree", side_effect=remove_payload) if moment == "payload"
-                         else mock.patch.object(Path, "unlink", autospec=True, side_effect=remove_record))
-                with patch, self.assertRaisesRegex(InterruptedError, "removal stopped"):
+                with (interrupt_descriptor_removal(moment, folder.name),
+                      self.assertRaisesRegex(InterruptedError, "removal stopped")):
                     _ = copies.mirror_remove(args)
                 self.assertTrue(copies.remote_record_path(mirror).exists())
                 with self.assertRaisesRegex(copies.CopyError, "another owner"):
@@ -365,20 +366,8 @@ class RemoteEntryTests(unittest.TestCase):
         payload = tree / "old-payload"
         payload.mkdir()
         _ = (payload / "file").write_text("old content")
-        remove, unlink = shutil.rmtree, Path.unlink
-
-        def remove_payload(path: Path) -> None:
-            remove(path)
-            raise InterruptedError("removal stopped")
-
-        def remove_record(path: Path, missing_ok: bool = False) -> None:
-            unlink(path, missing_ok=missing_ok)
-            if path == tree / ".copy-record.json":
-                raise InterruptedError("removal stopped")
-
-        patch = (mock.patch.object(shutil, "rmtree", side_effect=remove_payload) if moment == "payload"
-                 else mock.patch.object(Path, "unlink", autospec=True, side_effect=remove_record))
-        with patch, self.assertRaisesRegex(InterruptedError, "removal stopped"):
+        with (interrupt_descriptor_removal(moment, payload.name),
+              self.assertRaisesRegex(InterruptedError, "removal stopped")):
             _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
         _ = (tree / "leftover").write_text("partly removed content")
         authority = tree.parent / ("." + tree.name + ".copy-removing.json")
@@ -386,6 +375,67 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual((tree / ".copy-record.json").exists(), moment == "payload")
         self.save_interrupted_mirror(mirror, key)
         return authority
+
+    def test_receive_keeps_removal_authority_when_the_guard_refuses(self) -> None:
+        mirror = self.mirror_record()
+        self.assertEqual(publish_mirror(mirror), 0)
+        payload = self.mirror / "old-content"
+        _ = payload.write_text("keep")
+        authority = floor_claims.removal_authority_path(self.mirror)
+        receive = mirror_arguments(mirror, "mirror-receive")
+        with mock.patch.object(build_folders, "may_remove_folder_tree", return_value=False):
+            with self.assertRaisesRegex(copies.CopyError, "guarded removal refused"):
+                _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
+            self.assertTrue(authority.is_file())
+            with self.assertRaisesRegex(copies.CopyError, "guarded removal refused"):
+                _ = copies.mirror_run(receive)
+        self.assertTrue(authority.is_file())
+        self.assertEqual(payload.read_text(), "keep")
+
+    def test_receive_recovers_the_mirror_left_by_sigkill_after_staging(self) -> None:
+        original = self.mirror_record()
+        self.assertEqual(publish_mirror(original), 0)
+        tree = self.mirror
+        _ = (tree / "old-payload").write_text("old content")
+        authority = floor_claims.removal_authority_path(tree)
+        record = tree / floor_claims.MIRROR_RECORD
+        write_text_atomic(authority, record.read_text())
+        receive = mirror_arguments(replace(original, owner="beta", session="beta-session"), "mirror-receive")
+        rename = build_folders._rename_without_replacing  # pyright: ignore[reportPrivateUsage]
+
+        def stop_after_staging(directory: int, source: str, destination: str) -> None:
+            rename(directory, source, destination)
+            if source == tree.name:
+                os.kill(os.getpid(), signal.SIGKILL)
+
+        def interrupted_receive() -> int:
+            with mock.patch.object(build_folders, "_rename_without_replacing", side_effect=stop_after_staging):
+                return copies.mirror_run(receive)
+
+        with ForkChildren() as children:
+            answer = children.start(interrupted_receive).result()
+        self.assertEqual(answer.returncode, -signal.SIGKILL, answer.stderr)
+        self.assertFalse(tree.exists())
+        [staged] = [path for path in tree.parent.glob(".removing-*") if path.is_dir()]
+        status = staged.stat()
+        self.assertEqual((staged / "old-payload").read_text(), "old content")
+        self.assertEqual(build_folders.StagedRemoval.read(floor_claims.read_mirror_record(authority)),
+                         build_folders.StagedRemoval(staged.name, status.st_dev, status.st_ino))
+
+        with staged.with_suffix(".lock").open("rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(copies.CopyError, "the staged mirror could not be removed"):
+                _ = copies.mirror_run(receive)
+            self.assertFalse(tree.exists())
+            self.assertTrue(authority.exists())
+
+        self.assertEqual(copies.mirror_run(receive), 0)
+        self.assertFalse(staged.exists())
+        self.assertFalse(staged.with_suffix(".lock").exists())
+        self.assertFalse(build_folders.lease_path(staged).exists())
+        self.assertFalse(authority.exists())
+        self.assertFalse((tree / "old-payload").exists())
+        self.assertEqual(floor_claims.read_mirror_record(record)["owner"], original.owner)
 
     def test_receive_refills_interrupted_removal_before_another_owner_uses_and_removes(self) -> None:
         for moment in ("payload", "record"):
@@ -494,8 +544,8 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
         clear = copies.clear_mirror_content
         unlink = Path.unlink
 
-        def clear_content(path: Path) -> None:
-            clear(path)
+        def clear_content(path: Path, pending: dict[str, object]) -> None:
+            clear(path, pending)
             if stage == "clear":
                 raise InterruptedError("receive stopped")
 
@@ -745,72 +795,69 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         ):
             yield controller, config, request
 
-    def test_admission_refuses_a_busy_mirror_and_keeps_both_owners(self) -> None:
+    def test_new_admission_refuses_a_busy_first_mirror_and_keeps_both_owners(self) -> None:
         first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
         second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
         self.assertEqual(publish_mirror(first), 0)
         self.assertEqual(publish_mirror(second), 0)
-        with self.admission() as (controller, config, request), copies.remote_lease(first):
+        with (self.admission() as (controller, config, request), copies.remote_lease(first),
+              mock.patch.object(offload, "write_mirror_busy") as record_busy):
             result = offload.run_offload(controller, config, request, 0)
+            record_busy.assert_called_once_with(config, "repository", "linux")
         self.assertIsInstance(result, offload.BusyMacDecline)
-        self.assertEqual(copies.owned_remote_mirrors("first-owner"), [first])
-        self.assertEqual(copies.owned_remote_mirrors("second-owner"), [second])
         self.assertEqual(copies.owned_remote_mirrors("new-owner"), [])
-        self.assertEqual(json.loads((Path(first.path) / ".copy-record.json").read_text())["owner"], "first-owner")
-        self.assertEqual(json.loads((Path(second.path) / ".copy-record.json").read_text())["owner"], "second-owner")
+        for mirror in (first, second):
+            self.assertEqual(copies.owned_remote_mirrors(mirror.owner), [mirror])
+            self.assertEqual(json.loads((Path(mirror.path) / ".copy-record.json").read_text())["owner"], mirror.owner)
 
-    def test_admission_adopts_a_saved_second_mirror_while_the_first_is_busy(self) -> None:
+    def test_saved_linux_assignment_adopts_the_second_mirror_while_the_first_is_leased(self) -> None:
         first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
         second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
         self.assertEqual(publish_mirror(first), 0)
         self.assertEqual(publish_mirror(second), 0)
-        with self.admission() as (controller, config, request), copies.remote_lease(first):
-            pid = os.getpid()
-            process = process_identity.process_start(pid)
-            assert isinstance(process, process_identity.Started)
-            session = NoOwningSession()
-            owner = placement.SubmittingOwner("local", pid, process.start)
-            scope = mac_test.RepositoryScope("repository", "key")
-            destination = placement.PlacementDestination("ssh", request.target, config.host, scope, 2)
-            assignment = placement.PlacementAssignment("episode", "attempt", destination,
-                execution_identity.SourceKeyKnown("tree"), owner, session, 0)
-            identity = claim_state.ClaimIdentity(
-                execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
-                assignment.episode, assignment.attempt)
-            args = mac_test.parser().parse_args([
-                "claim", "--target", request.target, "--pid", str(pid), "--what", "nextest package",
-                "--worktree", str(self.source), "--claim-id", identity.claim_id,
-                "--episode", identity.episode, "--attempt", identity.attempt,
-            ], namespace=mac_test.CliArguments())
-            paths = mac_test.state_paths(request.target)
-            with redirect_stdout(io.StringIO()):
-                self.assertEqual(mac_test.command_claim(args, paths, session=session), 0)
-            reservation, = claim_state.read_claims(paths)
-            legacy_path = reservation.path.rename(reservation.path.with_name(reservation.path.stem + ".slot-2.json"))
-            command_claim = mac_test.command_claim
+        pid = os.getpid()
+        start = process_identity.process_start(pid)
+        assert isinstance(start, process_identity.Started)
+        session = NoOwningSession()
+        scope = claim_state.RepositoryScope("repository", "key")
+        destination = placement.PlacementDestination("ssh", "linux", second.host, scope, 2)
+        assignment = placement.PlacementAssignment("episode", "attempt", destination,
+            execution_identity.SourceKeyKnown("tree"), placement.SubmittingOwner("natedev", pid, start.start), session, 0)
+        identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
+                                             assignment.episode, assignment.attempt)
+        reference = placement.ProviderClaimReference("ssh", "linux", scope, identity.claim_id,
+                                                     identity.episode, identity.attempt)
+        command_claim = mac_test.command_claim
 
-            def claim_with_mirror_lease(args: mac_test.CliArguments, state: claim_state.StatePaths) -> int:
-                self.assertEqual(args.from_pid, pid)
-                with self.assertRaises(copies.BusyRemoteMirror), copies.remote_lease(second):
-                    self.fail("The assigned mirror lease is free before the claim transfer")
-                return command_claim(args, state)
+        def claim_with_mirror_lease(args: mac_test.CliArguments, paths: claim_state.StatePaths) -> int:
+            self.assertEqual(args.from_pid, pid)
+            with self.assertRaisesRegex(copies.BusyRemoteMirror, "slot-2: busy"), copies.remote_lease(second):
+                self.fail("The runner must hold the mirror lease before it adopts the claim.")
+            return command_claim(args, paths)
 
-            def authorize(permission: wire.ConsumePermission) -> wire.FirstAuthorization:
-                adopted, = claim_state.read_claims(paths)
-                self.assertEqual(adopted.path, legacy_path)
-                self.assertEqual(adopted.record.get("remote_host"), config.host)
-                return wire.FirstAuthorization(permission.assignment, permission.claim)
-
-            with (mock.patch.object(mac_test, "command_claim", side_effect=claim_with_mirror_lease),
-                  mock.patch.object(admission_client, "consume_permission", side_effect=authorize)):
-                result = offload.run_offload(controller, config, replace(request,
-                    admission=offload.MacClaimFromWait(pid, identity, session),
-                    placement=offload.AssignedOffloadRequest(assignment)), 0)
-
+        with (self.admission() as (controller, config, request), copies.remote_lease(first),
+              mock.patch.object(admission_client, "consume_permission",
+                                return_value=wire.FirstAuthorization(assignment, reference)) as consume):
+            paths = claim_state.state_paths("linux")
+            args = mac_test.CliArguments()
+            args.pid, args.target, args.worktree = pid, "linux", str(request.repo_root)
+            self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, assignment=assignment), 0)
+            saved, = claim_state.read_claims(paths)
+            legacy = saved.path.with_name(saved.path.stem + ".slot-2.json")
+            _ = saved.path.rename(legacy)
+            request = replace(request, placement=offload.AssignedOffloadRequest(assignment),
+                              admission=offload.MacClaimFromWait(pid, identity, session))
+            with mock.patch.object(mac_test, "command_claim", side_effect=claim_with_mirror_lease) as adopt:
+                result = offload.run_offload(controller, config, request, 0)
+            adopt.assert_called_once()
+            consume.assert_called_once()
+            self.assertFalse(legacy.exists())
         self.assertIsInstance(result, offload.PassedOnTarget)
         self.assertEqual(controller.attempt_evidence.slot, 2)
         self.assertEqual(copies.owned_remote_mirrors("first-owner"), [first])
         self.assertEqual([record.path for record in copies.owned_remote_mirrors("new-owner")], [second.path])
+        self.assertEqual(json.loads((Path(first.path) / ".copy-record.json").read_text())["owner"], "first-owner")
+        self.assertEqual(json.loads((Path(second.path) / ".copy-record.json").read_text())["owner"], "new-owner")
 
     def test_busy_refusal_names_the_session_from_the_unit_owner_chain(self) -> None:
         run = self.root / "unit-run"

@@ -60,7 +60,7 @@ class RemoteCopiesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, copies_environment(self.root)))
-        private = private_copy_config(self.root, repository="repository", maximum=2)
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.source = ImmutableGitSeed.create(self.root, "main", "Copy Tests", "copy@example.invalid",
                                              {"Cargo.toml": "[workspace]\n", "source.txt": "committed\n", "stable.txt": "stable\n"}).checkout
@@ -427,7 +427,7 @@ class RemoteCopiesTests(unittest.TestCase):
         )
         for cause, status, remote_output, detail in cases:
             with self.subTest(cause=cause), mock.patch.dict(os.environ, {**copies_environment(self.root / cause),
-                    **private_copy_config(self.root / cause, repository="repository").environment}):
+                    **private_copy_config(self.root / cause).environment}):
                 mirrors = [self.remote(path=f"mirror/{cause}-{index}") for index in range(2)]
                 for mirror in mirrors:
                     copies.register_remote(mirror)
@@ -459,7 +459,7 @@ class RemoteCopiesTests(unittest.TestCase):
             root = self.root / action
             root.mkdir()
             with self.subTest(action=action), local_remote_transport(root), \
-                    mock.patch.dict(os.environ, private_copy_config(root, repository="repository").environment), \
+                    mock.patch.dict(os.environ, private_copy_config(root).environment), \
                     warm_claim_servers(), ExitStack() as contexts:
                 mirror = self.remote(path=str(root / "mirror"))
                 self.assertEqual(publish_mirror(mirror), 0)

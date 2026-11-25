@@ -38,7 +38,7 @@ class BuildCopiesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        configuration = private_copy_config(self.root, repository="widget")
+        configuration = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, configuration.environment))
         self.source = self.root / "source-folder"
         self.source.mkdir()
@@ -422,7 +422,7 @@ class BuildCopiesTests(unittest.TestCase):
                             build_copies.claim_unused_build_folder(row.path)):
                         self.fail("The claim admitted a temporary folder with Git storage")
                     cleanup = mock.Mock()
-                    self.assertFalse(build_folders.remove_build_folder(row.path, cleanup))
+                    self.assertFalse(build_folders.remove_build_folder(row.path, delete=cleanup))
                     cleanup.assert_not_called()
 
     def test_inventory_and_claim_refuse_an_external_symbolic_link(self) -> None:
@@ -440,7 +440,7 @@ class BuildCopiesTests(unittest.TestCase):
                     build_copies.claim_unused_build_folder(temporary)):
                 self.fail("The claim admitted a link outside the temporary folder")
             cleanup = mock.Mock()
-            self.assertFalse(build_folders.remove_build_folder(temporary, cleanup))
+            self.assertFalse(build_folders.remove_build_folder(temporary, delete=cleanup))
             cleanup.assert_not_called()
 
     def test_temporary_review_scans_each_directory_once_without_path_status_calls(self) -> None:
@@ -459,7 +459,7 @@ class BuildCopiesTests(unittest.TestCase):
         ):
             self.assertIsNone(build_folders.hold_child_leases(temporary, leases, review_temporary=True))
             self.assertEqual(scan.call_count, 2)
-            status.assert_not_called()
+            self.assertTrue(all(call.kwargs.get("dir_fd") is not None for call in status.call_args_list))
             link_status.assert_not_called()
 
     def test_inventory_and_claim_keep_a_temporary_folder_with_a_live_owner(self) -> None:
@@ -702,7 +702,7 @@ with folders.temporary_build_folder(request) as path:
         path = self.make_temporary()
         with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
             with build_copies.claim_unused_build_folder(path):
-                self.assertTrue(build_folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+                self.assertTrue(build_folders.remove_build_folder(path))
                 self.assertFalse(build_folders.lease_path(path).exists())
                 with self.assertRaisesRegex(build_folders.BuildFolderClaimHeld, "claim lock"), (
                         build_folders.tool_folder("tool", parent=path)):
@@ -717,7 +717,7 @@ with folders.temporary_build_folder(request) as path:
         command = [sys.executable, "-m", "scripts.lib.build_folders", "stable", "--path", str(child)]
         with mock.patch.object(os, "kill", side_effect=ProcessLookupError):
             with build_copies.claim_unused_build_folder(path):
-                self.assertTrue(build_folders.remove_build_folder(path, lambda: shutil.rmtree(path)))
+                self.assertTrue(build_folders.remove_build_folder(path))
                 self.assertFalse(build_folders.lease_path(path).exists())
                 result = subprocess.run(command, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 2, result.stderr)
@@ -1165,6 +1165,77 @@ with folders.temporary_build_folder(request) as path:
         self.assertEqual(self.git(self.source, "show", refs[0] + ":change.txt"), "save this source")
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertIn(str(path), output.getvalue())
+
+    def test_assigned_copy_recovers_cargo_reset_after_sigkill(self) -> None:
+        self.assert_cargo_reset_recovers(self.interrupt_cargo_reset())
+
+    def test_assigned_copy_recovers_cargo_reset_under_a_linked_build_root(self) -> None:
+        real_root = self.root / "real-build"
+        real_root.mkdir()
+        build_root = build_folders.build_root()
+        build_root.symlink_to(real_root, target_is_directory=True)
+        path = self.interrupt_cargo_reset()
+        self.assertTrue(path.is_relative_to(build_root))
+        self.assertTrue(path.resolve().is_relative_to(real_root))
+
+        lock_path = path / "target.lock"
+        with lock_path.open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (self.assertRaisesRegex(BlockingIOError, "assigned copy 2"),
+                  build_copies.take_copy(self.source, self.base, showrunner="builds", unit="queue",
+                                        work="next", purpose="test", selection=build_copies.ExactCopyRequest(2))):
+                self.fail("The assigned copy admitted a job while the target lock was held")
+            self.assertTrue(os.path.samestat(lock_path.stat(), os.fstat(lock.fileno())))
+            self.assertIn("cargo_removal", self.lease(path))
+
+        self.assert_cargo_reset_recovers(path)
+
+    def interrupt_cargo_reset(self) -> Path:
+        reset = """
+import os
+from pathlib import Path
+import signal
+import sys
+from unittest.mock import patch
+
+from scripts.lib import build_folders, build_copies
+
+rename = build_folders._rename_without_replacing
+
+def stop_after_staging(directory, source, destination):
+    rename(directory, source, destination)
+    if source == "target" and destination.startswith(".removing-"):
+        os.kill(os.getpid(), signal.SIGKILL)
+
+with build_copies.take_copy(Path(sys.argv[1]), sys.argv[2], showrunner="builds", unit="queue",
+                           work="reset", purpose="test", selection=build_copies.ExactCopyRequest(2)) as copy:
+    (copy.cargo_dir / "old").write_text("old Cargo output")
+    with patch.object(build_folders, "_rename_without_replacing", stop_after_staging):
+        build_copies.limit_copy_size(copy, 0)
+"""
+        checkout = Path(__file__).resolve().parents[2]
+        stopped = subprocess.run([sys.executable, "-c", reset, str(self.source), self.base],
+                                 cwd=checkout, env={**os.environ, "PYTHONPATH": str(checkout)},
+                                 capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(stopped.returncode, -signal.SIGKILL, stopped.stderr)
+        path = build_folders.copy_path("widget", "queue", 2)
+        stage, = (entry for entry in path.glob(".removing-*") if entry.is_dir())
+        identity = stage.stat()
+        self.assertEqual(self.lease(path).get("cargo_removal"),
+                         {"removal_stage": stage.name, "copy_device": identity.st_dev, "copy_inode": identity.st_ino})
+        self.assertEqual((stage / "old").read_text(), "old Cargo output")
+        self.assertFalse((path / "target").exists())
+        return path
+
+    def assert_cargo_reset_recovers(self, path: Path) -> None:
+        with build_copies.take_copy(self.source, self.base, showrunner="builds", unit="queue",
+                                  work="next", purpose="test", selection=build_copies.ExactCopyRequest(2)) as copy:
+            self.assertEqual(copy.path, path)
+            self.assertEqual(list(copy.cargo_dir.iterdir()), [])
+            self.assertEqual(list(path.glob(".removing-*")), [])
+            self.assertFalse((path / "target.lock").exists())
+            self.assertNotIn("cargo_removal", self.lease(path))
+        self.assertEqual(self.rescue_refs(), "")
 
     def test_run_gives_the_child_the_cargo_environment_and_lock_and_keeps_its_exit_code(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
