@@ -162,6 +162,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/session_state.py` | read | StaffRow, Exited, Paused |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
+| `scripts/adhoc_review/shared_review.py` | read | snapshot supplies the staff names and current sessions for join |
 | `scripts/agents/codex_test_support.py` | read | CodexBackend (fixture) |
 | `scripts/agents/detached_runs.py` | read | local_snapshot |
 | `scripts/agents/restart_support.py` | read | Kind (type only); the continuation send names the recipient kind |
@@ -391,7 +392,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 242 accessor rows (42 write, 199 read, and 1 owner).
+The table has 243 accessor rows (42 write, 200 read, and 1 owner).
 
 ## Approved copies
 
