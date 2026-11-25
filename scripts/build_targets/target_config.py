@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum, auto
@@ -157,37 +157,6 @@ def command_configuration() -> Generator[None]:
         yield
     finally:
         COMMAND_CONFIGURATION.reset(token)
-
-
-class MissingSlotCapacity(Enum):
-    REQUIRE_CONFIGURED = auto()
-    SINGLE_SLOT = auto()
-
-
-def slot_capacity(values: Mapping[str, str] | conf.ConfigRead, repository: str, *,
-                  missing: MissingSlotCapacity) -> int:
-    """Read the repository capacity before the target default."""
-    key = f"slots.{repository}"
-    if isinstance(values, conf.ConfigRead):
-        scoped = values.value(key, positive_slot_capacity, default=MissingSlotCapacity.REQUIRE_CONFIGURED)
-        if isinstance(scoped, int):
-            return scoped
-        if missing is MissingSlotCapacity.SINGLE_SLOT:
-            return values.value("slots", positive_slot_capacity, default=1)
-        return values.value("slots", positive_slot_capacity)
-    value = values.get(key, values.get("slots", ""))
-    if key not in values and "slots" not in values and missing is MissingSlotCapacity.SINGLE_SLOT:
-        return 1
-    try:
-        return positive_slot_capacity(value)
-    except ValueError as error:
-        raise ConfigError(f"{key}: {error}") from error
-
-
-def positive_slot_capacity(value: str) -> int:
-    if not value.isascii() or not value.isdecimal() or int(value) < 1:
-        raise ValueError("expected a positive integer")
-    return int(value)
 
 
 def require_target_name(target: str) -> None:

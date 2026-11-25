@@ -118,8 +118,8 @@ A `mend-check` finding starts the Mac fix pass in the same Mac run. The `mend-fi
 
 ## Mac Linux guest folders
 
-The Mac Linux route uses `mac_run.held` to take a repository slot on the Mac.
-A Mac block or a busy repository slot can refuse the claim.
+The Mac Linux route uses `mac_run.held` to claim a repository on the Mac.
+A Mac block or an active claim for the repository can refuse the claim.
 The route returns `GuestNotStarted` with the refusal reason before any upload or retry backoff.
 The route releases the claim when the guest proves the run ended.
 The current API also releases the claim at `unreachable_wait_seconds` (`build_targets.conf`) if the guest cannot prove the run ended.
@@ -459,7 +459,7 @@ The runner uses `rsync -rlp --safe-links` and publishes the completed copy throu
 Files return to `~/.local/state/mac-test/fetched/<call id>/<folder>`. Existing destinations are refused. A failure or signal removes the partial copy.
 A fetch result adds `fetch=fetched|missing|too_large|failed|not_run` to the result file.
 
-After a Linux run reports completion, natedev releases the slot claim before it calls `buildlog.sync.sync_target(target)`.
+After a Linux run reports completion, natedev releases the repository claim before it calls `buildlog.sync.sync_target(target)`.
 The exchange selects one configured peer and preserves the host paths from `sync.hosts.<target>`.
 AWS rows arrive under `~/.local/state/buildlog/aws-build/` on natedev.
 The Linux runner uses `BUILDLOG_SYNC=1` to finish the local recorder write before it reports completion.
@@ -483,7 +483,7 @@ It also excludes direct children of another user, except children of PID 1.
 Slot processes keep their user, but an orphan can acquire PID 1 as its parent.
 Other same-user processes with unreadable evidence keep the slot busy.
 
-`verify-linux` steps use the target slots and build budget for admission.
+`verify-linux` steps use the repository claim and build budget for admission.
 They do not contact natedev's admission service or obey natedev's hold.
 The controller still checks spending before AWS admission.
 
@@ -825,12 +825,16 @@ It also carries the repository scope.
 Busy refusals can name the unit director's session.
 
 `offload.py` requests Mac, Linux, and AWS mirrors through `copies.py`.
-It publishes ownership only for the selected slot after admission succeeds.
-Failed admission and unselected slots retain their owners.
-Claims and admission use `target_config.slot_capacity` with an explicit missing-value policy.
-An empty configured capacity raises `ConfigError`.
-The policy supplies a fallback only when both capacity keys are absent.
-The Mac retains its single slot per repository.
+Each SSH target permits one claim per repository.
+Native Mac and mac-linux work share this limit.
+On Linux targets, the sender publishes mirror ownership after admission succeeds.
+Failed admission preserves the mirror owner.
+The reader keeps the saved file and fence for each old numbered claim.
+An old live claim holds the repository.
+When a local owner ends, the reader releases its local claim.
+For each remote claim, the runner checks the saved mirror before release.
+New Linux claims use the first mirror.
+The runner takes the saved assignment's mirror lease before it adopts a Linux reservation.
 
 The Terminal launcher enters the numbered copy before it checks its per-run token.
 Cleanup removes the token before `stop-checkout` scans the copy.
@@ -968,8 +972,7 @@ Token readiness reports remain separate from fixed placement constraints.
 No placement wait holds the cargo token; a local grant takes it.
 A remote selection releases the unused continuation claim.
 
-The adapter claims only the assignment's target, scope, and slot under the existing provider lock.
-Linux repository scopes carry the selected slot.
+The adapter claims the assignment's target and scope under the provider lock.
 Distinct known Mac repository scopes can coexist.
 A whole-Mac scope overlaps every repository scope.
 A definite refusal reports `ClaimFailure` before the queue decides another attempt.
@@ -1014,7 +1017,7 @@ Unknown remote memory remains unknown and creates no local memory charge.
 One `mirror_busy_backoff_s` key in `mac_test.conf` serves both Mac and AWS targets.
 Each target stores `mirror-busy-<repository>.until` beside its unreachable backoff record.
 A mirror busy refusal during copy writes this time.
-No available slot lease also writes this time.
+A busy mirror lease also writes this time.
 A `mirror-use` busy refusal after copy becomes `BusyMacDecline`, without a lost run.
 A successful copy removes the repository's refusal time.
 `free-now` reads this local record without SSH or a lock.

@@ -312,6 +312,7 @@ An explicit gzip quality takes precedence over the wildcard quality.
 Responses that support gzip include `Vary: Accept-Encoding`.
 Static files have different ETags for gzip and identity.
 HEAD returns the headers for the selected encoding with no body.
+Disks shows the drive cards and the session list.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
 The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.

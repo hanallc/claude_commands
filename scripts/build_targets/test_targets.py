@@ -42,7 +42,7 @@ END = datetime(2026, 10, 11, 22, 5, tzinfo=timezone.utc)
 
 def fixture_mac_mirror(worktree: Path, repository: str, key: str) -> claim_state.ResolvedMacMirror:
     """Give routing tests a mirror identity without Git commands."""
-    fence = claim_state.mac_claim_stem(key, 0)
+    fence = claim_state.mac_claim_stem(key)
     return claim_state.ResolvedMacMirror(key, repository, f"{fence}.json", fence, str(worktree))
 
 
