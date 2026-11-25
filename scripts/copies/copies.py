@@ -7,6 +7,7 @@ except FileNotFoundError:
     pass
 
 import argparse
+import ast
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
@@ -1465,10 +1466,114 @@ class DirectCommandCopy:
     tree: Path
 
 
+GATE_SCRIPT = "scripts/production/gate.py"
+GATE_CHECK_HELP = 3
+GATE_CHECK_REFUSED = 4
+GATE_CHECK_PROGRAM = """
+import argparse
+from importlib.util import find_spec
+from pathlib import Path
+import sys
+
+root = Path.cwd()
+help_status, refusal_status, parser_directory, launcher, mode, *arguments = sys.argv[1:]
+parser_root = Path(parser_directory)
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise SystemExit(message)
+
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        repo = getattr(parsed, "repo", ".")
+        if mode == "run":
+            if repo == "{tree}":
+                parsed.repo = "."
+            elif Path(repo) != Path("."):
+                self.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
+        return parsed
+
+sys.argv[0] = str(parser_root / "scripts/production" / launcher)
+sys.path.insert(0, str(parser_root))
+spec = find_spec("scripts.production.gate")
+if spec is None or spec.origin is None or Path(spec.origin) != parser_root / "scripts/production/gate.py":
+    raise SystemExit("Use the gate module from the selected checkout.")
+from scripts.production.gate import check_prepared_gate_source
+
+try:
+    check_prepared_gate_source(arguments, Parser(prog=launcher, allow_abbrev=False), root)
+except SystemExit as error:
+    if error.code == 0:
+        raise SystemExit(int(help_status)) from None
+    if error.code == 1:
+        raise SystemExit(int(refusal_status)) from None
+    raise
+"""
+
+
+def gate_command_source_check(command: Sequence[str], *,
+                              numbered_copy: bool = False) -> Callable[[Path], None] | None:
+    """Select the parser checkout for a gate script."""
+    program = parse_command_program(command, keep_path=True)
+    if isinstance(program, OtherCommand):
+        return None
+    script, arguments = program
+    launcher = Path(script)
+    if launcher.name not in MERGE_GATE_PROGRAMS:
+        return None
+    relative = Path(GATE_SCRIPT).with_name(launcher.name)
+    launcher_checkout = None
+    if launcher.is_absolute():
+        from scripts.lib.python_startup.sitecustomize import checkout_root
+
+        root = checkout_root(str(launcher.parent))
+        if not root or launcher.parent.resolve() / launcher.name != Path(root) / relative or not launcher.is_file():
+            return None
+        launcher_checkout = Path(root)
+    elif launcher not in (relative, Path("{tree}") / relative):
+        return None
+
+    def check(source: Path) -> None:
+        parser_root = launcher_checkout if launcher_checkout is not None else source.resolve()
+        path = parser_root / GATE_SCRIPT
+        if path.resolve() != path:
+            raise CopyError(f"Use the regular {GATE_SCRIPT} file in {parser_root}.")
+        if launcher_checkout is None and launcher.name == "gate.py":
+            expanded = [part.replace("{tree}", str(source)) for part in command] if numbered_copy else command
+            if not first_step.canonical_gate_command(expanded, source):
+                return
+        if not path.is_file():
+            return
+        try:
+            syntax = ast.parse(path.read_bytes(), filename=str(path))
+        except SyntaxError:
+            return
+        if not any(isinstance(node, ast.FunctionDef) and node.name == "check_prepared_gate_source"
+                   for node in syntax.body):
+            return
+        mode = "run" if numbered_copy else "gate-step"
+        result = subprocess.run(
+            [sys.executable, "-IB", "-c", GATE_CHECK_PROGRAM, str(GATE_CHECK_HELP), str(GATE_CHECK_REFUSED),
+             str(parser_root), launcher.name, mode, *arguments],
+            cwd=source, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        )
+        if result.returncode == GATE_CHECK_HELP:
+            print(result.stdout, end="")
+            raise SystemExit(0)
+        if result.returncode == GATE_CHECK_REFUSED:
+            _ = sys.stderr.write(result.stderr)
+            raise SystemExit(1)
+        if result.returncode:
+            raise CopyError(result.stderr.rstrip() or f"Gate argument check exited with status {result.returncode}.")
+
+    return check
+
+
 @contextmanager
 def _command_copy(
     owner: str, repo: str | Path, policy: SourcePolicy, command: Sequence[str], *,
     merge: MergePolicy, step: str = "", gate_targets: tuple[str, ...] = (), place_unnamed_gate: bool = True,
+    check_source: Callable[[Path], None] | None = None,
 ) -> Generator[AdmittedCommandCopy | DirectCommandCopy]:
     """Hold the copy and any first-step admission through the caller scope."""
     from scripts.build_targets.gate_targets import uses_parent_reservation
@@ -1479,9 +1584,12 @@ def _command_copy(
         with ExitStack() as scope:
             if isinstance(job, StepJob) and (gate_targets or not uses_parent_reservation(tuple(command))):
                 source = Path(repo).expanduser().resolve()
-                if (gate_targets or place_unnamed_gate and command_program(command) in GATE_SCRIPTS
+                if (check_source is not None or gate_targets
+                        or place_unnamed_gate and command_program(command) in GATE_SCRIPTS
                         or isinstance(verify_command(command), VerifyCommand)):
                     source = scope.enter_context(requested_source(source, policy, merge))
+                    if check_source is not None:
+                        check_source(source)
                     policy = CommittedSource(commit_at(source, "HEAD"))
                     merge = NO_MERGE
                 admission = first_step.admitted_run(command, source, targets=gate_targets,
@@ -1492,6 +1600,8 @@ def _command_copy(
                 yield AdmittedCommandCopy(tree, admitted)
             else:
                 tree = scope.enter_context(standing(owner, repo, policy, merge=merge, step=label, command=command))
+                if check_source is not None:
+                    check_source(tree)
                 yield DirectCommandCopy(tree)
     except first_step.FirstStepRefused as error:
         failure = CopyError(str(error))
@@ -2686,6 +2796,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
                 raise CopyError(error)
     owner = checked_owner(args.owner) if args.owner else caller_owner()
     source = Path(args.repo or "").expanduser().resolve()
+    check_source = gate_command_source_check(command, numbered_copy=True)
     verification = verify_command(command)
     with ExitStack() as scope:
         captured = ""
@@ -2709,7 +2820,7 @@ def run_copy(args: CopyArguments, command: Sequence[str], policy: SourcePolicy, 
             source_arguments = [part.replace("{tree}", str(source)) for part in command]
             targets = first_step.gate_targets(source_arguments, source, args.targets)
             prepared = scope.enter_context(_command_copy(owner, source, policy, command, merge=merge,
-                                                         gate_targets=targets))
+                                                         gate_targets=targets, check_source=check_source))
             tree = prepared.tree
             environment = {"PYTHONDONTWRITEBYTECODE": "1", "COPIES_STEP_OWNER": owner,
                            "BUILDLOG_PREPARED_COPY": str(tree)}
@@ -2756,6 +2867,10 @@ def run_gate_step(args: CopyArguments, command: Sequence[str]) -> int:
 
     if command_program(command) not in GATE_SCRIPTS:
         raise CopyError("gate-step requires a gate command")
+    expanded = [part.replace("{tree}", str(source)) for part in command]
+    if check := gate_command_source_check(expanded):
+        check(source)
+        command = expanded
     targets = first_step.gate_targets(command, source, args.targets)
 
     def run() -> subprocess.CompletedProcess[str]:
