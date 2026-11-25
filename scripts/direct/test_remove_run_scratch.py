@@ -19,7 +19,7 @@ from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
 from scripts.lib import scratch
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
@@ -38,7 +38,7 @@ class RemoveRunScratchTests(unittest.TestCase):
         self.fixture_root = root / "fixture"
         self.fixture_root.mkdir()
         self.enterContext(isolated_staff_file(root / "staff.json", {}))
-        environment = {**fixture_git_environment(root), **private_slot_config(root).environment}
+        environment = {**fixture_git_environment(root), **private_copy_config(root).environment}
         _ = environment.pop("STAFF_CONFIG", None)
         environment["HOME"] = str(root / "home")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
