@@ -574,12 +574,12 @@ class LocalVersionPreflightTests(unittest.TestCase):
                     if later_match:
                         _ = (root / "box-tools.json").write_text('{"versions":{"rustc":"rustc 1.99.0"}}')
                         _ = offload.run_offload(controller, config, request, 1)
-                        claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                        claim.assert_called_once_with(controller, config, request, HANA,
                                                       mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                                                       retire_wait=False)
                         self.assertFalse(eligibility.linux_version_decline_path("linux", HANA.name).exists())
                 else:
-                    claim.assert_called_once_with(controller, config, request, HANA, mock.ANY,
+                    claim.assert_called_once_with(controller, config, request, HANA,
                                                   mac_repository=claim_state.NO_SAVED_MAC_REPOSITORY,
                                                   retire_wait=False)
                     self.assertFalse(offload.linux_version_declined_recently("linux", HANA.name, 60, 100))
@@ -626,7 +626,8 @@ class OffloadSettingsTests(unittest.TestCase):
               mock.patch.object(offload, "check_taken_over_claim", return_value=offload.LeftoversEnded()),
               mock.patch.object(offload, "release_claim", return_value=offload.ClaimReleaseConfirmed()) as release,
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
-            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, lease)
+            result = offload.leased_offload(controller, config, request, HANA, time.monotonic(), True, lease,
+                                            admission_slot=1)
             assert isinstance(result, offload.DeclinedMacRun)
             self.assertEqual(offload.write_result(result, offload.ResultFile(result_path)), 75)
 

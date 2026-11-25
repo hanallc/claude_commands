@@ -24,7 +24,7 @@ from scripts.build_queue.admission_jobs import (GATE_JOB_NOT_RECORDED, HAND_MADE
     GateJobNotRecorded, NotVerifyCall as NotVerifyCall, StepJob, VerifyCall as VerifyCall,
     VerifyStep as VerifyStep, VerifyVerb as VerifyVerb)
 from scripts.build_queue.snapshot_codec import select_queue_name
-from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun, RunIdentity,
+from scripts.build_queue.scope_activity import (EmptyBuildScope, IdleService, LiveBuildRun, NoLiveBuildRun,
     NotServiceSlice, RunningServiceJob, ScopeProcesses, ServiceJobState)
 
 from scripts.build_targets import target_config
@@ -94,6 +94,11 @@ class RemoteStartHoldEnded:
 
 
 @dataclass(frozen=True)
+class GuestStartNotReported:
+    """The assignment has no saved guest execution folder."""
+
+
+@dataclass(frozen=True)
 class GuestStartNotRecorded:
     """The queue has no saved confirmation of a guest start."""
 
@@ -120,6 +125,7 @@ class SavedPlacementAssignment:
     refusal_settings: RefusalSettings | NoRefusalSettings = NoRefusalSettings()
     remote_start_hold: RemoteStartHold | RemoteStartHoldUnrecorded | RemoteStartHoldEnded = RemoteStartHoldUnrecorded()
     placement_candidates: tuple[placement.CandidateEligibility, ...] = ()
+    guest_start: execution_identity.GuestExecution | GuestStartNotReported = GuestStartNotReported()
     guest_execution_observed: bool = False
     guest_proof_required: bool = False
     confirmed_guest_start: ConfirmedGuestStart | GuestStartNotRecorded = GuestStartNotRecorded()
@@ -837,7 +843,7 @@ class UnitPriorityEntry(TypedDict):
 class RunPriorityEntry(TypedDict):
     """The entry raises only the steps of one run; the unit and step name it on the page."""
     kind: Literal["RunPriorityEntry"]
-    run: RunIdentity
+    run: execution_identity.RunIdentity
     unit: str
     step: str
     why: str
@@ -861,7 +867,7 @@ def entry_asker(entry: PriorityEntry) -> Asker | AskerNotRecorded:
 def entry_covers(entry: PriorityEntry, unit: str, run: LiveBuildRun | NoLiveBuildRun) -> bool:
     """A run entry covers the steps of its run; a unit entry covers the steps of its unit."""
     if is_run_entry(entry):
-        return isinstance(run, LiveBuildRun) and RunIdentity(run.pid, run.start_time) == entry["run"]
+        return isinstance(run, LiveBuildRun) and execution_identity.RunIdentity(run.pid, run.start_time) == entry["run"]
     return entry["unit"] == unit
 
 
@@ -1369,6 +1375,8 @@ def execution_group(step: RunningStep, fallback: str) -> str:
         identity = evidence.identity
         if isinstance(identity, execution_identity.ProcessExecution):
             return repr((identity.host, identity.generation, identity.pid, identity.start_time))
+        if isinstance(identity, execution_identity.GuestExecution):
+            return repr((identity.target, identity.attempt))
         return repr((identity.target, identity.generation, identity.instance, identity.attempt))
     if step.assignment_host:
         return repr((step.assignment_host, fallback))

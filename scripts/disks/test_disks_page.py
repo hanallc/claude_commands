@@ -24,6 +24,7 @@ from scripts.disks import disks_page
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
+from scripts.lib.process_group import run_process_group
 from scripts.review_links import page_frame, test_page_frame
 
 GIB = 1 << 30
@@ -273,7 +274,7 @@ function render(){}
 function renderCards(){}
 const fetch=async(url)=>{
  if(url==='measure') return {ok:true,json:async()=>({state:'started',target:1})};
- if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
+ if(stalled) return new Promise(()=>pendingReads.push(url.split('?')[0]));
  return {ok:true,json:async()=>({measured_at:fileAt,render_seconds:.03,drives:[]})};
 };
 START
@@ -284,7 +285,7 @@ START
  check(!parts.age.hidden && parts.age.textContent==='70 min ago',
   'The first measure must record the old data age.');
  stalled=true;void pageRefresh.refresh();
- check(pendingReads.length===2,'The Disks and Builds reads must have separate pending resolvers.');
+ check(pendingReads.length===1 && pendingReads[0]===DATA_FILE,'Only the Disks data read must be pending.');
  const ageLimit=JSON.parse(line.dataset.statusOptions).ageLimit;
  now+=(Math.max(settings.wait_seconds,ageLimit)+1)*1000;pageRefresh.changed();
  check(line.dataset.state==='Late' && parts.reason.textContent==='The feed has stopped.',
@@ -542,8 +543,8 @@ const localStorage={getItem:()=>null};
         assert start is not None
         scenario = scenario.replace("START", start[0])
         node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        done = subprocess.run([node, "--unhandled-rejections=strict", "-e",
-                               environment + functions + page_frame.REFRESH_SCRIPT + scenario],
+        done = subprocess.run([node, "--unhandled-rejections=strict", "-"],
+                              input=environment + functions + page_frame.REFRESH_SCRIPT + scenario,
                               capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "PASS"), done.stderr)
 
@@ -719,11 +720,11 @@ async function checkSessionLayout() {
                         profile = Path(directory) / f"profile-{width}"
                         profile.mkdir()
                         _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        done = subprocess.run(
+                        done = run_process_group(
                             ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                              "--window-size", f"{width},900", "--screenshot", str(profile / "disks.png"),
                              f"http://127.0.0.1:{server.server_port}/"],
-                            capture_output=True, text=True, timeout=45, check=False)
+                            timeout=45)
                         self.assertEqual(done.returncode, 0, done.stderr)
                         self.assertEqual(results, [{"width": width, "failures": []}])
             finally:

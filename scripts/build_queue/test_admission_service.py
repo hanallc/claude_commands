@@ -21,6 +21,7 @@ import math
 import errno
 import os
 from pathlib import Path
+from queue import Queue
 import stat
 import select
 import shutil
@@ -1559,6 +1560,36 @@ class MacBackoffTestFixture:
         return evidence.eligibility
 
 
+def mac_cycle_probe_ok(_fixture: MacBackoffTestFixture) -> Callable[[Sequence[str]], offload.CommandOutput]:
+    from scripts.mac_test import offload
+
+    return lambda _arguments: offload.CommandOutput(
+        0, "free_gib=60\nhost=fixture-mac\nrc=0\nmirror_setup=0\tready\n", "")
+
+
+@dataclass(frozen=True)
+class MacDiskSweepFixture:
+    admission: AdmissionFixture
+    key: placement.HostEvidenceKey
+    started: threading.Event
+    release: threading.Event
+    inline: threading.Event
+    disk_ready: threading.Event
+    readings: Queue[placement.HostEvidence]
+
+    def subscribe(self, key: placement.HostEvidenceKey) -> service.HostEvidenceReader:
+        reader = cast(Callable[[placement.HostEvidenceKey, float], service.HostEvidenceReader],
+                      getattr(self.admission.server, "_host_evidence_reader"))
+        return reader(key, test_hang_guard.TEST_HANG_GUARD_SECS)
+
+    def other_key(self) -> placement.HostEvidenceKey:
+        server = self.admission.server
+        other = replace(self.key, package="another-package")
+        request = server.host_requests[self.key]
+        server.host_requests[other] = replace(request, constraints=replace(request.constraints, package=other.package))
+        return other
+
+
 class LocalHoldPlacementTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
@@ -1930,14 +1961,15 @@ class LocalHoldPlacementTests(unittest.TestCase):
                 "the claim has no saved Mac mirror", fixture.clock.now())),))
 
     @contextmanager
-    def mac_backoff_fixture(self) -> Generator[MacBackoffTestFixture]:
+    def mac_backoff_fixture(self, *, backoff: bool = True, probe_timeout: int = 1) -> Generator[MacBackoffTestFixture]:
         from scripts.build_queue.test_placement import placement_request
         from scripts.build_targets import target_config
         from scripts.mac_test import claim_state, eligibility, offload
 
         with AdmissionFixture() as fixture:
             settings = fixture.root / "mac_test.conf"
-            _ = write_config_fixture(settings, "offload=on\nhost=fixture-mac\nlinux_only.hana=\nprobe_timeout_s=1\n")
+            _ = write_config_fixture(settings,
+                f"offload=on\nhost=fixture-mac\nlinux_only.hana=\nprobe_timeout_s={probe_timeout}\nfree_floor_gib=60\n")
             target = target_config.SshTarget("mac", "macos", settings)
             request = placement_request(fixture)
             destination = request.constraints.candidates[0].destination
@@ -1947,10 +1979,384 @@ class LocalHoldPlacementTests(unittest.TestCase):
                   mock.patch.object(claim_state, "mac_repository_identity", return_value=mirror),
                   mock.patch.object(eligibility, "state_directory", return_value=fixture.root / "mac-state"),
                   mock.patch.object(offload.ProcessController, "capture", probe.capture)):
-                offload.write_backoff(time.time() + 300, target.name)
+                if backoff:
+                    offload.write_backoff(time.time() + 300, target.name)
                 key = fixture.server.host_evidence_key(request, destination)
                 fixture.server.host_requests[key] = request
                 yield MacBackoffTestFixture(fixture, eligibility.backoff_path(target.name), key, probe)
+
+    @contextmanager
+    def mac_cycle_fixture(self, *, keys: int, probe_seconds: int = 0, blocked_key: bool = False,
+                          repositories: Sequence[str] = (),
+                          configure_probe: Callable[[MacBackoffTestFixture], Callable[[Sequence[str]], offload.CommandOutput]]
+                          = mac_cycle_probe_ok,
+                          ) -> Generator[tuple[MacBackoffTestFixture, tuple[placement.HostEvidenceKey, ...]]]:
+        from scripts.mac_test import claim_state, mac_test
+
+        start = threading.Event()
+        readings: Queue[placement.HostEvidence] = Queue()
+        guard = test_hang_guard.TEST_HANG_GUARD_SECS
+
+        class ObservedWorker(service.HostEvidenceWorker):
+            @override
+            def _read(self) -> None:
+                if not start.wait(guard):
+                    raise AssertionError("the test did not start the probe cycle")
+                super()._read()
+
+            @override
+            def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+                running = super()._probe(key, subscription)
+                readings.put(self.evidence(key))
+                return running
+
+        with (self.mac_backoff_fixture(backoff=False, probe_timeout=15) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ObservedWorker)):
+            server = fixture.admission.server
+            server.host_probe = server.read_provider_evidence
+            if repositories:
+                _ = write_config_fixture(conf.path("mac_test"), "".join(f"linux_only.{name}=\n" for name in repositories))
+            probe = configure_probe(fixture)
+
+            def capture(arguments: Sequence[str]) -> offload.CommandOutput:
+                fixture.admission.clock.advance(probe_seconds)
+                return probe(arguments)
+
+            def mirror(root: str) -> claim_state.ResolvedMacMirror:
+                name = Path(root).name
+                return claim_state.ResolvedMacMirror("https://fixture.invalid/team/hana", name, f"{name}.json", name, root)
+
+            _ = fixture.admission.enter_context(mock.patch.object(
+                claim_state, "mac_repository_identity", side_effect=mirror))
+
+            fixture.probe.answer = capture
+            request = server.host_requests[fixture.key]
+            subscribed: list[placement.HostEvidenceKey] = []
+            read = cast(Callable[[placement.HostEvidenceKey, float], service.HostEvidenceReader],
+                        getattr(server, "_host_evidence_reader"))
+            try:
+                for index in range(keys):
+                    session = (OwningSession("blocked-session") if blocked_key and index == 0
+                               else fixture.key.session)
+                    root = fixture.admission.root / (repositories[index] if repositories else "hana")
+                    key = replace(fixture.key, repository=str(root), package=f"package-{index}", session=session)
+                    server.host_requests[key] = replace(request, constraints=replace(
+                        request.constraints, repository=key.repository, package=key.package, session=session))
+                    _ = read(key, guard)
+                    subscribed.append(key)
+                if blocked_key:
+                    paths = mac_test.state_paths(fixture.key.destination.target)
+                    paths.block.parent.mkdir(parents=True, exist_ok=True)
+                    since = datetime.now(UTC)
+                    mac_test.write_block(paths.block, claim_state.ActiveMacBlock(
+                        "nate", "release work", since, since + timedelta(hours=1),
+                        claim_state.RecordedSession("submitting-session", "nate"), mac_test.NO_SHOWRUNNER,
+                        "off_by_this_block", mac_test.FREE_MESSAGE_NOT_NEEDED))
+                start.set()
+                completed = {readings.get(timeout=guard).key for _ in subscribed}
+                self.assertEqual(completed, set(subscribed))
+                worker, = server.host_targets.values()
+                worker.close()
+                worker.thread.join(guard)
+                self.assertFalse(worker.thread.is_alive())
+                yield fixture, tuple(subscribed)
+            finally:
+                server.close()
+                start.set()
+                for worker in server.host_targets.values():
+                    worker.thread.join(guard)
+                    self.assertFalse(worker.thread.is_alive())
+
+    def test_mac_cycle_reads_the_host_once_for_many_policy_keys(self) -> None:
+        with self.mac_cycle_fixture(keys=5) as (fixture, _keys):
+            self.assertEqual(fixture.probe.call_count, 1)
+
+    def test_mac_cycle_keeps_sixteen_slow_readings_fresh_together(self) -> None:
+        with self.mac_cycle_fixture(keys=16, probe_seconds=12) as (fixture, keys):
+            evidence = [fixture.admission.server.host_evidence(key) for key in keys]
+            for reading in evidence:
+                self.assertIsInstance(reading, placement.FreshHostEvidence)
+                assert isinstance(reading, placement.FreshHostEvidence)
+                self.assertEqual(reading.eligibility, placement.AllowedHost())
+            self.assertEqual(len({reading.observed_at for reading in evidence}), 1)
+
+    def test_mac_cycle_keeps_the_session_block_for_each_key(self) -> None:
+        with self.mac_cycle_fixture(keys=3, blocked_key=True) as (fixture, keys):
+            evidence = [fixture.admission.server.host_evidence(key) for key in keys]
+            results = [reading.eligibility for reading in evidence if isinstance(reading, placement.FreshHostEvidence)]
+            self.assertEqual(results, [placement.TemporaryExclusion("blocked"), placement.AllowedHost(),
+                                       placement.AllowedHost()])
+            self.assertEqual(fixture.probe.call_count, 1)
+
+    def test_mac_cycle_includes_a_cleanup_claim_written_during_ssh(self) -> None:
+        from scripts.mac_test import claim_state, mac_test, offload
+
+        def configure_probe(fixture: MacBackoffTestFixture) -> Callable[[Sequence[str]], offload.CommandOutput]:
+            paths = mac_test.state_paths(fixture.key.destination.target)
+            request = fixture.admission.server.host_requests[fixture.key]
+            paths.claims.mkdir(parents=True, exist_ok=True)
+            cleanup: claim_state.RemoteJobClaim = {
+                "claim_id": "cleanup", "episode": "previous", "attempt": "previous-attempt",
+                "submitting_session": "", "pid": request.owner.pid, "proc_start": "ended",
+                "remote_host": fixture.key.destination.host, "what": "check", "cleanup_pending": True,
+                "worktree": str(fixture.admission.root / "hana"), "since": "2026-11-17T11:00:00+00:00",
+            }
+            kept = cleanup.copy()
+            del kept["cleanup_pending"]
+            kept.update(claim_id="kept", repo_key="kept", repo_name="kept",
+                        mac_repository=claim_state.MacMirrorIdentity("kept", "kept", "kept.json", "kept").record())
+            mac_test.write_json(paths.claims / "kept.json", kept)
+            replaced = kept.copy()
+            replaced.update(claim_id="old", repo_key="replaced", repo_name="replaced",
+                            mac_repository=claim_state.MacMirrorIdentity(
+                                "replaced", "replaced", "replaced.json", "replaced").record())
+            mac_test.write_json(paths.claims / "replaced.json", replaced)
+
+            def capture(_arguments: Sequence[str]) -> offload.CommandOutput:
+                mac_test.write_json(paths.claims / "hana.json", cleanup)
+                mac_test.write_json(paths.claims / "replaced.json", {**replaced, "claim_id": "new"})
+                return offload.CommandOutput(0,
+                    "free_gib=60\nhost=fixture-mac\nrc=0\nmirror_setup=0\tready\n"
+                    + "mirror_process=0\t41\told-kept-start\nmirror_process=1\t42\told-replaced-start\n", "")
+
+            return capture
+
+        with self.mac_cycle_fixture(keys=2, configure_probe=configure_probe) as (fixture, keys):
+            server = fixture.admission.server
+            for key in keys:
+                evidence = server.host_evidence(key)
+                assert isinstance(evidence, placement.FreshHostEvidence)
+                self.assertEqual([claim.reference.claim_id for claim in evidence.cleanup_claims], ["cleanup"])
+                self.assertEqual(evidence.eligibility, placement.AllowedHost())
+                executions = {reference.claim_id: execution for reference, execution in evidence.executions}
+                self.assertEqual(executions["kept"], execution_identity.ObservedExecution(
+                    execution_identity.ProcessExecution(key.destination.host, "", 41, "old-kept-start")))
+                self.assertEqual(executions["new"], execution_identity.ExecutionEvidenceUnavailable(
+                    "remote execution remains unresolved", evidence.observed_at))
+                self.assertNotIn("old", executions)
+            request = server.host_requests[keys[0]]
+            reply, = server.handle_request(request)
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual(reply.eligibility, (placement.CandidateEligibility(
+                keys[0].destination, placement.TemporaryExclusion("busy")),))
+
+    def test_mac_cycle_applies_each_mirrors_setup_result(self) -> None:
+        from scripts.mac_test import floor_claims, offload
+
+        setup_reports: list[str] = []
+
+        def configure_probe(fixture: MacBackoffTestFixture) -> Callable[[Sequence[str]], offload.CommandOutput]:
+            root = fixture.admission.root
+            ready = root / offload.mac_mirror_root().relative / "hana"
+            ready.mkdir(parents=True)
+            (ready / floor_claims.MIRROR_MARK).touch()
+            runner = root / ".claude/scripts/lib/py"
+            runner.parent.mkdir(parents=True)
+            _ = runner.write_text("#!/bin/sh\nexit 1\n")
+            runner.chmod(0o700)
+            commands = "df() { printf 'header\\nfs a b 60\\n'; }\nhostname() { printf 'fixture-mac\\n'; }\n"
+
+            def capture(arguments: Sequence[str]) -> offload.CommandOutput:
+                result = subprocess.run(["/bin/sh", "-c", commands + arguments[-1]], capture_output=True,
+                                        text=True, timeout=5, check=False)
+                setup_reports.extend(line for line in result.stdout.splitlines() if line.startswith("mirror_setup="))
+                return offload.CommandOutput(result.returncode, result.stdout, result.stderr)
+
+            return capture
+
+        with self.mac_cycle_fixture(keys=2, repositories=("hana", "other"),
+                                    configure_probe=configure_probe) as (fixture, keys):
+            evidence = [fixture.admission.server.host_evidence(key) for key in keys]
+            results = [reading.eligibility for reading in evidence if isinstance(reading, placement.FreshHostEvidence)]
+            self.assertEqual(results, [placement.AllowedHost(), placement.TemporaryExclusion("copy")])
+            self.assertEqual(fixture.probe.call_count, 1)
+            self.assertEqual(setup_reports, ["mirror_setup=0\tready", "mirror_setup=1\tfailed"])
+
+    @contextmanager
+    def mac_disk_sweep_fixture(self) -> Generator[MacDiskSweepFixture]:
+        from scripts.mac_test import offload
+
+        started, release, inline, disk_ready = (threading.Event() for _ in range(4))
+        readings: Queue[placement.HostEvidence] = Queue()
+        recoveries: list[threading.Thread] = []
+        guard = test_hang_guard.TEST_HANG_GUARD_SECS
+        caller = threading.current_thread()
+        start = threading.Thread.start
+
+        class ObservedWorker(service.HostEvidenceWorker):
+            @override
+            def _probe(self, key: placement.HostEvidenceKey, subscription: object) -> bool:
+                running = super()._probe(key, subscription)
+                readings.put(self.evidence(key))
+                return running
+
+        def capture(arguments: Sequence[str]) -> offload.CommandOutput:
+            if arguments[-1].endswith("--floor-only --host mac"):
+                started.set()
+                thread = threading.current_thread()
+                if thread is caller or thread.name.startswith("placement-evidence-"):
+                    inline.set()
+                elif not release.wait(guard):
+                    raise AssertionError("the test did not release the sweep")
+                disk_ready.set()
+                return offload.CommandOutput(0, "", "")
+            free = 60 if disk_ready.is_set() else 59
+            return offload.CommandOutput(0, f"free_gib={free}\nhost=fixture-mac\nrc=0\nmirror_setup=0\tready\n", "")
+
+        def start_thread(thread: threading.Thread) -> None:
+            start(thread)
+            if thread.name == "mac-disk-recovery":
+                recoveries.append(thread)
+
+        with (self.mac_backoff_fixture(backoff=False) as fixture,
+              mock.patch.object(service, "HostEvidenceWorker", ObservedWorker),
+              mock.patch.object(threading.Thread, "start", start_thread)):
+            fixture.probe.answer = capture
+            server = fixture.admission.server
+            server.host_probe = server.read_provider_evidence
+            try:
+                yield MacDiskSweepFixture(fixture.admission, fixture.key, started, release, inline, disk_ready, readings)
+            finally:
+                release.set()
+                server.close()
+                for worker in server.host_targets.values():
+                    worker.thread.join(guard)
+                for recovery in recoveries:
+                    recovery.join(guard)
+                self.assertFalse(any(worker.thread.is_alive() for worker in server.host_targets.values()))
+                self.assertFalse(any(recovery.is_alive() for recovery in recoveries))
+
+    def test_mac_disk_probe_returns_pending_before_the_sweep_ends(self) -> None:
+        from scripts.mac_test import offload
+
+        with self.mac_disk_sweep_fixture() as fixture:
+            evidence = fixture.admission.server.read_provider_evidence(fixture.key)
+            self.assertFalse(fixture.inline.is_set(), "the probe ran the sweep inline")
+            assert isinstance(evidence, service.MacDiskRecoveryPendingEvidence)
+            self.assertEqual(evidence.disk, offload.MacDiskShort(59, 60))
+            self.assertEqual(evidence.eligibility, placement.TemporaryExclusion("disk"))
+            self.assertTrue(fixture.started.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+            self.assertFalse(fixture.release.is_set())
+
+    def test_another_mac_key_gets_fresh_disk_evidence_during_the_sweep(self) -> None:
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            guard = test_hang_guard.TEST_HANG_GUARD_SECS
+            first = fixture.subscribe(fixture.key)
+            self.assertEqual(fixture.readings.get(timeout=guard).key, fixture.key)
+            self.assertFalse(fixture.inline.is_set(), "the first probe ran the sweep inline")
+            self.assertTrue(fixture.started.wait(guard))
+            fixture.admission.clock.advance(1)
+            other = fixture.other_key()
+            second = fixture.subscribe(other)
+            self.assertIs(first.worker, second.worker)
+            evidence = fixture.readings.get(timeout=guard)
+            self.assertEqual(evidence.key, other)
+            self.assertIsInstance(evidence, service.MacDiskRecoveryPendingEvidence)
+            self.assertEqual(evidence.observed_at, fixture.admission.clock.now())
+            self.assertEqual(server.host_evidence(other), evidence)
+            self.assertFalse(fixture.release.is_set())
+
+    def test_mac_at_the_disk_floor_stays_excluded_until_the_sweep_ends(self) -> None:
+        from scripts.mac_test import offload
+
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            first = server.read_provider_evidence(fixture.key)
+            assert isinstance(first, service.MacDiskRecoveryPendingEvidence)
+            self.assertTrue(fixture.started.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+            fixture.disk_ready.set()
+            second = server.read_provider_evidence(fixture.other_key())
+            assert isinstance(second, placement.FreshHostEvidence)
+            self.assertEqual(second.eligibility, placement.TemporaryExclusion("disk"))
+            assert isinstance(second, service.MacDiskRecoveryPendingEvidence)
+            self.assertEqual(second.disk, offload.MacDiskShort(59, 60))
+            self.assertFalse(fixture.release.is_set())
+
+    def test_mac_disk_recovery_excludes_another_keys_cached_allowed_reading(self) -> None:
+        for during_pass in (False, True):
+            with self.subTest(during_pass=during_pass):
+                self.assert_mac_disk_recovery_blocks_cached_reading(during_pass)
+
+    def assert_mac_disk_recovery_blocks_cached_reading(self, during_pass: bool) -> None:
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            fixture.disk_ready.set()
+            cached = server.read_provider_evidence(fixture.key)
+            assert isinstance(cached, placement.FreshHostEvidence)
+            self.assertEqual(cached.eligibility, placement.AllowedHost())
+            server.publish_host_evidence(cached)
+
+            def start_recovery() -> None:
+                fixture.disk_ready.clear()
+                other = server.read_provider_evidence(fixture.other_key())
+                self.assertIsInstance(other, service.MacDiskRecoveryPendingEvidence)
+                self.assertTrue(fixture.started.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
+
+            request = server.host_requests[fixture.key]
+            if during_pass:
+                read = server.host_evidence
+
+                def read_before_recovery(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                    evidence = read(key)
+                    if key == fixture.key and not fixture.started.is_set():
+                        self.assertEqual(evidence, cached)
+                        start_recovery()
+                    return evidence
+
+                with mock.patch.object(server, "host_evidence", side_effect=read_before_recovery):
+                    reply, = server.handle_request(request)
+            else:
+                start_recovery()
+                reply, = server.handle_request(request)
+            self.assertIsInstance(reply, wire.PlacementWait)
+            assert isinstance(reply, wire.PlacementWait)
+            self.assertEqual(reply.eligibility, (placement.CandidateEligibility(
+                fixture.key.destination, placement.TemporaryExclusion("disk")),))
+            self.assertNotIn(request.episode, server.current_assignments)
+            self.assertEqual(server.host_observations[fixture.key], cached)
+
+    def test_mac_sweep_completion_refreshes_every_key_during_a_probe(self) -> None:
+        with self.mac_disk_sweep_fixture() as fixture:
+            server = fixture.admission.server
+            guard = test_hang_guard.TEST_HANG_GUARD_SECS
+            first_read, publish_first, refresh = (threading.Event() for _ in range(3))
+            read = server.host_probe
+
+            def probe(key: placement.HostEvidenceKey) -> placement.HostEvidence:
+                evidence = read(key)
+                if key == fixture.key and not first_read.is_set():
+                    first_read.set()
+                    if not publish_first.wait(guard):
+                        raise AssertionError("the test did not release the probe")
+                return evidence
+
+            server.host_probe = probe
+            reader = fixture.subscribe(fixture.key)
+            try:
+                self.assertTrue(first_read.wait(guard))
+                self.assertFalse(fixture.inline.is_set(), "the probe ran the sweep inline")
+                self.assertTrue(fixture.started.wait(guard))
+                other = fixture.other_key()
+                _ = fixture.subscribe(other)
+                request = reader.worker.requested.set
+
+                def notify() -> None:
+                    request()
+                    refresh.set()
+
+                with mock.patch.object(reader.worker.requested, "set", side_effect=notify):
+                    fixture.release.set()
+                    self.assertTrue(refresh.wait(guard))
+                publish_first.set()
+                self.assertIsInstance(fixture.readings.get(timeout=guard), service.MacDiskRecoveryPendingEvidence)
+                refreshed = [fixture.readings.get(timeout=guard) for _ in range(2)]
+                self.assertEqual({reading.key for reading in refreshed}, {fixture.key, other})
+                for evidence in refreshed:
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    self.assertEqual(evidence.eligibility, placement.AllowedHost())
+            finally:
+                publish_first.set()
 
     def test_good_mac_probe_ends_active_backoff(self) -> None:
         from scripts.mac_test import offload
@@ -9743,6 +10149,96 @@ class RunPlaceTests(unittest.TestCase):
             assert "order_since" in row
             self.assertEqual(row["order_since"], second.since)
             self.assertFalse(fixture.server.reservations)
+
+    def test_doc_keeps_its_run_rank_without_a_memory_hold_or_repository_slot(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            grant = fixture.finish_step(first)
+            self.assertIsInstance(fixture.server.slots[grant.reservation], records.BetweenStepsSlot)
+            fixture.free(0)
+            fixture.hold_starts()
+            fixture.clock.advance(1)
+            peer = fixture.request()
+            _ = fixture.server.handle_request(peer)
+            fixture.clock.advance(1)
+            doc = fixture.request(step="doc", run=run)
+            doc = replace(doc, identity=replace(doc.identity, verify=records.VerifyCall("doc", "verify doc", 1, 2)))
+            self.assertIsInstance(fixture.server.handle_request(doc)[0], wire.Wait)
+            self.assertEqual(fixture.queue_pids(), [doc.owner.pid, peer.owner.pid])
+            self.assertIsInstance(fixture.server.slots[grant.reservation], records.BetweenStepsSlot)
+            self.assertIsInstance(fixture.server.waiters[doc.episode].continuation_claim, service.NoContinuationClaim)
+
+            fixture.free(60 * GIB)
+            write_pressure_reading(fixture.root / "pressure")
+            fixture.allow_next_start()
+            _ = fixture.run_pass()
+            doc_grant = fixture.server.reservations[doc.episode].reservation_id
+            self.assertFalse(fixture.server.verify_run_slots)
+            self.assertEqual(fixture.server.handle_request(wire.ReleaseRequest("doc", doc_grant, 0)), [wire.Ok()])
+            self.assertNotIn(doc_grant, fixture.server.slots)
+
+    def test_mac_busy_mend_keeps_its_rank_for_the_retry(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, adopt_assignment, assignment_for, consume_permission, local_candidate,
+            placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            run = fixture.run_owner()
+            first = fixture.request(run=run)
+            _ = fixture.finish_step(first)
+            fixture.free(0)
+            fixture.hold_starts()
+            fixture.clock.advance(1)
+            peer = fixture.request()
+            _ = fixture.server.handle_request(peer)
+            fixture.clock.advance(1)
+            mend = placement_request(fixture)
+            assert isinstance(mend.profile, records.StepProfile)
+            mend = replace(mend, run=run, profile=replace(mend.profile, step="mend"),
+                identity=replace(mend.identity, step="mend"), constraints=replace(mend.constraints,
+                    command=("cargo", "mend"), candidates=(*mend.constraints.candidates, local_candidate(fixture))))
+            _ = publish_candidate(fixture, mend)
+            remote = assignment_for(fixture, mend)
+            self.assertEqual(remote.destination.provider, "mac")
+            saved_place = next(place for place in fixture.server.places.values() if place.episode == mend.episode)
+            self.assertTrue(saved_place.move_id)
+            claim = adopt_assignment(fixture, mend, remote)
+            self.assertEqual(fixture.server.handle_request(consume_permission("mend-start", remote, claim)),
+                             [wire.FirstAuthorization(remote, claim)])
+
+            key = fixture.server.host_evidence_key(mend, remote.destination)
+            evidence = fixture.provider_evidence[key]
+            assert isinstance(evidence, placement.FreshHostEvidence)
+            execution = execution_identity.ProcessExecution(remote.destination.host, evidence.generation, 700001, "start")
+            observed = replace(evidence, executions=((claim, execution_identity.ObservedExecution(execution)),))
+            fixture.provider_evidence[key] = observed
+            fixture.server.publish_host_evidence(observed)
+            _ = fixture.run_pass()
+            self.assertNotIn(mend.owner.pid, fixture.queue_pids())
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, mend, placement.TemporaryExclusion("busy"))
+            refused, = fixture.server.handle_request(wire.ExecutionReport("mend-busy", remote, claim,
+                execution_identity.ExecutionNotStarted(), placement.PrelaunchRefused("busy"),
+                placement.DispatchPathSettled()))
+            assert isinstance(refused, wire.DispatchStatus)
+            self.assertEqual(refused.state, placement.ClosedAssignment("busy"))
+            waiting, = fixture.server.handle_request(mend)
+            self.assertIsInstance(waiting, wire.PlacementWait)
+            self.assertEqual(fixture.queue_pids(), [mend.owner.pid, peer.owner.pid])
+            returned = next(place for place in fixture.server.places.values() if place.episode == mend.episode)
+            self.assertEqual(returned.move_id, saved_place.move_id)
+            row = next(row for _, row in self.reading(fixture).ordered if row["pid"] == mend.owner.pid)
+            self.assertEqual(row.get("order_since"), first.since)
+
+            fixture.clock.advance(1)
+            _ = publish_candidate(fixture, mend)
+            retry = assignment_for(fixture, mend)
+            self.assertEqual(retry.destination, remote.destination)
+            self.assertNotEqual(retry.attempt, remote.attempt)
+            self.assertEqual(retry.episode, remote.episode)
 
     def test_restart_between_steps_keeps_the_run_watch_without_a_memory_charge(self) -> None:
         with AdmissionFixture() as fixture:

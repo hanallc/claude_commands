@@ -8,15 +8,19 @@ except FileNotFoundError:
 
 import sys
 
+SET_MODEL_EXAMPLE = "agents {command} producers fable high"
+
+
 def _usage() -> str:
     from scripts.agents import set_model
 
+    example = SET_MODEL_EXAMPLE.format(command=set_model.COMMAND)
     return f"""usage: agents COMMAND
   agents help
   agents status [ACCOUNT] [--json] [--here]
-  agents pause NAME [--finish-step] --why TEXT
+  agents pause NAME [--finish-step] [--keep-workers] --why TEXT
   agents exit NAME [--finish-step] --why TEXT
-  agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] --why TEXT
+  agents pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
   agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
@@ -29,7 +33,7 @@ def _usage() -> str:
   agents remove-stray NAME SESSION
   agents transfer NAME [--model MODEL --effort EFFORT]
   agents add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]
-  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: agents {set_model.COMMAND} producers fable high)
+  agents {set_model.COMMAND} {set_model.ARGUMENTS}   (example: {example})
 """
 
 if __name__ == "__main__" and sys.argv[1:2] == ["status"]:
@@ -119,6 +123,7 @@ class CommandLine(argparse.Namespace):
     production: str = ""
     excluded: list[str] = []
     finish_step: bool = False
+    keep_workers: bool = False
     retired: bool = False
     resend_opening_prompt: bool = False
     old: str = ""
@@ -157,6 +162,23 @@ def wait_for_workers(record: staff.StaffSnapshot) -> None:
         if not waiting:
             return
         time.sleep(1)
+
+
+def _row_at_path(path: str, record: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Select one row by its full staff path, or by a path under a showrunner, such as assembly/fix2.
+
+    Return None when no row has the path, so that the caller can try a native session name.
+    """
+    found: dict[staff.StaffId, str] = {}
+    for full in (path, *(f"{root.name}/{path}" for root in record.rows if root.kind in ("showrunner", "producer"))):
+        if (row := record.by_path(full)) is not None:
+            _ = found.setdefault(row.id, full)
+    if len(found) == 1:
+        return record.rows_by_id[next(iter(found))]
+    if found:
+        paths = ", ".join(sorted(found.values()))
+        raise staff.StaffRefused(f"{path}: several staff rows match: {paths}; use the full path or the staff id")
+    return None
 
 
 def _result_code(result: StopResult | ResumeResult) -> int:
@@ -424,15 +446,44 @@ def remove_stray_producer(name: str, session: str) -> int:
         return finish_producer_cleanup(cleanup_path, cleanup, admission)
 
 
-def _message(row: staff.StaffRow, text: str) -> restart_support.MessageSendOutcome:
-    address = "codex:" if isinstance(staff.backend(row), staff.CodexBackend) else "session:"
+def _message(row: staff.StaffRow, text: str, *, require_live: bool = False,
+             key: str = "") -> restart_support.MessageSendOutcome:
+    address = str(row.id)
+    if not require_live:
+        prefix = "codex:" if isinstance(staff.backend(row), staff.CodexBackend) else "session:"
+        address = prefix + row.current_session
     try:
-        result = restart_support.send_message(address + row.current_session, "agents lifecycle", text)
+        result = restart_support.send_message(address, "agents lifecycle", text, key=key,
+                                              recipient_kind=row.kind if require_live else None,
+                                              once_per_key=bool(key))
     except (OSError, ValueError, RuntimeError) as error:
         result = restart_support.MessageUnconfirmed(kind="unconfirmed", reason=str(error))
-    if not restart_support.message_was_delivered(result):
+    accepted = (restart_support.message_was_accepted(result) if key else restart_support.message_was_delivered(result))
+    if not accepted:
         print(f"anomaly: {row.name}: continuation delivery: {result}", file=sys.stderr)
     return result
+
+
+def _deliver_pending_resume(row: staff.StaffRow) -> tuple[staff.StaffRow, int]:
+    pending = row.resume_pending
+    assert isinstance(pending, staff.ResumePending)
+    text = stop_resume.PAUSED_CONTINUATION
+    keep_workers = pending.original_pause.keep_workers
+    if not keep_workers:
+        workers = (quota_state.no_worker_notice() if quota_state.no_worker_mode()
+                   else "Resume your existing workers. Do not open new workers.")
+        text = f"{text} {workers}"
+    delivery = (_message(row, text, require_live=True, key=pending.key) if keep_workers
+                else _message(row, text, key=pending.key))
+    if restart_support.message_was_accepted(delivery):
+        current = staff.finish_resume(row.id, pending.key)
+        if isinstance(current.paused, staff.Active) and isinstance(current.exited, staff.Active):
+            shutdown_record.remove_started([str(row.id)])
+            print(f"{row.name}: active")
+        return current, 0
+    if delivery["kind"] == "rejected":
+        row = staff.finish_resume(row.id, pending.key, restore_pause=True)
+    return row, 1
 
 
 def _finish_tasks(row: staff.StaffRow, record: staff.StaffSnapshot) -> None:
@@ -456,6 +507,47 @@ def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
         stop_resume.running_on_account(str(row.current_session), "",
             kind="codex" if isinstance(staff.backend(row), staff.CodexBackend) else "claude"),
         stop_resume.ClaudeUp))
+
+
+def _local_keep_workers_refusal(row: staff.StaffRow) -> str:
+    try:
+        observed = herdr.read_conversation(str(row.current_session))
+        kind = observed.kind if isinstance(observed, herdr.LiveConversation) else pane_launch.current_kind(row)
+    except (OSError, ValueError, herdr_types.HerdrFailure):
+        return "The director's backend is unavailable. Use the default pause."
+    if kind == "codex":
+        return "The running Codex hook is unverified. Use the default pause."
+    return ""
+
+
+def _keep_workers_refusal(row: staff.StaffRow) -> str:
+    machine = stop_resume.member_machine(row)
+    if machine and not unit_machine_is_local(machine):
+        status, output = run_remote(["_keep-workers-check", str(row.id), str(row.current_session)])
+        if status == 0 and output.strip() == "claude":
+            return ""
+        if status == 2 and output.strip():
+            return " ".join(output.splitlines())
+        return f"Cannot check the director on {machine}. Use the default pause."
+    return _local_keep_workers_refusal(row)
+
+
+def _remote_keep_workers_check(identity: str, session: str) -> int:
+    try:
+        row = staff.initial_snapshot().by_id(staff.StaffId(identity))
+        if row is None or row.current_session != session:
+            raise ValueError("the director changed before the hook check")
+        machine = stop_resume.member_machine(row)
+        if machine and not unit_machine_is_local(machine):
+            raise ValueError(f"the director belongs to {machine}")
+        reason = _local_keep_workers_refusal(row)
+    except (OSError, ValueError, staff.StaffRefused) as error:
+        reason = " ".join(str(error).splitlines()) + ". Use the default pause."
+    if reason:
+        print(reason)
+        return 2
+    print("claude")
+    return 0
 
 
 def _lifecycle(options: CommandLine) -> int:
@@ -483,27 +575,44 @@ def _lifecycle(options: CommandLine) -> int:
     code = 0
     for row in rows:
         if options.command == "resume":
-            if isinstance(row.worktree, staff.RemovedWorktree):
-                print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
-                code = 2
-                continue
-            with staff.row_operation(str(row.id)):
-                started = False
-                if _paused_resume_needs_message(row):
-                    _ = staff.resume(str(row.id))
-                    workers = (quota_state.no_worker_notice() if quota_state.no_worker_mode()
-                               else "Resume your existing workers. Do not open new workers.")
-                    delivery = _message(row, f"Continue where you stopped. {workers}")
-                    if restart_support.message_was_delivered(delivery):
-                        started = True
-                        shutdown_record.remove_started([str(row.id)])
-                        print(f"{row.name}: active")
-                    else:
-                        _ = staff.set_hold(str(row.id), row.paused)
-                        code = 1
+            with ExitStack() as operation:
+                try:
+                    _ = operation.enter_context(staff.row_operation(str(row.id)))
+                except staff.StaffRefused as error:
+                    if not options.production:
+                        raise
+                    print(f"shutdown: StaffRefused: {error}", file=sys.stderr)
+                    code = 2
+                    continue
+                current = staff.initial_snapshot().by_id(row.id)
+                if current is None:
+                    print(f"{row.name}: staff row is missing", file=sys.stderr)
+                    code = 2
+                    continue
+                row = current
+                if isinstance(row.worktree, staff.RemovedWorktree):
+                    print(f"{row.name}: retired; use agents resume {row.name} --retired", file=sys.stderr)
+                    code = 2
+                    continue
+                if isinstance(row.resume_pending, staff.ResumePending):
+                    row, status = _deliver_pending_resume(row)
+                    code = max(code, status)
+                    if status or (isinstance(row.paused, staff.Active) and isinstance(row.exited, staff.Active)):
+                        continue
+                pause = row.paused
+                if isinstance(pause, staff.Paused) and _paused_resume_needs_message(row):
+                    _, status = _deliver_pending_resume(staff.begin_resume(row.id, pause))
+                    code = max(code, status)
+                elif isinstance(pause, staff.Paused) and pause.keep_workers:
+                    result = stop_resume.resume(str(row.id), why=why, to=options.to, keep_workers=True)
+                    code = max(code, _result_code(result))
+                    if isinstance(result, stop_resume.ClaudeUp):
+                        _, status = _deliver_pending_resume(staff.begin_resume(row.id, pause))
+                        code = max(code, status)
                 else:
+                    started = False
                     try:
-                        if isinstance(row.paused, staff.Paused):
+                        if isinstance(pause, staff.Paused):
                             _ = staff.resume(str(row.id))
                         result = stop_resume.resume(str(row.id), why=why, to=options.to)
                         started = isinstance(result, stop_resume.ClaudeUp)
@@ -511,8 +620,8 @@ def _lifecycle(options: CommandLine) -> int:
                             _ = staff.resume(str(row.id))
                         code = max(code, _result_code(result))
                     finally:
-                        if not started and isinstance(row.paused, staff.Paused):
-                            _ = staff.set_hold(str(row.id), row.paused)
+                        if not started and isinstance(pause, staff.Paused):
+                            _ = staff.set_hold(str(row.id), pause)
             continue
         if options.command == "exit" and row.kind == "producer":
             if _worktree_is_remote(row):
@@ -525,14 +634,20 @@ def _lifecycle(options: CommandLine) -> int:
                 print(f"{row.name}: exited")
             code = max(code, stopped)
             continue
+        if options.keep_workers and row.kind in ("unit", "showrunner") and (reason := _keep_workers_refusal(row)):
+            print(f"{row.name}: --keep-workers refused. {reason}", file=sys.stderr)
+            code = 2
+            continue
         already_exited = options.command == "exit" and isinstance(row.exited, staff.Exited)
-        held = row if already_exited else staff.pause(str(row.id), why)
+        held = row if already_exited else staff.pause(str(row.id), why, keep_workers=options.keep_workers)
         remote_exit = options.command == "exit" and _worktree_is_remote(row)
         if options.finish_step and not remote_exit:
             _finish_tasks(row, record)
         if remote_exit:
             outcome = unit_remote_command("stop", row, record, finish_step=options.finish_step)
             stopped = int(outcome["code"])
+        elif options.keep_workers:
+            stopped = 0
         else:
             unresolved = stop_resume.stop_unit_workers(row.id, record)
             stopped = int(bool(unresolved))
@@ -579,8 +694,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if arguments == ["_unit-local"]:
         return unit_local_command()
+    if len(arguments) == 3 and arguments[0] == "_keep-workers-check":
+        return _remote_keep_workers_check(arguments[1], arguments[2])
     parser = argparse.ArgumentParser(prog="agents", usage=_usage().removeprefix("usage: ").rstrip())
-    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    commands = parser.add_subparsers(prog=parser.prog, dest="command", required=True, metavar="COMMAND")
     command = commands.add_parser("stop")
     selection = command.add_mutually_exclusive_group(required=True)
     _ = selection.add_argument("session", nargs="?")
@@ -600,7 +717,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--model", default="")
     _ = command.add_argument("--effort", default="")
     _ = command.add_argument("--job", default="")
-    command = commands.add_parser(set_model.COMMAND)
+    example = SET_MODEL_EXAMPLE.format(command=set_model.COMMAND)
+    command = commands.add_parser(set_model.COMMAND, description=f"Example: {example}")
     _ = command.add_argument("role", metavar="ROLE")
     _ = command.add_argument("model", metavar="MODEL")
     _ = command.add_argument("effort", metavar="EFFORT", nargs="?", default="")
@@ -618,6 +736,8 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--why", required=True)
             _ = command.add_argument("--finish-step", action="store_true")
             _ = command.add_argument("--except", dest="excluded", action="append", default=[])
+            if verb == "pause":
+                _ = command.add_argument("--keep-workers", action="store_true")
     command = commands.add_parser("retire")
     _ = command.add_argument("session")
     _ = command.add_argument("--to")
@@ -759,24 +879,28 @@ def main(argv: list[str] | None = None) -> int:
         if options.command in ("pause", "exit", "resume"):
             return _lifecycle(options)
         record = staff.initial_snapshot()
-        member = record.by_member_reference(options.session)
-        matches = [member for member in record.rows if member.name == options.session]
-        named = matches[0] if len(matches) == 1 else None
-        row = member or record.by_path(options.session) or named
+        session = options.session
+        row = _row_at_path(session, record) if "/" in session else None
+        if row is not None:
+            target = row
+            session = str(row.id)
+        else:
+            matches = [member for member in record.rows if member.name == session]
+            target = record.by_member_reference(session) or (matches[0] if len(matches) == 1 else None)
+            row = target or record.by_path(session)
         if options.dry_run:
-            target = stop_resume.stop_target(options.session)
-            if isinstance(target, (stop_resume.SessionNotFound, stop_resume.StopFailed)):
-                return _result_code(target)
+            stop_target = stop_resume.stop_target(session)
+            if isinstance(stop_target, (stop_resume.SessionNotFound, stop_resume.StopFailed)):
+                return _result_code(stop_target)
             if row is not None and row.kind in ("unit", "showrunner"):
                 for child in record.find(kind="worker", parent=row.id):
                     print(f"{child.name}: would stop")
-            print(f"{row.name if row is not None else options.session}: would stop")
+            print(f"{row.name if row is not None else session}: would stop")
             return 0
         unresolved = stop_resume.stop_unit_workers(row.id, record) if row is not None and row.kind in ("unit", "showrunner") else []
         deadline = worker_lifecycle.effective_deadline()
-        target = member or named
         result = (stop_resume.stop_producer(target.id, "agents stop ran", deadline=deadline)
-                  if target is not None and target.kind == "producer" else stop_resume.stop(options.session, deadline=deadline))
+                  if target is not None and target.kind == "producer" else stop_resume.stop(session, deadline=deadline))
         return max(_result_code(result), int(bool(unresolved)))
     except herdr.RebootLockBusy as error:
         print(error, file=sys.stderr)

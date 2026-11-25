@@ -142,6 +142,8 @@ class AgentsUsageTests(unittest.TestCase):
                          ["help", "status", "pause", "exit", "pause", "resume", "resume", "resume", "retire", "rename", "move",
                           "reboot", "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
         self.assertIn("resume NAME", output)
+        self.assertIn("pause NAME [--finish-step] [--keep-workers] --why TEXT", output)
+        self.assertIn("pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
@@ -197,6 +199,27 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                     code, output, errors = self.invoke(arguments)
                     self.assertEqual((code, errors), (0, ""))
                     self.assertIn("agents select-model TARGET MODEL", output)
+
+    def test_subcommand_help_shows_its_usage_and_guidance(self) -> None:
+        cases = (
+            ("move", "usage: agents move [-h] [--dry-run] [--why WHY] SESSION_OR_GROUP ACCOUNT",
+             "Move Claude sessions to <claudeN>.", ("default",)),
+            ("set-model", "usage: agents set-model [-h] ROLE MODEL [EFFORT]",
+             "Example: agents set-model producers fable high", ()),
+        )
+        for command, usage, guidance, forbidden_text in cases:
+            with self.subTest(command=command):
+                result = subprocess.run(
+                    [sys.executable, str(Path(__file__).with_name("shutdown.py")), command, "--help"],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                    env={**os.environ, "COLUMNS": "100"},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                lines = [line for line in result.stdout.splitlines() if line]
+                self.assertEqual(lines[:2], [usage, guidance])
+                for forbidden in forbidden_text:
+                    self.assertNotIn(forbidden, result.stdout)
 
     def test_unknown_command_prints_usage_and_exits_two(self) -> None:
         status, output, errors = self.invoke(["unknown-command"])
@@ -394,9 +417,6 @@ names.test-all=test all
 names.test-modules=test named
 prose.gate=the gate
 prose.build=release build
-owned.default={unit} {step}
-owned.showrunner-default=showrunner {step}
-owned.ci-default=CI {step}
 """,
     "showrunners": """\
 # range: 0..100
@@ -427,7 +447,7 @@ def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
 
 
 def retirement_copies_environment(root: Path) -> dict[str, str]:
-    private = build_slots_test_support.private_slot_config(root, repository="fixture", default_maximum=2)
+    private = build_slots_test_support.private_slot_config(root)
     return {**private.environment, "HOME": str(root), "SCRATCH_COPIES_ROOT": str(root / "copies")}
 
 
@@ -492,14 +512,6 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 
 @final
 class MoveTests(unittest.TestCase):
-    def test_help_teaches_only_numbered_claude_targets(self) -> None:
-        output = io.StringIO()
-        with redirect_stdout(output), self.assertRaises(SystemExit) as result:
-            _ = shutdown.main(["move", "--help"])
-        self.assertEqual(result.exception.code, 0)
-        self.assertIn("<claudeN>", output.getvalue())
-        self.assertNotIn("default", output.getvalue())
-
     def test_session_delegates_once_with_the_reason_and_preserves_the_result(self) -> None:
         with mock.patch.object(accounts, "main", return_value=1) as move:
             code = shutdown.main(["move", "TEST-nightly-review", "claude 2", "--why", "weekly limit"])
@@ -829,7 +841,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertNotIn("busy", output)
+            self.assertNotIn(": busy; held by ", output)
             self.assert_slot_held(tree)
             self.assertTrue(tree.exists())
         self.assertTrue(self.worktree.is_dir())
@@ -838,7 +850,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertNotIn("busy", output)
+            self.assertNotIn(": busy; held by ", output)
             self.assert_slot_held(tree)
         code, output = self.retire()
         self.assertEqual(code, 0, output)

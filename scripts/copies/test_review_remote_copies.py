@@ -22,6 +22,8 @@ from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
 
+from scripts.build_hold.owning_session import NoOwningSession
+from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
@@ -70,7 +72,7 @@ class RemoteEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
-        private = private_slot_config(self.root, repository="repository", maximum=2)
+        private = private_slot_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(warm_claim_servers())
@@ -743,13 +745,63 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         ):
             yield controller, config, request
 
-    def test_admission_selects_a_leased_slot_and_keeps_the_other_owner(self) -> None:
+    def test_new_admission_refuses_a_busy_first_mirror_and_keeps_both_owners(self) -> None:
         first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
         second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
         self.assertEqual(publish_mirror(first), 0)
         self.assertEqual(publish_mirror(second), 0)
-        with self.admission() as (controller, config, request), copies.remote_lease(first):
+        with (self.admission() as (controller, config, request), copies.remote_lease(first),
+              mock.patch.object(offload, "write_mirror_busy") as record_busy):
             result = offload.run_offload(controller, config, request, 0)
+            record_busy.assert_called_once_with(config, "repository", "linux")
+        self.assertIsInstance(result, offload.BusyMacDecline)
+        self.assertEqual(copies.owned_remote_mirrors("new-owner"), [])
+        for mirror in (first, second):
+            self.assertEqual(copies.owned_remote_mirrors(mirror.owner), [mirror])
+            self.assertEqual(json.loads((Path(mirror.path) / ".copy-record.json").read_text())["owner"], mirror.owner)
+
+    def test_saved_linux_assignment_adopts_the_second_mirror_while_the_first_is_leased(self) -> None:
+        first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
+        second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
+        self.assertEqual(publish_mirror(first), 0)
+        self.assertEqual(publish_mirror(second), 0)
+        pid = os.getpid()
+        start = process_identity.process_start(pid)
+        assert isinstance(start, process_identity.Started)
+        session = NoOwningSession()
+        scope = claim_state.RepositoryScope("repository", "key")
+        destination = placement.PlacementDestination("ssh", "linux", second.host, scope, 2)
+        assignment = placement.PlacementAssignment("episode", "attempt", destination,
+            execution_identity.SourceKeyKnown("tree"), placement.SubmittingOwner("natedev", pid, start.start), session, 0)
+        identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
+                                             assignment.episode, assignment.attempt)
+        reference = placement.ProviderClaimReference("ssh", "linux", scope, identity.claim_id,
+                                                     identity.episode, identity.attempt)
+        command_claim = mac_test.command_claim
+
+        def claim_with_mirror_lease(args: mac_test.CliArguments, paths: claim_state.StatePaths) -> int:
+            self.assertEqual(args.from_pid, pid)
+            with self.assertRaisesRegex(copies.BusyRemoteMirror, "slot-2: busy"), copies.remote_lease(second):
+                self.fail("The runner must hold the mirror lease before it adopts the claim.")
+            return command_claim(args, paths)
+
+        with (self.admission() as (controller, config, request), copies.remote_lease(first),
+              mock.patch.object(admission_client, "consume_permission",
+                                return_value=wire.FirstAuthorization(assignment, reference)) as consume):
+            paths = claim_state.state_paths("linux")
+            args = mac_test.CliArguments()
+            args.pid, args.target, args.worktree = pid, "linux", str(request.repo_root)
+            self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, assignment=assignment), 0)
+            saved, = claim_state.read_claims(paths)
+            legacy = saved.path.with_name(saved.path.stem + ".slot-2.json")
+            _ = saved.path.rename(legacy)
+            request = replace(request, placement=offload.AssignedOffloadRequest(assignment),
+                              admission=offload.MacClaimFromWait(pid, identity, session))
+            with mock.patch.object(mac_test, "command_claim", side_effect=claim_with_mirror_lease) as adopt:
+                result = offload.run_offload(controller, config, request, 0)
+            adopt.assert_called_once()
+            consume.assert_called_once()
+            self.assertFalse(legacy.exists())
         self.assertIsInstance(result, offload.PassedOnTarget)
         self.assertEqual(copies.owned_remote_mirrors("first-owner"), [first])
         self.assertEqual([record.path for record in copies.owned_remote_mirrors("new-owner")], [second.path])

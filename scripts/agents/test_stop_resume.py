@@ -310,6 +310,41 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(exited.why, "keep stopped")
             self.assertEqual(stop_resume.resume_for_upkeep(row.id), held)
 
+    def test_stop_selects_a_worker_by_its_unit_path(self) -> None:
+        hana = fixture_member("showrunner", name="hana")
+        assembly = fixture_member("unit", name="assembly", parent=hana.id)
+        worker = fixture_member("worker", name="fix2", parent=assembly.id)
+        _ = fixture_member("worker", name="fix2", parent=fixture_member("unit", name="cables", parent=hana.id).id)
+        with (patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning(worker.current_session)) as stop,
+              patch.object(stop_resume, "stop_unit_workers", return_value=[]) as stop_workers):
+            for path in ("assembly/fix2", "hana/assembly/fix2"):
+                with self.subTest(path=path), redirect_stdout(io.StringIO()):
+                    self.assertEqual(shutdown.main(["stop", path]), 0)
+                    self.assertEqual(stop.call_args.args, (str(worker.id),))
+            stop_workers.assert_not_called()
+            with self.subTest(path="hana/assembly"), redirect_stdout(io.StringIO()):
+                self.assertEqual(shutdown.main(["stop", "hana/assembly"]), 0)
+                self.assertEqual(stop_workers.call_args.args[0], assembly.id)
+                self.assertEqual(stop.call_args.args, (str(assembly.id),))
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(shutdown.main(["stop", "--dry-run", "assembly/fix2"]), 0)
+            self.assertEqual(output.getvalue(), "fix2: would stop\n")
+            stop.reset_mock()
+            other = fixture_member("unit", name="assembly", parent=fixture_member("showrunner", name="cad").id)
+            _ = fixture_member("worker", name="fix2", parent=other.id)
+            with redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(shutdown.main(["stop", "assembly/fix2"]), 2)
+            self.assertEqual(errors.getvalue(), "shutdown: StaffRefused: assembly/fix2: several staff rows match: "
+                             + "cad/assembly/fix2, hana/assembly/fix2; use the full path or the staff id\n")
+            stop.assert_not_called()
+
+    def test_stop_gives_a_path_with_no_staff_row_to_the_session_stop(self) -> None:
+        """A native session name can contain a slash, such as review/x."""
+        with (patch.object(stop_resume, "stop", return_value=stop_resume.NotRunning("review/x")) as stop,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(shutdown.main(["stop", "review/x"]), 0)
+        self.assertEqual(stop.call_args.args, ("review/x",))
+
     def test_remote_producer_exit_stops_on_mac_and_saves_the_hold(self) -> None:
         row = fixture_member("producer", name="alpha", worktree=staff.PresentWorktree("mac", self.root))
         mac_state = self.root / "mac-shutdown"
@@ -1753,6 +1788,39 @@ class StopResumeTests(unittest.TestCase):
         pane_record.save("agents", {})
         result = stop_resume._resume_once(identity, why="test", names=LaunchNames(staff.StaffSnapshot(())))  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(result, stop_resume.SessionNotFound(identity))
+
+    def test_kept_worker_resume_starts_only_the_director(self) -> None:
+        from scripts.production import worker
+
+        identity = staff.StaffId(self.entry["session_id"])
+        row = staff.StaffRow(identity, "unit", "alpha", staff.StaffRoot(), current_session=identity,
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root),
+                             unit_type=staff.UnitDetails("direct"))
+        record = staff.StaffSnapshot((row,))
+        up = stop_resume.ClaudeUp(identity, "w1:p2", "claude3")
+        for saved in (True, False):
+            with self.subTest(saved=saved):
+                if not saved:
+                    pane_record.save("agents", {})
+                with (patch.object(staff, "initial_snapshot", return_value=record),
+                      patch.object(stop_resume, "running_on_account", side_effect=[sessions.SessionNotLive(), up]),
+                      patch.object(stop_resume, "_start_session", return_value=sessions.LiveSessionProcess(456)) as start_pane,
+                      patch.object(stop_resume, "_watch_resume"),
+                      patch.object(worker, "resume_workers") as worker_message,
+                      patch.object(restart, "start_row", return_value="w1:p2") as start_row,
+                      patch.object(shutdown_record, "remove_started") as remove):
+                    result = stop_resume.resume(str(row.id), keep_workers=True)
+                self.assertEqual(result, up, str(result))
+                worker_message.assert_not_called()
+                remove.assert_not_called()
+                if saved:
+                    start_pane.assert_called_once()
+                    self.assertEqual(start_pane.call_args.args[3], "")
+                    start_row.assert_not_called()
+                else:
+                    start_pane.assert_not_called()
+                    start_row.assert_called_once_with(row, record, self.client, target_account="",
+                        worker_scope=restart.WorkerRestartScope.SELECTED_ROWS)
 
     def test_admitted_pane_run_with_no_start_fails_after_one_attempt(self) -> None:
         with patch.object(self.client, "run", self.start):

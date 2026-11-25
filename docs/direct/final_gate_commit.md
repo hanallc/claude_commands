@@ -11,8 +11,14 @@ Loop/verbose only after plan exhaustion:
 1. Launch one final gate under <BackgroundVerificationContract/>. With a root
    `Cargo.toml`, run `verify.sh final` for the workspace all-targets check and
    full tests. Without a root `Cargo.toml`, run the repository's unit gate.
-   For `~/.claude`, use
-   `~/.claude/scripts/lib/py ~/.claude/scripts/production/targeted_test.py --checkout <tree>`.
+   For `claude_commands`, run this command from the unit worktree root.
+
+   ```sh
+   ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+     --repo . --commit HEAD -- ./scripts/lib/py scripts/production/gate.py --affected
+   ```
+
+   Add `--apply-uncommitted .` before `--` if the worktree has uncommitted changes.
 2. If either gate fails, create a synthetic phase `final` / `Final verification` once:
    capture a new baseline, run `start-phase`, reset review and smoke state, open
    the concrete failures in the ledger, then use its gate plus <FixDispatch/>.

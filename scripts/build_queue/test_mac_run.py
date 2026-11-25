@@ -1608,7 +1608,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
 
             def take_over_then_claim(current: offload.ProcessController, _config: eligibility.OffloadConfig,
                                      _request: offload.OffloadRequest, _repo: eligibility.RepositoryIdentity,
-                                     _slots: tuple[int, ...], *, retire_wait: bool,
+                                     *, retire_wait: bool,
                                      mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository,
                                      ) -> offload.TakenOverMacClaim | offload.FreshMacClaim:
                 self.assertFalse(retire_wait)
@@ -1636,7 +1636,7 @@ with patch.object(Path, "unlink", interrupt_unlink), patch.object(Path, "replace
         controller = offload.ProcessController()
 
         def claim(current: offload.ProcessController, _config: eligibility.OffloadConfig,
-                  _request: offload.OffloadRequest, _repo: eligibility.RepositoryIdentity, _slots: tuple[int, ...], *,
+                  _request: offload.OffloadRequest, _repo: eligibility.RepositoryIdentity, *,
                   retire_wait: bool,
                   mac_repository: claim_state.MacRepositoryIdentity | claim_state.NoSavedMacRepository,
                   ) -> offload.FreshMacClaim:

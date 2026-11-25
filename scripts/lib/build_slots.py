@@ -98,12 +98,6 @@ def source_checkout(source: Path) -> Path:
     return (Path(common) / configured).resolve()
 
 
-def configured_maximum(settings: conf.ConfigRead, machine: str, repository: str) -> int:
-    """Read the Mac claim limit for the repository, or the machine's default limit."""
-    key = f"slots.{machine}.{repository}.max"
-    return settings.whole(key if key in settings.values() else f"slots.{machine}.default_max")
-
-
 def _persistent_source(source: Path) -> Path:
     seen: set[Path] = set()
     while True:
@@ -294,6 +288,7 @@ def take_copy(source: Path, commit: str, *, showrunner: str, unit: str, work: st
                 yield LeasedCopy(path, name, number, MappingProxyType({
                     "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_BUILD_DIR": str(target),
                     build_folders.NUMBERED_COPY_LOCK_ENV: str(descriptor),
+                    build_folders.COPY_KEEP_ENV: str(build_folders.copy_keep_file(path)),
                 }), (descriptor,))
                 return
         if isinstance(selection, ExactSlotRequest):

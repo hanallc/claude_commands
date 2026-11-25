@@ -46,7 +46,7 @@ else:
 from scripts.build_queue.system_clock import SystemClock
 
 from scripts.lib import conf, process_stat
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import atomic_sample, write_text_atomic
 
 BUILDS_SESSION = "builds"
 LAUNCH_WAIT_LIMIT_REASON = "launch wait limit reached without admission"
@@ -400,9 +400,10 @@ def _waits_for_live_service(request: wire.Request) -> bool:
 
 def _query(request: wire.ViewRequest | wire.ExplainRequest | wire.MineRequest | wire.PlacementRequest
            | wire.ClaimFailure | wire.ConsumePermission | wire.ExecutionReport | wire.PrerequisiteReport
-           | wire.CancelPlacement | wire.SettlementRequest | status_wire.PlacementStatusRequest) -> wire.Reply:
+           | wire.CancelPlacement | wire.SettlementRequest
+           | status_wire.PlacementStatusRequest, *, wait_for_service: bool = True) -> wire.Reply:
     from scripts.build_queue import admission_protocol as wire, admission_records as records
-    if _waits_for_live_service(request):
+    if wait_for_service and _waits_for_live_service(request):
         reply = _call(request, lambda _wait: None, report_refusal=False)
         if isinstance(reply, LeftQueue):
             raise _QueueLeft()
@@ -599,8 +600,8 @@ def consume_permission(request: wire.ConsumePermission) -> wire.FirstAuthorizati
     raise wire.AdmissionUnavailable("invalid permission answer")
 
 
-def report_execution(request: wire.ExecutionReport) -> wire.DispatchStatus:
-    reply = _query(request)
+def report_execution(request: wire.ExecutionReport, *, wait_for_service: bool = True) -> wire.DispatchStatus:
+    reply = _query(request, wait_for_service=wait_for_service)
     if isinstance(reply, wire.DispatchStatus):
         return reply
     raise wire.AdmissionUnavailable("invalid execution report answer")
@@ -1687,11 +1688,13 @@ class PlacementWaitNotice:
     last_reply: wire.Wait | wire.PlacementResourceWait
     elapsed_memory_seconds: float = 0.0
     provider_diagnostics: tuple[placement.BusyProviderDiagnostic, ...] = ()
+    sampled_at: float | None = None
+    episode: str = ""
 
 
 def first_hana_image_notice() -> bool:
     """Share the notice with other clients that use the same verify run folder."""
-    hold_wait_file = os.environ.get("BUILDLOG_HOLD_WAIT_FILE", "")
+    hold_wait_file = os.environ.get("BUILDLOG_HOLD_WAITER_FILE") or os.environ.get("BUILDLOG_HOLD_WAIT_FILE", "")
     if hold_wait_file:
         try:
             with Path(hold_wait_file).with_name("hana-image-stale").open("x"):
@@ -1862,10 +1865,12 @@ class WaitOutput:
                  "/build:page shows the detail" if first else "")
         self.status(f"{prefix}: " + "; ".join(part for part in parts if part))
 
-    def elapsed_seconds(self) -> int:
+    def elapsed_seconds(self, *, at: float | None = None) -> int:
         if isinstance(self.last_resource, wire.PlacementResourceWait):
             return int(self.elapsed_memory_seconds)
-        return int(self.elapsed_memory_seconds + CLOCK.monotonic() - self.started) if self.held or self.deadline_reached else 0
+        if not (self.held or self.deadline_reached):
+            return 0
+        return int(self.elapsed_memory_seconds + (CLOCK.monotonic() if at is None else at) - self.started)
 
     def finished(self, *, left: bool = False, placement_events: bool = False) -> None:
         if not self.held:
@@ -2137,22 +2142,12 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
     already_queued = False
     keep_wait = False
     pinned_refusal_reported = False
+    wait_result = os.environ.get("BUILDLOG_PLACEMENT_WAIT_RESULT", "") if args.wait_events else ""
+    reported_elapsed = 0
+    last_wait: wire.Wait | wire.PlacementResourceWait | None = None
+    finished_elapsed: int | None = None
+
     try:
-        if args.command == "place-step" and placement_wait_state.exists():
-            try:
-                saved = wire.parse_record(placement_wait_state.read_text(), PlacementWaitNotice)
-            except (ValueError, TypeError):
-                placement_wait_state.unlink(missing_ok=True)
-            else:
-                output.started, output.last_reasons = saved.started, saved.last_reasons
-                output.last_position = saved.last_position
-                output.elapsed_memory_seconds = saved.elapsed_memory_seconds
-                output.last_provider_diagnostics = saved.provider_diagnostics
-                if isinstance(saved.last_reply, wire.Wait):
-                    output.last_holder = saved.last_reply.snapshot.holder
-                else:
-                    output.last_resource = saved.last_reply
-                output.held = True
         from scripts.build_queue import placement, admission_records as records
         from scripts.buildlog import store
 
@@ -2164,6 +2159,27 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
 
         step_argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
         episode = args.episode or f"{args.pid}-{start}-{args.source_key}"
+        if placement_wait_state.exists():
+            try:
+                saved = wire.parse_record(placement_wait_state.read_text(), PlacementWaitNotice)
+            except (ValueError, TypeError):
+                placement_wait_state.unlink(missing_ok=True)
+            else:
+                last_wait = saved.last_reply
+                output.started, output.last_reasons = saved.started, saved.last_reasons
+                output.last_position = saved.last_position
+                output.elapsed_memory_seconds = saved.elapsed_memory_seconds
+                output.last_provider_diagnostics = saved.provider_diagnostics
+                if isinstance(saved.last_reply, wire.Wait):
+                    output.last_holder = saved.last_reply.snapshot.holder
+                else:
+                    output.last_resource = saved.last_reply
+                output.held = True
+                if saved.sampled_at is not None:
+                    reported_elapsed = output.elapsed_seconds(at=saved.sampled_at)
+                    if saved.episode != episode:
+                        # The lint judgment starts a new episode after formatting.
+                        output.started += CLOCK.monotonic() - saved.sampled_at
         if queued_episode_state.exists():
             try:
                 queued = wire.parse_record(queued_episode_state.read_text(), QueuedPlacementEpisode)
@@ -2244,19 +2260,22 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             if _leave_queue():
                 _ = cancel_placement(wire.CancelPlacement(uuid.uuid4().hex, episode, owner,
                     "the caller left before placement"), unit=identity.unit)
+                finished_elapsed = output.elapsed_seconds()
                 raise _QueueLeft()
             # The first pass only lets a free remote target take the step; it is no memory wait.
             token_check = (isinstance(prerequisite, placement.TokenRequired)
                            and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             if isinstance(answer.wait, wire.Wait) and not token_check:
                 output(answer.wait)
-                notice = PlacementWaitNotice(output.started, output.last_reasons,
-                    output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
-                write_text_atomic(placement_wait_state, wire.encode_record(notice), new_file_mode=0o600)
+                last_wait = answer.wait
             elif isinstance(answer.wait, wire.PlacementResourceWait):
                 output.resource_wait(answer.wait)
+                last_wait = answer.wait
+            sampled_at = CLOCK.monotonic()
+            if last_wait is not None:
                 notice = PlacementWaitNotice(output.started, output.last_reasons,
-                    output.last_position, answer.wait, output.elapsed_memory_seconds, output.last_provider_diagnostics)
+                    output.last_position, last_wait, output.elapsed_memory_seconds, output.last_provider_diagnostics,
+                    sampled_at=sampled_at, episode=episode)
                 write_text_atomic(placement_wait_state, wire.encode_record(notice), new_file_mode=0o600)
             if isinstance(answer.wait, wire.Wait):
                 cause = answer.wait.reason
@@ -2275,8 +2294,10 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                 keep_wait = True
                 if not args.wait_events:
                     print(wire.encode_reply(answer), end="")
+                finished_elapsed = output.elapsed_seconds(at=sampled_at)
                 return 78
             CLOCK.sleep(records.read_memory_config().waiting_pass_seconds)
+        finished_elapsed = output.elapsed_seconds()
         if isinstance(answer, wire.DispatchStatus):
             reason = answer.state.reason if isinstance(answer.state, placement.ClosedAssignment) else answer.reason
             if args.pinned_refusals:
@@ -2289,7 +2310,9 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
             return 2
         write_assignment(args.assignment_file, answer)
         if isinstance(answer, wire.LocalPlacementGranted) and args.shell_state is not None:
-            write_shell_grant(args.shell_state, answer.grant, output.elapsed_seconds())
+            write_shell_grant(args.shell_state, answer.grant, finished_elapsed)
+        if finished_elapsed and args.wait_events and not wait_result:
+            output.on_event(f"memory-seconds {finished_elapsed}")
         output.finished(left=isinstance(answer, wire.Assignment), placement_events=args.wait_events)
         if output.held:
             output.on_event("done")
@@ -2311,6 +2334,11 @@ def _place_step(args: ClientArguments, output: WaitOutput) -> int:
                     if not pinned_refusal_reported:
                         raise
                     print(str(error), file=sys.stderr)
+        if wait_result and finished_elapsed is not None and sys.exc_info()[0] in (None, _QueueLeft):
+            try:
+                atomic_sample(Path(wait_result), f"{max(0, finished_elapsed - reported_elapsed)}\n")
+            except OSError as error:
+                print(f"cannot record the placement wait: {error}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
