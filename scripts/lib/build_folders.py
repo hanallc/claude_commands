@@ -760,7 +760,7 @@ def parse_resolved_form(path: Path, build_root: Path) -> ParsedFolder:
 
 
 def test_runs_parent(checkout: Path) -> Path:
-    """Use the selected checkout's build output or its temporary parent."""
+    """Select a test parent from the checkout output or the caller's private temporary folder."""
     target = checkout / "target"
     output = None
     if isinstance(parse_form(checkout), BuildCopy):
@@ -777,10 +777,22 @@ def test_runs_parent(checkout: Path) -> Path:
             raise InvalidFolderForm(f"{parent}: a model test folder must not be a link")
         return parent
 
+    from scripts.lib import session_folder, unit_runs
+
     inherited = inherited_temporary_parent().resolve()
-    if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV):
-        return inherited.parent
-    return inherited / "test-runs"
+    parent = inherited.parent if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV) else inherited / "test-runs"
+    build = build_root().resolve()
+    protected = (
+        build / "test-runs",
+        session_folder.configured_root().resolve(),
+        session_folder.former_root().resolve(),
+        unit_runs.RUN_ROOT.resolve(),
+        unit_runs.FORMER_RUN_ROOT.resolve(),
+    )
+    resolved = parent.resolve()
+    if inherited == build or any(folder.is_relative_to(root) for root in protected for folder in (inherited, resolved)):
+        raise InvalidFolderForm(f"{checkout}: test runs from {inherited} require an assigned build output")
+    return parent
 
 
 def repository_git_timeout() -> float:

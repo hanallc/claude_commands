@@ -132,7 +132,8 @@ os.execv(os.environ["TEST_REAL_PYTHON"], [os.environ["TEST_REAL_PYTHON"], *sys.a
         functions = shell_functions(
             VERIFY, "verify_helper", "initialize_step_record", "publish_step_state", "step_state", "step_writes_tree",
             "run", "run_step", "finish_step_token", "route_compiling_step",
-            "take_local_placement", "apply_placement_outcome",
+            "wait_for_verify_child", "wait_for_verify_step_group",
+            "take_local_placement", "apply_placement_outcome", "publish_placement_wait",
             "sync_token_state", "acquire_token", "record_token_wait", "build_hold_wait_local",
             "run_lint_sequence", "run_lint_held_sequence", "run_lint_judgment",
             "read_metadata", "load_metadata", "workspace_taplo",
