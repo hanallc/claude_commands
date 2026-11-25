@@ -50,7 +50,9 @@ Use `/tune` to set `review_hold=on` when message holding can resume.
 `send.py` keeps local messages during an open review and returns `KEPT` with the held messages file path.
 The hold ends when the review ends (count 0), or after `review_hold_idle_minutes` with no user prompt.
 Each user prompt restarts that time.
-The next user prompt after an idle end delivers the held messages and starts the hold again while the review has open items.
+`scripts/message/review_hold.py end-now` ends the current session's hold and uses the idle release.
+The command keeps the review item count.
+The next user prompt delivers any pending messages and starts the hold again while the review has open items.
 A release appends the held messages to `~/.local/state/adhoc_review/.holds/<session>.held.md` (mode 0600).
 Each release starts with a `Released at HH:MM:SS <zone>` line, and its entries start again at 1, oldest first.
 Each entry keeps the sender, the Sent line, the `Sender native id:` line and the text.
