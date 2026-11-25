@@ -213,6 +213,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/herdr/worker_panes.py` | write | snapshot, runtime_id, row_operation, slot_operation; worker_admission.publish |
 | `scripts/hooks/conversation_pause.py` | read | local_by_current_session; StaffSnapshot, LiveDoc, WrappedDoc |
 | `scripts/hooks/conversation_pause_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/hooks/goal_card.py` | read | Reads staff.json for the current session. StaffRow.from_json, StaffSnapshot, active |
 | `scripts/hooks/herdr_tab_title.py` | read | snapshot |
 | `scripts/hooks/idle_update.py` | read | StaffSnapshot and Kind (types); the prompt hook passes the row |
 | `scripts/hooks/post-tool-use-sendmessage-miss.py` | read | snapshot |
@@ -280,6 +281,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/merge_gate.py` | read | snapshot, initial_snapshot, doc_owner |
 | `scripts/production/gate_test_support.py` | write | LiveDoc; fixture_member calls ensure |
+| `scripts/production/goal.py` | read | StaffId type for the producer and List owner |
 | `scripts/production/next_item.py` | read | snapshot |
 | `scripts/production/production_admission.py` | write | record_path, snapshot, authority_snapshot, set_doc; checks and records a change to the document binding |
 | `scripts/production/production_doc.py` | read | StaffRow, StaffSnapshot, LiveDoc, WrappedDoc |
@@ -389,7 +391,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 244 accessor rows (42 write, 201 read, and 1 owner).
+The table has 246 accessor rows (42 write, 203 read, and 1 owner).
 
 ## Approved copies
 
