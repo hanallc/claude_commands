@@ -293,7 +293,7 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "The Pushover Message API sets the title character limit.",
     ),
     ExternalLiteral(
-        "scripts/notify/push_texts.py", "MESSAGE_MAX",
+        "scripts/notify/pushover.py", "MESSAGE_MAX",
         "The Pushover Message API sets the message character limit.",
     ),
     TunableLiteral(

@@ -63,14 +63,8 @@ from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.notify import silence
 from scripts.notify import decision_priority
-from scripts.notify.push_texts import (
-    ActionEnd, KnownActionEnd, NoHeader, PhoneBudget, UnknownActionEnd,
-    MESSAGE_MAX as MESSAGE_MAX, phone_message_limit as phone_message_limit,
-    format_phone_body, phone_footer, sender_name as sender_name,
-)
-from scripts.notify.push_catalog import (
-    NATE_ADHOC_TEXT_ID, PAID_CREDIT_ACTION_PREFIX, RESTART_FAILED_TEXT_ID, remaining_credit_accounts,
-)
+from scripts.notify.push_catalog import (NATE_ADHOC_TEXT_ID, PAID_CREDIT_ACTION_PREFIX, RESTART_FAILED_TEXT_ID,
+                                         remaining_credit_accounts)
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
@@ -86,13 +80,15 @@ TOKEN_APPROVAL_REQUIRED = "Token alert template needs current approval"
 PAID_CREDIT_TEXT_IDS = frozenset({"quota.paid_credits", "quota.paid_credits_queued"})
 PAID_CREDIT_ACCOUNT = re.compile(r"codex[1-9][0-9]*")
 PAID_CREDIT_DETAIL_PREFIX = "paid-credit account="
-ACTION_END_DETAIL = "action end="
-UNKNOWN_ACTION_END = UnknownActionEnd()
 RETRY_S = 300
 EXPIRE_S = 10800
 TITLE_MAX = 250
+MESSAGE_MAX = 1024
 ACTION_TEXT_MAX = MESSAGE_MAX - len("Action: ") - 1
 TIMEOUT_S = 15
+# send.py's default_sender: the Claude session that ran send.py follows this prefix.
+SESSION_SOURCE = "send.py in "
+FREE_TEXT = "none (free text)"
 USAGE = "usage: pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY] [--through-silence] [--user-asked]"
 CANCEL_USAGE = "usage: pushover.py cancel [--source NAME] KEY"
 REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/pushover.py"'
@@ -132,8 +128,6 @@ class PushLogRecord(TypedDict):
     title: str
     message: str
     outcome: str
-    action_end: NotRequired[int]
-    body_prefix: NotRequired[str]
 
 
 Post = Callable[[str, bytes], tuple[int, bytes]]
@@ -208,21 +202,29 @@ def parent_source() -> str:
     return (found or fallback)[:limit]
 
 
+def sender_name(source: str) -> str:
+    """Return the sender on one line. Use the session name for a send.py source."""
+    limit = conf.read("notify").whole("pushover.max_source_chars")
+    return " ".join(source.removeprefix(SESSION_SOURCE).split())[:limit]
+
+
+def _phone_footer(sender: str, text_id: str) -> str:
+    return f"\n\nSent by: {sender} · Template: {text_id or FREE_TEXT}"
+
+
+def phone_message_limit(source: str, text_id: str) -> int:
+    """Return the message space before the phone footer."""
+    return MESSAGE_MAX - len(_phone_footer(sender_name(source), text_id))
+
+
 def log(source: str, priority: str, title: str, message: str, outcome: str, *,
-        key: str = "", template: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE,
-        action_end: ActionEnd = UNKNOWN_ACTION_END, body_prefix: str | None = None) -> None:
+        key: str = "", template: str = "", reference: push_reference.PushReference = push_reference.NO_REFERENCE) -> None:
     entry: PushLogRecord = {"time": datetime.now().astimezone().replace(microsecond=0).isoformat(),
              "source": source, "priority": priority, "title": title, "message": message, "outcome": outcome}
     if key or template or reference["kind"] != "none":
         entry["key"] = key
         entry["template"] = template
         entry["reference"] = reference
-    if isinstance(action_end, KnownActionEnd):
-        entry["action_end"] = action_end.index
-    elif isinstance(action_end, NoHeader):
-        entry["action_end"] = 0
-    if body_prefix is not None:
-        entry["body_prefix"] = body_prefix
     try:
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as out:
@@ -407,16 +409,6 @@ def refuse(source: str, priority: str, title: str, message: str, reason: str) ->
     return 2
 
 
-def _refuse_unusable_sender_limit(source: str, priority: str, title: str, message: str,
-                                  error: conf.Unusable, detail: str) -> int:
-    """Log the configuration problem and refuse the push."""
-    diagnostic = " ".join(str(error).splitlines())
-    outcome = f"{REFUSED_BEFORE_SENDING}: {diagnostic}"
-    log(source, priority, title, message, outcome + (f", {detail}" if detail else ""))
-    print(f"pushover: {outcome}", file=sys.stderr)
-    return 2
-
-
 def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     if "--text-id" not in argv:
         print("pushover: " + push_texts.TEMPLATE_REQUIRED, file=sys.stderr)
@@ -449,11 +441,10 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
             return refuse(source, priority, title, message, reason)
         case ActionAllowed():
             pass
-    header, key = arguments["header"], arguments["key"]
     draft = review.Draft(source, priority, title, action,
-                         trimmed_body(action, arguments["message"], arguments["session"], header=header),
-                         arguments["answerable"], arguments["session"], arguments["due"], arguments["reference"],
-                         header=header)
+                         trimmed_body(action, arguments["message"], arguments["session"], header=arguments["header"]),
+                         arguments["answerable"], arguments["session"], arguments["due"], arguments["reference"])
+    header, key = arguments["header"], arguments["key"]
     registered_text = bool(arguments["text_id"]) and not push_texts.agent_written(arguments["text_id"])
     user_asked = arguments["user_asked"]
     claimed = False
@@ -547,8 +538,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     if code == 0 and not registered_text and isinstance(outcome, (review.Rewritten, review.Questions)):
         print("pushover: sent as rewritten:")
         print(version.title)
-        if version.header:
-            print(first_line(version.action, version.session))
+        print(first_line(version.action, version.session))
         print(version.body)
     return code
 
@@ -600,10 +590,7 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
         key = "question:" + draft.reference["path"]
     need = "blocked" if priority == "2" else "decision" if draft.due or priority == "1" else "note"
     priority = decision_priority.priority(need, draft.due)
-    header = header and draft.header
     message = posted_message(draft.action, draft.body, draft.session, header=header)
-    action_length = len(first_line(draft.action, draft.session)) if header else 0
-    detail = f"{ACTION_END_DETAIL}{action_length}\n{detail}"
     if text_id in PAID_CREDIT_TEXT_IDS and PAID_CREDIT_ACCOUNT.fullmatch(paid_credit_account):
         # Save the account even if the title is too short to show it.
         detail = f"{PAID_CREDIT_DETAIL_PREFIX}{paid_credit_account}\n{detail}"
@@ -627,43 +614,20 @@ def paid_credit_details(push: silence.KeptPush) -> tuple[str, str]:
     return detail, ""
 
 
-def action_details(detail: str, message: str) -> tuple[str, ActionEnd]:
-    """Read the action length from the Mac payload or silence record."""
-    if detail.startswith(ACTION_END_DETAIL):
-        length, _, rest = detail.removeprefix(ACTION_END_DETAIL).partition("\n")
-        if length.isascii() and length.isdecimal() and len(length) <= len(str(MESSAGE_MAX)):
-            action_end = push_texts.read_action_end(int(length), message)
-            if not isinstance(action_end, UnknownActionEnd):
-                return rest, action_end
-    return detail, UNKNOWN_ACTION_END
-
-
 def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Keep a reviewed push during silence or post it on natedev."""
     source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
     detail, _ = paid_credit_details(push)
-    detail, action_end = action_details(detail, message)
     if push["text_id"] == "quota.claude_expiry" or push["text_id"] in TOKEN_ALERT_IDS:
         if silence.active():
             return refuse(source, priority, title, message, "silence is active")
     elif priority != "2" and push.get("silence_policy", silence.SilencePolicy.KEEP_DURING_SILENCE) == silence.SilencePolicy.KEEP_DURING_SILENCE:
-        try:
-            with conf.diagnostics(report=False) as diagnostics:
-                budget = PhoneBudget(phone_message_limit(source, push["text_id"]))
-            _ = format_phone_body(message, action_end, length=budget)
-        except conf.Unusable as error:
-            return _refuse_unusable_sender_limit(source, priority, title, message, error, detail)
-        except ValueError as error:
-            return refuse(source, priority, title, message, str(error))
         kept = silence.keep_here(push, deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
-            for diagnostic in diagnostics:
-                print(diagnostic, file=sys.stderr)
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
             print(f"pushover: kept: silence {kept.until}")
             return 0
-    return post_message(source, priority, title, message, keys_file, post, detail, push["key"], push["text_id"],
-                        action_end=action_end)
+    return post_message(source, priority, title, message, keys_file, post, detail, push["key"], push["text_id"])
 
 
 def _update_kept_restart_failure(message: str) -> push_texts.RenderedPush | None:
@@ -699,17 +663,13 @@ def refresh_paid_credit_action(push: silence.KeptPush, account: str) -> str:
         from scripts.whoami.agent_accounts import codex_credit_accounts
 
         accounts = remaining_credit_accounts(account, codex_credit_accounts())
-        _, newline, body = message.partition("\n")
-        header = prefix + accounts
-        refreshed = header + newline + body
-        budget = PhoneBudget(phone_message_limit(push["source"], push["text_id"]))
-        _ = format_phone_body(refreshed, KnownActionEnd(len(header)), length=budget)
     except (OSError, ValueError) as error:
         log(push["source"], push["priority"], push["title"], message,
             f"anomaly: kept paid-credit action uses the saved account list: {error}",
             key=push["key"], template=push["text_id"])
         return message
-    return refreshed
+    _, newline, body = message.partition("\n")
+    return f"{prefix}{accounts}{newline}{body}"
 
 
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
@@ -718,8 +678,6 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
     text_id = push["text_id"]
     reason = ""
     title, message = push["title"], push["message"]
-    detail, account = paid_credit_details(push)
-    detail, action_end = action_details(detail, message)
     if text_id and not any(entry.id == text_id for entry in push_texts.catalog()):
         reason = f"retired template {text_id}"
     else:
@@ -730,7 +688,6 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
                 reason = "restart failure lacks saved resume values"
             else:
                 title, message = rendered.posted_title, rendered.message
-                action_end = rendered.action_end
         if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
             reason = TOKEN_APPROVAL_REQUIRED
         if reference["kind"] == "question":
@@ -749,21 +706,18 @@ def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = 
         log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
             key=push["key"], template=push["text_id"], reference=reference)
         return push_reference.KeptPushDropped()
-    if text_id in PAID_CREDIT_TEXT_IDS:
-        refreshed = refresh_paid_credit_action(push, account)
-        if isinstance(action_end, KnownActionEnd):
-            action_end = KnownActionEnd(action_end.index + len(refreshed) - len(message))
-        message = refreshed
+    detail, account = paid_credit_details(push)
     detail = f"kept during silence, {detail}" if detail else "kept during silence"
+    if push["text_id"] in PAID_CREDIT_TEXT_IDS:
+        message = refresh_paid_credit_action(push, account)
     need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
     priority = decision_priority.priority(need, push.get("due", ""))
     return post_message(push["source"], priority, title, message, keys_file, post, detail,
-                        push["key"], text_id, action_end=action_end)
+                        push["key"], push["text_id"])
 
 
 def post_message(source: str, priority: str, title: str, message: str,
-                 keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "",
-                 *, action_end: ActionEnd = UNKNOWN_ACTION_END) -> int:
+                 keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "") -> int:
     """Every push to the phone goes out here, with its sender and template on one last line."""
     if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
         return refuse(source, priority, title, message, TOKEN_APPROVAL_REQUIRED)
@@ -772,32 +726,30 @@ def post_message(source: str, priority: str, title: str, message: str,
         with conf.diagnostics(report=False) as diagnostics:
             sender = sender_name(source)
     except conf.Unusable as error:
-        return _refuse_unusable_sender_limit(source, priority, title, message, error, detail)
+        diagnostic = " ".join(str(error).splitlines())
+        outcome = f"{REFUSED_BEFORE_SENDING}: {diagnostic}"
+        log(source, priority, title, message, outcome + suffix)
+        print(f"pushover: {outcome}", file=sys.stderr)
+        return 2
     for diagnostic in diagnostics:
         print(diagnostic, file=sys.stderr)
     if not sender:
         log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
         print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
         return 2
-    title = title[:TITLE_MAX]
-    footer = phone_footer(sender, text_id)
-    budget = PhoneBudget(MESSAGE_MAX - len(footer))
-    try:
-        body = format_phone_body(message, action_end, length=budget)
-    except ValueError as error:
-        return refuse(source, priority, title, message, str(error))
-    phone_message = body + footer
+    footer = _phone_footer(sender, text_id)
+    message = message[:MESSAGE_MAX - len(footer)].rstrip() + footer
     keys = read_keys(keys_file)
     if keys is None:
         outcome = f"{REFUSED_BEFORE_SENDING}: keys missing"
-        log(source, priority, title, phone_message, outcome + suffix)
+        log(source, priority, title, message, outcome + suffix)
         print(f"pushover: {outcome}. Set PUSHOVER_USER and PUSHOVER_TOKEN in {keys_file}.", file=sys.stderr)
         return 2
-    data = urllib.parse.urlencode(fields(keys, title, phone_message, priority, key)).encode()
+    data = urllib.parse.urlencode(fields(keys, title, message, priority, key)).encode()
     try:
         status, raw = post(API_URL, data)
     except (urllib.error.URLError, TimeoutError) as error:
-        log(source, priority, title, phone_message, f"unreachable: {error}" + suffix)
+        log(source, priority, title, message, f"unreachable: {error}" + suffix)
         print(f"pushover: could not reach Pushover: {error}", file=sys.stderr)
         return 1
     try:
@@ -808,15 +760,11 @@ def post_message(source: str, priority: str, title: str, message: str,
     if status == 200 and reply.get("status") == 1:
         receipt = reply.get("receipt")
         outcome = f"sent, receipt {receipt}" if receipt else "sent"
-        body_prefix = None
-        if isinstance(action_end, KnownActionEnd) and len(body) > action_end.index:
-            original_body = message[action_end.index + 1:]
-            body_prefix = original_body[:len(original_body) - len(original_body.lstrip("\r\n"))]
-        log(source, priority, title, phone_message, outcome + suffix, action_end=action_end, body_prefix=body_prefix)
+        log(source, priority, title, message, outcome + suffix)
         print(f"pushover: {outcome}")
         return 0
     errors = "; ".join(reply.get("errors", [])) or f"HTTP {status}"
-    log(source, priority, title, phone_message, f"refused: {errors}" + suffix)
+    log(source, priority, title, message, f"refused: {errors}" + suffix)
     print(f"pushover: refused: {errors}", file=sys.stderr)
     return 1
 
