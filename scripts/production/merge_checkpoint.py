@@ -2169,7 +2169,7 @@ def run_batch_probe(red: BatchRed, commit: str = "") -> subprocess.CompletedProc
             command = checkpoint_gate.batch_module_command(red.red[0], checkout, tree)
             assert command is not None
             submitted = checkpoint_gate.gate_step_command(command, tree, ("natedev",))
-            result = checkpoint_gate.run_test_command(submitted, tree, raise_start_errors=True)
+            result = checkpoint_gate.run_gate_step_command(submitted, tree, copies.COMMAND_LOCKS.get())
             with red.log.open("a", encoding="utf-8") as output:
                 _ = output.write(f"\nProbe {commit or 'main'} on {red.main_tip}\n")
                 _ = output.write(result.stdout + result.stderr)

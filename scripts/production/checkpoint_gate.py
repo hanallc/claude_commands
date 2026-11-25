@@ -10,7 +10,7 @@ import signal
 import subprocess
 import tomllib
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from datetime import datetime
 from itertools import takewhile
@@ -171,8 +171,14 @@ def run_gate_step_command(command: list[str], folder: Path, locks: tuple[int, ..
         try:
             stdout, stderr = child.communicate()
         except BaseException:
-            child.send_signal(signal.SIGINT)
-            _ = child.communicate()
+            with suppress(OSError):
+                child.send_signal(signal.SIGINT)
+            while True:
+                try:
+                    _ = child.communicate()
+                    break
+                except KeyboardInterrupt:
+                    continue
             raise
         return subprocess.CompletedProcess(command, cast(int, child.returncode), stdout, stderr)
 
@@ -184,14 +190,15 @@ def run_test_command(command: list[str], folder: Path, *, merge_head: str = "",
     scripts = Path(__file__).resolve().parents[1]
     start = gate_program_start(command)
     use_copy = bool(merge_head) and command_program(command[start:]) in GATE_SCRIPTS
+    targets = () if use_copy else checkpoint_gate_targets(command, folder)
     if use_copy:
         submitted = [*command[:start], str(scripts / "lib/py"), str(scripts / "copies/copies.py"), "run",
                      "--repo", str(folder.resolve()), "--commit", merge_head, "--",
                      *gate_copy_command(command[start:])]
-    elif targets := checkpoint_gate_targets(command, folder):
+    elif targets:
         submitted = gate_step_command(command, folder, targets)
     try:
-        if submitted[start + 1:start + 3] == [str(scripts / "copies/copies.py"), "gate-step"]:
+        if targets:
             return run_gate_step_command(submitted, folder, locks)
         return subprocess.run(submitted, cwd=folder, capture_output=True, text=True, check=False, pass_fds=locks)
     except OSError as error:

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import gzip
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from pathlib import Path
 import shlex
 import shutil
@@ -1029,10 +1030,19 @@ raise SystemExit(1)
 
         return run
 
+    @contextmanager
+    def mock_row_drop_gate(self, run: Callable[..., subprocess.CompletedProcess[str]]) -> Generator[None]:
+        def run_probe(command: list[str], folder: Path, _locks: tuple[int, ...]) -> subprocess.CompletedProcess[str]:
+            return run(command, folder)
+
+        with (patch.object(checkpoint_gate, "run_test_command", side_effect=run),
+              patch.object(checkpoint_gate, "run_gate_step_command", side_effect=run_probe)):
+            yield
+
     def test_persistent_red_drops_only_its_owner_and_full_gates_survivors(self) -> None:
         start, _, beta, rows = self.prepare_row_drop()
         runs: list[RowDropRun] = []
-        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
+        with self.mock_row_drop_gate(self.row_drop_gate(runs)):
             result = self.land_batch(rows)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         _ = self.assert_landed(start, [beta])
@@ -1052,8 +1062,7 @@ raise SystemExit(1)
                 if red_base:
                     _ = self.push_main_change("src/base-red.txt", "base fault\n")
                 runs: list[RowDropRun] = []
-                with patch.object(checkpoint_gate, "run_test_command",
-                                  side_effect=self.row_drop_gate(runs, both_red=not red_base)):
+                with self.mock_row_drop_gate(self.row_drop_gate(runs, both_red=not red_base)):
                     result = self.land_batch(rows)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assert_rolled_back(start)
@@ -1066,7 +1075,7 @@ raise SystemExit(1)
         start, alpha, beta, rows = self.prepare_row_drop(dependent=True)
         self.assertEqual(self.git("merge-base", alpha, beta), alpha)
         runs: list[RowDropRun] = []
-        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
+        with self.mock_row_drop_gate(self.row_drop_gate(runs)):
             result = self.land_batch(rows)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assert_rolled_back(start)
@@ -1077,7 +1086,7 @@ raise SystemExit(1)
     def test_survivor_gate_red_prevents_publication(self) -> None:
         start, _, _, rows = self.prepare_row_drop()
         runs: list[RowDropRun] = []
-        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs, survivor_red=True)):
+        with self.mock_row_drop_gate(self.row_drop_gate(runs, survivor_red=True)):
             result = self.land_batch(rows)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assert_rolled_back(start)
@@ -1106,7 +1115,7 @@ raise SystemExit(1)
                         raise KeyboardInterrupt
                     return gate(command, folder, merge_head=merge_head, raise_start_errors=raise_start_errors)
 
-                with patch.object(checkpoint_gate, "run_test_command", side_effect=gate):
+                with self.mock_row_drop_gate(gate):
                     with (patch.object(checkpoint_gate, "run_test_command", side_effect=interrupt),
                           self.assertRaises(KeyboardInterrupt)):
                         _ = self.land_batch(rows)
@@ -1119,7 +1128,7 @@ raise SystemExit(1)
                     self.assertNotIn("\ndrop\t", record.read_text())
                     self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), start)
                     runs.clear()
-                    with patch.object(checkpoint_gate, "run_test_command", side_effect=resend_gate):
+                    with self.mock_row_drop_gate(resend_gate):
                         retry = self.land_batch(rows)
                     self.assertEqual(retry.returncode, 1, retry.stdout + retry.stderr)
                     if survivors:
@@ -1156,7 +1165,7 @@ raise SystemExit(1)
                 raise KeyboardInterrupt
             return merge(request, batch_checkout=batch_checkout)
 
-        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs)):
+        with self.mock_row_drop_gate(self.row_drop_gate(runs)):
             with (patch.object(merge_checkpoint, "merge", side_effect=interrupt),
                   self.assertRaises(KeyboardInterrupt)):
                 _ = self.land_batch(rows)
@@ -1176,7 +1185,7 @@ raise SystemExit(1)
 
     def test_dropped_row_gets_result_send_line_and_kept_log(self) -> None:
         _, alpha, beta, rows = self.prepare_row_drop()
-        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate([])):
+        with self.mock_row_drop_gate(self.row_drop_gate([])):
             result = self.land_batch(rows)
         with patch.dict("os.environ", self.env):
             results = land_runs.last_results()
@@ -1194,7 +1203,7 @@ raise SystemExit(1)
 
     def test_failed_probe_log_save_rolls_back_the_batch(self) -> None:
         start, _, _, rows = self.prepare_row_drop()
-        with (patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate([])),
+        with (self.mock_row_drop_gate(self.row_drop_gate([])),
               patch.object(build_record, "keep_log", side_effect=OSError("log write refused"))):
             result = self.land_batch(rows)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -1204,7 +1213,7 @@ raise SystemExit(1)
     def test_main_move_requires_survivor_retest(self) -> None:
         _, _, beta, rows = self.prepare_row_drop()
         runs: list[RowDropRun] = []
-        with patch.object(checkpoint_gate, "run_test_command", side_effect=self.row_drop_gate(runs, move_main=True)):
+        with self.mock_row_drop_gate(self.row_drop_gate(runs, move_main=True)):
             result = self.land_batch(rows)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(runs[-2:], [RowDropRun(False, False, True, False), RowDropRun(False, False, True, True)])

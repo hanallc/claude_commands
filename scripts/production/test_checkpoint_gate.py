@@ -150,6 +150,40 @@ class CheckpointGateTests(unittest.TestCase):
             _ = checkpoint_gate.run_test_command(list(GATE), folder)
         run.assert_called_once_with(list(GATE), cwd=folder, capture_output=True, text=True, check=False, pass_fds=())
 
+    def test_gate_step_arguments_do_not_select_a_supervisor(self) -> None:
+        folder = Path("/fixture")
+        command = ["/bin/echo", str(Path(copies.__file__).resolve()), "gate-step"]
+        completed = subprocess.CompletedProcess(command, 0, "echo output\n", "")
+        with (mock.patch.object(checkpoint_gate, "run_gate_step_command") as supervise,
+              mock.patch.object(subprocess, "run", return_value=completed) as run):
+            self.assertIs(checkpoint_gate.run_test_command(command, folder), completed)
+        supervise.assert_not_called()
+        run.assert_called_once_with(command, cwd=folder, capture_output=True, text=True, check=False, pass_fds=())
+
+    def test_supervisor_signal_error_preserves_the_first_interrupt(self) -> None:
+        interrupt = KeyboardInterrupt("first interrupt")
+        communicate = mock.Mock(side_effect=[interrupt, ("", "")])
+        send_signal = mock.Mock(side_effect=ProcessLookupError("supervisor exited"))
+        child = mock.Mock(communicate=communicate, send_signal=send_signal)
+        with (mock.patch.object(subprocess, "Popen", return_value=nullcontext(child)),
+              self.assertRaises(KeyboardInterrupt) as raised):
+            _ = checkpoint_gate.run_gate_step_command(list(GATE), Path("/fixture"), ())
+        send_signal.assert_called_once_with(signal.SIGINT)
+        self.assertEqual(communicate.call_count, 2)
+        self.assertIs(raised.exception, interrupt)
+
+    def test_supervisor_wait_survives_further_interrupts(self) -> None:
+        interrupt = KeyboardInterrupt("first interrupt")
+        communicate = mock.Mock(side_effect=[interrupt, KeyboardInterrupt(), KeyboardInterrupt(), ("", "")])
+        send_signal = mock.Mock()
+        child = mock.Mock(communicate=communicate, send_signal=send_signal)
+        with (mock.patch.object(subprocess, "Popen", return_value=nullcontext(child)),
+              self.assertRaises(KeyboardInterrupt) as raised):
+            _ = checkpoint_gate.run_gate_step_command(list(GATE), Path("/fixture"), ())
+        send_signal.assert_called_once_with(signal.SIGINT)
+        self.assertEqual(communicate.call_count, 4)
+        self.assertIs(raised.exception, interrupt)
+
     def test_claude_gate_without_target_override_launches_with_default_targets(self) -> None:
         with PlacementFixture() as fixture:
             _ = write_config_fixture(fixture.root / "build_targets.conf", "targets=natedev\nenabled.natedev=on\n")
