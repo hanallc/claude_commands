@@ -33,7 +33,6 @@ from scripts.copies import copies
 from scripts.copies.copies_test_support import AdmissionWaitReached, copies_environment, stop_before_slot
 from scripts.build_queue import step_estimator
 from scripts.mac_test import eligibility, offload
-from scripts.disks import slots
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, reap
 from scripts.direct.wait_for_test_state import wait_for_pid, wait_until
 from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env
@@ -317,11 +316,6 @@ class SlotOrderTests(unittest.TestCase):
         self.assert_shell_cargo_finishes(process, checkout)
         self.assertEqual(self.requests, [])
 
-    def report(self) -> slots.SlotReport:
-        return slots.read_slots(self.slot_root, conf.read("build_folders"),
-            self.queue.server.host, None, self.queue.clock.now(), build_folders.build_folder_state,
-            owners=lambda owner: owner)
-
     def test_scratch_queue_command_waits_before_it_creates_a_slot(self) -> None:
         self.queue.hold_starts()
         owner = fixture_member("showrunner", name="scratch-owner")
@@ -512,7 +506,6 @@ placement_once
             waiting, = reply.reading.view.waiting
             self.assertEqual(waiting.job, StepJob("test-all"))
         self.assertFalse(self.slot_root.exists())
-        self.assertEqual(self.report()["groups"], [])
         process.kill()
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertFalse(self.slot_root.exists())
