@@ -1544,8 +1544,8 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
 
     def run_lock_probe(self, probe: str, event: str, *arguments: str) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run([sys.executable, "-c", probe, *arguments],
-                                  capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+            return process_group.run_process_group([sys.executable, "-c", probe, *arguments],
+                                                   timeout=TEST_HANG_GUARD_SECS)
         except subprocess.TimeoutExpired:
             self.fail(f"The lock probe did not finish {event}.")
 
@@ -1564,6 +1564,7 @@ with f.temporary_build_folder(outer_spec) as outer:
             assert shared == outer
         child = os.fork()
         if child == 0:
+            os.close(write)
             signal.alarm(TEST_HANG_GUARD_SECS)
             assert os.read(read, 1) == b'x'
             assert outer.is_dir() and inner.is_dir()
@@ -1716,6 +1717,7 @@ def fork_after_lock(fd, mode):
     if not child and mode == fcntl.LOCK_SH | fcntl.LOCK_NB:
         pid = os.fork()
         if pid == 0:
+            os.close(write)
             signal.alarm(TEST_HANG_GUARD_SECS)
             assert os.read(read, 1) == b'x'
             assert path.is_dir() and f.build_folder_state(path) == 'held'
@@ -1765,6 +1767,7 @@ def fork_from_worker():
     assert reached.wait(TEST_HANG_GUARD_SECS), 'the allocator did not create the folder'
     child = os.fork()
     if child == 0:
+        os.close(write)
         signal.alarm(TEST_HANG_GUARD_SECS)
         assert signal.getsignal(signal.SIGINT) == signal.default_int_handler
         try:
