@@ -11,6 +11,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from typing import cast
 import unittest
 from unittest import mock
 
-from scripts.lib import build_folder_lock, build_folders
+from scripts.lib import build_folder_lock, build_folders, removal_guard
 from scripts.lib.removal_bwrap_test_support import BuildMount, LINUX_CHECKOUT, RemovalSandbox
 from scripts.lint.test_removal_bwrap import CANARY, PROBE_MOUNT, PROBE_OUTSIDE
 
@@ -56,6 +57,21 @@ remove_after_parent_moves(Path(sys.argv[2]))
 """
 
 
+PROBE_MAC_MOUNT = """
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from scripts.lib import removal_guard
+
+mount = Path(sys.argv[2])
+assert removal_guard.identity(mount.stat()) in removal_guard.read().mounts.points, mount
+probe = mount / "write-probe"
+probe.touch(exist_ok=False)
+probe.unlink()
+"""
+
+
 def remove_after_parent_moves(candidate: Path) -> None:
     """Keep the original parent open when its path changes."""
     parent = candidate.parent
@@ -77,7 +93,8 @@ def _lease_owner(case: ClaimCase) -> int:
     if case is ClaimCase.LIVE_OWNER:
         return os.getpid()
     if case is ClaimCase.FOREIGN_OWNER:
-        assert Path("/proc/1").stat().st_uid != os.geteuid()
+        if sys.platform == "linux":
+            assert Path("/proc/1").stat().st_uid != os.geteuid()
         try:
             os.kill(1, 0)
         except PermissionError:
@@ -130,6 +147,8 @@ def _claim_after_other_owner(candidate: Path) -> None:
 
 def run_claim(candidate: Path, case: ClaimCase) -> None:
     """Run the real claim with the selected fixture state."""
+    if sys.platform == "darwin":
+        assert removal_guard.read().root == Path.home() / "build"
     lease = build_folders.lease_path(candidate)
     _ = lease.write_text(json.dumps({"pid": _lease_owner(case)}))
     if case is ClaimCase.OWNER_REPLACEMENT:
@@ -160,7 +179,7 @@ def run_claim(candidate: Path, case: ClaimCase) -> None:
             print("replacement refused")
 
 
-@unittest.skipUnless(sys.platform == "linux", "requires Linux bubblewrap")
+@unittest.skipUnless(sys.platform in ("linux", "darwin"), "requires Linux or macOS")
 class ToolFolderRemovalTests(unittest.TestCase):
     def sandbox(self) -> RemovalSandbox:
         root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="tool-removal-"))).resolve()
@@ -185,7 +204,8 @@ class ToolFolderRemovalTests(unittest.TestCase):
 
     def claim(self, sandbox: RemovalSandbox, candidate: Path,
               case: ClaimCase = ClaimCase.LEFTOVER) -> subprocess.CompletedProcess[str]:
-        return sandbox.python("-c", RUN_CLAIM, str(LINUX_CHECKOUT), str(candidate), case.value)
+        checkout = sandbox.checkout if sys.platform == "darwin" else LINUX_CHECKOUT
+        return sandbox.python("-c", RUN_CLAIM, str(checkout), str(candidate), case.value)
 
     def assert_claim(self, result: subprocess.CompletedProcess[str], name: str) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -239,32 +259,71 @@ class ToolFolderRemovalTests(unittest.TestCase):
         self.assertFalse(local.exists())
         self.assert_canary(keep)
 
+    def disk_image(self, *arguments: str) -> str:
+        try:
+            result = subprocess.run(["/usr/bin/hdiutil", *arguments], stdin=subprocess.DEVNULL,
+                                    text=True, capture_output=True, timeout=20, check=False)
+        except (FileNotFoundError, PermissionError) as error:
+            self.skipTest(f"hdiutil {arguments[0]} is unavailable: {error}")
+        detail = (result.stderr or result.stdout).strip()
+        if result.returncode and any(reason in detail.lower() for reason in (
+                "permission denied", "operation not permitted", "not authorized")):
+            self.skipTest(f"hdiutil {arguments[0]} cannot use the fixture: {detail}")
+        self.assertEqual(result.returncode, 0, detail)
+        return result.stdout
+
+    def detach_image(self, device: str) -> None:
+        result = subprocess.run(["/usr/bin/hdiutil", "detach", "-force", device], stdin=subprocess.DEVNULL,
+                                text=True, capture_output=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def mount_canary(self, sandbox: RemovalSandbox, candidate: Path) -> Path:
+        mount = candidate / "unit"
+        local = sandbox.host_path(mount)
+        local.mkdir()
+        if sys.platform == "darwin":
+            image = sandbox.fixture / "removal.dmg"
+            _ = self.disk_image("create", "-size", "16m", "-fs", "HFS+", "-layout", "NONE", "-format", "UDRW", str(image))
+            try:
+                attached = self.disk_image("attach", "-nobrowse", "-mountpoint", str(local), "-owners", "off", "-plist", str(image))
+                reply = cast(dict[str, list[dict[str, str]]], plistlib.loads(attached.encode()))
+                [device] = [entry["dev-entry"] for entry in reply["system-entities"] if entry.get("mount-point") == str(local)]
+            except BaseException:
+                if local.is_mount():
+                    self.detach_image(str(local))
+                raise
+            self.addCleanup(self.detach_image, device)
+            self.assertTrue(local.is_mount(), f"hdiutil did not mount {local}")
+            keep = local / "output"
+            probe = (PROBE_MAC_MOUNT, str(sandbox.checkout), str(mount))
+        else:
+            keep = sandbox.bind_source / "output"
+            probe = (PROBE_MOUNT, str(mount))
+        self.canary(keep)
+        result = sandbox.python("-c", *probe)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return keep
+
     def test_does_not_follow_a_bind_mount_inside_the_leftover(self) -> None:
         sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
         candidate = self.candidate(sandbox)
-        mount = candidate / "unit"
-        sandbox.host_path(mount).mkdir()
-        keep = sandbox.bind_source / "output"
-        self.canary(keep)
-        probe = sandbox.python("-c", PROBE_MOUNT, str(mount))
-        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+        keep = self.mount_canary(sandbox, candidate)
         result = self.claim(sandbox, candidate)
         self.assert_canary(keep)
         self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
         self.assert_claim(result, "proof-2")
 
     def test_keeps_a_bind_mount_after_the_removal_parent_moves(self) -> None:
-        with mock.patch.object(RemovalSandbox, "build", Path("/build/removal-parent")):
-            sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
+        sandbox = replace(self.sandbox(), mount=BuildMount.BIND_UNIT)
+        with mock.patch.object(RemovalSandbox, "build", sandbox.build / "removal-parent"):
             candidate = self.candidate(sandbox)
-            sandbox.host_path(candidate / "unit").mkdir()
-            keep = sandbox.bind_source / "output"
-            self.canary(keep)
-            result = sandbox.python("-c", RUN_MOVED_PARENT, str(LINUX_CHECKOUT), str(candidate))
-        self.assert_canary(keep)
+            keep = self.mount_canary(sandbox, candidate)
+            checkout = sandbox.checkout if sys.platform == "darwin" else LINUX_CHECKOUT
+            result = sandbox.python("-c", RUN_MOVED_PARENT, str(checkout), str(candidate))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         moved = candidate.parent.with_name("moved") / candidate.name
         self.assert_canary(sandbox.host_path(moved / "old" / "output"))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_canary(sandbox.host_path(moved / "unit" / "output") if sys.platform == "darwin" else keep)
 
     def test_second_claim_keeps_the_first_claim_live_owner(self) -> None:
         sandbox = self.sandbox()
@@ -300,12 +359,21 @@ class ToolFolderRemovalTests(unittest.TestCase):
 
     def test_keeps_a_folder_with_a_foreign_lease_owner(self) -> None:
         sandbox = self.sandbox()
-        candidate = sandbox.host_path(self.candidate(sandbox))
+        candidate = self.candidate(sandbox)
+        if sys.platform == "darwin":
+            with self.assertRaises(PermissionError):
+                os.kill(1, 0)
+            self.assert_claim(self.claim(sandbox, candidate, ClaimCase.FOREIGN_OWNER), "proof-2")
+        else:
+            self.assert_claim(self.claim_with_host_pids(sandbox, sandbox.host_path(candidate)), "proof-2")
+        self.assert_canary(sandbox.host_path(candidate / "old" / "output"))
+
+    def claim_with_host_pids(self, sandbox: RemovalSandbox, candidate: Path) -> subprocess.CompletedProcess[str]:
         bubblewrap = shutil.which("bwrap")
         self.assertIsNotNone(bubblewrap)
         assert bubblewrap is not None
         # Keep host PIDs visible. Only the fixture has a writable bind.
-        result = subprocess.run([
+        return subprocess.run([
             bubblewrap, "--unshare-user", "--unshare-net", "--unshare-ipc", "--unshare-uts", "--die-with-parent",
             "--ro-bind", "/", "/", "--bind", str(sandbox.fixture), str(sandbox.fixture), "--clearenv",
             "--hostname", "natedev", "--chdir", str(sandbox.fixture),
@@ -315,8 +383,6 @@ class ToolFolderRemovalTests(unittest.TestCase):
             str(Path(sys.executable).resolve()), "-B", "-c", RUN_CLAIM, str(sandbox.checkout), str(candidate),
             ClaimCase.FOREIGN_OWNER.value,
         ], check=False, capture_output=True, text=True, timeout=90)
-        self.assert_canary(candidate / "old" / "output")
-        self.assert_claim(result, "proof-2")
 
     def test_keeps_a_folder_with_a_held_lock(self) -> None:
         self.assert_kept(ClaimCase.HELD_LOCK)
