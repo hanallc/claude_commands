@@ -820,6 +820,7 @@ The admission, scheduling caches, and rerun rules below apply to `SharedMachine`
   After it writes the lease, the gate appends a `gate_folder_start` line to the local host log.
   The line contains the folder path, lease owner identity, commit SHA, branch, and step.
   The `gate_run` line adds the same owner identity, `suite_folders`, and `end`.
+  If SIGTERM interrupts the gate before it masks the signal for the end write, the gate records a `sigterm` end.
   The gate defers SIGTERM during the end write.
   The gate uses a `gate_folder_end` line when timing is unavailable or its write fails.
   The end is `normal`, `red`, or `sigterm`.

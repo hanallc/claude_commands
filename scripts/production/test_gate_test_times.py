@@ -117,6 +117,35 @@ gate.gate_temporary = observe_folder
                 if end == "sigterm":
                     self.assertEqual(record["modules"], [])
 
+    def test_sigterm_before_the_timing_mask_writes_one_end(self) -> None:
+        preamble = """from contextlib import contextmanager
+allocate = gate.gate_temporary
+sigmask = signal.pthread_sigmask
+
+def stop_before_mask(how, signals):
+    if how == signal.SIG_BLOCK and signals == {signal.SIGTERM}:
+        signal.pthread_sigmask = sigmask
+        assert signal.SIGTERM not in sigmask(signal.SIG_BLOCK, ())
+        signal.raise_signal(signal.SIGTERM)
+    return sigmask(how, signals)
+
+@contextmanager
+def arm_after_suite(recovery, tool, parent):
+    with allocate(recovery, tool, parent) as folder:
+        yield folder
+    signal.pthread_sigmask = stop_before_mask
+
+gate.gate_temporary = arm_after_suite
+"""
+        result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        record = self.only_record()
+        self.assertEqual(record.get("end"), "sigterm")
+        self.assertTrue(record["aborted"])
+        kinds = [row.get("kind") for path in Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
+                 for row in store.locked_rows(path)]
+        self.assertEqual(kinds.count("gate_folder_end"), 0)
+
     def test_sigterm_during_the_timing_append_writes_one_end(self) -> None:
         preamble = """from scripts.buildlog import store
 write_all = store._write_all

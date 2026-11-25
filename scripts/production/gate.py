@@ -1947,12 +1947,14 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     began = time.monotonic()
     started_at = time.time()
     initial_hold_seconds = hold.seconds if hold is not None else 0.0
+    end_recorded = False
 
     def can_retry_memory_stop(result: GateJobResult) -> bool:
         return (result.memory_stopped and result.returncode != 0 and not result.tripwire_tripped
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
+        nonlocal end_recorded
         previous_signals = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         try:
             end = gate_run_end(status)
@@ -1960,13 +1962,14 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                     aborted and not job_started and end != "sigterm"):
                 if not isinstance(journal.start, GateFolderAllocation):
                     gate_record.write_gate_folder_event(gate_folder_end(journal.start, end))
-                return
-            waited = hold.waited_s() if hold is not None else 0.0
-            wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
-            record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
-                            wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
-                            reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
-                            cap_mib=admission.governor_mib, aborted=aborted, mode=mode, folder_start=journal.start)
+            else:
+                waited = hold.waited_s() if hold is not None else 0.0
+                wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
+                record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
+                                wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
+                                reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
+                                cap_mib=admission.governor_mib, aborted=aborted, mode=mode, folder_start=journal.start)
+            end_recorded = True
         finally:
             _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous_signals)
 
@@ -1985,12 +1988,11 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
             waited = hold.seconds if hold is not None else 0.0
             elapsed = time.monotonic() - began - (waited - initial_hold_seconds)
             status = int(not suite_result().passed)
+            record(status, aborted=False)
         except BaseException:
-            if not isinstance(journal.start, GateFolderAllocation):
+            if not end_recorded and not isinstance(journal.start, GateFolderAllocation):
                 record(1, aborted=True)
             raise
-        else:
-            record(status, aborted=False)
         finally:
             _ACTIVE_GATE_FOLDER_JOURNAL.reset(token)
 
