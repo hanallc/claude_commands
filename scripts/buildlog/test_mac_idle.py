@@ -395,6 +395,38 @@ done
     def unreachable(self) -> None:
         _ = (self.paths.mac_state / "unreachable_until").write_text("10000000")
 
+    def test_failed_probe_keeps_the_mac_unreachable_after_backoff(self) -> None:
+        _ = (self.paths.mac_state / "failed_probe").write_text("failed\n")
+        _ = (self.paths.mac_state / "unreachable_until").write_text("1180\n")
+
+        self.assertEqual(mac_idle.mac_work(self.paths, 1240), mac_idle.MacUnreachable(1180))
+        mac_idle.watch_once(self.paths, 1240)
+
+        saved = mac_idle.read_record(self.paths.state / "alert.json")
+        self.assertEqual((saved["state"], saved["until"]), ("unreachable", 1180))
+        self.assertEqual(mac_idle.view_alert_line(1240, ZoneInfo("UTC")),
+                         "MAC UNREACHABLE: the last probe failed: 1 step waits for the Mac.")
+        _ = self.claim(working=True)
+        self.assertIsInstance(mac_idle.mac_work(self.paths, 1240), mac_idle.NatedevJobOnMac)
+
+    def test_ended_backoff_without_a_failed_probe_leaves_the_mac_free(self) -> None:
+        _ = (self.paths.mac_state / "unreachable_until").write_text("1180\n")
+
+        self.assertEqual(mac_idle.mac_work(self.paths, 1240), mac_idle.FreeMac(0))
+
+    def test_running_mac_ci_takes_precedence_over_a_failed_probe_after_backoff(self) -> None:
+        _ = (self.paths.mac_state / "failed_probe").write_text("failed\n")
+        _ = (self.paths.mac_state / "unreachable_until").write_text("1180\n")
+
+        with mock.patch.object(mac_test, "ci_activity", return_value=mac_test.CI_MAC_JOB_RUNNING) as ci:
+            self.assertEqual(mac_idle.mac_work(self.paths, 1179, waiting_for_mac=True),
+                             mac_idle.MacUnreachable(1180))
+            self.assertEqual(mac_idle.mac_work(self.paths, 1240), mac_idle.MacUnreachable(1180))
+            ci.assert_not_called()
+            self.assertIsInstance(mac_idle.mac_work(self.paths, 1240, waiting_for_mac=True),
+                                  mac_idle.NatedevJobOnMac)
+            ci.assert_called_once()
+
     def block(self, holder: str = "research", detail: str = "P15 F11 L0 run", *, terminal: bool = False) -> None:
         since = datetime.fromtimestamp(1000, timezone.utc)
         delivery = (mac_test.HolderQueue(holder) if terminal else
@@ -804,6 +836,24 @@ done
             self.watch(push_at + 180)
             self.assertEqual(saved(), ("unreachable", "", 1, True))
         self.assertEqual(push.call_count, 2)
+
+    def test_probe_backoff_renewal_sends_one_push_for_the_same_outage(self) -> None:
+        push_at = self.push_at()
+        backoff = self.paths.mac_state / "unreachable_until"
+        _ = (self.paths.mac_state / "failed_probe").write_text("failed\n")
+        _ = backoff.write_text(str(push_at + 30))
+
+        with (mock.patch.object(mac_idle, "notify_showrunner", return_value=True) as repair,
+              mock.patch.object(mac_idle, "push_outage", return_value=True) as push):
+            self.watch(push_at)
+            push.assert_called_once()
+            self.watch(push_at + 60)
+            _ = backoff.write_text(str(push_at + 150))
+            self.watch(push_at + 120)
+
+        push.assert_called_once()
+        repair.assert_not_called()
+        self.assertTrue(self.pushed())
 
     def test_parked_app_claim_alert_names_holder_and_never_repairs(self) -> None:
         self.waiting_steps(7)
