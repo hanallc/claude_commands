@@ -47,7 +47,6 @@ from scripts.production import change_routing, change_review, staff, the_list, t
 from scripts.review_links import accounts_page, branch_page, change_page, change_browser, console, for_you, image_store, images, investigations_page, list_page, review_items, review_page
 from scripts.review_links import console_tune, go_ledger, new_item_dialog, page_frame, placement_disk, question_record, reply_tokens, review_actions, review_link, review_submissions, send_hold, staff_names, studio_page
 from scripts.review_links.review_link import private_name, tailscale_ip as tailscale_ip
-from scripts.statusline import rebuild_row
 from scripts.whoami import usage_store
 
 # A restart passes the listening socket to the new process in this variable.
@@ -980,13 +979,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             try:
                 with server.staff_read_scope():
                     if route.query == "view=count":
-                        try:
-                            snapshot = for_you.read(include_running_revision=False)
-                        except RecursionError as error:
-                            rebuild = rebuild_row.read()
-                            snapshot = for_you.ForYouSnapshot(
-                                (), (for_you.UnavailableSource("For you", str(error)),), rebuild.machines)
-                        payload = console.for_you_count_view(snapshot)
+                        payload = console.for_you_count_view(for_you.read_for_status_line(include_reasons=True))
                     else:
                         payload = console.for_you_payload()
             except (OSError, ValueError) as error:

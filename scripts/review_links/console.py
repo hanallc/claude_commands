@@ -236,9 +236,11 @@ def for_you_count(snapshot: for_you.ForYouSnapshot) -> ForYouCountPayload:
 
 
 def for_you_count_view(snapshot: for_you.ForYouSnapshot) -> dict[str, object]:
-    """Send the counts and rebuild machines without command text."""
+    """Send the counts, rebuild machines, and short reasons."""
     status = snapshot.status_line_actions()
     payload: dict[str, object] = {**for_you_count(snapshot), "rebuild_machines": status.rebuild_machines}
+    if status.rebuild_reasons:
+        payload["rebuild_reasons"] = dict(status.rebuild_reasons)
     if isinstance(status.other_count, int):
         payload["other_count"] = status.other_count
     if status.partial:

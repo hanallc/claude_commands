@@ -18,7 +18,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2044,15 +2044,21 @@ class ChangePageTests(unittest.TestCase):
                 configuration = Path(os.environ["CONF_DIR"]) / "statusline.conf"
                 cache = self.temporary / "rebuild-cache"
                 _ = configuration.write_text(f"rebuild.cache={cache}\n")
-                details = rebuild_row.ExpectedSystems(
+                expected = rebuild_row.ExpectedSystems(
                     "d" * 40, ("/etc/nixos", "main", "natedev", "MacBook-Pro"),
-                    "/nix/store/" + "1" * 32 + "-natedev", "/nix/store/" + "2" * 32 + "-mac").details()
-                _ = cache.write_text(f"rebuild mac\n{2 ** 40}\n{configuration}\n{details}\n")
-                _ = rebuild_row.changes_path(cache).write_text(json.dumps({"mac": [
-                    {"commit": "c" * 40, "at": "2026-11-12T10:00:00+00:00", "reason": "Apply the Mac settings.",
-                     "session": ""},
-                    {"commit": "e" * 40, "at": "2026-11-12T14:30:00+00:00", "reason": "memory: <defer> defrag",
-                     "session": owner.id}]}))
+                    "/nix/store/" + "1" * 32 + "-natedev", "/nix/store/" + "2" * 32 + "-mac")
+                running = "/nix/store/running-mac"
+                details = {**asdict(expected), "running_system_probes": {"mac": True},
+                           "running_system_paths": {"mac": running}}
+                _ = cache.write_text(f"rebuild mac\n{2 ** 40}\n{configuration}\n{json.dumps(details)}\n")
+                mac_answer = rebuild_row.RebuildAnswer(
+                    ("mac",), False, expected, compared=("mac",), probes=rebuild_row.RunningSystemProbes(mac=True),
+                    running_paths={"mac": running})
+                comparison = rebuild_row.ComparedChanges(running, "b" * 40, expected.commit, (
+                    rebuild_row.Change("c" * 40, "2026-11-12T10:00:00+00:00", "Apply the Mac settings.", ""),
+                    rebuild_row.Change("e" * 40, "2026-11-12T14:30:00+00:00", "memory: <defer> defrag", owner.id),
+                ))
+                _ = rebuild_row.changes_path(cache).write_text(json.dumps({"mac": asdict(comparison)}))
                 body = change_browser.render_rebuilds().decode()
                 self.assertEqual(rebuild_row.read(configuration).machines, ("natedev", "mac"))
                 block = body.split('<div data-rebuilds data-count="2" data-label="Rebuild natedev and the Mac">', 1)[1]
@@ -2064,33 +2070,30 @@ class ChangePageTests(unittest.TestCase):
                               + '<dl><dt><time datetime="2026-11-12T14:30:00+00:00">Nov 12, 2026, 09:30</time></dt>'
                               + '<dd>memory: &lt;defer&gt; defrag</dd></dl></div></section>', mac)
                 self.assertLess(mac.index("Apply the Mac settings."), mac.index("<h3>Commits</h3>"))
-                only = change_browser.rebuild_list(rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)),
+                only = change_browser.rebuild_list(mac_answer,
                                                    {"mac": (rebuild_row.Change("f" * 40, "2026-11-12T15:00:00+00:00",
                                                                                "Turn on swap", ""),)},
                                                    staff.snapshot())
                 self.assertEqual(only, '<div data-rebuilds data-count="1" data-label="Rebuild the Mac">'
                                  + '<article data-machine="mac"><h2>Rebuild the Mac</h2>'
-                                 + '<section class="rebuild-commits"><h3>Commits</h3>'
-                                 + '<div data-owner><h4>Unknown session</h4>'
-                                 + '<dl><dt><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dt>'
-                                 + '<dd>Turn on swap</dd></dl></div></section></article></div>')
+                                 + '<p>Changes not read yet</p></article></div>')
 
             with self.subTest(rebuilds="one owner and one time each"):
+                ordered = (
+                    rebuild_row.Change("1" * 40, "2026-11-12T13:00:00+00:00", "Older", owner.id),
+                    rebuild_row.Change("2" * 40, "2026-11-12T15:00:00+00:00", "First", owner.id),
+                    rebuild_row.Change("3" * 40, "2026-11-12T14:00:00+00:00", "Between", ""),
+                    rebuild_row.Change("4" * 40, "2026-11-12T15:00:00+00:00", "Second", owner.id),
+                )
                 grouped = change_browser.rebuild_list(
-                    rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)),
-                    {"mac": (rebuild_row.Change("1" * 40, "2026-11-12T13:00:00+00:00", "Older", owner.id),
-                             rebuild_row.Change("2" * 40, "2026-11-12T15:00:00+00:00", "First", owner.id),
-                             rebuild_row.Change("3" * 40, "2026-11-12T14:00:00+00:00", "Between", ""),
-                             rebuild_row.Change("4" * 40, "2026-11-12T15:00:00+00:00", "Second", owner.id))},
-                    staff.snapshot())
+                    mac_answer, {"mac": replace(comparison, commits=ordered)}, staff.snapshot())
                 self.assertEqual(grouped.count('<h4>page-owner (showrunner)</h4>'), 1)
                 self.assertIn('<div data-owner><h4>page-owner (showrunner)</h4><dl>'
                               + '<dt><time datetime="2026-11-12T15:00:00+00:00">Nov 12, 2026, 10:00</time></dt>'
                               + '<dd>First</dd><dd>Second</dd>'
                               + '<dt><time datetime="2026-11-12T13:00:00+00:00">Nov 12, 2026, 08:00</time></dt>'
                               + '<dd>Older</dd></dl></div><div data-owner><h4>Unknown session</h4>', grouped)
-                self.assertIn('<p>The change list is not available yet.</p>', change_browser.rebuild_list(
-                    rebuild_row.RebuildAnswer(("mac",), False, compared=("mac",)), {}, staff.snapshot()))
+                self.assertIn('<p>Changes not read yet</p>', change_browser.rebuild_list(mac_answer, {}, staff.snapshot()))
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_page_status_uses_the_real_changes_loader(self) -> None:
