@@ -141,6 +141,7 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
     def attach_image(self, image: Path, mount: Path) -> Generator[None]:
         device: str | None = None
         attempts: list[str] = []
+        interrupt: BaseException | None = None
         try:
             reply = self.disk_image("attach", "-nobrowse", "-mountpoint", str(mount),
                                     "-owners", "off", "-plist", str(image), allow_skip=True, attempts=attempts)
@@ -151,8 +152,17 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             device = devices.pop()
             self.assertTrue(mount.is_mount(), f"hdiutil did not mount {mount}")
             yield
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                interrupt = error
+            raise
         finally:
-            self.cleanup_image(image, device, attempts)
+            try:
+                self.cleanup_image(image, device, attempts)
+            except BaseException as cleanup_error:
+                if interrupt is None:
+                    raise
+                interrupt.add_note(f"Disk image cleanup failed: {cleanup_error}")
 
     @contextmanager
     def mount_canary(self, sandbox: RemovalSandbox, candidate: Path) -> Generator[Path]:
@@ -175,26 +185,30 @@ class ToolFolderMountRemovalTests(ToolFolderRemovalFixture):
             self.assert_child_ok(result)
             yield keep
 
-    def test_interrupted_image_attach_reports_the_image_without_a_saved_device(self) -> None:
+    def test_attach_interrupt_keeps_the_cleanup_diagnostics(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         image = root / "fixture/removal.dmg"
         mount = image.parent / "mount"
         info = plistlib.dumps({"images": [
             {"image-path": str(image), "system-entities": [{"dev-entry": "/dev/disk9", "mount-point": str(mount)}]},
         ]}).decode()
-        with mock.patch.object(subprocess, "run", side_effect=[
-            KeyboardInterrupt(),
-            subprocess.CompletedProcess([], 0, info, ""),
-        ]) as run:
-            with self.assertRaisesRegex(AssertionError, "Disk images still attached") as failure:
-                with self.attach_image(image, mount):
-                    self.fail("the interrupted attach returned")
-        self.assertIsInstance(failure.exception.__context__, KeyboardInterrupt)
-        self.assertIn(str(image), str(failure.exception))
-        self.assertEqual([call.args[0] for call in run.call_args_list], [
-            ["/usr/bin/hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount), "-owners", "off", "-plist", str(image)],
-            ["/usr/bin/hdiutil", "info", "-plist"],
-        ])
+        for interrupt in (KeyboardInterrupt(), SystemExit(130)):
+            with self.subTest(interrupt=type(interrupt)):
+                with (mock.patch.object(subprocess, "run", side_effect=[
+                    interrupt,
+                    subprocess.CompletedProcess([], 0, info, "info diagnostic"),
+                ]) as run, self.assertRaises(type(interrupt)) as failure):
+                    with self.attach_image(image, mount):
+                        self.fail("the interrupted attach returned")
+                self.assertIs(failure.exception, interrupt)
+                self.assertEqual(len(interrupt.__notes__), 1)
+                note = interrupt.__notes__[0]
+                self.assertIn(f"Disk images still attached: {image}", note)
+                self.assertIn(f"/usr/bin/hdiutil info -plist\nexit status: 0\nstdout:\n{info}\nstderr:\ninfo diagnostic", note)
+                self.assertEqual([call.args[0] for call in run.call_args_list], [
+                    ["/usr/bin/hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount), "-owners", "off", "-plist", str(image)],
+                    ["/usr/bin/hdiutil", "info", "-plist"],
+                ])
 
     def test_detaches_the_device_from_attach_after_the_mount_moves(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
