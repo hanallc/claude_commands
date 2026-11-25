@@ -92,6 +92,32 @@ BODY_READY_SCRIPT = r"""async function readyReviewCard(row){
 }
 """
 
+WAIT_FOR_BROWSER_STATE = r"""const until=(predicate,label,extraRoot,timeoutMs=HANG_GUARD_MS)=>new Promise((resolve,reject)=>{
+ const cleanup=()=>{
+  clearTimeout(timer);
+  observer.disconnect();
+  document.removeEventListener('fixture-progress',ready);
+ };
+ const ready=()=>{
+  try{
+   if(!predicate()) return;
+  }catch(error){
+   cleanup();reject(error);return;
+  }
+  cleanup();resolve();
+ };
+ const observer=new MutationObserver(ready);
+ const options={childList:true,subtree:true,attributes:true,characterData:true};
+ observer.observe(document,options);
+ if(extraRoot) observer.observe(extraRoot,options);
+ document.addEventListener('fixture-progress',ready);
+ const timer=setTimeout(()=>{
+  cleanup();reject(new Error('Timed out waiting for '+label+'.'));
+ },timeoutMs);
+ ready();
+});""".replace('HANG_GUARD_MS', str(TEST_HANG_GUARD_SECS * 1000))
+
+
 SNAPSHOT_FETCH_SCRIPT = r"""<script>
 const snapshots=SNAPSHOTS;
 let shown='initial';
@@ -2039,10 +2065,7 @@ window.fetch=(url,options)=>{
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
- const until=async (predicate,label='the expected browser state')=>{
-  const end=performance.now()+8000;
-  while(!predicate()){if(performance.now()>end) throw new Error('Timed out waiting for '+label+'.');await frame();}
- };
+ WAIT_FOR_BROWSER_STATE
  const refresh=()=>{
   const review=document.querySelector('[data-review]');
   const refreshed=new Promise(resolve=>review.addEventListener('review-refreshed',resolve,{once:true}));
@@ -2133,15 +2156,20 @@ window.fetch=(url,options)=>{
       conflict.startsWith('/revise-conflict') ? 'This item changed.' : 'This item is already Done.';
      return new Response(JSON.stringify({reason}),{status:409});
     }
-    posts++;await delayedSave;return new Response(JSON.stringify({reason:'Retry the save.'}),{status:400});
+    posts++;document.dispatchEvent(new Event('fixture-progress'));
+    await delayedSave;return new Response(JSON.stringify({reason:'Retry the save.'}),{status:400});
    }
    if(new URL(url,location.href).searchParams.get('version')==='1'){
     if(holdVersion){
      holdVersion=false;
-     await new Promise(resolve=>{releaseVersion=resolve;});
+     await new Promise(resolve=>{
+      releaseVersion=resolve;
+      document.dispatchEvent(new Event('fixture-progress'));
+     });
     }
     if(timeoutVersion){
      timeoutVersion=false;stalled=true;
+     document.dispatchEvent(new Event('fixture-progress'));
      if(!options?.signal) throw new Error('The reload has no deadline.');
      return new Promise((_,reject)=>{
       options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true});
@@ -2184,7 +2212,7 @@ window.fetch=(url,options)=>{
   replacement.requestSubmit(laterButton);
   check(laterButton.disabled && posts===1,'F002: a remounted form cannot submit a second save.');
   releaseSave();
-  await until(()=>!replacement.dataset.sending,'the failed save to finish');
+  await until(()=>!replacement.dataset.sending,'the failed save to finish',replacement);
   check(replacement.elements.feedback.value==='Edit during save.',
    'F019: a failed save keeps text edited before the form remounted.');
   const previousVersion=document.querySelector('[data-review]').dataset.version;
@@ -2204,7 +2232,7 @@ window.fetch=(url,options)=>{
   stale.requestSubmit(stale.querySelector('button[value=works]'));
   await until(()=>!row('page-owner/C4') && !stale.dataset.sending &&
    document.querySelector('[data-review]').dataset.version!==conflictVersion,
-   'the refreshed view without the completed row');
+   'the refreshed view without the completed row',stale);
   const conflictNotice=document.querySelector('[data-hidden-action-status]');
   check(document.querySelector('[data-review]').dataset.show==='open' &&
    !conflictNotice.hidden && conflictNotice.textContent.includes('This item is already Done.'),
@@ -2244,7 +2272,7 @@ window.fetch=(url,options)=>{
   await until(()=>stalled,'the stalled recovery request');
   check(form(DRAFT_KEY).querySelector('button[value=answer]').disabled,
    'The stale revision is locked during its reload.');
-  await until(()=>!form(DRAFT_KEY).querySelector('button[value=answer]').disabled,'the reload deadline');
+  await until(()=>!form(DRAFT_KEY).querySelector('button[value=answer]').disabled,'the reload deadline',undefined,8000);
   check(document.querySelector('[data-page-status]').dataset.state==='Failed' &&
    document.querySelector('[data-review]').dataset.requestTimeoutSeconds==='3',
    'The configured recovery deadline releases the stale revision.');
@@ -2279,7 +2307,7 @@ window.fetch=(url,options)=>{
    const status=replacement.querySelector('[data-send-status]');
    status.textContent='';
    releaseVersion();
-   await until(()=>status.textContent.includes('This item changed.'),'the first recovery to finish');
+   await until(()=>status.textContent.includes('This item changed.'),'the first recovery to finish',status);
    check(replacement.elements.feedback.value===words,'The first recovery keeps the current words.');
    check((await remountDraft()).elements.feedback.value===words,'The stored draft keeps the current words.');
   }
@@ -2319,7 +2347,8 @@ window.fetch=(url,options)=>{
         with patch.object(review_items, 'read', return_value=[
                 item for item in revised_again.records.values() if item.key != 'page-owner/C6']):
             deleted = review_page.build_snapshot(self.root)
-        probe = (probe.replace('DRAFT_KEY', json.dumps(key)).replace('EXPECTED_TOKEN', json.dumps(expected_token))
+        probe = (probe.replace('WAIT_FOR_BROWSER_STATE', WAIT_FOR_BROWSER_STATE)
+                 .replace('DRAFT_KEY', json.dumps(key)).replace('EXPECTED_TOKEN', json.dumps(expected_token))
                  .replace('EXPECTED_REVISION', json.dumps(expected_revision))
                  .replace('REVISED_QUESTION', json.dumps(review_page.record_revision(revised.records[key], revised.assets)))
                  .replace('REVISED_AGAIN', json.dumps(review_page.record_revision(revised_again.records[key], revised_again.assets))))
@@ -2333,7 +2362,10 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
  if(fields.get('body')==='page-owner/C399' && window.coldBodyMounts===undefined){
   window.coldBodyMounts=document.querySelectorAll('[data-list-item]').length;
   const response=measuredFetch(url,options);
-  await new Promise(resolve=>{window.releaseColdBody=resolve;});
+  await new Promise(resolve=>{
+   window.releaseColdBody=resolve;
+   document.dispatchEvent(new Event('fixture-progress'));
+  });
   return response;
  }
  return measuredFetch(url,options);
@@ -2415,11 +2447,12 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
                     result=run_process_group(['firefox','--headless','--no-remote','--profile',profile,
                         '--window-size','1440,900','--screenshot',str(self.fixture.temporary/'window.png'),
                         f'http://127.0.0.1:{server.server_port}/#item=page-owner%2FC399'],
-                        timeout=45)
+                        timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode,0,result.stderr)
             finally:
                 server.shutdown()
-                thread.join(5)
+                thread.join(TEST_HANG_GUARD_SECS)
+                self.assertFalse(thread.is_alive(), 'The windowed Review server did not stop.')
         self.assertEqual(results,[[]])
         self.assertEqual(
             set(requested_bodies),
@@ -8102,6 +8135,12 @@ window.fetch=async(_url,options={})=>{
   const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event(event,{bubbles:true}));
  };
  const showValue=(doc=document)=>doc.querySelector('[data-filter-row="show"] [data-filter-value][aria-pressed="true"]').dataset.filterValue;
+ WAIT_FOR_BROWSER_STATE
+ const readyReviewCard=async row=>{
+  const form=()=>recordDetails(row).querySelector('[data-review-form]');
+  await until(form,'the open card '+row.dataset.key);
+  return form();
+ };
  try{
   await flush();
   check(shown().length===5 && shown().every(row=>row.dataset.state==='Open'),'Open includes only Open records');
@@ -8126,12 +8165,10 @@ window.fetch=async(_url,options={})=>{
   const draft=recordDetails(question).querySelector('textarea');draft.value='Keep this draft';draft.dispatchEvent(new Event('input'));
   draft.focus();draft.setSelectionRange(2,7,'backward');
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
-  let fresh=rows().find(row=>row.dataset.type==='question');
-  const updateDeadline=performance.now()+8000;
-  while(!recordDetails(fresh)?.querySelector('[name="token"]')?.value.endsWith('-refreshed')){
-   if(performance.now()>updateDeadline) throw new Error('The revised question did not load.');
-   await flush();fresh=rows().find(row=>row.dataset.type==='question');
-  }
+  const currentQuestion=()=>rows().find(row=>row.dataset.type==='question');
+  await until(()=>recordDetails(currentQuestion())?.querySelector('[name="token"]')?.value.endsWith('-refreshed'),
+   'the revised question');
+  let fresh=currentQuestion();
   const refreshedDraft=recordDetails(fresh).querySelector('textarea');
   check(recordIsOpen(fresh) && refreshedDraft.value==='Keep this draft','Refresh keeps the card and draft.');
   check(document.activeElement===refreshedDraft && refreshedDraft.selectionStart===2 &&
@@ -8147,7 +8184,7 @@ window.fetch=async(_url,options={})=>{
    const timeout=nativeTimeout(()=>{
     review.removeEventListener('review-refreshed',refreshed);
     reject(new Error('Review did not refresh after the refusal.'));
-   },8000);
+   },HANG_GUARD_MS);
    review.addEventListener('review-refreshed',refreshed,{once:true});
   });
   const liveRow=key=>rows().find(row=>row.dataset.key===key);
@@ -8169,22 +8206,15 @@ window.fetch=async(_url,options={})=>{
   check(posts.length===postCount,'Clicking the disabled action sends no request.');
   releaseBody();heldBody=null;
   const works=()=>recordDetails(returnedOther).querySelector('[value="works"]:enabled:not([aria-disabled="true"])');
-  const bodyDeadline=performance.now()+8000;
-  while(!works()){
-   if(performance.now()>bodyDeadline) throw new Error('The returned card did not enable its actions.');
-   await flush();
-  }
+  await until(works,'the actions in the returned card');
   check(visibleStatus('Not saved: Fixture older refusal'),'A refused row shows the reason.');
   rejected=holdPost();works().click();
   refreshed=afterRefresh();rejected.refuse('Fixture newer refusal');await refreshed;
   check(!visibleStatus('Not saved: Fixture older refusal'),'A later refusal replaces the previous reason.');
   const targetKey=initialTarget.dataset.key;
   liveRow(targetKey).querySelector('.list-toggle').click();
-  const targetDeadline=performance.now()+8000;
-  while(!recordDetails(liveRow(targetKey))?.querySelector('[data-review-form]')){
-   if(performance.now()>targetDeadline) throw new Error('The target Change body did not load.');
-   await flush();
-  }
+  await until(()=>recordDetails(liveRow(targetKey))?.querySelector('[data-review-form]'),
+   'the target Change body');
   const target=liveRow(targetKey);
   const form=recordDetails(target).querySelector('form'),savedResponse=holdPost();
   form.requestSubmit(form.querySelector('[value="works"]'));
@@ -8388,6 +8418,8 @@ window.fetch=async(_url,options={})=>{
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         self_root = self.root
+        probe = (probe.replace('WAIT_FOR_BROWSER_STATE', WAIT_FOR_BROWSER_STATE)
+                 .replace('HANG_GUARD_MS', str(TEST_HANG_GUARD_SECS * 1000)))
         body = source.replace('<head>','<head>'+setup,1).replace('</body>',probe+'</body>').encode()
         for width in (1440,390):
             with self.subTest(width=width):
@@ -8404,7 +8436,8 @@ window.fetch=async(_url,options={})=>{
                         self.send_header('Content-Type','text/html; charset=utf-8')
                         self.end_headers()
                         if self.path == '/complete':
-                            _ = complete.wait(90)
+                            if not complete.wait(TEST_HANG_GUARD_SECS):
+                                raise TimeoutError('The browser did not report the Review filter results.')
                         else:
                             _ = self.wfile.write(review_page.render(self_root, show=parse_qs(self.path.partition('?')[2]).get('show', ['open'])[0])
                                 if self.path.startswith('/console/review.html') else
@@ -8424,7 +8457,7 @@ window.fetch=async(_url,options={})=>{
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
                             done=run_process_group(['firefox','--headless','--no-remote','--profile',profile,
                                 '--window-size',f'{width},900','--screenshot',str(self.fixture.temporary/f'review-{width}.png'),
-                                f'http://127.0.0.1:{server.server_port}/'],timeout=120)
+                                f'http://127.0.0.1:{server.server_port}/'],timeout=TEST_HANG_GUARD_SECS)
                         self.assertEqual(done.returncode,0,done.stderr)
                     finally:
                         server.shutdown()
