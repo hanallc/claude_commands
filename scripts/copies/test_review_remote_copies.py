@@ -22,8 +22,6 @@ from typing import ClassVar, TextIO, cast, final, override
 import unittest
 from unittest import mock
 
-from scripts.build_hold.owning_session import NoOwningSession
-from scripts.build_queue import admission_client, admission_wire as wire, execution_identity, placement
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
@@ -509,10 +507,10 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 original = self.mirror_record(path=self.mirror.parent / "slot-1")
                 authority = self.interrupt_mirror_removal(original, moment)
                 tree = Path(original.path)
-                with self.admission(free_gib=0) as (controller, config, request):
+                with self.admission() as (controller, config, request):
                     def receive(current: offload.ProcessController, settings: eligibility.OffloadConfig,
                                 selected: offload.OffloadRequest,
-                                repository: eligibility.KnownRepository) -> offload.CopiedTree:
+                                repository: eligibility.KnownRepository) -> offload.TreeCopyFailed:
                         self.assertIs(current, controller)
                         self.assertEqual(settings.host, config.host)
                         mirror = offload.request_mirror(settings, selected, repository)
@@ -521,10 +519,11 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                                         str(tree / "source.txt")]
                         self.assertEqual(copies.mirror_run(args), 0)
                         self.assertFalse(authority.exists())
-                        return offload.CopiedTree(offload.KnownTreeKey("tree"))
+                        return offload.TreeCopyFailed("The copy stopped after mirror receive")
 
-                    with mock.patch.object(offload, "copy_tree_with_key", side_effect=receive):
+                    with mock.patch.object(offload, "copy_tree_with_key", side_effect=receive) as copy:
                         result = offload.run_offload(controller, config, request, 0)
+                    copy.assert_called_once()
                 self.assertIsInstance(result, offload.DeclinedMacRun)
                 expected_owner = "alpha"
                 self.assertEqual(json.loads((tree / ".copy-record.json").read_text())["owner"], expected_owner)
@@ -628,18 +627,19 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
             with self.subTest(moment=moment):
                 original = self.mirror_record(path=self.mirror.parent / "slot-1")
                 _ = self.interrupt_mirror_removal(original, moment)
-                with self.admission(free_gib=0) as (controller, config, request):
+                with self.admission() as (controller, config, request):
                     def receive(current: offload.ProcessController, settings: eligibility.OffloadConfig,
                                 selected: offload.OffloadRequest,
-                                repository: eligibility.KnownRepository) -> offload.CopiedTree:
+                                repository: eligibility.KnownRepository) -> offload.TreeCopyFailed:
                         self.assertIs(current, controller)
                         mirror = offload.request_mirror(settings, selected, repository)
                         args = mirror_arguments(mirror, "mirror-receive")
                         self.assertEqual(copies.mirror_run(args), 0)
-                        return offload.CopiedTree(offload.KnownTreeKey("tree"))
+                        return offload.TreeCopyFailed("The copy stopped after mirror receive")
 
-                    with mock.patch.object(offload, "copy_tree_with_key", side_effect=receive):
+                    with mock.patch.object(offload, "copy_tree_with_key", side_effect=receive) as copy:
                         result = offload.run_offload(controller, config, request, 0)
+                    copy.assert_called_once()
                 self.assertIsInstance(result, offload.DeclinedMacRun)
                 self.assertEqual(copies.owned_remote_mirrors("alpha"), [original])
                 self.assertEqual(copies.owned_remote_mirrors("new-owner"), [])
@@ -726,21 +726,23 @@ subprocess.run(['bash', sys.argv[1]], check=True, pass_fds=linux_runner.executio
             eligibility.OffloadConfig, offload.OffloadRequest]]:
         settings = self.root / "target.conf"
         _ = write_config_fixture(settings, "offload=on\n", template="mac_test")
-        target = target_config.SshTarget("linux", "linux", settings)
+        target = target_config.SshTarget("mac", "macos", settings)
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
                                       1, 1, 1, "1", {"mirror_busy_backoff_s": "120"})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
-                                        target="linux", owner="new-owner", holder_session="new-session")
+                                        target="mac", owner="new-owner", holder_session="new-session")
         controller = offload.ProcessController()
+        mirror = claim_state.mac_repository_identity(str(self.source))
+        assert isinstance(mirror, claim_state.ResolvedMacMirror), mirror
 
         def claim(arguments: Sequence[str], attempt: offload.LocalClaimAttempt) -> None:
             args = mac_test.parser().parse_args(list(arguments[2:]), namespace=mac_test.CliArguments())
             output = io.StringIO()
             with redirect_stdout(output):
                 status = mac_test.command_claim(args, mac_test.state_paths(args.target))
-            attempt.answer = offload.read_claim_answer(offload.CommandOutput(status, output.getvalue(), ""))
-            if status in (0, 13):
-                controller.claim_identity = claim_state.reply_claim_identity(output.getvalue())
+            reply = offload.CommandOutput(status, output.getvalue(), "")
+            attempt.answer = offload.read_claim_answer(reply)
+            _ = controller.accept_claim_reply(reply)
 
         def release(current: offload.ProcessController, name: str) -> None:
             self.assertIs(current, controller)
@@ -764,18 +766,16 @@ subprocess.run(['bash', sys.argv[1]], check=True, pass_fds=linux_runner.executio
 
         def mirror_path(repository: eligibility.KnownRepository, target: str = "mac", slot: int = 1) -> str:
             self.assertEqual(repository.name, "repository")
-            self.assertEqual(target, "linux")
+            self.assertEqual(target, "mac")
             return str(self.mirror.parent / f"slot-{slot}")
 
         with (
             mock.patch.object(eligibility, "mac_step_eligibility", return_value=eligibility.KnownRepository("repository")),
-            mock.patch.object(offload, "trusted_linux_source", return_value=True),
+            mock.patch.object(claim_state, "mac_repository_identity", return_value=replace(mirror, mirror_name="repository")),
             mock.patch.object(target_config, "configured_ssh_target", return_value=target),
             mock.patch.object(offload, "remote_mirror", side_effect=mirror_path),
-            mock.patch.object(mac_test, "target_claim_scope", return_value=mac_test.RepositoryScope("repository", "key")),
             mock.patch.object(mac_test, "start_claim_watcher"),
             mock.patch.object(controller, "complete_claim", side_effect=claim),
-            mock.patch.object(offload, "expected_linux_parity", return_value={}),
             mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
             mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("tree"))),
             mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(free_gib, "host")),
@@ -795,61 +795,12 @@ subprocess.run(['bash', sys.argv[1]], check=True, pass_fds=linux_runner.executio
         with (self.admission() as (controller, config, request), copies.remote_lease(first),
               mock.patch.object(offload, "write_mirror_busy") as record_busy):
             result = offload.run_offload(controller, config, request, 0)
-            record_busy.assert_called_once_with(config, "repository", "linux")
+            record_busy.assert_called_once_with(config, "repository", "mac")
         self.assertIsInstance(result, offload.BusyMacDecline)
         self.assertEqual(copies.owned_remote_mirrors("new-owner"), [])
         for mirror in (first, second):
             self.assertEqual(copies.owned_remote_mirrors(mirror.owner), [mirror])
             self.assertEqual(json.loads((Path(mirror.path) / ".copy-record.json").read_text())["owner"], mirror.owner)
-
-    def test_saved_linux_assignment_adopts_the_second_mirror_while_the_first_is_leased(self) -> None:
-        first = self.mirror_record("first-owner", self.mirror.parent / "slot-1")
-        second = self.mirror_record("second-owner", self.mirror.parent / "slot-2")
-        self.assertEqual(publish_mirror(first), 0)
-        self.assertEqual(publish_mirror(second), 0)
-        pid = os.getpid()
-        start = process_identity.process_start(pid)
-        assert isinstance(start, process_identity.Started)
-        session = NoOwningSession()
-        scope = claim_state.RepositoryScope("repository", "key")
-        destination = placement.PlacementDestination("ssh", "linux", second.host, scope, 2)
-        assignment = placement.PlacementAssignment("episode", "attempt", destination,
-            execution_identity.SourceKeyKnown("tree"), placement.SubmittingOwner("natedev", pid, start.start), session, 0)
-        identity = claim_state.ClaimIdentity(execution_identity.assigned_claim_id(assignment.episode, assignment.attempt),
-                                             assignment.episode, assignment.attempt)
-        reference = placement.ProviderClaimReference("ssh", "linux", scope, identity.claim_id,
-                                                     identity.episode, identity.attempt)
-        command_claim = mac_test.command_claim
-
-        def claim_with_mirror_lease(args: mac_test.CliArguments, paths: claim_state.StatePaths) -> int:
-            self.assertEqual(args.from_pid, pid)
-            with self.assertRaisesRegex(copies.BusyRemoteMirror, "slot-2: busy"), copies.remote_lease(second):
-                self.fail("The runner must hold the mirror lease before it adopts the claim.")
-            return command_claim(args, paths)
-
-        with (self.admission() as (controller, config, request), copies.remote_lease(first),
-              mock.patch.object(admission_client, "consume_permission",
-                                return_value=wire.FirstAuthorization(assignment, reference)) as consume):
-            paths = claim_state.state_paths("linux")
-            args = mac_test.CliArguments()
-            args.pid, args.target, args.worktree = pid, "linux", str(request.repo_root)
-            self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False, assignment=assignment), 0)
-            saved, = claim_state.read_claims(paths)
-            legacy = saved.path.with_name(saved.path.stem + ".slot-2.json")
-            _ = saved.path.rename(legacy)
-            request = replace(request, placement=offload.AssignedOffloadRequest(assignment),
-                              admission=offload.MacClaimFromWait(pid, identity, session))
-            with mock.patch.object(mac_test, "command_claim", side_effect=claim_with_mirror_lease) as adopt:
-                result = offload.run_offload(controller, config, request, 0)
-            adopt.assert_called_once()
-            consume.assert_called_once()
-            self.assertFalse(legacy.exists())
-        self.assertIsInstance(result, offload.PassedOnTarget)
-        self.assertEqual(controller.attempt_evidence.slot, 2)
-        self.assertEqual(copies.owned_remote_mirrors("first-owner"), [first])
-        self.assertEqual([record.path for record in copies.owned_remote_mirrors("new-owner")], [second.path])
-        self.assertEqual(json.loads((Path(first.path) / ".copy-record.json").read_text())["owner"], "first-owner")
-        self.assertEqual(json.loads((Path(second.path) / ".copy-record.json").read_text())["owner"], "new-owner")
 
     def test_busy_refusal_names_the_session_from_the_unit_owner_chain(self) -> None:
         run = self.root / "unit-run"
@@ -894,7 +845,7 @@ subprocess.run(['bash', sys.argv[1]], check=True, pass_fds=linux_runner.executio
         self.assertEqual(publish_mirror(second), 0)
         with self.admission() as (controller, config, request):
             result = offload.run_offload(controller, config, request, 0)
-        self.assertIsInstance(result, offload.PassedOnTarget)
+        self.assertIsInstance(result, offload.PassedOnMac)
         self.assertEqual(copies.owned_remote_mirrors("second-owner"), [second])
         self.assertEqual([record.path for record in copies.owned_remote_mirrors("new-owner")], [first.path])
         self.assertEqual(json.loads((Path(second.path) / ".copy-record.json").read_text())["owner"], "second-owner")
@@ -942,7 +893,7 @@ subprocess.run(['bash', sys.argv[1]], check=True, pass_fds=linux_runner.executio
                         self.assertFalse(admission.done())
                         cancel.set()
                         result = admission.result(timeout=15)
-                self.assertIsInstance(result, offload.PassedOnTarget)
+                self.assertIsInstance(result, offload.PassedOnMac)
                 self.assertTrue(Path(mirror.path).exists())
             finally:
                 cancel.set()

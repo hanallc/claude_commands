@@ -4647,7 +4647,8 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
     def test_fixed_candidates_ignore_bad_cleanup_settings(self) -> None:
         with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
-            settings, request, _destination = self.target_settings_fixture(fixture)
+            settings, request, _destination = self.target_settings_fixture(fixture, platform="macos")
+            _ = mac_claim_request(fixture)
             before = self.client_constraints(request)
             timeout = conf.read(settings).text("leftover_timeout_s")
             _ = settings.write_text(settings.read_text().replace(
@@ -4691,21 +4692,6 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             _ = registry.write_text(registry.read_text().replace("platform.fixture=linux", "platform.fixture=broken"))
             with self.subTest(neighbor="invalid registry entry"):
                 check_healthy()
-
-    def test_client_and_service_recover_the_same_linux_policy(self) -> None:
-        with PlacementFixture() as fixture, redirect_stderr(io.StringIO()) as warnings:
-            settings, request, _destination = self.target_settings_fixture(fixture)
-            self.commit_settings(settings)
-            _ = settings.write_text(settings.read_text().replace("kinds=check", "kinds=broken"))
-            candidates = [candidate for candidate in self.client_constraints(request).candidates
-                          if candidate.destination.target == "fixture"]
-            self.assertEqual([candidate.destination.slot for candidate in candidates], [1])
-            self.assertTrue(all(candidate.eligibility == ALLOWED_HOST for candidate in candidates))
-            with mock.patch.object(offload.ProcessController, "capture", return_value=offload.CommandOutput(0, "", "")):
-                evidence = self.read_target(fixture, request)
-            assert isinstance(evidence, placement.FreshHostEvidence), evidence
-            self.assertEqual(evidence.eligibility, ALLOWED_HOST)
-            self.assertEqual(warnings.getvalue().count("kinds='broken'"), 1)
 
     def test_hana_preview_recovers_budget_and_ignores_guest_guard(self) -> None:
         from decimal import Decimal
@@ -4876,18 +4862,16 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
     def test_admission_starts_probe_recovery_and_execution_keeps_the_host_override(self) -> None:
         from scripts.build_targets import build_targets
         from scripts.copies import copies
-        from scripts.mac_test import eligibility
 
         with PlacementFixture() as fixture:
-            settings, request, destination = self.target_settings_fixture(fixture)
+            settings, request, destination = self.target_settings_fixture(fixture, platform="macos")
+            _, worktree = mac_claim_request(fixture)
             host = socket.gethostname().split(".", 1)[0]
-            good = settings.read_text() + f"\n# range: 1..\nshell_timeout_s=10\n# range: 1..\nshell_timeout_s.{host}=31\n"
+            good = settings.read_text() + f"\n# range: 1..\nprobe_timeout_s.{host}=31\n"
             broken = "\n".join("floor_sweep_timeout_s=broken" if line.startswith("floor_sweep_timeout_s=") else line
                                for line in good.splitlines()) + "\n"
             _ = settings.write_text(broken)
-            repository = eligibility.KnownRepository("hana")
-            with (mock.patch.object(eligibility, "repository_identity", return_value=repository),
-                  mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.FailedProbe()),
+            with (mock.patch.object(mac_test, "free_now", return_value="bad"),
                   mock.patch.object(build_targets, "start_probe_recovery") as start):
                 evidence = self.read_target(fixture, request)
                 assert isinstance(evidence, placement.FreshHostEvidence), evidence
@@ -4897,11 +4881,18 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
             _ = settings.write_text(good)
             args = build_targets.CliArguments()
             args.target, args.repo_root, args.kind = destination.target, request.constraints.repository, "check"
-            with (mock.patch.object(eligibility, "repository_identity", return_value=repository),
-                  mock.patch.object(eligibility, "read_failed_probe", return_value=eligibility.FailedProbe()),
+            mirror = claim_state.mac_repository_identity(str(worktree))
+            assert isinstance(mirror, claim_state.ResolvedMacMirror), mirror
+
+            def claim(controller: offload.ProcessController, *_args: object,
+                      **_kwargs: object) -> offload.FreshMacClaim:
+                controller.mac_repository = mirror.claim_repository()
+                return offload.FreshMacClaim(1)
+
+            with (mock.patch.object(mac_test, "free_now", return_value="bad"),
                   mock.patch.object(copies, "remote_lease", return_value=nullcontext()),
                   mock.patch.object(offload, "request_mirror"),
-                  mock.patch.object(offload, "claim_for_run", return_value=offload.FreshMacClaim(1)),
+                  mock.patch.object(offload, "claim_for_run", side_effect=claim),
                   mock.patch.object(offload, "copy_tracked_scripts", return_value=True),
                   mock.patch.object(offload, "copy_tree_with_key", return_value=offload.CopiedTree(offload.KnownTreeKey("source"))),
                   mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(100, "fixture")) as probe,
@@ -4911,7 +4902,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
             probe.assert_called_once()
             config = cast(eligibility.OffloadConfig, probe.call_args.args[1])
-            self.assertEqual(offload.runner_values(config, destination.target)["shell_timeout_s"], "31")
+            self.assertEqual(config.probe_timeout_s, 31)
 
     def test_each_mac_run_kind_is_admitted_on_the_mac_and_refused_on_a_linux_target(self) -> None:
         cases: tuple[tuple[str, placement.CommandKind | placement.CommandKindNotSent, str], ...] = (
@@ -4940,12 +4931,17 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
                       mock.patch.object(mac_test, "free_now", return_value="free")):
                     evidence = fixture.read_host_evidence(key)
                 fixture.server.publish_host_evidence(evidence)
-                admitted = isinstance(sent, placement.CommandKindNotSent) and step == "nextest" or (
-                    sent in placement.MAC_RUN_KINDS and platform == "macos")
-                if admitted:
+                if sent in placement.MAC_RUN_KINDS and platform == "macos":
                     assert isinstance(evidence, placement.FreshHostEvidence)
                     self.assertEqual(evidence.eligibility, placement.AllowedHost())
                     self.assertEqual(assignment_for(fixture, request).destination, destination)
+                elif isinstance(sent, placement.CommandKindNotSent) and platform == "linux":
+                    assert isinstance(evidence, placement.FreshHostEvidence)
+                    refusal = placement.TemporaryExclusion("target does not permit this command")
+                    self.assertEqual(evidence.eligibility, refusal)
+                    reply, = fixture.server.handle_request(request)
+                    assert isinstance(reply, wire.PlacementWait), reply
+                    self.assertEqual(reply.eligibility, (placement.CandidateEligibility(destination, refusal),))
                 else:
                     assert isinstance(evidence, placement.FreshHostEvidence)
                     self.assertEqual(evidence.eligibility, placement.FixedExclusion("command"))
