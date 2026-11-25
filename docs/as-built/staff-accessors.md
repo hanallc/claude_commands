@@ -20,7 +20,11 @@ The fixed `id` identifies a member across session changes.
 `set_run` stores the open run path.
 `clear_run` clears pointers that match the supplied run path.
 
-`Kind` is `Literal["showrunner", "unit", "worker", "producer"]`.
+`Kind` is `Literal["showrunner", "unit", "worker", "producer", "session"]`.
+A session has `StaffRoot` as its parent.
+Its `launch_folder` field records where it starts.
+A unit can still own that folder as its worktree.
+`create_session` adds a session and its account in one staff transaction.
 A producer has `StaffRoot` as its parent.
 It can hold both a worktree and a document.
 It can start a staff path, such as `morty`.
@@ -345,6 +349,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
 | `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers |
+| `scripts/agents/clone_session.py` | write | create_session adds the clone with its distinct native ID. |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
@@ -386,7 +391,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 241 accessor rows (41 write, 199 read, and 1 owner).
+The table has 242 accessor rows (42 write, 199 read, and 1 owner).
 
 ## Approved copies
 

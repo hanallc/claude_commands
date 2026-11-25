@@ -38,21 +38,18 @@ Add `--dry-run` to print their names without stopping them.
 All lifecycle scripts use `scripts/agents/`.
 
 `agents clone NAME --as NEW` forks a live conversation on the source machine.
-The command accepts a staff name, staff id, or native session id.
-It refuses a name another staff row or live session uses.
-It opens a new Herdr tab after the source tab.
-The fork uses the source folder, account, model, and effort.
-Claude uses `--resume --fork-session`. Codex uses `codex fork`.
-The first prompt names the clone and directs it to wait for a request to its own name.
-The command checks the new native id before it creates a root producer row.
-The row stores the clone's launch folder and account home.
-The source keeps its own transcript, staff row, and message address.
-
-Use `scripts.lib.scratch.temporary_folder("clone-probe")` for a clone probe.
-Create the test checkout and fixture config directory inside that scratch folder.
-Set `CLAUDE_CONFIG_DIR` to the fixture config directory for a Claude probe.
-Create its `projects` directory inside the fixture.
-Stop the probe before the Python scope removes its scratch folder.
+Use a staff name, staff ID, or native session ID.
+The command requires one proved pane and opens the clone after its source tab on the same Herdr server.
+The live pane must show the current model and effort.
+For Codex, show Model with Reasoning in the status line.
+Claude uses `--resume --fork-session`.
+Codex uses `codex fork`.
+The first prompt names both sessions and asks the clone to wait for a request addressed to it.
+The command refuses occupied names and reserved message addresses.
+It checks the clone's native ID, folder, and account before it adds a root `session` row.
+The staff owner checks the name and ID together before it creates the row.
+The row stores the launch folder and account for ordinary restart and resume.
+Messages to each name resolve to that session's native ID.
 
 `agents pause NAME [--keep-workers] --why TEXT` pauses a director.
 The director finishes its current turn and holds at the prompt.

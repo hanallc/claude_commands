@@ -15,6 +15,8 @@ from scripts.whoami import agent_accounts
 from scripts.whoami import account
 from scripts.herdr import pane_launch, herdr_types
 
+from scripts.production import staff
+
 if TYPE_CHECKING:
     from scripts.production.staff import StaffRow
 
@@ -34,6 +36,9 @@ def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWith
     if to:
         return (accounts.CodexWorkersAccount(to, agent_accounts.codex_account_home(to).home)
                 if kind == "codex" else accounts.NamedAccount(to, accounts.account_dir(to)))
+    if not isinstance(row, SessionWithoutStaffRow) and row.kind == "session" and isinstance(row.home, staff.SessionHome):
+        return (accounts.CodexWorkersAccount(agent_accounts.codex_home_role_label(row.home.path), row.home.path)
+                if kind == "codex" else accounts.NamedAccount(accounts.claude_config_label(row.home.path), row.home.path))
     if kind == "codex":
         return accounts.role_account("workers")
     if not isinstance(row, SessionWithoutStaffRow) and row.kind == "producer":
@@ -45,8 +50,6 @@ def resume_account(kind: Literal["claude", "codex"], row: StaffRow | SessionWith
 
 def repair_home(row: StaffRow, kind: str, pid: int) -> None:
     """Repair the member's home from its unchanged current process."""
-    from scripts.production import staff
-
     try:
         reader = cast(pane_launch.NativeProcessReader, cast(object, import_module("scripts.herdr.herdr")))
         observed = reader.native_process(pid, kind)

@@ -3216,12 +3216,16 @@ class Herdr:
         if self.command_terminal(pane) != terminal:
             raise HerdrFailure(f"{pane}: the terminal changed", "wrong_target")
 
+    def command_footer(self, pane: str, terminal: str, *, target: str, codex: bool) -> tuple[str, ...]:
+        """Read the live footer for the verified conversation."""
+        visible = self._visible_screen(pane)
+        self.check_command_target(pane, terminal, target=target, codex=codex)
+        active = _composer_region(visible, codex=codex)
+        return tuple(_prompt_screen(visible).splitlines()[active.end:]) if isinstance(active, ComposerRegion) else ()
+
     def command_screen(self, pane: str, terminal: str, *, target: str) -> CommandScreen:
         recent = self.read(pane, 60, joined=True, ansi=False)
-        visible = self._visible_screen(pane)
-        self.check_command_target(pane, terminal, target=target, codex=False)
-        active = _composer_region(visible)
-        footer = tuple(_prompt_screen(visible).splitlines()[active.end:]) if isinstance(active, ComposerRegion) else ()
+        footer = self.command_footer(pane, terminal, target=target, codex=False)
         return CommandScreen(_command_history(recent, codex=False), footer)
 
     def idle_command(self, pane: str, terminal: str, text: str, *, target: str, codex: bool) -> tuple[str, ...]:

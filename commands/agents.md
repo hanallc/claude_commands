@@ -38,9 +38,12 @@ Use the `agents` program.
 
 Run the command on the source session's machine.
 Use its staff name, staff id, or native session id.
-The clone uses the source folder, account, model, and effort.
+The source must have one proved Herdr pane.
+Show the current model and effort in that pane.
+For Codex, include Model with Reasoning in the status line.
+The clone uses the source folder and account.
 Its opening prompt names both sessions.
-Its new staff row gives messages a separate address.
+Send messages to the clone by its new name.
 
 ## Create a producer
 

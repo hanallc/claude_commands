@@ -2,155 +2,203 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from pathlib import Path
+import re
 import subprocess
+from dataclasses import dataclass, replace
+from pathlib import Path
 from time import monotonic
 from typing import Literal, cast
 
-from scripts.agents import pane_record, producer_creation, producer_lifecycle, remote, stop_resume
+from scripts.agents import pane_record, producer_creation, producer_lifecycle, remote, set_model, stop_resume
 from scripts.herdr import herdr, pane_launch
-from scripts.production import staff, worker_admission
+from scripts.lib import codex_models_cache
+from scripts.message import sessions
+from scripts.production import staff
 from scripts.whoami.account import named_account_environment
+
+
+AgentKind = Literal["claude", "codex"]
+_ACCOUNT_VARIABLE = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+
+
+def _account_home(kind: AgentKind, process: herdr.NativeAgentProcess) -> Path:
+    configured = process.environment.get(_ACCOUNT_VARIABLE[kind])
+    path = Path(configured) if configured else Path(process.environment.get("HOME", "")) / f".{kind}"
+    if not path.is_absolute():
+        raise ValueError(f"{process.current_identity}: the {kind} account home is unknown")
+    return path
 
 
 @dataclass(frozen=True)
 class CloneSource:
     name: str
     pane: str
-    kind: Literal["claude", "codex"]
+    kind: AgentKind
     launch: herdr.ForegroundLaunch
 
     @property
     def identity(self) -> str:
         return self.launch.process.current_identity
 
-    @property
-    def account_home(self) -> Path:
-        key = "CLAUDE_CONFIG_DIR" if self.kind == "claude" else "CODEX_HOME"
-        return Path(self.launch.process.environment.get(key) or Path.home() / f".{self.kind}").expanduser()
 
-
-def _source(reference: str, record: staff.StaffSnapshot, client: herdr.Herdr) -> CloneSource:
-    selected = stop_resume.stop_target(reference)
+def _source_id(reference: str, record: staff.StaffSnapshot) -> str:
+    member = record.by_member_reference(reference)
+    if member is None and "/" in reference:
+        member = record.by_path(reference)
+    if member is not None:
+        return member.current_session
+    named = [row for row in record.rows if row.name == reference]
+    if len(named) > 1:
+        raise ValueError(f"{reference}: several staff rows match; use the staff ID")
+    if named:
+        return named[0].current_session
+    try:
+        return staff.native_id(reference)
+    except staff.StaffRefused:
+        selected = stop_resume.stop_target(reference)
     if isinstance(selected, stop_resume.StopFailed):
         raise ValueError(selected.reason)
-    tabs = client.tab_sessions()
     if isinstance(selected, stop_resume.SessionNotFound):
-        matches = {session for tab in tabs if tab.label == reference and (session := tab.session_id)}
+        tabs = herdr.Herdr(herdr.shared_session()).tab_sessions()
+        matches = [tab.session_id for tab in tabs if tab.label == reference and tab.session_id]
         if len(matches) > 1:
             raise ValueError(f"{reference}: several tabs match")
-        if matches:
-            selected = matches.pop()
-        else:
-            try:
-                selected = staff.native_id(reference)
-            except staff.StaffRefused as error:
-                raise ValueError(f"{reference}: no live session on this machine") from error
-    live = herdr.read_conversation(selected)
-    if not isinstance(live, herdr.LiveConversation):
-        reason = live.reason if isinstance(live, herdr.UnknownConversation) else "session is not live"
-        raise ValueError(f"{reference}: {reason}")
-    panes = {place.pane for pid in live.pids if isinstance(place := herdr.herdr_place_of(pid), herdr.HerdrPlace)
-             and place.session == client.session}
-    if not panes:
-        panes = {tab.pane_id for tab in tabs if tab.session_id == selected}
-    if len(panes) != 1:
-        raise ValueError(f"{reference}: expected one live Herdr pane on this machine")
-    pane = panes.pop()
-    launch = client.foreground_launch(pane, live.kind)
-    if launch.process.current_identity != selected:
+        if not matches:
+            raise ValueError(f"{reference}: no live session on this machine")
+        return matches[0]
+    return selected
+
+
+def _source(reference: str, record: staff.StaffSnapshot) -> tuple[CloneSource, herdr.Herdr]:
+    identity = _source_id(reference, record)
+    claude = sessions.session_processes(identity)
+    if isinstance(claude, sessions.SessionLivenessUnknown):
+        raise ValueError(f"{reference}: {claude.reason}")
+    if claude.pids:
+        live = herdr.LiveConversation("claude", claude.pids)
+    else:
+        live = herdr.read_conversation(identity, "codex")
+        if not isinstance(live, herdr.LiveConversation):
+            reason = live.reason if isinstance(live, herdr.UnknownConversation) else "session is not live"
+            raise ValueError(f"{reference}: {reason}")
+    places: set[herdr.HerdrPlace] = set()
+    for pid in live.pids:
+        place = herdr.herdr_place_of(pid)
+        if isinstance(place, herdr.UnprovedHerdrPlacement):
+            raise ValueError(f"{reference}: {place.reason}")
+        if isinstance(place, herdr.HerdrPlace):
+            places.add(place)
+    if len(places) != 1:
+        raise ValueError(f"{reference}: expected one proved live Herdr pane, found {len(places)}")
+    place = places.pop()
+    client = herdr.Herdr(place.session)
+    tabs = client.tab_sessions()
+    if any(tab.session_id == identity and tab.pane_id != place.pane for tab in tabs):
+        raise ValueError(f"{reference}: several tabs match")
+    launch = client.foreground_launch(place.pane, live.kind)
+    if launch.process.current_identity != identity or launch.pid not in live.pids:
         raise ValueError(f"{reference}: the source pane changed sessions")
-    member = record.by_current_session(selected)
-    name = member.name if member is not None else next((tab.label for tab in tabs if tab.pane_id == pane and tab.label), reference)
-    return CloneSource(name, pane, live.kind, launch)
+    member = record.by_current_session(identity)
+    label = next((tab.label for tab in tabs if tab.pane_id == place.pane and tab.label), reference)
+    return CloneSource(member.name if member is not None else label, place.pane, live.kind, launch), client
+
+
+_CODEX_MODEL = r"gpt-[a-z0-9][a-z0-9.-]*"
+_CODEX_EFFORT = r"none|minimal|low|medium|high|xhigh|max"
+_CODEX_MODEL_AND_EFFORT = re.compile(rf"(.+?) ({_CODEX_EFFORT})(?: (?:fast|standard|flex))?")
 
 
 @dataclass(frozen=True)
-class CodexForkSettings:
-    model: str = ""
-    effort: str = ""
-
-    def arguments(self) -> list[str]:
-        arguments: list[str] = []
-        if self.model:
-            arguments.extend(("--model", self.model))
-        if self.effort:
-            arguments.extend(("-c", f"model_reasoning_effort={json.dumps(self.effort)}"))
-        return arguments
+class LiveForkSettings:
+    model: str
+    effort: str
 
 
-def _codex_settings(source: CloneSource) -> CodexForkSettings:
-    model = effort = ""
-    arguments = iter(source.launch.arguments[1:])
-    for flag in arguments:
-        option, equals, value = flag.partition("=")
-        if option == "--":
-            break
-        if option in ("--model", "-m"):
-            model = value if equals else next(arguments, "")
-        elif option in ("--config", "-c"):
-            key, _, setting = (value if equals else next(arguments, "")).partition("=")
-            if key == "model_reasoning_effort":
-                effort = setting.strip("\"'")
-            elif key == "model":
-                model = setting.strip("\"'")
+def _codex_models(home: Path) -> dict[str, set[str]]:
     try:
-        transcript = worker_admission.codex_transcript_source(source.identity, source.account_home)
-    except ValueError:
-        return CodexForkSettings(model, effort)
-    for row in worker_admission.transcript_records(
-            transcript, boundary=worker_admission.TranscriptRecordBoundary.COMPLETE_LINES):
-        if isinstance(row, worker_admission.TornTranscriptRecord):
+        cache = codex_models_cache.read_models_cache(home / "models_cache.json", retry_delays=())
+    except codex_models_cache.ModelsCacheUnreadable:
+        return {}
+    names: dict[str, set[str]] = {}
+    for value in cast(list[object], cache["models"]):
+        if not isinstance(value, dict):
             continue
-        payload = row.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        settings = cast(dict[str, object], payload)
-        if row.get("type") != "turn_context":
-            if (settings.get("type") != "thread_settings_applied"
-                    or settings.get("thread_id") != source.identity
-                    or not isinstance(snapshot := settings.get("thread_settings"), dict)):
-                continue
-            settings = cast(dict[str, object], snapshot)
-        if isinstance(current := settings.get("model"), str) and current:
-            model = current
-        if isinstance(current := settings.get("reasoning_effort", settings.get("effort")), str) and current:
-            effort = current
-    return CodexForkSettings(model, effort)
+        row = cast(dict[str, object], value)
+        slug = row.get("slug")
+        label = row.get("display_name")
+        if isinstance(slug, str) and slug:
+            names.setdefault(slug, set()).add(slug)
+            if isinstance(label, str) and label:
+                names.setdefault(label, set()).add(slug)
+    return names
 
 
-def _command(source: CloneSource, name: str) -> tuple[dict[str, str], list[str]]:
+def _codex_model(name: str, catalog: dict[str, set[str]]) -> str:
+    if name in catalog:
+        slugs = catalog[name]
+        return next(iter(slugs)) if len(slugs) == 1 else ""
+    return name if re.fullmatch(_CODEX_MODEL, name) else ""
+
+
+def _live_settings(source: CloneSource, client: herdr.Herdr, home: Path) -> LiveForkSettings:
+    terminal = client.command_terminal(source.pane)
+    footer = client.command_footer(source.pane, terminal, target=source.identity, codex=source.kind == "codex")
+    if source.kind == "claude":
+        current = set_model.current_claude_model(footer)
+        model = f"claude-{current.model}" if current.model else ""
+        effort = current.effort
+    else:
+        fields = {part.strip() for line in footer for part in line.split(" · ")}
+        catalog = _codex_models(home)
+        pairs = {(model, match[2]) for part in fields if (match := _CODEX_MODEL_AND_EFFORT.fullmatch(part))
+                 and (model := _codex_model(match[1], catalog))}
+        if len(pairs) > 1:
+            raise ValueError(f"{source.name}: the live pane reports conflicting model and effort")
+        model, effort = next(iter(pairs), ("", ""))
+        if not model:
+            models = {model for part in fields if (model := _codex_model(part, catalog))}
+            if len(models) == 1:
+                model = models.pop()
+    if not model or not effort:
+        missing = "model and effort" if not (model or effort) else "effort" if model else "model"
+        raise ValueError(f"{source.name}: cannot prove the current {missing} from the live pane")
+    return LiveForkSettings(model, effort)
+
+
+def _arguments(source: CloneSource, settings: LiveForkSettings, name: str) -> list[str]:
     prompt = (f"You are {name}, a clone of {source.name}. Use {name} as your session name. "
               f"Messages to {source.name} are for the source session. "
-              "Wait for a request addressed to you before you continue the work.")
-    home = source.account_home
+              "Wait for a request addressed to you.")
     if source.kind == "codex":
-        return {"CODEX_HOME": str(home)}, ["fork", source.identity, *_codex_settings(source).arguments(), "--", prompt]
+        return ["fork", source.identity, "--model", settings.model,
+                "-c", f"model_reasoning_effort={json.dumps(settings.effort)}", "--", prompt]
     launched = pane_launch.parse_claude_arguments(source.launch.arguments)
-    turn = pane_record.claude_turn_settings(source.identity, home)
-    settings = pane_record.claude_resume_settings(turn, fallback=pane_record.ClaudeResumeSettings(
-        launched.value(pane_launch.MODEL_FLAGS), launched.value(frozenset({"--effort"}))))
-    arguments = pane_record.claude_conversation_arguments(source.identity, name, settings, launched.plugin_directories,
-                                                         remote_control=True, fork=True)
-    return named_account_environment(home), [*arguments, "--", prompt]
+    arguments = pane_record.claude_conversation_arguments(source.identity, name,
+        pane_record.ClaudeResumeSettings(settings.model, settings.effort),
+        launched.plugin_directories, remote_control=True, fork=True)
+    return [*arguments, "--", prompt]
 
 
 def run(reference: str, name: str) -> int:
+    staff.validate_name("session", name)
     producer_lifecycle.check_name(name)
     with producer_creation.operation(name):
         record = staff.initial_snapshot()
         producer_lifecycle.require_free_name(name, record)
         if producer_creation.record_path(name).exists():
             raise ValueError(f"{name}: producer creation is pending")
-        client = herdr.Herdr(herdr.shared_session())
-        source = _source(reference, record, client)
-        environment, arguments = _command(source, name)
+        source, client = _source(reference, record)
+        home = _account_home(source.kind, source.launch.process)
+        environment = named_account_environment(home) if source.kind == "claude" else {"CODEX_HOME": str(home)}
         prepared = herdr.prepare_agent_environment(source.launch.cwd, environment)
         if isinstance(prepared, herdr.nix_env.Refused):
             raise ValueError(prepared.reason)
+        prepared = replace(prepared, env={**prepared.env, **environment},
+                           unset_environment=prepared.unset_environment - environment.keys())
+        settings = _live_settings(source, client, home)
         if client.foreground_launch(source.pane, source.kind) != source.launch:
             raise ValueError(f"{reference}: source changed before the fork")
+        arguments = _arguments(source, settings, name)
         launched = herdr.launch_prepared_agent(client.session, herdr.ForkTab(source.pane, name), prepared,
             source.kind, arguments, herdr.NoOpeningPrompt(), 90_000, agent=name, client=client)
         if isinstance(launched.outcome, herdr.PromptNotSubmitted):
@@ -158,16 +206,21 @@ def run(reference: str, name: str) -> int:
         try:
             native = stop_resume.wait_for_native_session(client, launched.pane,
                 monotonic() + herdr.PROGRAM_TIMEOUT_SECONDS, kind=source.kind)
+            clone = client.foreground_launch(launched.pane, source.kind)
         except subprocess.SubprocessError as error:
             raise ValueError(f"{name}: cannot prove the clone in pane {launched.pane}: {error}") from error
-        fresh = staff.initial_snapshot()
-        if native == source.identity or fresh.by_member_reference(native) is not None:
+        if native == source.identity or native != clone.process.current_identity:
             raise ValueError(f"{name}: pane {launched.pane} did not start a separate session")
-        if any(row.name.casefold() == name.casefold() for row in fresh.all_rows):
-            raise ValueError(f"{name}: a staff row claimed this name during launch")
-        row = staff.ensure("producer", name=name, runtime_id=native,
-                           worktree=staff.PresentWorktree(remote.local_machine(), prepared.directory))
-        _ = staff.set_home(row.id, staff.SessionHome(source.account_home))
+        if _account_home(source.kind, clone.process) != home:
+            raise ValueError(f"{name}: pane {launched.pane} did not start on the source account")
+        if Path(clone.cwd).resolve() != prepared.directory:
+            raise ValueError(f"{name}: pane {launched.pane} did not start in the source folder")
+        row = staff.create_session(name, native, staff.SessionLaunchFolder(remote.local_machine(), prepared.directory),
+                                   staff.SessionHome(home))
+        entry = pane_launch.launch(launched.pane, native, clone.cwd, clone.process.environment,
+                                   clone.arguments, kind=source.kind)
+        entry.update(name=name, pid=clone.pid, proc_start=clone.process.started)
+        pane_record.write(client.session, entry)
         client.remember_row_tab(row.id, launched.pane)
     print(f"{name}: cloned {source.name} as {native} in pane {launched.pane}")
     return 0

@@ -192,8 +192,9 @@ def _claude_model_key(model: str) -> str:
     return re.sub(r"[ .]", "-", model.lower().removeprefix("claude-"))
 
 
-def _current_claude_model(screen: herdr.CommandScreen) -> ScreenModel:
-    for line in screen.footer:
+def current_claude_model(footer: tuple[str, ...]) -> ScreenModel:
+    """Read the model and effort that Claude displays now."""
+    for line in footer:
         for field in line.split("|"):
             if status := re.fullmatch(rf"\s*({_CLAUDE_MODEL})(?:\s+{_EFFORT})?(?:\s+·.*)?\s*", field):
                 return ScreenModel(_claude_model_key(status[1]), status[2] or "")
@@ -246,7 +247,7 @@ def _wait_for_claude_model(client: herdr.Herdr, pane: str, terminal: str, identi
                 break
         else:
             continue
-        current = _current_claude_model(after)
+        current = current_claude_model(after.footer)
         if current.model and current.model != wanted:
             continue
         if require_effort and current.effort and current.effort != target.effort:
@@ -304,7 +305,7 @@ def update_pane(place: unit_lookup.Place, identity: str, target: models_registry
     if target.kind == "codex":
         return _update_codex(client, pane, terminal, identity, target, checks)
     screen = client.command_screen(pane, terminal, target=identity)
-    current = _current_claude_model(screen)
+    current = current_claude_model(screen.footer)
     wanted = _claude_model_key(target.model)
     if current == ScreenModel(wanted, target.effort):
         return ""

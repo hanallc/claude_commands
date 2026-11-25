@@ -1557,6 +1557,8 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", cap
 
 def member_machine(member: StaffRow) -> str:
     """Return the member's recorded machine, or an empty string when unknown."""
+    if isinstance(member.launch_folder, staff.SessionLaunchFolder):
+        return member.launch_folder.machine
     location = member.worktree if isinstance(member.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else member.doc
     if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
         return location.machine
