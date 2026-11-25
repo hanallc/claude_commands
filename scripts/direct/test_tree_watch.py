@@ -15,6 +15,7 @@ from scripts.direct import tree_watch
 from scripts.lib.cargo_output import CargoOutputRoots, CargoOutputUnavailable
 
 from scripts.direct.tree_watch_test_support import (
+    WATCH_DEADLINE,
     EventWatcher,
     TreeWatchFixture,
     write_workspace as write_workspace,
@@ -168,7 +169,7 @@ class TreeWatchTests(TreeWatchFixture):
             parent.terminate()
             _ = parent.communicate(timeout=TEST_HANG_GUARD_SECS)
             try:
-                output, errors = watcher.communicate(timeout=TEST_HANG_GUARD_SECS)
+                output, errors = watcher.communicate(timeout=WATCH_DEADLINE)
             except subprocess.TimeoutExpired:
                 self.fail("The watcher did not exit after its parent exited.")
             self.assertEqual(watcher.returncode, 3, output + errors)
