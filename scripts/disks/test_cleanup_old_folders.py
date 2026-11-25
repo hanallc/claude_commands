@@ -24,12 +24,16 @@ from scripts.lint import tmp_sweep
 from scripts.production import staff
 
 SCRIPT = Path(__file__).with_name("cleanup_old_folders.py").resolve()
+GATE_LEASE_START = "Wed Nov 25 12:00:00 2026" if sys.platform == "darwin" else "123"
+REUSED_GATE_LEASE_START = "Wed Nov 25 12:00:01 2026" if sys.platform == "darwin" else "124"
+FIXTURE_GATE_DEVICE = -1
 
 
 class CleanupTests(unittest.TestCase):
     home: Path = Path()
     configuration: Path = Path()
     build: Path = Path()
+    gate: Path = Path()
 
     @override
     def setUp(self) -> None:
@@ -38,12 +42,15 @@ class CleanupTests(unittest.TestCase):
         self.home.mkdir()
         self.build = base / "build"
         self.build.mkdir()
+        self.gate = base / "gate"
+        self.gate.mkdir()
         self.configuration = base / "disks.conf"
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.home), "CONF_DIR": str(base)})))
         _ = (base / "build_folders.conf").write_text(
-            f"roots.build={self.build}\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
+            f"roots.build={self.build}\nroots.gate={self.gate}\n# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
         _ = self.enterContext(mock.patch.object(
             cleanup_old_folders, "local_machine", return_value=cleanup_old_folders.Machine.NATEDEV))
+        _ = self.enterContext(mock.patch.object(cleanup_old_folders, "read_gate_device", return_value=FIXTURE_GATE_DEVICE))
         _ = self.enterContext(mock.patch.object(cleanup_old_folders, "platform_mounts", return_value=lambda: (Path("/"),)))
         _ = self.enterContext(mock.patch.object(removal_guard, "known_names", return_value=removal_guard.KnownNames(
             frozenset(("hana",)), frozenset())))
@@ -105,7 +112,7 @@ with patch.object(cleanup, "local_machine", return_value=cleanup.Machine.NATEDEV
         self.assertEqual((result.returncode, result.stdout), (1, ""), result.stderr)
         self.assertIn("requires bwrap", result.stderr)
 
-    def test_worker_review_preserves_link_and_orphan_fields(self) -> None:
+    def test_worker_review_preserves_link_orphan_and_gate_fields(self) -> None:
         cleanup = cleanup_old_folders
         orphan = self.build / "p-orphan"
         rows = (
@@ -113,6 +120,11 @@ with patch.object(cleanup, "local_machine", return_value=cleanup.Machine.NATEDEV
                         place=cleanup.CleanupPlace.LINK),
             cleanup.Row(orphan, None, removal_guard.Kept("review only"), "no Git checkout",
                         cleanup.worktree_sidecar_names(orphan), cleanup.CleanupPlace.ORPHAN_SIDECARS),
+            cleanup.Row(self.gate / "t-old", 8192, cleanup.WouldRemove("b" * 64),
+                        sidecars=("t-old.lock",), place=cleanup.CleanupPlace.GATE_FOLDER,
+                        gate=cleanup.GateDetails("t", 1_700_000_000_000_000_000,
+                                                 (cleanup.LeaseStatus(cleanup.LeaseState.DEAD, "PID 42"),),
+                                                 "none found")),
         )
         review = cleanup.HostList(cleanup.Machine.NATEDEV, rows, ((42, "fixture"),))
         channel = io.StringIO()
@@ -587,6 +599,316 @@ for folder in masks:
             self.assertIn(reason, output)
             self.assertTrue(path.exists())
 
+    def test_gate_rows_check_leases_and_recovery_before_eligibility(self) -> None:
+        self.write_settings(str(self.home / "missing"))
+        dead = self.candidate("t-dead", home=self.gate)
+        live = self.candidate("t-live", home=self.gate)
+        _ = self.candidate("mg-unleased", home=self.gate)
+        recovery = self.candidate("gate-recovery-record", home=self.gate)
+        _ = (recovery / "run.json").write_text("{}\n")
+        for path, record in ((dead, {"pid": 42, "process_start": GATE_LEASE_START}), (live, {"pid": 43})):
+            _ = build_folders.lease_path(path).write_text(json.dumps(record))
+            path.with_suffix(".lock").touch()
+
+        def lease_owner(pid: int) -> process_start.Started | process_start.Gone:
+            self.assertIn(pid, (42, 43))
+            return process_start.Gone() if pid == 42 else process_start.Started(REUSED_GATE_LEASE_START)
+
+        with mock.patch.object(process_start, "process_start", side_effect=lease_owner):
+            status, output, errors = self.command("--host-list")
+            self.assertEqual((status, errors), (0, ""))
+            rows = {line.split("\t")[1]: line.split("\t")[3] for line in output.splitlines()
+                    if line.startswith("natedev\t")}
+            self.assertEqual({place for place, result in rows.items() if result.startswith("would remove if named")},
+                             {repr(str(dead)), repr(str(self.gate / "mg-unleased"))})
+            self.assertIn(f"lease=dead (PID 42 start {GATE_LEASE_START!r})", rows[repr(str(dead))])
+            self.assertIn("lease=alive (PID 43)", rows[repr(str(live))])
+            self.assertIn("lease PID 43 is still running", rows[repr(str(live))])
+            self.assertIn("gate recovery record", rows[repr(str(recovery))])
+
+        self.write_settings(f"{self.gate}/t-*, {recovery}")
+        with mock.patch.object(process_start, "process_start",
+                               return_value=process_start.Started(REUSED_GATE_LEASE_START)):
+            status, output, errors = self.command("--host-list", "--json")
+        self.assertEqual((status, errors), (0, ""))
+        record = cast(cleanup_old_folders.HostRecord, json.loads(output))
+        self.assertEqual([row["path"] for row in record["rows"] if row["fingerprint"]], [str(dead)])
+        with mock.patch.object(process_start, "process_start", return_value=process_start.Unreadable("denied")):
+            status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertIn("cannot verify lease PID 42", output)
+        self.assertNotRegex(output, rf"{str(dead)!r}\t[0-9]+\twould remove")
+
+    def test_gate_rows_keep_git_repositories_by_name(self) -> None:
+        marker_folder = self.candidate("t-directory", home=self.gate)
+        (marker_folder / ".git").mkdir()
+        marker_file = self.candidate("t-file", home=self.gate)
+        _ = (marker_file / ".git").write_text("invalid Git pointer\n")
+        module = self.candidate("targeted-test-module/child/.git/modules/x", home=self.gate)
+        _ = (module / "payload").write_bytes(b"x" * (2 << 20))
+        bare = self.candidate("mg-bare", home=self.gate)
+        (bare / "HEAD").touch()
+        (bare / "refs").mkdir()
+        (bare / "objects").mkdir()
+        self.write_settings(str(marker_file))
+
+        status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        for path in (marker_folder, marker_file, module.parents[3], bare):
+            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tholds a Git repository; manual review")
+        self.assertIn("kept (holds a Git repository; manual review): 4 (0.002 GiB)", output)
+
+    def test_gate_listing_does_not_start_git(self) -> None:
+        source, checkout = self.git_fixture()
+        gate_checkout = self.gate / "mg-checkout"
+        _ = self.git(source, "worktree", "move", str(checkout), str(gate_checkout))
+        fixture = self.candidate("t-checkout", home=self.gate)
+        _ = self.git(fixture, "init", "-q")
+        self.write_settings(str(gate_checkout))
+
+        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("gate list started a process")) as run:
+            status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        run.assert_not_called()
+        for path in (fixture, gate_checkout):
+            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tholds a Git repository; manual review")
+
+    def test_other_rows_keep_git_data_in_the_gate_root_without_starting_git(self) -> None:
+        source, worktree = self.git_fixture()
+        _ = self.git(source, "worktree", "move", str(worktree), str(self.home / "linked"))
+        worktree = self.home / "linked"
+        origin_clone = self.home / "origin-clone"
+        alternate_clone = self.home / "alternate-clone"
+        _ = self.git(self.home, "clone", "-q", str(source), str(origin_clone))
+        _ = self.git(self.home, "clone", "-q", "--shared", str(source), str(alternate_clone))
+        gate_repo = self.gate / "mg-source"
+        _ = source.rename(gate_repo)
+        bare = self.gate / "mg-origin #1"
+        _ = self.git(self.home, "clone", "-q", "--bare", str(gate_repo), str(bare))
+        _ = self.git(origin_clone, "remote", "set-url", "origin", str(bare))
+        gate_alias = self.home / "gate-alias"
+        gate_alias.symlink_to(self.gate)
+        _ = self.git(alternate_clone, "remote", "set-url", "origin", "https://example.invalid/source")
+        _ = (alternate_clone / ".git/objects/info/alternates").write_text(
+            f"{gate_alias / gate_repo.name}/.git/objects\n")
+        _ = (worktree / ".git").write_text(f"gitdir: {gate_repo}/.git/worktrees/old\n")
+        rows = (worktree, origin_clone, alternate_clone)
+        self.write_settings(", ".join(map(str, rows)))
+
+        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("cleanup started Git")) as run:
+            status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        run.assert_not_called()
+        for path in rows:
+            self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tGit data in the gate root; manual review")
+
+    def test_git_storage_on_the_gate_device_keeps_the_row_without_starting_git(self) -> None:
+        source, linked = self.git_fixture()
+        clone = self.home / "clone"
+        _ = self.git(self.home, "clone", "-q", "--shared", str(source), str(clone))
+        registration = git_files.at(linked).git_dir
+        read_status = Path.lstat
+
+        for path, storage in ((linked, registration), (clone, clone / ".git"),
+                              (clone, source), (clone, source / ".git/objects")):
+            with self.subTest(storage=storage):
+                self.write_settings(str(path))
+
+                def read_device(place: Path) -> os.stat_result:
+                    info = read_status(place)
+                    if place == storage:
+                        fields = list(info)
+                        fields[2] = FIXTURE_GATE_DEVICE
+                        return os.stat_result(fields)
+                    return info
+
+                with (mock.patch.object(Path, "lstat", read_device),
+                      mock.patch.object(subprocess, "Popen", side_effect=AssertionError("cleanup started Git")) as run):
+                    status, output, errors = self.command("--host-list")
+                self.assertEqual((status, errors), (0, ""))
+                run.assert_not_called()
+                self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tGit data in the gate root; manual review")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux process paths")
+    def test_gate_rows_are_kept_when_a_process_uses_the_device_through_an_alias(self) -> None:
+        first, second = (self.candidate(name, home=self.gate) for name in ("t-first", "mg-second"))
+        self.write_settings(f"{self.gate}/*")
+        proc, pid = self.proc_fixture()
+        thread = pid / "task/43"
+        (thread / "fd").mkdir(parents=True)
+        status_text = (pid / "status").read_text()
+        _ = (thread / "status").write_text(status_text)
+        _ = (pid / "status").write_text(status_text.replace("Threads: 1", "Threads: 2"))
+        for task in (pid, thread):
+            (task / "root").symlink_to(self.gate)
+            (task / "cwd").symlink_to(self.gate)
+        alternate = self.candidate("mount-alias")
+        payload = alternate / "payload"
+        maps = pid / "maps"
+        maps.touch()
+        map_files = pid / "map_files"
+        map_files.mkdir()
+        mapped = map_files / "1000-2000"
+        descriptor = thread / "fd/5"
+        cwd = thread / "cwd"
+        info = payload.stat()
+        mapping = f"{mapped.name} r--p 00000000 {os.major(info.st_dev):x}:{os.minor(info.st_dev):x} {info.st_ino}"
+        for reference, target in ((descriptor, payload), (cwd, alternate), (mapped, payload)):
+            with self.subTest(reference=reference.name):
+                if reference == cwd:
+                    cwd.unlink()
+                if reference == mapped:
+                    _ = maps.write_text(f"{mapping} {payload}\n")
+                reference.symlink_to(target)
+                with mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)):
+                    status, output, errors = self.command("--host-list")
+                self.assertEqual((status, errors), (0, ""))
+                for path in (first, second):
+                    self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\t"
+                                     + "gate root open through another path; live use not provable")
+                reference.unlink()
+                if reference == cwd:
+                    cwd.symlink_to(self.gate)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux process paths")
+    def test_gate_rows_keep_process_root_and_executable_aliases(self) -> None:
+        path = self.candidate("t-first", home=self.gate)
+        self.write_settings(str(path))
+        proc, pid = self.proc_fixture()
+        alias = self.candidate("mount-alias")
+        (pid / "cwd").symlink_to(self.gate)
+        (pid / "maps").touch()
+        root = pid / "root"
+        executable = pid / "exe"
+
+        for root_path, exe_path in ((alias, path / "payload"), (self.gate, alias / "payload")):
+            with self.subTest(root=root_path, executable=exe_path):
+                root.symlink_to(root_path)
+                executable.symlink_to(exe_path)
+                with mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)):
+                    status, output, errors = self.command("--host-list")
+                root.unlink()
+                executable.unlink()
+                self.assertEqual((status, errors), (0, ""))
+                self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\t"
+                                 + "gate root open through another path; live use not provable")
+
+    def test_an_unreadable_gate_root_keeps_one_row_and_lists_other_folders(self) -> None:
+        other = self.candidate()
+        cache = self.candidate("sccache", home=self.build)
+        self.write_settings(str(other))
+        names = os.listdir
+
+        def read_names(path: int | str | Path) -> list[str]:
+            if isinstance(path, int) and os.path.samestat(os.fstat(path), self.gate.stat()):
+                raise PermissionError(errno.EACCES, "permission denied")
+            return names(path)
+
+        with mock.patch.object(os, "listdir", side_effect=read_names):
+            status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertEqual(output.count(f"\t{str(self.gate)!r}\t"), 1)
+        self.assertRegex(output, rf"{str(self.gate)!r}\tunknown\t.*permission denied")
+        self.assertRegex(output, rf"{str(other)!r}\t[0-9]+\twould remove")
+        self.assertRegex(output, rf"{str(cache)!r}\t[0-9]+\tkept: shared tool cache, list only")
+
+    def test_gate_newest_time_includes_the_lock_and_lease(self) -> None:
+        path = self.candidate("t-stamps", home=self.gate)
+        self.write_settings(str(self.home / "missing"))
+        lock = path.with_suffix(".lock")
+        lease = build_folders.lease_path(path)
+        lock.touch()
+        _ = lease.write_text(json.dumps({"pid": 42}))
+        for item in (path, path / "payload", lock, lease):
+            os.utime(item, ns=(1_000, 1_000))
+        for sidecar, newest in ((lock, 2_000), (lease, 3_000)):
+            with self.subTest(sidecar=sidecar):
+                os.utime(sidecar, ns=(newest, newest))
+                with mock.patch.object(process_start, "process_start", return_value=process_start.Gone()):
+                    status, output, errors = self.command("--host-list", "--json")
+                self.assertEqual((status, errors), (0, ""))
+                record = cast(cleanup_old_folders.HostRecord, json.loads(output))
+                row = next(row for row in record["rows"] if row["path"] == str(path))
+                assert "gate" in row
+                self.assertEqual(row["gate"]["newest_ns"], newest)
+
+    def test_gate_row_keeps_a_malformed_lease_start(self) -> None:
+        path = self.candidate("t-bad-start", home=self.gate)
+        _ = build_folders.lease_path(path).write_text(json.dumps({"pid": 42, "process_start": "invalid"}))
+        path.with_suffix(".lock").touch()
+        self.write_settings(str(self.home / "missing"))
+
+        with mock.patch.object(process_start, "process_start", return_value=process_start.Started(GATE_LEASE_START)):
+            status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertRegex(output, rf"{str(path)!r}\t[0-9]+\tcannot verify the start time for lease PID 42")
+
+    def test_gate_row_keeps_an_entry_owned_by_another_user(self) -> None:
+        path = self.candidate("mg-other-owner/nested", home=self.gate)
+        foreign = (path / "payload").stat()
+        stamp = cleanup_old_folders.entry_stamp
+        self.write_settings(str(self.home / "missing"))
+
+        def foreign_owner(info: os.stat_result) -> cleanup_old_folders.EntryStamp:
+            record = stamp(info)
+            if os.path.samestat(info, foreign):
+                return record._replace(uid=os.geteuid() + 1)
+            return record
+
+        with mock.patch.object(cleanup_old_folders, "entry_stamp", side_effect=foreign_owner):
+            status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertRegex(output, rf"{str(path.parent)!r}\t[0-9]+\tother user's files; live use not provable")
+
+    def test_gate_rows_keep_a_path_open_in_a_nonleader_thread(self) -> None:
+        gate = self.candidate("mg-thread", home=self.gate)
+        self.write_settings(str(gate))
+        proc, pid = self.proc_fixture()
+        uid = os.geteuid()
+        status_text = f"Uid: {uid} {uid} {uid} {uid}\nState: S\n"
+        _ = (pid / "status").write_text(status_text + "Threads: 2\n")
+        thread = pid / "task/43"
+        (thread / "fd").mkdir(parents=True)
+        for task in (pid, thread):
+            (task / "root").symlink_to(self.gate)
+            (task / "cwd").symlink_to(self.gate)
+        _ = (thread / "status").write_text(status_text)
+        _ = (pid / "maps").write_text("")
+        (thread / "fd/5").symlink_to(gate / "payload")
+        with mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc)):
+            status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        row = next(line for line in output.splitlines() if line.startswith(f"natedev\t{str(gate)!r}\t"))
+        self.assertRegex(row, r"\t[0-9]+\tpid 42 holds a file open")
+        self.assertIn("use=pid 42 holds a file open", row)
+
+    def test_gate_summary_counts_measured_bytes_by_kind_and_verdict(self) -> None:
+        large = self.candidate("t-large", home=self.gate)
+        _ = (large / "payload").write_bytes(b"x" * (2 << 20))
+        targeted = self.candidate("targeted-test-small", home=self.gate)
+        unknown = self.candidate("unknown-maker", home=self.gate)
+        nested_record = self.candidate("mg-holds-record/archive", home=self.gate) / "run.json"
+        nested_record.touch()
+        alias = self.gate / "mg-link"
+        alias.symlink_to(large)
+        orphan = self.gate / "fc-orphan"
+        build_folders.lease_path(orphan).touch()
+        self.write_settings(str(self.home / "missing"))
+        os.utime(large, (1_700_000_000, 1_700_000_000))
+        os.utime(large / "payload", (1_700_000_001, 1_700_000_001))
+        status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertIn("newest=2023-11-14T22:13:21Z", output)
+        self.assertRegex(output, rf"{str(unknown)!r}\t[0-9]+\tunknown gate entry type")
+        self.assertRegex(output, rf"{str(alias)!r}\t[0-9]+\tgate entry is a link")
+        self.assertRegex(output, rf"{str(orphan)!r}\t[0-9]+\torphan gate sidecars")
+        self.assertRegex(output, rf"{str(nested_record.parents[1])!r}\t[0-9]+\tgate recovery record")
+        rows = [line.split("\t")[1] for line in output.splitlines() if line.startswith("natedev\t")]
+        self.assertEqual(rows[:2], [repr(str(large)), repr(str(targeted))])
+        self.assertIn("Gate rows on natedev: t and targeted-test would remove if named: 2 (0.002 GiB); "
+                      + "t would remove if named: 1 (0.002 GiB); targeted-test would remove if named: 1 (0.000 GiB); "
+                      + "fc kept: 1 (0.000 GiB); mg kept: 2 (0.000 GiB); unknown kept: 1 (0.000 GiB)", output)
+
     def test_child_lease_keeps_parent_in_preview_and_apply(self) -> None:
         payload = self.candidate("old/nested/copy") / "payload"
         self.write_settings("~/old")
@@ -945,6 +1267,25 @@ for folder in masks:
                 self.assertTrue((path / "work").is_file())
                 (objects / "info/alternates").unlink()
 
+    def test_clone_review_skips_a_gate_pointer_only_if_its_git_directory_is_missing(self) -> None:
+        _, clone = self.clone_fixture()
+        fixture = self.candidate("t-fixture", home=self.gate)
+        pointer = fixture / ".git"
+        _ = pointer.write_text(f"gitdir: {self.home / 'missing'}\n")
+
+        status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertRegex(output, rf"{str(clone)!r}\t[0-9]+\twould remove")
+        self.assertRegex(output, rf"{str(fixture)!r}\t[0-9]+\tholds a Git repository; manual review")
+
+        broken_registration = self.home / "source/.git/worktrees/no-backlink"
+        broken_registration.mkdir(parents=True)
+        _ = pointer.write_text(f"gitdir: {broken_registration}\n")
+        status, output, errors = self.command("--host-list")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertNotRegex(output, rf"{str(clone)!r}\t[0-9]+\twould remove")
+        self.assertIn(str(broken_registration / "gitdir"), output)
+
     def test_orphan_row_does_not_block_clone_review_or_removal(self) -> None:
         _, path = self.clone_fixture()
         orphan = self.home / "worktrees/absent"
@@ -953,9 +1294,10 @@ for folder in masks:
         lock.touch()
         storage_path = cleanup_old_folders.CleanupBounds.storage_path
 
-        def check_storage(bounds: cleanup_old_folders.CleanupBounds, place: Path, *, follow_links: bool = True) -> Path:
+        def check_storage(bounds: cleanup_old_folders.CleanupBounds, place: Path, *,
+                          follow_links: bool = True, exclude_gate: bool = False) -> Path:
             self.assertNotEqual(place, orphan, "an absent base must never be resolved")
-            return storage_path(bounds, place, follow_links=follow_links)
+            return storage_path(bounds, place, follow_links=follow_links, exclude_gate=exclude_gate)
 
         with mock.patch.object(cleanup_old_folders.CleanupBounds, "storage_path", check_storage):
             status, output, errors = self.command("--host-list")

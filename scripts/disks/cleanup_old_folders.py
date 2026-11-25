@@ -31,6 +31,7 @@ from enum import Enum
 from itertools import chain
 from pathlib import Path
 from typing import Literal, NamedTuple, NotRequired, TextIO, TypedDict, cast, override
+from urllib.parse import unquote, urlsplit
 
 from scripts.copies import copies
 from scripts.lib import build_folder_lock, build_folders, conf, git_files, git_rescue, process_start, removal_guard
@@ -54,6 +55,9 @@ class CleanupPlace(Enum):
     LINK = "old worktree link"
     ORPHAN_SIDECARS = "orphan worktree sidecars"
     REVIEW_FOLDER = "old worktree folder for review"
+    GATE_FOLDER = "gate folder"
+    GATE_SIDECARS = "orphan gate sidecars"
+    UNREADABLE_GATE_ROOT = "unreadable gate root"
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,46 @@ class WouldRemove:
     fingerprint: str
 
 
+class GateEvidenceUnavailable(Enum):
+    UNKNOWN = "unknown"
+
+
+class LeaseState(Enum):
+    ABSENT = "no lease"
+    UNREADABLE = "unreadable"
+    ALIVE = "alive"
+    DEAD = "dead"
+
+
+@dataclass(frozen=True)
+class LeaseStatus:
+    state: LeaseState
+    owner: str = ""
+
+    def text(self) -> str:
+        return f"{self.state.value} ({self.owner})" if self.owner else self.state.value
+
+
+@dataclass(frozen=True)
+class GateDetails:
+    kind: str
+    newest_ns: int | GateEvidenceUnavailable
+    leases: tuple[LeaseStatus, ...]
+    use: str
+
+
+class NoGateDetails(Enum):
+    NOT_GATE_ROW = "not a gate row"
+
+
+class GateRootNotSelected(Enum):
+    NOT_SELECTED = "this review has no gate root"
+
+
+class GateDeviceUnavailable(Enum):
+    UNKNOWN = "cannot identify the gate root filesystem"
+
+
 @dataclass(frozen=True)
 class Row:
     path: Path
@@ -76,6 +120,14 @@ class Row:
     git: str = ""
     sidecars: tuple[str, ...] = ()
     place: CleanupPlace = CleanupPlace.FOLDER
+    gate: GateDetails | NoGateDetails = NoGateDetails.NOT_GATE_ROW
+
+
+class GateRecord(TypedDict):
+    kind: str
+    newest_ns: int | None
+    lease: tuple[tuple[str, str], ...]
+    use: str
 
 
 class RowRecord(TypedDict):
@@ -85,6 +137,7 @@ class RowRecord(TypedDict):
     fingerprint: str
     git: str
     sidecars: NotRequired[tuple[str, ...]]
+    gate: NotRequired[GateRecord]
 
 
 class HostRecord(TypedDict):
@@ -107,6 +160,10 @@ def row_record(row: Row) -> RowRecord:
     }
     if row.sidecars:
         record["sidecars"] = row.sidecars
+    if isinstance(row.gate, GateDetails):
+        gate = row.gate
+        record["gate"] = {"kind": gate.kind, "newest_ns": gate.newest_ns if isinstance(gate.newest_ns, int) else None,
+                          "lease": tuple((lease.state.value, lease.owner) for lease in gate.leases), "use": gate.use}
     return record
 
 
@@ -137,6 +194,18 @@ class NoUseFound(Enum):
     CLEAR = "no use found"
 
 
+class GatePathUse(Enum):
+    CLEAR = ""
+    ALIAS = "gate root open through another path; live use not provable"
+    UNREADABLE = "cannot check for other paths to the gate root"
+
+
+class GateTaskState(Enum):
+    OTHER_USER = "the task belongs to another user"
+    ENDED = "the task has ended"
+    ALIVE = "the current user owns the live task"
+
+
 class Arguments(argparse.Namespace):
     go: str | None = None
     host_list: bool = False
@@ -148,8 +217,9 @@ REMOTE_COMMAND = "~/.claude/scripts/lib/py ~/.claude/scripts/disks/cleanup_old_f
 MAC_UNREACHABLE = "mac unreachable"
 PROC_ROOT = "/proc"
 DIGEST = re.compile(r"[0-9a-f]{64}")
-CONFIG_SECTION = re.compile(r'\[([a-zA-Z0-9-]+)(?:\.[a-zA-Z0-9.-]+|[ \t]+"(?:[^"\\]|\\.)*")?\]')
-CONFIG_INCLUDE_PATH = re.compile(r"path(?=[ \t\r\v\f=;#]|$)", re.IGNORECASE)
+CONFIG_SECTION = re.compile(r'\[([a-zA-Z0-9-]+)(?:\.([a-zA-Z0-9.-]+)|[ \t]+"((?:[^"\\]|\\.)*)")?\]')
+CONFIG_KEY = re.compile(r"[a-zA-Z][a-zA-Z0-9-]*")
+CONFIG_ESCAPES = {"n": "\n", "t": "\t", "b": "\b", '"': '"', "\\": "\\"}
 GIT_READ_CONFIG = (
     ("core.excludesFile", ""),
     ("core.attributesFile", ""),
@@ -162,6 +232,15 @@ GIT_KEEP_REASON = "holds Git work: the owner saves it, then removes the folder b
 UNREGISTERED_GIT = "not a registered linked worktree"
 NO_LOCAL_ORIGIN = "no local source repository"
 NO_CLEANUP_SETTING = removal_guard.Kept("list only: no setting names it")
+GATE_IF_NAMED = removal_guard.Kept("would remove if named")
+GATE_RECOVERY = "gate recovery record"
+GATE_OTHER_OWNER = "other user's files; live use not provable"
+GATE_GIT_KEEP_REASON = "holds a Git repository; manual review"
+GATE_GIT_STORAGE = "Git data in the gate root; manual review"
+TEST_GATE_KINDS = ("t", "targeted-test")
+GATE_PREFIXES = ("merge-gate-recovery", "gate-recovery", "phase-44ca-gate",
+                 "merge-gate", "fc", "mg", "g", *TEST_GATE_KINDS)
+UNKNOWN_GATE_KIND = "unknown"
 LINUX_BUILD_ROOT = Path("/build")
 ALTERNATE_SCAN_DEPTH = 7
 ALTERNATE_SCAN_SECONDS = 30
@@ -291,6 +370,11 @@ class CleanupBounds:
     home: Path
     build: Path
     repositories: frozenset[str]
+    gate: Path | GateRootNotSelected = GateRootNotSelected.NOT_SELECTED
+    gate_device: int | GateDeviceUnavailable = GateDeviceUnavailable.UNKNOWN
+
+    def is_gate_child(self, path: Path) -> bool:
+        return path.parent == self.gate
 
     def forbids_walk(self, path: Path) -> bool:
         if path.is_relative_to(self.home / "rust/hanadocs"):
@@ -304,7 +388,15 @@ class CleanupBounds:
         if self.forbids_walk(path):
             raise removal_guard.ChangedEntry(f"protected path: {path}")
 
-    def storage_path(self, path: Path, *, follow_links: bool = True) -> Path:
+    def require_git_outside_gate(self, path: Path) -> None:
+        if isinstance(self.gate, Path) and path.is_relative_to(self.gate):
+            raise GateGitStorage()
+
+    def require_git_on_another_device(self, info: os.stat_result) -> None:
+        if info.st_dev == self.gate_device:
+            raise GateGitStorage()
+
+    def storage_path(self, path: Path, *, follow_links: bool = True, exclude_gate: bool = False) -> Path:
         """Resolve a Git storage path without entering a protected folder."""
         if not path.is_absolute():
             raise ValueError(f"expected an absolute Git storage path: {path}")
@@ -318,9 +410,13 @@ class CleanupBounds:
                 continue
             entry = resolved / part
             self.require_walk(entry)
+            if exclude_gate:
+                self.require_git_outside_gate(entry)
             identity = entry.lstat()
             if stat.S_ISLNK(identity.st_mode):
                 if not follow_links:
+                    if exclude_gate:
+                        require_git_pointer_outside_gate(path, self)
                     raise GitMetadataRefused(entry, "is a symlink")
                 links += 1
                 if links > 40:
@@ -331,6 +427,8 @@ class CleanupBounds:
                 remaining.extend(reversed(target.parts[1:] if target.is_absolute() else target.parts))
             else:
                 resolved = entry
+        if exclude_gate and isinstance(self.gate_device, int):
+            self.require_git_on_another_device(resolved.lstat())
         return resolved
 
     def protects(self, path: Path) -> bool:
@@ -339,6 +437,9 @@ class CleanupBounds:
         if self.forbids_walk(path) or any(root.is_relative_to(path) for root in (
             self.home, self.build, LINUX_BUILD_ROOT, self.home / "rust/hanadocs",
         )):
+            return True
+        if isinstance(self.gate, Path) and (self.gate.is_relative_to(path)
+                or (path.is_relative_to(self.gate) and not self.is_gate_child(path))):
             return True
         return path.is_relative_to(self.build) and any(self.is_model_folder(part) for part in (path, *path.parents))
 
@@ -514,13 +615,19 @@ class CleanupGit(Enum):
     PROTECTED = "bare repository or nested Git metadata"
 
 
+class NoSourceFingerprint(Enum):
+    GATE_FOLDER = "gate folders do not use Git rescue"
+
+
 @dataclass(frozen=True)
 class CleanupTree:
     fingerprint: str
     size: int
     git: CleanupGit
     lease_owners: tuple[Path, ...]
-    source_fingerprint: str
+    source_fingerprint: str | NoSourceFingerprint
+    newest_ns: int
+    gate_issue: str
 
 
 class Snapshot(Enum):
@@ -531,22 +638,34 @@ def inspect_cleanup_tree(checked: CheckedCleanup,
                          entries: dict[Path, CleanupEntry] | Snapshot = Snapshot.PREVIEW) -> CleanupTree:
     """Measure the tree and record each entry without following links."""
     fingerprint = hashlib.sha256()
-    source_fingerprint = hashlib.sha256()
+    gate = checked.bounds.is_gate_child(checked.path)
+    source_fingerprint = NoSourceFingerprint.GATE_FOLDER if gate else hashlib.sha256()
     inodes: set[removal_guard.Identity] = set()
     lease_owners: list[Path] = []
     size = 0
+    newest_ns = checked.info.st_mtime_ns
+    gate_issue = ""
+    uid = os.geteuid()
     git = CleanupGit.NONE
     dot_git = checked.path / ".git"
 
     def visit(parent: int, name: str, path: Path) -> None:
-        nonlocal size, git
+        nonlocal size, git, newest_ns, gate_issue
         checked.bounds.require_walk(path)
         info = os.stat(name, dir_fd=parent, follow_symlinks=False)
         stamp = entry_stamp(info)
+        newest_ns = max(newest_ns, stamp.modified_ns)
+        if gate:
+            if path.name == "run.json":
+                gate_issue = GATE_RECOVERY
+            elif not gate_issue and stamp.uid != uid:
+                gate_issue = GATE_OTHER_OWNER
+            elif not gate_issue and not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                gate_issue = f"contains a link or an unknown entry type: {path}"
         evidence = json.dumps((str(path.relative_to(checked.path)), stamp)).encode()
         fingerprint.update(evidence)
         in_git = path.is_relative_to(dot_git)
-        if not in_git:
+        if not in_git and not isinstance(source_fingerprint, NoSourceFingerprint):
             source_fingerprint.update(evidence)
         key = removal_guard.identity(info)
         if key not in inodes:
@@ -569,7 +688,7 @@ def inspect_cleanup_tree(checked: CheckedCleanup,
                 names = tuple(sorted(os.listdir(descriptor)))
                 if git is not CleanupGit.PROTECTED and not in_git and git_metadata(names):
                     bare = BARE_GIT_NAMES.issubset(name.casefold() for name in names)
-                    git = (CleanupGit.CHECKOUT if path == checked.path and ".git" in names and not bare
+                    git = (CleanupGit.CHECKOUT if not gate and path == checked.path and ".git" in names and not bare
                            else CleanupGit.PROTECTED)
                 for child in names:
                     visit(descriptor, child, path / child)
@@ -588,7 +707,9 @@ def inspect_cleanup_tree(checked: CheckedCleanup,
     checked.recheck()
     visit(checked.parent, checked.name, checked.path)
     checked.recheck()
-    return CleanupTree(fingerprint.hexdigest(), size, git, tuple(lease_owners), source_fingerprint.hexdigest())
+    source = (source_fingerprint if isinstance(source_fingerprint, NoSourceFingerprint)
+              else source_fingerprint.hexdigest())
+    return CleanupTree(fingerprint.hexdigest(), size, git, tuple(lease_owners), source, newest_ns, gate_issue)
 
 
 def cargo_artifact(entry: CleanupEntry, path: Path, entries: dict[Path, CleanupEntry]) -> bool:
@@ -843,53 +964,110 @@ class GitMetadataRefused(GitCleanupRefused):
         super().__init__(f"review only: Git metadata {str(path)!r} {reason}")
 
 
+class GateGitStorage(GitCleanupRefused):
+    def __init__(self) -> None:
+        super().__init__(GATE_GIT_STORAGE)
+
+
+class MissingGateGitDirectory(FileNotFoundError):
+    """A gate checkout names a Git directory that does not exist."""
+
+
 WRONG_GIT_WORKTREE = "review only: Git worktree root does not match the row path"
 
 
-def config_has_include(lines: Iterable[str]) -> bool:
-    """Check Git config keys as text. Do not read any include path."""
-    section = ""
-    continued = quoted = False
-    for physical in lines:
-        line = physical.rstrip("\r\n")
-        if not continued:
-            line = line.lstrip(" \t\r\v\f")
-            while line.startswith("["):
-                match = CONFIG_SECTION.match(line)
-                if match is None:
-                    raise ValueError("cannot read Git config section")
-                section = match[1].lower()
-                line = line[match.end():].lstrip(" \t\r\v\f")
-            if not line or line.startswith(("#", ";")):
-                continue
-            if section in ("include", "includeif") and CONFIG_INCLUDE_PATH.match(line):
-                return True
-            _, equals, line = line.partition("=")
-            if not equals:
-                continue
-        continued = False
+def git_config_value(line: str, lines: Iterator[str]) -> str:
+    value: list[str] = []
+    end = 0
+    quoted = False
+    while True:
         characters = iter(line)
         for char in characters:
-            if char == "\\":
-                if not next(characters, ""):
-                    continued = True
-            elif char == '"':
+            if char == '"':
                 quoted = not quoted
-            elif not quoted and char in "#;":
-                break
-        if not continued:
-            quoted = False
-    return False
+                continue
+            if not quoted and char in "#;":
+                return "".join(value[:end])
+            if char == "\\":
+                escape = next(characters, "")
+                if not escape:
+                    line = next(lines, "")
+                    break
+                if escape not in CONFIG_ESCAPES:
+                    raise ValueError("cannot read Git config escape")
+                char = CONFIG_ESCAPES[escape]
+                value.append(char)
+                end = len(value)
+            elif quoted or char not in " \t\r\v\f":
+                value.append(char)
+                end = len(value)
+            elif value:
+                value.append(char)
+        else:
+            if quoted:
+                raise ValueError("cannot read Git config value")
+            return "".join(value[:end])
+
+
+def git_config_origins(content: str) -> Iterator[str]:
+    """Read local origin values before Git can open a repository."""
+    section = subsection = ""
+    lines = iter(content.split("\n"))
+    for physical in lines:
+        line = physical.lstrip(" \t\r\v\f")
+        while line.startswith("["):
+            match = CONFIG_SECTION.match(line)
+            if match is None:
+                raise ValueError("cannot read Git config section")
+            section = match[1].lower()
+            subsection = re.sub(r"\\(.)", r"\1", match[3]) if match[3] is not None else (match[2] or "").lower()
+            line = line[match.end():].lstrip(" \t\r\v\f")
+        key = CONFIG_KEY.match(line)
+        if key is None:
+            continue
+        name = key[0].lower()
+        if section in ("include", "includeif") and name == "path":
+            raise GitCleanupRefused("git config include")
+        value = line[key.end():].lstrip(" \t\r\v\f")
+        if value.startswith("="):
+            parsed = git_config_value(value[1:], lines)
+            if section == "remote" and subsection == "origin" and name == "url":
+                yield parsed
+
+
+def check_git_origin_gate(value: str, worktree: Path, bounds: CleanupBounds) -> None:
+    if not isinstance(bounds.gate, Path) or not value:
+        return
+    if value.lower().startswith("file://"):
+        url = urlsplit(value)
+        if url.netloc not in ("", "localhost"):
+            return
+        value = unquote(url.path, errors="surrogateescape")
+    elif ":" in value.partition("/")[0]:
+        return
+    try:
+        origin = bounds.storage_path(worktree / Path(value).expanduser(), exclude_gate=True)
+        try:
+            git_dir = checked_git_files(origin, bounds).common_dir
+        except git_files.NotACheckout:
+            git_dir = origin
+        check_object_stores(git_dir / "objects", bounds)
+    except GateGitStorage:
+        raise
+    except (OSError, ValueError):
+        # The existing Git review reports other problems with the origin.
+        return
 
 
 def require_safe_git_config(common_dir: Path, git_dir: Path, worktree: Path, bounds: CleanupBounds) -> None:
-    require_safe_git_tree(bounds.storage_path(common_dir, follow_links=False))
+    check_object_stores(common_dir / "objects", bounds)
+    require_safe_git_tree(bounds.storage_path(common_dir, follow_links=False, exclude_gate=True))
     configs: dict[Path, str] = {}
     for directory in dict.fromkeys((common_dir, git_dir)):
         for name in ("config", "config.worktree"):
             path = directory / name
             try:
-                resolved = bounds.storage_path(path, follow_links=False)
+                resolved = bounds.storage_path(path, follow_links=False, exclude_gate=True)
             except FileNotFoundError:
                 if os.path.lexists(path):
                     raise
@@ -899,8 +1077,8 @@ def require_safe_git_config(common_dir: Path, git_dir: Path, worktree: Path, bou
                 if not stat.S_ISREG(os.fstat(config.fileno()).st_mode):
                     raise ValueError(f"expected a regular Git config: {path}")
                 content = config.read()
-                if config_has_include(content.splitlines()):
-                    raise GitCleanupRefused("git config include")
+                for origin in git_config_origins(content):
+                    check_git_origin_gate(origin, worktree, bounds)
                 configs[path] = content
     for path, content in configs.items():
         with isolated_git_config():
@@ -983,14 +1161,13 @@ def local_clone(checkout: git_files.Checkout, bounds: CleanupBounds) -> LocalClo
     if not separator or extra or not url or ":" in url:
         return removal_guard.Kept(NO_LOCAL_ORIGIN)
     try:
-        origin = bounds.storage_path(path / Path(url).expanduser())
+        origin = bounds.storage_path(path / Path(url).expanduser(), exclude_gate=True)
         if not origin.is_dir() or origin.is_relative_to(path):
             return removal_guard.Kept(NO_LOCAL_ORIGIN)
         try:
             source = checked_git_files(origin, bounds)
         except git_files.NotACheckout:
             require_safe_git_config(origin, origin, origin, bounds)
-            check_object_stores(origin / "objects", bounds)
             actual = cleanup_git(origin, f"--git-dir={origin}", "rev-parse", "--absolute-git-dir").strip()
             if Path(actual) != origin:
                 return removal_guard.Kept(NO_LOCAL_ORIGIN)
@@ -998,7 +1175,6 @@ def local_clone(checkout: git_files.Checkout, bounds: CleanupBounds) -> LocalClo
         else:
             git_dir = source.common_dir
             require_safe_git_config(git_dir, source.git_dir, source.toplevel, bounds)
-            check_object_stores(git_dir / "objects", bounds)
         if git_dir.is_relative_to(path):
             return removal_guard.Kept(NO_LOCAL_ORIGIN)
         return LocalClone(origin, git_dir, removal_guard.identity(git_dir.stat()))
@@ -1029,7 +1205,6 @@ def checkout_for_git_status(checked: CheckedCleanup) -> git_files.Checkout:
     overrides = cleanup_git(path, "rev-parse", "--local-env-vars").splitlines()
     if any(name in os.environ for name in overrides):
         raise removal_guard.ChangedEntry("the environment overrides the Git repository or index")
-    check_object_stores(checkout.common_dir / "objects", checked.bounds)
     toplevel = cleanup_git(path, "rev-parse", "--show-toplevel").removesuffix("\n")
     if checkout.toplevel != path or Path(toplevel) != path:
         raise GitCleanupRefused(WRONG_GIT_WORKTREE)
@@ -1104,7 +1279,7 @@ def borrower_repositories(bounds: CleanupBounds, deadline: float) -> Iterator[Pa
                 pending.extend((folder / name, remaining - 1) for name in sorted(children, reverse=True))
 
 
-def checked_git_files(path: Path, bounds: CleanupBounds) -> git_files.Checkout:
+def checked_git_files(path: Path, bounds: CleanupBounds, *, exclude_gate: bool = True) -> git_files.Checkout:
     """Check the row's Git directory and its named registration without following links."""
     marker = path / ".git"
     bounds.require_walk(marker)
@@ -1113,34 +1288,63 @@ def checked_git_files(path: Path, bounds: CleanupBounds) -> git_files.Checkout:
     except FileNotFoundError as error:
         raise git_files.NotACheckout(f"{path}: no .git entry") from error
     if stat.S_ISDIR(marker_info.st_mode):
+        if exclude_gate:
+            bounds.require_git_on_another_device(marker_info)
         for name in ("gitdir", "commondir"):
             pointer = marker / name
             if os.path.lexists(pointer):
-                check_git_pointer(pointer, marker, bounds)
+                check_git_pointer(pointer, marker, bounds, exclude_gate=exclude_gate)
         return git_files.Checkout(path, marker, marker, marker_info, marker_info)
+    if exclude_gate and stat.S_ISLNK(marker_info.st_mode):
+        _ = bounds.storage_path(marker, follow_links=False, exclude_gate=True)
     pointer = read_git_pointer(marker)
     if not pointer.startswith("gitdir:") or not pointer.removeprefix("gitdir:").strip():
         raise ValueError(f"invalid Git directory pointer: {str(marker)!r}")
     named = path / pointer.removeprefix("gitdir:").strip()
     registration = Path(os.path.normpath(named))
-    if registration.parent.name != "worktrees" or registration.is_relative_to(path):
+    named_registration = registration.parent.name == "worktrees" and not registration.is_relative_to(path)
+    gate_borrower = not exclude_gate and bounds.is_gate_child(path)
+    if not named_registration and exclude_gate:
+        require_git_pointer_outside_gate(named, bounds)
+    if not named_registration and not gate_borrower:
         raise GitMetadataRefused(marker, "points outside the row and its named registration")
-    git_dir = bounds.storage_path(named, follow_links=False)
+    try:
+        git_dir = bounds.storage_path(named, follow_links=False, exclude_gate=exclude_gate)
+    except FileNotFoundError as error:
+        if gate_borrower:
+            raise MissingGateGitDirectory(str(error)) from error
+        raise
+    if not named_registration:
+        raise GitMetadataRefused(marker, "points outside the row and its named registration")
     common = git_dir.parent.parent
     git_info = git_dir.lstat()
     common_info = common.lstat()
+    if exclude_gate:
+        bounds.require_git_on_another_device(common_info)
     if not stat.S_ISDIR(git_info.st_mode) or not stat.S_ISDIR(common_info.st_mode):
         raise GitMetadataRefused(marker, "does not name a registration directory")
-    check_git_pointer(git_dir / "gitdir", marker, bounds)
-    check_git_pointer(git_dir / "commondir", common, bounds)
+    check_git_pointer(git_dir / "gitdir", marker, bounds, exclude_gate=exclude_gate)
+    check_git_pointer(git_dir / "commondir", common, bounds, exclude_gate=exclude_gate)
     return git_files.Checkout(path, git_dir, common, git_info, common_info)
 
 
-def check_git_pointer(pointer: Path, expected: Path, bounds: CleanupBounds) -> None:
+def check_git_pointer(pointer: Path, expected: Path, bounds: CleanupBounds, *, exclude_gate: bool) -> None:
     named = pointer.parent / read_git_pointer(pointer)
-    if (Path(os.path.normpath(named)) != expected
-            or bounds.storage_path(named, follow_links=False) != expected):
+    if Path(os.path.normpath(named)) != expected:
+        if exclude_gate:
+            require_git_pointer_outside_gate(named, bounds)
         raise GitMetadataRefused(pointer, "points outside the row and its named registration")
+    if bounds.storage_path(named, follow_links=False, exclude_gate=exclude_gate) != expected:
+        raise GitMetadataRefused(pointer, "points outside the row and its named registration")
+
+
+def require_git_pointer_outside_gate(path: Path, bounds: CleanupBounds) -> None:
+    try:
+        _ = bounds.storage_path(path, exclude_gate=True)
+    except GateGitStorage:
+        raise
+    except (OSError, ValueError):
+        pass
 
 
 def read_git_pointer(path: Path) -> str:
@@ -1186,11 +1390,11 @@ def require_safe_git_tree(root: Path) -> None:
         os.close(directory)
 
 
-def alternate_paths(objects: Path, bounds: CleanupBounds) -> Iterator[Path]:
+def alternate_paths(objects: Path, bounds: CleanupBounds, *, exclude_gate: bool) -> Iterator[Path]:
     """Read the alternate links before any Git command can follow them."""
     entry = objects / "info/alternates"
     try:
-        path = bounds.storage_path(entry, follow_links=False)
+        path = bounds.storage_path(entry, follow_links=False, exclude_gate=exclude_gate)
     except FileNotFoundError:
         if os.path.lexists(entry):
             raise
@@ -1216,20 +1420,20 @@ def alternate_paths(objects: Path, bounds: CleanupBounds) -> Iterator[Path]:
             yield objects / os.fsdecode(name)
 
 
-def object_stores(start: Path, bounds: CleanupBounds, deadline: float) -> Iterator[Path]:
+def object_stores(start: Path, bounds: CleanupBounds, deadline: float, *, exclude_gate: bool = True) -> Iterator[Path]:
     pending = [start]
     visited: set[Path] = set()
     while pending:
         if time.monotonic() >= deadline:
             raise ValueError(f"Git object scan timed out at {start}")
-        objects = bounds.storage_path(pending.pop(), follow_links=False)
+        objects = bounds.storage_path(pending.pop(), follow_links=False, exclude_gate=exclude_gate)
         if objects in visited:
             continue
         if not objects.is_dir():
             raise ValueError(f"expected a Git object directory: {objects}")
         visited.add(objects)
         yield objects
-        pending.extend(alternate_paths(objects, bounds))
+        pending.extend(alternate_paths(objects, bounds, exclude_gate=exclude_gate))
 
 
 def check_object_stores(objects: Path, bounds: CleanupBounds) -> None:
@@ -1256,7 +1460,9 @@ def require_no_borrowers(path: Path, clone: LocalClone, bounds: CleanupBounds,
             continue
         repository = bounds.storage_path(repository)
         try:
-            git_dir = checked_git_files(repository, bounds).common_dir
+            git_dir = checked_git_files(repository, bounds, exclude_gate=False).common_dir
+        except MissingGateGitDirectory:
+            continue
         except git_files.NotACheckout:
             git_dir = repository
             if not os.path.lexists(git_dir / "objects") or not os.path.lexists(git_dir / "HEAD"):
@@ -1264,7 +1470,7 @@ def require_no_borrowers(path: Path, clone: LocalClone, bounds: CleanupBounds,
         if git_dir in checked:
             continue
         checked.add(git_dir)
-        for objects in object_stores(git_dir / "objects", bounds, deadline):
+        for objects in object_stores(git_dir / "objects", bounds, deadline, exclude_gate=False):
             if objects.is_relative_to(path):
                 raise removal_guard.ChangedEntry(f"Git object storage is used by {repository}: {objects}")
 
@@ -1307,12 +1513,43 @@ def expand_places(pattern: Path, bounds: CleanupBounds) -> Iterator[Path]:
         return
 
 
+def gate_places(bounds: CleanupBounds) -> dict[Path, CleanupPlace]:
+    root = bounds.gate
+    if not isinstance(root, Path) or bounds.forbids_walk(root):
+        return {}
+    try:
+        with build_folder_lock.folder_parent(root / "entry", Path("/"), create=False) as directory:
+            names = frozenset(os.listdir(directory))
+    except FileNotFoundError:
+        return {}
+    places: dict[Path, CleanupPlace] = {}
+    for name in names:
+        base = name.removesuffix(".lease.json") if name.endswith(".lease.json") else name.removesuffix(".lock")
+        if base in ("", ".", "..") or base.endswith((".lock", ".lease.json")):
+            places[root / name] = CleanupPlace.GATE_FOLDER
+        elif base == name or base in names:
+            places[root / base] = CleanupPlace.GATE_FOLDER
+        else:
+            places[root / base] = CleanupPlace.GATE_SIDECARS
+    return places
+
+
 def collect(machine: Machine, settings: conf.ConfigRead, bounds: CleanupBounds) -> tuple[Candidate, ...]:
     """Expand the configured places and skip missing or protected paths."""
     reason = settings.value(f"cleanup.list_only_reason.{machine.value}", str,
                             recover_invalid=False, host_override=conf.HostOverride.IGNORED)
     assignments: dict[Path, Candidate] = {}
     expansions: dict[Path, tuple[Path, ...]] = {}
+    try:
+        gates = gate_places(bounds)
+    except OSError as error:
+        assert isinstance(bounds.gate, Path)
+        gate_error = f"cannot read the gate root: {removal_guard.single_line(error)}"
+        assignments[bounds.gate] = Candidate(bounds.gate, removal_guard.Kept(gate_error), CleanupPlace.UNREADABLE_GATE_ROOT)
+        gates = {}
+
+    for path, place in gates.items():
+        assignments[path] = Candidate(path, NO_CLEANUP_SETTING, place)
 
     def expanded(pattern: Path) -> tuple[Path, ...]:
         if pattern not in expansions:
@@ -1326,6 +1563,11 @@ def collect(machine: Machine, settings: conf.ConfigRead, bounds: CleanupBounds) 
         for pattern in configured:
             if bounds.protects(pattern):
                 continue
+            if bounds.is_gate_child(pattern):
+                for path, place in gates.items():
+                    if place is CleanupPlace.GATE_FOLDER and fnmatch.fnmatchcase(path.name, pattern.name):
+                        assignments[path] = Candidate(path, decision, place)
+                continue
             for path in expanded(pattern):
                 assignments[path] = Candidate(path, decision)
     if machine is Machine.NATEDEV:
@@ -1335,12 +1577,14 @@ def collect(machine: Machine, settings: conf.ConfigRead, bounds: CleanupBounds) 
                 if path not in assignments:
                     assignments[path] = Candidate(path, NO_CLEANUP_SETTING)
         for path, place in top_worktrees(bounds):
+            if bounds.is_gate_child(path):
+                continue
             configured = assignments.get(path)
             if configured is None:
                 assignments[path] = Candidate(path, NO_CLEANUP_SETTING, place)
             elif place is CleanupPlace.LINK:
                 assignments[path] = Candidate(path, configured.decision, place)
-    return tuple(assignments[path] for path in sorted(assignments))
+    return tuple(sorted(assignments.values(), key=candidate_order))
 
 
 def top_worktrees(bounds: CleanupBounds) -> Iterator[tuple[Path, CleanupPlace]]:
@@ -1403,6 +1647,7 @@ class CleanupProcessReview:
     pwd_users: tuple[tuple[Path, int], ...] = ()
     pwd_failure: removal_guard.Kept | NoUseFound = NoUseFound.CLEAR
     unreadable_processes: tuple[tuple[int, str], ...] = ()
+    gate_paths: GatePathUse = GatePathUse.CLEAR
 
     def all_uses(self) -> Iterator[tuple[str, int, str]]:
         yield from self.paths
@@ -1416,6 +1661,7 @@ class ProcessCheckRequest(TypedDict):
     paths: tuple[str, ...]
     links: bool
     descriptors: tuple[int, ...]
+    gate_root: str
 
 
 class ProcessCheckResult(TypedDict):
@@ -1425,6 +1671,7 @@ class ProcessCheckResult(TypedDict):
     pwd_users: tuple[tuple[str, int], ...]
     pwd_failure: str
     unreadable: tuple[tuple[int, str], ...]
+    gate_paths: str
 
 
 class WorkerReview(TypedDict):
@@ -1482,16 +1729,20 @@ class WorkerChannel:
             raise ValueError("the masked cleanup worker stopped before it sent a result")
         return message_object(cast(object, json.loads(line)))
 
-    def check_process_use(self, paths: Sequence[Path], check_links: bool, fds: frozenset[int]) -> CleanupProcessReview:
+    def check_process_use(self, paths: Sequence[Path], check_links: bool, fds: frozenset[int],
+                          gate_root: Path | GateRootNotSelected) -> CleanupProcessReview:
         request: ProcessCheckRequest = {
             "kind": "process", "pid": os.getpid(), "paths": tuple(map(str, paths)),
             "links": check_links, "descriptors": tuple(sorted(fds)),
+            "gate_root": str(gate_root) if isinstance(gate_root, Path) else "",
         }
         self.send(request)
         fields = self.receive()
         path_failure = fields.get("path_failure")
         pwd_failure = fields.get("pwd_failure")
-        if fields.get("kind") != "process-result" or not isinstance(path_failure, str) or not isinstance(pwd_failure, str):
+        gate_paths = fields.get("gate_paths")
+        if (fields.get("kind") != "process-result" or not isinstance(path_failure, str)
+                or not isinstance(pwd_failure, str) or not isinstance(gate_paths, str)):
             raise ValueError("invalid cleanup process result")
         return CleanupProcessReview(
             tuple((cast(str, path), cast(int, pid), cast(str, action))
@@ -1501,6 +1752,7 @@ class WorkerChannel:
                   for path, pid in message_rows(fields.get("pwd_users"), (str, int))),
             removal_guard.Kept(pwd_failure) if pwd_failure else NoUseFound.CLEAR,
             unreadable_records(fields.get("unreadable")),
+            GatePathUse(gate_paths),
         )
 
 
@@ -1528,17 +1780,123 @@ def report_partial_removal(path: Path, error: Exception, deleted: Sequence[Path]
 
 
 def process_uses(paths: Sequence[Path], *, check_links: bool = False,
-                 ignored_fds: frozenset[int] = tmp_sweep.NO_IGNORED_FDS) -> CleanupProcessReview:
+                 ignored_fds: frozenset[int] = tmp_sweep.NO_IGNORED_FDS,
+                 gate_root: Path | GateRootNotSelected = GateRootNotSelected.NOT_SELECTED) -> CleanupProcessReview:
     channel = MASKED_WORKER_CHANNEL.get()
     if isinstance(channel, WorkerChannel):
-        return channel.check_process_use(paths, check_links, ignored_fds)
-    return read_process_use(paths, check_links=check_links, ignored_fds=ignored_fds)
+        return channel.check_process_use(paths, check_links, ignored_fds, gate_root)
+    return read_process_use(paths, check_links=check_links, ignored_fds=ignored_fds, gate_root=gate_root)
+
+
+def gate_link_is_alias(link: Path, root: Path, device: int) -> bool:
+    return link.stat().st_dev == device and not Path(os.readlink(link)).is_relative_to(root)
+
+
+def gate_task_uses_alias(task: Path, root: Path, device: int, ignored: frozenset[int]) -> bool:
+    if any(gate_link_is_alias(task / name, root, device) for name in ("cwd", "root")):
+        return True
+    try:
+        if gate_link_is_alias(task / "exe", root, device):
+            return True
+    except FileNotFoundError:
+        pass
+    for link in (task / "fd").iterdir():
+        if link.name.isdecimal() and int(link.name) not in ignored:
+            try:
+                if gate_link_is_alias(link, root, device):
+                    return True
+            except FileNotFoundError:
+                if not process_ended(link):
+                    raise
+    return False
+
+
+def gate_mappings_use_alias(process: Path, root: Path, device: int) -> bool:
+    with (process / "maps").open("rb") as mappings:
+        for line in mappings:
+            fields = line.split(maxsplit=5)
+            if len(fields) < 5 or fields[4] == b"0":
+                continue
+            major, minor = (int(part, 16) for part in fields[3].split(b":"))
+            if (major, minor) != (os.major(device), os.minor(device)):
+                continue
+            # The map table identifies the device. Check the matching link in /proc.
+            try:
+                if gate_link_is_alias(process / "map_files" / os.fsdecode(fields[0]), root, device):
+                    return True
+            except (FileNotFoundError, PermissionError):
+                if len(fields) < 6:
+                    raise
+                names = tmp_sweep.proc_path_candidates(fields[5].removesuffix(b"\n"))
+                if isinstance(names, tmp_sweep.MissingProcessData):
+                    raise
+                if any(not Path(os.fsdecode(name)).is_relative_to(root) for name in names):
+                    return True
+    return False
+
+
+def gate_task_state(status: Sequence[str], uid: str) -> GateTaskState:
+    users = next(line.split()[1:3] for line in status if line.startswith("Uid:"))
+    if len(users) != 2 or not all(user.isdecimal() for user in users):
+        raise ValueError("cannot read the process user")
+    if uid not in users:
+        return GateTaskState.OTHER_USER
+    state = next(line.split()[1] for line in status if line.startswith("State:"))
+    return GateTaskState.ENDED if state in ("Z", "X") else GateTaskState.ALIVE
+
+
+def gate_process_use(root: Path, ignored_fds: frozenset[int],
+                     worker_fds: tmp_sweep.WorkerRemovalDescriptors | tmp_sweep.NoWorkerDescriptors) -> GatePathUse:
+    uid = str(os.geteuid())
+    try:
+        device = root.stat().st_dev
+        processes = tuple(Path(PROC_ROOT).iterdir())
+    except OSError:
+        return GatePathUse.UNREADABLE
+    result = GatePathUse.CLEAR
+    for process in processes:
+        if not process.name.isdecimal():
+            continue
+        pid = int(process.name)
+        ignored = ignored_fds if pid == os.getpid() else tmp_sweep.NO_IGNORED_FDS
+        if isinstance(worker_fds, tmp_sweep.WorkerRemovalDescriptors) and pid == worker_fds.pid:
+            ignored |= worker_fds.numbers
+        try:
+            status = (process / "status").read_text(errors="replace").splitlines()
+            leader_state = gate_task_state(status, uid)
+            if leader_state is GateTaskState.OTHER_USER:
+                continue
+            threaded = not any(line.startswith("Threads:") and line.split() == ["Threads:", "1"] for line in status)
+            tasks = ((task for task in (process / "task").iterdir()
+                      if task.name.isdecimal() and task.name != process.name) if threaded else ())
+            read_maps = False
+            for task in chain((process,), tasks):
+                try:
+                    leader = task == process
+                    state = (leader_state if leader
+                             else gate_task_state((task / "status").read_text(errors="replace").splitlines(), uid))
+                    if state is not GateTaskState.ALIVE:
+                        continue
+                    if gate_task_uses_alias(task, root, device, ignored if leader else tmp_sweep.NO_IGNORED_FDS):
+                        return GatePathUse.ALIAS
+                    if not read_maps:
+                        if gate_mappings_use_alias(task, root, device):
+                            return GatePathUse.ALIAS
+                        read_maps = True
+                except (OSError, ValueError, StopIteration, IndexError):
+                    if not process_ended(task):
+                        result = GatePathUse.UNREADABLE
+        except (OSError, ValueError, StopIteration, IndexError):
+            if not process_ended(process):
+                result = GatePathUse.UNREADABLE
+    return result
 
 
 def read_process_use(paths: Sequence[Path], *, check_links: bool,
                      ignored_fds: frozenset[int] = tmp_sweep.NO_IGNORED_FDS,
                      worker_fds: tmp_sweep.WorkerRemovalDescriptors | tmp_sweep.NoWorkerDescriptors =
-                     tmp_sweep.NoWorkerDescriptors.NONE) -> CleanupProcessReview:
+                     tmp_sweep.NoWorkerDescriptors.NONE,
+                     gate_root: Path | GateRootNotSelected = GateRootNotSelected.NOT_SELECTED) -> CleanupProcessReview:
     if not (paths or check_links):
         return CleanupProcessReview()
     prefix = tuple(str(path) for path in paths)
@@ -1579,7 +1937,9 @@ def read_process_use(paths: Sequence[Path], *, check_links: bool,
         path_failure = pwd_failure
     pwd_users = tuple((path, pid) for path, pid in pwd_scan.users if pid not in ended)
     found = [item for item in uses.paths if item[1] not in ended] if isinstance(uses, tmp_sweep.ProcessUsesKnown) else []
-    return CleanupProcessReview(tuple(found), path_failure, pwd_users, pwd_failure, unreadable)
+    gate_paths = (gate_process_use(gate_root, ignored_fds, worker_fds)
+                  if isinstance(gate_root, Path) and not use_lsof else GatePathUse.CLEAR)
+    return CleanupProcessReview(tuple(found), path_failure, pwd_users, pwd_failure, unreadable, gate_paths)
 
 
 def answer_process_check(channel: WorkerChannel, request: dict[str, object]) -> None:
@@ -1587,19 +1947,23 @@ def answer_process_check(channel: WorkerChannel, request: dict[str, object]) -> 
     links = request.get("links")
     paths = message_array(request.get("paths"))
     fds = message_array(request.get("descriptors"))
+    gate = request.get("gate_root")
     if (type(pid) is not int or pid <= 0 or not isinstance(links, bool)
+            or not isinstance(gate, str) or (gate and (not Path(gate).is_absolute() or ".." in Path(gate).parts))
             or any(not isinstance(path, str) or not path.startswith("/") for path in paths)
             or any(type(fd) is not int or fd <= 2 for fd in fds)):
         raise ValueError("invalid cleanup process request")
     uses = read_process_use(
         tuple(map(Path, cast(list[str], paths))), check_links=links,
         worker_fds=tmp_sweep.WorkerRemovalDescriptors(pid, frozenset(cast(list[int], fds))),
+        gate_root=Path(gate) if gate else GateRootNotSelected.NOT_SELECTED,
     )
     result: ProcessCheckResult = {
         "kind": "process-result", "paths": uses.paths, "pwd_users": tuple((str(path), pid) for path, pid in uses.pwd_users),
         "path_failure": uses.path_failure.reason if isinstance(uses.path_failure, removal_guard.Kept) else "",
         "pwd_failure": uses.pwd_failure.reason if isinstance(uses.pwd_failure, removal_guard.Kept) else "",
         "unreadable": uses.unreadable_processes,
+        "gate_paths": uses.gate_paths.value,
     }
     channel.send(result)
 
@@ -1609,6 +1973,11 @@ def keep_for_process(path: Path, uses: CleanupProcessReview, *,
                      other_folders: tuple[Path, ...] = ()) -> removal_guard.Kept | NoUseFound:
     if isinstance(uses.path_failure, removal_guard.Kept):
         return uses.path_failure
+    return find_process_use(path, uses, sidecars=sidecars, other_folders=other_folders)
+
+
+def find_process_use(path: Path, uses: CleanupProcessReview, *, sidecars: tuple[Path, ...],
+                     other_folders: tuple[Path, ...] = ()) -> removal_guard.Kept | NoUseFound:
     folders = tuple(map(str, (path, *other_folders)))
     sidecar_names = frozenset(map(str, sidecars))
     for name, pid, action in sorted(uses.all_uses()):
@@ -1720,7 +2089,10 @@ def review_worktree_folder(checked: CheckedCleanup, uses: CleanupProcessReview,
     reason = "review only"
     if isinstance(uses.path_failure, removal_guard.Kept):
         reason += f"; {uses.path_failure.reason}"
-    details = worktree_git_state(checked)
+    try:
+        details = worktree_git_state(checked)
+    except GateGitStorage as error:
+        return Row(path, None, removal_guard.Kept(str(error)), place=CleanupPlace.REVIEW_FOLDER)
     return Row(path, None, removal_guard.Kept(reason), details, place=CleanupPlace.REVIEW_FOLDER)
 
 
@@ -1739,6 +2111,8 @@ def worktree_git_state(checked: CheckedCleanup) -> str:
                     else int(cleanup_git(path, "rev-list", "--count", "HEAD", "--not", "--remotes")))
         checked.recheck()
         return f"dirty: {dirty}, unpushed: {unpushed}, branch: {branch!r}"
+    except GateGitStorage:
+        raise
     except (OSError, ValueError, StopIteration, removal_guard.Refused) as error:
         return f"Git state unavailable: {table_text(removal_guard.single_line(error))}"
 
@@ -1746,37 +2120,65 @@ def worktree_git_state(checked: CheckedCleanup) -> str:
 class LeasePidCheck(Enum):
     MATCH_START = "match the lease PID and start time"
     ANY_LIVE_PID = "keep the place while the lease PID is alive"
+    MATCH_START_IF_PRESENT = "match the start time when the record has one"
 
 
-def keep_for_lease(path: Path, *, check: LeasePidCheck = LeasePidCheck.MATCH_START) -> removal_guard.Kept | NoUseFound:
+@dataclass(frozen=True)
+class FolderLeaseReview:
+    status: LeaseStatus
+    keep: removal_guard.Kept | NoUseFound = NoUseFound.CLEAR
+
+
+def review_lease(path: Path, check: LeasePidCheck) -> FolderLeaseReview:
     try:
         fields = copies.clone_lease_fields(path)
     except FileNotFoundError:
-        return NoUseFound.CLEAR
+        return FolderLeaseReview(LeaseStatus(LeaseState.ABSENT))
     except (OSError, ValueError):
-        return removal_guard.Kept("cannot read the folder lease")
+        return FolderLeaseReview(LeaseStatus(LeaseState.UNREADABLE), removal_guard.Kept("cannot read the folder lease"))
     pid = fields.get("pid")
     start = fields.get("process_start")
     if type(pid) is not int or pid <= 0:
-        return removal_guard.Kept("cannot read the lease PID")
+        return FolderLeaseReview(LeaseStatus(LeaseState.UNREADABLE), removal_guard.Kept("cannot read the lease PID"))
+    owner = f"PID {pid}"
+    if isinstance(start, str) and start:
+        owner += f" start {start!r}"
+    unreadable = LeaseStatus(LeaseState.UNREADABLE, owner)
+    invalid_start = removal_guard.Kept(f"cannot verify the start time for lease PID {pid}")
+    linux = sys.platform != "darwin"
+    start_identity = ""
+    if check is LeasePidCheck.MATCH_START_IF_PRESENT and "process_start" in fields:
+        try:
+            start_identity = copies.clone_process_identity(start if isinstance(start, str) else "", linux=linux)
+        except ValueError:
+            return FolderLeaseReview(unreadable, invalid_start)
     current = process_start.process_start(pid)
     if isinstance(current, process_start.Unreadable):
-        return removal_guard.Kept(f"cannot verify lease PID {pid}")
+        return FolderLeaseReview(unreadable, removal_guard.Kept(f"cannot verify lease PID {pid}"))
     if isinstance(current, process_start.Started):
-        if check is LeasePidCheck.ANY_LIVE_PID:
-            return removal_guard.Kept(f"lease PID {pid} is still running")
-        if not isinstance(start, str) or not start:
-            return removal_guard.Kept(f"cannot verify the start time for lease PID {pid}")
-        if current.start == start:
-            return removal_guard.Kept(f"lease PID {pid} is still running")
-    return NoUseFound.CLEAR
+        if check is LeasePidCheck.MATCH_START and (not isinstance(start, str) or not start):
+            return FolderLeaseReview(unreadable, invalid_start)
+        try:
+            matches = (copies.clone_process_identity(current.start, linux=linux) == start_identity
+                       if start_identity else current.start == start)
+        except ValueError:
+            return FolderLeaseReview(unreadable, invalid_start)
+        if check is LeasePidCheck.ANY_LIVE_PID or start is None or matches:
+            return FolderLeaseReview(LeaseStatus(LeaseState.ALIVE, owner),
+                                     removal_guard.Kept(f"lease PID {pid} is still running"))
+    return FolderLeaseReview(LeaseStatus(LeaseState.DEAD, owner))
+
+
+def keep_for_lease(path: Path, *, check: LeasePidCheck = LeasePidCheck.MATCH_START) -> removal_guard.Kept | NoUseFound:
+    return review_lease(path, check).keep
 
 
 def keep_for_leases(path: Path, lease_owners: Sequence[Path], check: LeasePidCheck) -> removal_guard.Kept | NoUseFound:
     if isinstance(reason := keep_for_lease(path, check=check), removal_guard.Kept):
         return reason
+    nested_check = LeasePidCheck.MATCH_START if check is LeasePidCheck.ANY_LIVE_PID else check
     for owner in lease_owners:
-        if isinstance(reason := keep_for_lease(owner), removal_guard.Kept):
+        if isinstance(reason := keep_for_lease(owner, check=nested_check), removal_guard.Kept):
             return reason
     return NoUseFound.CLEAR
 
@@ -1786,7 +2188,7 @@ def worktree_sidecar_names(path: Path) -> tuple[str, str]:
 
 
 def related_sidecars(path: Path, machine: Machine, bounds: CleanupBounds) -> tuple[Path, ...]:
-    if ((machine is Machine.MAC and path == bounds.home / MAC_OLD_WORKTREE)
+    if (bounds.is_gate_child(path) or (machine is Machine.MAC and path == bounds.home / MAC_OLD_WORKTREE)
             or (machine is Machine.NATEDEV and path.parent in (bounds.build, LINUX_BUILD_ROOT)
                 and path.name.startswith("p-"))):
         return tuple(path.with_name(name) for name in worktree_sidecar_names(path))
@@ -1797,27 +2199,35 @@ def related_sidecars(path: Path, machine: Machine, bounds: CleanupBounds) -> tup
 class WorktreeSidecars:
     stamps: dict[str, build_folders.SidecarIdentity]
     size: int
+    newest_ns: int | GateEvidenceUnavailable
 
     def bind(self, fingerprint: str) -> str:
         return digest((fingerprint, self.stamps)) if self.stamps else fingerprint
+
+    def newest_with(self, modified_ns: int) -> int:
+        return max(modified_ns, self.newest_ns) if isinstance(self.newest_ns, int) else modified_ns
 
 
 def inspect_sidecars(parent: int, guard: CleanupGuard, related: tuple[Path, ...]) -> WorktreeSidecars:
     stamps: dict[str, build_folders.SidecarIdentity] = {}
     size = 0
+    modified: list[int] = []
     device = os.fstat(parent).st_dev
     for path in related:
         try:
             info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
             continue
+        if path.parent == guard.bounds.gate and info.st_uid != os.geteuid():
+            raise removal_guard.ChangedEntry(GATE_OTHER_OWNER)
         key = removal_guard.identity(info)
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_dev != device
                 or guard.crosses_mount(path, key)):
             raise removal_guard.ChangedEntry(f"cannot verify worktree sidecar: {path}")
         stamps[path.name] = (*key, info.st_ctime_ns)
         size += info.st_blocks * 512
-    return WorktreeSidecars(stamps, size)
+        modified.append(info.st_mtime_ns)
+    return WorktreeSidecars(stamps, size, max(modified) if modified else GateEvidenceUnavailable.UNKNOWN)
 
 
 def confirm_sidecars(checked: CheckedCleanup, guard: CleanupGuard, related: tuple[Path, ...],
@@ -1826,7 +2236,9 @@ def confirm_sidecars(checked: CheckedCleanup, guard: CleanupGuard, related: tupl
             not isinstance(lease, build_folders.HeldFolderRemovalLease)
             or lease.sidecar_identities() != approved.stamps))):
         raise removal_guard.ChangedEntry("worktree sidecars changed or their lock is unavailable")
-    if isinstance(reason := keep_for_lease(checked.path, check=LeasePidCheck.ANY_LIVE_PID), removal_guard.Kept):
+    check = (LeasePidCheck.MATCH_START_IF_PRESENT if guard.bounds.is_gate_child(checked.path)
+             else LeasePidCheck.ANY_LIVE_PID)
+    if isinstance(reason := keep_for_lease(checked.path, check=check), removal_guard.Kept):
         raise removal_guard.ChangedEntry(reason.reason)
 
 
@@ -1836,7 +2248,9 @@ def finish_sidecars(path: Path, guard: CleanupGuard, lease: build_folders.HeldFo
         lock_stamp = approved.stamps.get(worktree_sidecar_names(path)[1])
         if lock_stamp is None or lease.sidecar_identities() != approved.stamps:
             raise removal_guard.ChangedEntry("worktree sidecars changed")
-        if isinstance(reason := keep_for_lease(path, check=LeasePidCheck.ANY_LIVE_PID), removal_guard.Kept):
+        check = (LeasePidCheck.MATCH_START_IF_PRESENT if guard.bounds.is_gate_child(path)
+                 else LeasePidCheck.ANY_LIVE_PID)
+        if isinstance(reason := keep_for_lease(path, check=check), removal_guard.Kept):
             raise removal_guard.ChangedEntry(reason.reason)
         with ExitStack() as stack:
             targets: list[removal_guard.CleanupTarget] = []
@@ -1907,22 +2321,131 @@ def review_orphan(path: Path, guard: CleanupGuard, uses: CleanupProcessReview) -
     return Row(path, sidecars.size, outcome, sidecars=tuple(sidecars.stamps), place=CleanupPlace.ORPHAN_SIDECARS)
 
 
+def gate_kind(path: Path) -> str:
+    if path.name.endswith((".lock", ".lease.json")):
+        return UNKNOWN_GATE_KIND
+    return next((prefix for prefix in GATE_PREFIXES if path.name.startswith(prefix + "-")), UNKNOWN_GATE_KIND)
+
+
+def candidate_order(candidate: Candidate) -> tuple[int, str, Path]:
+    if candidate.place in (CleanupPlace.GATE_FOLDER, CleanupPlace.GATE_SIDECARS):
+        kind = gate_kind(candidate.path)
+        return (0 if kind in TEST_GATE_KINDS else 1), kind, candidate.path
+    return 2, "", candidate.path
+
+
+def gate_tree_refusal(kind: str, tree: CleanupTree) -> str:
+    if kind in ("gate-recovery", "merge-gate-recovery") or tree.gate_issue == GATE_RECOVERY:
+        return GATE_RECOVERY
+    if tree.git is not CleanupGit.NONE:
+        return GATE_GIT_KEEP_REASON
+    if tree.gate_issue:
+        return tree.gate_issue
+    return "unknown gate entry type" if kind == UNKNOWN_GATE_KIND else ""
+
+
+def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessReview,
+                related: tuple[Path, ...]) -> Row:
+    path = candidate.path
+    kind = gate_kind(path)
+    check = LeasePidCheck.MATCH_START_IF_PRESENT
+    use = find_process_use(path, uses, sidecars=related)
+    use_notes = tuple(reason.reason for reason in (use, uses.path_failure) if isinstance(reason, removal_guard.Kept))
+    if uses.gate_paths is GatePathUse.ALIAS:
+        use_notes = (uses.gate_paths.value, *use_notes)
+    elif uses.gate_paths is GatePathUse.UNREADABLE:
+        use_notes += (uses.gate_paths.value,)
+    lease_statuses = (LeaseStatus(LeaseState.UNREADABLE),)
+    newest: int | GateEvidenceUnavailable = GateEvidenceUnavailable.UNKNOWN
+    size: int | None = None
+    names: tuple[str, ...] = ()
+    outcome: removal_guard.Kept | WouldRemove
+    try:
+        with build_folder_lock.folder_parent(path, Path("/"), create=False) as parent:
+            orphan = candidate.place is CleanupPlace.GATE_SIDECARS
+            sidecars = orphan_sidecars(path, parent, guard) if orphan else inspect_sidecars(parent, guard, related)
+            names = tuple(sidecars.stamps)
+            base_lease = review_lease(path, check)
+            lease_statuses = (base_lease.status,)
+            if orphan:
+                size, newest = sidecars.size, sidecars.newest_ns
+                notes = [*use_notes]
+                if isinstance(base_lease.keep, removal_guard.Kept):
+                    notes.append(base_lease.keep.reason)
+                if notes:
+                    raise removal_guard.ChangedEntry("orphan gate sidecars. " + ". ".join(notes))
+                raise removal_guard.ChangedEntry("orphan gate sidecars")
+            info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            size = info.st_blocks * 512 + sidecars.size
+            newest = sidecars.newest_with(info.st_mtime_ns)
+            if path.name.casefold() == ".git":
+                raise removal_guard.ChangedEntry(GATE_GIT_KEEP_REASON)
+            if not stat.S_ISDIR(info.st_mode):
+                if info.st_uid != os.geteuid():
+                    raise removal_guard.ChangedEntry(GATE_OTHER_OWNER)
+                raise removal_guard.ChangedEntry(
+                    "gate entry is a link" if stat.S_ISLNK(info.st_mode) else "unknown gate entry type")
+            size, newest = None, GateEvidenceUnavailable.UNKNOWN
+            with guard.check(path) as checked:
+                tree = inspect_cleanup_tree(checked)
+                size = tree.size + sidecars.size
+                newest = sidecars.newest_with(tree.newest_ns)
+                leases = (base_lease, *(review_lease(owner, check) for owner in tree.lease_owners))
+                lease_statuses = tuple(lease.status for lease in leases if lease.status.state is not LeaseState.ABSENT)
+                if reason := gate_tree_refusal(kind, tree):
+                    raise removal_guard.ChangedEntry(reason)
+                if use_notes:
+                    raise removal_guard.ChangedEntry(use_notes[0])
+                for owner in leases:
+                    if isinstance(owner.keep, removal_guard.Kept):
+                        raise removal_guard.ChangedEntry(owner.keep.reason)
+                with build_folders.folder_removal_lease(path, children=True, wait=False, root=Path("/")) as lease:
+                    if isinstance(lease, build_folders.RefusedRemovalLease):
+                        raise removal_guard.ChangedEntry("a folder lock is held or unreadable")
+                    confirm_sidecars(checked, guard, related, lease, sidecars)
+                    if candidate.decision is RemovalAssessment.PENDING:
+                        outcome = WouldRemove(sidecars.bind(tree.fingerprint))
+                    elif candidate.decision == NO_CLEANUP_SETTING:
+                        outcome = GATE_IF_NAMED
+                    else:
+                        outcome = candidate.decision
+    except (OSError, removal_guard.Refused, RuntimeError, ValueError) as error:
+        reason = removal_guard.single_line(error)
+        if kind in ("gate-recovery", "merge-gate-recovery") and reason != GATE_RECOVERY:
+            reason = f"{GATE_RECOVERY}. {reason}"
+        outcome = removal_guard.Kept(reason)
+    details = GateDetails(kind, newest, lease_statuses, ", ".join(use_notes) or "none found")
+    return Row(path, size, outcome, sidecars=names, place=candidate.place, gate=details)
+
+
 def assess(candidates: Sequence[Candidate], guard: CleanupGuard, machine: Machine) -> HostList:
     """Measure each guarded candidate and check process use and leases."""
     prefixes: list[Path] = []
+    gate_root: Path | GateRootNotSelected = GateRootNotSelected.NOT_SELECTED
     for candidate in candidates:
         if candidate.place is CleanupPlace.ORPHAN_SIDECARS:
             prefixes.extend(candidate.path.with_name(name) for name in worktree_sidecar_names(candidate.path))
-        elif candidate.decision is RemovalAssessment.PENDING or candidate.place is CleanupPlace.REVIEW_FOLDER:
+        elif (candidate.decision is RemovalAssessment.PENDING
+              or candidate.place in (CleanupPlace.REVIEW_FOLDER, CleanupPlace.GATE_FOLDER, CleanupPlace.GATE_SIDECARS)):
             prefixes.extend((candidate.path, *related_sidecars(candidate.path, machine, guard.bounds)))
-    uses = process_uses(prefixes, check_links=any(candidate.place is CleanupPlace.LINK for candidate in candidates))
+        if candidate.place in (CleanupPlace.GATE_FOLDER, CleanupPlace.GATE_SIDECARS):
+            gate_root = guard.bounds.gate
+    uses = process_uses(prefixes, check_links=any(candidate.place is CleanupPlace.LINK for candidate in candidates),
+                        gate_root=gate_root)
     membership = (worktree_staff()
                   if any(candidate.place in (CleanupPlace.LINK, CleanupPlace.REVIEW_FOLDER) for candidate in candidates)
                   else staff.StaffSnapshot(()))
     rows: list[Row] = []
     for candidate in candidates:
         path = candidate.path
+        if candidate.place is CleanupPlace.UNREADABLE_GATE_ROOT:
+            assert isinstance(candidate.decision, removal_guard.Kept)
+            rows.append(Row(path, None, candidate.decision, place=candidate.place))
+            continue
         related = related_sidecars(path, machine, guard.bounds)
+        if candidate.place in (CleanupPlace.GATE_FOLDER, CleanupPlace.GATE_SIDECARS):
+            rows.append(assess_gate(candidate, guard, uses, related))
+            continue
         pid_check = LeasePidCheck.ANY_LIVE_PID if related else LeasePidCheck.MATCH_START
         size = None
         names: tuple[str, ...] = ()
@@ -1997,8 +2520,12 @@ def assess(candidates: Sequence[Candidate], guard: CleanupGuard, machine: Machin
 
 
 def require_no_process_use(path: Path, fds: Sequence[int], *, sidecars: tuple[Path, ...] = (),
-                           other_folders: tuple[Path, ...] = (), check_links: bool = False) -> None:
-    uses = process_uses((path, *sidecars, *other_folders), check_links=check_links, ignored_fds=frozenset(fds))
+                           other_folders: tuple[Path, ...] = (), check_links: bool = False,
+                           gate_root: Path | GateRootNotSelected = GateRootNotSelected.NOT_SELECTED) -> None:
+    uses = process_uses((path, *sidecars, *other_folders), check_links=check_links, ignored_fds=frozenset(fds),
+                        gate_root=gate_root)
+    if uses.gate_paths is not GatePathUse.CLEAR:
+        raise removal_guard.ChangedEntry(uses.gate_paths.value)
     if check_links and isinstance(uses.pwd_failure, removal_guard.Kept):
         raise removal_guard.ChangedEntry(uses.pwd_failure.reason)
     if isinstance(reason := keep_for_process(path, uses, sidecars=sidecars, other_folders=other_folders),
@@ -2183,7 +2710,10 @@ def remove_worktree_link(path: Path, guard: CleanupGuard, approval: WouldRemove)
 
 def remove_configured_folder(path: Path, guard: CleanupGuard, machine: Machine, approval: WouldRemove) -> None:
     related = related_sidecars(path, machine, guard.bounds)
-    pid_check = LeasePidCheck.ANY_LIVE_PID if related else LeasePidCheck.MATCH_START
+    gate = guard.bounds.is_gate_child(path)
+    gate_root = guard.bounds.gate if gate else GateRootNotSelected.NOT_SELECTED
+    pid_check = (LeasePidCheck.MATCH_START_IF_PRESENT if gate
+                 else LeasePidCheck.ANY_LIVE_PID if related else LeasePidCheck.MATCH_START)
     with guard.check(path) as checked:
         fds = [checked.parent]
         with build_folders.folder_removal_lease(path, children=True, wait=False, probe_fds=fds,
@@ -2193,7 +2723,7 @@ def remove_configured_folder(path: Path, guard: CleanupGuard, machine: Machine, 
             if isinstance(lease, build_folders.RefusedRemovalLease):
                 raise removal_guard.ChangedEntry("a folder lock is held or unreadable")
             sidecars = inspect_sidecars(checked.parent, guard, related)
-            require_no_process_use(path, fds, sidecars=related)
+            require_no_process_use(path, fds, sidecars=related, gate_root=gate_root)
             entries: dict[Path, CleanupEntry] = {}
             tree = inspect_cleanup_tree(checked, entries)
             require_saved_cargo_output(checked, entries)
@@ -2206,6 +2736,8 @@ def remove_configured_folder(path: Path, guard: CleanupGuard, machine: Machine, 
 
             if related:
                 confirm_sidecars(checked, guard, related, lease, sidecars)
+            if gate and (reason := gate_tree_refusal(gate_kind(path), tree)):
+                raise removal_guard.ChangedEntry(reason)
             if tree.git is CleanupGit.CHECKOUT:
                 reviewed = review_cleanup_git(checked, tree, guard)
                 if sidecars.bind(reviewed.fingerprint(tree)) != approval.fingerprint:
@@ -2216,9 +2748,14 @@ def remove_configured_folder(path: Path, guard: CleanupGuard, machine: Machine, 
             else:
                 if sidecars.bind(tree.fingerprint) != approval.fingerprint:
                     raise removal_guard.ChangedEntry("identity or contents changed since the list was checked")
+
+                def before_delete() -> None:
+                    require_no_process_use(path, fds, sidecars=related, gate_root=gate_root)
+                    if gate:
+                        recheck_leases(checked, guard, tree)
+
                 remove_reviewed_entries(checked, removal_guard.ApprovedCleanup(
-                    entries, removal_guard.CleanupRemoval.PLAIN),
-                    before_delete=lambda: require_no_process_use(path, fds, sidecars=related))
+                    entries, removal_guard.CleanupRemoval.PLAIN), before_delete=before_delete)
             if sidecars.stamps and isinstance(lease, build_folders.HeldFolderRemovalLease):
                 finish_sidecars(path, guard, lease, sidecars)
 
@@ -2234,7 +2771,7 @@ def apply(review: HostList, bounds: CleanupBounds) -> int:
         try:
             if row.place is CleanupPlace.LINK:
                 remove_worktree_link(path, guard, row.outcome)
-            elif row.place is CleanupPlace.FOLDER:
+            elif row.place in (CleanupPlace.FOLDER, CleanupPlace.GATE_FOLDER):
                 remove_configured_folder(path, guard, review.machine, row.outcome)
             else:
                 raise removal_guard.ChangedEntry("the folder is for review only")
@@ -2254,6 +2791,19 @@ def run_remote(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(arguments, capture_output=True, text=True, timeout=timeout, check=False)
 
 
+def decode_gate_details(raw: object) -> GateDetails | NoGateDetails:
+    if raw is None:
+        return NoGateDetails.NOT_GATE_ROW
+    fields = message_object(raw)
+    kind, newest, lease, use = (fields.get(key) for key in ("kind", "newest_ns", "lease", "use"))
+    if (not isinstance(kind, str) or kind not in (*GATE_PREFIXES, UNKNOWN_GATE_KIND)
+            or (newest is not None and (type(newest) is not int or not -(1 << 64) <= newest < (1 << 64)))
+            or not isinstance(use, str)):
+        raise ValueError("invalid gate row details")
+    leases = tuple(LeaseStatus(LeaseState(state), cast(str, owner)) for state, owner in message_rows(lease, (str, str)))
+    return GateDetails(kind, newest if newest is not None else GateEvidenceUnavailable.UNKNOWN, leases, use)
+
+
 def decode_cleanup_rows(raw: object, machine: Machine) -> tuple[Row, ...]:
     rows: list[Row] = []
     seen: set[Path] = set()
@@ -2269,15 +2819,21 @@ def decode_cleanup_rows(raw: object, machine: Machine) -> tuple[Row, ...]:
         if not path.is_absolute() or ".." in path.parts or path in seen:
             raise ValueError("invalid cleanup path")
         seen.add(path)
+        gate = decode_gate_details(fields.get("gate"))
         listed = message_array(fields.get("sidecars", []))
         sidecars = tuple(name for name in worktree_sidecar_names(path) if name in listed)
-        if len(sidecars) != len(listed) or (machine is Machine.MAC and sidecars
+        if len(sidecars) != len(listed) or (machine is Machine.MAC and sidecars and isinstance(gate, NoGateDetails)
                                            and not path.as_posix().endswith("/" + MAC_OLD_WORKTREE)):
             raise ValueError("invalid cleanup sidecars")
-        place = CleanupPlace.FOLDER if machine is Machine.MAC else CleanupPlace(fields.get("place"))
-        if stamp and place not in (CleanupPlace.FOLDER, CleanupPlace.LINK):
+        if machine is Machine.MAC:
+            place = CleanupPlace.GATE_FOLDER if isinstance(gate, GateDetails) else CleanupPlace.FOLDER
+        else:
+            place = CleanupPlace(fields.get("place"))
+        if isinstance(gate, GateDetails) != (place in (CleanupPlace.GATE_FOLDER, CleanupPlace.GATE_SIDECARS)):
+            raise ValueError("invalid gate row place")
+        if stamp and place not in (CleanupPlace.FOLDER, CleanupPlace.LINK, CleanupPlace.GATE_FOLDER):
             raise ValueError("invalid cleanup approval")
-        rows.append(Row(path, size, removal_guard.Kept(keep) if keep else WouldRemove(stamp), git, sidecars, place))
+        rows.append(Row(path, size, removal_guard.Kept(keep) if keep else WouldRemove(stamp), git, sidecars, place, gate))
     return tuple(rows)
 
 
@@ -2327,6 +2883,34 @@ def remove_remote(review: HostList, run_ssh: SshRunner) -> int:
     return answer.returncode
 
 
+def show_gate_totals(review: HostList) -> None:
+    groups: dict[tuple[str, str], list[int | None]] = {}
+    kept: dict[str, list[int | None]] = {}
+    for row in review.rows:
+        if isinstance(row.gate, GateDetails):
+            if isinstance(row.outcome, WouldRemove):
+                verdict = "would remove"
+            elif row.outcome == GATE_IF_NAMED:
+                verdict = GATE_IF_NAMED.reason
+            else:
+                verdict = "kept"
+                kept.setdefault(row.outcome.reason, []).append(row.size)
+            groups.setdefault((row.gate.kind, verdict), []).append(row.size)
+    if groups:
+        def total(label: str, sizes: list[int | None]) -> str:
+            gib = sum(size or 0 for size in sizes) / (1 << 30)
+            unknown = sizes.count(None)
+            note = f", {unknown} sizes unknown" if unknown else ""
+            return f"{label}: {len(sizes)} ({gib:.3f} GiB{note})"
+
+        test_sizes = [size for kind in TEST_GATE_KINDS for size in groups.get((kind, GATE_IF_NAMED.reason), [])]
+        totals = [total(f"t and targeted-test {GATE_IF_NAMED.reason}", test_sizes)]
+        for kind, verdict in sorted(groups, key=lambda group: (group[0] not in TEST_GATE_KINDS, group)):
+            totals.append(total(f"{kind} {verdict}", groups[kind, verdict]))
+        totals.extend(total(f"kept ({table_text(reason)})", sizes) for reason, sizes in sorted(kept.items()))
+        print(f"Gate rows on {review.machine.value}: " + "; ".join(totals))
+
+
 def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, approval: str) -> None:
     uid = os.geteuid()
     try:
@@ -2346,6 +2930,12 @@ def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, ap
                 reason = f"{reason}, {row.git}"
             if row.sidecars:
                 reason = f"{reason}; includes {', '.join(map(repr, row.sidecars))}"
+            if isinstance(row.gate, GateDetails):
+                gate = row.gate
+                newest = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(gate.newest_ns // 10**9))
+                          if isinstance(gate.newest_ns, int) else gate.newest_ns.value)
+                leases = ", ".join(lease.text() for lease in gate.leases) or LeaseState.ABSENT.value
+                reason += f"; kind={gate.kind}; newest={newest}; lease={leases}; use={gate.use}"
             size = row.size if row.size is not None else "unknown"
             print(f"{review.machine.value}\t{str(row.path)!r}\t{size}\t{table_text(reason)}")
     if isinstance(mac, MacListUnavailable):
@@ -2354,6 +2944,7 @@ def show(local: HostList, mac: HostList | MacListUnavailable | LocalListOnly, ap
         total = sum(row.size or 0 for row in review.rows)
         note = " measured (some sizes unknown)" if any(row.size is None for row in review.rows) else ""
         print(f"{review.machine.value} total: {total} bytes{note}")
+        show_gate_totals(review)
     if isinstance(mac, MacListUnavailable):
         print("mac total: unknown")
     print(f"Digest: {approval}")
@@ -2382,8 +2973,20 @@ def parse_arguments(argv: Sequence[str]) -> Arguments:
     return args
 
 
+def read_gate_device(root: Path) -> int | GateDeviceUnavailable:
+    try:
+        info = root.lstat()
+    except OSError:
+        return GateDeviceUnavailable.UNKNOWN
+    return info.st_dev if stat.S_ISDIR(info.st_mode) else GateDeviceUnavailable.UNKNOWN
+
+
 def review_local(machine: Machine) -> tuple[HostList, CleanupBounds]:
-    bounds = CleanupBounds(Path.home(), build_folders.build_root(), removal_guard.known_names().repositories)
+    gate = build_folders.configured_gate_root()
+    if not gate.is_absolute() or ".." in gate.parts or gate == Path("/"):
+        raise ValueError(f"invalid gate root: {gate}")
+    bounds = CleanupBounds(Path.home(), build_folders.build_root(), removal_guard.known_names().repositories,
+                           gate, read_gate_device(gate))
     candidates = collect(machine, conf.read("disks"), bounds)
     paths = frozenset(candidate.path for candidate in candidates)
     guard = read_cleanup_guard(paths, bounds)

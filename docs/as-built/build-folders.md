@@ -218,6 +218,32 @@ On natedev it also reads the Mac list over SSH. When SSH fails, the command show
 The Mac slot folder is list-only. Bob handles its removal by hand.
 `/build/sccache` is a shared tool cache from the system configuration. The cleanup lists it and keeps it.
 
+The command lists each direct entry under `roots.gate`.
+The list shows `t-` and `targeted-test-` rows first.
+A row includes its lock and lease files and shows its kind, size, newest modification time, lease state, and live use.
+The newest time includes the lock and lease files.
+If the command cannot read the gate root, it shows one kept row for that root and lists the other places.
+The command keeps a gate row that contains a `.git` file or folder at any depth.
+It also keeps a bare repository that it identifies by name.
+The list shows `holds a Git repository; manual review` for these rows.
+The gate check uses file names and runs no Git commands.
+The command keeps other rows whose Git directory, registration, alternates, or local origin use the gate root's filesystem.
+These rows show `Git data in the gate root; manual review`.
+The command keeps every folder with a `run.json` recovery record.
+It keeps unknown entries, links, mounts, and folders in use.
+It keeps orphan side files and entries with unreadable evidence.
+The process scan checks only the current user.
+On natedev, the parent uses `/proc` to check thread paths.
+It checks the working directory, root directory, executable, open files, and file mappings.
+If it finds a reference to the gate filesystem through a path outside the gate root, it keeps every gate row.
+The list shows `gate root open through another path; live use not provable`.
+The command keeps a row if any entry belongs to another user.
+It also keeps a row if the lease start identity is invalid.
+A folder that passes the checks shows `would remove if named` when `cleanup.dead` does not name it.
+The summary first shows the combined count and GiB of `t-` and `targeted-test-` rows that would remove if named.
+It then shows the count and GiB by kind and result.
+It also shows the count and GiB for each reason it keeps a row.
+
 On natedev, the list finds `.saved-target-*` folders directly in `~/rust`.
 It also checks `~/worktrees` and its subfolders to a depth of three for saved targets.
 It checks each saved target for use and verifies the inner `target` folder.
