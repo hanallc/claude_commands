@@ -811,6 +811,31 @@ class ProbeSnapshot:
 
 
 @dataclass(frozen=True)
+class MacMirrorProcess:
+    """One process observed in a saved Mac mirror."""
+
+    pid: int
+    start_time: str
+
+
+class MacMirrorSetup(Enum):
+    """The result of preparing a mirror for a step."""
+
+    READY = "ready"
+    FAILED = "failed"
+    UNREPORTED = "unreported"
+
+
+@dataclass(frozen=True)
+class MacHostProbeSnapshot:
+    """Disk space, mirror setup, and mirror processes from one SSH command."""
+
+    disk: ProbeSnapshot
+    processes: dict[str, MacMirrorProcess]
+    setup: dict[eligibility.LegacyMirrorName, MacMirrorSetup]
+
+
+@dataclass(frozen=True)
 class LeftoversEnded:
     """Both selectors completed and found no remaining remote work."""
 
@@ -1777,20 +1802,19 @@ def mirror_target(repository: KnownRepository, target: str, slot: int) -> str:
     return f"{remote_mirror(repository, target, slot)}/target"
 
 
+_MAC_DISK_PROBE = (
+    'free_gib=$(df -g "$HOME" | awk \'NR == 2 {print $4}\')\n'
+    'printf \'free_gib=%s\\nhost=%s\\nrc=0\\n\' "$free_gib" "$(hostname -s)"'
+)
+
+
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     from scripts.copies import copies
 
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
-    return "\n".join(
-        (
-            copies.mirror_probe_setup(remote_mirror(repository, target, slot)),
-            "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
-            "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
-            + '"$free_gib" "$(hostname -s)"',
-        )
-    )
+    return copies.mirror_probe_setup(remote_mirror(repository, target, slot)) + "\n" + _MAC_DISK_PROBE
 
 
 def parse_probe(output: str) -> ProbeResult:
@@ -2150,6 +2174,82 @@ def save_mac_watch_origin(controller: ProcessController, host: str, root: MacMir
         write_text_atomic(path, json.dumps(record, separators=(",", ":")) + "\n")
 
 
+def _record_probe_failure(target: str, reason: str) -> UnavailableProbe:
+    mark = eligibility.state_directory(target) / "failed_probe"
+    try:
+        with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
+            changed = not mark.exists()
+            write_text_atomic(mark, "failed\n")
+    except BlockingIOError:
+        return UNAVAILABLE_PROBE
+    if changed:
+        label = "Mac" if target in ("", "mac") else target
+        print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
+    return UNAVAILABLE_PROBE
+
+
+def _probe_failure_reason(result: CapturedCommandResult, timeout_s: float) -> str:
+    if isinstance(result, CommandTimedOut):
+        return f"SSH probe timed out after {timeout_s:g} s"
+    if isinstance(result, CommandCouldNotStart):
+        return f"SSH probe could not start (time limit {timeout_s:g} s)"
+    if result.status != 0:
+        return next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+                    f"SSH probe exited with status {result.status}")
+    return "the probe answer could not be read"
+
+
+def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSettings, target: str,
+                   mirrors: Sequence[str], *, setup_mirrors: Sequence[eligibility.LegacyMirrorName] = (),
+                   ) -> MacHostProbeSnapshot | UnavailableProbe:
+    """Read disk space, prepare step mirrors, and scan saved mirrors in one SSH command."""
+    from scripts.copies import copies
+
+    script: list[str] = []
+    if setup_mirrors:
+        root = mac_mirror_root()
+        for index, mirror in enumerate(setup_mirrors):
+            setup = copies.mirror_probe_setup(f"{root.relative}/{mirror}")
+            script.extend((f"if ( {setup} ); then", f"printf 'mirror_setup={index}\\tready\\n'",
+                           "else", f"printf 'mirror_setup={index}\\tfailed\\n'", "fi"))
+    script.append(_MAC_DISK_PROBE)
+    if mirrors:
+        script.append('if mac_cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn); then')
+        script.append('lsof() { printf "%s\\n" "$mac_cwd_records"; }')
+        for index, mirror in enumerate(mirrors):
+            selector = mirror_selector_script(KnownRepository(mirror), target)
+            script.extend(("(", selector, 'for pid in $(select_leftovers); do',
+                'start=$(ps -p "$pid" -o lstart=) || continue',
+                f"""printf 'mirror_process={index}\\t%s\\t%s\\n' "$pid" "$start" """,
+                "done", ")"))
+        script.append("fi")
+    started_ns = time.time_ns()
+    result = controller.capture([*ssh_prefix(config), "\n".join(script)], CommandTimeLimit(config.probe_timeout_s))
+    if isinstance(result, CommandOutput) and result.status == 0:
+        disk = parse_probe(result.stdout)
+        if isinstance(disk, ProbeSnapshot):
+            record_reachable(target, probe_started_ns=started_ns)
+            processes: dict[str, MacMirrorProcess] = {}
+            setups = dict.fromkeys(setup_mirrors, MacMirrorSetup.UNREPORTED)
+            for line in result.stdout.splitlines():
+                label, _, payload = line.partition("=")
+                if label not in ("mirror_setup", "mirror_process"):
+                    continue
+                index_text, tab, payload = payload.partition("\t")
+                if not (tab and index_text.isascii() and index_text.isdecimal()):
+                    continue
+                index = int(index_text)
+                if label == "mirror_setup":
+                    if index < len(setup_mirrors) and payload in ("ready", "failed"):
+                        setups[setup_mirrors[index]] = MacMirrorSetup(payload)
+                elif index < len(mirrors):
+                    pid_text, _, start_time = payload.partition("\t")
+                    if pid_text.isascii() and pid_text.isdecimal() and int(pid_text) > 0 and start_time.strip():
+                        _ = processes.setdefault(mirrors[index], MacMirrorProcess(int(pid_text), start_time.strip()))
+            return MacHostProbeSnapshot(disk, processes, setups)
+    return _record_probe_failure(target, _probe_failure_reason(result, config.probe_timeout_s))
+
+
 def probe_mac(
     controller: ProcessController,
     config: OffloadConfig | eligibility.SshProbeSettings,
@@ -2158,20 +2258,6 @@ def probe_mac(
     slot: int = 1,
     *, record_version_decline: bool = True,
 ) -> ProbeResult:
-    mark = eligibility.state_directory(target) / "failed_probe"
-
-    def failed(reason: str) -> UnavailableProbe:
-        try:
-            with claim_state.locked(mark.parent / PROBE_RESULT_LOCK_NAME, wait=False):
-                changed = not mark.exists()
-                write_text_atomic(mark, "failed\n")
-        except BlockingIOError:
-            return UNAVAILABLE_PROBE
-        if changed:
-            label = "Mac" if target in ("", "mac") else target
-            print(f"mac_test: could not reach the {label}: {reason}", file=sys.stderr, flush=True)
-        return UNAVAILABLE_PROBE
-
     def succeeded(probe: ProbeSnapshot) -> ProbeSnapshot:
         record_reachable(target, probe_started_ns=probe_started_ns)
         return probe
@@ -2185,7 +2271,7 @@ def probe_mac(
         script = linux_runner.probe_command_script(remote_mirror(repository, target, slot), runner_values(config, target),
                                                    repository.policy_name)
         if isinstance(probe_reachability(controller, config), UnreachableHost):
-            return failed("SSH reachability check failed")
+            return _record_probe_failure(target, "SSH reachability check failed")
         timeout_s = linux_runner.positive_setting(config.values, "shell_timeout_s") + config.probe_timeout_s
     else:
         script = probe_script(repository, target, slot)
@@ -2209,14 +2295,7 @@ def probe_mac(
     if (linux and isinstance(result, CommandOutput)
             and result.stdout.strip() == "linux_startup=unresolved"):
         return UnresolvedSlotStartup()
-    if isinstance(result, CommandTimedOut):
-        reason = f"SSH probe timed out after {timeout_s:g} s"
-    elif isinstance(result, CommandCouldNotStart):
-        reason = f"SSH probe could not start (time limit {timeout_s:g} s)"
-    elif result.status != 0:
-        reason = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
-                      f"SSH probe exited with status {result.status}")
-    else:
+    if isinstance(result, CommandOutput) and result.status == 0:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
             if watch_root is not None:
@@ -2238,9 +2317,8 @@ def probe_mac(
                 if record_version_decline:
                     write_version_decline(target, repository.name)
                 return UnavailableProbe(detail)
-            return failed("public tools or tracked scripts differ")
-        reason = "the probe answer could not be read"
-    return failed(reason)
+            return _record_probe_failure(target, "public tools or tracked scripts differ")
+    return _record_probe_failure(target, _probe_failure_reason(result, timeout_s))
 
 
 @dataclass(frozen=True)
@@ -2265,6 +2343,11 @@ def check_mac_disk_floor(probe: ProbeSnapshot, free_floor_gib: float) -> MacDisk
     return MacDiskShort(probe.free_gib, free_floor_gib)
 
 
+def mac_disk_floor(config: OffloadConfig | eligibility.SshProbeSettings) -> float:
+    return (config.free_floor_gib if isinstance(config, OffloadConfig)
+            else config.configuration.number("free_floor_gib"))
+
+
 @dataclass(frozen=True)
 class SweepShort:
     """The Mac remains below the disk minimum after the sweep."""
@@ -2284,8 +2367,7 @@ def ensure_mac_disk_floor(
     probe: ProbeSnapshot, target: str = "mac", slot: int = 1,
 ) -> MacDiskReady | SweepShort | SweepFailed:
     """Run one shared floor sweep, then read the Mac disk space again."""
-    floor = (config.free_floor_gib if isinstance(config, OffloadConfig)
-             else config.configuration.number("free_floor_gib"))
+    floor = mac_disk_floor(config)
     disk = check_mac_disk_floor(probe, floor)
     if isinstance(disk, MacDiskReady):
         return disk
