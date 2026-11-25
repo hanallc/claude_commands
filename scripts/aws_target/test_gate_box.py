@@ -16,7 +16,7 @@ from typing import Self, cast, override
 import unittest
 from unittest import mock
 
-from scripts.aws_target import aws_trial, cloud_gate, gate_box, ledger
+from scripts.aws_target import aws_trial, cloud_gate, gate_box, gate_source, ledger
 from scripts.aws_target import test_aws_trial as trial_tests
 from scripts.aws_target.ledger_test_support import write_gate_config
 from scripts.lib.python_startup import sitecustomize as python_startup
@@ -280,6 +280,87 @@ subprocess.run = fail_log_put
             self.assertEqual((root / 'session-directory').stat().st_mode & 0o777, 0o755)
             self.assertEqual((root / 'guest.py').read_text(), gate_box.GUEST)
             self.assertEqual(json.loads((root / 'request.json').read_text()), {'modules': modules})
+
+    def test_private_guest_checks_each_bundle_hash_and_the_requested_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / 'source'
+            repo.mkdir()
+            _ = gate_source.git(repo, 'init', '-q')
+            _ = gate_source.git(repo, 'config', 'user.name', 'Fixture')
+            _ = gate_source.git(repo, 'config', 'user.email', 'fixture@example.invalid')
+            _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'Fixture base')
+            base = gate_source.git(repo, 'rev-parse', 'HEAD')
+            base_bundle, delta = root / 'base.bundle', root / 'delta.bundle'
+            gate_source.create_bundle(repo, base_bundle, (base,))
+            _ = (repo / 'tracked').write_text('candidate')
+            _ = gate_source.git(repo, 'add', 'tracked')
+            _ = gate_source.git(repo, 'commit', '-qm', 'Fixture candidate')
+            commit = gate_source.git(repo, 'rev-parse', 'HEAD')
+            tree = gate_source.git(repo, 'rev-parse', 'HEAD^{tree}')
+            gate_source.create_bundle(repo, delta, (commit,), exclude=base)
+            links = {'commit': commit, 'tree': tree, 'source_base_commit': base, 'source_delta': 'present',
+                     'source_base_sha256': gate_source.bundle_sha256(base_bundle),
+                     'source_delta_sha256': gate_source.bundle_sha256(delta)}
+
+            def get(name: str, destination: Path) -> None:
+                bundle = base_bundle if name == 'source_base' else delta
+                _ = destination.write_bytes(bundle.read_bytes())
+
+            box = root / 'valid'
+            box.mkdir()
+            checkout = gate_box.restore_private_source(box, links, {'origin_main': base}, get)
+            self.assertEqual(gate_source.git(checkout, 'rev-parse', 'HEAD'), commit)
+            self.assertEqual((checkout / 'tracked').read_text(), 'candidate')
+            for field, diagnostic in (('source_base_sha256', 'source_base checksum'),
+                                      ('source_delta_sha256', 'source_delta checksum'), ('tree', 'commit or tree')):
+                with self.subTest(field=field):
+                    box = root / field
+                    box.mkdir()
+                    with self.assertRaisesRegex(gate_box.GuestSourceRejected, diagnostic):
+                        _ = gate_box.restore_private_source(box, {**links, field: '0' * 64}, {'origin_main': base}, get)
+
+    def test_private_guest_rejects_a_delta_with_a_missing_prerequisite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / 'source'
+            repo.mkdir()
+            _ = gate_source.git(repo, 'init', '-q')
+            _ = gate_source.git(repo, 'config', 'user.name', 'Fixture')
+            _ = gate_source.git(repo, 'config', 'user.email', 'fixture@example.invalid')
+            _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'Fixture base')
+            base = gate_source.git(repo, 'rev-parse', 'HEAD')
+            base_bundle, delta = root / 'base.bundle', root / 'delta.bundle'
+            gate_source.create_bundle(repo, base_bundle, (base,))
+            _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'Missing commit')
+            missing = gate_source.git(repo, 'rev-parse', 'HEAD')
+            _ = gate_source.git(repo, 'commit', '--allow-empty', '-qm', 'Fixture candidate')
+            commit = gate_source.git(repo, 'rev-parse', 'HEAD')
+            gate_source.create_bundle(repo, delta, (commit,), exclude=missing)
+
+            def get(name: str, destination: Path) -> None:
+                _ = destination.write_bytes((base_bundle if name == 'source_base' else delta).read_bytes())
+
+            box = root / 'guest'
+            box.mkdir()
+            links = {'source_base_commit': base, 'source_delta': 'present',
+                     'source_base_sha256': gate_source.bundle_sha256(base_bundle),
+                     'source_delta_sha256': gate_source.bundle_sha256(delta)}
+            with self.assertRaisesRegex(gate_box.GuestSourceRejected, 'could not be restored'):
+                _ = gate_box.restore_private_source(box, links, {'origin_main': base}, get)
+
+    def test_private_boot_uses_only_verified_nix_store_paths(self) -> None:
+        links = {**dict.fromkeys(('guest', 'request', 'log', 'result', 'boot_error'), 'https://example.invalid/fixture'),
+                 'production': 'true', 'expires': '1800000000', 'step': 'size'}
+        paths = ('/nix/store/' + 'a' * 32 + '-fixture',)
+        script = gate_box.user_data(links, 'a' * 40, 20, 5, 30, tool_paths=paths)
+        self.assertNotIn('github', script)
+        self.assertIn('set -- ' + paths[0], script)
+        self.assertIn('path-info --recursive "$@"', script)
+        self.assertIn('copy --from https://cache.nixos.org "$@"', script)
+        self.assertIn('shell "$@"', script)
+        self.assertIn("message='GateToolsUnavailable'", script)
+        self.assertLess(len(script.encode()), 16 * 1024)
 
     def test_production_boot_stages_and_errors_with_local_stubs(self) -> None:
         self.production_boot_stubs(('', 'boot', 'nix', 'tools shell', 'tools ready', 'bwrap unavailable',

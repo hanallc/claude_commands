@@ -14,7 +14,7 @@ import time
 from typing import cast, final
 from uuid import uuid4
 
-from scripts.aws_target import admin_secrets, ledger, plan_identity
+from scripts.aws_target import admin_secrets, gate_source, ledger, plan_identity
 from scripts.aws_target.aws_cli import AwsCli, AwsExecutor, AwsUnavailable, aws_error_code
 
 
@@ -446,6 +446,36 @@ class PlanRun:
         return (tuple(documents),
                 GatePolicyResources(bucket, profile, role,
                                     json.dumps(document, separators=(',', ':'))))
+
+    def gate_source_policy(self, region: str, template: dict[str, object], deployment: str,
+                           scaler_name: str) -> BucketPolicyKnown:
+        resources = ledger.mapping(template['Resources'])
+        refs: dict[str, object] = {**self.template_refs(region, {'DeploymentId': deployment, 'ScalerUserName': scaler_name})}
+        bucket = gate_source.bucket_name(deployment, region)
+        definition = ledger.mapping(ledger.mapping(resources['GateSourceBucket'])['Properties'])
+        if resolve_template(definition['BucketName'], refs, {}) != bucket:
+            raise PlanRefused('The proposed regional source bucket differs from its expected name.')
+        refs['GateSourceBucket'] = bucket
+        attributes = {'GateSourceBucket.Arn': self.s3(bucket)}
+        row = ledger.mapping(resources['GateSourceBucketPolicy'])
+        policy = ledger.mapping(row['Properties'])
+        if resolve_template(policy['Bucket'], refs, attributes) != bucket:
+            raise PlanRefused('The proposed regional source policy targets a different bucket.')
+        document = ledger.mapping(resolve_template(policy['PolicyDocument'], refs, attributes))
+        return BucketPolicyKnown(json.dumps(document, separators=(',', ':')))
+
+    def probe_gate_source(self, api: AwsCli, principal: str, exclusions: GatePolicyExclusions,
+                          documents: tuple[str, ...], deployment: str, bucket_policy: BucketPolicyKnown) -> None:
+        bucket = gate_source.bucket_name(deployment, api.region)
+        policy = ScalerPolicyPlan(exclusions.live_arns, documents)
+        for key in (gate_source.CURRENT_BASE_KEY, gate_source.BASE_BUNDLE_PREFIX + 'plan/probe.bundle',
+                    gate_source.DELTA_PREFIX + 'plan/probe.bundle'):
+            for action in ('s3:GetObject', 's3:PutObject'):
+                self._simulate(api, principal, policy, action, self.s3(f'{bucket}/{key}'), {},
+                               bucket_policy.document, label='Gate source', show=False)
+        self._simulate(api, principal, policy, 's3:ListBucket', self.s3(bucket),
+                       {'s3:prefix': gate_source.CURRENT_BASE_KEY}, bucket_policy.document,
+                       label='Gate source', show=False)
 
     def probe_gate_scaler(self, api: AwsCli, principal: str, exclusions: GatePolicyExclusions,
                           documents: tuple[str, ...], shared: GatePolicyResources, launch: GateLaunchProbe,

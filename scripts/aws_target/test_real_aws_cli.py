@@ -89,7 +89,10 @@ SCENARIOS = {
         'test_expired_uncertain_launch_keeps_reservation_until_reconciliation',
         'test_stopped_instance_reports_a_confirmed_spot_interruption',
         'test_reconcile_closes_the_missing_box_in_a_batch',
+        'test_delta_upload_failure_uses_the_other_region_and_an_uncertain_retry_keeps_its_pin',
     ),
+    'test_teardown.SourceBucketRemovalTests': (
+        'test_down_empties_the_home_and_regional_source_buckets_before_stack_deletion',),
     'test_gpu_size_trial.GpuOnlineTests': (
         'test_upload_uses_s3_cp_at_the_multipart_limit',
         'test_hana_nextest_uses_the_cheapest_offer_within_quota_and_settles',

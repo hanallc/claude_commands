@@ -979,8 +979,8 @@ Paired trials use the same regional launch and cleanup path.
 The home stack owns the artifact bucket and the global gate role and instance profile.
 Each fallback region has a separate gate stack in its default VPC.
 The deployment generates each regional template from the home template.
-The regional template contains network, launch, scaler policy, and expiry resources.
-The regional scaler policy keeps the home tag, type, Spot, and launch-template restrictions.
+The regional template contains network, launch, source storage, and expiry resources.
+The home scaler policies keep the tag, type, Spot, and launch-template restrictions for each region.
 The regional expiry function terminates expired boxes in that region.
 
 The deployment resolves the pinned image by Name and owner or copies it when no matching image exists.
@@ -1021,6 +1021,43 @@ A paired trial uses the changed candidate's entry point to supervise both verifi
 A candidate without the entry point publishes `candidate predates guest entry point` through the existing boot error link.
 The controller reports the failure to the queue.
 The result fields and transfer links keep their existing format.
+
+### Private source bundles
+
+Each gate stack owns an encrypted, private source bucket with the existing cost tags.
+The bucket policy requires TLS and limits the scaler to the manifest and bundle keys.
+The gate plan checks the source bucket policy in each proposed region.
+Teardown empties each source bucket before it deletes the stack.
+
+The deployment captures one `origin/main` commit and publishes a full Git bundle to each source bucket.
+The hourly job checks for a refresh when cloud gates are enabled.
+It refreshes each base after seven days.
+A regional publication verifies the bundle checksum before it advances `base/current.json`.
+A conditional manifest write protects a newer base from a delayed publication.
+A failed regional publication keeps the previous manifest and leaves the other regions available.
+
+The controller pins the selected region's base in the saved launch record.
+It uses `BaseOnly` when the base contains all requested commits.
+Otherwise, it uploads a delta for the selected base in the same region.
+Paired modules that select the same base share one regional delta.
+Recovery reuses the saved source keys and launch arguments for an uncertain launch.
+
+The controller selects bases for 14 days.
+The bucket expires base objects after 15 days and deltas after one day.
+The manifest has no expiry rule.
+The controller requires the attempt deadline to precede delta expiry.
+An unavailable base, a base mismatch, or a failed delta upload prevents the regional variant from launching.
+
+The guest downloads the exact signed objects and verifies their SHA-256 hashes.
+It verifies bundle prerequisites, detached commits, and trees before it runs tests.
+It publishes `GuestSourceRejected` through the boot error link when source verification fails.
+The deployment verifies pinned Linux tool paths in the Nix binary cache.
+The private boot uses those paths and reports `GateToolsUnavailable` if tool preparation fails.
+
+Older deployment records and saved launches keep the public clone path.
+Private paired trials use bundles for both revisions and create no remote trial branches.
+The cold proof run with GitHub access denied is pending.
+The repository visibility and `clone_url` remain as before.
 
 The guest reads the NixOS metadata cache or the cloud-init metadata cache without network requests.
 It omits `instance_running_at` when the cache is absent or invalid.
@@ -1135,7 +1172,8 @@ Run one `deploy.py up` at a time. Two runs from different state folders can save
 
 `buildlog.timer` runs the hourly Spot snapshot through `buildlog hourly` on natedev.
 The existing timer uses `OnUnitInactiveSec=3600s` and calls the installed scripts.
-The hourly job refreshes the Spot snapshot and placement scores. It also checks billed hours.
+The hourly job refreshes the Spot snapshot, placement scores, and any regional source bases that are due.
+It also checks billed hours.
 `python3 scripts/aws_target/aws_target.py snapshot` runs the same operations manually.
 `aws_target.py tick` reconciles the Hana lifecycle and refreshes account charges.
 `price_refresh_seconds` limits snapshot attempts to one per configured interval.

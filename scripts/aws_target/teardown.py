@@ -12,7 +12,7 @@ import subprocess
 import time
 from typing import cast, final
 
-from scripts.aws_target import admin_secrets, box, ledger, remote
+from scripts.aws_target import admin_secrets, box, gate_source, ledger, remote
 from scripts.aws_target.aws_target import AwsCli, AwsExecutor, AwsUnavailable, control_lock
 from scripts.aws_target.config import deployment_record
 from scripts.lib import conf
@@ -297,6 +297,7 @@ class TargetRemoval:
         if not stack:
             return False
         if stack.get('StackStatus') != 'DELETE_IN_PROGRESS':
+            empty_gate_source_bucket(self.api, stack, self.identity.deployment_id)
             _ = self.api.call('delete-stack', '--stack-name', self.identity.stack_id, service='cloudformation')
         self._wait(lambda: not self._stack(), 'foundation deletion did not finish')
         print('removed: foundation stack, scaler user, policies, and Budget actions')
@@ -425,6 +426,32 @@ class TargetRemoval:
         return True
 
 
+def empty_gate_source_bucket(api: AwsCli, stack: dict[str, object], deployment: str) -> None:
+    outputs = ledger.rows(stack, 'Outputs') if 'Outputs' in stack else ()
+    for output in outputs:
+        if output.get('OutputKey') == 'GateSourceBucket':
+            bucket = ledger.text(output, 'OutputValue')
+            if bucket != gate_source.bucket_name(deployment, api.region):
+                raise ValueError('The regional source bucket differs from the saved deployment')
+            break
+    else:
+        return
+    while True:
+        try:
+            objects = api.call('list-objects-v2', '--bucket', bucket, '--no-paginate', service='s3api')
+        except AwsUnavailable as error:
+            if 'NoSuchBucket' in str(error):
+                return
+            raise
+        if 'Contents' not in objects or not ledger.rows(objects, 'Contents'):
+            return
+        keys = [{'Key': ledger.text(row, 'Key')} for row in ledger.rows(objects, 'Contents')]
+        removed = api.call('delete-objects', '--bucket', bucket, '--delete',
+                           json.dumps({'Objects': keys, 'Quiet': True}), service='s3api')
+        if removed.get('Errors'):
+            raise AwsUnavailable('The source bucket still contains objects')
+
+
 def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = False) -> bool:
     """Remove regional stacks before deleting their copied images."""
     from scripts.aws_target.config import gate_deployment
@@ -432,7 +459,9 @@ def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = 
     manifest = gate_deployment(manifest_path, api.region) if manifest_path.exists() else {}
     stack_path = directory / 'regional-stacks.json'
     stacks = remote.read_record(stack_path) if stack_path.exists() else {}
-    for row in ledger.rows(manifest, 'regions') if manifest else ():
+    regions = ledger.rows(manifest, 'regions') if manifest else ()
+    source_regions = {ledger.text(row, 'region') for row in regions if row.get('source_bucket')}
+    for row in regions:
         if row.get('stack'):
             stacks[ledger.text(row, 'region')] = row['stack']
     changed = bool(stacks)
@@ -452,6 +481,12 @@ def remove_regional_gates(api: AwsCli, directory: Path, *, include_home: bool = 
     for region, name in list(stacks.items()):
         target = api.in_region(region)
         try:
+            if region in source_regions:
+                reply = target.call('describe-stacks', '--stack-name', str(name), service='cloudformation')
+                saved_stacks = ledger.rows(reply, 'Stacks')
+                if len(saved_stacks) != 1 or saved_stacks[0].get('StackName') != name:
+                    raise ValueError('The regional stack differs from the saved deployment')
+                empty_gate_source_bucket(target, saved_stacks[0], ledger.text(manifest, 'deployment_id'))
             _ = target.call('delete-stack', '--stack-name', str(name), service='cloudformation')
             _ = target.call('wait', 'stack-delete-complete', '--stack-name', str(name), service='cloudformation')
         except AwsUnavailable as error:

@@ -29,7 +29,7 @@ import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, ledger
+from scripts.aws_target import admin_secrets, aws_trial as trial, cloud_gate, gate_box, gate_source, ledger
 from scripts.aws_target.ledger_test_support import CostFixture, install_aws_fixture_settings, override_fixture_settings, text_setting
 from scripts.aws_target.aws_target import AwsCli
 from scripts.build_queue.admission_jobs import StepJob
@@ -931,7 +931,8 @@ else:
         with self.assertRaises(ValueError):
             trial.validate_paired_result(row, request, 'i-other')
 
-    def guest(self, *, limit: float | None = None) -> tuple[dict[str, object], list[dict[str, object]]]:
+    def guest(self, *, limit: float | None = None, private: bool = False
+              ) -> tuple[dict[str, object], list[dict[str, object]]]:
         from scripts.aws_target import gate_box, cloud_gate
         box = self.root / 'box'
         box.mkdir()
@@ -939,9 +940,18 @@ else:
         guest_delivery_margin_s = 60
         request = trial.module_request(self.request(), 'fixture/test_sample.py', 'attempt', int(time.time()) + guest_deadline_s)
         request['module_time_limit_s'] = guest_deadline_s if limit is None else limit
+        links: dict[str, object] = {'production': True, 'step': 'size', 'log': 'log', 'result': 'result',
+                                    'instance_type': 'm7a.8xlarge'}
+        if private:
+            request.update(source_form='regional-bundle', origin_main=self.base, clone_url='https://github.com/denied')
+            base_bundle, delta = box / 'base-object', box / 'delta-object'
+            gate_source.create_bundle(self.repo, base_bundle, (self.base,))
+            gate_source.create_bundle(self.repo, delta, (self.changed,), exclude=self.base)
+            links.update(source_base='base-object', source_base_commit=self.base,
+                         source_base_sha256=gate_source.bundle_sha256(base_bundle), source_delta='delta-object',
+                         source_delta_sha256=gate_source.bundle_sha256(delta))
         cloud_gate.save(box / 'request.json', request)
-        cloud_gate.save(box / 'links.json', {'production': True, 'step': 'size', 'log': 'log', 'result': 'result',
-                                           'instance_type': 'm7a.8xlarge'})
+        cloud_gate.save(box / 'links.json', links)
         tools = self.root / 'tools'
         tools.mkdir()
         curl = tools / 'curl'
@@ -949,10 +959,25 @@ else:
 import json, pathlib, sys
 config = pathlib.Path(sys.argv[sys.argv.index('--config') + 1])
 name = json.loads(config.read_text().partition('= ')[2])
-pathlib.Path({str(box)!r}, 'uploaded-' + name).write_bytes(sys.stdin.buffer.read())
+root = pathlib.Path({str(box)!r})
+if '--data-binary' in sys.argv:
+    (root / ('uploaded-' + name)).write_bytes(sys.stdin.buffer.read())
+else:
+    pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes((root / name).read_bytes())
 print('200', end='')
 ''')
         curl.chmod(0o755)
+        if private:
+            git_path = shutil.which('git')
+            assert git_path is not None
+            git = tools / 'git'
+            _ = git.write_text(f'''#!{sys.executable}
+import os, sys
+if any('github.com' in item or '://' in item for item in sys.argv[1:]):
+    raise SystemExit('The fixture denies network Git')
+os.execv({git_path!r}, [{git_path!r}, *sys.argv[1:]])
+''')
+            git.chmod(0o755)
         _ = (box / 'guest.py').write_text(gate_box.GUEST)
         trace = self.root / 'trace.jsonl'
         # The guest selects the candidate checkout after it clones the source.
@@ -964,6 +989,34 @@ print('200', end='')
         reply = cloud_gate.read(box / 'uploaded-result')
         traces = [ledger.mapping(cast(object, json.loads(line))) for line in trace.read_text().splitlines()] if trace.exists() else []
         return reply, traces
+
+    def test_private_paired_guest_runs_both_revisions_without_network_git(self) -> None:
+        reply, traces = self.guest(private=True)
+        self.assertEqual(reply['verdict'], 'pass', reply)
+        self.assertEqual(len(traces), 8)
+        self.assertEqual(trial.checked_git(self.root / 'box/base', 'rev-parse', 'HEAD'), self.base)
+        self.assertEqual(trial.checked_git(self.root / 'box/changed', 'rev-parse', 'HEAD'), self.changed)
+
+    def test_private_paired_trial_sends_a_bundle_without_remote_branch_commands(self) -> None:
+        _ = trial.checked_git(self.repo, 'update-ref', 'refs/remotes/origin/main', self.base)
+        previous = self.remote_branches()
+        cloud_gate.save(self.state / 'gate-deployment.json', {'template': 'fixture',
+            'source_tool_paths': ['/nix/store/' + 'a' * 32 + '-fixture']})
+        with (mock.patch.object(trial, 'sweep_trial_branches', side_effect=AssertionError('remote branch sweep')),
+              mock.patch.object(trial, 'delete_trial_branches', side_effect=AssertionError('remote branch deletion')),
+              mock.patch.object(trial, 'paired_service', return_value=0) as service):
+            status = trial.paired_main(['--base', self.base, '--changed', self.changed, '--repo', str(self.repo),
+                                      '--modules', 'fixture/test_sample.py'], self.state)
+            self.assertEqual(status, 0)
+        service.assert_called_once()
+        self.assertEqual(self.remote_branches(), previous)
+        folder, = (self.state / 'paired-trials').iterdir()
+        request_path, = folder.glob('*/request.json')
+        request = cloud_gate.read(request_path)
+        self.assertEqual(request['source_form'], 'regional-bundle')
+        bundle = folder / gate_source.SOURCE_ARCHIVE
+        heads = gate_source.git(self.repo, 'bundle', 'list-heads', str(bundle))
+        self.assertEqual({line.split()[0] for line in heads.splitlines()}, {self.base, self.changed})
 
     def test_local_guest_uses_two_trees_alternating_isolated_processes(self) -> None:
         reply, traces = self.guest()

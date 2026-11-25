@@ -31,7 +31,7 @@ from scripts.aws_target.gate_box import (
     boot_trap as boot_trap, log_push_loop as log_push_loop,
     RUN_FIELDS as RUN_FIELDS, validate_paired_result as validate_paired_result,
 )
-from scripts.aws_target import ledger, cloud_gate
+from scripts.aws_target import cloud_gate, gate_source, ledger
 from scripts.aws_target.s3_presign import SigningKey as SigningKey, presign as presign
 from scripts.aws_target.aws_target import AwsCli, AwsUnavailable
 from scripts.aws_target.config import read_settings, account_settings_path, gate_deployment, gate_regions
@@ -540,7 +540,7 @@ def paired_service(command: Sequence[str], unit: str) -> int:
 
 def paired_main(argv: Sequence[str], directory: Path) -> int:
     parser = argparse.ArgumentParser(description='Compare two local revisions on disposable gate boxes',
-                                     epilog='aws_trial.py pushes and deletes its own trial branches; never push or delete a trial branch by hand.')
+                                     epilog='Legacy deployments manage their own trial branches.')
     _ = parser.add_argument('--base', required=True)
     _ = parser.add_argument('--changed', required=True)
     _ = parser.add_argument('--modules', nargs='+', required=True)
@@ -565,21 +565,28 @@ def paired_main(argv: Sequence[str], directory: Path) -> int:
         home = conf.read(account_settings_path()).text('region')
         _ = gate_regions(home)
         deployment = gate_deployment(directory / 'gate-deployment.json', home)
-        clone_url = trial.clone_url
-        prefix = cloud_gate.settings().text('trial_branch_prefix')
-        sweep_trial_branches(args.repo, clone_url, prefix, int(time.time()))
+        source = gate_source.deployment_source(deployment)
         expires = int(time.time()) + cloud_gate.settings().whole('lifetime_minutes') * 60
         folder = directory / 'paired-trials' / uuid4().hex
         folder.mkdir(parents=True)
-        trial_id = folder.name
-        for variant, revision in (('base', trial.base), ('changed', trial.changed)):
-            branch = f'{prefix}-{expires}-{folder.name}-{variant}'
-            _ = checked_git(args.repo, 'check-ref-format', 'refs/heads/' + branch)
-            _ = checked_git(args.repo, 'push', clone_url, revision.commit + ':refs/heads/' + branch)
+        source_fields: dict[str, object] = {}
+        if isinstance(source, gate_source.PrivateBundleSource):
+            origin_main = checked_git(args.repo, 'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}')
+            gate_source.archive(args.repo, folder, (trial.base.commit, trial.changed.commit, origin_main))
+            source_fields = {'source_form': 'regional-bundle', 'origin_main': origin_main}
+        else:
+            clone_url = trial.clone_url
+            prefix = cloud_gate.settings().text('trial_branch_prefix')
+            sweep_trial_branches(args.repo, clone_url, prefix, int(time.time()))
+            trial_id = folder.name
+            for variant, revision in (('base', trial.base), ('changed', trial.changed)):
+                branch = f'{prefix}-{expires}-{folder.name}-{variant}'
+                _ = checked_git(args.repo, 'check-ref-format', 'refs/heads/' + branch)
+                _ = checked_git(args.repo, 'push', clone_url, revision.commit + ':refs/heads/' + branch)
         for module in trial.modules:
             path = folder / uuid4().hex
             path.mkdir()
-            cloud_gate.save(path / 'request.json', module_request(trial, module, path.name, expires))
+            cloud_gate.save(path / 'request.json', {**module_request(trial, module, path.name, expires), **source_fields})
             cloud_gate.save(path / 'deployment.json', deployment)
         command = cloud_gate.service_command('scripts.aws_target.aws_trial', ['--paired-worker', str(folder)],
                                              'cloud-paired-trial-' + folder.name, paired=True)
