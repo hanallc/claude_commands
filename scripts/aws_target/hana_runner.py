@@ -15,7 +15,7 @@ from typing import cast
 
 from scripts.aws_target import hana_protocol, hana_source as source
 from scripts.aws_target.hana_result import HanaCommandResult, PeakUnavailable
-from scripts.lib import build_folders, build_slots, conf
+from scripts.lib import build_copies, build_folders, conf
 from scripts.mac_test import linux_runner
 
 IMAGE_COMPILER_VERSION = Path('/etc/hana-aws/compiler-version')
@@ -90,7 +90,7 @@ def materialize_and_run(request: hana_protocol.HanaExecutionRequest, verified_bu
                 PeakUnavailable('The command unit did not report peak memory')))
     except linux_runner.LeasedCommandLost as error:
         return hana_protocol.HanaExecutionLost(str(error))
-    except (OSError, ValueError, subprocess.SubprocessError, build_slots.SlotGitFailure) as error:
+    except (OSError, ValueError, subprocess.SubprocessError, build_copies.CopyGitFailure) as error:
         return hana_protocol.HanaExecutionRefused(str(error))
 
 
@@ -106,7 +106,7 @@ def materialize_source_update(request: hana_protocol.HanaExecutionRequest,
             if isinstance(leased, source.MissingBasis):
                 raise ValueError('The complete source update still requires basis commits')
             return hana_protocol.HanaSourceUpdated(leased.identity)
-    except (OSError, ValueError, subprocess.SubprocessError, build_slots.SlotGitFailure) as error:
+    except (OSError, ValueError, subprocess.SubprocessError, build_copies.CopyGitFailure) as error:
         return hana_protocol.HanaSourceUpdateRefused(str(error))
 
 

@@ -3569,7 +3569,7 @@ with patch.object(fcntl, "flock", admission):
         phase = cast(list[dict[str, object]], report["phases"])[0]
         self.assertEqual((phase["state"], phase["wait_n"]), ("Covered", 0))
 
-    def test_slot_waits_follow_the_live_pass_across_reused_servers_and_parallel_phases(self) -> None:
+    def test_waits_follow_the_live_pass_across_reused_servers_and_parallel_phases(self) -> None:
         session = self.covered_wait_phase("wait-slot")
         self.team_slot = "impl"
         _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", "6",
@@ -3596,7 +3596,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual((records[first]["phase_id"], records[second]["phase_id"]), ("6", "7"))
         self.assertNotEqual(records[first]["phase_instance_id"], records[second]["phase_instance_id"])
 
-    def test_unresolved_slot_wait_is_counted_without_borrowing_the_current_phase(self) -> None:
+    def test_wait_without_an_open_pass_is_counted_without_borrowing_the_current_phase(self) -> None:
         session = self.covered_wait_phase("wait-missing-slot")
         printed_id = self.run_command("start-wait", "--session-dir", str(session), "--slot", "absent",
                                       "--kind", "WaitingForMemoryOrSlot", "--reason", "admission busy", at=1020)

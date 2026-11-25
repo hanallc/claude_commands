@@ -445,11 +445,11 @@ gate.run_suites(Path.cwd(), full=True)
                     recovery_scope = (gate.gate_recovery(self.checkout) if scope == "shared"
                                       else gate.private_gate_recovery(self.checkout, parent))
                     with (recovery_scope as recovery,
-                          mock.patch.object(build_folders, "remove_build_folder", return_value=False) as remove,
+                          mock.patch.object(build_folders, "may_remove_build_path", return_value=False) as remove,
                           redirect_stderr(io.StringIO()) as report):
                         with gate.gate_temporary(recovery, "merge-gate", parent) as folder:
                             self.assertTrue(folder.is_dir())
-                    remove.assert_called_once()
+                    remove.assert_called_once_with(folder)
                     self.assertTrue(folder.is_dir())
                     saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                     self.assertEqual(saved["folders"], [str(folder)])

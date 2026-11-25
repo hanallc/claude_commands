@@ -40,7 +40,7 @@ from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import (
-    atomic_file, build_folder_lock, build_folders, build_slots, build_slots_test_support, conf, git_files, process_group, process_start,
+    atomic_file, build_folder_lock, build_folders, build_copies, build_copies_test_support, conf, git_files, process_group, process_start,
     socket_test_support, unit_runs,
 )
 from scripts.lib.atomic_file import write_text_atomic
@@ -451,7 +451,7 @@ def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
 
 
 def retirement_copies_environment(root: Path) -> dict[str, str]:
-    private = build_slots_test_support.private_slot_config(root)
+    private = build_copies_test_support.private_copy_config(root)
     return {**private.environment, "HOME": str(root), "SCRATCH_COPIES_ROOT": str(root / "copies")}
 
 
@@ -500,7 +500,7 @@ def setUpModule() -> None:
     unittest.addModuleCleanup(ShutdownStaffFixture.owner_server.close)
     unittest.enterModuleContext(mock.patch.dict(os.environ, environment, clear=True))
     _ = unittest.enterModuleContext(mock.patch.object(staff_test_support, "write_config_fixture", write_pinned_fixture_setting))
-    _ = unittest.enterModuleContext(mock.patch.object(build_slots_test_support, "config_environment", shutdown_fixture_configuration))
+    _ = unittest.enterModuleContext(mock.patch.object(build_copies_test_support, "config_environment", shutdown_fixture_configuration))
     _ = unittest.enterModuleContext(mock.patch.object(rename_unit_test_support, "config_environment", shutdown_fixture_configuration))
     _ = unittest.enterModuleContext(mock.patch.object(remote_test_support, "copies_environment", retirement_copies_environment))
     _ = unittest.enterModuleContext(mock.patch.object(socket_test_support, "config_environment", shutdown_fixture_configuration))
@@ -4092,7 +4092,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.write(output / "review/artifact", "review")
         self.env["COPIES_CONFIG"] = str(Path(self.env["CONF_DIR"]) / "copies.conf")
         with mock.patch.dict(os.environ, self.env, clear=True):
-            with build_slots.take_copy(self.checkout, "HEAD", showrunner="demo", unit="alpha",
+            with build_copies.take_copy(self.checkout, "HEAD", showrunner="demo", unit="alpha",
                                        work="rename", purpose="fixture") as copy:
                 self.assertEqual(copy.path, output / "1")
                 copy_git = git_files.at(copy.path).git_dir
