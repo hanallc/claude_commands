@@ -220,20 +220,20 @@ Group B (branches `style-s3-rename`, `style-s3-applied` and `style-s3-footprint`
 7. `s3-rename-applied`: `rename_applied`, the ticket-aware applied check. It builds on `s3-rename`.
 8. `s3-footprint`: `footprint`; then the S3 measure (needed blobs, cold time, the stop point).
 
-Group C (branch `style-s3-declarations`, checkpoint f991c6968, 2026-11-24; it merges main next):
+Group C (branch `style-s3-declarations`, checkpoint f991c6968, 2026-11-24; on cargo-liner main in 2317a6ae8 as 520ceaf89, 2026-11-24):
 
 9. `s3-declarations`: `declaration`, `site_evidence` and `approvals`, the complete declaration reading. The request carries an approval snapshot (decision paths and answers); Python keeps the decision-file parse. The phase also moved the S3 readers to the one oracle pin 1210fd999a: the ledger read accepts schemas 47 and 51 from one list, and the file rename plan follows the Python grammar.
 
 Code with no consumer cannot land, so each S3 phase extends `finding`, its consumer. The `next` request and reply types (`NextOutcome`, `SelectedTicket`) move to S5, which builds `next` (style-unit, 2026-11-18).
 
-S4 has seven phases, from the S4 scope read (style-unit, 2026-11-22). Phase 1 runs first. Phases 2, 3 and 4 run side by side after it. Phase 5 follows them. Phase 6 builds its ledger projection beside them. Phase 7 adds the B and D cells after phase 5 (style-unit, 2026-11-23). The full suite and Python parity run once, on the final S4 tree. The Python membership adapter moves to S5, with the publication adapter.
+S4 has seven phases, from the S4 scope read (style-unit, 2026-11-22). Phase 1 runs first. Phases 2, 3 and 4 run in series after it: phase 2 builds the shared source mask that phases 3 and 4 read, and the unit has one writer and one tester (style-unit, 2026-11-24). Phase 5 follows them. Phase 6 builds its ledger projection beside them. Phase 7 adds the B and D cells after phase 5 (style-unit, 2026-11-23). The full suite and Python parity run once, on the final S4 tree. The Python membership adapter moves to S5, with the publication adapter.
 
 1. `s4-sites-regex` (checkpoint 88a4d1f58 on `style-s4-sites-regex`, 2026-11-23; on cargo-liner main as 4902fb25e, 2026-11-24): `sites` with the shared envelope, catalog input, schema 47 and 51 reads, typed `Unavailable`, and regex sites. One difference from Python is intended: `sites` lists only the requested rule. Python `_refresh_candidate_sites` lists every tier B and D rule, so one bad rule fails the request for all rules. In Rust, an invalid rule fails only its own request (style-unit, 2026-11-23, review finding F003).
-2. `s4-sites-types`: field affixes, variant stutter, field type stutter, struct fields and single-impl traits.
+2. `s4-sites-types`: the shared source mask (`mask_source`), field affixes, variant stutter, field type stutter, struct fields and single-impl traits.
 3. `s4-sites-source`: allows, test allows, observer guards, literals and test literals.
 4. `s4-sites-structure`: module roots, submodule names, workspace dependencies and Bevy Kana; candidate D membership.
 5. `s4-sites-prefilter`: B prefilter rules over the full generator path union.
-6. `s4-coverage` (checkpoint ce2d467e7 on `style-s4-coverage`, 2026-11-23): `coverage` with observed counts and the cell projection for tier A, C and E rules. A rule that needs B or D sites gives a typed `Unavailable` answer.
+6. `s4-coverage` (checkpoint ce2d467e7 on `style-s4-coverage`, 2026-11-23; on cargo-liner main as 77c877600, 2026-11-24): `coverage` with observed counts and the cell projection for tier A, C and E rules. A rule that needs B or D sites gives a typed `Unavailable` answer.
 7. `s4-coverage-sites`: tier B and D cells from the native `sites` membership. It starts after `s4-sites-prefilter`.
 
 ### `syn` and reuse
