@@ -259,7 +259,8 @@ class MacIdleTests(NotificationGuardedTestCase):
         verify = mac_idle.SCRIPTS / "direct/verify.sh"
         source = verify.read_text()
         functions: list[str] = []
-        for name in ("publish_step_state", "step_state", "step_writes_tree", "finish_step_token", "run", "run_step"):
+        for name in ("publish_step_state", "step_state", "step_writes_tree", "finish_step_token", "run", "run_step",
+                     "wait_for_verify_child", "wait_for_verify_step_group"):
             start = source.index(f"\n{name}() {{") + 1
             end = source.index("\n}\n", start) + 2
             functions.append(source[start:end])

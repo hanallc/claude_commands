@@ -413,7 +413,7 @@ class SnapshotCodecTests(unittest.TestCase):
             self.assertEqual(cast(str, getattr(reason, "head_name")), "the natedev hold by fps for Phase 3 timing")
         self.assertEqual(cast(str, getattr(older, "text")), "natedev is held by fps for Phase 3 timing; waiting for release")
 
-    def test_gpu_slot_wait_keeps_its_shape_in_a_field_with_no_wait_behind_the_head(self) -> None:
+    def test_gpu_capacity_wait_keeps_its_shape_in_a_field_with_no_wait_behind_the_head(self) -> None:
         waiting = wait_reply(records.NeedsMemory()).snapshot
         decision = replace(waiting.decision, gpu=records.GpuSlotWait(1, 1))
         status = snapshot_with_head_cause(waiting, records.GpuSlotWait(1, 1)).head_reason

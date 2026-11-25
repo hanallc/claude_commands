@@ -483,7 +483,7 @@ Mac rows use this owner lookup order.
 A CI row uses `hana CI` as the owner.
 A gate job that the feed cannot read shows only its owner, from `owner_name`, on a local, remote or cloud row.
 So each of these rows removes the showrunner prefix in the same way, for example `merge-gate` for `sdlc-merge-gate`.
-`slot_wait.QueueRowName.owned` and `memory_feed.row_name_parts` use `row_text`, so the name and its parts agree.
+`queue_wait.QueueRowName.owned` and `memory_feed.row_name_parts` use `row_text`, so the name and its parts agree.
 An absolute repository path does not supply a project name.
 Matching and history retain the original step name.
 The queue omits a live unowned scope when its run has no reservation and keeps no memory.

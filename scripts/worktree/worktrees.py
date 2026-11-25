@@ -352,7 +352,7 @@ def retire(unit: str) -> None:
         return
     for repo in sorted(root.iterdir()):
         if (repo.name in build_folders.BUILD_ROOT_EXCEPTIONS
-                or repo.name in ("cargo", "paths", "slot", "hana-ci")
+                or repo.name in ("cargo", "paths", "hana-ci")
                 or repo.name.startswith("old-") or repo.is_symlink() or not repo.is_dir()):
             continue
         folder = build_folders.unit_folder(repo.name, unit)
@@ -2191,7 +2191,8 @@ def _migration_maker_roots(scratch: Path, settings: conf.ConfigRead) -> tuple[Pa
     values = settings.settings
     if isinstance(values, dict) and (setting := values.get("roots.scratch")) is not None and setting.value:
         former_scratch = Path(setting.value).expanduser()
-    roots = (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate"), scratch.parents[1] / "slot",
+    user_roots = tuple(scratch.parents[1] / name for name in sorted(build_folders.USER_REMOVAL_ROOTS))
+    roots = (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate"), *user_roots,
              session_folder.configured_root().resolve(), Path.home() / ".local")
     former_scratch = former_scratch.resolve()
     return roots if former_scratch == scratch else (*roots, former_scratch)

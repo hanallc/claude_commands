@@ -2841,13 +2841,13 @@ def run_limited(tmp: Path, argv: Sequence[str], copy: Path, environment: dict[st
 
 def run_guest(request_path: Path) -> int:
     """Take a numbered copy, then run the gate or the argv of the request in it."""
-    from scripts.lib import build_slots
+    from scripts.lib import build_copies
 
     request = guest_request(request_path)
     main = Path.cwd()
     work = request['work'] if 'argv' in request else request['mode']
     with (build_folders.inherit_build_lock(RUN_LOCK_FD),
-          build_slots.take_copy(main, request['commit'], showrunner='', unit=request['unit'],
+          build_copies.take_copy(main, request['commit'], showrunner='', unit=request['unit'],
                                 work=work, purpose=TARGET) as copy):
         with build_folders.tool_folder(TARGET, copy.cargo_dir) as runtime:
             home = runtime / 'home'

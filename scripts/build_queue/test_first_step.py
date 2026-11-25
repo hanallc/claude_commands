@@ -23,7 +23,7 @@ from scripts.build_queue.test_placement import (
 )
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, command_job
 from scripts.mac_test import claim_state
 from scripts.message.session_send_test_support import forbid_real_sender
@@ -475,7 +475,7 @@ class FirstStepTests(unittest.TestCase):
                     acquire.assert_called_once_with(placed.request)
 
     def test_local_gate_keeps_its_reservation_and_assignment_through_the_handoff(self) -> None:
-        position = SlotQueuePosition("episode", 3)
+        position = CopyQueuePosition("episode", 3)
         assignment = placement.PlacementAssignment(position.episode, "attempt",
             placement.PlacementDestination("local", "natedev", "fixture-host", claim_state.WHOLE_MAC),
             execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("fixture-host", 1, "2"),
@@ -620,7 +620,7 @@ class FirstStepTests(unittest.TestCase):
             grant = wire.Assignment(assignment)
             path = fixture.root / "assignment.json"
             client.write_assignment(path, grant)
-            admitted = first_step.FirstStepAdmission(SlotQueuePosition(request.episode, request.since), grant, path)
+            admitted = first_step.FirstStepAdmission(CopyQueuePosition(request.episode, request.since), grant, path)
 
             admitted.handoff(fixture.root)
             self.assertEqual(os.environ["BUILDLOG_FIRST_STEP_ASSIGNMENT"], str(path))
@@ -651,7 +651,7 @@ class FirstStepTests(unittest.TestCase):
             assignment = assignment_for(fixture, request)
             other_owner = replace(assignment.owner, start_time=assignment.owner.start_time + "0")
             grant = wire.Assignment(replace(assignment, owner=other_owner))
-            admitted = first_step.FirstStepAdmission(SlotQueuePosition(request.episode, request.since),
+            admitted = first_step.FirstStepAdmission(CopyQueuePosition(request.episode, request.since),
                                                      grant, fixture.root / "assignment.json")
 
             with fixture.serving(), self.assertRaisesRegex(wire.AdmissionUnavailable,

@@ -829,12 +829,16 @@ gate.run_suites(Path.cwd(), full=True)
                 with self.subTest(scope=scope):
                     recovery_scope = (gate.gate_recovery(self.checkout) if scope == "shared"
                                       else gate.private_gate_recovery(self.checkout, parent))
-                    with (self.assertRaisesRegex(gate.GateRecoveryUnresolved, "UNRESOLVED: could not remove"),
+                    with (redirect_stderr(io.StringIO()) as report,
+                          self.assertRaisesRegex(gate.GateRecoveryUnresolved, "UNRESOLVED: could not remove"),
                           recovery_scope as recovery,
                           mock.patch.object(build_folders, "may_remove_build_path", return_value=False) as remove,
                           gate.gate_temporary(recovery, "merge-gate", parent) as folder):
                         self.assertTrue(folder.is_dir())
-                    remove.assert_called_once()
+                    remove.assert_called_once_with(folder)
+                    self.assertEqual(report.getvalue().splitlines(), [
+                        f"kept for a manual removal list: {folder} (gate, the gate could not remove its folder)"
+                    ])
                     self.assertTrue(folder.is_dir())
                     saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                     self.assertEqual(saved["folders"], [str(folder)])
@@ -966,6 +970,7 @@ gate.run_suites(Path.cwd(), full=True)
         with mock.patch.dict(os.environ, self.environment, clear=True):
             for suffix in (".lease.json", ".lock"):
                 with (self.subTest(suffix=suffix),
+                      redirect_stderr(io.StringIO()) as report,
                       gate.private_gate_recovery(self.checkout, parent) as recovery,
                       ExitStack() as cleanup):
                     folder = cleanup.enter_context(gate.gate_temporary(recovery, "merge-gate", parent))
@@ -986,6 +991,9 @@ gate.run_suites(Path.cwd(), full=True)
                 saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                 self.assertEqual(saved["folders"], [str(folder)])
                 self.assertIs(saved["finished"], False)
+                [notice] = report.getvalue().splitlines()
+                self.assertTrue(notice.startswith("kept for a manual removal list: "))
+                self.assertIn(str(blocked), notice)
 
     def test_failed_gate_removes_its_folder(self) -> None:
         parent = self.root / "gate-temporary"
