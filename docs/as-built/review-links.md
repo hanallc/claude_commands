@@ -2677,9 +2677,18 @@ The toast uses the recipient name shown when the user presses **Send**.
 For **Tell**, the toast uses the signed producer.
 If a draft can recover an earlier filing, the toast says "Sending."
 The toast appears at the bottom right of the top window.
-It sits 24 px from the bottom and right edges. At phone widths, the right gutter is 16 px.
+It sits 24 px from the bottom and right edges.
+At 560 px or less, the right gutter is 16 px.
+At 640 px or less, the stack is at most 280 px wide.
 Stacked toasts share the right edge. Long names wrap.
-The stack scrolls when it would extend within 24 px of the top edge.
+The stack scrolls when it reaches the space reserved for the frozen header and a full card button.
+The stack keeps room for a full toast and its Undo button within the viewport.
+The page adds bottom scroll space and scroll padding from the top of the stack to the bottom of the page frame.
+A linked Review card reduces its height by the same amount.
+The card body scrolls when it has enough space between the header and footer.
+The full card scrolls when the body cannot fit between them.
+Closing a sending frame removes its toast.
+The page removes the scroll space from frames that close or when no toast is visible.
 The toast uses the console colors.
 The toast moves to the top open modal dialog, or to the page, so no dialog covers it or makes it inert.
 The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.

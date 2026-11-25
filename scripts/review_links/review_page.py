@@ -1527,8 +1527,9 @@ background:var(--card);color:var(--ink)}.review-actions .primary{background:var(
 
 CARD_VIEW_STYLE = '''<style>
 :root:has([data-review-card]){overflow:hidden;scrollbar-gutter:auto}
+:root[data-send-undo-space]:has([data-review-card]){padding-bottom:0;scroll-padding-bottom:auto}
 :root:not(.layout-measuring) main:has(>[data-review-card]){max-width:none;padding:0}
-.review-box{position:relative;box-sizing:border-box;display:flex;flex-direction:column;max-height:100dvh;padding:24px;background:var(--card)}
+.review-box{position:relative;box-sizing:border-box;display:flex;flex-direction:column;max-height:calc(100dvh - var(--send-undo-space,0px));padding:24px;background:var(--card)}
 .review-box-header{flex:none}
 .review-box-header h1{margin:0 0 8px;padding-right:84px;font-size:24px;white-space:pre-line;overflow-wrap:anywhere}
 .review-box-meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;color:var(--ink-3);font-size:13px}
@@ -1788,7 +1789,7 @@ function fitReviewBox(){
  box.style.setProperty('--review-body-min',min);
  const height=Math.ceil(fixedHeight+Math.max(minBody,detail.getBoundingClientRect().height));
  boxFrame?.style.setProperty('--review-card-height',height+'px');
- const whole=fixedHeight+minBody>document.documentElement.clientHeight;
+ const whole=fixedHeight+minBody>parseFloat(style.maxHeight);
  box.toggleAttribute('data-whole-scroll',whole);
  if(whole && min!==oldMin && menu?.contains(document.activeElement))
   document.activeElement.scrollIntoView({block:'nearest'});
@@ -1799,6 +1800,7 @@ function showCard(row){
  row.querySelector('.review-box-header').append(updates);
  card.replaceChildren(row);
  resizeBox.disconnect();
+ resizeBox.observe(row,{box:'border-box'});
  for(const element of row.querySelectorAll('.review-box-header,[data-review-detail],.review-box-footer,[data-later-menu]'))
   resizeBox.observe(element,{box:'border-box'});
  fitReviewBox();

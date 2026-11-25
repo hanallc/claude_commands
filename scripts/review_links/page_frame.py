@@ -896,13 +896,18 @@ document.addEventListener('click',event=>{
 # New item and linked Review callers close their dialogs before the hold and reopen them on Undo or failure.
 # The card and dialog scripts share one definition of heldFetch and SendUndone in each frame.
 HELD_SEND_STYLE = '''
-[data-send-undo-stack]{position:fixed;right:24px;bottom:24px;z-index:2147483647;
-display:grid;justify-items:end;gap:8px;margin:0;width:max-content;max-width:calc(100% - 48px);
-max-height:calc(100% - 48px);overflow-y:auto}
-@media (max-width:560px){[data-send-undo-stack]{right:16px;max-width:calc(100% - 32px)}}
+[data-send-undo-space]{padding-bottom:var(--send-undo-space);scroll-padding-bottom:var(--send-undo-space)}
+[data-send-undo-stack]{--undo-gutter:24px;position:fixed;right:var(--undo-gutter);bottom:24px;z-index:2147483647;
+display:grid;justify-items:end;gap:8px;margin:0;width:max-content;
+max-width:min(var(--undo-width,100%),calc(100% - 2 * var(--undo-gutter)));
+max-height:min(calc(100dvh - 48px),max(var(--send-undo-min,0px),
+calc(100dvh - var(--send-undo-top,56px) - 72px - 24px)));overflow-y:auto}
+@media (max-width:640px){[data-send-undo-stack]{--undo-width:280px}}
+@media (max-width:560px){[data-send-undo-stack]{--undo-gutter:16px}}
 [data-send-undo]{position:relative;display:flex;align-items:center;gap:16px;padding:10px 10px 12px 16px;
 border:1px solid var(--border,#2d3748);border-radius:8px;background:var(--nav,#141b28);color:var(--text,#e4eaf4);
 box-shadow:0 4px 16px #0008;font:500 14px/20px system-ui,sans-serif;overflow:hidden;min-width:0}
+[data-send-undo][hidden]{display:none}
 [data-send-undo] span{min-width:0;overflow-wrap:anywhere}
 [data-send-undo] button{flex:none;padding:4px 10px;border:0;border-radius:4px;background:none;color:var(--accent,#c2d4ff);
 font:600 14px/20px system-ui,sans-serif;cursor:pointer}
@@ -911,15 +916,129 @@ font:600 14px/20px system-ui,sans-serif;cursor:pointer}
 transform-origin:left}
 '''
 
+SEND_UNDO_STACK_SCRIPT = (f'window.getSendUndoStack ||= (() => {{\n'
+                          f'const SEND_UNDO_STYLE={json.dumps(HELD_SEND_STYLE)};\n') + r'''
+function installSendUndoStyle(doc){
+ if(!doc.head || doc.head.querySelector('style[data-send-undo-style]')) return;
+ const style=doc.createElement('style');style.dataset.sendUndoStyle='';style.textContent=SEND_UNDO_STYLE;
+ doc.head.append(style);
+}
+function createSendUndoStack(host){
+ installSendUndoStyle(host);
+ const stack=host.createElement('div');
+ stack.dataset.sendUndoStack='';stack.setAttribute('role','status');
+ const view=host.defaultView;
+ const pages=new Map();
+ let pendingMeasure=0;
+ const setSpace=(doc,space)=>{
+  const root=doc.documentElement;
+  if(!root) return;
+  if(space && !doc.getElementById('console-shell')){
+   installSendUndoStyle(doc);
+   const value=space+'px';
+   if(root.style.getPropertyValue('--send-undo-space')!==value)
+    root.style.setProperty('--send-undo-space',value);
+   if(!root.hasAttribute('data-send-undo-space')) root.setAttribute('data-send-undo-space','');
+  }else if(root.hasAttribute('data-send-undo-space')){
+   root.removeAttribute('data-send-undo-space');
+   root.style.removeProperty('--send-undo-space');
+  }
+ };
+ const scheduleMeasure=()=>{
+  if(!pendingMeasure && stack.childElementCount) pendingMeasure=view.requestAnimationFrame(measure);
+ };
+ const frameLoaded=event=>{if(event.target.localName==='iframe') scheduleMeasure();};
+ const hasFrame=node=>node.localName==='iframe' || node.querySelector?.('iframe');
+ const changed=records=>{
+  if(!stack.childElementCount){
+   view.cancelAnimationFrame(pendingMeasure);
+   size.disconnect();
+   for(const stop of pages.values()) stop();
+   pages.clear();stack.remove();
+   return;
+  }
+  const modalChanged=records.some(record=>record.attributeName==='open' && record.target.localName==='dialog');
+  const moved=!stack.isConnected || modalChanged;
+  if(moved) rehome();
+  if(moved || records.some(record=>stack.contains(record.target) ||
+   (record.type==='attributes' ? hasFrame(record.target)
+    : [...record.addedNodes,...record.removedNodes].some(hasFrame)))) scheduleMeasure();
+ };
+ const watchPage=doc=>{
+  const pageView=doc.defaultView;
+  const watch=new view.MutationObserver(changed);
+  watch.observe(doc,{subtree:true,childList:true,attributes:true,attributeFilter:['open','hidden']});
+  doc.addEventListener('load',frameLoaded,true);
+  const events=new view.AbortController();
+  pageView?.addEventListener('resize',scheduleMeasure,{signal:events.signal});
+  pageView?.addEventListener('page-top-resize',scheduleMeasure,{signal:events.signal});
+  pages.set(doc,()=>{
+   watch.disconnect();events.abort();
+   doc.removeEventListener('load',frameLoaded,true);
+   setSpace(doc,0);
+  });
+ };
+ const measure=()=>{
+  pendingMeasure=0;
+  if(!stack.childElementCount) return;
+  const current=new Map([[host,{top:0,bottom:view.innerHeight,visible:true}]]);
+  let top=Number.NEGATIVE_INFINITY;
+  for(const [doc,area] of current){
+   for(const frame of doc.querySelectorAll('iframe')){
+    const child=frame.contentDocument;
+    if(!child) continue;
+    const box=frame.getBoundingClientRect(),start=area.top+box.top+frame.clientTop;
+    const bottom=Math.min(area.bottom,start+frame.clientHeight);
+    const visible=area.visible && box.width>0 && bottom>Math.max(0,start,area.top)
+     && doc.defaultView.getComputedStyle(frame).visibility==='visible';
+    current.set(child,{top:start,bottom,visible});
+   }
+   if(!pages.has(doc)) watchPage(doc);
+   if(area.visible && doc.documentElement){
+    const header=parseFloat(doc.defaultView.getComputedStyle(doc.documentElement)
+     .getPropertyValue('--page-top-height'));
+    top=Math.max(top,area.top+(Number.isFinite(header) ? header : doc===host ? 56 : 0));
+   }
+  }
+  const limit=Math.max(0,top)+'px';
+  if(stack.style.getPropertyValue('--send-undo-top')!==limit)
+   stack.style.setProperty('--send-undo-top',limit);
+  const minimum=Math.ceil(Math.max(...Array.from(stack.children,toast=>toast.getBoundingClientRect().height)))+'px';
+  if(stack.style.getPropertyValue('--send-undo-min')!==minimum)
+   stack.style.setProperty('--send-undo-min',minimum);
+  const box=stack.getBoundingClientRect();
+  for(const [doc,area] of current){
+   setSpace(doc,area.visible && box.height ? Math.max(0,area.bottom-box.top) : 0);
+  }
+  for(const [doc,stop] of pages){
+   if(current.has(doc)) continue;
+   stop();pages.delete(doc);
+  }
+ };
+ // Move the stack into the open modal so the Undo button stays active.
+ const rehome=()=>{
+  const place=host.activeElement?.closest('dialog:modal') ||
+   [...host.querySelectorAll('dialog:modal')].pop() || host.body;
+  if(stack.parentElement!==place) place.append(stack);
+ };
+ rehome();
+ const size=new view.ResizeObserver(scheduleMeasure);
+ size.observe(stack);
+ watchPage(host);
+ return stack;
+}
+return ()=>document.querySelector('[data-send-undo-stack]') || createSendUndoStack(document);
+})();'''
+
 HELD_SEND_SCRIPT = (f'window.heldFetch || (() => {{\nconst SEND_HOLD_PATH={json.dumps(send_hold.HOLD_PATH)},'
                     f'SEND_REQUEST_HEADER={json.dumps(send_hold.REQUEST_HEADER)},'
-                    f'SEND_UNDO_STYLE={json.dumps(HELD_SEND_STYLE)};\n') + r'''class SendUndone extends Error{
+                    f'SEND_UNDO_STACK_SCRIPT={json.dumps(SEND_UNDO_STACK_SCRIPT)};\n') + r'''class SendUndone extends Error{
  constructor(){super('Undone. Edit and send again.');this.name='SendUndone';}
 }
 function sendUndoHost(){
  try{ return window.top.document; }catch{ return document; }
 }
-const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const pause=(ms,view=window)=>new Promise(resolve=>view.setTimeout(resolve,ms));
 const RETRY_LIMIT_MS=120_000,KEEPALIVE_LIMIT=64*1024;
 const heldRequests=new Map();
 function trackHeldRequest(key){
@@ -947,23 +1066,13 @@ function trackHeldRequest(key){
 }
 function showSendUndo(request,seconds,receiver){
  const {hold}=request,host=sendUndoHost();
- if(!host.querySelector('style[data-send-undo-style]')){
-  const style=host.createElement('style');style.dataset.sendUndoStyle='';style.textContent=SEND_UNDO_STYLE;
-  host.head.append(style);
+ const view=host.defaultView;
+ if(!view.getSendUndoStack){
+  // Install the observer in the top window so it stays active after a frame closes.
+  const script=host.createElement('script');script.textContent=SEND_UNDO_STACK_SCRIPT;
+  host.head.append(script);script.remove();
  }
- let stack=host.querySelector('[data-send-undo-stack]');
- if(!stack){
-  stack=host.createElement('div');stack.dataset.sendUndoStack='';stack.setAttribute('role','status');
- }
- // The stack moves to the top open modal dialog, or to the body, so no dialog hides it or makes it inert.
- const rehome=()=>{
-  const place=host.activeElement?.closest('dialog:modal') ||
-   [...host.querySelectorAll('dialog:modal')].pop() || host.body;
-  if(stack.parentElement!==place) place.append(stack);
- };
- rehome();
- const watch=new MutationObserver(rehome);
- watch.observe(host.body,{subtree:true,childList:true,attributes:true,attributeFilter:['open']});
+ const stack=view.getSendUndoStack();
  const toast=host.createElement('div'),text=host.createElement('span'),button=host.createElement('button');
  const bar=host.createElement('div');
  const sent=receiver===null ? 'Saved.' : receiver ? 'Sent to '+receiver+'.' : 'Sent.';
@@ -975,18 +1084,19 @@ function showSendUndo(request,seconds,receiver){
  const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
  const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
  return new Promise(resolve=>{
-  let done=false;
+  let done=false,removalTimer=0;
   const remove=()=>{
-   toast.remove();watch.disconnect();
-   if(!stack.children.length) stack.remove();
+   view.clearTimeout(removalTimer);
+   window.removeEventListener('pagehide',close);
+   toast.remove();
   };
   const finish=undone=>{
    if(done) return;
    done=true;remove();resolve(undone);
   };
   const reportResult=async(response,late=false,warning)=>{
-   if(request.closed) return;
    const result=await response?.clone().json().catch(()=>null);
+   if(request.closed || !toast.parentNode) return;
    if(!late && !result?.send_failure && (!warning || response?.ok)){
     if(warning) warning.then(remove);
     else remove();
@@ -996,17 +1106,19 @@ function showSendUndo(request,seconds,receiver){
     ? (result.no_message ? 'Saved.' : sent)
     : result?.send_failure || result?.reason || result?.error || 'The send result is unavailable.';
    text.textContent=(late ? 'Too late to undo. ' : '')+summary;
-   fade.cancel();toast.style.display='';
-   pause(3000).then(remove);
+   fade.cancel();toast.hidden=false;
+   removalTimer=view.setTimeout(remove,3000);
   };
-  request.closeToast=()=>{
+  const close=()=>{
    remove();
    if(!done){done=true;resolve(false);}
   };
+  request.closeToast=close;
+  window.addEventListener('pagehide',close);
   fade.finished.then(()=>{
    if(done) return;
    done=true;
-   button.remove();bar.remove();toast.style.display='none';
+   button.remove();bar.remove();toast.hidden=true;
    resolve(reportResult);
   },()=>{});
   button.addEventListener('click',async()=>{
@@ -1026,7 +1138,7 @@ function showSendUndo(request,seconds,receiver){
    }
    const failed='Undo failed. The send can still leave.';
    text.textContent=failed;
-   const warning=pause(3000).then(()=>{if(text.textContent===failed) toast.style.display='none';});
+   const warning=pause(3000,view).then(()=>{if(text.textContent===failed) toast.hidden=true;});
    resolve(response=>reportResult(response,false,warning));
   });
  });
