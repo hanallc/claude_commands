@@ -32,7 +32,7 @@ from scripts.build_queue.test_memory_feed import reservation_reading
 from scripts.buildlog import store
 from scripts.direct import progress_history
 from scripts.herdr import turn_end, worker_panes
-from scripts.lib import atomic_file, process_start, process_stop, scratch
+from scripts.lib import atomic_file, process_group, process_start, process_stop, scratch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import write_config_fixture
@@ -46,6 +46,8 @@ class KillActionTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())))
+        _ = self.enterContext(patch.object(process_stop, "CGROUP_ROOT", self.root / "cgroups"))
 
     def launch_record(self, caller: detached_runs.Caller, command: list[str],
                       launch_supervisor: Callable[[list[str], IO[bytes]], object]) -> Path:
@@ -74,9 +76,8 @@ class KillActionTests(unittest.TestCase):
         supervisor = os.getpid()
         started = process_start.process_start(supervisor)
         assert isinstance(started, process_start.Started)
-        with patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())):
-            record = self.launch_record(detached_runs.DirectorCaller(name, recipient), ["cargo", step],
-                                        lambda _argv, _log: SimpleNamespace(pid=supervisor))
+        record = self.launch_record(detached_runs.DirectorCaller(name, recipient), ["cargo", step],
+                                    lambda _argv, _log: SimpleNamespace(pid=supervisor))
         run_slice: process_stop.RunSliceIdentity = {"unit": "builds-detached-fixture.slice", "device": 1, "inode": 2,
             "path": "/user.slice/builds.slice/builds-detached.slice/builds-detached-fixture.slice"}
         route = kill_action.DetachedCommand(record, 17, "123", supervisor, started.start, run_slice)
@@ -321,15 +322,15 @@ class KillActionTests(unittest.TestCase):
             reader.settimeout(TEST_HANG_GUARD_SECS)
             environment = {name: value for name, value in os.environ.items() if name != "UNIT_DETACHED_RECORD"}
             command = [sys.executable, "-c", source, str(writer.fileno())]
-            with subprocess.Popen(command, env=environment, pass_fds=(writer.fileno(),),
-                                  start_new_session=True) as process:
+            process = subprocess.Popen(command, env=environment, pass_fds=(writer.fileno(),), start_new_session=True)
+            try:
                 writer.close()
-                try:
-                    with reader.makefile("rb") as stream:
-                        yield process, stream
-                finally:
-                    with suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
+                with reader.makefile("rb") as stream:
+                    yield process, stream
+            finally:
+                with suppress(ProcessLookupError):
+                    process_group.send_process_group(process.pid, signal.SIGKILL)
+                _ = process.wait(TEST_HANG_GUARD_SECS)
 
     def stop_outside_process(self, pid: int, *, words: str = "") -> tuple[kill_action.KillResult, list[str]]:
         started = process_start.process_start(pid)
@@ -670,9 +671,9 @@ with socket.socket(fileno=int(sys.argv[1])) as peer:
         listener.listen(1)
         listener.settimeout(TEST_HANG_GUARD_SECS)
         port = cast(tuple[str, int], listener.getsockname())[1]
-        command = [sys.executable, "-c", """
+        command = [sys.executable, "-c", f"""
 import signal, socket, sys
-with socket.create_connection(("127.0.0.1", int(sys.argv[1]))) as peer:
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), {TEST_HANG_GUARD_SECS}) as peer:
     def finish(*_):
         peer.sendall(b"t")
         sys.exit(0)
@@ -704,17 +705,30 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
 """, *argv[-3:]], stdin=subprocess.DEVNULL, stdout=log,
                 stderr=subprocess.STDOUT, start_new_session=True)
             supervisors.append(process)
-            self.addCleanup(process.wait, TEST_HANG_GUARD_SECS)
+            self.addCleanup(self.reap_fixture_supervisor, process)
             return process
 
-        with patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
-            path = self.launch_record(caller, command, supervise)
+        try:
+            with patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}):
+                path = self.launch_record(caller, command, supervise)
+            try:
+                connection = listener.accept()[0]
+            except TimeoutError as error:
+                raise AssertionError(path.with_suffix(".log").read_text()) from error
+        finally:
+            listener.close()
         (supervisor,) = supervisors
-        connection = listener.accept()[0]
         _ = self.enterContext(connection)
         connection.settimeout(TEST_HANG_GUARD_SECS)
         self.assertEqual(connection.recv(1), b"r", path.with_suffix(".log").read_text())
         return path, supervisor, connection
+
+    def reap_fixture_supervisor(self, process: subprocess.Popen[bytes]) -> None:
+        try:
+            _ = process.wait(TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            process_group.stop_process_group(process)
+            raise
 
     def test_kill_leaves_the_live_supervisor_to_finish_the_record(self) -> None:
         path, supervisor, connection = self.launch_live_run(
@@ -726,7 +740,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
         def term(_directory: int, run_slice: process_stop.RunSliceIdentity) -> None:
             self.assertEqual(run_slice, target.route.run_slice)
             self.assertEqual(worker_lifecycle.read_json_object(path)["status"], "running")
-            os.killpg(target.route.group, signal.SIGTERM)
+            process_group.send_process_group(target.route.group, signal.SIGTERM)
             self.assertEqual(connection.recv(1), b"")
             _ = events.write_text("populated 0\n")
 

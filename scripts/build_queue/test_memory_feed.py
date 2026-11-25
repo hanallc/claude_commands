@@ -1705,7 +1705,8 @@ process.stdout.write(JSON.stringify({
                              "cloud" if row.get("kind") == "cloud" else str(local_position))
                     self.assertIn(f'<td class="place">{place}</td>', cell)
                     self.assertRegex(cell, r'<td class="row-action"><button type="button" class="row-add"[^>]*>.*</button></td>$')
-                    self.assertIn(f'<td class="pid">{row["pid"]}</td>', cell)
+                    pid_title = ' title="Kill is not available for this run yet"' if kind == "row" else ""
+                    self.assertIn(f'<td class="pid"{pid_title}>{row["pid"]}</td>', cell)
                     machine = str(row.get("machine") or "")
                     if kind == "wait":
                         # A queued row shows a dim icon for each machine that can take it.
@@ -2545,6 +2546,7 @@ const data = {payload};
 const fetch = async () => ({{ok:true, json:async()=>data}});
 const consoleHidden = () => false, paused = false;
 const render = () => {{}}, level = () => "ok", latest = data, $ = () => node();
+const nextKillRead = Infinity;
 const reportVersion = data.report_version;
 const refresh = createPageRefresh(tick);
 (async () => {{

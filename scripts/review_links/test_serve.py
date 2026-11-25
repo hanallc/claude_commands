@@ -8665,6 +8665,7 @@ class ServerStartupTests(unittest.TestCase):
 class ReviewLinksConfigTests(unittest.TestCase):
     def test_service_polls_read_settings_only_when_a_check_is_due(self) -> None:
         server = serve.ReviewLinksServer.__new__(serve.ReviewLinksServer)
+        server.kill_actions = cast(kill_action.KillActions, Mock(spec=kill_action.KillActions))
         server.mode = serve.ServerMode.LIVE
         server.next_attachment_retry = 105.0
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
