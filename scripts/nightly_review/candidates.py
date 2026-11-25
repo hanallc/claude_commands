@@ -40,6 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
+from scripts.console_text import check as console_text
+
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import conf
 
@@ -286,6 +288,8 @@ def record(report: Path) -> int:
                                              + r"(?: \[gain/week: [^\]]+\])?(?: \[by: [^\]]+\])? — (?:proposed|deferred|accepted|declined|done|relayed)(?:[ ,].*)?")
                 if any(complete_record.fullmatch(line) is not None for line in known):
                     continue
+                console_text.require((candidate.title, candidate.scope, candidate.gain_text),
+                                     "efficiency candidate")
                 # A stopped append can leave just the heading or part of its final state.
                 known = [line for line in known if not candidate.line.startswith(line) or not line]
                 known.append(candidate.line)
@@ -297,7 +301,7 @@ def record(report: Path) -> int:
                 write_text_atomic(ledger, "\n".join(known) + "\n")
             open_candidates = ordered(known)
             write_note(table(open_candidates) if open_candidates else "no open candidates")
-    except OSError as error:
+    except (ValueError, OSError) as error:
         print(f"candidates: {error}", file=sys.stderr)
         return 1
     return 0
@@ -334,6 +338,7 @@ def record_outcome(identity: str, state: str, applied: str, ledger: Path, *, wai
         if not unchanged and open_candidate(line) is None:
             raise OutcomeRefused(f"E{index + 1} is not an open candidate in {ledger}")
         if reason:
+            console_text.require(reason, "efficiency candidate", refusal=OutcomeRefused)
             _ = efficiency_reviews.record(ledger, f"E{found['number']}", "Deferred: " + reason, review_events.KeepMark(),
                                           who="filer", waiting_why=reason)
         if unchanged:

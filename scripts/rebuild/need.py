@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -350,8 +350,20 @@ def active_system(output: str, log: str = "") -> ActiveSystem | None:
     return unknown
 
 
+def resolve_legacy_commit(commit: str, nixos_repo: Path, run: Callable[[list[str]], str]) -> str:
+    """Resolve a unique abbreviated need hash to a commit."""
+    if not SHORT_COMMIT.fullmatch(commit):
+        return ""
+    git = ["git", "-C", str(nixos_repo), "rev-parse"]
+    resolved = run([*git, "--verify", "--quiet", "--end-of-options", f"{commit}^{{commit}}"])
+    if (FULL_NEED_COMMIT.fullmatch(resolved) and resolved.startswith(commit)
+            and run([*git, f"--disambiguate={commit}"]) == resolved):
+        return resolved
+    return ""
+
+
 def clear_running_needs(machine: Machine, system: ActiveSystem, nixos_repo: Path,
-                        run: Callable[[list[str]], str]) -> None:
+                        run: Callable[[list[str]], str], *, legacy_commits: Mapping[str, str] | None = None) -> None:
     """Archive requests covered by the clean active revision."""
     revision = system.revision
     if not system.evidence or not REVISION.fullmatch(revision):
@@ -362,13 +374,11 @@ def clear_running_needs(machine: Machine, system: ActiveSystem, nixos_repo: Path
         if record["machine"] != machine:
             continue
         commit = record["nixos_commit"]
-        if not FULL_NEED_COMMIT.fullmatch(commit):
-            resolved = run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
-                            f"{commit}^{{commit}}"])
-            if (not FULL_NEED_COMMIT.fullmatch(resolved) or not resolved.startswith(commit)
-                    or run(["git", "-C", repo, "rev-parse", f"--disambiguate={commit}"]) != resolved):
+        if SHORT_COMMIT.fullmatch(commit):
+            commit = (resolve_legacy_commit(commit, nixos_repo, run) if legacy_commits is None
+                      else legacy_commits.get(commit, ""))
+            if not commit:
                 continue
-            commit = resolved
         base = run(["git", "-C", repo, "merge-base", commit, revision])
         if base == commit:
             _archive(record, commit, system.evidence)
@@ -392,13 +402,18 @@ def clear_needs(machine: Machine, generations: Path, nixos_repo: Path) -> None:
         clear_running_needs(machine, system, nixos_repo, command_output)
 
 
-def command_output(command: list[str], *, timeout: int = 30) -> str:
-    """Return command output when the command succeeds within its time limit."""
+def command_result(command: list[str], *, timeout: int = 30) -> str | None:
+    """Return stdout on success and None on failure."""
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return result.stdout.strip(" \t\r\n") if result.returncode == 0 else ""
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def command_output(command: list[str], *, timeout: int = 30) -> str:
+    """Return command output when the command succeeds within its time limit."""
+    return (command_result(command, timeout=timeout) or "").strip(" \t\r\n")
 
 
 class Arguments(argparse.Namespace):

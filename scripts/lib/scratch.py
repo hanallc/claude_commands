@@ -835,6 +835,17 @@ def new(task: str = "", word: str = "", now: float | None = None, *,
             return path
 
 
+@contextmanager
+def temporary_folder(word: str) -> Generator[Path]:
+    """Own one private scratch folder and remove it when the scope ends."""
+    path = new(word=word, throwaway=True)
+    try:
+        path.chmod(0o700)
+        yield path
+    finally:
+        remove(path)
+
+
 def worker_task(staff_id: str) -> str:
     """Name the task that owns one worker's assignment folders."""
     return f"gate:worker-{staff_id}"

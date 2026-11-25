@@ -47,7 +47,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -82,7 +82,7 @@ from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, gate_job_for_command, gate_job_from_process, gate_natedev_only_flag,
     gate_target_kind, read_step_names,
@@ -90,8 +90,8 @@ from scripts.lib.build_steps import (
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
-    affected_modules, change_review, land_runs, nightly_schedule, session_staff, showrunners, staff,
-    unit_config, unit_lookup, unit_names,
+    affected_modules, change_review, land_runs, nightly_schedule, promotion, session_staff,
+    showrunners, staff, unit_config, unit_lookup, unit_names,
 )
 from scripts.production.gate_modules import GateRefused, discover_test_modules, is_test_module, test_module_name
 from scripts.production.gate_routes import (
@@ -172,7 +172,7 @@ os.execvp(sys.argv[1], sys.argv[1:])
 @dataclass
 class GateArguments(argparse.Namespace):
     """Typed command-line boundary; merge fields are validated before use."""
-    repo: str = ""
+    repo: str = field(default_factory=lambda: str(Path.cwd()))
     merge_branch: str = ""
     unit_branch: str = ""
     checkpoint: str = ""
@@ -181,12 +181,12 @@ class GateArguments(argparse.Namespace):
     production: str = ""
     unit: str = ""
     phase: str = ""
-    body: str = ""
+    body: str = "The full suite verified this checkpoint."
     promote: bool = False
-    main_repo: str = ""
-    ssh: str = ""
-    mac_host: str = ""
-    mac_repo: str = ""
+    main_repo: str = "~/.claude"
+    ssh: str = "ssh"
+    mac_host: str = "mac"
+    mac_repo: str = "~/.claude"
     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     affected: bool = False
     tests_only: bool = False
@@ -195,6 +195,8 @@ class GateArguments(argparse.Namespace):
     nightly: bool = False
     modules: list[str] = field(default_factory=list)
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    enrolled: bool = False
+    legacy_direct_main: bool = False
     command: tuple[str, ...] = ()
     prepared_copy: bool = False
 
@@ -679,6 +681,10 @@ class HeldGateToken:
     value: str
 
 
+class RollbackRecoveryRefused(GateRefused):
+    """The resources are free, but the checkout still needs rollback."""
+
+
 @dataclass
 class GateRecovery:
     """Own the resources and merge baseline of one gate process."""
@@ -790,21 +796,22 @@ class GateRecovery:
             report_retained_gate_folder(folder, "the gate owner ended")
         if self.rollback:
             repo = Path(self.repo)
-            with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
-                    return
-                _ = cleanup.enter_context(scratch.copy_lock(repo))
-                head = checked_git(repo, "rev-parse", "HEAD")
-                if head not in (self.rollback, self.rollback_head):
-                    parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
-                    if parents != [self.rollback, self.rollback_source]:
-                        raise GateRefused(f"gate recovery kept {self.path}: HEAD {head} differs from the recorded merge")
-                rollback_merge(repo, self.rollback)
-                self.rollback = ""
-                self.save()
+            try:
+                with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
+                        return
+                    _ = cleanup.enter_context(scratch.copy_lock(repo))
+                    rollback_merge(repo, self.rollback, checkpoint=self.rollback_source,
+                                   recorded_merge=self.rollback_head, recovery=self)
+                    self.rollback = ""
+                    self.save()
+            except (GateRefused, copies.CopyError, scratch.ScratchError, OSError, subprocess.SubprocessError) as error:
+                if self.groups or self.tokens:
+                    raise
+                raise RollbackRecoveryRefused(f"gate recovery kept {self.path} for {repo}: {error}") from error
             print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
         self.finish()
 
@@ -826,8 +833,9 @@ class NoGateRecovery:
     """No gate owns resources in this calling context."""
 
 
+NO_GATE_RECOVERY = NoGateRecovery()
 ACTIVE_GATE_RECOVERY: ContextVar[GateRecovery | NoGateRecovery] = ContextVar(
-    "merge_gate_recovery", default=NoGateRecovery())
+    "merge_gate_recovery", default=NO_GATE_RECOVERY)
 _reported_foreign_gate_refusals: set[tuple[int, Path]] = set()
 
 
@@ -837,20 +845,28 @@ def gate_run_directory(repo: Path) -> Path:
 
 
 def recover_gate_runs(repo: Path) -> None:
+    requested_checkout = str(repo.resolve())
     current = ACTIVE_GATE_RECOVERY.get()
-    if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
+    if isinstance(current, GateRecovery) and current.repo == requested_checkout and current.pid == os.getpid():
         return
     own_directory = gate_run_directory(repo)
     root = own_directory.parent
     if not root.exists():
         return
+    refusals: list[str] = []
     for directory in sorted(root.iterdir()):
         if directory.is_dir():
-            recover_gate_directory(directory, own_directory=own_directory)
+            try:
+                recover_gate_directory(directory, own_directory=own_directory)
+            except RollbackRecoveryRefused as error:
+                refusals.append(str(error))
+    if refusals:
+        raise RollbackRecoveryRefused("\n".join(refusals))
 
 
 def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
     """Recover dead owners while holding the directory lock."""
+    refusals: list[GateRefused] = []
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -859,7 +875,8 @@ def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
                 recover_gate_record(path)
             except GateRefused as error:
                 if directory == own_directory:
-                    raise
+                    refusals.append(error)
+                    continue
                 report_key = (os.getpid(), path)
                 if report_key not in _reported_foreign_gate_refusals:
                     reason = " ".join(str(error).splitlines())
@@ -867,6 +884,11 @@ def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
                     _reported_foreign_gate_refusals.add(report_key)
     finally:
         os.close(descriptor)
+    if refusals:
+        message = "\n".join(str(error) for error in refusals)
+        if all(isinstance(error, RollbackRecoveryRefused) for error in refusals):
+            raise RollbackRecoveryRefused(message)
+        raise GateRefused(message)
 
 
 def recover_gate_record(path: Path) -> None:
@@ -1163,7 +1185,7 @@ def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
 
 def failure_log_tail(output: str) -> str:
     """Keep the same output limit as the saved failure log."""
-    limit = conf.read("test_times").whole("GATE_FAILURE_LOG_KIB") * 1024
+    limit = conf.read("test_times").whole("gate_failure_log_kib") * 1024
     return output.encode("utf-8")[-limit:].decode("utf-8", errors="replace")
 
 
@@ -2318,6 +2340,19 @@ def promotion_edit_conflict(repo: Path, target: str, waiting: str = "") -> str:
     return ""
 
 
+def live_file_refusal(repo: Path, target: str) -> str:
+    """Report all conflicts between the incoming tree and enrolled live files."""
+    from scripts.production.production_doc import ProductionPathsError, live_file_conflicts
+
+    try:
+        conflicts = live_file_conflicts(repo, target)
+    except ProductionPathsError as error:
+        return f"cannot verify live files: {error}"
+    if conflicts:
+        return "incoming tree conflicts with live production files\n" + "\n".join(map(str, conflicts))
+    return ""
+
+
 def live_state_refusal(repo: Path, target: str) -> str:
     """Run the target tree's live state checks before its code is installed."""
     with tempfile.TemporaryDirectory(prefix="promotion-state-") as temporary:
@@ -2389,6 +2424,20 @@ def push_record_path(repo: Path, operation: str, source: str) -> Path:
     return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
 
 
+def promotion_record_path(repo: Path, branch: str, tip: str) -> Path:
+    return push_record_path(repo, "promotion", f"{branch}:{tip}")
+
+
+def promotion_retry_record(source: Path, main: Path, branch: str, tip: str) -> RecordedPush | NoRecordedPush:
+    """Find the receipt for the local tip in either checkout."""
+    for checkout in dict.fromkeys((source, main)):
+        for path in (promotion_record_path(checkout, branch, tip), push_record_path(checkout, "promotion", branch)):
+            record = read_push_record(path)
+            if isinstance(record, RecordedPush) and record.commit == tip and record.source_commit == tip:
+                return record
+    return NoRecordedPush()
+
+
 def read_push_record(path: Path) -> RecordedPush | NoRecordedPush:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -2419,9 +2468,11 @@ def write_push_record(path: Path, record: RecordedPush) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
+def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str, *, legacy: Path | None = None) -> str:
     """Trust only this checkpoint's recorded merge, with its original parents."""
     record = read_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint))
+    if isinstance(record, NoRecordedPush) and legacy is not None:
+        record = read_push_record(push_record_path(legacy, "checkpoint", origin + ":" + checkpoint))
     if isinstance(record, NoRecordedPush):
         return origin
     head = checked_git(repo, "rev-parse", "HEAD")
@@ -2436,54 +2487,76 @@ def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
 
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
+    from scripts.production.checkpoint_gate import Stop
+
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
+    source = Path(args.repo).expanduser().resolve() if args.enrolled else main_repo
     hold = BuildHoldWait()
     hold.wait_until_free()
     wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
     hold.wait_until_free()
-    with main_push_lock.main_push_lock(main_repo):
-        fetch_branches(main_repo, "main", args.merge_branch)
-        head = checked_git(main_repo, "rev-parse", "HEAD")
-        origin = checked_git(main_repo, "rev-parse", "origin/main")
-        path = push_record_path(main_repo, "promotion", args.merge_branch)
-        target = checked_git(main_repo, "rev-parse", f"origin/{args.merge_branch}")
+    with main_push_lock.main_push_lock(source):
+        fetch_branches(source, "main", args.merge_branch)
+        head = checked_git(source, "rev-parse", "refs/heads/main")
+        origin = checked_git(source, "rev-parse", "origin/main")
+        target = checked_git(source, "rev-parse", f"origin/{args.merge_branch}")
         if head != origin:
-            record = read_push_record(path)
-            if (not isinstance(record, RecordedPush) or head != record.commit
-                    or record.source_commit != record.commit
-                    or git(main_repo, "merge-base", "--is-ancestor", origin, head).returncode
-                    or git(main_repo, "merge-base", "--is-ancestor", head, target).returncode):
+            record = promotion_retry_record(source, main_repo, args.merge_branch, head)
+            if (isinstance(record, NoRecordedPush)
+                    or git(source, "merge-base", "--is-ancestor", origin, head).returncode
+                    or git(source, "merge-base", "--is-ancestor", head, target).returncode):
                 raise GateRefused("main HEAD differs from origin/main")
-            target = record.commit
-        if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
+        if git(source, "merge-base", "--is-ancestor", origin, target).returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
+        if refusal := live_file_refusal(source, target):
+            raise GateRefused(refusal)
         if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
-        if refusal := live_state_refusal(main_repo, target):
+        if refusal := live_state_refusal(source, target):
             raise GateRefused(refusal)
-        write_push_record(path, RecordedPush(origin, target, target))
+
+        def install(approved: promotion.ApprovedPromotion) -> None:
+            # Save the receipt before the ref update. A retry can verify the local tip.
+            path = promotion_record_path(source, args.merge_branch, approved.sha)
+            if not create_text_atomic(path, json.dumps({"base": origin, "commit": approved.sha, "source_commit": approved.sha})):
+                existing = read_push_record(path)
+                if not isinstance(existing, RecordedPush) or existing.commit != approved.sha or existing.source_commit != approved.sha:
+                    raise GateRefused(f"promotion receipt changed: {path}")
+            try:
+                approved.install(main_repo, head)
+            except (OSError, UnicodeError) as error:
+                raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
+            landed = approved.land(source)
+            print(land_main.hook_report(landed.hook), flush=True)
+
         try:
-            waiting_rows.move_to(main_repo, target)
-        except (OSError, UnicodeError) as error:
-            raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
-        try:
-            landed = land_main.land(main_repo, target)
-        except land_main.LandError as error:
+            if args.legacy_direct_main:
+                published = promotion.publish_legacy_main(source, target, install)
+            else:
+                document = change_review.production_doc(args.production)
+                published = promotion.publish(promotion.CollectedCi(document), source, args.merge_branch, target, install)
+        except (Stop, change_review.ChangeReviewError, land_main.LandError, ValueError) as error:
             raise GateRefused(str(error)) from error
-        print(land_main.hook_report(landed.hook), flush=True)
-        promoted = checked_git(main_repo, "rev-parse", "HEAD")
+    promote_mac(args, main_repo, published)
+
+
+def promote_mac(args: GateArguments, main_repo: Path, published: promotion.PublishedMain) -> None:
+    promoted = published.sha
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + f" {shlex.quote(promoted)}"
     waiting = shlex.quote(waiting_rows.WAITING_PATHS)
     remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
+              f"if git merge-base --is-ancestor {shlex.quote(promoted)} HEAD; then "
               "if [ -f scripts/lib/waiting_rows.py ]; "
-              f"then {check} {waiting} && scripts/lib/py scripts/lib/waiting_rows.py fast-forward origin/main; "
-              f"else {check} && git merge --ff-only -q origin/main; fi); rc=$?; "
+              "then scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; fi; "
+              "elif [ -f scripts/lib/waiting_rows.py ]; "
+              f"then {check} {waiting} && scripts/lib/py scripts/lib/waiting_rows.py fast-forward {shlex.quote(promoted)}; "
+              f"else {check} && git merge --ff-only -q {shlex.quote(promoted)}; fi); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
         result = subprocess.run([args.ssh, args.mac_host, remote],
@@ -2498,23 +2571,93 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {detail}; the claude-sync job on the Mac retries within 15 minutes")
 
 
-def rollback_merge(repo: Path, baseline: str) -> None:
-    if git(repo, "rev-parse", "--verify", "MERGE_HEAD").returncode == 0:
-        _ = git(repo, "merge", "--abort")
-    merged = checked_git(repo, "rev-parse", "HEAD")
-    result = git(repo, "reset", "--keep", baseline)
-    if result.returncode == 0:
-        return
-    # The checkout started clean. Tracked edits created during the gate belong
-    # to this run; restore them to the merge tree before retrying once.
-    changed = checked_git(repo, "diff", "HEAD", "--name-only", "-z").split("\0")
-    tracked = [path for path in changed if path]
+@contextmanager
+def hold_rollback_head(repo: Path, baseline: str, head: str) -> Generator[None]:
+    """Prepare the ref change and commit it after the tree update."""
+    operation = f"verify HEAD {baseline}" if head == baseline else f"update HEAD {baseline} {head}"
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as errors:
+        with subprocess.Popen(["git", "update-ref", "-m", "gate rollback", "--stdin"], cwd=repo, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=errors, text=True,
+                              errors="replace", pass_fds=copies.COMMAND_LOCKS.get()) as transaction:
+            input_stream = transaction.stdin
+            assert input_stream is not None
+            output = cast(TextIO, transaction.stdout)
+
+            def reply(commands: str) -> str:
+                with suppress(BrokenPipeError):
+                    _ = input_stream.write(commands + "\n")
+                    input_stream.flush()
+                return output.readline()
+
+            action = "prepare"
+            try:
+                response = reply("start")
+                if response == "start: ok\n":
+                    response = reply(f"{operation}\nprepare")
+                if response == "prepare: ok\n":
+                    try:
+                        yield
+                    except BaseException as error:
+                        aborted = reply("abort")
+                        if aborted != "abort: ok\n":
+                            error.add_note(f"Git did not confirm the rollback abort. {aborted.strip()}")
+                        raise
+                    action = "commit"
+                    response = reply("commit")
+                    if response == "commit: ok\n":
+                        return
+            finally:
+                # Git aborts an open transaction at EOF.
+                with suppress(BrokenPipeError):
+                    input_stream.close()
+            response = (response + output.read()).strip()
+        _ = errors.seek(0)
+        detail = "\n".join(part for part in (response, errors.read().strip()) if part)
+    raise rollback_failure(repo, head, f"cannot {action} the rollback ref transaction: {detail}")
+
+
+def rollback_failure(repo: Path, merged: str, detail: str) -> GateRefused:
+    blocking = git(repo, "status", "--porcelain", "--untracked-files=all").stdout.strip()
+    return GateRefused(f"merge NOT undone; merge commit {merged}; blocking files: {blocking or detail}; {detail}")
+
+
+def restore_rollback_files(repo: Path, merged: str) -> None:
+    staged = checked_git(repo, "diff", "--cached", merged, "--no-renames", "--name-only", "-z")
+    dirty = checked_git(repo, "diff", "--no-renames", "--name-only", "-z")
+    tracked = sorted(set(staged.split("\0") + dirty.split("\0")) - {""})
     if tracked:
-        _ = git(repo, "restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked)
-    result = git(repo, "reset", "--keep", baseline)
-    if result.returncode:
-        blocking = git(repo, "status", "--porcelain", "--untracked-files=all").stdout.strip()
-        raise GateRefused(f"merge NOT undone; merge commit {merged}; blocking files: {blocking or result.stderr.strip()}; {result.stderr.strip()}")
+        _ = checked_git(repo, "--literal-pathspecs", "restore", f"--source={merged}",
+                        "--staged", "--worktree", "--", *tracked)
+
+
+def rollback_merge(repo: Path, baseline: str, *, checkpoint: str = "", recorded_merge: str = "",
+                   recovery: GateRecovery | NoGateRecovery = NO_GATE_RECOVERY) -> None:
+    head = checked_git(repo, "rev-parse", "HEAD")
+    if head not in (baseline, recorded_merge):
+        if recorded_merge or (checkpoint and checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
+                              != [baseline, checkpoint]):
+            raise GateRefused(f"rollback kept HEAD {head}: it differs from the gate merge")
+    merged = recorded_merge or head
+    # Keep the source tree in the record until the ref transaction ends.
+    if head != baseline and isinstance(recovery, GateRecovery) and recovery.rollback_head != merged:
+        recovery.rollback_head = merged
+        recovery.save()
+    with hold_rollback_head(repo, baseline, head):
+        pending = git(repo, "rev-parse", "--verify", "MERGE_HEAD")
+        if pending.returncode == 0:
+            if pending.stdout.strip() != checkpoint or git(repo, "rev-parse", "--verify", "MERGE_AUTOSTASH").returncode == 0:
+                raise GateRefused("rollback kept the pending merge: the gate cannot undo it")
+            restore_rollback_files(repo, merged)
+        result = git(repo, "read-tree", "-m", "-u", merged, baseline)
+        if result.returncode:
+            # Remove tracked edits from the gate before Git tries the tree update again.
+            restore_rollback_files(repo, merged)
+            result = git(repo, "read-tree", "-m", "-u", merged, baseline)
+        if result.returncode:
+            raise rollback_failure(repo, merged, failure_detail(result))
+        _ = checked_git(repo, "read-tree", "--reset", baseline)
+        if pending.returncode == 0:
+            _ = checked_git(repo, "merge", "--quit")
 
 
 def notify_style(repo: Path, branch: str, tip: str) -> None:
@@ -2551,12 +2694,18 @@ def check_local_doc_commits(repo: Path, origin: str) -> None:
         print(f"Local doc commit goes out with this merge: {hashes.split()[0][:12]} {subject}", flush=True)
 
 
+def merge_for_gate(repo: Path, checkpoint: str, message: str) -> str:
+    result = git(repo, "merge", "--no-overwrite-ignore", "--no-ff", "-m", message, checkpoint)
+    if result.returncode:
+        conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
+        raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}")
+    return checked_git(repo, "rev-parse", "HEAD")
+
+
 def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     hold = BuildHoldWait()
     hold.wait_until_free()
-    repo = Path(str(args.repo)).resolve()
-    # Untracked files (each showrunner's LOG) never block; a merge that would
-    # overwrite one fails on its own and is aborted.
+    repo = Path(args.repo).expanduser().resolve()
     if checked_git(repo, "status", "--porcelain", "--untracked-files=no"):
         raise GateRefused("merge checkout has uncommitted tracked changes")
     if checked_git(repo, "branch", "--show-current") != args.merge_branch:
@@ -2565,7 +2714,8 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     baseline = checked_git(repo, "rev-parse", "HEAD")
     checkpoint = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.checkpoint}^{{commit}}")
     origin = f"origin/{args.merge_branch}"
-    check_local_doc_commits(repo, checkpoint_retry_origin(repo, origin, checkpoint))
+    legacy = Path(args.main_repo).expanduser() if args.enrolled else None
+    check_local_doc_commits(repo, checkpoint_retry_origin(repo, origin, checkpoint, legacy=legacy))
     previous = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.previous_checkpoint}^{{commit}}")
     if git(repo, "merge-base", "--is-ancestor", checkpoint, f"origin/{args.unit_branch}").returncode:
         raise GateRefused("checkpoint is not on origin unit branch")
@@ -2585,30 +2735,31 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
             _ = change_review.publication_changes(commits, production, known_producer=producer)
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
+    preview = git(repo, "merge-tree", "--write-tree", "--name-only", baseline, checkpoint)
+    if preview.returncode not in (0, 1) or not preview.stdout:
+        raise GateRefused(f"cannot preview checkpoint merge: {failure_detail(preview)}")
+    if refusal := live_file_refusal(repo, preview.stdout.splitlines()[0]):
+        raise GateRefused(refusal)
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     recovery = ACTIVE_GATE_RECOVERY.get()
+    merged = ""
     if isinstance(recovery, GateRecovery):
         recovery.rollback = baseline
-        recovery.rollback_head = baseline
+        recovery.rollback_head = merged
         recovery.rollback_source = checkpoint
         recovery.save()
     try:
         hold.wait_until_free()
-        result = git(repo, "merge", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
-        if result.returncode:
-            conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
-            abort = git(repo, "merge", "--abort")
-            raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
-                              + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
-        merged = checked_git(repo, "rev-parse", "HEAD")
+        receipt = push_record_path(repo, "checkpoint", origin + ":" + checkpoint)
+        message = f"{subject}\n\n{args.body}"
+        merged = merge_for_gate(repo, checkpoint, message)
         if isinstance(recovery, GateRecovery):
             recovery.rollback_head = merged
             recovery.save()
         if isinstance(producer, str):
             change_review.record_merge_producer(change_review.KnownMergeProducer(merged, producer))
         if merged != baseline:
-            write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
-                              RecordedPush(baseline, merged, checkpoint))
+            write_push_record(receipt, RecordedPush(baseline, merged, checkpoint))
         previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
         os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
@@ -2624,15 +2775,19 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
             if suites.time_limit_report:
                 tell_time_limit(args.unit, repo, suites)
             raise GateRefused("RED: " + (suites.time_limit_report or "types or suites failed"))
+        if checked_git(repo, "rev-parse", "HEAD") != merged:
+            raise GateRefused(f"checkout changed after the gate selected {merged}")
         fetch_branches(repo, "main")
-        if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
+        if git(repo, "merge-base", "--is-ancestor", "origin/main", merged).returncode:
             raise GateRefused("origin/main is not an ancestor of the merge branch")
         hold.wait_until_free()
+        if refusal := live_file_refusal(repo, merged):
+            raise GateRefused(refusal)
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
         try:
-            rollback_merge(repo, baseline)
+            rollback_merge(repo, baseline, checkpoint=checkpoint, recorded_merge=merged, recovery=recovery)
             if isinstance(recovery, GateRecovery):
                 recovery.rollback = ""
                 recovery.save()
@@ -2649,9 +2804,16 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     if isinstance(recovery, GateRecovery):
         recovery.rollback = ""
         recovery.save()
-    _ = checked_git(repo, "push", "origin", str(args.merge_branch))
-    notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
-    print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
+    if args.legacy_direct_main:
+        _ = checked_git(repo, "push", "origin", "main")
+    else:
+        from scripts.production.checkpoint_gate import Stop
+        try:
+            promotion.push_integration(repo, merged, args.merge_branch)
+        except Stop as error:
+            raise GateRefused(error.detail) from error
+    notify_style(repo, str(args.merge_branch), merged)
+    print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', merged)}", flush=True)
     if args.promote:
         promote(args)
     if review_list is not None:
@@ -2661,7 +2823,31 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     return 0
 
 
-def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
+def gate_production(args: GateArguments) -> Path:
+    """Resolve the publication checkout from the exact staff document."""
+    from scripts.production.production_doc import EnrolledPaths, LegacyProduction, Refusal, production_field, resolve_production_paths
+
+    try:
+        document = change_review.production_doc(args.production)
+        paths = resolve_production_paths(document)
+        merge_branch = production_field(document.read_text(encoding="utf-8").splitlines(), "Merge branch")
+        if args.merge_branch != merge_branch:
+            raise GateRefused(f"{document}: expected merge branch {merge_branch}")
+        args.legacy_direct_main = isinstance(paths, LegacyProduction) and merge_branch == "main"
+        if isinstance(paths, EnrolledPaths):
+            if promotion.is_main_branch(merge_branch):
+                raise GateRefused(f"{document}: main is not an integration branch")
+            args.repo = str(paths.integration)
+            args.main_repo = str(paths.main)
+            args.enrolled = True
+        return document
+    except change_review.ChangeReviewError as error:
+        raise GateRefused(f"{error}: the gate adds this merge's change-review rows to its list") from error
+    except Refusal as error:
+        raise GateRefused(str(error)) from error
+
+
+def change_review_list(args: GateArguments, document: Path | None = None) -> tuple[Path, Path | None]:
     """The production whose merge this is, and the list its rows go to: --change-review, else its own.
 
     The production is --production, else the calling showrunner's. Rows always name their
@@ -2670,7 +2856,7 @@ def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
     if args.change_review and not args.production:
         raise GateRefused("--change-review needs --production: every row's list names its production")
     try:
-        production = change_review.production_doc(str(args.production))
+        production = document if document is not None else change_review.production_doc(str(args.production))
     except change_review.ChangeReviewError as error:
         raise GateRefused(f"{error}: the gate adds this merge's change-review rows to its list") from error
     if args.change_review:
@@ -3893,21 +4079,21 @@ def parse_gate_arguments(arguments: Sequence[str], parser: argparse.ArgumentPars
     add_suite_arguments(parser, repo_default=repo_default)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
-    _ = parser.add_argument("--body", default="The full suite verified this checkpoint.")
+    _ = parser.add_argument("--body", default=GateArguments.body)
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
                             help="the production staff name (default: the calling showrunner's)")
     _ = parser.add_argument("--promote", action="store_true")
-    _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")
-    _ = parser.add_argument("--ssh", default="ssh")
-    _ = parser.add_argument("--mac-host", default="mac")
-    _ = parser.add_argument("--mac-repo", default="~/.claude")
+    _ = parser.add_argument("--main-repo", "--main-checkout", default=GateArguments.main_repo)
+    _ = parser.add_argument("--ssh", default=GateArguments.ssh)
+    _ = parser.add_argument("--mac-host", default=GateArguments.mac_host)
+    _ = parser.add_argument("--mac-repo", default=GateArguments.mac_repo)
     _ = parser.add_argument("--tests-only", action="store_true")
     _ = parser.add_argument("--affected", action="store_true", help="run affected tests in a temporary test folder")
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
-                            help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
-    args = cast(GateArguments, parser.parse_args(arguments))
+                            help="promote origin/<merge-branch> to main and the Mac with a collected CI verdict")
+    args = parser.parse_args(arguments, namespace=GateArguments(repo=repo_default))
     if args.affected and (args.tests_only or args.nightly or args.promote_only or args.promote):
         parser.error("--affected cannot be combined with --tests-only, --nightly or promotion")
     if args.promote_only and not args.merge_branch:
@@ -4033,7 +4219,8 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     try:
         if args.nightly:
             args.unit = _nightly_unit(args)
-        checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
+        document = gate_production(args) if not args.nightly else None
+        checkout = Path(args.main_repo if args.promote_only and not args.enrolled else args.repo).expanduser().resolve()
         if not (args.nightly or args.promote_only):
             with gate_cleanup_scope(scratch.copy_lock(checkout), gate_recovery(checkout)):
                 return merge_checkpoint(args, target)
@@ -4046,7 +4233,7 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
                         _sweep_nightly_build_folders()
         with scratch.copy_lock(checkout):
             promote(args)
-            production, review_list = change_review_list(args)
+            production, review_list = change_review_list(args, document)
             if review_list is not None:
                 record_changes(checkout, review_list, production, args.merge_branch)
             return 0

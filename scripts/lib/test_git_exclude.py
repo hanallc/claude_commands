@@ -1,11 +1,34 @@
 """Shared excludes protect a unit file in every worktree, including clean tracked files."""
+import os
 import subprocess
+import tempfile
+from pathlib import Path
+from typing import override
+from unittest.mock import patch
 
-from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
+from scripts.lib.git_exclude import ExcludeRefused, ensure_exact_excluded, ensure_excluded, require_untracked_ignored
+from scripts.production.production_names import NOTES_DIRECTORY
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.production.unit_config_test_support import UnitConfigFixture
 
 
 class GitExcludeTests(UnitConfigFixture):
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            environment = {**fixture_git_environment(Path(folder)), "GIT_CONFIG_SYSTEM": os.devnull}
+            with patch.dict(os.environ, environment, clear=True):
+                super().setUpClass()
+
+    @override
+    def setUp(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {
+            **fixture_git_environment(folder), "GIT_CONFIG_SYSTEM": os.devnull,
+        }, clear=True))
+        super().setUp()
+
     def test_preview_and_writer_agree_when_shared_rules_end_with_a_negation(self) -> None:
         for existing, refused in (("/.unit.toml\n!/.unit.toml\n", True),
                                   ("!/.unit.toml\n", False)):
@@ -75,3 +98,22 @@ class GitExcludeTests(UnitConfigFixture):
                 ensure_excluded(checkout, pattern)
         self.assertEqual(list(outside.iterdir()), [])
         self.assertNotIn("/one", self.exclude.read_text())
+
+    def test_production_paths_are_untracked_and_ignored(self) -> None:
+        source = Path(__file__).resolve().parents[2] / ".gitignore"
+        _ = (self.worktree / ".gitignore").write_bytes(source.read_bytes())
+        notes = f"{NOTES_DIRECTORY}/fixture/"
+        for relative in (notes, "docs/plans/fixture-production-live.md", "docs/plans/fixture-log.md",
+                         "projects/sample/memory/notes.md", "plans/fixture.md", "todos/session.json",
+                         "tasks/session/task.json", "teams/session/config.json",
+                         "projects/sample/session.jsonl", "projects/sample/session/tool-results/result.txt",
+                         "sessions/session.json", "state/session/session.json", "history.jsonl",
+                         "file-history/session/file", "session-env/session/file", "shell-snapshots/shell.sh",
+                         "paste-cache/file", "uploads/file", "config/showrunners.json", "config/accounts.lock",
+                         "config/models.conf.tmp"):
+            with self.subTest(path=relative):
+                if relative == notes:
+                    (self.worktree / notes).mkdir(parents=True)
+                    ensure_exact_excluded(self.worktree, notes)
+                    self.assertIn("/" + notes, self.exclude.read_text().splitlines())
+                require_untracked_ignored(self.worktree, relative)

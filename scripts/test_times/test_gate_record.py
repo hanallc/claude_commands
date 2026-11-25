@@ -45,11 +45,11 @@ class GateRecordTests(unittest.TestCase):
             "CONF_DIR": str(self.config), "BUILDLOG_DIR": str(self.buildlog),
             "HOME": str(self.root / "home"),
         }))
-        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=0.5")
+        _ = write_config_fixture(self.config / "test_times.conf", "slow_test_s=0.5")
 
     def test_time_limits_use_passing_history_on_the_same_vcpu_count(self) -> None:
-        _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=3")
+        _ = write_config_fixture(self.config / "gate.conf", "gate_time_limit_factor=2")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_runs=3")
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         index.create_schema(connection)
@@ -80,15 +80,15 @@ class GateRecordTests(unittest.TestCase):
             with self.subTest(missing=missing):
                 self.assertIsInstance(gate_record.history_time_limit(connection, 8, [*modules, *missing], 2, True),
                                       gate_record.NoGateTimeLimit)
-        _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=3")
+        _ = write_config_fixture(self.config / "gate.conf", "gate_time_limit_factor=3")
         self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(60))
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_runs=1")
         self.assertEqual(gate_record.history_time_limit(connection, 8, (), 2, False), gate_record.GateTimeLimit(90))
 
     def test_full_time_limit_uses_only_runs_with_the_same_job_count(self) -> None:
         """A 16-job run on natedev never takes its limit from 32-job cloud runs on the same vCPU count."""
-        _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=1.5")
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=5")
+        _ = write_config_fixture(self.config / "gate.conf", "gate_time_limit_factor=1.5")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_runs=5")
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         index.create_schema(connection)
@@ -107,8 +107,8 @@ class GateRecordTests(unittest.TestCase):
 
     def test_full_time_limit_skips_runs_of_the_type_check_alone(self) -> None:
         """Five passing --full runs of the type check alone set a 175 s limit that cut the 11-15 nightly."""
-        _ = write_config_fixture(self.config / "gate.conf", "GATE_TIME_LIMIT_FACTOR=1.5")
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=5")
+        _ = write_config_fixture(self.config / "gate.conf", "gate_time_limit_factor=1.5")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_runs=5")
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         index.create_schema(connection)
@@ -236,9 +236,9 @@ class GateRecordTests(unittest.TestCase):
 
     def test_slow_threshold_reads_the_config_at_each_call(self) -> None:
         path = self.config / "test_times.conf"
-        _ = path.write_text("# range: 0..\nSLOW_TEST_S=0.75\n", encoding="utf-8")
+        _ = path.write_text("# range: 0..\nslow_test_s=0.75\n", encoding="utf-8")
         self.assertEqual(gate_record.slow_test_s(), 0.75)
-        _ = path.write_text("# range: 0..\nSLOW_TEST_S=1.25\n", encoding="utf-8")
+        _ = path.write_text("# range: 0..\nslow_test_s=1.25\n", encoding="utf-8")
         self.assertEqual(gate_record.slow_test_s(), 1.25)
 
     def test_module_runs_number_each_module_and_preserve_execution_data(self) -> None:
@@ -530,7 +530,7 @@ class GateRecordTests(unittest.TestCase):
 
     def test_gate_write_keeps_the_used_threshold_and_counts_each_module_attempt(self) -> None:
         config = self.config / "test_times.conf"
-        _ = write_config_fixture(config, "SLOW_TEST_S=0.75")
+        _ = write_config_fixture(config, "slow_test_s=0.75")
         threshold = gate_record.slow_test_s()
         first = module_times()
         first["tests_run"] = 3
@@ -550,7 +550,7 @@ class GateRecordTests(unittest.TestCase):
                                   gate_record.TimingNotApplicable(), ""),
         ]
         run["modules"] = gate_record.module_runs(executions, threshold)
-        _ = write_config_fixture(config, "SLOW_TEST_S=1.25")
+        _ = write_config_fixture(config, "slow_test_s=1.25")
         gate_record.write_gate_run(run, executions)
         entries = [entry for path in self.buildlog.glob("*/*.jsonl") for entry in store.locked_rows(path)]
         self.assertEqual(len(entries), 1)
@@ -573,7 +573,7 @@ class GateRecordTests(unittest.TestCase):
         sizes: list[int] = []
         for kib in (1, 2):
             with self.subTest(kib=kib):
-                _ = write_config_fixture(self.config / "test_times.conf", f"GATE_FAILURE_LOG_KIB={kib}")
+                _ = write_config_fixture(self.config / "test_times.conf", f"gate_failure_log_kib={kib}")
                 executions = [gate_record.Execution("tools", "nested/test_failure.py", 1.0, 0.5, 10.0, 1, "",
                                                      gate_record.NoModuleTimes("runner stopped"), output)]
                 run = gate_run()

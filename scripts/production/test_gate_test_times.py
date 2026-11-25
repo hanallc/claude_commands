@@ -66,7 +66,7 @@ class MergeGateTestTimesTests(MergeGateFixture):
         _ = write_config_fixture(config / "build_folders.conf")
         _ = write_config_fixture(config / "gate.conf")
         _ = write_config_fixture(config / "lint.conf")
-        _ = write_config_fixture(config / "test_times.conf", "SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "test_times.conf", "slow_test_s=1.0")
 
     def only_record(self) -> gate_record.GateRunRecord:
         records = self.gate_run_records()
@@ -332,7 +332,7 @@ store._write_all = stop_during_timing_append
                             result = self.run_gate("--tests-only", "--full")
                     else:
                         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "test_times.conf",
-                                                 "SLOW_TEST_S=invalid")
+                                                 "slow_test_s=invalid")
                         result = self.run_gate("--tests-only", "--full")
                     self.assertEqual(result.returncode, baseline.returncode, result.stdout + result.stderr)
                     self.assertEqual(report_without_measurements(result.stdout), report_without_measurements(baseline.stdout))

@@ -126,41 +126,6 @@ def listing_in(production_name: str, every: unit_lookup.LabeledProductions) -> U
                        every.unreadable_pane_lists, every.failures)
 
 
-class LiveUnitIds(NamedTuple):
-    """Keep unknown units and observation failures with the proved Claude IDs."""
-
-    proved_ids: list[str]
-    unknown: dict[str, session_staff.UnknownUnit]
-    failures: tuple[str, ...]
-
-
-def live_unit_ids(runner: showrunners.Showrunner) -> LiveUnitIds:
-    """Return proved Claude directors and retain unknown units."""
-    name = runner["name"]
-    try:
-        record = staff.snapshot()
-        listing = read_units(name, record=record)
-    except OSError as error:
-        reason = f"live_units: the units of {name} could not be listed: {error}"
-        print(reason, file=sys.stderr)
-        return LiveUnitIds([], {}, (reason,))
-    for line in listing.anomalies:
-        print(line, file=sys.stderr)
-    live: list[str] = []
-    unknown: dict[str, session_staff.UnknownUnit] = {}
-    for unit in listing.units:
-        if isinstance(unit.owner, session_staff.UnknownUnit):
-            unknown[unit.unit] = unit.owner
-        elif isinstance(unit.owner, session_staff.ProvedLiveUnit):
-            owner = unit.owner.owner
-            claude = owner.claude if isinstance(owner, unit_lookup.LabeledSession) else owner
-            if isinstance(claude, unit_lookup.LiveClaude):
-                member = record.by_current_session(claude.session_id)
-                if member is not None:
-                    live.append(str(member.id))
-    return LiveUnitIds(live, unknown, listing.failures)
-
-
 def main(arguments: list[str]) -> int:
     """Print one line per unit: unit id, pane, whether Claude runs (live, stopped, unknown, gone), name."""
     status = arguments[:1] == ["--status"]

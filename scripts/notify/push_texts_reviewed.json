@@ -124,18 +124,6 @@
       "time": "2026-11-01T12:00:00-05:00"
     }
   },
-  "codex.reset_ready": {
-    "long_machine": {
-      "reviewer": "opus",
-      "sha256": "1f065b1a5dcd7b40a7239274d3d8c502bfbcb27763417405c9b8168bea52fd46",
-      "time": "2026-10-14T04:26:14.156449-04:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "1f065b1a5dcd7b40a7239274d3d8c502bfbcb27763417405c9b8168bea52fd46",
-      "time": "2026-10-14T04:25:55.369515-04:00"
-    }
-  },
   "decision.choices": {
     "hana": {
       "objections": [
@@ -155,6 +143,23 @@
       "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
       "sha256": "f8044fe25f39b5647778f07a98609db9352b8c97c87404e559754757f62bde9b",
       "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
+  "hana_shot.mac_locked": {
+    "typical": {
+      "objections": [
+        {
+          "quote": "Hana screenshot waits for the Mac",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "The screenshot starts when the Mac is ready.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: nate 2026-11-24 22:41 PST on the Review page picked 'Locked now: the test runs at once, and the phone text words are OK' ('okay - i'm locking the mac now'); sdlc 22:47 PST: covered; reviewer: claude-opus-5-5",
+      "sha256": "c74fe3284561fbd52311a98fe81337704e0b74530d2411e78cd4e3c144e5292b",
+      "time": "2026-11-25T01:47:52.420368-05:00"
     }
   },
   "mac.locked": {
@@ -541,115 +546,6 @@
       "reviewer": "user-spec: nate: Approved on the Images page (item 221 before/after pair), 17:56 PST Nov 23; reviewer: claude-opus-5-5",
       "sha256": "857e2524de0dad99591b30b524f8537a3a7884781344e396b657819ce6d5acbc",
       "time": "2026-11-23T21:09:33.147416-05:00"
-    }
-  },
-  "permission.rca_fixed": {
-    "prompt": {
-      "objections": [
-        {
-          "quote": "Now: helpers use the build command that is always allowed.",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "09:01 AST",
-          "rule": "times-carry-zone"
-        },
-        {
-          "quote": "the handler session",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "cargo-liner: fixed why handler hit a check",
-          "rule": "title-names-the-stake"
-        }
-      ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "7cf2db469273d701681a79ac90b96ec6c5cc6b743b3ec9f65a2299296afa7fa4",
-      "time": "2026-11-06T06:23:55.806386-05:00"
-    },
-    "typical": {
-      "objections": [
-        {
-          "quote": "Now: a script writes that file, so the session never has to.",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "At 14:23 AST",
-          "rule": "times-carry-zone"
-        },
-        {
-          "quote": "hana: fixed why demo hit a check",
-          "rule": "title-names-the-stake"
-        }
-      ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "7cf2db469273d701681a79ac90b96ec6c5cc6b743b3ec9f65a2299296afa7fa4",
-      "time": "2026-11-06T06:23:48.742433-05:00"
-    }
-  },
-  "permission.rca_fixed_rewritten": {
-    "typical": {
-      "objections": [
-        {
-          "quote": "Now: a script writes that file.",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "14:23 AST",
-          "rule": "times-carry-zone"
-        },
-        {
-          "quote": "hana: fixed why demo hit a check",
-          "rule": "title-names-the-stake"
-        }
-      ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "d9008fdeef008c21c13d24c776a1ea37bda54cf163fa00296294b653463d1d84",
-      "time": "2026-11-06T06:24:01.951136-05:00"
-    }
-  },
-  "permission.rca_started": {
-    "prompt": {
-      "objections": [
-        {
-          "quote": "A session now finds the cause and fixes it, so this does not happen again. A second push comes when the fix is in.",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "At 09:01 AST",
-          "rule": "times-carry-zone"
-        },
-        {
-          "quote": "in the handler session",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "cargo-liner: finding why handler hit a check",
-          "rule": "title-names-the-stake"
-        }
-      ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "061af204971c2047ec7a469ce023c71a37cd03f865fc18f633003f2ce13e965f",
-      "time": "2026-11-06T06:23:42.184395-05:00"
-    },
-    "typical": {
-      "objections": [
-        {
-          "quote": "A session now finds the cause and fixes it, so this does not happen again. A second push comes when the fix is in.",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "14:23 AST",
-          "rule": "times-carry-zone"
-        },
-        {
-          "quote": "hana: finding why demo hit a check",
-          "rule": "title-names-the-stake"
-        }
-      ],
-      "reviewer": "user-spec: User 2026-11-06 via natedev: 'Why did i get this. SDLC is working.' Texts by messaging-unit from natedev's three defects; the user has not read them; reviewer: opus",
-      "sha256": "061af204971c2047ec7a469ce023c71a37cd03f865fc18f633003f2ce13e965f",
-      "time": "2026-11-06T06:23:34.421590-05:00"
     }
   },
   "quota.claude_expiry": {
@@ -1391,14 +1287,73 @@
   },
   "shutdown.restart_failed": {
     "one_long_name": {
-      "reviewer": "opus",
-      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
-      "time": "2026-11-07T12:59:46.071567-05:00"
+      "objections": [
+        {
+          "quote": "account-migration\u2026 did not start on claude3",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "claude3",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "account-migration\u2026 did not start on claude3",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "/agents resume account-migration-verification --to claude3",
+          "rule": "first-150-stand-alone"
+        }
+      ],
+      "reviewer": "user-spec: nate, brain adhoc review Nov 24 11:41 PST, \"yes\" to: title \"trunk did not start on claude4\"; action \"In the natedev session, run: /agents resume trunk --to claude4\"; no body; no message for a unit that its watchdog starts again; no-name case \"A session did not start on claude4\"; reviewer: claude-opus-5-5",
+      "sha256": "1cfa7ae480ccee94fe5f20e16b86c32c1e1b58add7362477606b0133f51022d5",
+      "time": "2026-11-24T16:23:49.297665-05:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "bf6001b8b3d7ba5f04633c8f7bb271495bece4ca7715b24d0b115a27d5c0db24",
-      "time": "2026-11-07T12:59:38.245148-05:00"
+      "objections": [
+        {
+          "quote": "trunk did not start on claude4",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "trunk did not start on claude4",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "trunk did not start on claude4",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "the body names the trunk pane or session, which the Action line does not name",
+          "rule": "push-one-action"
+        }
+      ],
+      "reviewer": "user-spec: nate, brain adhoc review Nov 24 11:41 PST, \"yes\" to: title \"trunk did not start on claude4\"; action \"In the natedev session, run: /agents resume trunk --to claude4\"; no body; no message for a unit that its watchdog starts again; no-name case \"A session did not start on claude4\"; reviewer: claude-opus-5-5",
+      "sha256": "1cfa7ae480ccee94fe5f20e16b86c32c1e1b58add7362477606b0133f51022d5",
+      "time": "2026-11-24T16:23:42.738478-05:00"
+    },
+    "unnamed": {
+      "objections": [
+        {
+          "quote": "codex2",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "A session did not start on codex2",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "A session did not start on codex2",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "In the natedev session, run: /agents resume 019b3a40-4250-7000-8000-000000000103 --to codex2",
+          "rule": "first-150-stand-alone"
+        }
+      ],
+      "reviewer": "user-spec: nate, brain adhoc review Nov 24 11:41 PST, \"yes\" to: title \"trunk did not start on claude4\"; action \"In the natedev session, run: /agents resume trunk --to claude4\"; no body; no message for a unit that its watchdog starts again; no-name case \"A session did not start on claude4\"; reviewer: claude-opus-5-5",
+      "sha256": "1cfa7ae480ccee94fe5f20e16b86c32c1e1b58add7362477606b0133f51022d5",
+      "time": "2026-11-24T16:23:56.264699-05:00"
     }
   },
   "silence.auto_off": {
