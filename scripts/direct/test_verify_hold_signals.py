@@ -92,7 +92,10 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
         # Use the signal bindings from Verify with its handler.
         signal_bindings = after_handler.split("\nif ", 1)[0]
         harness = (
-            shell_functions(VERIFY, "placement_once", "interrupt_hold_wait", "finish_exit_diagnostics")
+            shell_functions(
+                VERIFY, "placement_once", "interrupt_hold_wait", "finish_exit_diagnostics",
+                "finish_verify_temp_allocation", "close_verify_session_temp", "stop_verify_step",
+            )
             + interrupted + signal_bindings + "\n"
             + r'''
 set -eu
@@ -157,9 +160,10 @@ placement_once
 
     def verify_exit_command(self, token: Path, action: str) -> list[str]:
         harness = shell_functions(INVOKE, "close_verify_exit_stderr") + shell_functions(
-            VERIFY, "save_verify_exit_stderr", "finish_exit_diagnostics",
+            VERIFY, "first_free_fd", "save_verify_exit_stderr", "finish_exit_diagnostics",
             "run_log_tee", "start_run_log", "stop_interrupted_run_log",
-            "report_stop", "verify_exit", "verify_interrupted",
+            "report_stop", "verify_exit", "verify_interrupted", "finish_verify_temp_allocation",
+            "close_verify_session_temp", "stop_verify_step",
         ) + r'''
 RUN_LOG=$1 RUN_LOG_PIDS=() CMD=test held_token=$2 VERIFY_START_DIR=$3
 RUN_STEP_PID=""

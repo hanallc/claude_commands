@@ -35,6 +35,7 @@ from uuid import NAMESPACE_URL, uuid5
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.herdr import pane_launch
@@ -435,7 +436,7 @@ def isolated_staff_file(path: Path, environment: dict[str, str]) -> Generator[No
     with ExitStack() as contexts:
         if Path(environment["STAFF_CONFIG"]) == CHECKOUT / "config/staff.conf":
             configuration = Path(contexts.enter_context(tempfile.TemporaryDirectory(prefix="staff-config-", dir="/tmp"))) / "staff.conf"
-            _ = write_config_fixture(configuration, "PRODUCER_WORKSPACE=producers\n")
+            _ = write_config_fixture(configuration, "producer_workspace=producers\n")
             environment["STAFF_CONFIG"] = str(configuration)
         _ = contexts.enter_context(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
             "STAFF_FILE": str(path),
@@ -907,6 +908,7 @@ class StaffTestCase(unittest.TestCase):
         write_text_atomic(ssh, f"#!{sys.executable}\n{FAKE_SSH}")
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            **fixture_git_environment(self.root),
             "HOME": str(self.root / "home"),
             **interpreter_cache_environment(self.root / "cache"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -922,7 +924,7 @@ class StaffTestCase(unittest.TestCase):
             "STAFF_TEST_LOCK_NOTICE": "",
             "PYTHONDONTWRITEBYTECODE": "1",
             "STAFF_CONFIG": str(CHECKOUT / "config/staff.conf"),
-        })))
+        }, clear=True)))
         _ = os.environ.pop("CLAUDE_PYTHON", None)
         _ = self.enterContext(isolated_staff_file(self.staff_file, {}))
         _ = self.enterContext(self.machine("natedev"))
@@ -989,8 +991,8 @@ class StaffTestCase(unittest.TestCase):
         path = self.root / "staff.conf"
         write_text_atomic(path, "".join(
             f"# range: 5e-324..\n{key}={value}\n" for key, value in (
-                ("OPERATION_LOCK_SECONDS", lock_seconds),
-                ("REMOTE_SECONDS", remote_seconds),
+                ("operation_lock_seconds", lock_seconds),
+                ("remote_seconds", remote_seconds),
             )
         ))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"STAFF_CONFIG": str(path)})))

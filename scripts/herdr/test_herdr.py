@@ -871,6 +871,7 @@ class NativePaneSessionTests(StaffTestCase):
             ("new-foreign-rollout", ["codex"], launch, current, herdr.PaneSessionReport(current)),
             ("new-no-rollout", ["codex"], "", current, herdr.PaneSessionReport(current)),
             ("resume", ["codex", "resume", launch], "", "", herdr.LaunchArgument(launch)),
+            ("fork", ["codex", "fork", launch], launch, current, herdr.PaneSessionReport(current)),
         )
         for case, arguments, rollout_id, report, expected in rows:
             with self.subTest(case=case):
@@ -906,6 +907,7 @@ class NativePaneSessionTests(StaffTestCase):
             (["codex", "Explain this repository"], True, ""),
             (["codex", "--", "Explain this repository"], True, ""),
             (["codex", "--model", "test-model", "--no-alt-screen"], True, ""),
+            (["codex", "fork", launch], True, ""),
             (["codex", "--config=resume"], False, "invalid configuration value"),
             (["codex", "-cresume"], False, "invalid configuration value"),
             (["codex", '-cmodel="test-model"'], True, ""),
@@ -3403,6 +3405,198 @@ class LaunchDestinationTests(StaffTestCase):
         self.assertIn("resume prompt was not sent", result.outcome.reason)
         self.assertIn("Check the retained pane and send the resume prompt by hand.", result.outcome.reason)
 
+    def test_fork_launch_uses_a_new_tab_while_the_source_session_runs(self) -> None:
+        source = fixture_runtime_id("fork-source")
+        _ = staff.ensure("showrunner", name="source", runtime_id=source)
+        client = Mock(spec=herdr.Herdr)
+        opened = cast(Mock, client.open_tab)
+        opened.return_value = herdr.PlacedForkTab("w1:p2", "fork-terminal")
+        cast(Mock, client.command_terminal).return_value = "fork-terminal"
+        started = cast(Mock, client.start_agent)
+        started.return_value = herdr.PromptSubmissionNotRequired()
+        prepared = herdr.PreparedAgentEnvironment(self.root, {"HOME": str(self.root)},
+                                                  frozenset({"CLAUDE_CONFIG_DIR"}))
+        arguments = ["--resume", source, "--fork-session", "-n", "clone"]
+        with (patch.object(herdr, "trust_claude_launch"),
+              patch.object(herdr, "_tab_staff") as membership,
+              patch.object(herdr, "read_conversation", return_value=herdr.LiveConversation("claude", (1,))) as live):
+            launched = herdr.launch_prepared_agent("agents", herdr.ForkTab("w1:p1", "clone"),
+                prepared, "claude", arguments, herdr.NoOpeningPrompt(), 5000, agent="clone", client=client)
+        self.assertEqual(launched.pane, "w1:p2")
+        live.assert_not_called()
+        membership.assert_not_called()
+        opened.assert_called_once()
+        self.assertEqual(cast(str, opened.call_args.kwargs["after_pane"]), "w1:p1")
+        setup = cast(Mock, client.run_in_pane).call_args
+        assert setup is not None
+        self.assertEqual(setup.kwargs["terminal"], "fork-terminal")
+        command = shlex.join(cast(list[str], setup.args[1]))
+        result = subprocess.run([BASH_BINARY, "-c", command + '\nprintf "%s" "${CLAUDE_CONFIG_DIR-unset}"'],
+                                env={"CLAUDE_CONFIG_DIR": "/server/account"}, text=True,
+                                capture_output=True, check=True)
+        self.assertEqual(result.stdout, "unset")
+        self.assertIn(f"export HOME={self.root}", command)
+        self.assertIn(f"{pane_launch.CLAUDE_FORK_NAME_ENV}=clone", command)
+        started.assert_called_once_with("clone", "w1:p2", "claude", arguments, herdr.NoOpeningPrompt(), 5000,
+                                        publication=herdr.LaunchPublicationTiming.AFTER_FORK_CHECKS)
+
+    def test_failed_fork_closes_only_its_terminal_on_the_source_server(self) -> None:
+        client = herdr.Herdr("private")
+        source = "w1:p1"
+        fork = "w1:p2"
+        panes: dict[str, herdr.PaneIdentity] = {
+            source: {"pane_id": source, "terminal_id": "source-terminal", "workspace_id": "w1", "session_id": "source"},
+            fork: {"pane_id": fork, "terminal_id": "fork-terminal", "workspace_id": "w1", "session_id": None},
+        }
+
+        def run(*arguments: str) -> str:
+            self.assertEqual(arguments, ("pane", "close", fork))
+            del panes[fork]
+            return ""
+
+        failure = herdr.AgentNotStarted("fixture start failed")
+        with (patch.object(herdr, "trust_claude_launch"),
+              patch.object(herdr, "shared_session", return_value="shared"),
+              patch.object(herdr, "stop_session") as stop,
+              patch.object(herdr, "start_agent", return_value=failure),
+              patch.object(client, "open_tab", return_value=herdr.PlacedForkTab(fork, "fork-terminal")),
+              patch.object(client, "pane_row", side_effect=panes.__getitem__),
+              patch.object(client, "panes", side_effect=lambda: list(panes.values())),
+              patch.object(client, "run_in_pane"),
+              patch.object(client, "start_agent", return_value=failure),
+              patch.object(client, "run", side_effect=run) as closed):
+            result = herdr.launch_prepared_agent(client.session, herdr.ForkTab(source, "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "claude", [], herdr.NoOpeningPrompt(),
+                1_000, agent="clone", client=client)
+        self.assertIs(result.outcome, failure)
+        closed.assert_called_once_with("pane", "close", fork)
+        stop.assert_not_called()
+        self.assertEqual(list(panes), [source])
+
+    def test_failed_fork_tab_move_closes_only_the_created_terminal(self) -> None:
+        client = herdr.Herdr("private")
+        source = "w1:p1"
+        fork = "w1:p3"
+        panes: dict[str, herdr.PaneIdentity] = {
+            source: {"pane_id": source, "terminal_id": "source-terminal", "workspace_id": "w1",
+                     "tab_id": "w1:t1", "session_id": "source"},
+        }
+
+        def create(*arguments: str) -> dict[str, object]:
+            self.assertEqual(arguments[:4], ("tab", "create", "--workspace", "w1"))
+            panes[fork] = {"pane_id": fork, "terminal_id": "fork-terminal", "workspace_id": "w1",
+                           "tab_id": "w1:t3", "session_id": None}
+            return {"root_pane": {"pane_id": fork}, "tab": {"tab_id": "w1:t3"}}
+
+        def run(*arguments: str) -> str:
+            if arguments[:2] == ("pane", "close"):
+                self.assertEqual(arguments, ("pane", "close", fork))
+                del panes[fork]
+            return ""
+
+        tabs = [{"tab_id": "w1:t1"}, {"tab_id": "w1:t2"}]
+        with (patch.object(client, "pane_row", side_effect=panes.__getitem__),
+              patch.object(client, "panes", side_effect=lambda: list(panes.values())),
+              patch.object(client, "listed", return_value=tabs),
+              patch.object(client, "result", side_effect=create),
+              patch.object(client, "run", side_effect=run),
+              patch.object(client, "socket_request", side_effect=herdr_types.HerdrFailure("tab move refused")) as move,
+              patch.object(client, "run_in_pane") as setup,
+              self.assertRaisesRegex(herdr_types.HerdrFailure, "tab move refused")):
+            _ = herdr.launch_prepared_agent(client.session, herdr.ForkTab(source, "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", ["fork", "source"],
+                herdr.NoOpeningPrompt(), 1_000, agent="clone", client=client)
+        move.assert_called_once_with("tab.move", tab_id="w1:t3", insert_index=1)
+        setup.assert_not_called()
+        self.assertEqual(list(panes), [source])
+
+    def test_failed_fork_terminal_read_after_placement_closes_the_created_pane(self) -> None:
+        client = LayoutHerdr("private")
+        client.spaces.append(("w1", "fixture"))
+        _ = client.add_tab("w1", herdr.LAYOUT_PLACEHOLDER)
+        _ = client.add_tab("w1", herdr.LAYOUT_PLACEHOLDER)
+        original = list(client.tabs)
+        source = original[0]["pane_id"]
+        command_terminal = client.command_terminal
+        captured: list[tuple[str, str]] = []
+
+        def read_terminal(pane: str) -> str:
+            if captured:
+                raise TimeoutError("terminal read timed out")
+            terminal = command_terminal(pane)
+            captured.append((pane, terminal))
+            return terminal
+
+        with (patch.object(client, "command_terminal", side_effect=read_terminal),
+              patch.object(client, "run_in_pane") as setup,
+              patch.object(client, "start_agent") as start,
+              patch.object(client, "close_terminal_pane", wraps=client.close_terminal_pane) as close):
+            result = herdr.launch_prepared_agent(client.session, herdr.ForkTab(source, "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", ["fork", "source"],
+                herdr.NoOpeningPrompt(), 1_000, agent="clone", client=client)
+        self.assertIsInstance(result.outcome, herdr.AgentNotStarted)
+        (pane, terminal), = captured
+        self.assertEqual(result.pane, pane)
+        self.assertEqual(setup.call_args.kwargs["terminal"], terminal)
+        start.assert_not_called()
+        close.assert_called_once_with(pane, terminal)
+        self.assertEqual(client.tabs, original)
+
+    def test_fork_start_timeout_closes_the_verified_terminal(self) -> None:
+        client = Mock(spec=herdr.Herdr)
+        cast(Mock, client.open_tab).return_value = herdr.PlacedForkTab("w1:p2", "fork-terminal")
+        cast(Mock, client.command_terminal).return_value = "fork-terminal"
+        cast(Mock, client.start_agent).side_effect = subprocess.TimeoutExpired("agent start", 1)
+        cast(Mock, client.close_terminal_pane).return_value = True
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic):
+            result = herdr.launch_prepared_agent("fixture", herdr.ForkTab("w1:p1", "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", ["fork", "source"],
+                herdr.NoOpeningPrompt(), 1_000, agent="clone", client=client)
+        self.assertIsInstance(result.outcome, herdr.AgentNotStarted)
+        self.assertIn("fork pane closed after start failed (start timed out)", diagnostic.getvalue())
+        cast(Mock, client.close_terminal_pane).assert_called_once_with("w1:p2", "fork-terminal")
+
+    def test_fork_writes_trust_to_the_file_selected_by_its_account_environment(self) -> None:
+        home = self.root / "source-home"
+        configured = home / ".claude"
+        configured.mkdir(parents=True)
+        client = Mock(spec=herdr.Herdr)
+        cast(Mock, client.open_tab).return_value = herdr.PlacedForkTab("w1:p2", "fork-terminal")
+        cast(Mock, client.command_terminal).return_value = "fork-terminal"
+        cast(Mock, client.start_agent).return_value = herdr.PromptSubmissionNotRequired()
+        for account in ({}, {"CLAUDE_CONFIG_DIR": str(configured)}):
+            with self.subTest(account=account):
+                target = (configured if account else home) / ".claude.json"
+                alternate = (home if account else configured) / ".claude.json"
+                result = herdr.launch_prepared_agent("fixture", herdr.ForkTab("w1:p1", "clone"),
+                    herdr.PreparedAgentEnvironment(self.root, {"HOME": str(home), **account}),
+                    "claude", ["--fork-session"], herdr.NoOpeningPrompt(), 1_000, agent="clone", client=client)
+                self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+                self.assertIsInstance(herdr.claude_trust(self.root, target), herdr.Trusted)
+                self.assertFalse(alternate.exists())
+                target.unlink()
+
+    def test_codex_fork_leaves_its_source_launch_untouched_until_verification(self) -> None:
+        client = herdr.Herdr("private")
+        source = fixture_runtime_id("codex-source")
+        fork = "w1:p2"
+        arguments = ["fork", source]
+        wrong = pane_launch.launch(fork, source, str(self.root), {}, ["codex", *arguments], kind="codex")
+        with (patch.object(herdr, "Herdr", return_value=client),
+              patch.object(client, "open_tab", return_value=herdr.PlacedForkTab(fork, "fork-terminal")),
+              patch.object(client, "command_terminal", return_value="fork-terminal"),
+              patch.object(client, "run_in_pane"),
+              patch.object(client, "start_command", return_value=subprocess.CompletedProcess([], 0, "", "")) as start,
+              patch.object(client, "codex_launch", return_value=wrong),
+              patch.object(pane_launch, "write") as publish):
+            result = herdr.launch_prepared_agent(client.session, herdr.ForkTab("w1:p1", "clone"),
+                herdr.PreparedAgentEnvironment(self.root, {}), "codex", arguments, herdr.NoOpeningPrompt(),
+                1_000, agent="clone", client=client)
+        self.assertIsInstance(result.outcome, herdr.PromptSubmissionNotRequired)
+        start.assert_called_once()
+        publish.assert_not_called()
+
     def test_every_launch_keeps_the_shell_after_the_agent_returns(self) -> None:
         for kind in ("claude", "codex"):
             for purpose in ("worker", "unit", "side"):
@@ -5179,7 +5373,9 @@ class HerdrTests(unittest.TestCase):
         copy_session_modules(message)
         _ = shutil.copytree(Path(herdr.__file__).resolve().parents[1] / "lib", isolated.parent / "lib", dirs_exist_ok=True,
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
-        for relative in ("agents/worker_lifecycle.py", "production/staff.py", "agents/remote.py"):
+        for relative in ("agents/remote.py", "agents/worker_lifecycle.py", "message/session_send.py",
+                         "production/production_doc.py", "production/production_names.py",
+                         "production/showrunners.py", "production/staff.py"):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)
@@ -5565,6 +5761,22 @@ class HerdrTests(unittest.TestCase):
                        "".join(f"p{pid}\nfcwd\nn/work\n" for pid in (71, 72)))
         self.assertCountEqual([row.pid for row in herdr.herdr_processes()], [71, 72])
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
+        self.assertEqual(herdr.herdr_places({72}).placements, {72: herdr.HerdrPlace("writing", "w1:p1")})
+
+    def test_darwin_placement_filter_reads_only_the_selected_servers(self) -> None:
+        self.darwin()
+        uid = os.getuid()
+        self.darwin_process_table(f"70 1 {uid} herdr server\n71 70 {uid} codex\n"
+                                  + f"80 1 {uid} herdr server\n81 80 {uid} codex\n")
+        self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/herdr.sock\n"
+                            + f"p80\nf3\nn{self.root}/config/herdr/sessions/other/herdr.sock\n")
+        self.configure(["--session", "default", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "w1:p1"}]}}))
+        self.darwin_environment(71, "codex", "HERDR_PANE_ID=w1:p1")
+
+        self.assertEqual(herdr.herdr_places({71, 99}).placements, {71: herdr.HerdrPlace("default", "w1:p1")})
+        pane_lists = [command for command in self.commands() if command[2:4] == ["pane", "list"]]
+        self.assertEqual(pane_lists, [["--session", "default", "pane", "list"]])
 
     def test_report_batches_shell_pids_for_several_panes(self) -> None:
         panes: list[dict[str, object]] = [{"pane_id": f"w1:p{n}", "terminal_id": f"terminal-{n}",
@@ -5906,6 +6118,28 @@ class HerdrTests(unittest.TestCase):
         self.share()
         self.assertEqual(herdr.attach_hint("solo", "solo"),
                          "herdr session attach fixture, workspace solo, tab solo")
+
+    def test_open_tab_places_a_clone_after_its_source_without_moving_other_tabs(self) -> None:
+        client = self.herdr
+        source: herdr.PaneIdentity = {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+            "terminal_id": "fixture-terminal", "label": "alpha", "session_id": None}
+        tabs = [{"tab_id": "w1:t1"}, {"tab_id": "w1:t2"}]
+        result = {"root_pane": {"pane_id": "w1:p3"}, "tab": {"tab_id": "w1:t3"}}
+        fork: herdr.PaneIdentity = {**source, "pane_id": "w1:p3", "tab_id": "w1:t3", "terminal_id": "fork-terminal"}
+        with (patch.object(client, "pane_row", side_effect={"w1:p1": source, "w1:p3": fork}.__getitem__),
+              patch.object(client, "listed", return_value=tabs) as listed,
+              patch.object(client, "result", return_value=result) as create,
+              patch.object(client, "run", return_value=""),
+              patch.object(client, "socket_request") as move,
+              patch.object(client, "save_layout"),
+              patch.object(client, "order_tabs") as order):
+            self.assertEqual(client.open_tab("", "alpha-copy", "/repo", {}, after_pane="w1:p1"),
+                             herdr.PlacedForkTab("w1:p3", "fork-terminal"))
+        listed.assert_called_once_with("tab", "--workspace", "w1")
+        create.assert_called_once_with("tab", "create", "--workspace", "w1", "--label", "alpha-copy",
+                                      "--cwd", "/repo", "--env", "HERDR_AGENT_PANE=1", "--no-focus")
+        move.assert_called_once_with("tab.move", tab_id="w1:t3", insert_index=1)
+        order.assert_not_called()
 
     def test_open_tab_creates_the_production_workspace_once_then_adds_tabs(self) -> None:
         boss = fixture_member("showrunner", name="boss")
@@ -6255,6 +6489,28 @@ class HerdrTests(unittest.TestCase):
         self.assertIn(self.proc / "12/environ", opened)
         self.assertNotIn(server / "environ", opened)
 
+    def test_placement_filter_ignores_pids_that_exit_before_handoff(self) -> None:
+        server = self.process(30, 1, ["herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/writing/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        _ = self.process(11, 30, ["codex"], {"HERDR_PANE_ID": "w1:p1"})
+        self.configure(["--session", "writing", "pane", "list"],
+                       json.dumps({"result": {"panes": [{"pane_id": "w1:p1"}]}}))
+
+        other_server = self.process(40, 1, ["herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/other/herdr.sock", 101)
+        self.socket_fd(other_server, 101)
+        orphan = self.process(41, 1, ["sh"], {})
+        for process in (other_server, orphan):
+            _ = (process / "cgroup").write_text("0::/user.slice/session-7.scope\n")
+        # PID 13 has a stat record but its cgroup read fails after exit.
+        _ = self.process(13, 1, ["codex"], {"HERDR_PANE_ID": "w1:p2"})
+        (self.proc / "12").mkdir()
+
+        self.assertEqual(herdr.herdr_places({11, 12, 13, 99}).placements, {11: herdr.HerdrPlace("writing", "w1:p1")})
+        pane_lists = [command for command in self.commands() if command[2:4] == ["pane", "list"]]
+        self.assertEqual(pane_lists, [["--session", "writing", "pane", "list"]])
+
     def test_handoff_survivors_keep_their_unit_after_reparenting(self) -> None:
         self.configure(["--session", "writing", "pane", "list"],
                        json.dumps({"result": {"panes": [{"pane_id": "p1"}]}}))
@@ -6351,6 +6607,7 @@ class HerdrTests(unittest.TestCase):
                     self.assertEqual({row.pid: row.place for row in rows}, expected)
                     self.assertEqual(herdr.herdr_place_of(13), herdr.HerdrPlace("writing", "w1:p1"))
                     self.assertEqual(herdr.herdr_places().placements, expected)
+                    self.assertEqual(herdr.herdr_places({13}).placements, {13: expected[13]})
             # Without a handoff the parent walk explains the scope; one live read verifies its pane.
             _ = (shell / "stat").write_text("11 (zsh) S 30 0 0\n")
             _ = (unrelated / "cgroup").write_text(f"{membership}/user.slice/session-7.scope\n")
@@ -8481,7 +8738,7 @@ class RowTabTests(StaffTestCase):
 
     def test_layout_scan_reports_missing_claude_arguments_only_after_start(self) -> None:
         configuration = self.root / "configuration"
-        _ = write_config_fixture(configuration / "shutdown.conf", "START_SECONDS=20\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "start_seconds=20\n")
         proc = self.root / "proc"
         uptime = proc / "uptime"
         ticks = os.sysconf("SC_CLK_TCK")
@@ -9039,7 +9296,7 @@ class SavedLayoutTests(unittest.TestCase):
             ("producer", "second-producer", "producers"))
         configuration = self.root / "configuration"
         configuration.mkdir()
-        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=producers\n")
+        _ = (configuration / "staff.conf").write_text("producer_workspace=producers\n")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
         for kind, name, workspace in cases:
             with self.subTest(kind=kind, name=name):
@@ -9048,7 +9305,7 @@ class SavedLayoutTests(unittest.TestCase):
                 record = staff.StaffSnapshot((row,))
                 self.assertEqual(client.saved_row_tab(row.id, row.name, herdr.row_workspace(row, record, row.name)),
                                  herdr.NewTab(workspace, name))
-        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=crew\n")
+        _ = (configuration / "staff.conf").write_text("producer_workspace=crew\n")
         producer = staff.StaffRow(staff.StaffId("producer-row"), "producer", "custom-producer", staff.STAFF_ROOT,
                                   current_session=staff.StaffId("producer-current"))
         self.assertEqual(client.saved_row_tab(producer.id, producer.name,
@@ -9057,7 +9314,7 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(client.saved_row_tab("missing-row", "unit", "production"),
                          herdr.NewTab("production", "unit"))
 
-        _ = (configuration / "staff.conf").write_text("PRODUCER_WORKSPACE=producers\n")
+        _ = (configuration / "staff.conf").write_text("producer_workspace=producers\n")
         owner = fixture_member("producer", name="owner")
         other = fixture_member("producer", name="other-owner")
         for case, binding, native, launch_owner in (

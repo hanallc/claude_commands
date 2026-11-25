@@ -11,12 +11,12 @@ import subprocess
 import sys
 import tempfile
 from typing import Literal, cast, override
+from unittest import mock
 from unittest.mock import patch
 
-from scripts.buildlog.store import host_name
 from scripts.copies import copies
-from scripts.lib import build_folders, build_slots, conf, copy_record, nix_env, scratch
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib import build_folders, build_copies, conf, copy_record, nix_env, scratch
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.nix_env_test_support import HELPER, ROOT, NixFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
@@ -26,7 +26,7 @@ class GeneratedSourceTests(NixFixture):
     def test_numbered_copy_requires_copy_proof_before_home_root_trust(self) -> None:
         build = self.home / "worktrees/build"
         _ = write_config_fixture(Path(self.env["CONF_DIR"]) / "build_folders.conf",
-            f"roots.build={build}\nroots.build.{host_name()}={build}\n"
+            f"roots.build={build}\nroots.build.{conf.local_host_key_name()}={build}\n"
             + f"roots.workspace={self.home / 'worktrees'}\n")
         numbered = build_folders.copy_path("hana", "demo", 1)
         envrc = self.envrc(numbered)
@@ -390,12 +390,12 @@ class RegisteredCopyTests(GitNixFixture):
             self.register(repository, checkout)
             yield checkout
             return
-        private = private_slot_config(self.root)
+        private = private_copy_config(self.root)
         nix_settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         _ = private.settings.with_name("nix_env.conf").write_bytes(nix_settings.read_bytes())
         if kind == "trusted-numbered":
             build = self.home / "worktrees/build"
-            _ = write_config_fixture(private.settings, f"roots.build={build}\nroots.build.{host_name()}={build}\n")
+            _ = write_config_fixture(private.settings, f"roots.build={build}\nroots.build.{conf.local_host_key_name()}={build}\n")
         with (patch.dict(os.environ, private.environment), patch.dict(self.env, private.environment),
               patch.object(tempfile, "tempdir", str(self.root)),
               copies.standing("nix-env-proof", repository, copies.CommittedSource("HEAD")) as checkout):
@@ -449,11 +449,11 @@ class RegisteredCopyTests(GitNixFixture):
 
     def test_ensure_holds_an_idle_copy_during_proof_and_refuses_a_busy_copy(self) -> None:
         repository = self.repository(self.home / "rust/repo")
-        private = private_slot_config(self.root)
+        private = private_copy_config(self.root)
         nix_settings = Path(self.env["CONF_DIR"]) / "nix_env.conf"
         _ = private.settings.with_name("nix_env.conf").write_bytes(nix_settings.read_bytes())
         with patch.dict(os.environ, private.environment):
-            with build_slots.take_copy(repository, "HEAD", showrunner="maker", unit="demo", work="test",
+            with build_copies.take_copy(repository, "HEAD", showrunner="maker", unit="demo", work="test",
                                        purpose="test envrc") as copy:
                 checkout = copy.path
             proof = nix_env.trusted_envrc
@@ -462,16 +462,26 @@ class RegisteredCopyTests(GitNixFixture):
                 self.assertEqual(build_folders.build_folder_state(checkout), "held")
                 return proof(envrc)
 
+            root = build_folders.build_root()
+            lease_lock = checkout.with_name(checkout.name + ".lock")
+            claim_lock = root / ".build-claim-locks" / lease_lock.relative_to(root)
+
+            def check_locks(command: list[str], **options: object) -> object:
+                if command[0] == "direnv":
+                    descriptors = cast(tuple[int, ...], options["pass_fds"])
+                    held = [os.fstat(descriptor) for descriptor in descriptors]
+                    locks = [path.stat() for path in (lease_lock, claim_lock)]
+                    self.assertCountEqual([(entry.st_dev, entry.st_ino) for entry in held],
+                                          [(entry.st_dev, entry.st_ino) for entry in locks])
+                return cast(object, mock.DEFAULT)
+
             with (patch.object(nix_env, "trusted_envrc", side_effect=check_proof) as checked,
-                  patch.object(subprocess, "run", wraps=subprocess.run) as run):
+                  patch.object(subprocess, "run", wraps=subprocess.run, side_effect=check_locks) as run):
                 outcome = nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"})
                 self.assertIsInstance(outcome, nix_env.Loaded)
                 checked.assert_called_once_with(checkout / ".envrc")
                 direnv = [call for call in run.call_args_list if call.args[0][0] == "direnv"]
                 self.assertEqual([call.args[0][1] for call in direnv], ["allow", "export"])
-                descriptors = cast(tuple[int, ...], direnv[0].kwargs["pass_fds"])
-                self.assertEqual(len(descriptors), 1)
-                self.assertEqual(direnv[1].kwargs["pass_fds"], descriptors)
             self.assertEqual(build_folders.build_folder_state(checkout), "free")
             with build_folders.numbered_copy_use_lease(checkout) as lease:
                 self.assertIsInstance(lease, build_folders.NumberedCopyUseLease)

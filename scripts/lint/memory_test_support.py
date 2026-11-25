@@ -100,7 +100,7 @@ TEST_CONFIG_DEFAULTS = {
         "loopback.command_timeout_s=60\n"
         "loopback.shell_timeout_s=30\n"
     ),
-    "buildlog.conf": "INDEX_READ_WAIT_SECONDS=1\n",
+    "buildlog.conf": "index_read_wait_seconds=1\n",
     "cloud_gate.conf": (
         "gpu_setup_dry_run_retry_timeout_s=30\n"
         "gpu_setup_dry_run_retry_interval_s=5\n"
@@ -123,12 +123,12 @@ TEST_CONFIG_DEFAULTS = {
     ),
     "dev_shell.conf": "timeout_s=30\n",
     "direct.conf": (
-        "CLAUDE_WORKER_REGISTER_WAIT_SECS=30\n"
-        "WORKER_FIRST_TURN_SECONDS=30\n"
-        "WORKER_SETTLE_SECONDS=30\n"
-        "WORKER_COMPACT_SECONDS=30\n"
-        "PANE_AGENT_START_SECONDS=30\n"
-        "WORKER_PUBLISH_LOCK_SECONDS=15\n"
+        "claude_worker_register_wait_secs=30\n"
+        "worker_first_turn_seconds=30\n"
+        "worker_settle_seconds=30\n"
+        "worker_compact_seconds=30\n"
+        "pane_agent_start_seconds=30\n"
+        "worker_publish_lock_seconds=15\n"
     ),
     "disks.conf": "measure.timeout_seconds=30\n",
     "fast_track.conf": (
@@ -189,20 +189,20 @@ TEST_CONFIG_DEFAULTS = {
         "send_timeout_s=30\n"
         "claim_poll_seconds=5\n"
     ),
-    "merge_checkpoint.conf": "MAC_PULL_RETRY_SECONDS=2\n",
+    "merge_checkpoint.conf": "mac_pull_retry_seconds=2\n",
     "nix_env.conf": (
         "command_timeout_seconds=30\n"
         "alert_timeout_seconds=30\n"
     ),
-    "notify.conf": "REVIEW_TIMEOUT_SECONDS=30\n",
+    "notify.conf": "review_timeout_seconds=30\n",
     "postmaster.conf": (
         "wait_seconds=3.0\n"
         "claim_grace_seconds=15.0\n"
         "poll_seconds=0.05\n"
     ),
     "production.conf": (
-        "RETIRE_TERM_WAIT_SECONDS=10\n"
-        "RETIRE_COMMAND_TIMEOUT_SECONDS=30\n"
+        "retire_term_wait_seconds=10\n"
+        "retire_command_timeout_seconds=30\n"
         "mac_run_example_seconds=20\n"
         "mac_run_status_grace_seconds=30\n"
         "mac_run_poll_seconds=1\n"
@@ -212,10 +212,10 @@ TEST_CONFIG_DEFAULTS = {
         "smoke_call_seconds=5\n"
         "smoke_signal_grace_seconds=2\n"
         "smoke_poll_seconds=1\n"
-        "RENAME_LIVE_WAIT_SECONDS=30\n"
-        "RENAME_RUN_STOP_WAIT_SECONDS=30\n"
-        "RENAME_POLL_SECONDS=1\n"
-        "RENAME_COMMAND_TIMEOUT_SECONDS=30\n"
+        "rename_live_wait_seconds=30\n"
+        "rename_run_stop_wait_seconds=30\n"
+        "rename_poll_seconds=1\n"
+        "rename_command_timeout_seconds=30\n"
         "units_census_seconds=10\n"
         "units_table_width_read_milliseconds=50\n"
     ),
@@ -239,15 +239,15 @@ TEST_CONFIG_DEFAULTS = {
         "drain_timeout_seconds=30\n"
     ),
     "shutdown.conf": (
-        "STOP_GRACE_SECONDS=2\n"
-        "KILL_GRACE_SECONDS=5\n"
-        "MOVE_STOP_MARGIN_SECONDS=3\n"
-        "START_SECONDS=20\n"
-        "OPENING_PROMPT_SECONDS=30\n"
-        "STAY_SECONDS=10\n"
-        "OWN_PANE_SHELL_SECONDS=30\n"
-        "RESUME_CHECK_SECONDS=30\n"
-        "RESUME_CHECK_INTERVAL_SECONDS=5\n"
+        "stop_grace_seconds=2\n"
+        "kill_grace_seconds=5\n"
+        "move_stop_margin_seconds=3\n"
+        "start_seconds=20\n"
+        "opening_prompt_seconds=30\n"
+        "stay_seconds=10\n"
+        "own_pane_shell_seconds=30\n"
+        "resume_check_seconds=30\n"
+        "resume_check_interval_seconds=5\n"
     ),
     "stall_watch.conf": (
         "sender_batch_seconds=30\n"
@@ -256,8 +256,8 @@ TEST_CONFIG_DEFAULTS = {
     ),
     "statusline.conf": "rebuild.eval_timeout=30\n",
     "test_times.conf": (
-        "MODULE_COST_STAGE_TIMEOUT_S=60\n"
-        "MODULE_COST_LEFTOVER_S=2\n"
+        "module_cost_stage_timeout_s=60\n"
+        "module_cost_leftover_s=2\n"
     ),
 }
 

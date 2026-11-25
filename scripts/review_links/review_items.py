@@ -645,8 +645,8 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, zone: ZoneInfo, do
                 sources.append(path)
             snapshots[path] = change_review.review_snapshot(path, include_reviewed=ReviewState.DONE in states,
                                                             collect_owners=owner_options is not None)
-    documents = {member.name: member.doc.path for member in members.rows
-                 if isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))}
+    documents = {member.name: doc for member in members.find(kind="showrunner")
+                 if (doc := record_store.local_document(member)) is not None}
     routing = change_routing.StaffRouting(members, documents, sources=sources, lists=(
         (path.stem.removeprefix(change_review.PREFIX), snapshot.text) for path, snapshot in snapshots.items()))
     queues: dict[tuple[str, Path], tuple[str, Path]] = {}
@@ -1121,8 +1121,8 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
     for doc in documents:
         with guard_source(doc, sources):
             member = members.by_doc(local_machine(), doc.resolve())
-            if member is not None and member.kind == 'showrunner':
-                scopes[doc] = member.id
+            if member is not None and (local_doc := record_store.local_document(member)) is not None:
+                scopes[local_doc] = member.id
     if include_registered:
         with guard_source(state_root() / "review-folders", sources):
             if exact:
@@ -1533,7 +1533,8 @@ def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.St
         owner = scope
     if kind in QUESTION_TYPES:
         owners = (scope,) if isinstance(scope,staff.StaffRow) else tuple(member for member in members.rows
-            if member.kind == 'showrunner' and isinstance(member.doc,(staff.LiveDoc,staff.WrappedDoc)) and member.doc.path in documents)
+            if member.kind == 'showrunner' and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
+            and member.doc.path in documents)
         return question_items(members,documents,zone=zone,owners=owners,sources=sources,include_unowned=False,states=states,
                               kinds=QUESTION_TYPES if kind == ReviewType.QUESTION else (kind,))
     if kind in INVESTIGATION_TYPES:

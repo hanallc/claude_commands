@@ -20,7 +20,7 @@ from unittest import mock
 from scripts.buildlog import rust_release
 from scripts.lib import build_folders, cargo_output, scratch
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush, render, user_send_argv
 from scripts.notify.user_action import ActionRequired
@@ -95,7 +95,7 @@ class RustReleaseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         temporary = self.enterContext(tempfile.TemporaryDirectory())
-        private = private_slot_config(Path(temporary))
+        private = private_copy_config(Path(temporary))
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.root = Path(temporary) / "buildlog"
         self.scratch = Path(temporary) / "scratch"
@@ -279,7 +279,7 @@ class RustReleaseTests(unittest.TestCase):
 
     def test_release_send_wait_includes_the_configured_review_limit(self) -> None:
         config = self.scratch / "notify.conf"
-        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = config.write_text("review_timeout_seconds=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
         with (mock.patch.object(review, "NOTIFY_CONFIG", config),
               mock.patch.object(subprocess, "run", return_value=done) as run):
