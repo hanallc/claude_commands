@@ -9,19 +9,12 @@ starting a process. `mac_run.sh` and `smoke_launch.sh` take the same labels
 from the caller's environment. The Mac command keeps both labels when it
 starts from Terminal.
 
-Test clones on either machine use `copies.py clone <source> --task gate:<id>`
-(or a real `phase:<unit>/<id>` or `--until <when>`). The command records the
-task before Git starts and prints the checkout inside its scratch folder.
-`scratch.py end --task gate:<id>` removes the clone. A failed clone remains
-owned by its task, so the same end command removes a partial copy.
-Clones inherit Claude trust when any account trusts the source checkout.
-Task completion, sweeps, and `copies.py mirror-remove` clear that clone trust before deletion.
-`mac_run.sh` uses one gate task per run. On exit, `hana-instances stop-checkout <path>`
-stops its test Hanas through the identity-checked stop path, confirms they
-exited, and checks for surviving builds and examples through the audit's
-process-use scan. Only then does the script end the task. A failed stop,
-unreadable inventory or failed SSH keeps the checkout and names the cause.
-It keeps no standing test clone. Purpose and owner reach the Terminal command.
+`mac_run.sh` holds a numbered copy under `~/build/hana/<unit>/<n>` on the Mac.
+It uses the Mac source commit when available and sends a Git bundle when necessary.
+`hana-instances stop-checkout` stops Hana and checks for surviving processes before the run returns the copy.
+SSH input must close before the lease ends.
+If the process check fails, the run records the reason and keeps the copy.
+Purpose and owner reach the Terminal command.
 
 The folder audit also checks registered test clones in the scratch root and
 loose Git clones. `clone_max_hours` in `hana_instances.conf` sets their idle limit;
