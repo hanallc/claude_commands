@@ -17,6 +17,7 @@ The PR script checks the range from the merge base to the PR head.
 It reads the head and base again before merge and supplies the checked head to GitHub.
 
 A clear record names the saved reviewer reply.
+The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
 The gate checks that the reply has a finding of no user decision for each changed test.
 For a Yes record, the gate reads the answer in the original question.
 
