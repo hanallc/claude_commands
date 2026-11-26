@@ -24,11 +24,14 @@ A known recovery or reset closes it silently.
 Natedev sends both Claude quota pushes.
 The quota check forecasts when each in-use Claude account will run out of weekly usage.
 It divides the weekly percentage left by the hourly usage rate and adds that duration to the current time.
-The rate measures the rise and elapsed time from the window start to the latest reading.
+The rate divides the total usage rise by the observed hours in the window.
 The setting `rate.lookback_minutes` defaults to 60 minutes.
-The latest reading must be at most 15 minutes old.
-The observed span must reach the window start without a refill, a gap over 15 minutes, or an interval that starts at 100%.
-The forecast needs a positive rate, a recent reading, and a known future reset.
+The window ends at the current time.
+The rate needs a reading at or before the window start and a newest reading at most 15 minutes old.
+The reading at or before the window start can be any age.
+The rate skips refills and gaps over 15 minutes, including gaps that cross the window start.
+It also skips spans that start at 100% used or have two readings at 0% used.
+The alert needs a positive rate and a known future reset.
 The quota check sends `quota.claude_expiry` when the forecast is before the reset and fewer than `claude_expiry.alert_hours` away.
 Scheduled moves suppress the push when they cover every group on that account.
 Consumed moves give no coverage.
