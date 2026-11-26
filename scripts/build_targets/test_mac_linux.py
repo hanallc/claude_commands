@@ -46,7 +46,7 @@ from scripts.production import checkpoint_gate, gate
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_routes import ALL_MODULES, AllModules, GateJobKind, GateResultUnknown, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection
 from scripts.production.test_checkpoint_gate import GatePlacementFixture
-from scripts.test_times.gate_record import NoGateTimeLimit
+from scripts.test_times.gate_record import NoGateTimeLimit, WallClockSpan
 
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -298,8 +298,8 @@ from time import sleep
 
 from scripts.copies import copies
 from scripts.production.gate_modules import discover_test_modules
-from scripts.production.gate_routes import GateJobKind, GateJobResult, GateRun, SelectedModules, SuiteMode
-from scripts.test_times.gate_record import TYPE_CHECK_JOB
+from scripts.production.gate_routes import AllModules, GateJobKind, GateJobResult, GateRun, SelectedModules, SuiteMode
+from scripts.test_times.gate_record import TYPE_CHECK_JOB, WallClockSpan
 
 
 def checked_git(repo, *args):
@@ -346,7 +346,7 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     assert int(checked_git(repo, 'rev-list', '--count', 'main', 'origin/main')) >= 2
     assert checked_git(repo, 'rev-parse', 'main') == os.environ['FIXTURE_EXPECTED_MAIN']
     assert checked_git(repo, 'rev-parse', 'origin/main') == os.environ['FIXTURE_EXPECTED_MAIN']
-    assert full == (mode is SuiteMode.GATE)
+    assert full == (mode is SuiteMode.GATE or isinstance(selected, AllModules))
     print('A guest log line must stay outside the JSON result.')
     scenario = os.environ['FIXTURE_GUEST_RESULT']
     if scenario == 'child-stdout':
@@ -375,6 +375,10 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
     jobs = tuple(GateJobResult(suite, path.name, int(scenario == 'red'), 1.3, 'fixture module output',
                                cpu_seconds=1.0, times=dict(timing, skipped=int(path.name == 'test_second.py')),
                                peak_mib=22) for suite, path in paths)
+    if scenario == 'sequential':
+        first, second = jobs
+        return GateRun((replace(first, wall_clock=WallClockSpan(1000, 1001.3)),
+                        replace(second, wall_clock=WallClockSpan(1001.3, 1002.6))), 2.6, 30)
     if type_dirs:
         result = subprocess.run([os.environ['GATE_BASEDPYRIGHT'], *type_dirs], cwd=repo,
                                 capture_output=True, text=True)
@@ -3822,6 +3826,35 @@ with (patch.object(conf, 'read', read_config),
         modules = cast(list[dict[str, object]], row['modules'])
         self.assertEqual([(module['suite'], module['module'], module['wall_s'], module['cpu_s']) for module in modules],
                          [('fixture', 'test_first.py', 1.3, 1.0), ('fixture', 'test_second.py', 1.3, 1.0)])
+
+    def test_guest_affected_full_records_full_selection(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}):
+            result = gate.run_gate_suites(self.repo, full=True, mode=SuiteMode.TARGETED, module_time_limit_s=3,
+                                          target=gate.MacLinuxAssignment(self.placed))
+        self.assertTrue(result.passed)
+        self.assertEqual([job.module for job in result.jobs], ['test_first.py', 'test_second.py'])
+        row = self.recorded_guest_gate()
+        self.assertEqual(row['step'], 'test-affected')
+        self.assertEqual(row['selection'], 'full')
+
+    def test_guest_suite_records_stream_wall_time_for_sequential_jobs(self) -> None:
+        sample = mac_linux.sample_guest_gate
+        clock = iter((10.0, 14.0))
+
+        def sample_with_clock() -> mac_linux.GuestGateSample:
+            with patch.object(mac_linux, 'monotonic', return_value=next(clock)):
+                return sample()
+
+        with patch.object(mac_linux, 'sample_guest_gate', side_effect=sample_with_clock) as samples:
+            result = self.route('sequential')
+        assert isinstance(result, GateRun) and result.passed, result
+        self.assertEqual(samples.call_count, 2)
+        self.assertEqual([job.seconds for job in result.jobs], [1.3, 1.3])
+        self.assertEqual([job.wall_clock for job in result.jobs],
+                         [WallClockSpan(1000, 1001.3), WallClockSpan(1001.3, 1002.6)])
+        row = self.recorded_guest_gate()
+        self.assertEqual(row['wall_s'], 2.6)
+        self.assertEqual(row['suites'], [{'suite': 'fixture', 'wall_s': 4.0, 'status': 0}])
 
     def test_named_guest_run_writes_no_gate_record(self) -> None:
         with patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'pass',
