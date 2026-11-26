@@ -1962,9 +1962,12 @@ The heading shows how many links point to Closed items and how many links exist.
 The section lists the items in number order, with the Studio row state badges in one column.
 The titles use the same text color and hover and focus underline as the Top priority link.
 The page uses the records it already reads for the snapshot.
+A related link appears in Linked items. Links shows blockers and URLs.
+A full snapshot replaces the links that an action response kept, even when the last link is gone.
 A missing record shows `#N not found`.
 The titled link opens the item.
-A Closed item opens outside the results with its log and no actions.
+A Closed item opens outside the results with its linked items and no actions.
+The snapshot keeps the Closed row summary. The page requests its full details when the row opens.
 A Closed item does not affect filter counts.
 Opening a row leaves its unread state and status chip unchanged.
 This rule also applies to direct links, refreshes, and reloads.

@@ -7071,6 +7071,37 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn(b"The Studio page is not available.", gzip.decompress(failed.body))
         self.assertIn("review-links studio: fixture read failed", log.getvalue())
 
+    def test_studio_reads_only_the_requested_closed_log(self) -> None:
+        keeper, leaf = self.list_keeper_item("Check the last result")
+        _, middle = self.list_keeper_item("Check the middle result")
+        _, source = self.list_keeper_item("Check the first result")
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((keeper,))):
+            _ = the_list.update(keeper.id, middle.id, {"related_to": (leaf.number,)}, source="morty")
+            _ = the_list.update(keeper.id, source.id, {"related_to": (middle.number,)}, source="morty")
+            _ = the_list.close(keeper.id, leaf.id, "The leaf log is complete.", source="morty")
+            _ = the_list.close(keeper.id, middle.id, "The middle log is complete.", source="morty")
+            with patch.object(list_page, "item_log", wraps=list_page.item_log) as render_log:
+                page = self.request(studio_page.PAGE_PATH)
+                self.assertEqual(page.status, 200)
+                rendered = [cast(list_page.ListRecord, call.args[0]).item.id for call in render_log.call_args_list]
+                self.assertEqual(rendered, [source.id])
+                self.assertIn(b'data-list-closed-loading role="status"', page.body)
+                self.assertIn(leaf.title.encode(), page.body)
+                self.assertNotIn(b"The middle log is complete.", page.body)
+                self.assertNotIn(b"The leaf log is complete.", page.body)
+                render_log.reset_mock()
+                query = urlencode({"item-state": middle.id, "keeper": keeper.id})
+                response = self.request(f"{studio_page.PAGE_PATH}?{query}")
+                self.assertEqual(response.status, 200)
+                rendered = [cast(list_page.ListRecord, call.args[0]).item.id for call in render_log.call_args_list]
+                self.assertEqual(rendered, [middle.id])
+                body = cast(list_page.SavedActionState, json.loads(response.body))
+                self.assertIs(body.get("detail_closed"), True)
+                detail = body.get("detail_html", "")
+                self.assertIn("The middle log is complete.", detail)
+                self.assertNotIn("The leaf log is complete.", detail)
+                self.assertNotIn("<form", detail)
+
     def test_studio_top_priority_post_names_the_item_and_refuses_other_requests(self) -> None:
         morty, item = self.list_keeper_item("Make this the top item")
         _, closed = self.list_keeper_item("A closed item")

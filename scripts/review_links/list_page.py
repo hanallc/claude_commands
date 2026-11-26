@@ -1053,14 +1053,10 @@ def item_url_label(address: SplitResult) -> str:
 
 def item_links_html(entry: ListRecord, log: ItemLog, displayed_next_step: str) -> str:
     item = entry.item
-    related = [
+    blockers = [
         f'<li><a data-record-jump href="{html.escape(item_link(entry.keeper, link.number))}">#{link.number}</a>'
         + ' — ' + item_text_html(link.condition) + '</li>' for link in item.blocked_by
     ]
-    related.extend(
-        f'<li>Related: <a data-record-jump href="{html.escape(item_link(entry.keeper, number))}">#{number}</a></li>'
-        for number in item.related_to
-    )
     links: dict[str, str] = {}
     for source in sorted(item_link_sources(item, log, displayed_next_step), key=lambda source: source.time):
         for match in item_url_matches(source.text):
@@ -1070,9 +1066,9 @@ def item_links_html(entry: ListRecord, log: ItemLog, displayed_next_step: str) -
             links[url] = ('<li>' + item_url_html(url, item_url_label(match.address), "item-link-label")
                           + f'<span class="item-link-field">{source.field}</span>'
                           + f'<span class="item-link-address">{html.escape(url)}</span></li>')
-    if not related and not links:
+    if not blockers and not links:
         return ""
-    return '<section class="item-links"><h3>Links</h3><ul>' + ''.join(related) + ''.join(links.values()) + '</ul></section>'
+    return '<section class="item-links"><h3>Links</h3><ul>' + ''.join(blockers) + ''.join(links.values()) + '</ul></section>'
 
 
 def linked_items_html(entry: ListRecord, linked_records: Mapping[tuple[staff.StaffId, int], ListRecord]) -> str:
@@ -1218,7 +1214,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
             schedule: DisplayedSchedule, mark: TopPriorityMark, progress: ListProgress, linked_items: str = "") -> str:
     item = entry.item
     if item.state is the_list.ItemState.CLOSED:
-        return detail_panel(entry, '', today, names, unread_answers, progress)
+        return '<p data-list-closed-loading role="status">Loading the item…</p>' + linked_items
     if isinstance(visibility, the_list.WaitingForAnswer) and item.state != the_list.ItemState.REPAIRED:
         return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark, progress,
                                linked_items=linked_items)
@@ -1433,14 +1429,15 @@ def saved_action_state(keeper: str, identity: str, *, status: change_page.Delive
     return action_state(owner, the_list.load(owner, identity), status=status,
                         park_request=park_request, not_fixed_request=not_fixed_request,
                         review_records=review_records, include_detail=include_detail,
-                        top_priority=top_priority)
+                        top_priority=top_priority, read_closed_detail=not (park_request or not_fixed_request))
 
 
 def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
                  status: change_page.DeliveryStatus | None = None, park_request: str = "",
                  not_fixed_request: str = "",
                  review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK,
-                 include_detail: bool = False, top_priority: TopPriority = TopPriority.HIDDEN) -> SavedActionState:
+                 include_detail: bool = False, top_priority: TopPriority = TopPriority.HIDDEN,
+                 read_closed_detail: bool = False) -> SavedActionState:
     zone = user_zone()
     today = the_list.now()
     local_today = today.astimezone(zone)
@@ -1508,6 +1505,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
     if report or include_detail:
         saved["next_step_html"] = progress.next_step_html()
         saved["next_step_sort"] = progress.next_step.casefold()
+    if read_closed_detail and saved.get("detail_closed"):
+        saved["detail_html"] = detail_panel(ListRecord(owner, item), '', local_today, names, unread_answers, progress)
     if has_detail:
         reviews: ReviewRecords = {}
         if item.reviews:
@@ -1525,7 +1524,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         if waiting:
             saved["waiting_details_html"] = body
         if include_detail:
-            revision = detail_revision(item, body)
+            revision = "action:" + detail_revision(item, body)
             saved.update(detail_html=body, detail_revision=revision)
     return saved
 
@@ -2187,7 +2186,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     snapshot = records(include_closed=True)
     items = [entry for entry in snapshot if entry.item.state is not the_list.ItemState.CLOSED]
     closed = [entry for entry in snapshot if entry.item.state is the_list.ItemState.CLOSED]
-    targets = {(entry.keeper, number) for entry in items for number in entry.item.related_to}
+    targets = {(entry.keeper, number) for entry in snapshot for number in entry.item.related_to}
     linked_records = {(entry.keeper, entry.item.number): entry for entry in snapshot
                       if (entry.keeper, entry.item.number) in targets}
     if status == "standalone":
@@ -2276,7 +2275,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                 entry, names, today, index, secret, {}, owner_cell=owner_cell, owner_sort=owner_sort,
                 search_text=SearchText(owner_search, normalize_search_text(entry.item.title), ""), parked=False,
                 open_question=False, open_ask=False, visibility=the_list.QuestionAttention(), unread_answers=frozenset(),
-                schedule=the_list.NoSchedule.UNSET, mark=TopPriorityMark.HIDDEN, hidden=True))
+                schedule=the_list.NoSchedule.UNSET, mark=TopPriorityMark.HIDDEN, hidden=True,
+                linked_items=linked_items_html(entry, linked_records)))
     shows = [record_table.Chip(chip.value, chip.label, chip_totals["show"][chip])
              for chip in ListChip]
     owner_chips = staff_chips(members, owners, chip_totals["owner"])
@@ -2872,12 +2872,30 @@ function syncUnread(item,form,unread,unreadSort){
  }
 }
 function installListDetail(item){
-  const detail=recordDetails(item),form=detail.querySelector('[data-feedback-form]');
+  const detail=recordDetails(item),loading=detail.querySelector('[data-list-closed-loading]');
+  if(loading){void loadClosedListDetail(item,loading);return;}
+  const form=detail.querySelector('[data-feedback-form]');
   if(form && !form.retainDraft) bindFeedbackForm(form);
   tableView.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
 }
-function replaceListDetail(detail,text){
- const linked=detail.querySelector('[data-linked-items]');
+async function loadClosedListDetail(item,loading){
+ const session=tableView.openSession;
+ const current=()=>tableView.openItem===item && tableView.openSession===session && recordDetails(item).contains(loading);
+ const [keeper,id]=item.dataset.key.split('/');
+ const query=new URLSearchParams({'item-state':id,keeper});
+ loading.textContent='Loading the item…';
+ try{
+  const response=await fetch(actionPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
+  if(!response.ok) throw new Error('The item is unavailable.');
+  const result=await response.json();
+  if(!result.detail_closed || typeof result.detail_html!=='string') throw new Error('The Closed detail is unavailable.');
+  if(current()) tableView.updateItemDetail(item,detail=>replaceListDetail(detail,result.detail_html));
+ }catch(_){
+  if(current()) loading.textContent='The item could not load. Close and open it to try again.';
+ }
+}
+function replaceListDetail(detail,text,{retainLinkedItems=true}={}){
+ const linked=retainLinkedItems ? detail.querySelector('[data-linked-items]') : null;
  detail.innerHTML=text;
  if(linked && !detail.querySelector('[data-linked-items]')) detail.querySelector('.list-item-fields')?.after(linked);
 }
@@ -2885,7 +2903,7 @@ function renderListDetail(revision,text,{retainLinks=false}={}){
  return (row,detail)=>{
   const links=retainLinks ? detail.querySelector('[data-list-review-links]') : null;
   row.dataset.detailRevision=revision;
-  replaceListDetail(detail,text);
+  replaceListDetail(detail,text,{retainLinkedItems:revision.startsWith('action:')});
   if(links) detail.querySelector('[data-list-review-links]')?.replaceWith(links);
   installListDetail(row);
  };
