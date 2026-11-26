@@ -9,7 +9,7 @@ except FileNotFoundError:
 import argparse
 import ast
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -3191,6 +3191,57 @@ def receive_metadata(tree: Path, args: CopyArguments) -> None:
     authority.unlink(missing_ok=True)
 
 
+def receiver_channel_closed(channel: int, pid: int) -> bool:
+    """Detect channel closure without taking protocol bytes from rsync."""
+    mode = os.fstat(channel).st_mode
+    if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
+        return False
+    if sys.platform == "darwin":
+        with closing(select.kqueue()) as queue:
+            process = select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                     select.KQ_NOTE_EXIT)
+            try:
+                _ = queue.control([process], 0)
+            except ProcessLookupError:
+                return False
+            incoming = select.kevent(channel, select.KQ_FILTER_READ, select.KQ_EV_ADD | select.KQ_EV_CLEAR)
+            _ = queue.control([incoming], 0)
+            while True:
+                events = queue.control(None, 2)
+                if any(event.filter == select.KQ_FILTER_READ and event.flags & select.KQ_EV_EOF for event in events):
+                    return True
+                if any(event.filter == select.KQ_FILTER_PROC for event in events):
+                    return False
+    child = os.pidfd_open(pid)
+    try:
+        events = select.poll()
+        events.register(channel, select.POLLRDHUP)
+        events.register(child, select.POLLIN)
+        return any(descriptor == channel for descriptor, _ in events.poll())
+    finally:
+        os.close(child)
+
+
+def run_mirror_receiver(command: list[str], descriptors: tuple[int, ...], environment: dict[str, str]) -> int:
+    """Keep the mirror lease through cleanup of the receiver group."""
+    reading, writing = os.pipe()
+    with os.fdopen(reading, "rb", buffering=0) as lifetime, os.fdopen(writing, "wb") as inherited:
+        with subprocess.Popen(command, pass_fds=(*descriptors, writing), env=environment, process_group=0) as child:
+            group = child.pid
+            inherited.close()
+            disconnected = True
+            try:
+                disconnected = receiver_channel_closed(0, group)
+            finally:
+                if disconnected:
+                    # Keep the leader PID until after the signal, so the group ID cannot be reused.
+                    with suppress(ProcessLookupError):
+                        os.killpg(group, signal.SIGKILL)
+                    # Rsync forks with these descriptors. EOF also covers its children.
+                    _ = lifetime.read(1)
+            return child.wait()
+
+
 def mirror_run(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
     with local_mirror_lease(tree, args.session, create_tree=args.action != "mirror-receive"):
@@ -3207,8 +3258,9 @@ def mirror_run(args: CopyArguments) -> int:
         if args.action == "mirror-use":
             descriptors = tuple(dict.fromkeys((*descriptors, *floor_claims.inherited_mirror_descriptors())))
         environment = {**os.environ, floor_claims.MIRROR_LEASE_FDS: ",".join(map(str, descriptors))}
-        answer = subprocess.run(command, pass_fds=descriptors, env=environment)
-        return answer.returncode
+        if args.action == "mirror-receive":
+            return run_mirror_receiver(command, descriptors, environment)
+        return subprocess.run(command, pass_fds=descriptors, env=environment).returncode
 
 
 class CopyParser(argparse.ArgumentParser):
