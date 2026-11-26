@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import html
 import json
+import re
 import secrets
 import shutil
 import sys
@@ -13,6 +14,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum, auto
 from pathlib import Path
 from types import MappingProxyType
 from typing import cast, override
@@ -23,7 +25,7 @@ from scripts.notify.review import CaptionLayout
 
 from scripts.lib import atomic_file, conf, file_lock
 from scripts.lib.user_zone import shown_time
-from scripts.production.delivery_state import QuestionSendState
+from scripts.production.delivery_state import QuestionSendState, read_fields
 from scripts.production import staff, the_list
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
@@ -39,6 +41,7 @@ ANSWERS = {"approved": "your image is approved.", "feedback": "your image is not
 # A page loaded before the answer buttons existed can still post delete.
 ACTIONS = frozenset(("delete", "question", "retry", *ANSWERS))
 ANSWER_PREFIX = "From the user (via the Images page): "
+_DECISION_FILE = re.compile(r"([0-9a-f]{12})-[0-9a-f]{64}\.json")
 
 
 NO_OPEN_QUESTIONS: Mapping[str, QuestionSendState] = MappingProxyType({})
@@ -68,6 +71,23 @@ class ImageAnswerSent:
     draft_confirmed: bool = False
 
 
+class ImageAnswerOrigin(Enum):
+    DIRECT = auto()
+    SIGNED_FORM = auto()
+
+
+@dataclass(frozen=True)
+class ImageDecision:
+    image_id: str
+    answer: str
+    feedback: str
+    time: datetime
+
+
+class NoImageDecision(Enum):
+    OUTSIDE_STORE = auto()
+
+
 @dataclass(frozen=True)
 class _AnswerDraft:
     action: str
@@ -83,6 +103,47 @@ class _AnswerDraft:
 
 def images_root(root: Path) -> Path:
     return root / image_store.IMAGES_FOLDER
+
+
+def decision_root(root: Path) -> Path:
+    return root / ".review-link-image-decisions"
+
+
+def read_image_decision(root: Path, path: Path) -> ImageDecision | NoImageDecision:
+    folder = decision_root(root)
+    name = _DECISION_FILE.fullmatch(path.name)
+    if (name is None or folder.is_symlink() or path.is_symlink()
+            or path.parent.resolve() != folder.resolve()):
+        return NoImageDecision.OUTSIDE_STORE
+    fields = read_fields(path)
+    match fields:
+        case {"image_id": str(identity), "source": str(source), "answer": str(answer),
+              "feedback": str(feedback), "time": str(stamp)} if (
+                identity == name[1] and source == the_list.IMAGE_ANSWER_SOURCE and answer in ANSWERS):
+            time = datetime.fromisoformat(stamp)
+            if time.utcoffset() == UTC.utcoffset(time):
+                return ImageDecision(identity, answer, feedback, time)
+        case _:
+            pass
+    raise ValueError(f"{path}: Invalid Images answer record.")
+
+
+def _save_image_decision(root: Path, identity: str, key: str, answer: str, feedback: str) -> None:
+    """Save the first signed answer for this request while the Images lock is held."""
+    folder = decision_root(root)
+    folder.mkdir(mode=0o700, exist_ok=True)
+    if folder.is_symlink():
+        raise OSError(f"{folder}: Expected an Images answer folder.")
+    path = folder / f"{identity}-{key.removeprefix('review:')}.json"
+    if path.is_symlink():
+        raise OSError(f"{path}: Expected an Images answer file.")
+    if path.exists():
+        atomic_file.sync_folder(folder)
+    else:
+        fields = {"image_id": identity, "source": the_list.IMAGE_ANSWER_SOURCE, "answer": answer,
+                  "feedback": feedback, "time": datetime.now(UTC).isoformat()}
+        atomic_file.write_text_atomic(path, json.dumps(fields) + "\n", new_file_mode=0o600)
+    atomic_file.sync_folder(root)
 
 
 def page_url() -> str:
@@ -395,7 +456,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
         return ask_question(root, identity, fields.get('feedback', [''])[0], status)
     if action in ANSWERS:
         round_id = fields["feedback_round"][0] if "feedback_round" in fields else None
-        return send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id)
+        return send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id,
+                           origin=ImageAnswerOrigin.SIGNED_FORM)
     try:
         delete(root, identity)
     except ValueError as error:
@@ -459,7 +521,7 @@ def _image_answers(directory: Path, record: image_store.ImageRecord) -> image_st
 
 
 def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, round_id: str | None,
-                    retry_key: str | None) -> tuple[str, image_store.ImageAnswers]:
+                    retry_key: str | None, origin: ImageAnswerOrigin) -> tuple[str, image_store.ImageAnswers]:
     """Save the words and the List recipient before the first send."""
     folder = directory / identity
     try:
@@ -487,6 +549,7 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
             words += "\n" + feedback
     if key not in attempts:
         previous: set[str] = set()
+        new_answer = True
         if record is None:
             message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {identity} was removed."
             if feedback:
@@ -498,11 +561,14 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
             legacy = folder / (".review-link-feedback-" + key.removeprefix("review:"))
             try:
                 previous = set(legacy.read_text(encoding="utf-8").splitlines())
+                new_answer = False
             except FileNotFoundError:
                 previous = answered_question_ids(record)
                 if round_id is not None and round_id != feedback_round(previous):
                     raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.") from None
             message = answer_message(record, answer, feedback)
+        if new_answer and origin is ImageAnswerOrigin.SIGNED_FORM and "list_item" not in saved:
+            _save_image_decision(directory.parent, identity, key, answer, feedback)
         attempts[key] = {"message": message, "words": words, "answered": sorted(previous),
                          "recipients": [], "confirmed": []}
         image_store.write_answers(directory, saved)
@@ -537,7 +603,8 @@ def _recipient_name(members: staff.StaffSnapshot, identity: str) -> str:
 
 
 def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None,
-                retry_key: str | None = None, draft: _AnswerDraft | None = None) -> ImageAnswerSent:
+                retry_key: str | None = None, draft: _AnswerDraft | None = None,
+                origin: ImageAnswerOrigin = ImageAnswerOrigin.DIRECT) -> ImageAnswerSent:
     """Send to each recipient that has yet to confirm this answer."""
     if not image_store.IDENTITY.fullmatch(identity):
         raise question_record.AnswerRefused("not an image id")
@@ -550,7 +617,7 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_
         raise question_record.AnswerRefused(f"no image {identity}")
     with file_lock.exclusive(lock):
         try:
-            key, saved = _picture_answer(directory, identity, answer, feedback, round_id, retry_key)
+            key, saved = _picture_answer(directory, identity, answer, feedback, round_id, retry_key, origin)
         except OSError as error:
             raise AnswerNotSent(f"Could not save the picture answer: {error}. Try again.") from error
     attempt = saved["attempts"][key]

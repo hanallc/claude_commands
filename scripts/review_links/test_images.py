@@ -850,7 +850,19 @@ class ImagesTests(ImagesFixture):
             with self.subTest(action=action, feedback=feedback):
                 self.sent.clear()
                 record = self.register("After: the panel.")
+                accepted_after = datetime.now(UTC)
                 self.submit(self.feedback_body(record, feedback, action))
+                archive = images.decision_root(self.root)
+                path, = archive.glob(f"{record['id']}-*.json")
+                fields = delivery_state.read_fields(path)
+                self.assertEqual(fields["source"], "nate via Images")
+                decision = images.read_image_decision(self.root, path)
+                assert isinstance(decision, images.ImageDecision)
+                self.assertEqual(decision, images.ImageDecision(record["id"], action, feedback.strip(), decision.time))
+                self.assertEqual(decision.time.tzinfo, UTC)
+                self.assertLessEqual(accepted_after, decision.time)
+                self.assertLessEqual(decision.time, datetime.now(UTC))
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual([message for _, _, message in self.sent], ["\n".join((
                     f"From the user (via the Images page): {first}", *lines,
                     f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
@@ -859,6 +871,10 @@ class ImagesTests(ImagesFixture):
                     + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
                 self.assertIn("feedback_at", image_store.read_record(self.root / image_store.IMAGES_FOLDER / record["id"]))
                 self.assertNotIn(record["id"], images.render(self.status).decode())
+                images.delete(self.root, record["id"])
+                directory = images.images_root(self.root)
+                (directory / f".review-link-image-answers-{record['id']}.json").unlink()
+                self.assertEqual(images.read_image_decision(self.root, path), decision)
 
     def test_linked_answers_save_before_delivery_and_survive_owner_delete(self) -> None:
         self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.temporary / "state")}))
@@ -917,6 +933,7 @@ class ImagesTests(ImagesFixture):
                 self.assertEqual(images.records(self.root), [])
                 saved = the_list.load(morty.id, item.id)
                 self.assertTrue(any(isinstance(entry.what, str) and words in entry.what for entry in saved.log))
+                self.assertFalse(images.decision_root(self.root).exists())
 
     def test_registration_saves_the_legacy_list_keeper(self) -> None:
         keeper, producer, item = self.list_item()
@@ -1260,14 +1277,24 @@ sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringi
         self.assertEqual(images.records(self.root), [record])
         self.assertIn(record["id"], images.render(self.status).decode())
 
-    def test_feedback_refuses_empty_text_and_an_unknown_action(self) -> None:
+    def test_feedback_refuses_empty_text_an_unknown_action_and_a_wrong_token(self) -> None:
         record = self.register()
         token = images.request_token(images.console_token(self.root), record["id"])
         for body, reason in ((self.feedback_body(record, "   "), "enter feedback"),
-                             (urlencode({"image": record["id"], "token": token, "action": "move"}), "use the form")):
+                             (urlencode({"image": record["id"], "token": token, "action": "move"}), "use the form"),
+                             (urlencode({"image": record["id"], "token": "wrong", "action": "feedback",
+                                         "feedback": "Use a larger title."}), "the image token does not match")):
             with self.subTest(reason=reason), self.assertRaisesRegex(question_record.AnswerRefused, reason):
                 self.submit(body)
         self.assertEqual((images.records(self.root), self.sent), ([record], []))
+        self.assertFalse(images.decision_root(self.root).exists())
+
+    def test_a_retry_does_not_date_an_older_answer(self) -> None:
+        record = self.register()
+        words = "Use a larger title."
+        _ = images.send_answer(self.root, record["id"], "feedback", words)
+        self.submit(self.feedback_body(record, words))
+        self.assertFalse(images.decision_root(self.root).exists())
 
 
 class ImageQuestionTests(ImagesFixture):

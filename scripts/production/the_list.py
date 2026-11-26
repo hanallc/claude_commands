@@ -152,7 +152,7 @@ class ItemChange:
 
 
 @dataclass(frozen=True)
-class _ImageAnswerChange(ItemChange):
+class ImageAnswerChange(ItemChange):
     what: str
     key: str
     producer: staff.StaffId
@@ -272,7 +272,7 @@ class Ask:
 
 
 PAGE_SOURCE = "nate via List"
-_IMAGE_ANSWER_SOURCE = "nate via Images"
+IMAGE_ANSWER_SOURCE = "nate via Images"
 _LEGACY_RECEIPT = "List request receipt: "
 _LEGACY_FEEDBACK = "Feedback to morty: "
 feedback_claims: set[tuple[Path, str]] = set()
@@ -1460,8 +1460,8 @@ def _validate(item: ListItem) -> None:
         seen_runs.add(delivery.key)
         seen_logs.add(delivery.log_index)
     for change in item.log:
-        if isinstance(change, _ImageAnswerChange):
-            if not change.what.strip() or change.source != _IMAGE_ANSWER_SOURCE:
+        if isinstance(change, ImageAnswerChange):
+            if not change.what.strip() or change.source != IMAGE_ANSWER_SOURCE:
                 raise ListError("invalid image answer log")
         elif isinstance(change.what, str):
             _log_line(change.what, "log text")
@@ -1772,8 +1772,8 @@ def _read_log_line(line: str, number: int, read_schedule: Callable[[object], Sch
             case {"note": str(note)} if len(fields) == 1:
                 content = _read_legacy_note(note, source, number, read_schedule)
             case {"note": str(note), "image_answer": {"key": str(key), "producer": str(producer)}} if len(fields) == 2:
-                return _ImageAnswerChange(_required_time(time), note, source, _request_id(key),
-                                          staff_id(producer, "image answer producer"))
+                return ImageAnswerChange(_required_time(time), note, source, _request_id(key),
+                                         staff_id(producer, "image answer producer"))
             case {"action": "Parked", "fields": values, "request": request} if len(fields) == 3:
                 parking = _read_field_change("Parked", values, number, read_schedule)
                 content = PageParkingChange("Parked", parking.fields, _request_id(request))
@@ -1905,7 +1905,7 @@ def _require_active_open_producers(items: Sequence[ListItem]) -> None:
 
 def _stored_log_line(entry: ItemChange) -> str:
     fields = _log_content(entry.what)
-    if isinstance(entry, _ImageAnswerChange):
+    if isinstance(entry, ImageAnswerChange):
         fields["image_answer"] = {"key": entry.key, "producer": entry.producer}
     return "- " + json.dumps({"time": entry.time.isoformat(), "source": entry.source, **fields},
                               ensure_ascii=False)
@@ -3278,7 +3278,7 @@ def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
 
 def _own_page_entry(entry: ItemChange) -> bool:
     """Find nate's own page entries. They do not change the unread update."""
-    if entry.source == _IMAGE_ANSWER_SOURCE:
+    if entry.source == IMAGE_ANSWER_SOURCE:
         return True
     return entry.source == PAGE_SOURCE and (isinstance(entry.what, MarkedRead) or entry.what == "Marked read"
                                             or _is_feedback(entry) or is_page_request_receipt(entry))
@@ -3798,7 +3798,7 @@ def save_image_answer(keeper: staff.StaffId, identity: str, key: str, words: str
     with store.locked():
         item = load(keeper, identity)
         for entry in reversed(item.log):
-            if isinstance(entry, _ImageAnswerChange) and entry.key == key:
+            if isinstance(entry, ImageAnswerChange) and entry.key == key:
                 sync_folder(store.folder())
                 return entry.producer
         moment = now()
@@ -3813,10 +3813,10 @@ def save_image_answer(keeper: staff.StaffId, identity: str, key: str, words: str
         picture = re.compile(r"(?<![a-z0-9])" + re.escape(image_id) + r"(?![a-z0-9])", re.IGNORECASE)
         asks = {ask.ask_id for ask in open_asks(item) if picture.search(ask.what) or picture.search(ask.why)}
         changed = _close_asks(_clear_unread(item), asks, moment, key)
-        log = (*item.log, ItemChange(moment, FieldChange("Updated", {**changes}), _IMAGE_ANSWER_SOURCE))
+        log = (*item.log, ItemChange(moment, FieldChange("Updated", {**changes}), IMAGE_ANSWER_SOURCE))
         if item.unread_since is not NoTimestamp.UNSET:
-            log = (*log, ItemChange(moment, MarkedRead(), _IMAGE_ANSWER_SOURCE))
-        answer = _ImageAnswerChange(moment, words, _IMAGE_ANSWER_SOURCE, key, item.producer)
+            log = (*log, ItemChange(moment, MarkedRead(), IMAGE_ANSWER_SOURCE))
+        answer = ImageAnswerChange(moment, words, IMAGE_ANSWER_SOURCE, key, item.producer)
         _save(store, replace(changed, **changes, updated=moment, log=(*log, answer)))
         return answer.producer
 

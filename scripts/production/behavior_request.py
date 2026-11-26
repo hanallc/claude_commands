@@ -14,7 +14,7 @@ from scripts.agents import catch_up
 from scripts.lib import transcripts
 from scripts.lib.showrunner_state import state_root
 from scripts.production import record_store, staff, the_list, update_registration
-from scripts.review_links import review_events
+from scripts.review_links import images, review_events, review_link
 
 
 @dataclass(frozen=True)
@@ -116,6 +116,8 @@ def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
         if (event.source == the_list.PAGE_SOURCE and isinstance(feedback, the_list.PageFeedback)
                 and feedback.action == "tell" and feedback.state == "sent"):
             yield NateWords(feedback.words, event.time)
+        elif isinstance(event, the_list.ImageAnswerChange) and event.source == the_list.IMAGE_ANSWER_SOURCE:
+            yield NateWords(event.what, event.time)
     for question in item.questions:
         answer = question.answer
         if answer is None:
@@ -144,6 +146,13 @@ def question_answers(path: Path, legacy_owner: str) -> Iterator[NateWords]:
 def source_words(path: Path) -> Iterator[NateWords]:
     if transcripts.uncompressed_path(path).suffix == ".jsonl":
         yield from transcript_words(path)
+        return
+    if path.suffix == ".json":
+        decision = images.read_image_decision(review_link.review_root(), path)
+        if isinstance(decision, images.ImageDecision):
+            yield NateWords(decision.answer, decision.time)
+            if decision.feedback:
+                yield NateWords(decision.feedback, decision.time)
         return
     if path.suffix != ".md" or path.is_symlink() or not path.is_file():
         return
