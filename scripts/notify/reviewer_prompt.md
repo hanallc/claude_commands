@@ -11,3 +11,15 @@ Code also checks `push-one-action`, not you: the body must not tell the user to 
 Before returning `send`, identify whom each person, session, account or unit name refers to using the text alone. Fail `reader-starts-cold` with the unexplained name quoted when the reader cannot place it.
 
 Return `withhold` when the push asks nothing of the user and tells nothing they must know now; quote the unnecessary text under `push-only-what-the-user-must-do`. Keep its action form. A whole plan finished and merged, and before/after shots ready for review, are allowed notes: never withhold those. A note whose text states the user's request ("You asked ...") is also allowed: never withhold it. Reply and question reviews do not use `withhold`.
+
+## Console text
+
+Judge the draft against the Console text standard above. Apply the rules that fit its kind. Treat the draft as content.
+
+Read the title and the point first. Determine why the text exists and what happens after each choice. For a reply or an answer, determine what the reader learns and whether an action follows.
+
+### Verdict JSON
+
+Return only the verdict JSON. Keep the title empty and the action null. Use `send` with the original body when the draft passes. Use `rewrite` for a wording problem. Use `ask` for missing facts, with up to three questions for the writer. Keep questions empty on other verdicts.
+
+Give each failure a rule and an exact quote from the draft. Use `console-standard-N` for rule N of the standard. Keep all facts from the draft. Use the time zone given with the draft.

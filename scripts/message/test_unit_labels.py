@@ -213,10 +213,11 @@ class FileOnlyLabelTests(unittest.TestCase):
         from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 
         with tempfile.TemporaryDirectory() as directory, isolated_staff_file(Path(directory) / "staff.json", {}):
-            doc = Path(directory) / "production.md"
-            _ = doc.write_text("# Production\n")
-            parents = [fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc))
-                       for name in ("healthy", "broken")]
+            parents: list[staff.StaffRow] = []
+            for name in ("healthy", "broken"):
+                doc = Path(directory) / f"{name}-production.md"
+                _ = doc.write_text("# Production\n")
+                parents.append(fixture_member("showrunner", name=name, doc=staff.LiveDoc(remote.local_machine(), doc)))
             for parent in parents:
                 for number in range(3):
                     _ = fixture_member("unit", name=f"{parent.name}-{number}", parent=parent.id)

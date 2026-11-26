@@ -10,6 +10,7 @@ from unittest import mock
 from scripts.message import send
 from scripts.production import staff, staff_move, unit_config
 from scripts.production import stall_watch
+from scripts.production.production_names import LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.production.staff_test_support import unit_membership
 from scripts.production.transfer_unit_test_support import UnitTransferFixture
 
@@ -47,6 +48,20 @@ class UnitTransferTests(UnitTransferFixture):
             unit_config.PlanFile(Path("docs/plans/alpha.md")), unit_config.AppPort(8123), ("review",)))
         path = self.unit / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns
+        with self.subTest(destination="enrolled without a serving merge unit"):
+            _ = self.git("switch", "-c", "main")
+            live = self.giving / "docs/plans" / f"other-production{LIVE_DOCUMENT_SUFFIX}"
+            self.write(live, self.production_doc("other", self.receiving)
+                       + f"- **Repository:** `{self.giving}`\n- **{MERGE_CHECKOUT_FIELD}:** `{self.giving}`\n")
+            _ = staff.set_doc(receiving.id, staff.LiveDoc("natedev", live))
+            refused = self.transfer("apply")
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("add a merge unit before adding other units", refused.stderr)
+            self.assertEqual(staff.by_id(row.id), row)
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+            assert isinstance(parents[1].doc, staff.LiveDoc)
+            _ = staff.set_doc(receiving.id, parents[1].doc)
+            _ = self.git("switch", "demo")
         self.assert_ok(self.transfer("apply"))
         self.assertEqual(staff.by_id(row.id), replace(row, parent=staff.ReportsTo(receiving.id)))
         self.assertEqual(tuple(staff.by_id(parent.id) for parent in parents), parents)

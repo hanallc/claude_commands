@@ -6,6 +6,7 @@ from __future__ import annotations
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 from scripts.herdr import herdr_types
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_test_support import fixture_git_environment
 
 import io
 import json
@@ -22,7 +23,7 @@ from unittest import mock
 
 
 from scripts.production import add_showrunner
-from scripts.production import promote_showrunner
+from scripts.production import production_doc, promote_showrunner
 from scripts.production import showrunners, worker
 from scripts.agents import stop_resume
 from scripts.production import showrunner_tree
@@ -37,6 +38,8 @@ from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.whoami import account
 
 from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.add_showrunner_test_support import write_guard_proof
+from scripts.production.production_names import GUARD_READY_FILE, LIVE_DOCUMENT_SUFFIX, MERGE_CHECKOUT_FIELD
 from scripts.production import staff, staff_sources, unit_config
 from scripts.production.fake_unit_host import process, private_process_registry
 
@@ -235,6 +238,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     root: Path = Path()
     parent_doc: Path = Path()
     child_doc: Path = Path()
+    child_integration: Path = Path()
     worktree: Path = Path()
     events: list[str] = []
     alive: list[bool] = []
@@ -252,6 +256,9 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **fixture_git_environment(self.root), "GIT_CONFIG_SYSTEM": os.devnull,
+        }, clear=True)))
         for name, path in {
             "NOTIFIER_STATE_DIR": self.root / "notifier",
             "SHOWRUNNER_STATE_DIR": self.root / "showrunner-state",
@@ -270,9 +277,15 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = (parent / "log.md").write_text("log\n")
         commit_all(parent)
         self.worktree = repo(self.root / "demo")
-        self.child_doc = self.worktree / "future-production.md"
-        _ = self.child_doc.write_text(doc_text(self.worktree))
+        _ = (self.worktree / "plan.md").write_text("# Unit plan\n")
         commit_all(self.worktree)
+        self.child_integration = self.root / "child-integration"
+        _ = subprocess.run(["git", "-C", str(self.worktree), "worktree", "add", "-qb", "child",
+                            str(self.child_integration), "main"], check=True, capture_output=True)
+        self.child_doc = self.worktree / f"future-production{LIVE_DOCUMENT_SUFFIX}"
+        self.write_child_doc(self.child_doc)
+        write_guard_proof(self.root, self.root / "showrunner-state", self.worktree)
+        _ = self.enterContext(mock.patch.object(production_doc, "GUARD_REPOSITORY", self.worktree))
         self.staff.register_production("parent", self.parent_doc)
         parent_row = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", self.parent_doc))
         _ = fixture_member("unit", name="demo", parent=parent_row.id, runtime_id=SESSION,
@@ -407,10 +420,23 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_promote_keeps_worker_rows_after_restore(self) -> None:
         unit = self.staff_unit()
         worker = fixture_member("worker", name="impl1", parent=unit.id)
+        plan = self.worktree / "plan.md"
+        plan_bytes = plan.read_bytes()
+        proof = self.root / "showrunner-state" / GUARD_READY_FILE
+        saved = proof.read_bytes()
+        proof.unlink()
+        with self.subTest(guard_proof=False):
+            code, output, errors = self.run_main()
+            self.assertEqual(code, 2, output + errors)
+            self.assertIn(GUARD_READY_FILE, errors)
+            self.assert_nothing_stopped()
+            self.assertEqual(staff.by_id(unit.id), unit)
+        _ = proof.write_bytes(saved)
         code, output, errors = self.run_main()
         self.assertEqual(code, 0, output + errors)
         self.assert_native_promotion(unit)
         self.assertEqual(staff.by_id(worker.id), worker)
+        self.assertEqual(plan.read_bytes(), plan_bytes)
         self.assertTrue(any(row.name == "child" for row in staff.find(kind="showrunner")))
 
     def test_promote_showrunner_rerun(self) -> None:
@@ -633,15 +659,19 @@ class PromoteShowrunnerTests(unittest.TestCase):
                 self.assertIn(cause, err)
                 self.assert_nothing_stopped()
 
-    def test_an_uncommitted_child_doc_is_refused(self) -> None:
-        outside = repo(self.root / "elsewhere")
-        _ = (outside / "seed").write_text("seed")
-        commit_all(outside)
-        self.child_doc = outside / "child-production.md"
-        _ = self.child_doc.write_text(doc_text(outside))
+    def write_child_doc(self, path: Path) -> None:
+        write_text_atomic(path, doc_text(self.child_integration).replace("**Merge branch:** main", "**Merge branch:** child")
+                          + f"- **Repository:** {self.worktree}\n- **{MERGE_CHECKOUT_FIELD}:** {self.worktree}\n")
+        with (self.worktree / ".git/info/exclude").open("a", encoding="utf-8") as excluded:
+            _ = excluded.write(f"\n/{path.relative_to(self.worktree).as_posix()}\n/log.md\n")
+
+    def test_a_tracked_child_live_doc_is_refused(self) -> None:
+        _ = subprocess.run(["git", "-C", str(self.worktree), "add", "-f", str(self.child_doc)],
+                           check=True, capture_output=True)
+        commit_all(self.worktree)
         code, _out, err = self.run_main()
         self.assertEqual(code, 2)
-        self.assertIn("is not committed; the unit commits it first", err)
+        self.assertIn("tracked", err)
         self.assert_nothing_stopped()
 
     def test_a_retired_or_unlisted_unit_is_refused(self) -> None:
@@ -657,7 +687,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def test_default_document_reads_valid_markdown_with_any_name(self) -> None:
         self.child_doc.unlink()
         first = self.worktree / "docs/child.md"
-        write_text_atomic(first, doc_text(self.worktree))
+        self.write_child_doc(first)
         for ignored in (".git/ignored.md", "target/ignored.md", "docs/incomplete-production.md"):
             write_text_atomic(self.worktree / ignored,
                 "- **Showrunner checkout:** invalid\n" if "incomplete" in ignored else doc_text(self.worktree))
@@ -947,7 +977,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
     def child_with_open_tabs(self, panes: list[herdr.PaneIdentity]) -> ProductionDocument:
         child_doc = self.worktree / "builds-production.md"
-        _ = child_doc.write_text(doc_text(self.worktree))
+        self.write_child_doc(child_doc)
         child = read_new_production(child_doc, "child")
         _ = self.enterContext(mock.patch.object(add_showrunner, "running", return_value=False))
         _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", return_value=[]))

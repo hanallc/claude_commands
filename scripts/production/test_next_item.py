@@ -2,6 +2,7 @@
 """Tests for next_item.py: the one item /next shows from the four lists, and moving an item to the end."""
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.production.change_review_test_support import pictured_changes
 
 from scripts.agents import remote
@@ -78,6 +79,7 @@ class NextItemTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)

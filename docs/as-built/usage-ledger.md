@@ -497,7 +497,7 @@ The hourly pass lives outside this repository, in `/etc/nixos/modules/linux/usag
   | `limit 250,000` | 683 | 8,066,593,866 | +39.6% | 111,029 |
   | `never` | 0 | 23,242,221,181 | +302.3% | 210,404 |
 
-  The new-worker row equals `limit 100,000` with 0 new workers: the fitted slope is negative, so the kept size never passes about 84,000. Stored weighted tokens of the same threads: 5,551,641,863; the replay's base is about 4% over it, because it does not cost the compaction request and does not simulate Codex compacting a full context. `UNIT_COMPACT_ABOVE_TOKENS` stays 100000.
+  The new-worker row equals `limit 100,000` with 0 new workers: the fitted slope is negative, so the kept size never passes about 84,000. Stored weighted tokens of the same threads: 5,551,641,863; the replay's base is about 4% over it, because it does not cost the compaction request and does not simulate Codex compacting a full context. `unit_compact_above_tokens` stays 100000.
 - **Compaction reread share** by role and model: `gpt-6.1-sol` 4.4% (director) and 6.8% (unassigned); Claude director models 4.9% to 7.0%; `gpt-5.6-sol` 0.4% to 0.5%.
 
 - **Unclassified rows**: a row stored before version 10 whose file is gone (or a Mac file not yet re-read) stays `unclassified`; the report counts such turns in its coverage.
