@@ -351,7 +351,7 @@ def _decode_images(images: tuple[PastedImage, ...]) -> tuple[_ImageUpload, ...]:
 
 def _identify_image(extension: str, data: bytes) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["magick", "identify", "-limit", "width", "8192",
+        ["magick", "identify", "-regard-warnings", "-limit", "width", "8192",
          "-limit", "height", "8192", "-limit", "area", "32MP",
          "-limit", "list-length", "32", "-limit", "memory", "128MiB",
          "-limit", "map", "128MiB", "-limit", "disk", "0",
@@ -365,10 +365,16 @@ def _validate_image(upload: _ImageUpload) -> None:
     except subprocess.TimeoutExpired:
         raise SubmissionError("The pasted image could not be read in time.") from None
     if result.returncode:
-        error = re.search(r"(?m)^[^:\r\n]+: (.+?) @ error/", result.stderr.decode(errors="replace"))
-        reason = (re.sub(r" `[^\r\n]*'$", "", error[1]).removesuffix(".") if error
-                  else f"ImageMagick exited with status {result.returncode}")
-        raise SubmissionError(f"The pasted image could not be read: {reason}.")
+        stderr = result.stderr.decode(errors="replace")
+        warnings = [line for line in stderr.splitlines() if "@ warning/" in line]
+        if "@ error/" in stderr or not warnings or any(
+                not re.fullmatch(r"[^:]+: iCCP:.*? @ warning/png\.c/\S+", line) for line in warnings):
+            diagnostic = re.search(r"(?m)^[^:\r\n]+: (.+?) @ error/", stderr)
+            if diagnostic is None and warnings:
+                diagnostic = re.match(r"[^:]+: (.+?) @ warning/", warnings[0])
+            reason = (re.sub(r" `[^\r\n]*'$", "", diagnostic[1]).removesuffix(".") if diagnostic
+                      else f"ImageMagick exited with status {result.returncode}")
+            raise SubmissionError(f"The pasted image could not be read: {reason}.")
     names = result.stdout.decode("ascii", errors="replace").splitlines()
     if not names:
         raise SubmissionError("The pasted image could not be read: ImageMagick did not report an image format.")
