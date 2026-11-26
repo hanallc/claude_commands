@@ -371,6 +371,9 @@ class ReviewItem:
             if isinstance(slot, delivery_state.AnsweredQuestion):
                 if handoff.filed_slot_id == slot.question_id:
                     time = AnswerTimeFromLog.USE_LOG
+            elif isinstance(self.source, InvestigationSource):
+                if handoff.filed_investigation_answer:
+                    time = AnswerTimeFromLog.USE_LOG
             elif isinstance(time, datetime) and any(self.log[index].time == time for index in handoff.answer_events):
                 time = AnswerTimeFromLog.USE_LOG
             log = tuple(event for index, event in enumerate(log) if index not in handoff.answer_events)
