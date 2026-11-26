@@ -1248,6 +1248,71 @@ if(example.filterOn){
         self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/01-128.webp"', tab)
         self.assertIn('<span class="studio-name">dwight</span> <b>2</b>', tab)
 
+    def test_studio_lists_linked_items_with_states_and_missing_records(self) -> None:
+        closed = self.add("Close this check", number=210)
+        missing = self.add("Remove this fixture record", number=406)
+        _ = self.add("Check <this> & that", number=413)
+        umbrella = self.add("The workflow is consistent and simple", number=494)
+        _ = the_list.update(MORTY.id, umbrella.id, {"related_to": (413, 406, 210)}, source="morty")
+        _ = the_list.close(MORTY.id, closed.id, "The check passed.", source="morty")
+        (the_list.folder(MORTY.id) / f"{missing.id}.md").unlink()
+        root = self.root / "reviews"
+        with patch.object(list_page, "records", wraps=list_page.records) as read_records:
+            markup = list_page.render(root, include_counts=False).decode()
+        read_records.assert_called_once_with(include_closed=True)
+        self.assertEqual(markup.count('<h3>Linked items</h3>'), 1)
+        panel = markup.split('data-number="494"', 1)[1].split('</tbody>', 1)[0]
+        section = panel.split('<section class="item-links" data-linked-items>', 1)[1].split('</section>', 1)[0]
+        parsed = ElementTree.fromstring('<section>' + section.replace(' data-record-jump ', ' data-record-jump="" ')
+                                        + '</section>')
+        rows = parsed.findall('ul/li')
+        self.assertEqual([(row.findtext('a') or row.text, row.findtext('span')) for row in rows], [
+            ('#210 Close this check', 'Closed'), ('#406 not found', None), ('#413 Check <this> & that', 'Working'),
+        ])
+        self.assertIsNone(rows[1].find('a'))
+        self.assertEqual([anchor.attrib['href'] for anchor in parsed.findall('ul/li/a')],
+                         [list_page.item_link(MORTY.id, 210) + '&reveal=1', list_page.item_link(MORTY.id, 413)])
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_studio_linked_items_open_and_refresh_with_the_page(self) -> None:
+        closed = self.add("Close a linked item", number=210)
+        open_item = self.add("Keep a linked item open", number=413)
+        umbrella = self.add("The workflow is consistent and simple", number=494)
+        _ = the_list.update(MORTY.id, umbrella.id, {"related_to": (413, 210)}, source="morty")
+        root = self.root / "reviews"
+        initial = list_page.render(root, include_counts=False).decode()
+        _ = the_list.close(MORTY.id, closed.id, "The check passed.", source="morty")
+        fresh = list_page.render(root, include_counts=False).decode()
+        self.browser_action_sequence(r'''
+ const item=number=>document.querySelector('[data-number="'+number+'"]');
+ const links=()=>recordDetails(item(494)).querySelector('[data-linked-items]');
+ const states=()=>[...links().querySelectorAll('.list-state')].map(badge=>badge.textContent).join(',');
+ const back=async()=>{
+  const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
+  history.back();await changed;
+ };
+ check(states()==='Working,Working','The section shows the states from the first page.');
+ refreshMarkup=FRESH_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ check(states()==='Closed,Working' && pageReads===1,'One page refresh updates the state badges.');
+ const count=document.querySelector('[data-list-count]').textContent;
+ links().querySelectorAll('a')[0].click();
+ const closed=item(210);
+ check(recordIsOpen(closed) && !closed.hidden && closed.closest('[data-linked-item]'),
+  'The closed item link opens its detail outside the results.');
+ check(!recordDetails(closed).querySelector('form') &&
+  recordDetails(closed).textContent.includes('The check passed.'),'The closed detail shows the log and no actions.');
+ check(document.querySelector('[data-list-count]').textContent===count,'The closed item does not change the counts.');
+ await back();
+ check(recordIsOpen(item(494)) && closed.hidden,'Back restores the umbrella and hides the closed item.');
+ links().querySelectorAll('a')[1].click();
+ const target=item(OPEN_NUMBER);
+ check(recordIsOpen(target) && !target.hidden && !recordIsOpen(item(494)) &&
+  new URLSearchParams(location.hash.slice(1)).get('item')===target.dataset.key,'The open item link opens its item.');
+'''.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/')).replace('OPEN_NUMBER', str(open_item.number)),
+                                     reduced_motion=True, add_item=False, markup=initial, open_number=494)
+
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_tab_filters_the_rows_to_its_producer(self) -> None:
         _ = self.fixture_items()
@@ -2328,7 +2393,11 @@ frame.addEventListener('load',async()=>{
    check(win.scrollY===270,'the previous page can scroll to 270');
   }
   const banner=doc.querySelector('[data-page-status]');
-  if(scenario==='banner') banner.style.minHeight='60px';
+  if(scenario==='banner'){
+   const measured=new Promise(resolve=>win.addEventListener('page-top-resize',resolve,{once:true}));
+   banner.style.minHeight='60px';
+   await measured;
+  }
   const originalTop=win.scrollY,beforeJump=win.location.href;
   const original=new URL(beforeJump),params=new URLSearchParams(original.hash.slice(1));
   if(pendingWords){params.set('q',pendingWords);original.hash=String(params);}
@@ -2361,7 +2430,7 @@ frame.addEventListener('load',async()=>{
   if(number==='99' || number==='29'){
    const message=number==='29' ? 'Item #29 is closed' : 'Item #99 is not on the List';
    const notice=missing();
-   check(!target && pageNotice.hidden && notice===sourceNotice() && !notice.hidden &&
+   check((!target || target.hidden) && pageNotice.hidden && notice===sourceNotice() && !notice.hidden &&
     notice.textContent===message && inView(notice),'The expanded row shows the target notice.');
    if(scenario==='closed') check(keptSource(),'A closed target keeps the source form and draft.');
   }else{
