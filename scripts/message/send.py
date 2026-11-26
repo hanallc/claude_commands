@@ -4493,11 +4493,8 @@ def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: se
     conversation = conversation_recipient(mailbox).conversation
     candidates = [record for record in records if record["sessionId"] == conversation]
     message_owner = _unique_message_owner(conversation, registry, candidates)
-    with _message_proof.message_lookup(message_owner):
+    with _message_proof.message_lookup(message_owner) as lookup:
         checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
-    if (isinstance(checked, unit_lookup.UnknownUnit) and checked.reason == herdr_types.PANE_STARTING
-            and not registry.unreadable):
-        return SessionIdWithoutLiveRecipient(mailbox, starting=True)
     if isinstance(checked, unit_lookup.ClaudeArgvUnavailable):
         try:
             _ = staff.native_id(conversation)
@@ -4509,7 +4506,11 @@ def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: se
         candidate = candidates[0]
         started = candidate.get("procStart", "")
         path = candidate["messagingSocketPath"]
-        if candidate["pid"] != checked.pid or not started or not path:
+        if candidate["pid"] != checked.pid or not started:
+            return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(checked.reason))
+        if checked.place in lookup.starting_panes:
+            return SessionIdWithoutLiveRecipient(mailbox, starting=True)
+        if not path:
             return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(checked.reason))
         attempt = ClaudeDeliveryAttempt(mailbox, checked.pid, started, path, fallback_pane=checked.place)
         return RelayAttempt(replace(message, to=f"uds:{path}", claude_attempt=attempt))
