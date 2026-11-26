@@ -599,7 +599,8 @@ def _read_panes(record: staff.StaffSnapshot, client: herdr.Herdr) -> PaneRead | 
 
 def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                      read: PaneRead | PaneReadUnavailable, client: herdr.Herdr, *,
-                     selection: SelectedWorkers | SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT) -> PaneEvidence:
+                     selection: SelectedWorkers | SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT,
+                     report_startup_absence: bool = True) -> PaneEvidence:
     workers = record.find(kind="worker", parent=parent)
     selected = [row for row in workers if isinstance(selection, AllWorkers)
                 or isinstance(selection, SelectedWorkers) and row.name in selection.names
@@ -615,9 +616,10 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
     # Only a worker that launched a pane in a parent tab can recover one.
     launched_here = {launch_owners[pane_id] for pane in panes
                      if (pane_id := _text(pane, "pane_id")) in launch_owners and _text(pane, "tab_id") in parent_tabs}
-    absence_unproved = any(item.tab in parent_tabs and (
+    blocking_panes = [item for item in scan.unknown if item.tab in parent_tabs and (
         item.pane not in launch_owners if isinstance(item, herdr.StartingPane)
-        else not isinstance(selection, SelectedWorkers)) for item in scan.unknown)
+        else not isinstance(selection, SelectedWorkers))]
+    warn_on_absence = report_startup_absence or any(not isinstance(item, herdr.StartingPane) for item in blocking_panes)
     states: list[WorkerPane] = []
     for row in selected:
         matches = scan.found.get(row.id, [])
@@ -666,8 +668,9 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                 states.append(_uncertain(row, "recovery pane belongs to another native session"))
                 continue
             states.append(StoppedWorker(row, identity, terminal))
-        elif absence_unproved:
-            states.append(_uncertain(row, "pane evidence is incomplete; absence is unproved"))
+        elif blocking_panes:
+            reason = "pane evidence is incomplete; absence is unproved"
+            states.append(_uncertain(row, reason) if warn_on_absence else UncertainWorker(row, reason))
         else:
             states.append(ClosedWorker(row))
     terminals: frozenset[str] = frozenset()
@@ -739,13 +742,20 @@ def run_execution_blocker(run: Path, record: staff.StaffSnapshot, owner: StaffId
 
 
 def observe_parents(parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot, *,
-                    selection: SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT) -> dict[StaffId, list[WorkerPane]]:
-    """Judge the selected workers of these parents from one pane read."""
+                    selection: SelectedWorkerRows | AllWorkers = AllWorkers.CURRENT,
+                    starting_panes: set[herdr.HerdrPlace] | None = None) -> dict[StaffId, list[WorkerPane]]:
+    """Read the selected workers and collect starting panes without a proved worker if requested."""
     if not parents:
         return {}
     client = _client()
     read = _read_panes(record, client)
-    return {parent.id: _parent_evidence(parent.id, record, read, client, selection=selection).states for parent in parents}
+    observed = {parent.id: _parent_evidence(parent.id, record, read, client, selection=selection,
+                report_startup_absence=starting_panes is None).states for parent in parents}
+    if starting_panes is not None and isinstance(read, PaneRead):
+        named = {state.pane for states in observed.values() for state in states if isinstance(state, StartingWorker)}
+        starting_panes.update(herdr.HerdrPlace(client.session, pane.pane) for pane in read.scan.unknown
+                              if isinstance(pane, herdr.StartingPane) and pane.pane not in named)
+    return observed
 
 
 def worker_state(observed: WorkerPane) -> Literal["idle", "busy", "unknown"]:

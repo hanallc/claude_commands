@@ -742,7 +742,7 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
         line_color = color.css if isinstance(color, accounts.AccountColor) else ""
         role_text = _spans(role_span)
         if role == accounts.CODEX_ROLE:
-            role_text += "".join(f"<br>{html.escape(worker['name'])}: {worker['state']}"
+            role_text += "".join(f"<br>{html.escape(accounts.starting_worker_text(worker))}"
                                  for worker in reading.starting_workers)
         rows.append("<tr>" + _cell(role_text) + _cell(_swatch(role_span))
                     + _cell(_busy_line(role, line_color, samples, reading.checked_at, reading.zone), "left busy-cell")
@@ -752,8 +752,11 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
                 + "".join(_cell(_spans(cells[key]) + (_not_running_slot("role-not-running-total", all_text, icon)
                                                       if key == "total" else ""), "right")
                           for key in ROLE_COUNT_COLUMNS) + "</tr>")
+    starting_panes = "".join(f"<li>{html.escape(accounts.starting_pane_text(pane))}</li>"
+                             for pane in reading.starting_panes)
     return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, _sort_orders(values, ROLE_COUNT_COLUMNS),
-                       descending=ROLE_COUNT_COLUMNS, unsorted=(BUSY_LINE_HEADING,))
+                       descending=ROLE_COUNT_COLUMNS, unsorted=(BUSY_LINE_HEADING,),
+                       after=f"<ul>{starting_panes}</ul>" if starting_panes else "")
 
 
 def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | None = None) -> str:
