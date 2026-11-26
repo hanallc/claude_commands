@@ -832,6 +832,10 @@ class WorkerResultUnconfirmed(Result):
     """The prompt may have sent input, and the transcript receipt is missing."""
 
 
+class WorkerResultInputUncertain(WorkerResultUnconfirmed):
+    """The prompt failed and could have sent input."""
+
+
 @dataclass(frozen=True)
 class BlockedWorkerResult:
     """The worker needs input, and the result must wait for the pane."""
@@ -5767,7 +5771,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     if isinstance(receipt, OrdinaryWorkerMessage):
                         return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
                 except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-                    reason = str(error)
+                    reason = str(error) or type(error).__name__
                     if isinstance(receipt, WorkerResultSubmission) and (
                             checking_target or isinstance(error, _WorkerResultReadinessFailure)):
                         return WorkerResultNotReady("retry", reason)
@@ -5784,10 +5788,15 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                     try:
                         if isinstance(receipt, WorkerResultSubmission):
-                            return _confirm_worker_result(worker, state.pane, state.terminal, review_text or text, boundary)
+                            confirmed = _confirm_worker_result(worker, state.pane, state.terminal, review_text or text, boundary)
+                            if isinstance(confirmed, WorkerResultUnconfirmed) and reason:
+                                return WorkerResultInputUncertain("retry", reason)
+                            return confirmed
                         if receipt.received(worker, membership):
                             return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
+                        if isinstance(receipt, WorkerResultSubmission) and reason:
+                            return WorkerResultInputUncertain("retry", reason)
                         reason = f"worker transcript is unavailable: {error}"
                     return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
