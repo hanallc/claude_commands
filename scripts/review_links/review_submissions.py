@@ -366,14 +366,13 @@ def _validate_image(upload: _ImageUpload) -> None:
         raise SubmissionError("The pasted image could not be read in time.") from None
     if result.returncode:
         stderr = result.stderr.decode(errors="replace")
-        warnings = [line for line in stderr.splitlines() if "@ warning/" in line]
-        if "@ error/" in stderr or not warnings or any(
-                not re.fullmatch(r"[^:]+: iCCP:.*? @ warning/png\.c/\S+", line) for line in warnings):
-            diagnostic = re.search(r"(?m)^[^:\r\n]+: (.+?) @ error/", stderr)
-            if diagnostic is None and warnings:
-                diagnostic = re.match(r"[^:]+: (.+?) @ warning/", warnings[0])
-            reason = (re.sub(r" `[^\r\n]*'$", "", diagnostic[1]).removesuffix(".") if diagnostic
-                      else f"ImageMagick exited with status {result.returncode}")
+        lines = [line for line in stderr.splitlines() if line]
+        if "@ error/" in stderr or not lines or any(
+                not re.fullmatch(r"[^:]+: iCCP:.*? @ warning/png\.c/\S+", line) for line in lines):
+            diagnostic = (re.search(r"(?m)^[^:\r\n]+: (.+?) @ error/", stderr)
+                          or re.search(r"(?m)^[^:\r\n]+: (.+?) @ warning/", stderr))
+            reason = diagnostic[1] if diagnostic else f"ImageMagick exited with status {result.returncode}"
+            reason = re.sub(r"[ \t]*[`']/[^'\r\n]*'", "", reason).strip().removesuffix(".")
             raise SubmissionError(f"The pasted image could not be read: {reason}.")
     names = result.stdout.decode("ascii", errors="replace").splitlines()
     if not names:

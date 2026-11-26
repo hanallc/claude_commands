@@ -3330,6 +3330,41 @@ class ReviewLinksServerTests(unittest.TestCase):
         reply = self.request(review_page.ATTACHMENT_PATH + "?" + urlencode({"key": key, "id": attachment.id}))
         self.assertEqual(reply, HttpReply(200, "image/png", image))
 
+    def test_new_item_refuses_a_libpng_read_error_with_an_iccp_warning(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, cache, request = self.page_bug_fixture()
+        request = replace(request, images=(new_item_dialog.PastedImage("image/png", PNG),))
+        identified = subprocess.CompletedProcess(
+            ["identify"], 1, stdout=b"PNG\n",
+            stderr=(b"identify: iCCP: extra compressed data @ warning/png.c/MagickPNGWarningHandler/1534.\n"
+                    + b"libpng: Read Error\n"))
+
+        with (patch.object(review_submissions, "_identify_image", return_value=identified),
+              patch.object(change_page, "send_to_staff") as send):
+            reply = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual(reply.status, 400, reply.body)
+        self.assertEqual(cache.get().records, {})
+        send.assert_not_called()
+
+    def test_new_item_removes_quoted_temporary_paths_from_the_decoder_error(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, cache, request = self.page_bug_fixture()
+        request = replace(request, images=(new_item_dialog.PastedImage("image/png", PNG),))
+        identified = subprocess.CompletedProcess(
+            ["identify"], 1, stdout=b"",
+            stderr=(b"identify: unable to write blob '/tmp/magick-output': No space left on device "
+                    + b"`/private/tmp/magick-input' @ error/blob.c/WriteBlob/1400.\n"))
+
+        with (patch.object(review_submissions, "_identify_image", return_value=identified),
+              patch.object(change_page, "send_to_staff") as send):
+            reply = self.new_item_http(self.new_item_body(request), finished=True)
+        error = "The pasted image could not be read: unable to write blob: No space left on device."
+        self.assertEqual((reply.status, json.loads(reply.body)), (400, {"error": error}))
+        self.assertEqual(cache.get().records, {})
+        send.assert_not_called()
+
     def test_new_item_reports_the_warning_for_a_truncated_jpeg(self) -> None:
         _, cache, request = self.page_bug_fixture()
         jpeg = subprocess.check_output(["magick", "-size", "64x64", "gradient:", "jpeg:-"], timeout=4)
