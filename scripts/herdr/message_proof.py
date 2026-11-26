@@ -3,8 +3,10 @@
 from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+
+from scripts.herdr.place import HerdrPlace
 
 
 @dataclass(frozen=True)
@@ -20,14 +22,21 @@ class StrictOwnerProof(Enum):
 
 type MessageOwnerProof = ProvedMessageOwner | StrictOwnerProof
 
-message_owner: ContextVar[MessageOwnerProof] = ContextVar("herdr_message_owner", default=StrictOwnerProof.REQUIRED)
+@dataclass
+class MessageLookup:
+    owner: MessageOwnerProof
+    starting_panes: set[HerdrPlace] = field(default_factory=set)
+
+
+active_lookup: ContextVar[MessageLookup | None] = ContextVar("herdr_message_lookup", default=None)
 
 
 @contextmanager
-def message_lookup(owner: MessageOwnerProof) -> Generator[None]:
+def message_lookup(owner: MessageOwnerProof) -> Generator[MessageLookup]:
     """Set the owner proof for one message lookup."""
-    token = message_owner.set(owner)
+    lookup = MessageLookup(owner)
+    token = active_lookup.set(lookup)
     try:
-        yield
+        yield lookup
     finally:
-        message_owner.reset(token)
+        active_lookup.reset(token)

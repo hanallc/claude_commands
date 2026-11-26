@@ -4174,6 +4174,21 @@ class WorkerPaneTests(StaffTestCase):
         })
         self.assertEqual(errors.getvalue(), "herdr agents:w1:p1: pane is starting\n")
 
+    def test_starting_pane_without_a_launch_record_leaves_absence_unproved(self) -> None:
+        starting, ready = self.worker("starting"), self.worker("ready")
+        pane = "w1:p1"
+        self.world.add(starting, pane)
+        self.world.add(ready, "w1:p2")
+        pid, _, _ = self.world.foreground[pane]
+        self.world.foreground[pane] = (pid, "claude", [])
+        fake_unit_host.process(os.environ, pid, 1, [], {}, started=str(100 * os.sysconf("SC_CLK_TCK")))
+        _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
+        _ = write_config_fixture(self.root / "conf/shutdown.conf", "start_seconds=20\n")
+        with patch.object(pane_launch, "read_valid_entries", return_value={}), redirect_stderr(io.StringIO()):
+            found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+        self.assertIsInstance(found[starting.id], worker_panes.UncertainWorker)
+        self.assertIsInstance(found[ready.id], worker_panes.OpenWorker)
+
     def test_unreadable_parent_pane_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")
         self.world.record(self.parent, "w1:p0")

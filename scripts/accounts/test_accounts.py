@@ -1575,6 +1575,38 @@ class AccountsTests(unittest.TestCase):
             observed = read_sessions(accounts.GroupAccounts())
         self.assertEqual(observed.counts[(numbered, "workers")], {row.current_session: "idle"})
 
+    def test_status_shows_a_starting_worker_without_a_read_warning(self) -> None:
+        from scripts.herdr import worker_panes
+        from scripts.herdr.test_worker_panes import PaneWorld
+        from scripts.production import fake_unit_host
+        from scripts.production.staff_test_support import unit_membership
+
+        _, target = self.workers_fixture()
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        owner = unit_membership("show", "unit")
+        owner = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root), expected=owner.worktree)
+        row = fixture_worker("starting-worker", owner.id, backend=staff.CodexBackend(target))
+        world = PaneWorld()
+        environment = fake_unit_host.environment(self.root)
+        environment["HERDR_PANE_RECORD_DIR"] = str(self.root / "launches")
+        with (patch.dict(os.environ, environment), patch.object(worker_panes, "_client", return_value=world),
+              patch.object(herdr, "native_process", side_effect=world.native_process),
+              patch.object(herdr, "_startup_processes", side_effect=world.descendants)):
+            world.add(owner, "w1:p0")
+            pane = "w1:p1"
+            world.add(row, pane, family="codex")
+            pid, _, _ = world.foreground[pane]
+            world.foreground[pane] = (pid, "codex", [])
+            fake_unit_host.process(environment, pid, 1, [], {}, started=str(100 * os.sysconf("SC_CLK_TCK")))
+            _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
+            _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "start_seconds=20\n")
+            reading = accounts.read_status(detail=True)
+        table = accounts.render_status_table(reading)
+        self.assertIn(f"herdr {world.session}:{pane}: pane is starting", reading.notes)
+        self.assertIn(f"worker {row.name}: starting", reading.detail_lines)
+        self.assertIn("busy 1, idle 0", table)
+        self.assertNotIn("read warning: herdr", table)
+
     def test_peer_counts_age_failure_and_recovery_use_only_the_local_counts(self) -> None:
         row = SharedStatusDocumentTests().row()
         now = datetime.now(timezone.utc)

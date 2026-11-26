@@ -6151,30 +6151,46 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                     self.assertEqual(send.pending(target), "")
 
     def test_send_queues_a_starting_claude_session_without_relaying(self) -> None:
+        identity, result = self.send_to_starting_claude(matching=True)
+        self.assertEqual(result, send.Result("queued", f"pane is starting; kept for session:{identity}"))
+        self.assertIn("Wait for startup.", send.queue_path(f"session-{identity}").read_text())
+        self.assertEqual(self.relayed, [])
+
+    def test_send_refuses_startup_evidence_for_another_conversation(self) -> None:
+        identity, result = self.send_to_starting_claude(matching=False)
+        self.assertEqual((result.outcome, result.detail), ("failed", "pane is starting"))
+        self.assertFalse(send.queue_path(f"session-{identity}").exists())
+        self.assertEqual(self.relayed, [])
+
+    def send_to_starting_claude(self, *, matching: bool) -> tuple[str, send.Result]:
         from scripts.herdr import herdr
 
         identity = fixture_runtime_id("starting-recipient")
-        address = f"session:{identity}"
+        reported = identity if matching else fixture_runtime_id("another-recipient")
         place = HerdrPlace("fixture", "w1:p1")
         pid = 998071
         environment = fake_unit_host.environment(self.root)
-        fake_unit_host.process(environment, pid, 998070, [], {}, started=str(100 * os.sysconf("SC_CLK_TCK")))
+        started = str(100 * os.sysconf("SC_CLK_TCK"))
+        fake_unit_host.process(environment, pid, 998070, [], {}, started=started)
         _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
         _ = write_config_fixture(self.root / "config/shutdown.conf", "start_seconds=20\n")
-        pane = {"pane_id": place.pane, "agent_session": {"kind": "id", "value": identity}}
+        _ = (self.root / "sessions" / f"{pid}.json").write_text(json.dumps({
+            "pid": pid, "sessionId": reported, "procStart": started, "name": "starting",
+            "messagingSocketPath": "", "updatedAt": 1,
+        }))
+        pane = {"pane_id": place.pane, "agent_session": {"kind": "id", "value": reported}}
         info = {"process_info": {"shell_pid": 998070, "foreground_process_group_id": pid,
                                  "foreground_processes": [{"pid": pid, "name": "claude"}]}}
-        with (mock.patch.dict(os.environ, environment),
+        with (mock.patch.dict(os.environ, environment), fake_unit_host.private_process_registry(),
+              mock.patch.object(sessions, "process_liveness", return_value=sessions.LiveSessionProcess(pid, started)),
               mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
               mock.patch.object(herdr, "herdr_processes", return_value=[]),
+              mock.patch.object(herdr, "process_placement", return_value=place),
               mock.patch.object(herdr.Herdr, "listed", return_value=[pane]),
               mock.patch.object(herdr.Herdr, "result", return_value=info),
               mock.patch.object(unit_lookup, "checked_conversation", new=checked_conversation)):
-            result = send.send(local_options(["--to", address, "--from", "fixture", "--text", "Wait for startup."]))
-
-        self.assertEqual(result, send.Result("queued", f"pane is starting; kept for {address}"))
-        self.assertIn("Wait for startup.", send.queue_path(f"session-{identity}").read_text())
-        self.assertEqual(self.relayed, [])
+            result = send.send(local_options(["--to", f"session:{identity}", "--from", "fixture", "--text", "Wait for startup."]))
+        return identity, result
 
     def test_absent_staff_recipient_keeps_its_queue_until_claude_returns(self) -> None:
         member = self.staff_rows["recipient"]
