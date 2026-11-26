@@ -1893,8 +1893,9 @@ The server clears that claim without a failure notice.
 If the server cannot start the send for another reason, it clears the claim and logs the error.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Remove sits at the left edge of the open row above the four-line text box.
-Remove saves text from the box as closing words and adds it after the removal line in the producer's notice.
-An empty box uses the short Studio notice and the default closing words.
+Remove saves the exact text from the box as closing words and adds it after the removal line in the notice.
+A blank box uses the short Studio notice and the default closing words.
+After a confirmed Remove, the page clears the submitted draft if it still matches.
 Park and Remove collapse the row after the save.
 The table applies the saved state before the next refresh.
 Park, Remove, Tell, Ask question, and Mark read show a message if the page cannot confirm the save.
@@ -2249,6 +2250,8 @@ The band appears on a producer tab and stays hidden on All.
 It shows the Top priority label with the flag, a link with the item number and title, the next step, the state, and the ETA.
 Click the link or press Enter while it has focus to open the item and save its place in the address.
 The link uses the same filter rules as other item links to show an item outside the current results.
+The title keeps its usual color and weight and uses the same hover and focus style as other item links.
+A refresh keeps focus on the same top item link. If that link is gone, focus moves to Search.
 A producer with no top item shows **No top priority item** and **Open an item and click "Make top priority".**
 The page renders one band for each top item and one band for no top item.
 A `:has()` rule for each band shows the band of the pressed Producer tab, so a tab click makes no request.
