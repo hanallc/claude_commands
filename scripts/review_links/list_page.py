@@ -1155,12 +1155,17 @@ def item_links_html(entry: ListRecord, log: ItemLog, displayed_next_step: str) -
 
 def linked_items_html(entry: ListRecord, linked_records: Mapping[tuple[staff.StaffId, int], ListRecord]) -> str:
     rows: list[str] = []
+    closed = 0
     for number in sorted(entry.item.related_to):
         linked = linked_records.get((entry.keeper, number))
-        text = (f'#{number} not found' if linked is None
-                else titled_item_link(linked, "item-link-label") + ' ' + state_badge(linked.item.state))
+        if linked is None:
+            rows.append(f'<li>#{number} not found</li>')
+            continue
+        state = linked.item.state
+        closed += int(state is the_list.ItemState.CLOSED)
+        text = titled_item_link(linked, "list-linked-title") + state_badge(state)
         rows.append(f'<li>{text}</li>')
-    return ('<section class="item-links" data-linked-items><h3>Linked items</h3><ul>'
+    return (f'<section class="item-links" data-linked-items><h3>Linked items · {closed} of {len(rows)} closed</h3><ul>'
             + ''.join(rows) + '</ul></section>') if rows else ''
 
 
@@ -2551,9 +2556,12 @@ scrollbar-width:thin;scrollbar-color:var(--ink-3) transparent}
 .item-links ul{list-style:none;padding:0;margin:0 0 16px}
 .item-links li{padding:6px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
 .item-links li:first-child{padding-top:0;border-top:0}
+[data-linked-items]>ul{display:grid;grid-template-columns:minmax(0,1fr) max-content;column-gap:12px}
+[data-linked-items]>ul>li{display:grid;grid-column:1/-1;grid-template-columns:subgrid;align-items:start;justify-items:start}
 .item-links .item-link-label{color:var(--accent);font-weight:600}
-:is(.item-links .item-link-label,.list-top-link){text-decoration:none}
-:is(.item-links .item-link-label,.list-top-link):is(:hover,:focus-visible){text-decoration:underline}
+a:is(.list-top-link,.list-linked-title){color:var(--ink);overflow-wrap:anywhere}
+:is(.item-links .item-link-label,.list-top-link,.list-linked-title){text-decoration:none}
+:is(.item-links .item-link-label,.list-top-link,.list-linked-title):is(:hover,:focus-visible){text-decoration:underline}
 .item-link-field{color:var(--ink-2);margin-inline-start:8px}
 .item-link-address{display:block;color:var(--ink-3);font-size:12px;margin-top:2px}
 .list-actions{position:relative}

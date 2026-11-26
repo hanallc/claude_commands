@@ -1823,7 +1823,9 @@ That request moves the item to Producer answering and shows its confirmation nex
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
 The Studio shows **Linked items** in the detail of an open item with `related_to` entries.
-It lists the numbers, titles, and current state badges in number order.
+The heading shows how many links point to Closed items and how many links exist.
+The section lists the items in number order, with the Studio row state badges in one column.
+The titles use the same text color and hover and focus underline as the Top priority link.
 The page uses the records it already reads for the snapshot.
 A missing record shows `#N not found`.
 The titled link opens the item.

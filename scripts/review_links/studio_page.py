@@ -110,7 +110,7 @@ border:1px solid color-mix(in srgb,var(--warning) 45%,var(--line));background:co
 letter-spacing:.08em;text-transform:uppercase;white-space:nowrap}
 .list-top-what{flex:1 1 240px;min-width:0}
 .list-top-what b{display:block;font-size:16px}
-.list-top-link{color:var(--ink);font-size:16px;font-weight:700;overflow-wrap:anywhere}
+.list-top-link{font-size:16px;font-weight:700}
 .list-top-next{color:var(--ink-2);font-size:13.5px}.list-top-next p{margin:0}
 .list-top-meta{display:flex;flex-direction:column;align-items:flex-end;gap:4px;white-space:nowrap}
 .list-top-meta small{color:var(--ink-3);font-size:12px}
