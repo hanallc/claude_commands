@@ -7474,6 +7474,38 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertNotIn("The leaf log is complete.", detail)
                 self.assertNotIn("<form", detail)
 
+    def test_studio_closed_detail_shows_an_unread_answer_without_marking_it_read(self) -> None:
+        keeper = self.configure_list_keeper()
+        item = the_list.add(keeper.id, "Check the result", owner=the_list.UnassignedOwner.NATE,
+                            source="nate", changes={})
+        closed = the_list.close(keeper.id, item.id, "The report is retired.", source="nate")
+        assert isinstance(item.updated, datetime)
+        assert isinstance(closed.updated, datetime)
+        question = question_record.Question("Q1", item.updated.isoformat(), "Which check passed?")
+        path = the_list.folder(keeper.id) / f"{item.id}.md"
+        fields = json.dumps(json.dumps([question_record.stored(question)]))
+        _ = path.write_text(path.read_text().replace("\n---\n", f"\nquestions: {fields}\n---\n", 1))
+        answer = "The page check passed."
+        answered_at = closed.updated + timedelta(minutes=1)
+        with (patch.object(staff, "caller_identity", return_value=keeper.current_session),
+              patch.object(the_list, "now", return_value=answered_at),
+              redirect_stdout(StringIO())):
+            self.assertEqual(the_list.main(["answer", item.id, "--question", question.question_id, "--text", answer]), 0)
+        saved = the_list.load(keeper.id, item.id)
+        self.assertEqual(the_list.unread_answer_ids(saved), frozenset({question.question_id}))
+        stored = path.read_bytes()
+
+        query = urlencode({"item-state": item.id, "keeper": keeper.id})
+        response = self.request(f"{studio_page.PAGE_PATH}?{query}")
+        self.assertEqual(response.status, 200)
+        body = cast(list_page.SavedActionState, json.loads(response.body))
+        self.assertIs(body.get("detail_closed"), True)
+        self.assertEqual(body.get("unread_answer"), "true")
+        detail = body.get("detail_html", "")
+        self.assertIn(question.words, detail)
+        self.assertIn(answer, detail)
+        self.assertEqual(path.read_bytes(), stored)
+
     def test_studio_top_priority_post_names_the_item_and_refuses_other_requests(self) -> None:
         morty, item = self.list_keeper_item("Make this the top item")
         _, closed = self.list_keeper_item("A closed item")
