@@ -1550,6 +1550,7 @@ function bindDraft(dialog, fresh = false) {
   input.name = name;
   input.value = choice.id;
   input.checked = choice.id === selected;
+  if (name === 'recipient_id') input.dataset.sendReceiver = choice.name;
   const face = node('span', choice.name);
   face.setAttribute('data-button-face', '');
   chip.append(input, face);
@@ -2496,7 +2497,7 @@ function bindDraft(dialog, fresh = false) {
   try {
    const item = await submissionPayload();
    if (submittedDraft?.payload !== item) {
-    const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
+    const recipientName = sendReceiver(recipientChips.querySelector('input:checked'));
     const draft = {payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
                    includeScreenshot: includePage.checked};
     if (separateFromNativeDraft && nativeListEdit) {
@@ -2511,9 +2512,10 @@ function bindDraft(dialog, fresh = false) {
    const sendItem = () => {
     posted = true;
     if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
-    const receiver = !hadEarlierSend && recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
+    const choice = recipientChips.querySelector('input:checked');
+    const receiver = !hadEarlierSend && choice?.value === item.recipient_id ? sendReceiver(choice) : undefined;
     const signal = AbortSignal.timeout(limits.requestTimeoutSeconds * 1000);
-    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver: receiver || undefined, signal});
+    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver, signal});
    };
    let result;
    try {

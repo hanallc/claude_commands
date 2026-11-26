@@ -710,14 +710,67 @@ NEGATIVE_VERDICT_LABELS = {
 }
 
 
+class SendWithoutName(StrEnum):
+    SAVE_ONLY = "save without a send"
+    UNAVAILABLE = "receiver name unavailable"
+
+
+@dataclass(frozen=True)
+class SendTo:
+    """The displayed name of the send destination."""
+
+    name: str
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("A send destination needs a name.")
+
+
+type SendReceiver = SendTo | SendWithoutName
+
+
+@dataclass(frozen=True)
+class SendControl:
+    label_html: str
+    attributes: str
+
+
+def send_control(label: str, receiver: SendReceiver, *, show_receiver: bool = False) -> SendControl:
+    """Use one receiver name for the control and its send message."""
+    if receiver is SendWithoutName.SAVE_ONLY:
+        return SendControl(html.escape(label), ' data-send-receiver=""')
+    if receiver is SendWithoutName.UNAVAILABLE:
+        return SendControl(html.escape(label), "")
+    receiver_html = html.escape(receiver.name, quote=True)
+    attributes = f' data-send-receiver="{receiver_html}"'
+    if show_receiver:
+        label = f"{label} {receiver.name}" if label else receiver.name
+    else:
+        attributes += f' aria-label="{html.escape(label, quote=True)}, {receiver_html}"'
+    return SendControl(html.escape(label), attributes)
+
+
+def send_button(label: str, receiver: SendReceiver, attributes: str, *, show_receiver: bool = False,
+                with_words: SendReceiver = SendWithoutName.UNAVAILABLE) -> str:
+    control = send_control(label, receiver, show_receiver=show_receiver)
+    alternative = ""
+    if with_words is not SendWithoutName.UNAVAILABLE:
+        named = send_control("", with_words, show_receiver=True)
+        alternative = f'<template data-send-with-words{named.attributes}></template>'
+    return f'<button{control.attributes} {attributes}>{control.label_html}{alternative}</button>'
+
+
 def verdict_button(item_type: VerdictItemType, action: VerdictAction, *,
-                   primary: bool = False, selected: bool = False) -> str:
+                   primary: bool = False, selected: bool = False,
+                   receiver: SendReceiver = SendWithoutName.UNAVAILABLE,
+                   with_words: SendReceiver = SendWithoutName.UNAVAILABLE) -> str:
     """Render the verdict for a change or a List repair."""
     label = "Works" if action is VerdictAction.WORKS else NEGATIVE_VERDICT_LABELS[item_type]
     pressed = 'aria-pressed="true" ' if selected else ""
     style = ' class="primary"' if primary else ""
     disabled = ' disabled' if item_type is VerdictItemType.LIST_REPAIR and action is VerdictAction.NOT_FIXED else ""
-    return f'<button {pressed}name="{item_type}" value="{action}"{style}{disabled}>{label}</button>'
+    return send_button(label, receiver, f'{pressed}name="{item_type}" value="{action}"{style}{disabled}',
+                       with_words=with_words)
 
 
 def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
@@ -1331,18 +1384,21 @@ heldFetch.resume=id=>{
  const request=heldRequests.get(id);
  return readHeldResult(request?.hold ?? id,request,false,true,holdRequestSignal());
 };
-function sendActionReceiver(form,data){
- const action=data.get('outcome') ?? data.get('action');
- if(data.get('action')==='works') return null;
- if(data.get('action')==='not works') return form.dataset.repairReceiver;
- const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
- if(action==='approve' && data.get('assignee')){
-  const option=form.elements.assignee?.selectedOptions[0];
-  return option?.value===data.get('assignee') ? option.dataset.sendReceiver : undefined;
- }
- return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
+function sendReceiver(control){
+ const form=control?.form;
+ const assignee=control?.hasAttribute('data-send-assignee') && form?.elements.assignee;
+ const withWords=control?.querySelector('[data-send-with-words]');
+ if(assignee?.value) control=assignee.selectedOptions[0];
+ else if(withWords && form?.elements.feedback?.value.trim()) control=withWords;
+ const receiver=control?.getAttribute('data-send-receiver');
+ return receiver==='' ? null : receiver ?? undefined;
 }
-window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
+function updateSendLabel(button){
+ const receiver=sendReceiver(button);
+ if(receiver) button.setAttribute('aria-label',button.textContent+', '+receiver);
+ else button.removeAttribute('aria-label');
+}
+window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendReceiver=sendReceiver;window.updateSendLabel=updateSendLabel;
 })();
 '''
 

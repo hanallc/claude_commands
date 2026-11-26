@@ -380,6 +380,8 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertEqual(review_submissions.submit(request).owner, parent.id)
 
     def test_returned_question_uses_its_scoped_key_among_matching_titles(self) -> None:
+        from scripts.review_links.test_change_page import BrowserForms
+
         doc, child, _ = self.review_wrap_fixture()
         kind = new_item_dialog.SubmissionKind.QUESTION
         first = review_submissions.submit(self.user_request(kind, child.id))
@@ -392,10 +394,11 @@ class TidyWrappedTests(unittest.TestCase):
         question = change_browser.WaitingQuestion(key, child.name, record, doc, child.id, child.name)
         status = change_page.DeliveryStatus(self.root / "review")
         browser = change_page.ReviewBrowser("fixture", kind="questions")
-        fields = {"row": key, "token": change_browser.row_token(browser, key),
-                  "outcome": "followup", "feedback": "More detail?"}
         prepared = change_browser.PreparedReviews((), {}, {}, (question,), (child.name,), staff.snapshot())
         with mock.patch.object(change_browser, "prepare", return_value=prepared):
+            forms = BrowserForms()
+            forms.feed(change_browser.render(browser, status).decode())
+            fields = forms.rows[key] | {"outcome": "followup", "feedback": "More detail?"}
             delivery, _ = change_browser.submit(browser, urlencode(fields), status)
         assert isinstance(delivery, change_page.MessageDelivery)
 

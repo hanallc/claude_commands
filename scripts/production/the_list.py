@@ -31,7 +31,7 @@ from itertools import chain, dropwhile, islice, takewhile
 from pathlib import Path
 from tempfile import TemporaryFile
 from time import monotonic
-from typing import IO, TYPE_CHECKING, Literal, TypedDict, cast
+from typing import IO, TYPE_CHECKING, Literal, NewType, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.agents import remote
@@ -4041,11 +4041,34 @@ class _QuestionAnswerer:
     morty: staff.StaffId | _NoActiveMorty
 
 
+class ListQuestionRoute(Enum):
+    CURRENT = "use the current route for an older form"
+
+
+ListQuestionSignature = NewType("ListQuestionSignature", str)
+
+
+@dataclass(frozen=True)
+class ListQuestionReceiver:
+    recipient: staff.StaffId | question_record.KeeperForUnavailableProducer
+    name: str
+
+    @property
+    def identity(self) -> staff.StaffId:
+        return self.recipient.keeper if isinstance(self.recipient, question_record.KeeperForUnavailableProducer) else self.recipient
+
+    @property
+    def signature(self) -> ListQuestionSignature:
+        fallback = self.recipient.producer if isinstance(self.recipient, question_record.KeeperForUnavailableProducer) else ""
+        return ListQuestionSignature(hashlib.sha256(json.dumps((self.identity, self.name, fallback)).encode()).hexdigest())
+
+
 @dataclass(frozen=True)
 class _ListQuestionStore:
     keeper: staff.StaffId
     ask_request: PageRequest | NoPageRequest = NoPageRequest.ABSENT
     answerer: _QuestionAnswerer | NoQuestionAnswerer = NoQuestionAnswerer.ABSENT
+    ask_recipient: staff.StaffId | ListQuestionRoute = ListQuestionRoute.CURRENT
 
     def questions(self, item: str) -> tuple[question_record.Question, ...]:
         current = load(self.keeper, item)
@@ -4054,7 +4077,14 @@ class _ListQuestionStore:
             archived = tuple(replace(entry.what.question, answer=question_record.Answer(
                 "Closed with the item.", entry.time.isoformat()))
                 for entry in current.log if isinstance(entry.what, QuestionClosed))
-            return (*current.questions, *archived)
+            # Reserve the IDs of questions sent to a different recipient.
+            questions = tuple(replace(question, answer=question_record.Answer(
+                "Sent to a different recipient.", question.asked_at))
+                if question.answer is None and question.words == self.ask_request.words
+                and self.ask_recipient is not ListQuestionRoute.CURRENT
+                and question.recipient_id(self.keeper) != self.ask_recipient else question
+                for question in current.questions)
+            return (*questions, *archived)
         return current.questions
 
     def add(self, item: str, question: question_record.Question) -> None:
@@ -4097,48 +4127,76 @@ class _ListQuestionStore:
                     raise
 
 
-def _new_question_recipient(keeper: staff.StaffId, producer: staff.StaffId
-                            ) -> staff.StaffId | question_record.KeeperForUnavailableProducer:
-    if producer == keeper:
-        return keeper
-    member = next((row for row in staff.active(staff.snapshot(), "producer") if row.id == producer), None)
-    if member is not None and not isinstance(member.exited, staff.Exited):
+class ListQuestionRouting:
+    """Use one producer availability check per List read."""
+
+    def __init__(self, members: staff.StaffSnapshot) -> None:
+        self.members: staff.StaffSnapshot = members
+        self.producers: dict[staff.StaffId, staff.StaffRow] = {
+            row.id: row for row in staff.active(members, "producer")
+        }
+        self.available: dict[staff.StaffId, bool] = {}
+
+    def receiver(self, keeper: staff.StaffId, producer: staff.StaffId) -> ListQuestionReceiver:
+        return self.name_recipient(self._recipient(keeper, producer))
+
+    def name_recipient(self, recipient: staff.StaffId | question_record.KeeperForUnavailableProducer
+                       ) -> ListQuestionReceiver:
+        identity = recipient.keeper if isinstance(recipient, question_record.KeeperForUnavailableProducer) else recipient
+        member = self.members.by_id(identity)
+        return ListQuestionReceiver(recipient, member.name if member is not None else str(identity))
+
+    def _recipient(self, keeper: staff.StaffId, producer: staff.StaffId
+                  ) -> staff.StaffId | question_record.KeeperForUnavailableProducer:
+        if producer == keeper:
+            return keeper
+        if producer not in self.available:
+            self.available[producer] = self._available(producer)
+        if self.available[producer]:
+            return producer
+        return question_record.KeeperForUnavailableProducer(keeper, producer)
+
+    def _available(self, producer: staff.StaffId) -> bool:
+        member = self.producers.get(producer)
+        if member is None or isinstance(member.exited, staff.Exited):
+            return False
         try:
             _ = session_pane.session_place(member.current_session)
         except (session_pane.NoSuchTarget, OSError, session_pane.HerdrFailure, ValueError):
-            pass
-        else:
-            return producer
-    return question_record.KeeperForUnavailableProducer(keeper, producer)
+            return False
+        return True
 
 
-def _prepare_question_recipient(path: Path, request: PageRequest, keeper: staff.StaffId, producer: staff.StaffId
-                                ) -> staff.StaffId | question_record.KeeperForUnavailableProducer:
-    """Keep the first recipient if the List write fails."""
-    fields = _request_fields(request)
+def _require_question_receiver(shown: ListQuestionSignature | ListQuestionRoute, receiver: ListQuestionReceiver) -> None:
+    if shown is not ListQuestionRoute.CURRENT and shown != receiver.signature:
+        raise question_record.AnswerRefused("The question recipient changed. Check it again before sending.")
+
+
+def _prepared_question_receiver(path: Path, request: PageRequest, routing: ListQuestionRouting
+                                ) -> ListQuestionReceiver | ListQuestionRoute:
     try:
         saved = delivery_state.read_fields(path)
     except FileNotFoundError:
-        recipient = _new_question_recipient(keeper, producer)
-        record = {"request": fields, **question_record.recipient_fields(recipient)}
-        write_text_atomic(path, json.dumps(record) + "\n", new_file_mode=0o600)
-        return recipient
-    if saved.get("request") != fields:
+        return ListQuestionRoute.CURRENT
+    if saved.get("request") != _request_fields(request):
         raise ListError("this request already has a different action or words")
     recipient = question_record.read_recipient(saved)
     if recipient is question_record.DefaultQuestionRecipient.PAGE:
         raise ListError("the prepared question has no recipient")
-    return recipient
+    receiver = routing.name_recipient(recipient)
+    name = saved.get("receiver_name")
+    return replace(receiver, name=name) if isinstance(name, str) else receiver
 
 
 def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
-                 status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
-    """Save the question and its signed request receipt before delivery."""
+                 status: change_page.DeliveryStatus, *,
+                 shown: ListQuestionSignature | ListQuestionRoute = ListQuestionRoute.CURRENT
+                 ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+    """Check the shown recipient and save the question before delivery."""
     if request.action != "question" or not request.words.strip() or len(request.words) > 10000:
         raise question_record.AnswerRefused("Enter a question first.")
     request = replace(request, words=request.words.strip())
     store = _store(keeper)
-    questions = _ListQuestionStore(keeper, request)
     with store.locked():
         item = load(keeper, identity)
         previous = _previous_page_request(item, request)
@@ -4146,18 +4204,33 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
             if isinstance(previous, QuestionRequestReceipt):
                 return change_page.NoMessageDelivery()
             raise question_record.AnswerRefused("This item is Closed.")
-        open_question = next((question for question in item.questions
-                              if question.answer is None and question.words == request.words), None)
-        if isinstance(previous, QuestionRequestReceipt):
-            if open_question is None or open_question.question_id != previous.question_id:
-                return change_page.NoMessageDelivery()
-        elif open_question is not None:
-            questions.save_request(item, request, open_question)
         request_key = json.dumps([str(store.path(item.id).resolve()), _request_id(request.request)]).encode()
         preparation = status.root / (".review-link-list-ask-" + hashlib.sha256(request_key).hexdigest())
-        recipient = (_prepare_question_recipient(preparation, request, keeper, item.producer) if open_question is None
-                     else open_question.recipient_id(keeper))
-        delivery = _claim_question(questions, item, request.words, recipient, status)
+        if isinstance(previous, QuestionRequestReceipt):
+            question = next((saved for saved in item.questions
+                             if saved.question_id == previous.question_id and saved.answer is None), None)
+            if question is None:
+                return change_page.NoMessageDelivery()
+            recipient = question.recipient_id(keeper)
+            delivery = _claim_question(_ListQuestionStore(keeper, request, ask_recipient=recipient),
+                                       item, request.words, recipient, status)
+            with suppress(OSError):
+                preparation.unlink()
+            return delivery
+        routing = ListQuestionRouting(staff.snapshot())
+        prepared = _prepared_question_receiver(preparation, request, routing)
+        receiver = routing.receiver(keeper, item.producer) if prepared is ListQuestionRoute.CURRENT else prepared
+        _require_question_receiver(shown, receiver)
+        questions = _ListQuestionStore(keeper, request, ask_recipient=receiver.identity)
+        open_question = next((question for question in item.questions if question.answer is None
+                              and question.words == request.words and question.recipient_id(keeper) == receiver.identity), None)
+        if open_question is not None:
+            questions.save_request(item, request, open_question)
+        elif prepared is ListQuestionRoute.CURRENT:
+            record = {"request": _request_fields(request), "receiver_name": receiver.name,
+                      **question_record.recipient_fields(receiver.recipient)}
+            write_text_atomic(preparation, json.dumps(record) + "\n", new_file_mode=0o600)
+        delivery = _claim_question(questions, item, request.words, receiver.recipient, status)
         with suppress(OSError):
             preparation.unlink()
         return delivery
@@ -4179,7 +4252,7 @@ def list_question_target(keeper: staff.StaffId, item: ListItem,
                                            recipient, keeper=keeper, alert_owner=owner)
 
 
-def image_list_keeper(identity: str) -> staff.StaffId:
+def image_list_folder_keeper(identity: str) -> staff.StaffId:
     """Find the List folder that holds this item, including old folders."""
     if re.fullmatch(r"L[1-9][0-9]*", identity) is None:
         raise ListError("Use a List item id such as L324.")
@@ -4189,22 +4262,41 @@ def image_list_keeper(identity: str) -> staff.StaffId:
         raise ListError(f"No List item {identity}.")
     if len(candidates) != 1:
         raise ListError(f"More than one List folder holds {identity}.")
-    keeper = staff.StaffId(candidates[0].parent.parent.name)
+    return staff.StaffId(candidates[0].parent.parent.name)
+
+
+def image_list_keeper(identity: str) -> staff.StaffId:
+    """Find the keeper and check that the List item is readable."""
+    keeper = image_list_folder_keeper(identity)
     _ = load(keeper, identity)
     return keeper
 
 
+def _image_answer_receipt(item: ListItem, key: str) -> _ImageAnswerChange | None:
+    return next((entry for entry in reversed(item.log)
+                 if isinstance(entry, _ImageAnswerChange) and entry.key == key), None)
+
+
+def image_answer_producer(item: ListItem, key: str) -> staff.StaffId:
+    """Use the producer saved with this answer when it has a List receipt."""
+    receipt = _image_answer_receipt(item, key)
+    return item.producer if receipt is None else receipt.producer
+
+
 def save_image_answer(keeper: staff.StaffId, identity: str, key: str, words: str, *,
-                      image_id: str, approved: bool) -> staff.StaffId:
+                      image_id: str, approved: bool,
+                      prepare: Callable[[staff.StaffId], None] | None = None) -> staff.StaffId:
     """Save the answer before delivery. Return the producer for this answer."""
     _ = _request_id(key)
     store = _store(keeper)
     with store.locked():
         item = load(keeper, identity)
-        for entry in reversed(item.log):
-            if isinstance(entry, _ImageAnswerChange) and entry.key == key:
-                sync_folder(store.folder())
-                return entry.producer
+        receipt = _image_answer_receipt(item, key)
+        if prepare is not None:
+            prepare(item.producer if receipt is None else receipt.producer)
+        if receipt is not None:
+            sync_folder(store.folder())
+            return receipt.producer
         moment = now()
         producer = staff.snapshot().by_id(item.producer)
         producer_name = producer.name if producer is not None else item.producer

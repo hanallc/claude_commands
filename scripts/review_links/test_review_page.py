@@ -53,6 +53,7 @@ from scripts.review_links import efficiency_reviews, new_item_dialog, reply_toke
 from scripts.review_links.browser_test_support import (
     UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results, newer_script_reload_results,
 )
+from scripts.review_links.test_change_page import CONTROL_SAVE_TIMEOUT, EXPIRE_SAVE
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
@@ -96,16 +97,6 @@ BODY_READY_SCRIPT = r"""async function readyReviewCard(row){
  return recordDetails(row).querySelector('[data-review-form]');
 }
 """
-
-CONTROL_SAVE_TIMEOUT = r"""
-const saveTimeout=new AbortController(),originalTimeout=AbortSignal.timeout;
-AbortSignal.timeout=milliseconds=>{
- AbortSignal.timeout=originalTimeout;
- check(milliseconds===5000,'The save uses the 5 s timeout.');
- return saveTimeout.signal;
-};
-"""
-EXPIRE_SAVE = "saveTimeout.abort(new DOMException('The save timed out.','TimeoutError'));"
 
 SNAPSHOT_FETCH_SCRIPT = r"""<script>
 const snapshots=SNAPSHOTS;
@@ -255,19 +246,94 @@ class ReviewPageTests(unittest.TestCase):
         return self.fixture.file_user_question(title)
 
     def test_legacy_question_names_the_answer_relay_in_both_views(self) -> None:
+        self.fixture.start_review_server()
         asker = fixture_member('producer', name='question-asker')
         key = self.fixture.file_user_question(asker=asker)
         snapshot = review_page.build_snapshot(self.root)
         review = snapshot.body(key).decode()
         browser = self.fixture.browser('questions')[2]
         for page in (review, browser):
-            labels = re.search(r'data-send-labels="([^"]+)"', page)
-            assert labels is not None
-            self.assertIn('"answer": "question-asker"', html.unescape(labels[1]))
+            answer = re.search(r'<button [^>]*data-send-receiver="([^"]+)"[^>]*value="answer"', page)
+            assert answer is not None
+            self.assertEqual(html.unescape(answer[1]), asker.name)
         delivery, _ = review_page.submit(self.root, self.card_body(snapshot, key, 'answer', 'Use wide cards.'),
                                          self.status, snapshot=snapshot)
         assert isinstance(delivery, change_page.MessageDelivery)
         self.assertEqual(delivery.recipients, (asker.id,))
+
+        renamed_key = self.fixture.file_user_question('Check feedback after an owner rename', asker=asker)
+        initial = review_page.build_snapshot(self.root)
+        original = self.card_body(initial, renamed_key, 'feedback', 'Keep this draft.')
+        members = staff.snapshot()
+        retained_question = initial.records[renamed_key]
+        owner = members.by_id(retained_question.owner)
+        assert owner is not None
+        old_revision = review_page.record_revision(retained_question, initial.assets, members)
+        renamed = staff.rename(owner.id, 'renamed-page-owner')
+        new_revision = review_page.record_revision(retained_question, initial.assets, staff.snapshot())
+        self.assertNotEqual(old_revision, new_revision)
+        refreshed = review_page.build_snapshot(self.root)
+        with self.assertRaisesRegex(review_items.ReviewRecordChanged, 'This item changed'):
+            _ = review_page.submit(self.root, original, self.status, snapshot=refreshed)
+        current = self.card_body(refreshed, renamed_key, 'feedback', 'Keep this draft.')
+        delivery, _ = review_page.submit(self.root, current+'&'+urlencode({'receiver': renamed.name}),
+                                         self.status, snapshot=refreshed)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertEqual(delivery.recipients, (renamed.id,))
+        self.assertIn('Keep this draft.', delivery.message)
+        _ = staff.rename(owner.id, owner.name)
+
+        moved_key = self.fixture.file_user_question('Check the relay after a move')
+        queue_key = self.fixture.file_user_question('Check the Changes queue after a move')
+        path, forms, _ = self.fixture.browser('questions')
+        browser = change_browser.page_at(self.root, path+'?type=questions')
+        old_queue = self.fixture.browser_fields(forms, queue_key, 'answer', 'Keep this queue draft.')
+        initial = review_page.build_snapshot(self.root)
+        original = self.card_body(initial, moved_key, 'answer', 'Keep these words.')
+        source = initial.records[moved_key].source
+        assert isinstance(source, review_items.QuestionSource)
+        retained = source.record.path.read_bytes()
+        destination = self.fixture.temporary/'destination.md'
+        _ = destination.write_text(self.fixture.production.read_text())
+        runner = fixture_member('showrunner', name='destination', doc=staff.LiveDoc(local_machine(), destination))
+        _ = staff.move(self.fixture.unit.id, staff.ReportsTo(runner.id))
+        refreshed = review_page.build_snapshot(self.root)
+        self.assertEqual(initial.records[moved_key], refreshed.records[moved_key])
+        with self.assertRaisesRegex(review_items.ReviewRecordChanged, 'This item changed'):
+            _ = review_page.submit(self.root, original, self.status, snapshot=refreshed)
+        self.assertEqual(source.record.path.read_bytes(), retained)
+        markup = refreshed.body(moved_key).decode()
+        answer = re.search(r'<button [^>]*data-send-receiver="([^"]+)"[^>]*value="answer"', markup)
+        assert answer is not None
+        shown = html.unescape(answer[1])
+        self.assertEqual(shown, runner.name)
+        current = self.card_body(refreshed, moved_key, 'answer', 'Keep these words.')
+        identities = update_registration.QuestionStaff.read()
+        scope = update_registration.question_scope(source.record.owner, identities.record)
+        original_relay = change_browser.question_relay(source.record, scope, identities)
+        next_relay = update_registration.AnswerRelay('The relay moved again.', asker.id)
+        with patch.object(change_browser, 'question_relay', side_effect=(original_relay, next_relay)) as route:
+            delivery, _ = review_page.submit(self.root, current+'&'+urlencode({'receiver': shown}),
+                                             self.status, snapshot=refreshed)
+        route.assert_called_once()
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertEqual(delivery.recipients, (runner.id,))
+        self.assertIn('Keep these words.', delivery.message)
+
+        without_revision = {key: value for key, value in old_queue.items() if key != 'question_revision'}
+        for name, fields in (('stale revision', old_queue), ('missing revision', without_revision)):
+            with self.subTest(form=name):
+                refusal = self.fixture.http_request(path, fields)
+                self.assertEqual(refusal.status, 409, refusal.body)
+                self.assertIn('This item changed', refusal.body)
+        _, forms, _ = self.fixture.browser('questions')
+        queue = self.fixture.browser_fields(forms, queue_key, 'answer', 'Keep this queue draft.')
+        with patch.object(update_registration, 'answer_relay', side_effect=(original_relay, next_relay)) as route:
+            delivery, _ = change_browser.submit(browser, urlencode(queue), self.status)
+        route.assert_called_once()
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertEqual(delivery.recipients, (runner.id,))
+        self.assertIn('Keep this queue draft.', delivery.message)
 
     def ready_submission_recipient(self) -> staff.StaffRow:
         doc = self.fixture.production
@@ -1028,6 +1094,29 @@ window.fetch=(url,options)=>{
                 self.assertTrue(any(str(proposal_path) in notice for notice in broken.notices))
                 with self.assertRaises(PermissionError):
                     _ = review_items.read_current(self.root, moved.records[issue], staff.snapshot())
+
+        before_route = before.body(change).decode()
+        match = re.search(r'<button data-send-receiver="([^"]+)"[^>]+value="question"', before_route)
+        assert match is not None
+        words = 'Keep my question.'
+        original = self.card_body(before, change, 'question', words)+'&'+urlencode({'receiver': match[1]})
+        change_before = self.fixture.review_list.read_bytes()
+        with self.assertRaises(review_items.ReviewRecordChanged):
+            _ = review_page.submit(self.root, original, self.status, snapshot=moved)
+        legacy = self.body(change, 'question', words)+'&'+urlencode({'receiver': match[1]})
+        with self.assertRaisesRegex(change_page.QuestionAnswerRefused, 'This item changed.'):
+            _ = change_browser.submit(moved.browser, legacy, self.status)
+        self.assertEqual(self.fixture.review_list.read_bytes(), change_before)
+        self.assertEqual(self.fixture.messages, [])
+        fresh = moved.body(change).decode()
+        displayed = re.search(r'<button data-send-receiver="([^"]+)"[^>]+value="question"', fresh)
+        assert displayed is not None
+        self.assertNotEqual(displayed[1], match[1])
+        resent = self.card_body(moved, change, 'question', words)+'&'+urlencode({'receiver': displayed[1]})
+        delivery, _ = review_page.submit(self.root, resent, self.status, snapshot=moved)
+        change_page.deliver(delivery, self.status)
+        self.assertEqual([recipient for recipient, _, message in self.fixture.messages if words in message],
+                         [displayed[1]])
 
     def test_snapshot_shows_and_counts_proposals_from_a_producer_document(self) -> None:
         doc = self.fixture.temporary / 'producer.md'
@@ -3457,7 +3546,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
         automatic = for_you.action_row(opened, self.fixture.unit.name)
         manual = replace(automatic, key=f'action/{uuid4()}', completion='manual')
         rebuild = replace(automatic, key='rebuild/natedev', kind='rebuild')
-        done_button = b'<button name="outcome" value="done"'
+        done_button = b'<button data-send-receiver="" name="outcome" value="done"'
         with patch.object(for_you, 'read', return_value=for_you.ForYouSnapshot((automatic, manual, rebuild), ())):
             snapshot = review_page.build_snapshot(self.root)
             markup = snapshot.body(automatic.key)
@@ -7060,7 +7149,8 @@ window.fetch=async(url,options={})=>{
   check(refreshed!==form && unavailable.value===ASSIGNEE &&
         unavailable.textContent===(__REMOVE_OPTION__ ? name+' — not available' : name),
         'Refresh keeps the assignee selected.');
-  refreshed.requestSubmit(refreshed.querySelector('[value="approve"]'));
+  const approve=refreshed.querySelector('[value="approve"]');
+  refreshed.requestSubmit(approve);
   check(window.posts.length===1 && window.posts[0].get('outcome')==='approve' &&
         window.posts[0].get('assignee')===ASSIGNEE,'Approve sends the selected assignee ID.');
   const until=performance.now()+8000,host=window.top.document;
@@ -7071,6 +7161,11 @@ window.fetch=async(url,options={})=>{
   const toast=host.querySelector('[data-send-undo]');
   const expected=__REMOVE_OPTION__ ? 'Sending.' : 'Sent to '+name+'.';
   check(toast.querySelector('span').textContent===expected,'The toast uses the current selected assignee.');
+  if(!__REMOVE_OPTION__){
+   const receiver=approve.getAttribute('aria-label')?.replace(/^Approve, /,'');
+   check(toast.querySelector('span').textContent==='Sent to '+receiver+'.',
+         'The Approve button and toast name the same receiver.');
+  }
   toast.querySelector('button').click();
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -7094,10 +7189,10 @@ window.fetch=async(url,options={})=>{
         self.assertIn('Run fewer checks.', body, 'The open card loads the issue text.')
         self.assertNotIn('proposal_id', body, 'The issue front matter stays off the card.')
         efficiency_body = review_page.build_snapshot(self.root).body(efficiency).decode()
-        self.assertIn('&quot;decline&quot;: null', efficiency_body)
+        self.assertIn('<button data-send-receiver="" name="outcome" value="decline">Decline</button>', efficiency_body)
         report = self.investigation()
         report_body = review_page.build_snapshot(self.root).body(f'investigation/{report.owner}/{report.id}').decode()
-        self.assertIn('&quot;read&quot;: null', report_body)
+        self.assertIn('<button data-send-receiver="" name="outcome" value="read"', report_body)
         commands = {proposal:'proposal_issue.py approve', efficiency:"candidates.py outcome E1 accepted --applied '<repo> <sha>'"}
         for key, command in commands.items():
             with self.subTest(key=key, action='approve'):
@@ -8095,6 +8190,13 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_undo_keeps_the_card_words_and_a_second_send_posts_again(self) -> None:
+        keeper = fixture_member('producer', name='morty')
+        producer = self.fixture.unit
+        key = 'page-owner/C1'
+        item = the_list.add(keeper.id, 'Check the changed layout', owner=self.fixture.showrunner_id,
+                            source='nate', changes={'producer': producer.id})
+        linked = the_list.link(keeper.id, item.id, (key,), source='nate')
+        self.assertNotEqual(linked.producer, keeper.id)
         setup = r"""<script>
 const realFetch=fetch,posts=[];
 window.setInterval=()=>0;
@@ -8111,6 +8213,7 @@ window.fetch=async(url,options)=>{
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
  const host=window.top.document,words='Keep these words.';
+ let sentTo='';
  const until=async(test,label)=>{
   const end=performance.now()+8000;
   while(!test()){
@@ -8126,10 +8229,15 @@ window.fetch=async(url,options)=>{
   let form=await readyReviewCard(row());
   const version=document.querySelector('[data-review]').dataset.version;
   form.elements.feedback.value=words;
-  form.requestSubmit(form.querySelector('[value="works"]'));
+  const works=form.querySelector('[value="works"]');
+  form.requestSubmit(works);
   await until(()=>host.querySelector('[data-send-undo] button'),'The Undo toast did not show.');
-  check(host.querySelector('[data-send-undo] span').textContent==='Sent to page-owner and builder-unit.',
+  sentTo=host.querySelector('[data-send-undo] span').textContent;
+  check(sentTo==='Sent to page-owner and builder-unit.',
         'The toast names every receiver of the verdict with words.');
+  const receiver=works.getAttribute('aria-label')?.replace(/^Works, /,'');
+  check(host.querySelector('[data-send-undo] span').textContent==='Sent to '+receiver+'.',
+        'The Works button and toast name the same receivers.');
   check(!row()?.getClientRects().length,'The verdict card is gone when the Undo toast shows.');
   host.querySelector('[data-send-undo] button').click();
   const cardForm=()=>row()?.isConnected && !row().hidden ? recordDetails(row())?.querySelector('[data-review-form]') : null;
@@ -8155,10 +8263,19 @@ window.fetch=async(url,options)=>{
   check(posts.every(post=>post.get('outcome')==='works' && post.get('feedback')===words),
    'The second Send posts the same words again.');
  }catch(error){failures.push(String(error));}
+ failures.push(JSON.stringify([sentTo,posts.at(-1)?.toString() || '']));
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
         markup = browser_markup(self.root).replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
-        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+        results, = firefox_probe_results(markup.encode())
+        self.assertEqual(results[:-1], [])
+        toast, body = cast(tuple[str, str], json.loads(results[-1]))
+        snapshot = review_page.build_snapshot(self.root)
+        delivery, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
+        change_page.deliver(delivery, self.status)
+        receivers = [recipient for recipient, _, message in self.fixture.messages if 'Keep these words.' in message]
+        self.assertIn(producer.name, receivers)
+        self.assertCountEqual(receivers, toast.removeprefix('Sent to ').removesuffix('.').split(' and '))
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_held_review_question_and_feedback_hide_the_row(self) -> None:

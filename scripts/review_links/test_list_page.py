@@ -50,10 +50,9 @@ from scripts.review_links import change_browser, change_page, images, new_item_d
 from scripts.review_links import review_items, review_link, review_page, review_submissions, search_fold, send_hold
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
-from scripts.review_links.test_change_page import BrowserForms
+from scripts.review_links.test_change_page import BrowserForms, CONTROL_SAVE_TIMEOUT, EXPIRE_SAVE
 from scripts.review_links.browser_test_support import newer_script_reload_results
 from scripts.review_links.test_record_table import save_notice_failures
-from scripts.review_links.test_review_page import CONTROL_SAVE_TIMEOUT, EXPIRE_SAVE
 from scripts.review_links.test_serve import new_item_notice_log, read_new_item_notices
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
@@ -3781,16 +3780,20 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
 
     def test_feedback_button_belongs_to_the_words_box_and_starts_disabled(self) -> None:
         item = self.add("Explain this item")
-        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", members=staff.snapshot(),
-                                       parking_label="", schedule=the_list.NoSchedule.UNSET, today=NOW)
+        members = staff.snapshot()
+        form = list_page.feedback_form(list_page.ListRecord(MORTY.id, item), "fixture-secret", members=members,
+                                       parking_label="", schedule=the_list.NoSchedule.UNSET, today=NOW,
+                                       routing=the_list.ListQuestionRouting(members))
         actions, words = form.split('</div>', 1)
         self.assertNotIn('value="tell"', actions)
         self.assertNotIn('<label for="words-', words)
         self.assertIn('placeholder="Your words for morty about this item"', words)
         self.assertIn('aria-label="Your words for morty about this item"', words)
         self.assertIn('</textarea><div class="list-tell"><span role="status" data-send-status hidden></span>'
-                      + '<button name="action" value="question" disabled>Ask question</button>'
-                      + '<button name="action" value="tell" disabled>Tell morty</button></div>', words)
+                      + '<button data-send-receiver="morty" aria-label="Ask question, morty"'
+                      + ' name="action" value="question" disabled>Ask question</button>'
+                      + '<button data-send-receiver="morty" name="action" value="tell" disabled>'
+                      + 'Tell morty</button></div>', words)
         self.assertIn("!words.value.trim()", list_page.SCRIPT)
         self.assertIn("const edit=()=>{draftStamp++;retain();persistDraft();};", list_page.SCRIPT)
         self.assertIn("words.addEventListener('input',edit)", list_page.SCRIPT)
@@ -7195,6 +7198,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_ask_uses_its_own_request_and_keeps_the_exact_retry(self) -> None:
+        item = self.add("Review a question retry", number=1)
         self.browser_action_sequence('''
  const words=form.elements.words,ask=form.querySelector('[value="question"]');
  check(ask?.disabled,'Ask question starts disabled');
@@ -7209,7 +7213,50 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  check(retry.id===question.id && retry.token===question.token,'an exact Ask retry keeps its signature');
  finishPost({item_state:'Working',parked:'false'});await flush();
  check(words.value==='' && ask.disabled,'a saved question clears the box');
-''')
+''', add_item=False)
+
+        root = self.root / "reviews"
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        with patch.object(session_pane, "session_place"):
+            before = list_page.render(root, include_counts=False).decode()
+        _ = the_list.update(MORTY.id, item.id, {"producer": MORTY.id}, source="morty")
+        after = json.dumps(list_page.render(root, include_counts=False).decode()).replace("</", r"<\/")
+        steps = r"""
+ const original=form.querySelector('[value="question"]');
+ const name=original.getAttribute('aria-label').split(', ')[1];
+ const words=form.elements.words;
+ words.value='Retry the question.';words.dispatchEvent(new Event('input'));
+ const first=submit('question');losePost();await flush();
+ refreshMarkup=AFTER_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ const current=recordDetails(document.querySelector('[data-number="1"]')).querySelector('[data-feedback-form]');
+ const ask=current.querySelector('[value="question"]');
+ check(current!==form && current.querySelector('[value="tell"]').textContent==='Tell morty',
+       'The refreshed form names the new producer for Tell.');
+ check(ask.getAttribute('aria-label')==='Ask question, '+name,
+       'The exact Ask retry keeps the original receiver on its button.');
+ const listFetch=window.fetch;
+ window.fetch=(path,options={})=>{
+  if(options.method==='POST' && new Headers(options.headers).get('X-Undo-Hold')==='1'){
+   requests.push(new URLSearchParams(options.body));
+   return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  return listFetch(path,options);
+ };
+ const toast=await new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   const text=document.querySelector('[data-send-undo] span');
+   if(text){observer.disconnect();resolve(text.textContent);}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+  const retry=submit('question',current);
+  check(retry.id===first.id && retry.token===first.token,'The retry keeps the signed Ask.');
+ });
+ check(toast==='Sent to '+name+'.','The retry toast names the receiver on the Ask button.');
+"""
+        self.browser_action_sequence(steps.replace("AFTER_PAGE", after), add_item=False, markup=before,
+                                     reduced_motion=True)
 
     def test_ask_marks_the_seen_update_read_after_it_saves(self) -> None:
         item = self.add("Read the update before asking")
@@ -7692,8 +7739,26 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         item = self.add("Check a producer's work")
         item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
         words = "Which check passed?"
+        def form(identity: str) -> tuple[dict[str, str], str]:
+            current = the_list.load(MORTY.id, identity)
+            markup = list_page.action_state(MORTY.id, current, status=status, include_detail=True).get("detail_html", "")
+            feedback = markup.split('<form method="post" data-feedback-form>', 1)[1].split('</form>', 1)[0]
+            fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)">', feedback))
+            button = re.search(r'<button[^>]+value="question"[^>]+>', feedback)
+            assert button is not None
+            receiver = re.search(r'aria-label="Ask question, ([^"]+)"', button[0])
+            assert receiver is not None
+            return {**fields, "action": "question", "words": words, "until": ""}, receiver[1]
+
+        with patch.object(session_pane, "session_place"):
+            old_form, previous = form(item.id)
+        self.assertEqual(previous, DWIGHT.name)
         with patch.object(session_pane, "session_place", side_effect=OSError("Producer offline")):
-            submission = list_page.submit(root, urlencode(self.fields(item, "question", words=words)), status)
+            with self.assertRaisesRegex(question_record.AnswerRefused, "The question recipient changed"):
+                _ = list_page.submit(root, urlencode(old_form), status)
+            self.assertEqual(the_list.load(MORTY.id, item.id), item)
+            new_form, receiver = form(item.id)
+            submission = list_page.submit(root, urlencode(new_form), status)
         saved = the_list.load(MORTY.id, item.id).questions[0]
         self.assertEqual(saved.recipient, question_record.KeeperForUnavailableProducer(MORTY.id, DWIGHT.id))
         markup = without_scripts(list_page.render(root, include_counts=False, status=status).decode())
@@ -7713,6 +7778,38 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
         record = change_page.read_question_attempt(path)
         self.assertIs(record.state, delivery_state.QuestionSendState.SENT)
         send.assert_called_once_with(MORTY.id, record.message, record.message_id)
+        delivered_to = staff.snapshot().by_id(record.recipient_id)
+        assert delivered_to is not None
+        self.assertEqual(receiver, delivered_to.name)
+
+        retry_item = self.add("Ask the producer when available")
+        _ = the_list.update(MORTY.id, retry_item.id, {"producer": DWIGHT.id}, source="morty")
+        with patch.object(session_pane, "session_place", side_effect=OSError("Producer offline")):
+            offline, _ = form(retry_item.id)
+            first = list_page.submit(root, urlencode(offline), status)
+        assert isinstance(first, list_page.ListQuestionDelivery)
+        with (patch.object(change_page, "send_question", return_value=question_outcome("refused", "Keeper offline")),
+              patch.object(change_page, "alert_delivery_failures")):
+            list_page.deliver(first)
+        old_question, = the_list.load(MORTY.id, retry_item.id).questions
+        with patch.object(session_pane, "session_place"):
+            stale_form, _ = form(retry_item.id)
+            renamed = staff.rename(DWIGHT.id, "renamed-dwight")
+            with self.assertRaisesRegex(question_record.AnswerRefused, "The question recipient changed"):
+                _ = list_page.submit(root, urlencode(stale_form), status)
+            fresh_form, receiver = form(retry_item.id)
+            fresh = list_page.submit(root, urlencode(fresh_form), status)
+        assert isinstance(fresh, list_page.ListQuestionDelivery)
+        with patch.object(change_page, "send_question", return_value=question_outcome()) as send:
+            list_page.deliver(fresh)
+        questions = the_list.load(MORTY.id, retry_item.id).questions
+        self.assertEqual(questions[0], old_question)
+        self.assertEqual(len(questions), 2)
+        self.assertEqual(questions[1].words, old_question.words)
+        self.assertIsNone(questions[1].answer)
+        self.assertEqual(receiver, renamed.name)
+        self.assertEqual(questions[1].recipient_id(MORTY.id), renamed.id)
+        self.assertEqual(send.call_args.args[0], renamed.id)
 
     def test_question_start_error_records_a_failure_and_logs_one_line(self) -> None:
         root = self.root / "reviews"
@@ -9382,9 +9479,9 @@ window.fetch=async(_url,options)=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_held_question_hides_the_item_and_failure_restores_it(self) -> None:
-        _ = self.add("Ask about the first item", number=1)
+        item = self.add("Ask about the first item", number=1)
         _ = self.add("Keep the second item visible", number=2)
-        self.browser_action_sequence(r'''
+        steps = r'''
  const loaded=window.fetch;
  window.fetch=(url,options={})=>{
   if(String(url).startsWith('/send-hold/'))
@@ -9407,9 +9504,13 @@ window.fetch=async(_url,options)=>{
   }
  };
  words.value=text;words.dispatchEvent(new Event('input'));
+ const ask=form.querySelector('[value="question"]');
+ const recipient=ask.getAttribute('aria-label')?.slice(ask.textContent.length+2);
  submit('question');
  const toast=()=>document.querySelector('[data-send-undo]:has(button)');
  await changed(toast,'The Undo toast did not show.');
+ const message=toast().querySelector('span').textContent;
+ check(message==='Sent to '+recipient+'.','The Ask button and toast name the same receiver.');
  check(shown().length===1 && !row.getClientRects().length && all.dataset.filterCount==='1',
   'The held question removes its item from the List and the chip count.');
  toast().getAnimations()[0].finish();
@@ -9417,13 +9518,80 @@ window.fetch=async(_url,options)=>{
  await changed(()=>row.getClientRects().length,'The failed question did not return.');
  check(order()===before && recordIsOpen(row) && words.value===text && all.dataset.filterCount==='2',
   'Failure restores the open item, its draft, and the chip count.');
-''', add_item=False, window_size=(500, 900))
+'''
+        for producer in (MORTY, DWIGHT):
+            with self.subTest(producer=producer.name):
+                _ = the_list.update(MORTY.id, item.id, {"producer": producer.id}, source="morty")
+                with patch.object(session_pane, "session_place"):
+                    self.browser_action_sequence(steps, add_item=False, window_size=(500, 900))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_ask_button_toast_and_delivery_name_the_producer(self) -> None:
+        item = self.add("Check the assigned item", number=1)
+        _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=1\n")
+        script = r"""
+(async()=>{
+ const row=document.querySelector('[data-number="1"]');
+ row.querySelector('.list-toggle').click();
+ const form=recordDetails(row).querySelector('[data-feedback-form]');
+ const ask=form.querySelector('[value="question"]');
+ const label=ask.getAttribute('aria-label');
+ const toast=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{
+   const text=document.querySelector('[data-send-undo] span');
+   if(text){observer.disconnect();resolve(text.textContent);}
+  });
+  observer.observe(document.body,{childList:true,subtree:true});
+ });
+ const sent=new Promise(resolve=>{
+  const request=window.fetch;
+  window.fetch=async(url,options)=>{
+   const response=await request(url,options);
+   if(String(url).startsWith('/send-hold/') && response.status!==202){
+    const result=await response.clone().json();
+    resolve(response.ok && !result.send_failure && !result.no_message);
+   }
+   return response;
+  };
+ });
+ form.elements.words.value='Which check passed?';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ if(ask.disabled) throw new Error('Ask question is disabled.');
+ ask.click();
+ return [label,await toast,await sent];
+})()
+"""
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(session_pane, "session_place"),
+              patch.object(unrouted_alert, "message_outcome", return_value=question_outcome()) as send,
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            browser = self.chrome()
+            try:
+                browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}")
+                result = browser.command("Runtime.evaluate", {"expression": script, "awaitPromise": True,
+                                                               "returnByValue": True}, browser.session)
+                self.assertNotIn("exceptionDetails", result)
+                self.assertEqual(cast(dict[str, object], result["result"])["value"],
+                                 [f"Ask question, {DWIGHT.name}", f"Sent to {DWIGHT.name}.", True])
+            finally:
+                browser.navigate("about:blank")
+                server.shutdown()
+                thread.join()
+        send.assert_called_once()
+        assert send.call_args is not None
+        self.assertEqual(send.call_args.args[0], f"session:{DWIGHT.current_session}")
+        self.assertIn("Which check passed?", cast(str, send.call_args.args[2]))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_tell_undo_toast_names_the_signed_producer(self) -> None:
         item = self.add("Check the assigned item", number=1)
-        _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
-        self.browser_action_sequence(r"""
+        steps = r"""
  const listFetch=window.fetch;
  window.fetch=(path,options={})=>{
   if(options.method==='POST' && new Headers(options.headers).get('X-Undo-Hold')==='1'){
@@ -9441,9 +9609,18 @@ window.fetch=async(_url,options)=>{
  });
  const words=form.elements.words;
  words.value='Check the result.';words.dispatchEvent(new Event('input'));
+ const label=form.querySelector('[value="tell"]').textContent;
+ const name=label.replace(/^Tell /,'');
  submit('tell');
- check(await toast==='Sent to dwight.','The Undo toast names the signed producer.');
-""", add_item=False)
+ const shown=await toast;
+ check(shown==='Sent to '+name+'.','The Tell button and toast name the same receiver.');
+ if(DIFFERENT_KEEPER) check(shown==='Sent to dwight.','The Undo toast names the signed producer.');
+"""
+        for producer in (MORTY, DWIGHT):
+            with self.subTest(producer=producer.name):
+                _ = the_list.update(MORTY.id, item.id, {"producer": producer.id}, source="morty")
+                self.browser_action_sequence(
+                    steps.replace('DIFFERENT_KEEPER', json.dumps(producer.id != MORTY.id)), add_item=False)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_shows_saved_actions_and_refreshes_until_delivery_ends(self) -> None:
@@ -11163,6 +11340,26 @@ window.fetch=async(_path,options={})=>{
 '''
         steps = steps.replace("SAVED_STATE", json.dumps(saved)).replace("RECIPIENT_ID", json.dumps(DWIGHT.id))
         self.browser_action_sequence(steps, add_item=False, markup=markup, reduced_motion=True)
+
+        refreshed = list_page.render(root, include_counts=False).decode()
+        retry = r'''
+ const words=form.elements.words,tell=form.querySelector('[value="tell"]'),label=tell.textContent;
+ words.value='Retry the same words.';words.dispatchEvent(new Event('input'));
+ const first=submit('tell');losePost();await flush();
+ refreshMarkup=REFRESHED;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ const item=document.querySelector('[data-number="1"]');
+ const current=recordDetails(item).querySelector('[data-feedback-form]');
+ check(current!==form && current.querySelector('[value="tell"]').textContent===label,
+       'The refreshed form keeps the server label for the signed Tell retry.');
+ const second=submit('tell',current);
+ check(second.id===first.id && second.token===first.token,'Tell keeps its original signed route.');
+ finishPost({unread:'false'});await flush();
+'''
+        refresh_markup = json.dumps(refreshed).replace('</', '<\\/')
+        self.browser_action_sequence(retry.replace('REFRESHED', refresh_markup), add_item=False,
+                                     markup=markup, reduced_motion=True)
 
     def test_feedback_recovers_after_restart_and_alerts_after_failed_tries(self) -> None:
         root = self.root / "reviews"

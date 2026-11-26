@@ -160,6 +160,16 @@ class BrowserForms(HTMLParser):
 
 SEND_MESSAGE = change_page.send_message
 
+CONTROL_SAVE_TIMEOUT = r"""
+const saveTimeout=new AbortController(),originalTimeout=AbortSignal.timeout;
+AbortSignal.timeout=milliseconds=>{
+ AbortSignal.timeout=originalTimeout;
+ check(milliseconds===5000,'The save uses the 5 s timeout.');
+ return saveTimeout.signal;
+};
+"""
+EXPIRE_SAVE = "saveTimeout.abort(new DOMException('The save timed out.','TimeoutError'));"
+
 
 # The Memory bar record predates structured question parts.
 MEMORY_BAR_ASK = "Memory bar on the Builds page: what name should the new block have?"
@@ -1101,8 +1111,10 @@ class ChangePageTests(unittest.TestCase):
         _ = self.enterContext(patch.object(change_page, "deliver", side_effect=finish_delivery))
         _ = self.enterContext(patch.object(change_page, "send_message", side_effect=self.capture_message))
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
-        if not legacy_links:
-            return
+        if legacy_links:
+            self.start_review_server()
+
+    def start_review_server(self) -> None:
         # Restart tests enable legacy recovery after they create the records.
         with (patch.object(change_page, "recover_pending"),
               patch.object(serve, "loaded_module_stamps", return_value={})):
@@ -3082,7 +3094,7 @@ class ChangePageTests(unittest.TestCase):
         key = self.file_user_question("Choose a safe save")
         path, forms, _ = self.browser("questions")
         fields = self.browser_fields(forms, key, "answer", "Keep my typed answer")
-        with patch.object(update_registration, "answer", side_effect=OSError("private save unavailable")):
+        with patch.object(update_registration, "write_selected_item", side_effect=OSError("private save unavailable")):
             failed = self.http_request(path, fields)
         self.assertEqual(failed.status, 503)
         self.assertIn("could not be saved", failed.body)
@@ -3967,9 +3979,10 @@ class ChangePageTests(unittest.TestCase):
             self.assertEqual(len(self.messages), count + 1)
 
         key = self.file_user_question("Keep the spacing")
-        browser = change_page.ReviewBrowser("private-recovery")
+        path, forms, _ = self.browser("questions")
+        browser = change_browser.page_at(self.root, path + "?type=questions")
         status = change_page.DeliveryStatus(self.root)
-        fields = {"row": key, "token": change_browser.row_token(browser, key), "outcome": "answer", "feedback": "Keep it"}
+        fields = self.browser_fields(forms, key, "answer", "Keep it")
         delivery, answer = change_browser.submit(browser, urlencode(fields), status)
         self.assertEqual(answer, "Keep it")
         self.assertIsInstance(delivery, change_page.MessageDelivery)
@@ -4153,7 +4166,8 @@ class ChangePageTests(unittest.TestCase):
                     + f"sessionStorage.setItem('reload-skip-place',{third});")
             skip_place = f"{shown}===(sessionStorage.getItem('reload-skip-place') || {second})"
             self.assertEqual(newer_script_reload_results(
-                body, newer=newer, place=place, placed=skip_place, start=save, saves=True), [[]])
+                body, newer=newer, place=place, placed=skip_place, start=CONTROL_SAVE_TIMEOUT + save,
+                saves=True, end=EXPIRE_SAVE), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_skip_save_and_empty_states_in_the_browser(self) -> None:

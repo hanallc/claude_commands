@@ -589,12 +589,14 @@ class ListFormRequestPrefix:
     seen_update: the_list.UnreadUpdate | the_list.NoUnreadUpdate
     recipient: the_list.FeedbackRecipient = the_list.LegacyFeedbackRecipient.KEEPER
     repair: the_list.RepairRevision | the_list.NoRepairRevision = the_list.NoRepairRevision.ABSENT
+    ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
 
     @classmethod
     def parse(cls, request: str) -> tuple[ListFormRequestPrefix, str]:
         """Read the signed prefix and its optional retry suffix."""
         match = re.fullmatch(r"(?P<nonce>[a-f0-9]{32})(?P<update>[a-f0-9]{64})?" +
-                             r"(?:!(?P<repair>[a-f0-9]{64}))?(?:~(?P<escaped>\.)?(?P<recipient>[^.\s]+))?" +
+                             r"(?:!(?P<repair>[a-f0-9]{64}))?(?:@(?P<ask>[a-f0-9]{64}))?" +
+                             r"(?:~(?P<escaped>\.)?(?P<recipient>[^.\s]+))?" +
                              r"(?P<retry>\.[a-f0-9]{32})?", request)
         if match is None:
             raise question_record.AnswerRefused("the List request does not match this page")
@@ -607,13 +609,18 @@ class ListFormRequestPrefix:
                 raise question_record.AnswerRefused("the List request does not match this page") from error
         update = the_list.UnreadUpdate(fingerprint) if fingerprint else the_list.NoUnreadUpdate.ABSENT
         repair = the_list.RepairRevision(match["repair"]) if match["repair"] else the_list.NoRepairRevision.ABSENT
-        return cls(match["nonce"], update, recipient, repair), match["retry"] or ""
+        ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
+        if value := match["ask"]:
+            ask_signature = the_list.ListQuestionSignature(value)
+        return cls(match["nonce"], update, recipient, repair, ask_signature), match["retry"] or ""
 
     def format(self) -> str:
         update = self.seen_update
         unread = update.fingerprint if isinstance(update, the_list.UnreadUpdate) else ""
         repair = "!" + self.repair.digest if isinstance(self.repair, the_list.RepairRevision) else ""
         prefix = self.nonce + unread + repair
+        if isinstance(self.ask_signature, str):
+            prefix += "@" + self.ask_signature
         if self.recipient is the_list.LegacyFeedbackRecipient.KEEPER:
             return prefix
         recipient = self.recipient
@@ -645,14 +652,18 @@ def request_token(root: Path, keeper: str, identity: str, prefix: str) -> str:
     return signed_token(secret, keeper, identity, prefix)
 
 
-def signed_item_request(entry: ListRecord, secret: str) -> tuple[str, str]:
+def signed_item_request(entry: ListRecord, secret: str, *,
+                        ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
+                        ) -> tuple[str, str]:
     request = ListFormRequestPrefix(secrets.token_hex(16), the_list.unread_update(entry.item),
-                                    entry.item.producer, entry.item.repair_revision).format()
+                                    entry.item.producer, entry.item.repair_revision, ask_signature).format()
     return request, signed_token(secret, entry.keeper, entry.item.id, request)
 
 
-def signed_form_fields(entry: ListRecord, secret: str) -> str:
-    request, token = signed_item_request(entry, secret)
+def signed_form_fields(entry: ListRecord, secret: str, *,
+                       ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
+                       ) -> str:
+    request, token = signed_item_request(entry, secret, ask_signature=ask_signature)
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
     return ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
                    for name, value in fields.items())
@@ -710,15 +721,19 @@ def top_button(mark: TopPriorityMark) -> str:
     return '<button name="action" value="top">Make top priority</button>' if mark is TopPriorityMark.MAKE_TOP else ''
 
 
-def repair_buttons(*, repaired: bool) -> str:
-    works = page_frame.verdict_button(page_frame.VerdictItemType.LIST_REPAIR, page_frame.VerdictAction.WORKS) if repaired else ''
-    not_fixed = page_frame.verdict_button(page_frame.VerdictItemType.LIST_REPAIR, page_frame.VerdictAction.NOT_FIXED)
+def repair_buttons(entry: ListRecord, members: staff.StaffSnapshot, *, repaired: bool) -> str:
+    works = (page_frame.verdict_button(page_frame.VerdictItemType.LIST_REPAIR, page_frame.VerdictAction.WORKS,
+                                     receiver=page_frame.SendWithoutName.SAVE_ONLY) if repaired else '')
+    receivers = " and ".join(dict.fromkeys((owner_name(members, entry.item.owner),
+                                          owner_name(members, entry.item.producer))))
+    not_fixed = page_frame.verdict_button(page_frame.VerdictItemType.LIST_REPAIR, page_frame.VerdictAction.NOT_FIXED,
+                                         receiver=page_frame.SendTo(receivers))
     return f'<div class="list-actions list-repair-actions"{"" if repaired else " hidden"}>{works}{not_fixed}</div>'
 
 
 def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapshot, parking_label: str,
-                  schedule: DisplayedSchedule, today: datetime, mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
-    hidden = signed_form_fields(entry, secret)
+                  schedule: DisplayedSchedule, today: datetime, routing: the_list.ListQuestionRouting,
+                  mark: TopPriorityMark = TopPriorityMark.HIDDEN) -> str:
     read = '<button name="action" value="read">Mark read</button>' if isinstance(entry.item.unread_since, datetime) else ''
     top = top_button(mark)
     key = html.escape(entry.key.replace('/', '-'), quote=True)
@@ -732,19 +747,24 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
     zone = user_zone()
     schedule_editor = schedule_fields(entry, schedule, members, key, zone)
     producer_name = owner_name(members, entry.item.producer)
-    producer_label = html.escape(producer_name, quote=True)
     words_label = html.escape(f"Your words for {producer_name} about this item", quote=True)
     repair = ''
-    repair_receiver = ''
     if isinstance(entry.item.report, the_list.ListReport):
         repaired = entry.item.state == the_list.ItemState.REPAIRED
         if repaired:
             words_label = "Your words about this repair"
-        owner = owner_name(members, entry.item.owner)
-        recipients = html.escape(" and ".join(dict.fromkeys((owner, producer_name))), quote=True)
-        repair_receiver = f' data-repair-receiver="{recipients}"'
-        repair = repair_buttons(repaired=repaired)
-    return (f'<form method="post" data-feedback-form data-recipient-name="{producer_label}"{repair_receiver}>' + hidden
+        repair = repair_buttons(entry, members, repaired=repaired)
+    ask = ''
+    ask_signature: the_list.ListQuestionSignature | the_list.ListQuestionRoute = the_list.ListQuestionRoute.CURRENT
+    if not scheduled:
+        route = routing.receiver(entry.keeper, entry.item.producer)
+        ask_signature = route.signature
+        ask = page_frame.send_button("Ask question", page_frame.SendTo(route.name),
+                                     'name="action" value="question" disabled')
+    hidden = signed_form_fields(entry, secret, ask_signature=ask_signature)
+    tell = page_frame.send_button("Tell", page_frame.SendTo(producer_name),
+                                  'name="action" value="tell" disabled', show_receiver=True)
+    return ('<form method="post" data-feedback-form>' + hidden
             + f'<p data-parked-detail{parked}>{note}</p>'
             + '<div class="list-actions"><button name="action" value="remove">Remove</button>' + read + top
             + f'<div class="list-parking-actions">{start_now}<button name="action" value="unpark" id="unpark-{key}"{parked}>Unpark</button>'
@@ -754,8 +774,7 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
             + f'<textarea name="words" id="words-{key}" rows="4" maxlength="10000" '
             + f'placeholder="{words_label}" aria-label="{words_label}"></textarea>'
             + repair + '<div class="list-tell"><span role="status" data-send-status hidden></span>'
-            + ('' if scheduled else '<button name="action" value="question" disabled>Ask question</button>')
-            + f'<button name="action" value="tell" disabled>Tell {producer_label}</button></div>'
+            + ask + tell + '</div>'
             + '<template data-schedule-template>' + schedule_editor + '</template></form>')
 
 
@@ -1154,10 +1173,10 @@ def review_version(item: the_list.ListItem) -> str:
     return html.escape(json.dumps((str(item.updated), len(item.log), item.reviews)), quote=True)
 
 
-def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *, unread: bool,
+def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, members: staff.StaffSnapshot, *, unread: bool,
                           mark: TopPriorityMark) -> str:
     top = top_button(mark)
-    repair = repair_buttons(repaired=False) if isinstance(entry.item.report, the_list.ListReport) else ''
+    repair = repair_buttons(entry, members, repaired=False) if isinstance(entry.item.report, the_list.ListReport) else ''
     if not parking_label and not unread and not top and not repair:
         return ""
     parked = '' if parking_label else ' hidden'
@@ -1180,7 +1199,7 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
     sections = (waiting_note(entry, names) + '<div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
-                    entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item),
+                    entry, secret, parking_label, names.members, unread=bool(unread_answers) or the_list.unread_delivery(entry.item),
                     mark=mark))
     return detail_panel(entry, sections, today, names, unread_answers, progress, ask_boxes(entry, secret, names))
 
@@ -1188,7 +1207,8 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
             unread_answers: frozenset[str], *, parking_label: str,
-            schedule: DisplayedSchedule, mark: TopPriorityMark, progress: ListProgress) -> str:
+            schedule: DisplayedSchedule, mark: TopPriorityMark, progress: ListProgress,
+            routing: the_list.ListQuestionRouting) -> str:
     item = entry.item
     if isinstance(visibility, the_list.WaitingForAnswer) and item.state != the_list.ItemState.REPAIRED:
         return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark, progress)
@@ -1196,7 +1216,7 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     failed: frozenset[str] = visibility.failed if isinstance(visibility, the_list.QuestionAttention) else frozenset()
     questions = panel_questions(item, today, unread_answers, failed) if isinstance(schedule, the_list.NoSchedule) else ''
     form = feedback_form(entry, secret, members=names.members, parking_label=parking_label,
-                         schedule=schedule, today=today, mark=mark)
+                         schedule=schedule, today=today, mark=mark, routing=routing)
     return waiting_note(entry, names, hidden=True) + detail_panel(
         entry, sections + questions + form, today, names, unread_answers, progress, ask_boxes(entry, secret, names), schedule=schedule)
 
@@ -1213,7 +1233,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
               reviews: ReviewDisplay, *, owner_cell: str, owner_sort: str, search_text: SearchText, parked: bool,
               open_question: bool, open_ask: bool, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
               unread_answers: frozenset[str],
-              schedule: DisplayedSchedule, mark: TopPriorityMark, hidden: bool = False) -> str:
+              schedule: DisplayedSchedule, mark: TopPriorityMark, routing: the_list.ListQuestionRouting,
+              hidden: bool = False) -> str:
     item = entry.item
     producer = owner_name(names.members, item.producer)
     unread = isinstance(item.unread_since, datetime)
@@ -1239,9 +1260,6 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     }
     if isinstance(item.report, the_list.ListReport):
         attributes["report"] = item.report.kind.value
-    keeper = names.members.by_id(entry.keeper)
-    if keeper is not None:
-        attributes["send-receiver"] = keeper.name
     attrs = ''
     for name, value in attributes.items():
         escaped = (record_table.identity_attribute(value) if name in ("key", "owner", "producer")
@@ -1301,7 +1319,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden_attr = ' hidden' if hidden else ''
     body = details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label,
-                   schedule=schedule, mark=mark, progress=progress)
+                   schedule=schedule, mark=mark, progress=progress, routing=routing)
     revision = detail_revision(item, body)
     return (f'<tbody data-list-item{attrs} data-detail-revision="{revision}"{hidden_attr}><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
@@ -1489,7 +1507,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         secret = form_secret(reading.root)
         body = details(ListRecord(owner, item), local_today, secret, reviews, names,
                        visibility, unread_answers, parking_label=parked_until,
-                       schedule=schedule, mark=top_priority_mark(top_priority, members, item), progress=progress)
+                       schedule=schedule, mark=top_priority_mark(top_priority, members, item), progress=progress,
+                       routing=the_list.ListQuestionRouting(members))
         if waiting:
             saved["waiting_details_html"] = body
         if include_detail:
@@ -1532,7 +1551,8 @@ def _replay_ask(keeper: staff.StaffId, item: the_list.ListItem, receipt: the_lis
 
 
 def _submit_ask(keeper: staff.StaffId, identity: str, request: the_list.PageRequest,
-                status: change_page.DeliveryStatus) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
+                status: change_page.DeliveryStatus, shown: the_list.ListQuestionSignature | the_list.ListQuestionRoute
+                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     """Serialize the receipt check and submission of List Ask requests."""
     with exclusive(the_list.folder(keeper) / f".{identity}.ask.lock"):
         item = the_list.load(keeper, identity)
@@ -1540,7 +1560,7 @@ def _submit_ask(keeper: staff.StaffId, identity: str, request: the_list.PageRequ
                         if entry.source == the_list.PAGE_SOURCE and isinstance(entry.what, the_list.QuestionRequestReceipt)
                         and entry.what.request.request == request.request), None)
         if receipt is None:
-            return the_list.ask_question(keeper, identity, request, status)
+            return the_list.ask_question(keeper, identity, request, status, shown=shown)
         if receipt.request != request:
             raise the_list.ListError("this request already has a different action or words")
         return _replay_ask(keeper, item, receipt, status)
@@ -1677,7 +1697,8 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         if item.state is the_list.ItemState.SCHEDULED:
             raise question_record.AnswerRefused("Ask the question after the item starts.")
         status = change_page.DeliveryStatus(root) if status is None else status
-        question = _submit_ask(keeper, identity, the_list.PageRequest(request, "question", words), status)
+        question = _submit_ask(keeper, identity, the_list.PageRequest(request, "question", words), status,
+                               prefix.ask_signature)
         if isinstance(question, change_page.MessageDelivery):
             _mark_seen_update_read(keeper, item, prefix.seen_update)
             return ListQuestionDelivery(question, status)
@@ -2227,6 +2248,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     deferred_links = False
     shown = 0
     top_items: list[ListRecord] = []
+    routing = the_list.ListQuestionRouting(members)
 
     @cache
     def owner_display(identity: the_list.ItemOwner) -> tuple[str, str, str]:
@@ -2267,7 +2289,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         row = item_rows(entry, names, today, index, secret, row_reviews, owner_cell=owner_cell, owner_sort=owner_sort,
                         search_text=search_text, parked=parked, open_question=open_question, open_ask=open_ask, visibility=visibility,
-                        unread_answers=unread_answers, schedule=schedule, mark=mark, hidden=not (visible or linked))
+                        unread_answers=unread_answers, schedule=schedule, mark=mark, routing=routing,
+                        hidden=not (visible or linked))
         if linked:
             linked_row = row
         else:
@@ -3398,6 +3421,7 @@ function bindFeedbackForm(form){
   const words=form.elements.words,until=form.elements.until;
   const tell=form.querySelector('[value="tell"]'),ask=form.querySelector('[value="question"]');
   const notFixed=form.querySelector('[value="not works"]');
+  const repairReceiver=sendReceiver(notFixed);
   const works=form.querySelector('[value="works"]'),repairActions=form.querySelector('.list-repair-actions');
   const syncTell=()=>{
    const repaired=item.dataset.state==='Repaired';
@@ -3405,19 +3429,34 @@ function bindFeedbackForm(form){
    const canReject=Boolean(notFixed && (repaired || retryRepair));
    if(repairActions) repairActions.hidden=!canReject;
    if(works) works.hidden=!repaired || Boolean(retryRepair);
-   if(notFixed) notFixed.disabled=!canReject || Boolean(form.dataset.sending) || repairRequests.sending(key) ||
-    (!retryRepair && !normalizeRepairWords(words.value));
+   if(notFixed){
+    const name=retryRepair?.payload.receiver ?? repairReceiver;
+    if(name) notFixed.dataset.sendReceiver=name;
+    updateSendLabel(notFixed);
+    notFixed.disabled=!canReject || Boolean(form.dataset.sending) || repairRequests.sending(key) ||
+     (!retryRepair && !normalizeRepairWords(words.value));
+   }
    if(!tell) return;
-   const name=matching('tell')?.recipientName ?? signed.recipientName;
+   const retry=matching('tell');
+   const name=retry?.receiver ?? signed.receiver;
    const wordsLabel=canReject ? 'Your words about this repair' : 'Your words for '+name+' about this item';
-   tell.textContent='Tell '+name;
+   tell.textContent=retry?.tellLabel ?? signed.tellLabel;
+   tell.dataset.sendReceiver=name;
    words.placeholder=wordsLabel;
    words.setAttribute('aria-label',wordsLabel);
    tell.disabled=Boolean(form.dataset.sending) || !words.value.trim();
-   if(ask) ask.disabled=tell.disabled;
+   if(ask){
+    const askRetry=matching('question','');
+    const askReceiver=askRetry ? askRetry.askReceiver : signed.askReceiver;
+    if(askReceiver==null) ask.removeAttribute('data-send-receiver');
+    else ask.dataset.sendReceiver=askReceiver;
+    updateSendLabel(ask);
+    ask.disabled=tell.disabled;
+   }
   };
   // Keep the signed update and recipient from the rendered form.
-  const signed={request:form.elements.request.value,token:form.elements.token.value,recipientName:form.dataset.recipientName};
+  const signed={request:form.elements.request.value,token:form.elements.token.value,receiver:sendReceiver(tell),
+   tellLabel:tell?.textContent,askReceiver:sendReceiver(ask)};
   let fresh=signed;
   const newRequest=()=>({
    ...signed,
@@ -3479,6 +3518,7 @@ function bindFeedbackForm(form){
    const rejectsRepair=action==='not works';
    const usesWords=action==='tell' || action==='question' || rejectsRepair;
    const saveAction=changesParking || action==='read' || action==='remove' || action==='works';
+   const receiver=sendReceiver(submitter ?? tell);
    const heldSave=saveAction && content.dataset.undoEnabled==='true';
    const asksQuestion=action==='question';
    const retryRepair=rejectsRepair && Boolean(repairRequests.get(key));
@@ -3524,7 +3564,7 @@ function bindFeedbackForm(form){
    if(rejectsRepair){
     data.set('words',submittedWords);
     retainDraft();
-    try{repair=repairRequests.begin(key,data,sendActionReceiver(form,data),drafts.get(key));}
+    try{repair=repairRequests.begin(key,data,receiver,drafts.get(key));}
     catch(error){showActionFailure(notice,error.message);return;}
    }
    if(!retry){if(!rejectsRepair && (!preset || parkForDelivery)) unconfirmed.add(attempt);fresh=newRequest();}
@@ -3588,8 +3628,6 @@ function bindFeedbackForm(form){
      return outcome.result;
     }
     const options={method:'POST',body:data};
-    const receiver=action==='works' ? sendActionReceiver(form,data)
-     : action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
     const requestTimeoutSeconds=Number(content.dataset.requestTimeoutSeconds);
     const response=await (action==='works' || usesWords || heldSave
      ? hold.post(actionPath,{...options,requestTimeoutSeconds},saveAction ? null : receiver)
@@ -3675,7 +3713,7 @@ function bindFeedbackForm(form){
      if(action==='unpark'){
       showUnparkResult(result);
      }else if(action==='tell' || rejectsRepair){
-      const recipient=repair?.payload.receiver ?? attempt.recipientName;
+      const recipient=repair?.payload.receiver ?? receiver;
       const deliveryFailed=rejectsRepair && !repairDelivered;
       const message=(deliveryFailed && (result.send_failure || 'The sender has not confirmed delivery.')) ||
        ('sent to '+recipient+(result.unread==='true' ? '; update remains unread' : ''));
@@ -3814,7 +3852,7 @@ function bindFeedbackForm(form){
     }
     refreshAfterListSave(stale || Boolean(tableView.deliveryRequest()) ||
       (saved && (changesParking || action==='remove' || action==='top' || item.dataset.waitingForAnswer!=='true')) ||
-      (!saved && !refused && (parkingReceipt || action==='remove')));
+      (!saved && (refused && asksQuestion || !refused && (parkingReceipt || action==='remove'))));
    }
   });
 }

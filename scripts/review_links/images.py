@@ -13,9 +13,10 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast, override
+from typing import Literal, cast, override
 from urllib.parse import parse_qs
 
 from scripts.console_text import check as console_text
@@ -67,6 +68,10 @@ class AnswerNotSent(Exception):
 class ImageAnswerSent:
     notice: str = ""
     draft_confirmed: bool = False
+
+
+class ImageRecipientReading(Enum):
+    CURRENT = "resolve the recipients for an older form"
 
 
 @dataclass(frozen=True)
@@ -238,10 +243,15 @@ def question_html(question: question_record.Question, open_questions: Mapping[st
     return page_question.open_question_html(question, failed=failed)
 
 
-def _answer_form(identity: str, token: str, round_id: str, feedback_rows: int, *, question: bool = True) -> str:
-    closing_buttons = ('<button type="submit" name="action" value="approved">Approved</button>'
-                       '<button type="submit" name="action" value="feedback">Send Feedback</button>')
-    returning_buttons = '<button type="submit" name="action" value="question">Ask question</button>' if question else ""
+def _answer_form(identity: str, token: str, round_id: str, feedback_rows: int, *,
+                 receiver: page_frame.SendReceiver = page_frame.SendWithoutName.UNAVAILABLE,
+                 question_receiver: page_frame.SendReceiver = page_frame.SendWithoutName.UNAVAILABLE,
+                 routes: str = "", question: bool = True) -> str:
+    closing_buttons = ''.join(
+        page_frame.send_button(label, receiver, f'type="submit" name="action" value="{action}"')
+        for action, label in (("approved", "Approved"), ("feedback", "Send Feedback")))
+    returning_buttons = (page_frame.send_button("Ask question", question_receiver, 'type="submit" name="action" value="question"')
+                         if question else "")
     return ('<form method="post" data-image-form>'
             + f'<input type="hidden" name="image" value="{identity}">'
             + f'<input type="hidden" name="token" value="{token}">'
@@ -249,7 +259,7 @@ def _answer_form(identity: str, token: str, round_id: str, feedback_rows: int, *
             + f'<label for="feedback-{identity}">Feedback</label>'
             + f'<textarea id="feedback-{identity}" name="feedback" rows="{feedback_rows}" autocomplete="off"></textarea>'
             + page_frame.review_action_groups(closing_buttons, returning_buttons)
-            + '<span role="status" data-image-status hidden></span></form>')
+            + routes + '<span role="status" data-image-status hidden></span></form>')
 
 
 def _card_heading(record: image_store.ImageHeading) -> str:
@@ -261,7 +271,8 @@ def _card_heading(record: image_store.ImageHeading) -> str:
 
 def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapshot, feedback_rows: int,
          names: staff_names.StaffNames | staff_names.NameReading = staff_names.NameReading.CURRENT, *,
-         open_questions: Mapping[str, QuestionSendState] = NO_OPEN_QUESTIONS) -> str:
+         open_questions: Mapping[str, QuestionSendState] = NO_OPEN_QUESTIONS, directory: Path | None = None,
+         list_records: ImageListRecords | None = None) -> str:
     """Render an image card with its title, details, and actions."""
     pair = "before" in record
     pictures = "".join(picture(record, label, file) for label, file in shown_files(record))
@@ -271,12 +282,13 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
     member = members.by_id(staff.StaffId(record["owner"]))
     shown_owner = (names.html(record["owner"], name) + f" ({names.role_label(member.kind, member.kind)})"
                    if member is not None else html.escape(owner))
-    receiver = f' data-send-receiver="{html.escape(name, quote=True)}"' if member is not None else ""
+    receiver = change_browser.receiver_names(members, (staff.StaffId(record["owner"]),))
+    answer_receiver, routes = image_answer_controls(record, members, directory, list_records)
     questions = sorted((question_record.read(saved) for saved in record.get('questions', [])),
                        key=lambda question: (question.answer is not None, int(question.question_id[1:])))
     round_id = feedback_round(answered_question_ids(record))
     return (f'<article id="image-{record["id"]}"{' class="pair"' if pair else ''} data-image="{record["id"]}" '
-            + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}"{receiver}>'
+            + f'data-owner="{html.escape(record["owner"], quote=True)}" data-owner-name="{html.escape(name, quote=True)}">'
             + _card_heading(record) + '<dl class="image-details">'
             + f'<dt>Owner:</dt><dd>{shown_owner}</dd>'
             + f'<dt>For  :</dt><dd>{html.escape(record["subject"])}</dd>'
@@ -284,11 +296,136 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + f'{shown_time(added)}</time></dd></dl>'
             + (f'<div class="image-pair" data-image-zoom-group>{pictures}</div>' if pair else pictures)
             + ''.join(question_html(question, open_questions) for question in questions)
-            + _answer_form(record["id"], request_token(token, record["id"]), round_id, feedback_rows)
+            + _answer_form(record["id"], request_token(token, record["id"]), round_id, feedback_rows,
+                           receiver=answer_receiver, question_receiver=receiver, routes=routes)
             + '</article>')
 
 
-def _pending_answer_cards(root: Path, token: str) -> list[str]:
+def _linked_image_keeper(record: image_store.ImageReference, identity: str) -> staff.StaffId:
+    return staff.StaffId(record["list_keeper"]) if "list_keeper" in record else the_list.image_list_folder_keeper(identity)
+
+
+class ImageListReading(Enum):
+    UNLINKED = "the picture has no List link"
+    UNAVAILABLE = "the linked List record is unreadable"
+
+
+class ImageListRecords:
+    """Read each linked List record once during a page render."""
+
+    def __init__(self) -> None:
+        self.keepers: dict[str, staff.StaffId | Literal[ImageListReading.UNAVAILABLE]] = {}
+        self.items: dict[tuple[staff.StaffId, str], the_list.ListItem | Literal[ImageListReading.UNAVAILABLE]] = {}
+
+    def read(self, record: image_store.ImageReference, identity: str
+             ) -> the_list.ListItem | Literal[ImageListReading.UNAVAILABLE]:
+        if "list_keeper" in record:
+            keeper = staff.StaffId(record["list_keeper"])
+        else:
+            if identity not in self.keepers:
+                try:
+                    self.keepers[identity] = the_list.image_list_folder_keeper(identity)
+                except (the_list.ListError, OSError) as error:
+                    print(f"review-links image {identity}: {error}", file=sys.stderr)
+                    self.keepers[identity] = ImageListReading.UNAVAILABLE
+            keeper = self.keepers[identity]
+        if keeper is ImageListReading.UNAVAILABLE:
+            return keeper
+        key = (keeper, identity)
+        if key not in self.items:
+            try:
+                self.items[key] = the_list.load(keeper, identity)
+            except (the_list.ListError, OSError) as error:
+                print(f"review-links image {identity}: {error}", file=sys.stderr)
+                self.items[key] = ImageListReading.UNAVAILABLE
+        return self.items[key]
+
+
+def answer_recipients(owner: staff.StaffId, producer: staff.StaffId) -> tuple[staff.StaffId, ...]:
+    return tuple(dict.fromkeys((owner, producer)))
+
+
+def pending_answer_recipients(answer: image_store.ImageAnswer, *,
+                              expected: tuple[staff.StaffId, ...] = ()) -> tuple[staff.StaffId, ...]:
+    """Return the recipients who still need the words."""
+    return tuple(staff.StaffId(identity) for identity in (answer["recipients"] or expected)
+                 if identity not in answer["confirmed"])
+
+
+def _recipient_attributes(recipients: tuple[staff.StaffId, ...]) -> str:
+    return f' data-image-answer-recipients="{html.escape(json.dumps(recipients), quote=True)}"'
+
+
+@dataclass(frozen=True)
+class ImageAnswerRoute:
+    recipients: tuple[staff.StaffId, ...]
+    names: str
+    receiver: page_frame.SendReceiver
+
+    @classmethod
+    def resolve(cls, members: staff.StaffSnapshot, recipients: tuple[staff.StaffId, ...]) -> ImageAnswerRoute:
+        if not recipients:
+            return cls(recipients, "", page_frame.SendWithoutName.SAVE_ONLY)
+        receiver = change_browser.receiver_names(members, recipients)
+        names = receiver.name if isinstance(receiver, page_frame.SendTo) else " and ".join(
+            _recipient_name(members, recipient) for recipient in recipients)
+        return cls(recipients, names, receiver)
+
+
+def image_answer_controls(record: image_store.ImageRecord, members: staff.StaffSnapshot,
+                          directory: Path | None, list_records: ImageListRecords | None
+                          ) -> tuple[page_frame.SendReceiver, str]:
+    """Render the current route and the pending recipients of saved answers."""
+    owner = staff.StaffId(record["owner"])
+    item = ((list_records or ImageListRecords()).read(record, record["list_item"]) if "list_item" in record
+            else ImageListReading.UNLINKED)
+    producer = item.producer if isinstance(item, the_list.ListItem) else owner
+    if directory is None and item is ImageListReading.UNLINKED:
+        return change_browser.receiver_names(members, (owner,)), ""
+
+    def route(producer: staff.StaffId, recipients: tuple[staff.StaffId, ...], match: str = ""
+              ) -> tuple[page_frame.SendReceiver, str]:
+        receiver = ImageAnswerRoute.resolve(members, recipients).receiver
+        control = page_frame.send_control("", receiver, show_receiver=True)
+        return receiver, (f'<template data-image-answer-route="{html.escape(producer, quote=True)}"'
+                          + control.attributes + match + _recipient_attributes(recipients) + '></template>')
+
+    if item is ImageListReading.UNAVAILABLE:
+        receiver = page_frame.SendWithoutName.UNAVAILABLE
+        current = f'<template data-image-answer-route=""{_recipient_attributes(())}></template>'
+    else:
+        receiver, current = route(producer, answer_recipients(owner, producer))
+    if directory is None:
+        return receiver, current
+    try:
+        saved = _image_answers(directory, record)
+    except (ValueError, OSError) as error:
+        print(f"review-links image {record['id']}: {error}", file=sys.stderr)
+        return receiver, current
+    folder = directory / record["id"]
+    routes = [current]
+    for key, attempt in saved["attempts"].items():
+        recipients = attempt["recipients"]
+        if not recipients and item is ImageListReading.UNAVAILABLE:
+            continue
+        saved_producer = (staff.StaffId(recipients[-1]) if recipients else
+                          the_list.image_answer_producer(item, key) if isinstance(item, the_list.ListItem) else producer)
+        pending = pending_answer_recipients(attempt, expected=answer_recipients(owner, saved_producer))
+        heading, _, feedback = attempt.get("words", "").partition("\n")
+        round_id = feedback_round(set(attempt["answered"]))
+        for action, label in ANSWERS.items():
+            if heading != f"Image {record['id']}: {label}":
+                continue
+            if _AnswerDraft(action, feedback, round_id).key(folder, record["registered_at"]) != key:
+                continue
+            match = (f' data-answer-action="{action}" data-answer-round="{round_id}"'
+                     + f' data-answer-words="{html.escape(feedback, quote=True)}"')
+            routes.append(route(saved_producer, pending, match)[1])
+    return receiver, ''.join(routes)
+
+
+def _pending_answer_cards(root: Path, token: str, members: staff.StaffSnapshot,
+                          list_records: ImageListRecords) -> list[str]:
     directory = images_root(root)
     cards: list[str] = []
     for identity in image_store.deleted_answer_ids(directory):
@@ -302,8 +439,23 @@ def _pending_answer_cards(root: Path, token: str) -> list[str]:
         details = (_card_heading(heading) + f'<p>{removed}</p>' if heading is not None
                    else _card_heading({"title": removed, "look_for": []}))
         for key, answer in saved["attempts"].items():
-            if answer["recipients"] and set(answer["recipients"]) <= set(answer["confirmed"]):
+            pending = pending_answer_recipients(answer)
+            if answer["recipients"] and not pending:
                 continue
+            if answer["recipients"]:
+                receiver = ImageAnswerRoute.resolve(members, pending).receiver
+            elif "list_item" in saved:
+                item = list_records.read(saved, saved["list_item"])
+                receiver = page_frame.SendWithoutName.UNAVAILABLE
+                if isinstance(item, the_list.ListItem):
+                    recipients = answer_recipients(staff.StaffId(saved["owner"]), the_list.image_answer_producer(item, key))
+                    pending = pending_answer_recipients(answer, expected=recipients)
+                    receiver = ImageAnswerRoute.resolve(members, pending).receiver
+            else:
+                pending = pending_answer_recipients(answer, expected=(staff.StaffId(saved["owner"]),))
+                receiver = ImageAnswerRoute.resolve(members, pending).receiver
+            retry = page_frame.send_button("Retry", receiver, 'type="submit" name="action" value="retry"'
+                                           + _recipient_attributes(pending))
             words = html.escape(answer.get("words", answer["message"]))
             cards.append(f'<article>{details}'
                          + f'<p class="image-answer-words">{words}</p>'
@@ -312,7 +464,7 @@ def _pending_answer_cards(root: Path, token: str) -> list[str]:
                          + f'<input type="hidden" name="token" value="{request_token(token, identity)}">'
                          + f'<input type="hidden" name="retry_key" value="{html.escape(key, quote=True)}">'
                          + '<span role="status" data-image-status>Not sent yet</span>'
-                         + '<div><button type="submit" name="action" value="retry">Retry</button></div>'
+                         + f'<div>{retry}</div>'
                          + '</form></article>')
     return cards
 
@@ -329,14 +481,16 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     waiting: list[str] = []
     cards: list[str] = []
     refresh_needed = False
+    list_records = ImageListRecords()
     for record in records(root):
         review = image_review(status, record)
         if review.visible():
-            cards.append(card(record, token, members, rows, names, open_questions=review.open_questions))
+            cards.append(card(record, token, members, rows, names, open_questions=review.open_questions,
+                              directory=images_root(root), list_records=list_records))
         elif review.open_questions:
             waiting.append(record['id'])
         refresh_needed |= review.refresh()
-    cards.extend(_pending_answer_cards(root, token))
+    cards.extend(_pending_answer_cards(root, token, members, list_records))
     answer_refresh_seconds = settings.number("page_refresh_seconds")
     refresh_seconds = answer_refresh_seconds if refresh_needed else 0
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
@@ -363,7 +517,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
     if not {"image", "token"} <= set(fields) <= {
-            "image", "token", "feedback", "action", "feedback_round", "retry_key", "draft_action"} or any(
+            "image", "token", "feedback", "action", "feedback_round", "retry_key", "draft_action", "producer", "recipients", "receiver"} or any(
             len(value) != 1 for value in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
@@ -376,13 +530,22 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     if action == "not approved":
         # A card loaded before I21 can still show the removed button.
         raise question_record.AnswerRefused("Not Approved was removed. Use Send Feedback.")
-    if action not in ACTIONS:
+    if (action not in ACTIONS or ("producer" in fields and action not in ANSWERS)
+            or ({"recipients", "receiver"} & fields.keys() and action != "retry" and action not in ANSWERS)):
         raise question_record.AnswerRefused("use the form on this page")
+    shown_recipients: tuple[staff.StaffId, ...] | ImageRecipientReading = ImageRecipientReading.CURRENT
+    if "recipients" in fields:
+        recipients = cast(object, json.loads(fields["recipients"][0]))
+        if not isinstance(recipients, list) or not all(
+                isinstance(recipient, str) for recipient in cast(list[object], recipients)):
+            raise question_record.AnswerRefused("use the form on this page")
+        shown_recipients = tuple(staff.StaffId(recipient) for recipient in cast(list[str], recipients))
+    shown_receiver = fields["receiver"][0] if "receiver" in fields else ImageRecipientReading.CURRENT
     if action == "retry":
         required = {"image", "token", "action", "retry_key"}
         if not required <= fields.keys() or not fields["retry_key"][0]:
             raise question_record.AnswerRefused("use the Retry button on this page")
-        draft_fields = fields.keys() - required
+        draft_fields = fields.keys() - required - {"recipients", "receiver"}
         draft_action = fields.get("draft_action", [""])[0]
         draft = None
         if draft_fields:
@@ -390,14 +553,17 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
                     or draft_action not in ANSWERS):
                 raise question_record.AnswerRefused("use the Retry button on this page")
             draft = _AnswerDraft(draft_action, fields["feedback"][0].strip(), fields.get("feedback_round", [None])[0])
-        return send_answer(root, identity, action, "", retry_key=fields["retry_key"][0], draft=draft)
+        return send_answer(root, identity, action, "", retry_key=fields["retry_key"][0], draft=draft,
+                           shown_recipients=shown_recipients, shown_receiver=shown_receiver)
     if "retry_key" in fields or "draft_action" in fields:
         raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':
         return ask_question(root, identity, fields.get('feedback', [''])[0], status)
     if action in ANSWERS:
         round_id = fields["feedback_round"][0] if "feedback_round" in fields else None
-        return send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id)
+        producer = staff.StaffId(fields["producer"][0]) if "producer" in fields else ImageRecipientReading.CURRENT
+        return send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id,
+                           shown_producer=producer, shown_recipients=shown_recipients, shown_receiver=shown_receiver)
     try:
         delete(root, identity)
     except ValueError as error:
@@ -461,7 +627,10 @@ def _image_answers(directory: Path, record: image_store.ImageRecord) -> image_st
 
 
 def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, round_id: str | None,
-                    retry_key: str | None) -> tuple[str, image_store.ImageAnswers]:
+                    retry_key: str | None, shown_producer: staff.StaffId | ImageRecipientReading,
+                    shown_recipients: tuple[staff.StaffId, ...] | ImageRecipientReading,
+                    shown_receiver: str | ImageRecipientReading
+                    ) -> tuple[str, image_store.ImageAnswers, ImageAnswerRoute]:
     """Save the words and the List recipient before the first send."""
     folder = directory / identity
     try:
@@ -487,7 +656,8 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
         words = f"Image {identity}: {ANSWERS[answer]}"
         if feedback:
             words += "\n" + feedback
-    if key not in attempts:
+    new_attempt = key not in attempts
+    if new_attempt:
         previous: set[str] = set()
         if record is None:
             message = ANSWER_PREFIX + ANSWERS[answer] + f"\nPicture {identity} was removed."
@@ -507,30 +677,53 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
             message = answer_message(record, answer, feedback)
         attempts[key] = {"message": message, "words": words, "answered": sorted(previous),
                          "recipients": [], "confirmed": []}
-        image_store.write_answers(directory, saved)
     else:
         atomic_file.sync_folder(directory)
 
+    legacy_form = (shown_producer is ImageRecipientReading.CURRENT and shown_recipients is ImageRecipientReading.CURRENT
+                   and shown_receiver is ImageRecipientReading.CURRENT)
+    if new_attempt and legacy_form:
+        image_store.write_answers(directory, saved)
+
     attempt = attempts[key]
+    owner = staff.StaffId(saved["owner"])
+    route: ImageAnswerRoute | ImageRecipientReading = ImageRecipientReading.CURRENT
+
+    def prepare(producer: staff.StaffId) -> None:
+        nonlocal route
+        pending = pending_answer_recipients(attempt, expected=answer_recipients(owner, producer))
+        route = ImageAnswerRoute.resolve(staff.snapshot(), pending)
+        if shown_producer is not ImageRecipientReading.CURRENT and shown_producer != producer:
+            raise question_record.AnswerRefused("The List producer changed. Check the picture and try again.")
+        if ((shown_recipients is not ImageRecipientReading.CURRENT and shown_recipients != route.recipients)
+                or (shown_receiver is not ImageRecipientReading.CURRENT
+                    and shown_receiver != change_browser.receiver_field(route.receiver))):
+            raise question_record.AnswerRefused("The receivers changed. Check the picture and try again.")
+        if new_attempt and not legacy_form:
+            image_store.write_answers(directory, saved)
+
     if not attempt["recipients"]:
-        recipients = [saved["owner"]]
+        producer = owner
         if "list_item" in saved:
             item = saved["list_item"]
             # Older attempts have the complete message in place of the List words.
             words = attempt.get("words", words or attempt["message"])
             approved = attempt["message"].partition("\n")[0] == ANSWER_PREFIX + ANSWERS["approved"]
             try:
-                keeper = staff.StaffId(saved["list_keeper"]) if "list_keeper" in saved else the_list.image_list_keeper(item)
+                keeper = _linked_image_keeper(saved, item)
                 producer = the_list.save_image_answer(keeper, item, key, words, image_id=identity,
-                                                      approved=approved)
+                                                      approved=approved, prepare=prepare)
             except (the_list.ListError, OSError) as error:
                 raise AnswerNotSent(f"Could not save the answer on {item}: {error}. Try again.") from error
             saved["list_keeper"] = keeper
-            if producer not in recipients:
-                recipients.append(producer)
-        attempt["recipients"] = recipients
+        else:
+            prepare(producer)
+        attempt["recipients"] = list(answer_recipients(owner, producer))
         image_store.write_answers(directory, saved)
-    return key, saved
+    else:
+        prepare(staff.StaffId(attempt["recipients"][-1]))
+    assert isinstance(route, ImageAnswerRoute)
+    return key, saved, route
 
 
 def _recipient_name(members: staff.StaffSnapshot, identity: str) -> str:
@@ -539,7 +732,11 @@ def _recipient_name(members: staff.StaffSnapshot, identity: str) -> str:
 
 
 def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_id: str | None = None,
-                retry_key: str | None = None, draft: _AnswerDraft | None = None) -> ImageAnswerSent:
+                retry_key: str | None = None, draft: _AnswerDraft | None = None,
+                shown_producer: staff.StaffId | ImageRecipientReading = ImageRecipientReading.CURRENT,
+                shown_recipients: tuple[staff.StaffId, ...] | ImageRecipientReading = ImageRecipientReading.CURRENT,
+                shown_receiver: str | ImageRecipientReading = ImageRecipientReading.CURRENT
+                ) -> ImageAnswerSent:
     """Send to each recipient that has yet to confirm this answer."""
     if not image_store.IDENTITY.fullmatch(identity):
         raise question_record.AnswerRefused("not an image id")
@@ -552,11 +749,12 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_
         raise question_record.AnswerRefused(f"no image {identity}")
     with file_lock.exclusive(lock):
         try:
-            key, saved = _picture_answer(directory, identity, answer, feedback, round_id, retry_key)
+            key, saved, route = _picture_answer(directory, identity, answer, feedback, round_id, retry_key,
+                                                shown_producer, shown_recipients, shown_receiver)
         except OSError as error:
             raise AnswerNotSent(f"Could not save the picture answer: {error}. Try again.") from error
     attempt = saved["attempts"][key]
-    remaining = tuple(staff.StaffId(target) for target in attempt["recipients"] if target not in attempt["confirmed"])
+    remaining = route.recipients
     failures: list[change_page.DeliveryFailure] = []
     if remaining:
         settings = conf.read("review_links")
@@ -576,8 +774,9 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_
             try:
                 record = image_store.read_record(folder)
             except FileNotFoundError:
-                owner = _recipient_name(staff.snapshot(), saved["owner"])
-                return ImageAnswerSent(f"This picture was removed; your words went to {owner}.",
+                notice = (f"This picture was removed; your words went to {route.names}." if route.names
+                          else "This picture was removed.")
+                return ImageAnswerSent(notice,
                                        draft_confirmed=draft is not None and draft.key(folder, saved["registered_at"]) == key)
             if (record["registered_at"] == saved["registered_at"] and record["owner"] == saved["owner"]
                     and "feedback_at" not in record and not answered_question_ids(record) - set(delivery["answered"])):
@@ -779,10 +978,30 @@ function clearDraft(state, form) {
   if (form) form.elements.feedback.value = '';
   saveDrafts();
 }
+function syncAnswerRoutes(form, draft) {
+  const [current, ...saved] = form.querySelectorAll('[data-image-answer-route]');
+  if (!current) return;
+  const words = form.elements.feedback.value.trim();
+  for (const button of form.querySelectorAll('button[value="feedback"],button[value="approved"]')) {
+    const round = (draft?.retryAction === button.value ? draft.retryRound : undefined)
+      ?? form.elements.feedback_round.value;
+    const route = saved.find(({dataset}) => dataset.answerAction === button.value &&
+      dataset.answerRound === round && dataset.answerWords === words) ?? current;
+    button.dataset.imageAnswerProducer = route.dataset.imageAnswerRoute;
+    button.dataset.imageAnswerRecipients = route.dataset.imageAnswerRecipients;
+    const receiver = sendReceiver(route);
+    if (receiver === undefined) button.removeAttribute('data-send-receiver');
+    else button.dataset.sendReceiver = receiver ?? '';
+    updateSendLabel(button);
+  }
+}
 function bind(root) {
   for (const form of forms(root)) {
+    const state = pictureState(imageId(form));
+    syncAnswerRoutes(form, state.draft);
     form.elements.feedback?.addEventListener('input', () => {
-      readEdit(form, pictureState(imageId(form)), true);
+      readEdit(form, state, true);
+      syncAnswerRoutes(form, state.draft);
       saveDrafts();
     });
     form.addEventListener('submit', submit);
@@ -802,7 +1021,15 @@ async function submit(event) {
     return;
   }
   const {retryAction, retryRound} = draft ?? {};
+  syncAnswerRoutes(form, draft);
   const body = new URLSearchParams(new FormData(form, event.submitter));
+  const producer = event.submitter?.dataset.imageAnswerProducer;
+  if (producer) body.set('producer', producer);
+  const recipients = event.submitter?.dataset.imageAnswerRecipients;
+  if (recipients) {
+    body.set('recipients', recipients);
+    body.set('receiver', sendReceiver(event.submitter) ?? '');
+  }
   if (key) {
     if (draft?.retryAction) {
       body.set('draft_action', draft.retryAction);
@@ -830,7 +1057,7 @@ async function submit(event) {
   let postFailed = false, retryable = true;
   try {
     const response = await hold.post(location.pathname, {method: 'POST', body, requestTimeoutSeconds: pageRequestSeconds()},
-                                     card.dataset.sendReceiver);
+                                     sendReceiver(event.submitter));
     if (!response.ok) {
       retryable = response.status >= 500;
       const reason = await response.json().then(body => body.reason, () => '');
