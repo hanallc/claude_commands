@@ -903,9 +903,19 @@ class ListProgress(NamedTuple):
     def next_step_html(self, *, link_urls: bool = False) -> str:
         if self.repair_producer_html:
             return '<p>' + self.repair_producer_html + ' repairs it again</p>'
-        if self.show_next_step:
-            return item_text_html(self.next_step or "Not recorded", paragraphs=True, link_urls=link_urls)
-        return ""
+        if not self.show_next_step:
+            return ""
+        text = self.next_step or "Not recorded"
+        paragraphs = change_browser.BLANK_LINE.split(text)
+        label = "Run this command:"
+        if len(paragraphs) >= 2 and paragraphs[-2] == label and label not in paragraphs[:-2]:
+            command = paragraphs[-1]
+            if command.strip():
+                prose = item_text_html(text.removesuffix(command), paragraphs=True, link_urls=link_urls)
+                block = page_frame.CODE_BLOCK.fullmatch(command)
+                code = page_frame.code_block_html(block) if block else page_frame.copy_code_block(command)
+                return prose + '<div class="list-command">' + code + '</div>'
+        return item_text_html(text, paragraphs=True, link_urls=link_urls)
 
 
 def item_progress(item: the_list.ListItem, names: staff_names.StaffNames, schedule: DisplayedSchedule) -> ListProgress:
@@ -2409,6 +2419,10 @@ background:var(--ink-2);border-radius:50%}
 .list-next-step-column{width:var(--list-next-step-width,23%)}
 .list-owner-name{display:block;overflow-wrap:anywhere;hyphens:none}
 .list-table td[data-label="Next step"]>:first-child{margin-top:0}.list-table td[data-label="Next step"]>:last-child{margin-bottom:0}
+.list-command{contain:inline-size}
+.list-command .code-block{margin:0}
+.list-command pre code{display:block;white-space:pre;overflow-wrap:normal;overflow-x:auto;
+scrollbar-width:thin;scrollbar-color:var(--ink-3) transparent}
 .list-item-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px}
 .list-item-fields section{grid-column:span 2}
 .list-item-fields :is(.list-field-state,.list-field-eta){grid-column:auto}
