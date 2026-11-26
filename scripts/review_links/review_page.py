@@ -1566,9 +1566,9 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         if outcome == 'answer':
             with review_items.after_store_write(key):
                 members = staff.snapshot()
-                file_exchange = cast(Callable[[ReviewItem, staff.StaffSnapshot], None],
+                file_exchange = cast(Callable[[ReviewItem, staff.StaffSnapshot, Path], None],
                                      import_module("scripts.review_links.answer_sources").file_saved_review)
-                file_exchange(review_items.read_current(root, item, members), members)
+                file_exchange(review_items.read_current(root, item, members), members, root)
         return delivery, 'feedback sent' if outcome == 'feedback' else answer
 
     item = validate()

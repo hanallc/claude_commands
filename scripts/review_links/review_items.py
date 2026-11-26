@@ -254,6 +254,7 @@ class ChangeSource:
     handed_at: datetime | None = None
     validators: tuple[staff.StaffId, ...] = ()
     answered_by: staff.StaffId = NO_SAVED_CHANGE_ANSWERER
+    answered_at: question_path.AnswerTime = question_path.NO_ANSWER_TIME
 
 
 @dataclass(frozen=True)
@@ -629,7 +630,8 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
         row['Change'], state, ReviewTimes(filed, max(event.time for event in logs)), tuple(logs),
         ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.OPEN
         else ('question',) if state == ReviewState.VALIDATING and identity else (),
-        ChangeSource(path, row, assignment, slots, handed_at, validators, answered_by), entry.urgency, after, queue,
+        ChangeSource(path, row, assignment, slots, handed_at, validators, answered_by, answered_at),
+        entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members),
         review_events.waiting_why(slots.waiting_why), answer_time=status_time,
