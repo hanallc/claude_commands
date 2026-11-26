@@ -1055,7 +1055,7 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
         else:
             if delivery == ORPHAN_RESULT_PENDING:
                 delivery = deliver(record, command_result(record))
-                if _worker_result_pending(delivery) and delivery != PARKED_WORKER_RESULT:
+                if _worker_result_pending(delivery) and delivery not in (PARKED_WORKER_RESULT, WORKER_READINESS_PENDING):
                     return CompletionReplay.RETRY
             if (not record.get("ended_pass_result_released")
                     and delivery not in (OTHER_PASS_DELIVERY, ENDED_PASS_RESULT_QUEUED)
@@ -1490,7 +1490,11 @@ class WorkerRunReceipt:
 DEFERRED_WORKER_RESULT = "deferred: "
 ORPHAN_RESULT_PENDING = DEFERRED_WORKER_RESULT + "the supervisor ended before delivery"
 PARKED_WORKER_RESULT = DEFERRED_WORKER_RESULT + "the worker is parked"
+BUSY_WORKER_RESULT = DEFERRED_WORKER_RESULT + "worker is working"
+WORKER_INPUT_NOT_READY = "worker is not ready for input"
+WORKER_READINESS_PENDING = DEFERRED_WORKER_RESULT + WORKER_INPUT_NOT_READY
 FAILED_WORKER_SUBMISSION = "submission failed: "
+LEGACY_WORKER_READINESS_FAILURE = FAILED_WORKER_SUBMISSION + WORKER_INPUT_NOT_READY
 UNCONFIRMED_WORKER_RESULT = "unconfirmed: "
 WORKER_INPUT_CHECKPOINT = UNCONFIRMED_WORKER_RESULT + "the prompt may have sent input"
 FAILED_RESULT_PUSH = "result push failed: "
@@ -1503,7 +1507,8 @@ def _worker_result_pending(delivery: str) -> bool:
 
 
 def _result_push_failed(delivery: str) -> bool:
-    return delivery.startswith((FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION, UNCONFIRMED_WORKER_RESULT))
+    return delivery != LEGACY_WORKER_READINESS_FAILURE and delivery.startswith((
+        FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION, UNCONFIRMED_WORKER_RESULT))
 
 
 def _needs_push_retry(record: RunRecord) -> bool:
@@ -2462,8 +2467,8 @@ def _keep_send_error(path: Path) -> Generator[None]:
 
 class WorkerResultInput(Enum):
     TYPE = "submit the result to an idle worker"
-    TURN_ENDED = "wait for the pane to become idle after the turn ends"
-    AFTER_SAVED_STOP = "wait for a busy pane after the hook has recorded a Stop"
+    WAIT_FOR_READINESS = "allow a wait for input readiness on an idle pane"
+    TURN_ENDED = "allow a wait for a busy pane after a Stop"
 
 
 class WorkerResultTarget(Enum):
@@ -2546,7 +2551,6 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
 
 
 def _deliver(record: RunRecord, result: CommandResult, *,
-             worker_input: WorkerResultInput = WorkerResultInput.TYPE,
              resume_parked: Callable[[], bool] | ParkedWorkerDelivery = ParkedWorkerDelivery.DEFER,
              input_lock: HeldWorkerInputLock | AcquireWorkerInputLock = AcquireWorkerInputLock.ACQUIRE,
              ) -> str | ConfirmedPaneResult:
@@ -2575,7 +2579,8 @@ def _deliver(record: RunRecord, result: CommandResult, *,
         return _save_delivery(path, detail)
 
     def save_deferral(detail: str) -> str:
-        return _save_delivery(path, saved if saved.startswith((FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION)) else detail)
+        failed = saved.startswith((FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION))
+        return _save_delivery(path, saved if failed and saved != LEGACY_WORKER_READINESS_FAILURE else detail)
 
     with _delivery_lock(path), contextlib.ExitStack() as locks:
         with record_lock(path):
@@ -2734,11 +2739,8 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             _ = validate_transport()
             _ = _save_delivery(path, checkpoint)
 
-        wait_for_idle = (worker_input is WorkerResultInput.TURN_ENDED
-                         or worker_input is WorkerResultInput.AFTER_SAVED_STOP
-                         and saved == DEFERRED_WORKER_RESULT + "worker is working")
-        request = send.WorkerResultSubmission(wait_for_idle=wait_for_idle,
-            worker_only=self_stop, before_input=before_input, before_holder=before_holder)
+        request = send.WorkerResultSubmission(worker_only=self_stop, before_input=before_input,
+                                              before_holder=before_holder)
         reason = ""
         try:
             ownership, passed = read_pass(worker, membership)
@@ -2793,6 +2795,8 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                 return _save_delivery(path, status)
             return save_deferral(status)
         if isinstance(delivery, send.WorkerResultNotSubmitted):
+            if delivery.detail == WORKER_INPUT_NOT_READY:
+                return _save_delivery(path, WORKER_READINESS_PENDING)
             return save_deferral(FAILED_WORKER_SUBMISSION + delivery.detail)
         if isinstance(delivery, send.WorkerResultUnconfirmed):
             prefix = UNCONFIRMED_RESULT_PUSH if saved.startswith(FAILED_RESULT_PUSH) else UNCONFIRMED_WORKER_RESULT
@@ -2851,6 +2855,8 @@ def _save_delivery(path: Path, delivery: str, *, if_current: str | None = None,
         if if_current is not None and if_current != current:
             return current
         record["delivery"] = delivery
+        if delivery == WORKER_READINESS_PENDING and record["status"] == "finished":
+            record["completion_pending"] = True
         if isinstance(worker_result_receipt, WorkerResultReceipt):
             record["worker_result_receipt"] = worker_result_receipt.to_json()
         if (delivery not in (COVERED_BY_DONE, OTHER_PASS_DELIVERY)
@@ -2864,6 +2870,7 @@ class WorkerResultReplay(Enum):
     NONE = "no result needs submission"
     RETRY = "result delivery is unresolved"
     DUPLICATE = "the transcript prevented duplicate input"
+    WAIT_FOR_INPUT = "wait for the pane to accept input before retrying"
 
 
 @dataclass(frozen=True)
@@ -2900,8 +2907,7 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
             continue
         path = runs / f"{record['run_id']}.json"
         try:
-            delivery = _deliver(record, command_result(record), worker_input=worker_input,
-                                resume_parked=resume_parked, input_lock=input_lock)
+            delivery = _deliver(record, command_result(record), resume_parked=resume_parked, input_lock=input_lock)
         except (Exception, SystemExit, KeyboardInterrupt) as error:
             detail = " ".join(str(error).splitlines()) or type(error).__name__
             _alert_late_delivery_failure(path, detail)
@@ -2912,6 +2918,9 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
             return delivery
         if _result_push_failed(delivery):
             _alert_late_delivery_failure(path)
+        if (delivery == BUSY_WORKER_RESULT and worker_input is WorkerResultInput.TURN_ENDED
+                or delivery == WORKER_READINESS_PENDING and worker_input is not WorkerResultInput.TYPE):
+            return WorkerResultReplay.WAIT_FOR_INPUT
         if _worker_result_pending(delivery):
             return WorkerResultReplay.RETRY
         if delivery.startswith("already delivered: ") and not isinstance(resume_parked, ParkedWorkerDelivery):

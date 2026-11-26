@@ -7446,6 +7446,45 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIs(worker_lifecycle.read_json_object(path).get("completion_pending"), False)
         self.assertEqual(self.notices, [])
 
+    def test_a_done_pane_keeps_a_result_pending_until_it_accepts_input(self) -> None:
+        row = self.fixture.worker(family="claude")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane)
+        self.fixture.world.locations[pane]["agent_status"] = "working"
+        record = self.record(row)
+        path = Path(record["log"]).with_suffix(".json")
+        self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(worker_lifecycle.read_json_object(path).get("delivery"), "deferred: worker is working")
+
+        self.fixture.world.locations[pane]["agent_status"] = "done"
+        ready = False
+
+        def readiness(target: str) -> herdr.WorkerReadiness:
+            self.assertEqual(target, pane)
+            return {"agent_status": herdr.AgentStatus.DONE, "interactive_ready": ready}
+
+        event = turn_end.WorkerEvent(str(row.current_session))
+        with (patch.object(self.fixture.world, "readiness", side_effect=readiness),
+              patch.object(self.fixture.world, "wait_for_prompt_input", return_value=herdr.PromptInputTimedOut())):
+            self.assertIs(turn_end.handle(event), turn_end.TurnOutcome.RETRY_EVIDENCE)
+            attempts = conf.read("detached_runs").whole("result_push_retries")
+            for _ in range(attempts + 1):
+                self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+                saved = worker_lifecycle.read_json_object(path)
+                self.assertEqual(saved.get("delivery"), "deferred: worker is not ready for input")
+                self.assertIs(saved.get("completion_pending"), True)
+                self.assertEqual(self.inputs, [])
+                self.assertEqual(self.notices, [])
+
+            ready = True
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+            self.assertEqual(detached_runs.reap_orphans(str(self.run_dir)), [])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved.get("delivery"), f"sent: worker {row.name} at {pane}")
+        self.assertIs(saved.get("completion_pending"), False)
+        self.assertEqual(len(self.inputs), 1)
+        self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
+
     def test_interrupted_result_record_waits_for_a_receipt_without_retyping(self) -> None:
         row = self.fixture.worker(family="claude")
         self.fixture.world.add(row, "w1:p1")
