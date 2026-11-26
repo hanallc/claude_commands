@@ -1384,7 +1384,7 @@ window.fetch = async (url, options) => {
         await new Promise(resolve => { release = resolve; });
         return new Response(JSON.stringify({reason:'The producer is offline.'}), {status:503});
       }
-      return new Response(JSON.stringify({notice:'This picture was removed; your words went to shot-owner.'}));
+      return new Response(JSON.stringify({state:'done', notice:'This picture was removed; your words went to shot-owner.'}));
     }
     return new Response(FRESH);
   }
@@ -1508,7 +1508,7 @@ sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringi
  const retries = () => [...document.querySelectorAll('button[value=retry]')];
  const retry = () => retries().find(button => button.closest('article').textContent.includes('Keep the title.'));
  const status = form => form.querySelector('[data-image-status]').textContent;
- const say = (ok, reason) => new Response(JSON.stringify(ok ? {draft_confirmed: true} : {reason}),
+ const say = (ok, reason) => new Response(JSON.stringify(ok ? {state: 'done', draft_confirmed: true} : {reason}),
                                             {status: ok ? 200 : 503});
  const submit = button => button.form.dispatchEvent(new SubmitEvent('submit', {
    bubbles:true, cancelable:true, submitter:button
@@ -1873,6 +1873,84 @@ class ImageQuestionTests(ImagesFixture):
         self.submit(urlencode({**current, "answer_request": "b" * 32}))
         self.assertEqual(len(self.sent), 1)
 
+    def test_accepted_request_id_is_stale_after_its_round_ends(self) -> None:
+        record = self.register()
+        identity = record["id"]
+        self.ask(record)
+        self.sent.clear()
+        token = images.request_token(images.console_token(self.root), identity)
+        post = {"image": identity, "token": token, "action": "approved", "answer_request": "a" * 32}
+        original = {**post, "feedback_round": images.feedback_round(set())}
+        self.submit(urlencode(original))
+        images.answer_question(self.root, identity, "Q1", "The gate passed.")
+        for repeat in (post, original, {**post, "feedback_round": images.feedback_round({"Q1"})}):
+            with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
+                self.submit(urlencode(repeat))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(list(images.decision_root(self.root).glob(f"{identity}-*.json"))), 1)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_browser_replays_the_same_request_after_an_unknown_result(self) -> None:
+        keeper, _, item = self.list_item()
+        probe = r'''
+async (find, whenPageShows) => {
+ const posts = [], issues = [];
+ const realFetch = window.fetch.bind(window), now = Date.now.bind(Date);
+ const check = (ok, message) => { if (!ok) issues.push(message); };
+ window.fetch = (url, options) => {
+  if (url === location.pathname && options?.method === 'POST') {
+   posts.push(String(options.body));
+   if (posts.length > 1) return Promise.resolve(Response.json({state: 'done'}));
+   if (!EXPIRED) return Promise.resolve(new Response('{"state":'));
+   return Promise.resolve(Response.json({hold: 'a'.repeat(24), seconds: 0},
+     {status: 202, headers: {'X-Send-Hold': 'held'}}));
+  }
+  if (url === '/send-hold/' + 'a'.repeat(24)) {
+   Date.now = () => now() + 601000;
+   return Promise.resolve(Response.json({reason: 'This send was undone or its result expired.'}, {status: 404}));
+  }
+  if (url === location.pathname) return Promise.resolve(new Response(FRESH_PAGE));
+  return realFetch(url, options);
+ };
+ const form = () => find('Result fixture').querySelector('form');
+ const submit = current => current.requestSubmit(current.querySelector('button[value=feedback]'));
+ const words = 'Keep the red row.';
+ const saved = () => JSON.parse(sessionStorage.getItem('images.answer-drafts:' + location.pathname) ?? '[]');
+ const first = form();
+ first.elements.feedback.value = words;
+ submit(first);
+ await whenPageShows('the refreshed list', () => !first.isConnected);
+ const request = new URLSearchParams(posts[0]).get('answer_request');
+ check(saved().some(([, draft]) => request && draft.requestId === request), 'Storage keeps the request ID.');
+ const retry = form();
+ check(retry.elements.feedback.value === words, 'The form keeps the words.');
+ if (retry.elements.feedback.value === words) {
+  submit(retry);
+  await whenPageShows('the confirmed refresh', () => !retry.isConnected);
+ }
+ check(posts.length === 2 && posts[0] === posts[1], 'Retry replays the same request.');
+ check(saved().length === 0, 'The final result clears the request ID.');
+ window.fetch = (url, options) => realFetch(url, url === '/results'
+   ? {...options, body: JSON.stringify([JSON.stringify(posts), ...issues])} : options);
+}'''
+        for expired in (True, False):
+            with self.subTest(expired=expired):
+                self.sent.clear()
+                record = images.register(self.shot, "Result fixture", self.owner_id(), "Phase check", list_item=item.id)
+                page = images.render(self.status)
+                fresh = json.dumps(page.decode()).replace("<", r"\u003c")
+                source = self.question_probe(probe.replace("EXPIRED", json.dumps(expired)).replace("FRESH_PAGE", fresh))
+                outcome, = firefox_probe_results(page.replace(b"</body>", f"<script>{source}</script></body>".encode()))
+                captured, *failures = outcome
+                self.assertEqual(failures, [])
+                for body in cast(list[str], json.loads(captured)):
+                    self.submit(body)
+                self.assertEqual(len(self.sent), 2)
+                entries = [entry for entry in the_list.load(keeper.id, item.id).log
+                           if isinstance(entry, the_list.ImageAnswerChange) and record["id"] in entry.what]
+                self.assertEqual(len(entries), 1)
+                images.delete(self.root, record["id"])
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
     def test_browser_keeps_a_stale_draft_for_the_current_round(self) -> None:
         record = self.register("Stale fixture")
@@ -1901,7 +1979,7 @@ async (find, whenPageShows, check) => {
   if (url !== location.pathname) return realFetch(url, options);
   if (options?.method === 'POST') {
    posts.push(new URLSearchParams(options.body));
-   return Promise.resolve(posts.length === 1 ? new Response(ERROR_BODY, {status: 400}) : new Response('{}'));
+   return Promise.resolve(posts.length === 1 ? new Response(ERROR_BODY, {status: 400}) : Response.json({state: 'done'}));
   }
   return Promise.resolve(new Response(posts.length === 1 ? FRESH_PAGE : ANSWERED_PAGE));
  };

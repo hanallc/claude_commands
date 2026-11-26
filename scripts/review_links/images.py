@@ -663,7 +663,10 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         key = retry_key
     elif form_retry is not None:
         # An accepted attempt takes priority over old refusal records.
-        if not draft.matches_answer(attempts[form_retry]):
+        accepted = attempts[form_retry]
+        signed = accepted.get("signed_answer")
+        if (not draft.matches_answer(accepted)
+                or signed is not None and current_round is not None and signed["round_id"] != current_round):
             raise question_record.AnswerRefused(STALE_ANSWER)
         key = form_retry
     else:
@@ -1094,7 +1097,8 @@ async function submit(event) {
     showActionFailure(status, state.draftError);
     return;
   }
-  const {retryAction, retryRound, requestId} = draft ?? {};
+  const {retryAction, retryRound, requestId, retryDirect} = draft ?? {};
+  const replay = !key && !question && retryAction === action && requestId && retryDirect;
   const body = new URLSearchParams(new FormData(form, event.submitter));
   if (key) {
     if (draft?.retryAction) {
@@ -1110,6 +1114,7 @@ async function submit(event) {
       if (sameDraft && draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
       if (!sameDraft || !draft.requestId) {
         draft.requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+        delete draft.retryDirect;
       }
       body.set('answer_request', draft.requestId);
       draft.retryAction = action;
@@ -1127,16 +1132,20 @@ async function submit(event) {
   saveDrafts();
   const card = form.closest('article');
   const hold = holdCard(card, hidden => { if (hidden) apply(); });
-  let postFailed = false, retryable = true, staleAnswer = false;
+  let postFailed = false, refused = false, staleAnswer = false;
   try {
-    const response = await hold.post(location.pathname, {method: 'POST', body}, card.dataset.sendReceiver);
+    const post = {method: 'POST', body};
+    // Replay the saved Images request when the hold result is unavailable.
+    const response = await (replay ? fetch(location.pathname, post)
+      : hold.post(location.pathname, post, card.dataset.sendReceiver));
     if (!response.ok) {
-      retryable = response.status >= 500;
-      const reason = await response.json().then(body => body.reason, () => '');
+      const reason = await response.json().then(body => body?.reason, () => '');
+      refused = [400, 403, 409].includes(response.status) && typeof reason === 'string' && reason.length > 0;
       staleAnswer = response.status === 400 && reason === staleAnswerReason;
       throw new Error(reason || 'HTTP ' + response.status);
     }
-    const result = question ? {} : await response.json().catch(() => ({}));
+    const result = question ? {} : await response.json().catch(() => null);
+    if (!question && result?.state !== 'done') throw new Error('The send result is unavailable. Try again.');
     if (edit && edit.elements.feedback.value !== (state.draft?.words ?? '')) {
       readEdit(edit, state);
       saveDrafts();
@@ -1176,10 +1185,15 @@ async function submit(event) {
     } else if (request.key) state.attempts.set(request.key, message);
     else {
       state.draftError = message;
-      if ((!retryable || undone) && !question && state.revision === request.revision) {
-        state.draft.retryAction = undone ? retryAction : undefined;
-        state.draft.retryRound = undone ? retryRound : undefined;
-        state.draft.requestId = undone ? requestId : undefined;
+      if (!question && state.revision === request.revision) {
+        if (refused || undone) {
+          state.draft.retryAction = undone ? retryAction : undefined;
+          state.draft.retryRound = undone ? retryRound : undefined;
+          state.draft.requestId = undone ? requestId : undefined;
+          state.draft.retryDirect = undone ? retryDirect : undefined;
+        } else {
+          state.draft.retryDirect = true;
+        }
         saveDrafts();
       }
     }
