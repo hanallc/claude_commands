@@ -3193,6 +3193,36 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(result, stop_resume.ResumeFailed(row.current_session, "pane list denied"))
         self.start.assert_not_called()
 
+    def test_stopped_unit_resumes_when_an_unreadable_record_belongs_to_another_session(self) -> None:
+        parent = fixture_member("showrunner", name="unit-owner")
+        row = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=self.entry["session_id"],
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root))
+        place = herdr.HerdrPlace("agents", self.entry["pane_id"])
+        shell = herdr.HerdrProcess(998042, place, {"CLAUDE_CODE_SESSION_ID": row.current_session},
+                                   "zsh", str(self.root))
+        directory = sessions.sessions_dir()
+        other = directory / "4242.json"
+        contents = json.dumps({"pid": 4242, "sessionId": fixture_runtime_id("other-session"), "procStart": "generation-1"})
+        _ = other.write_text(contents)
+
+        def start(*_command: str) -> str:
+            _ = (directory / "456.json").write_text(json.dumps({
+                "pid": 456, "sessionId": row.current_session, "procStart": "generation-1",
+                "name": row.name, "messagingSocketPath": "", "updatedAt": 2,
+            }))
+            return ""
+
+        self.start.side_effect = start
+        with (patch.object(sessions, "session_liveness", session_records.session_liveness),
+              patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              patch.object(herdr, "herdr_processes", return_value=[shell])):
+            result = stop_resume.resume(str(row.id), to="claude4")
+        self.assertIsInstance(result, stop_resume.ClaudeUp, result)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual((result.pane_id, result.session_id, result.account), (place.pane, row.current_session, "claude4"))
+        self.assertEqual(other.read_text(), contents)
+        self.start.assert_called_once()
+
     def test_stopped_unit_resumes_in_its_pane_with_a_detached_holder(self) -> None:
         from scripts.production.fake_unit_host import process
 
@@ -5088,6 +5118,34 @@ class StopResumeTests(unittest.TestCase):
                 _ = path.write_text(contents)
                 result = stop_resume.resume("alpha", why="maintenance")
                 self.assertEqual(result, stop_resume.ResumeFailed(identity, f"session registry unreadable: {path}"))
+        self.start.assert_not_called()
+
+    def test_resume_keeps_the_first_registry_error_when_the_retry_reaches_the_deadline(self) -> None:
+        identity = self.entry["session_id"]
+        first_file = sessions.sessions_dir() / "4242.json"
+        reason = f"session registry unreadable: {first_file}"
+        _ = first_file.write_text("{")
+        first = sessions.SessionLivenessUnknown(reason, (first_file,))
+        policy = sessions.SessionRetryPolicy(4, 0.125)
+        for limit, extra_delay, reads in ((0.125, 0.0, 0), (0.25, 0.125, 0), (0.25, 0.0, 1)):
+            self.clock.elapsed = 0
+
+            def sleep(delay: float) -> None:
+                self.advance(delay + extra_delay)
+
+            with (self.subTest(limit=limit, extra_delay=extra_delay),
+                  patch.object(time, "monotonic", lambda: self.clock.elapsed),
+                  patch.object(time, "sleep", side_effect=sleep),
+                  operation_deadline.within(limit),
+                  patch.object(sessions, "session_liveness", return_value=first) as observe,
+                  patch.object(sessions, "retry_policy", return_value=policy),
+                  patch.object(session_records, "retry_policy", return_value=policy),
+                  patch.object(sessions, "read_registry", wraps=sessions.read_registry) as read):
+                result = stop_resume.resume("alpha")
+            self.assertEqual(result, stop_resume.ResumeFailed(identity, reason))
+            observe.assert_called_once_with(identity)
+            self.assertEqual(read.call_count, reads)
+            self.assertLessEqual(self.clock.elapsed, limit)
         self.start.assert_not_called()
 
     def test_resume_reports_identity_failure_once_at_the_deadline(self) -> None:
