@@ -128,8 +128,18 @@ def registry_unreadable_reason(paths: tuple[Path, ...]) -> str:
     return "session registry unreadable: " + ", ".join(map(str, paths))
 
 
-def _check_registry_deadline(deadline: float, delay: float = 0) -> None:
+class _RegistryRetryExpired(TimeoutError):
+    """The deadline prevents a retry of an unreadable record."""
+
+    def __init__(self, path: Path) -> None:
+        self.path: Path = path
+        super().__init__("session registry read deadline passed")
+
+
+def _check_registry_deadline(deadline: float, delay: float = 0, *, unreadable: Path | None = None) -> None:
     if deadline != math.inf and time.monotonic() + delay >= deadline:
+        if unreadable is not None:
+            raise _RegistryRetryExpired(unreadable)
         raise TimeoutError("session registry read deadline passed")
 
 
@@ -223,7 +233,7 @@ def _read_observation(path: Path, policy: SessionRetryPolicy, *,
                       ) -> RegistryObservation | UnreadableSessionRecord | RegistryRecordGone | None:
     """Reread a concurrent write; only a live unreadable record remains uncertain."""
     for attempt in range(policy.registry_reads):
-        _check_registry_deadline(deadline)
+        _check_registry_deadline(deadline, unreadable=path if attempt else None)
         try:
             if dependencies is not None:
                 dependencies(path)
@@ -238,7 +248,7 @@ def _read_observation(path: Path, policy: SessionRetryPolicy, *,
         except (OSError, ValueError, TypeError):
             pass
         if attempt + 1 < policy.registry_reads:
-            _check_registry_deadline(deadline, policy.registry_delay_seconds)
+            _check_registry_deadline(deadline, policy.registry_delay_seconds, unreadable=path)
             time.sleep(policy.registry_delay_seconds)
     if path.stem.isdigit():
         try:
@@ -379,13 +389,19 @@ def _session_observations(session_id: str, registry: RegistryRead) -> Iterator[L
         yield SessionLivenessUnknown(registry_unreadable_reason(registry.unreadable), registry.unreadable)
 
 
-def session_liveness(session_id: str, registry: RegistryRead | None = None,
+def session_liveness(session_id: str, registry: RegistryRead | None = None, *, deadline: float = math.inf,
                      ) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
-    """Find a running session and its pid, preserving unknown registry or process identity.
-    A caller that checks many sessions reads the registry once and passes it."""
+    """Find a running session and its PID within the registry read deadline.
+
+    Report unknown liveness if the registry or process identity is unreadable.
+    Pass one registry read to check multiple sessions."""
     reading = _liveness_registry.get() if registry is None else registry
     if isinstance(reading, ReadCurrentRegistry):
-        reading = read_registry()
+        try:
+            reading = read_registry() if deadline == math.inf else read_registry(deadline=deadline)
+        except _RegistryRetryExpired as error:
+            paths = (error.path,)
+            return SessionLivenessUnknown(registry_unreadable_reason(paths), paths)
     return next(_session_observations(session_id, reading), SessionNotLive())
 
 

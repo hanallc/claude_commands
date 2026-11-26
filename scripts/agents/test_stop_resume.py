@@ -2866,10 +2866,10 @@ class StopResumeTests(unittest.TestCase):
     def advance(self, seconds: float) -> None:
         self.clock.elapsed += seconds
 
-    def observe(self, session: str, registry: sessions.RegistryRead | None = None
+    def observe(self, session: str, registry: sessions.RegistryRead | None = None, *, deadline: float = math.inf
                 ) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
         if registry is not None:
-            return session_records.session_liveness(session, registry=registry)
+            return session_records.session_liveness(session, registry=registry, deadline=deadline)
         return sessions.LiveSessionProcess(456) if session in self.launched else cast(
             sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown, self.live(session))
 
@@ -3213,7 +3213,8 @@ class StopResumeTests(unittest.TestCase):
             return ""
 
         self.start.side_effect = start
-        with (patch.object(sessions, "session_liveness", session_records.session_liveness),
+        with (patch.object(time, "monotonic", lambda: self.clock.elapsed),
+              patch.object(sessions, "session_liveness", session_records.session_liveness),
               patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
               patch.object(herdr, "herdr_processes", return_value=[shell])):
             result = stop_resume.resume(str(row.id), to="claude4")
@@ -5102,7 +5103,8 @@ class StopResumeTests(unittest.TestCase):
             return ""
 
         self.start.side_effect = start
-        with (patch.object(Path, "read_text", read),
+        with (patch.object(time, "monotonic", lambda: self.clock.elapsed),
+              patch.object(Path, "read_text", read),
               patch.object(sessions, "session_liveness", session_records.session_liveness)):
             result = stop_resume.resume("alpha", why="maintenance")
         self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", "claude3"))
@@ -5147,6 +5149,50 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(read.call_count, reads)
             self.assertLessEqual(self.clock.elapsed, limit)
         self.start.assert_not_called()
+
+    def test_resume_keeps_the_first_registry_error_when_startup_cannot_fit_a_retry(self) -> None:
+        identity = self.entry["session_id"]
+        unreadable = sessions.sessions_dir() / "4242.json"
+        reason = f"session registry unreadable: {unreadable}"
+        _ = write_config_fixture(self.root / "configuration/shutdown.conf", "start_seconds=0.625\nstop_grace_seconds=2\n")
+        read_text = Path.read_text
+        for poll_first, registry_reads in ((False, 1), (False, 4), (True, 1), (True, 4)):
+            self.clock.elapsed = 0
+            self.launched.clear()
+            unreadable.unlink(missing_ok=True)
+            reads = 0
+
+            def start(*_command: str) -> str:
+                if not poll_first:
+                    _ = unreadable.write_text("{")
+                return ""
+
+            def sleep(delay: float) -> None:
+                if poll_first and self.clock.elapsed == 0 and delay == 0.5:
+                    _ = unreadable.write_text("{")
+                self.advance(delay)
+
+            def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                nonlocal reads
+                if path == unreadable:
+                    reads += 1
+                return read_text(path, encoding=encoding, errors=errors)
+
+            self.start.side_effect = start
+            policy = sessions.SessionRetryPolicy(registry_reads, 0.75)
+            with (self.subTest(poll_first=poll_first, registry_reads=registry_reads),
+                  patch.object(time, "monotonic", lambda: self.clock.elapsed),
+                  patch.object(time, "sleep", side_effect=sleep),
+                  patch.object(Path, "read_text", read),
+                  patch.object(sessions, "session_liveness", session_records.session_liveness),
+                  patch.object(sessions, "retry_policy", return_value=policy),
+                  patch.object(session_records, "retry_policy", return_value=policy),
+                  patch.object(sessions, "read_registry", wraps=sessions.read_registry) as retry):
+                result = stop_resume.resume("alpha")
+                self.assertEqual(result, stop_resume.ResumeFailed(identity, reason))
+                self.assertEqual(reads, 1)
+                self.assertEqual(self.clock.elapsed, 0.5 if poll_first else 0)
+                retry.assert_not_called()
 
     def test_resume_reports_identity_failure_once_at_the_deadline(self) -> None:
         errors = io.StringIO()
