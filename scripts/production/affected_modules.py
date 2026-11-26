@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from functools import cache
 from importlib.metadata import packages_distributions
 from io import BytesIO
+from itertools import chain
 from pathlib import Path, PurePosixPath
 import json
 import os
@@ -586,6 +587,24 @@ type ResolvedDirectory = RepositoryDirectory | UnrootedPath | OutsideRepository
 type ScanBindings = frozenset[tuple[str, ResolvedDirectory]]
 
 
+def unresolved_scan_paths(facts: dict[str, SourceFacts]) -> bool:
+    """Check whether pruning could suppress an error from path resolution."""
+    checked: set[ScanPath] = set()
+    for source in facts.values():
+        for scope in source.scan_scopes:
+            paths = chain((path for _, path in scope.bindings), (scan.directory for scan in scope.scans),
+                          (path for call in scope.calls for path in call.arguments),
+                          (path for call in scope.calls for _, path in call.keywords))
+            for value in paths:
+                if isinstance(value, ScanPath) and isinstance(value.root, AbsolutePathRoot) and value not in checked:
+                    try:
+                        _ = Path(value.root.path).joinpath(*value.parts).resolve()
+                    except (OSError, ValueError):
+                        return True
+                    checked.add(value)
+    return False
+
+
 def scan_components(predecessors: dict[ScanScopeKey, set[ScanScopeKey]],
                     successors: dict[ScanScopeKey, set[ScanScopeKey]],
                     roots: set[ScanScopeKey]) -> dict[ScanScopeKey, frozenset[ScanScopeKey]]:
@@ -652,29 +671,6 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
     def symbols(source: str, target: str) -> tuple[ScanScopeKey, ...]:
         return tuple(find_symbols(source, target))
 
-    all_scopes = {(path, scope.name): scope for path, names in scopes.items() for scope in names.values()}
-    predecessors: dict[ScanScopeKey, set[ScanScopeKey]] = {key: set() for key in all_scopes}
-    successors: dict[ScanScopeKey, set[ScanScopeKey]] = {key: set() for key in all_scopes}
-    calls: dict[ScanScopeKey, list[tuple[ScanCall, bool, tuple[ScanScopeKey, ...]]]] = {}
-    for key, scope in all_scopes.items():
-        source = key[0]
-        resolved: list[tuple[ScanCall, bool, tuple[ScanScopeKey, ...]]] = []
-        for call in scope.calls:
-            local = call.target in scopes[source]
-            targets = (((source, call.target),) if local else
-                       tuple(target for target in symbols(source, call.target) if target in all_scopes))
-            if targets:
-                resolved.append((call, local, targets))
-                successors[key].update(targets)
-                for target in targets:
-                    predecessors[target].add(key)
-        if resolved:
-            calls[key] = resolved
-    components = scan_components(predecessors, successors, {key for key, scope in all_scopes.items() if scope.scans})
-    calls = {key: [(call, local, reachable) for call, local, targets in invocations
-                   if (reachable := tuple(target for target in targets if target in components))]
-             for key, invocations in calls.items() if key in components}
-
     def directory(source: str, value: ScanPath | UnrootedPath | OutsideRepository,
                   parameters: dict[str, ResolvedDirectory], seen: frozenset[ScanScopeKey]) -> ResolvedDirectory:
         if isinstance(value, (UnrootedPath, OutsideRepository)):
@@ -711,6 +707,69 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
             return OutsideRepository()
         return origin
 
+    def direct_scans(source: str, scope: ScanScope, parameters: dict[str, ResolvedDirectory]) -> Iterator[RepositoryScan]:
+        for scan in scope.scans:
+            root = directory(source, scan.directory, parameters, frozenset())
+            if isinstance(root, UnrootedPath):
+                yield RepositoryScan(".", scan.pattern, True)
+            elif isinstance(root, RepositoryDirectory):
+                yield RepositoryScan(root.path, scan.pattern, scan.recursive)
+
+    def scan_arguments(source: str, call: ScanCall, parameters: dict[str, ResolvedDirectory]
+                       ) -> tuple[list[ResolvedDirectory], dict[str, ResolvedDirectory]]:
+        arguments = [directory(source, value, parameters, frozenset()) for value in call.arguments]
+        keywords = {name: directory(source, value, parameters, frozenset()) for name, value in call.keywords}
+        return arguments, keywords
+
+    if (unresolved_scan_paths(facts)
+            or any(len(source.scan_scopes) != len(scopes[path]) for path, source in facts.items())):
+        def all_called_scans(source: str, scope: ScanScope, parameters: dict[str, ResolvedDirectory],
+                             follow_imports: bool, seen: frozenset[ScanScopeKey]) -> Iterator[RepositoryScan]:
+            key = source, scope.name
+            if key in seen:
+                return
+            visited = seen | {key}
+            yield from direct_scans(source, scope, parameters)
+            for call in scope.calls:
+                arguments, keywords = scan_arguments(source, call, parameters)
+                local = call.target in scopes[source]
+                targets: tuple[ScanScopeKey, ...] = ((source, call.target),) if local else ()
+                if not local and follow_imports and any(isinstance(value, RepositoryDirectory)
+                                                        for value in (*arguments, *keywords.values())):
+                    targets = symbols(source, call.target)
+                for path, name in targets:
+                    callee = scopes[path].get(name)
+                    if callee is not None:
+                        bound = {**dict(zip(callee.parameters, arguments)), **keywords}
+                        yield from all_called_scans(path, callee, bound, follow_imports and local, visited)
+
+        return {path: frozenset(scan for scope in source.scan_scopes
+                                for scan in all_called_scans(path, scope, {}, True, frozenset()))
+                for path, source in facts.items()}
+
+    all_scopes = {(path, scope.name): scope for path, names in scopes.items() for scope in names.values()}
+    predecessors: dict[ScanScopeKey, set[ScanScopeKey]] = {key: set() for key in all_scopes}
+    successors: dict[ScanScopeKey, set[ScanScopeKey]] = {key: set() for key in all_scopes}
+    calls: dict[ScanScopeKey, list[tuple[ScanCall, bool, tuple[ScanScopeKey, ...]]]] = {}
+    for key, scope in all_scopes.items():
+        source = key[0]
+        resolved: list[tuple[ScanCall, bool, tuple[ScanScopeKey, ...]]] = []
+        for call in scope.calls:
+            local = call.target in scopes[source]
+            targets = (((source, call.target),) if local else
+                       tuple(target for target in symbols(source, call.target) if target in all_scopes))
+            if targets:
+                resolved.append((call, local, targets))
+                successors[key].update(targets)
+                for target in targets:
+                    predecessors[target].add(key)
+        if resolved:
+            calls[key] = resolved
+    components = scan_components(predecessors, successors, {key for key, scope in all_scopes.items() if scope.scans})
+    calls = {key: [(call, local, reachable) for call, local, targets in invocations
+                   if (reachable := tuple(target for target in targets if target in components))]
+             for key, invocations in calls.items() if key in components}
+
     @cache
     def called_scans(key: ScanScopeKey, bindings: ScanBindings,
                      follow_imports: bool, seen: frozenset[ScanScopeKey]) -> frozenset[RepositoryScan]:
@@ -718,18 +777,11 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
         scope = all_scopes[key]
         parameters = dict(bindings)
         seen = seen | {key}
-        result: set[RepositoryScan] = set()
-        for scan in scope.scans:
-            root = directory(source, scan.directory, parameters, frozenset())
-            if isinstance(root, UnrootedPath):
-                result.add(RepositoryScan(".", scan.pattern, True))
-            elif isinstance(root, RepositoryDirectory):
-                result.add(RepositoryScan(root.path, scan.pattern, scan.recursive))
+        result = set(direct_scans(source, scope, parameters))
         for call, local, targets in calls.get(key, ()):
             if not local and not follow_imports:
                 continue
-            arguments = [directory(source, value, parameters, frozenset()) for value in call.arguments]
-            keywords = {name: directory(source, value, parameters, frozenset()) for name, value in call.keywords}
+            arguments, keywords = scan_arguments(source, call, parameters)
             if not local and not any(isinstance(value, RepositoryDirectory) for value in (*arguments, *keywords.values())):
                 continue
             for target in targets:
@@ -778,7 +830,7 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
         if worktree:
             tokens[path] = facts.tokens
             config_reads[path] = facts.config_reads
-            scan_facts[path] = facts
+        scan_facts[path] = facts
         dependencies: set[str] = set()
         for level, module, names in facts.imports:
             if level:
@@ -794,7 +846,7 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
 
         dependencies.discard(path)
         graph[path] = dependencies
-    scans = repository_scan_graph(repo, scan_facts, bare_modules) if worktree else {}
+    scans = repository_scan_graph(repo, scan_facts, bare_modules) if worktree or unresolved_scan_paths(scan_facts) else {}
     return SourceGraph(graph, tokens, config_reads, scans)
 
 

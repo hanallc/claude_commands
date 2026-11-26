@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import os
@@ -1056,11 +1057,58 @@ FILES = collect(Path(__file__).parent)
         self.add_test("checks/test_reader.py", "import scripts.component.deleted\n")
         self.certify()
         (self.repo / "scripts/component/deleted.py").unlink()
-        self.write("scripts/checks/test_reader.py", "VALUE = 1\n")
         _ = self.commit()
         with mock.patch.object(affected, "repository_scan_graph", wraps=affected.repository_scan_graph) as scans:
             self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_reader.py",))
         scans.assert_called_once()
+
+        graph_for_files = affected.graph_for_files
+
+        def without_base_imports(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
+                                 cached: dict[str, affected.SourceFacts], *, worktree: bool) -> affected.SourceGraph:
+            graph = graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree)
+            return graph if worktree else replace(graph, imports={})
+
+        with mock.patch.object(affected, "graph_for_files", side_effect=without_base_imports):
+            self.assertEqual(self.selection().modules, ())
+
+    def test_unresolved_absolute_scan_paths_require_the_full_suite(self) -> None:
+        source = "scripts/component/subject.py"
+        invalid_path = str(self.repo / "bad") + "\0"
+        for historical in (False, True):
+            with self.subTest(historical=historical):
+                self.write(source, "from pathlib import Path\n"
+                           + (f"FILES = Path({invalid_path!r}).glob('*.txt')\n" if historical
+                              else f"ignored(Path({invalid_path!r}))\n"))
+                if historical:
+                    self.certify()
+                    (self.repo / source).unlink()
+                _ = self.commit()
+                result = affected.select_affected(self.repo, self.base, self.modules, set())
+                self.assertIsInstance(result, affected.FullSuite)
+                assert isinstance(result, affected.FullSuite)
+                self.assertIn("embedded null", result.reason)
+
+    def test_cached_duplicate_scope_names_keep_every_scan_root(self) -> None:
+        self.write("assets/subject.md", "before\n")
+        self.add_test("checks/test_reader.py", "from pathlib import Path\n"
+                      + "ROOT = Path(__file__).resolve().parents[2]\n"
+                      + "FILES = list((ROOT / 'assets').glob('*.md'))\n")
+        self.certify()
+        self.write("assets/subject.md", "after\n")
+        _ = self.commit()
+        expected = self.selection()
+        self.assertEqual(expected.modules, (self.repo / "scripts/checks/test_reader.py",))
+        _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
+        cache_path = self.cache_dir() / "affected-module-facts.json"
+        cache = affected.read_fact_cache(cache_path)
+        blob = self.git("rev-parse", "HEAD:scripts/checks/test_reader.py")
+        facts = cache[blob]
+        cache[blob] = replace(facts, scan_scopes=(*facts.scan_scopes, affected.ScanScope("", (), (), (), ())))
+        affected.write_fact_cache(cache_path, cache)
+        with mock.patch.object(ast, "parse", side_effect=AssertionError("warm cache parsed source")):
+            result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        self.assertEqual(result, expected)
 
     def test_invalid_historical_test_still_requires_a_full_suite(self) -> None:
         self.add_test("checks/test_deleted.py", "broken (\n")
