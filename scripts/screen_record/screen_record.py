@@ -2,6 +2,10 @@
 """Record a short MP4 of one X11 window selected by title."""
 
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
 import argparse
 from datetime import datetime, timezone
@@ -14,10 +18,11 @@ import sys
 import time
 from typing import NamedTuple
 
+from scripts.lib import conf
+from scripts.lib.sizes import GIB
+
 
 MAX_SECONDS = 60
-MAX_BYTES = 500_000_000
-DIRECTORY_LIMIT = 2_147_483_648
 MAX_AGE_SECONDS = 604_800
 WINDOW_IDS: re.Pattern[str] = re.compile(r"0x[0-9a-fA-F]+")
 WINDOW_NAME = re.compile(r'WM_NAME\((?:STRING|UTF8_STRING)\)\s*=\s*"((?:\\.|[^"\\])*)"')
@@ -57,8 +62,8 @@ def error(message: str, code: int) -> int:
     return code
 
 
-def prune(directory: Path) -> None:
-    """Remove expired clips, then oldest clips until stored bytes fall below 2 GiB."""
+def prune(directory: Path, max_directory_bytes: int) -> None:
+    """Remove expired clips, then oldest clips until stored bytes fall below the limit."""
     now = time.time()
     candidates: list[tuple[Path, float, int]] = []
     for path in directory.glob("*.mp4"):
@@ -95,18 +100,20 @@ def prune(directory: Path) -> None:
     remaining.sort(key=lambda clip: (clip[1], clip[0].name))
     total = sum(size for _, _, size in remaining)
     for path, _, size in remaining:
-        if total < DIRECTORY_LIMIT:
+        if total < max_directory_bytes:
             break
         if remove(path, size):
             size_count += 1
             total -= size
 
     if expired_count or size_count:
+        cap = (f"{max_directory_bytes // GIB} GiB" if max_directory_bytes % GIB == 0
+               else f"{max_directory_bytes:,} bytes")
         print(
             f"screen_record: pruned {expired_count + size_count} clips "
             + f"({round(deleted_bytes / 1_000_000)} MB): "
             + f"{expired_count} older than 7 days, "
-            + f"{size_count} to bring the directory under 2 GiB",
+            + f"{size_count} to bring the directory under {cap}",
             file=sys.stderr,
         )
 
@@ -220,7 +227,7 @@ def clip_path(directory: Path, label: str) -> Path:
         return path
 
 
-def record(window_id: str, title: str, seconds: int, display: str, path: Path) -> int:
+def record(window_id: str, title: str, seconds: int, display: str, path: Path, *, max_bytes: int) -> int:
     duration = seconds + 15
     # libx264 needs even dimensions for yuv420p, so the crop drops an odd last row or column.
     # zerolatency stops x264 from queueing frames for lookahead and frame threads (dozens on
@@ -231,7 +238,7 @@ def record(window_id: str, title: str, seconds: int, display: str, path: Path) -
         "timeout", "--kill-after=5", str(duration),
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-f", "x11grab", "-framerate", "60", "-draw_mouse", "0", "-window_id", str(int(window_id, 16)),
-        "-i", display, "-t", str(seconds), "-fs", str(MAX_BYTES),
+        "-i", display, "-t", str(seconds), "-fs", str(max_bytes),
         "-vf", "crop=trunc(iw/2)*2:trunc(ih/2)*2",
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-crf", "18",
         "-pix_fmt", "yuv420p", str(path),
@@ -256,10 +263,11 @@ def record(window_id: str, title: str, seconds: int, display: str, path: Path) -
     except OSError as exc:
         path.unlink(missing_ok=True)
         return error(f"ffmpeg produced no readable clip: {exc}", 1)
-    if size >= MAX_BYTES:
+    if size >= max_bytes:
+        cap = f"{max_bytes // 1_000_000} MB" if max_bytes % 1_000_000 == 0 else f"{max_bytes:,} bytes"
         print(path)
         return error(
-            f"stopped at the 500 MB file cap (ffmpeg -fs); the clip is shorter than {seconds} s",
+            f"stopped at the {cap} file cap (ffmpeg -fs); the clip is shorter than {seconds} s",
             3,
         )
     print(path)
@@ -308,10 +316,15 @@ def main() -> int:
 
     directory = Path(os.environ.get("SCREEN_RECORD_DIR") or Path.home() / ".cache" / "screen-record").expanduser().resolve()
     try:
+        settings = conf.read("screen_record")
+        max_bytes = settings.whole("recording.max_bytes")
+        max_directory_bytes = settings.whole("retention.max_directory_bytes")
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        prune(directory)
+        prune(directory, max_directory_bytes)
         found = find_window(args.window)
-        return record(found.window_id, found.title, seconds, display, clip_path(directory, args.name))
+        return record(found.window_id, found.title, seconds, display, clip_path(directory, args.name), max_bytes=max_bytes)
+    except conf.Unusable as exc:
+        return error(str(exc), 1)
     except WindowLookupFailure as exc:
         print(exc, file=sys.stderr)
         return 1

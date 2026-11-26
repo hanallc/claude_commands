@@ -46,12 +46,14 @@ from scripts.production import (change_review, change_routing, delivery_state, i
 from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import (browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names,
                                   studio_page)
-from scripts.review_links import change_browser, change_page, images, new_item_dialog, page_question, question_record
+from scripts.review_links import change_browser, change_page, images, new_item_dialog, page_question, page_version, question_record
 from scripts.review_links import review_items, review_link, review_page, review_submissions, search_fold, send_hold
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
+from scripts.review_links.browser_test_support import newer_script_reload_results
 from scripts.review_links.test_record_table import save_notice_failures
+from scripts.review_links.test_review_page import CONTROL_SAVE_TIMEOUT, EXPIRE_SAVE
 from scripts.review_links.test_serve import new_item_notice_log, read_new_item_notices
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.statusline import counts_row, rebuild_row
@@ -444,7 +446,7 @@ class ListPageTests(unittest.TestCase):
         _ = (config / "statusline.conf").write_text(
             "role.showrunner=#a379fd\nrole.unit-director=#ffaf02\n"
             + "role.producer=#90fe42\nrole.worker=#ff0404\n")
-        _ = (config / "review_links.conf").write_text(
+        _ = write_config_fixture(config / "review_links.conf",
             "# whole: 1..20\ndelivery_tries=3\n# range: 0..300\ndelivery_pause_seconds=0\n"
             + "# whole: 1..20\nfeedback_rows=5\n# whole: 1..20\nreview_words_rows=4\n"
             + "# whole: 1..1440\nlater_soon_minutes=60\n"
@@ -1203,6 +1205,55 @@ if(example.filterOn){
 }
 ''')
 
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        # The probe types "typed words", so every title matches it as a search.
+        for number in range(30):
+            _ = self.add(f"Check typed words {number}")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        self.assertEqual(markup.count(f'data-script-version="{list_page.SCRIPT_VERSION}"'), 1)
+        newer = "(url,options)=>options?.cache==='no-store' ? Promise.resolve({ok:true,text:async()=>NEWER_PAGE}) : undefined"
+        newer = newer.replace("NEWER_PAGE", json.dumps(markup.replace(list_page.SCRIPT_VERSION, "newer-script"))
+                              .replace("</", "<\\/"))
+        row = "[...document.querySelectorAll('[data-list-item]')][20]"
+        toggle = (f"{row}.querySelector('.list-toggle').click();"
+                  + "await new Promise(resolve=>setTimeout(resolve,500));")
+        place = toggle + f"scrollTo({{top:{row}.getBoundingClientRect().top+scrollY-40,behavior:'instant'}});"
+        words = f"recordDetails({row}).querySelector('textarea[name=words]')"
+        opened = f"recordIsOpen({row})"
+        with self.subTest(hold="the words of an open item"):
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, placed=opened, start=f"type({words},'typed words');",
+                end=f"type({words},'');"), [[]])
+        with self.subTest(hold="none, for the words of a closed item"):
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, holds=False,
+                start=f"type({words},'typed words');" + toggle + f"check(!{opened},'the item closes with its words');"),
+                [[]])
+        with self.subTest(hold="search words while the field has focus"):
+            # The address keeps the search words only after a short wait, so the field holds while it has focus.
+            # A headless frame never has focus, so the probe gives it focus as a user's typing does.
+            search = ("(field=>{document.hasFocus=()=>true;field.focus({preventScroll:true});type(field,'typed words');})"
+                      + "(document.querySelector('#list-search'));")
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, placed=opened, start=search, end="document.hasFocus=()=>false;"),
+                [[]])
+        with self.subTest(hold="an open Park picker"):
+            picker = f"recordDetails({row}).querySelector('[data-later-toggle]')"
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, placed=opened,
+                start=f"{picker}.click();check(dateTimePickerOpen(document),'the picker opens');",
+                end=f"{picker}.click();check(!dateTimePickerOpen(document),'the picker closes');"), [[]])
+        with self.subTest(hold="a Mark read save that never answers"):
+            # The save has no visible edit, so only the save holds the reload.
+            short = markup.replace('data-request-timeout-seconds="15"', 'data-request-timeout-seconds="5"', 1)
+            self.assertNotEqual(short, markup)
+            save = (f"const form=recordDetails({row}).querySelector('form');"
+                    + "form.requestSubmit(form.querySelector('[value=\"read\"]'));")
+            self.assertEqual(newer_script_reload_results(
+                short, newer=newer, place=place, placed=opened, start=CONTROL_SAVE_TIMEOUT+save,
+                saves=True, end=EXPIRE_SAVE), [[]])
+
     def studio_avatars(self, *producers: staff.StaffId) -> Path:
         """Point the Studio at a temporary avatar root with one picture for All and for each producer."""
         root = self.root / "avatars"
@@ -1210,9 +1261,13 @@ if(example.filterOn){
             (root / folder).mkdir(parents=True)
             for size in studio_page.SIZES:
                 _ = (root / folder / f"01-{size}.webp").write_bytes(b"RIFF")
-        with (self.root / "config/review_links.conf").open("a") as settings:
-            _ = settings.write(f"studio_avatar_root={root}\n")
+        _ = write_config_fixture(self.root / "config/review_links.conf", f"studio_avatar_root={root}\n")
         return root
+
+    def test_script_version_includes_the_schedule_templates(self) -> None:
+        self.assertEqual(list_page.SCRIPT_VERSION, page_version.script_version(
+            change_page.DOCUMENT_ASSETS, list_page.STYLE, list_page.DIALOGS, list_page.SCHEDULE_TEMPLATES,
+            list_page.SCRIPT))
 
     def test_studio_view_swaps_the_producer_chip_row_for_picture_tabs(self) -> None:
         _ = self.fixture_items()
@@ -9018,7 +9073,7 @@ window.fetch=async(_url,options)=>{
     def test_list_repair_undo_restores_the_draft_and_works_leaves_needs_me(self) -> None:
         _ = self.file_repaired_report("Fix the menu", "Open the menu and count all six choices.")
         steps = r"""
- document.querySelector('[data-undo-enabled]').dataset.undoEnabled='true';
+ document.querySelector('[data-undo-seconds]').dataset.undoSeconds='30';
  const originalFetch=window.fetch;let undos=0;
  const undoOutcome=UNDO_OUTCOME;
  let undoPath='';
@@ -9112,10 +9167,148 @@ window.fetch=async(_url,options)=>{
                                              add_item=False, reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_not_fixed_uses_the_configured_request_timeout(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
+        _ = self.file_repaired_report("Fix the menu")
+        steps = r"""
+ const originalFetch=window.fetch,deadlines=new Map();
+ const configured=Number(document.querySelector('[data-list]').dataset.requestTimeoutSeconds)*1000;
+ AbortSignal.timeout=milliseconds=>{
+  const {signal}=new AbortController();
+  deadlines.set(signal,milliseconds);
+  return signal;
+ };
+ let heldPost,resultRead,resumedRead,receiptRead,retryPost,holdReads=0;
+ const button=form.querySelector('[value="not works"]');
+ const until=async(condition,message)=>{
+  const end=performance.now()+4000;
+  while(!condition()){
+   if(performance.now()>end) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ window.fetch=async(path,options={})=>{
+  const timeout=deadlines.get(options.signal);
+  if(String(path).startsWith('/send-hold/')){
+   if(++holdReads===1){
+    resultRead=timeout;
+    return Response.json({reason:'The fixture lost the result.'},{status:503});
+   }
+   resumedRead=timeout;
+   return Response.json({}, {status:404,headers:{'X-Send-Hold-Outcome':'missing'}});
+  }
+  if(new URL(path,location.href).searchParams.has('not-fixed-request')){
+   receiptRead=timeout;
+   return Response.json({not_fixed_receipt:{request:requests[0].get('request'),state:'accepted'}});
+  }
+  if(options.method!=='POST') return originalFetch(path,options);
+  requests.push(new URLSearchParams(options.body));
+  if(requests.length===1){
+   heldPost=timeout;
+   const hold=new Headers(options.headers).get('X-Undo-Request');
+   return Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  retryPost=timeout;
+  check(!new Headers(options.headers).has('X-Undo-Hold'),'An accepted send retries without a new hold.');
+  return Response.json({reason:'The fixture did not confirm delivery.'},{status:503});
+ };
+ form.elements.words.value='The last menu choice still disappears.';
+ form.elements.words.dispatchEvent(new Event('input'));
+ submit('not works');
+ await until(()=>!form.dataset.sending && !button.disabled,'The first send did not finish.');
+ button.click();
+ await until(()=>requests.length===2 && !form.dataset.sending,'The accepted retry did not finish.');
+ check(heldPost===configured,'The held POST uses the configured timeout.');
+ const allowsGrace=timeout=>timeout>configured && timeout<=configured+RELEASE_GRACE_MS;
+ check(allowsGrace(resultRead),
+  'The held result uses the configured timeout plus the remaining Undo grace.');
+ check(allowsGrace(resumedRead),
+  'The resumed result uses the configured timeout plus the remaining Undo grace.');
+ check(receiptRead===configured,'The receipt read uses the configured timeout.');
+ check(retryPost===configured,'The accepted retry POST uses the configured timeout.');
+"""
+        self.browser_action_sequence(steps.replace("RELEASE_GRACE_MS", str(send_hold.RELEASE_GRACE_SECONDS * 1000)),
+                                     add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_not_fixed_recovers_when_the_held_post_response_is_lost(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\nundo_seconds=10\n")
+        settings = conf.read("review_links")
+        undo_seconds = settings.whole("undo_seconds")
+        wait_seconds = settings.whole("page_request_timeout_seconds") + undo_seconds + send_hold.RELEASE_GRACE_SECONDS
+        item = self.file_repaired_report("Fix the menu")
+        root = self.root / "reviews"
+        script = r"""
+(async()=>{
+ const row=document.querySelector('[data-number="ITEM_NUMBER"]');
+ row.querySelector('.list-toggle').click();
+ const form=recordDetails(row).querySelector('[data-feedback-form]');
+ const button=form.querySelector('[value="not works"]'),words=form.elements.words;
+ const actualFetch=window.fetch,postedHolds=[];
+ let result;
+ window.fetch=async(path,options={})=>{
+  const response=await actualFetch(path,options);
+  if(options.method==='POST' && new URLSearchParams(options.body).get('action')==='not works'){
+   if(response.status!==202) throw new Error('The server did not hold the Not fixed POST.');
+   const held=await response.json();
+   if(!postedHolds.length && held.seconds!==UNDO_SECONDS) throw new Error('The server used the wrong Undo time.');
+   postedHolds.push(held.hold);
+   throw new TypeError('The fixture lost the held POST response.');
+  }
+  if(String(path)==='/send-hold/'+postedHolds[0] && response.status===200){
+   result=await response.clone().json();
+  }
+  return response;
+ };
+ const settled=async()=>{
+  const deadline=performance.now()+WAIT_SECONDS*1000;
+  while(form.dataset.sending){
+   if(performance.now()>deadline) throw new Error('The Not fixed request did not settle.');
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ words.value='The last menu choice still disappears.';
+ words.dispatchEvent(new Event('input'));
+ button.click();
+ await settled();
+ if(postedHolds.length!==2 || postedHolds[0]!==postedHolds[1] || result)
+  throw new Error('Both lost responses must refer to the same hold.');
+ button.click();
+ await settled();
+ return {posts:postedHolds.length,state:result?.not_fixed_receipt?.state ?? 'no result'};
+})()
+""".replace("ITEM_NUMBER", str(item.number)).replace("UNDO_SECONDS", str(undo_seconds))
+        script = script.replace("WAIT_SECONDS", str(wait_seconds))
+        with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root)}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(list_page, "recover_pending"),
+              patch.object(change_page, "send_to_staff", return_value=None) as send,
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            chrome = self.chrome()
+            try:
+                chrome.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}")
+                reply = chrome.command("Runtime.evaluate", {"expression": script, "awaitPromise": True,
+                                       "returnByValue": True}, chrome.session)
+                self.assertNotIn("exceptionDetails", reply)
+                self.assertEqual(cast(dict[str, object], reply["result"])["value"],
+                                 {"posts": 2, "state": "delivered"})
+            finally:
+                chrome.navigate("about:blank")
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertCountEqual([call.args[0] for call in send.call_args_list], (OWNER.id, DWIGHT.id))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_not_fixed_undo_times_out_while_reading_the_body(self) -> None:
         _ = self.file_repaired_report("Fix the menu")
-        self.browser_action_sequence(r"""
+        steps = r"""
  const deadlines=new Map(),originalFetch=window.fetch;
+ const configured=Number(document.querySelector('[data-list]').dataset.requestTimeoutSeconds)*1000;
+ const undoSeconds=30;
  AbortSignal.timeout=milliseconds=>{
   const controller=new AbortController();
   deadlines.set(controller.signal,{controller,milliseconds});
@@ -9154,7 +9347,7 @@ window.fetch=async(_url,options)=>{
   if(options.method!=='POST' || requests.length) return originalFetch(path,options);
   requests.push(new URLSearchParams(options.body));
   const hold=new Headers(options.headers).get('X-Undo-Request');
-  return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  return Response.json({hold,seconds:undoSeconds},{status:202,headers:{'X-Send-Hold':'held'}});
  };
  words.value=text;words.dispatchEvent(new Event('input'));
  const initial=submit('not works');
@@ -9175,12 +9368,15 @@ window.fetch=async(_url,options)=>{
   'The card reports the timeout.');
  button.click();
  await until(()=>requests.length===2,'Retry did not send the original request.');
- check(deadline.milliseconds===deadlines.get(resultSignal)?.milliseconds,
-  'Undo and hold result reads use the same time limit.');
+ const resumed=deadlines.get(resultSignal)?.milliseconds;
+ check(resumed>configured+RELEASE_GRACE_MS && resumed<=configured+undoSeconds*1000+RELEASE_GRACE_MS,
+  'The resumed result deadline allows the remaining Undo time and grace.');
  check(requests[1].toString()===requests[0].toString(),'Retry uses the original signed payload.');
  finishPost({status:503,reason:'The fixture did not confirm delivery.'});
  await until(()=>!form.dataset.sending,'Retry did not finish.');
-""", add_item=False, reduced_motion=True)
+"""
+        self.browser_action_sequence(steps.replace("RELEASE_GRACE_MS", str(send_hold.RELEASE_GRACE_SECONDS * 1000)),
+                                     add_item=False, reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_not_fixed_keeps_the_draft_until_delivery_is_confirmed(self) -> None:
@@ -11863,12 +12059,15 @@ try{
  const refusedForm=recordDetails(refreshed).querySelector('form');
  holdPost=true;
  const refused=submitted(refusedForm,refusedForm.querySelector('[value="tell"]'));
- dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
- check(reads.length===3,'The shared status event makes no List request during a row save.');
+ // A refresh during a save checks the script version and keeps the current rows.
+ const heldRows=rows();
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
+ check(reads.length===4 && rows().length===heldRows.length && rows().every((row,i)=>row===heldRows[i]),
+  'The shared status event reads the page and keeps the rows during a row save.');
  finishPost({headers:new Headers(),ok:false,status:409,json:async()=>({reason:'The row save was refused.'})});
  holdPost=false;finishPost=undefined;
  await refused;
- check(reads.length===3 && refreshed.isConnected,'A refused row save makes no List request after the event.');
+ check(reads.length===4 && refreshed.isConnected,'A refused row save makes no List request after the event.');
  check(refreshed.dataset.unread==='true' && refusedForm.elements.words.value==='Keep my draft' &&
        refusedForm.querySelector('[data-send-status]').textContent==='Not saved: The row save was refused.',
        'A refusal restores the unread state and shows the reason beside the draft.');

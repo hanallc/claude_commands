@@ -12,6 +12,7 @@ from typing import override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 from scripts.rebuild import need
 from scripts.review_links import change_browser, change_page, for_you, review_items, review_page, staff_names
@@ -32,6 +33,7 @@ class RebuildReasonTests(unittest.TestCase):
         self.repo.mkdir()
         self.config = self.root / "statusline.conf"
         self.cache = self.root / "comparison"
+        _ = write_config_fixture(self.root / "user_zone.conf")
         self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(self.root),
             "FOR_YOU_ACTIONS_DIR": str(self.root / "actions"),

@@ -1047,7 +1047,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 | 200 changed lines | `FILE_CHANGED_LINE_LIMIT`, check 5, per file |
 | 30 s | `BUSY_TIMEOUT_SECONDS` on every ledger connection (a split's write takes less when its deadline is closer); `notify_style` subprocess timeout |
 | 90 min | `style_plan.py split` default time limit; one split of the types unit took 8.98 min on a copy of the live ledger |
-| 3 | `LOCK_ATTEMPTS` in `retry_on_change`; the third change refuses `...; rerun` |
+| 3 as shipped | `write.lock_attempts` in `config/style_ledger.conf` sets the attempt limit. `retry_on_change` refuses if the rows change on the last attempt. |
 | 32 | alias expansion bound in trait-path resolution |
 | 10 s / 35 s | `send.py --timeout` / subprocess bound (`SEND_RUN_SECONDS`) in `style_sync.py` |
 | 16 hex | `finding_id` length |

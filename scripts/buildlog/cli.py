@@ -219,7 +219,8 @@ def moments_report(args: list[str]) -> int:
         return 2
     connection = index.read_only()
     try:
-        print("\n".join(report.moments_section(connection, day)))
+        classes = report.RebuildClasses()
+        print("\n".join(report.moments_section(connection, day, classes)))
     finally:
         connection.close()
     return 0

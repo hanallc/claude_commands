@@ -32,10 +32,9 @@ from dataclasses import asdict, dataclass, field
 from subprocess import Popen
 from typing import Literal, cast
 
-from scripts.lib import conf_reads
+from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
 
-CONFIG = _WORKER_PATH.parents[2] / "config/send_repeat_guard.conf"
 NOTICE_SENDER = "send-repeat-guard"
 
 
@@ -67,31 +66,18 @@ def warn(reason: str) -> None:
 
 
 def configuration() -> Limits | GuardUnavailable:
-    """Read at use. A bad config fails open, without invented code defaults."""
-    path = Path(os.environ.get("SEND_REPEAT_CONFIG", str(CONFIG)))
+    """Read the guard limits. Keep delivery enabled when recovery fails."""
     try:
-        values: dict[str, int] = {}
-        contents = conf_reads.read_text(path)
-        for line in contents.splitlines():
-            line = line.split("#", 1)[0].strip()
-            if not line:
-                continue
-            key, separator, value = line.partition("=")
-            if not separator or key.strip() in values:
-                raise ValueError("expected unique key=value lines")
-            values[key.strip()] = int(value.strip())
-        if set(values) != set(Limits.__dataclass_fields__) or any(value <= 0 for value in values.values()):
-            raise ValueError("all configured limits must be positive integers")
-        if values["repeat_count"] < 3:
-            raise ValueError("repeat_count must allow the first two copies")
-        for key, origin in conf_reads.shift_origins(path, contents).items():
-            if key in values and origin.shift.value == str(values[key]):
-                origin.record()
-        return Limits(**values)
-    except (OSError, ValueError, TypeError) as error:
-        reason = f"{path}: {error}"
+        with conf.diagnostics(report=False) as diagnostics:
+            settings = conf.read("send_repeat_guard")
+            limits = Limits(**{key: settings.whole(key) for key in Limits.__dataclass_fields__})
+    except conf.Unusable as error:
+        reason = str(error)
         warn(reason)
         return GuardUnavailable(reason)
+    for diagnostic in diagnostics:
+        print(diagnostic, file=sys.stderr)
+    return limits
 
 
 def normalize(text: str) -> str:

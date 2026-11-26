@@ -655,7 +655,8 @@ def refuse_scheduled_draft_reuse(request_id: str) -> None:
     review_submissions.refuse_scheduled_draft_reuse(request_id, load_list_draft=_load_list_draft)
 
 
-def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_submissions.ListItemDestination:
+def submit_scheduled(request: new_item_dialog.ScheduledSubmission, *,
+                     live_words_limit: int) -> review_submissions.ListItemDestination:
     """File a browser Schedule and recover its receipt and notices on Retry."""
     fields: list[object] = [request.page, request.recipient_id, request.words]
     if request.producer_route:
@@ -664,6 +665,7 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
 
     @contextmanager
     def prepare() -> Generator[tuple[review_submissions.ListDraftClaim, review_submissions.ListDraftWriter]]:
+        words = new_item_dialog.read_words(request.words, "Your words", live_words_limit)
         with investigation.recipient_locks(request.recipient_id):
             members = staff.snapshot()
             recipient = review_submissions.selected_recipient(request.recipient_id, members)
@@ -671,7 +673,7 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
                 raise new_item_dialog.SubmissionError("Pick a producer.")
             producer = recipient if request.producer_route else None
             owner = review_submissions.assigned_member(request.assignment, recipient, members)
-            filing = prepare_scheduled(owner, request.words, members, producer=producer)
+            filing = prepare_scheduled(owner, words, members, producer=producer)
             notices, warning = _assignment_notices(filing.title, filing.producer, filing.keeper, owner, members)
             claim = review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback, notices, warning)
             draft = review_submissions.NewItemDraft(request.request_id, claim)

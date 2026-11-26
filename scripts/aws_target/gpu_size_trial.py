@@ -44,7 +44,6 @@ SYSTEM_MODULE = ROOT / 'docs/plans/builds-aws/gpu-trial.nix'
 WRAPPER = Path(__file__).with_name('gpu_trial_wrapper.py')
 ARCHIVE_PROFILE = 'gpu-size-trial-archive'
 NEXTEST_INFRASTRUCTURE_EXIT = 125
-NEXTEST_LOG_TAIL_BYTES = 1024 * 1024
 NEXTEST_LOG_TAIL_CHUNK_BYTES = 64 * 1024
 # Use the upper limits for expiry_schedule_minutes and expiry_timeout_s in cloud_gate.conf.
 MAX_GATE_EXPIRY_INTERVAL_MINUTES = 60
@@ -665,11 +664,12 @@ def prepare_locked(repo: Path, commit: str, folder: Path,
 
 def nextest_log_tail(path: Path) -> str:
     """Read up to 200 final lines within a fixed byte limit."""
+    limit = conf.read("cloud_gate").whole("gpu_size_trial.nextest_log_tail_bytes")
     chunks: list[bytes] = []
     newlines = 0
     with path.open('rb') as content:
         position = content.seek(0, os.SEEK_END)
-        remaining = min(position, NEXTEST_LOG_TAIL_BYTES)
+        remaining = min(position, limit)
         while remaining and newlines <= 200:
             size = min(remaining, NEXTEST_LOG_TAIL_CHUNK_BYTES)
             position -= size
@@ -695,7 +695,7 @@ def append_failed_nextest_logs(folder: Path) -> None:
             _ = output.write('\nNextest diagnostic: ' + str(diagnostic.relative_to(folder)) + ' (last 200 lines)\n')
             try:
                 _ = output.write(nextest_log_tail(diagnostic) + '\n')
-            except OSError as error:
+            except (OSError, conf.Unusable) as error:
                 _ = output.write('Could not read the nextest diagnostic: ' + str(error) + '\n')
 
 

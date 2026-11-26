@@ -363,6 +363,56 @@ Reduced motion stops the loader icon.
 `page_frame.createPageRefresh` owns the refresh timers, visibility handling, failures and status drawing.
 Each loader checks the request identity before it changes content.
 An older response cannot replace a newer response.
+A page passes `page_version.script_version(*VERSION_PARTS)` to `title`, which puts it on the status line as `data-script-version`.
+`VERSION_PARTS` holds the page's static script, style and markup.
+The hash also covers `page_version.SHARED_PARTS`, the parts that each page shares: the frame style and refresh script, the owner heading assets (`PAGE_SCRIPT_ERRORS`, `HEADING_STYLE`, `OWNER_STYLE`), `CONSOLE_DIALOG_ASSETS` and the New item dialog script and style.
+A page in `change_page.document` adds `change_page.DOCUMENT_ASSETS`, the style and script around each page.
+`reloadForNewScript(page, held)` is the first step of each refresh after the loader's stale-request check.
+It runs before any page early return and before the page swaps content.
+When the fetched page has another version, it reloads the page.
+Accounts, Images, The List, Review, the Changes and Questions pages, and Investigations call it.
+An open page then never runs an old script on a fragment from a changed page script. No page has a second reload rule.
+Review reads its snapshot version as JSON, so that answer names the script version as `script`, and Review passes the string.
+A Review refresh reads only the index and the card bodies. Its version also hashes `SHELL_PARTS`, the fixed shell markup: the search field, the Type and Show chips, the notices, the table head and the open-row template (`record_table.render_inline_detail()`).
+Only a visible edit or a save in flight holds the reload. The shared `pageHoldsInput` finds a visible edit:
+- a shown text field with unsaved text,
+- an open dialog, menu or date picker,
+- a shown text selection that is not empty.
+A text field marked `data-reload-safe` holds the reload only while it has focus, because the address restores its words after a short wait.
+The List and Review search fields carry it.
+Words in closed items or hidden cards do not hold the reload.
+The reload discards words without a saved draft. Images restores saved drafts from hidden cards.
+Each page passes its save in flight as `held`:
+- Accounts: its `hold()`, which covers the color popup, the move menu, the quota panel and their pending saves,
+- Images: `sending`,
+- The List: `saving`,
+- Review: `pendingSaves`,
+- the Changes and Questions pages: `activeSaves`,
+- Investigations: `sending`.
+The New item dialog stays open while it sends, so the open dialog holds the reload.
+Each save POST uses `page_request_timeout_seconds` from `config/review_links.conf`.
+Pages write the duration in `data-request-timeout-seconds`.
+The Review card frame and the New item dialog read the duration from their own settings.
+A held save gives the result its own timeout and allows time for the server's Undo grace period.
+The New item screenshot request has no time limit.
+When a save fetch ends by its time limit, the result of the save is not known.
+The shared `saveTimeoutWords` then gives **No answer in N s. The save can still finish.**, with N from `page_request_timeout_seconds`.
+Accounts, Images, Investigations, the Changes and Questions pages and Review show these words in place of **Not saved**, **Not sent** or the Accounts failure words.
+An Accounts color save that ends by its time limit keeps the new color. The next refresh shows the true color.
+A held reload can follow a timed-out save at once. Then the words do not show, and the loaded page shows the true state.
+While the reload waits, the status shows Paused: **A newer page loads when your edit ends.** It never shows Failed for a hold.
+When `reloadForNewScript` holds a reload, it records the hold. When the hold ends, the page reloads at once.
+The shared `reloadWhenHoldEnds` checks the hold on the 1 s status clock and on each `input`, `change`, `close` and `selectionchange` event.
+The first held reload adds these event listeners, so the shared script has no effect on the page when it loads.
+It listens in the bubble phase, so the page's own handlers run first. A `close` event does not bubble, so its check runs one task later.
+Each save end calls the page refresh's `changed`, so the check also runs then.
+A selection holds the reload only while it shows. A selection in a hidden row or a closed dialog has no client rects and does not hold it.
+The check does not wait for a timed refresh, so a page with refresh period 0 also reloads.
+There is no time limit on a hold.
+A held reload answers with only the busy reason. A page hold does not keep this answer back.
+The status keeps the data it shows and counts the answer as current, so a long edit stays Paused and never shows Late.
+Before the first data, a held answer shows Paused with its reason.
+The browser keeps the scroll place across the reload. The address keeps the open row, the shown card and the filters.
 Accounts and List read their rendered page at `page_refresh_seconds` intervals.
 Review checks the snapshot version at that interval.
 It requests the compact index only when the version changes.
@@ -646,7 +696,9 @@ It defaults to Open and keeps the Show, Owner, and Search controls.
 All includes withdrawn actions and their reasons.
 The card shows the command, machine, working directory, requester, reason, waiting work, and completion method.
 Copy uses the shared code block. It leaves the action open.
-Done uses the signed Review form to complete an open manual action through the action store.
+Open actions show Done for both manual and automatic completion.
+Review shows the same confirmation for both methods.
+Done uses the signed Review form to complete the action through the action store.
 The saved action leaves Open and appears in Done and All at once.
 The same signed Done request can return the saved result again.
 The console refreshes its count after the save.
@@ -754,7 +806,7 @@ If the fade is still in progress, the return starts at the copy's current height
 The animation updates when the user opens or closes a card during the transition.
 The status region above the table shows a failure only for the most recent submission.
 It shows that failure when the row or its details are hidden.
-It also confirms when a manual For you action completes.
+It also confirms when Done completes a For you action with either completion method.
 The next save attempt or reload clears this notice.
 Filter and sort changes apply at once.
 The reduced motion preference disables row animations.
@@ -903,11 +955,19 @@ A retry can recover the filed item after a restart.
 For a synchronous screenshot, the server uses the capture digest to verify a retry.
 It replaces the old screenshot when the checkbox is selected.
 Clear **Include a screenshot** to omit the image.
-A Bug includes structured page sections and up to 48 rows of visible text from when the dialog opens.
+A Bug includes structured page sections and visible text from when the dialog opens.
+`new_item.max_page_rows` sets the visible row limit. It ships at 48.
 Other types include the same page data when Send requests a pending screenshot or the screenshot is unavailable.
 The Review card shows this evidence under **Page data**.
 A Bug also includes the page title, address, filters, and render time.
 The dialog shows Error lines and Script errors when the page has errors.
+
+The `new_item.*` keys and `page_capture.max_active` in `config/review_links.conf` set the New item limits.
+A new Send uses the live values.
+Saved items, restart recovery and attachment use the upper bound of each limit line.
+If a limit is unusable, Send gets a 503 response and the dialog keeps the draft.
+The console unavailable view omits the owner controls and the dialog.
+
 Review and Accounts reuse gzip bytes for an unchanged page with its current owner control.
 A Bug with a screenshot also includes the viewport.
 **Send** closes the New item dialog at once.
@@ -1095,7 +1155,7 @@ The hidden `later` field keeps the wall time for the draft.
 The page converts that time to UTC for the request.
 The arrow keys, Home and End move between items, Enter picks one and Escape closes the menu.
 A click outside the control or a move of focus outside the control closes the menu.
-The page refresh waits while the menu is open.
+While the menu is open, a refresh checks only the script version.
 The server stores the preset time in the user zone.
 List and Review refuse a new save if the deadline has passed.
 A List retry can still return the result of an earlier save.
@@ -1203,6 +1263,39 @@ The mark is `waiting` after Ask question and `done` after Approve or Send feedba
 
 Hana console, Accounts (`/console/accounts.html`) shows the accounts board.
 The console lists it as **Accounts**, with the Lucide `users` icon.
+The **Moves** section precedes the Accounts table.
+The section reads batch progress from `~/.local/state/accounts/move-progress/`.
+A progress record stores the initiator, cause, target, start time, and member order.
+Each member result keeps the requested account. An unknown account shows as moving in the Now line.
+The Now line shows which members move now.
+The Next line names the next unit and gives the number of other units that wait.
+It estimates the time left after the first result.
+**All N units** shows the state of each member.
+A refusal without named members omits the unit list, count, and progress bar.
+It distinguishes members already on the target from moved members.
+It shows that a member stopped only when the result confirms the stop.
+**Earlier moves** includes the three newest ended batches and any interrupted batches.
+The holder note uses `move.stuck_seconds` in `config/shutdown.conf`.
+The note uses "task" when the command does not identify the type of task.
+The page preserves open move details during refresh.
+The writer saves the current batch with each result and saves the full batch at the end.
+The page offers retry when the member is off the target account and no operation holds it.
+The page uses the board's local session read to check the account, including sessions outside counted roles.
+The Accounts POST accepts one failed member from one saved batch.
+The server starts the standard hand move command in a detached process.
+The command handles the row lock, queue and wait limit.
+The failure line and retry response use the same rule for these messages.
+
+- `Another move is in progress. Try again when it ends.`
+- `<unit> has no saved session.`
+- `The retry did not start. Try again.`
+
+The progress record keeps the diagnostic for the move.
+The server logs one diagnostic line to stderr when it refuses a retry or fails to start it.
+The browser accepts a retry only when the HTTP response succeeds and its state is `saved`.
+A malformed retry or any other response uses the third message.
+A second retry starts another hand move.
+A hand move to the account the member already uses reports "already on" and stops no process.
 The server keeps the last good page, its completion time, its render times, and its usage store revision under one lock.
 The first request waits for a render in a child process (`accounts_page.py`).
 The server records the usage store file metadata before it starts each render.
@@ -1224,9 +1317,41 @@ A failed render keeps the last good page and writes one line to stderr.
 Failed renders add no render time.
 A cached Accounts response carries its render failure to the status line.
 
+The Logins card appears before Accounts. When Moves is present, it appears after Moves.
+It lists reported login ends in date order, with one row per account and machine.
+The card matches each row by SSH alias and account.
+A row clears when its stored end changes. Each row gives the `/login` action.
+The card uses account colors and formats dates in the user's zone.
+`login_card.error_days` and `login_card.warning_days` set the color limits.
+The card uses the timer's selector for the next sitting or safety request.
+On the other machine, the card reads the copy from the sending machine's timer.
+It shows **Login requests unavailable.** if the copy is missing or older than two peer intervals plus the peer timeout.
+It shows **No login request.** when no requested date remains.
+
 The Accounts table has two swatch columns without a heading.
 The account swatch column is between **account** and **left**.
+Hover over an account name to see the email from its login record.
+When the record has no usable email, the title says **No email in the login record**.
+**Fable left** follows **left** and shows the cached weekly Fable percent for Claude accounts.
+It is empty for Codex accounts. It shows a dash for a Claude account when the cache has no current Fable window.
 The role swatch column is between **role** and **next**.
+After **next**, **weekly reset** shows the weekly reset time.
+A running account uses green. This includes a Claude account with an unassigned session.
+Claude accounts with weekly quota left use green. Codex accounts use green when current quota or enabled credits permit work.
+The color ignores Codex quota and credit readings from the future or older than the configured age limit.
+For exhausted accounts with no running session, the reset color uses a scale from green to orange.
+The reading time is the start of the scale.
+The scale ends at the furthest future reset among accounts with no role and 0% quota in the current weekly window.
+A Codex weekly reading sets the end only if its age is zero through `usage_stale_minutes`.
+The page uses one status snapshot for the scale and the row colors.
+At one quarter of this time span, the color uses 50% orange.
+The orange weight changes linearly on each side of that point.
+A reset at or after the end of the scale uses 100% orange.
+When no account sets the end, future exhausted resets use 100% orange.
+An expired reset for an exhausted account uses the default text color.
+The reset colors keep at least 4.5:1 contrast in both themes.
+**resets** shows the reset count from the Codex account note or a dash when the count is missing.
+Claude accounts show a dash in **resets**.
 Select a named header or press Enter to sort.
 The dot and swatch headers have no sort control.
 The arrow sits before a right-aligned label and after a left-aligned label.
@@ -1234,6 +1359,7 @@ The arrow uses the column gap without adding to the table width.
 The column gap and arrow scale with the root font size.
 The viewer's sort choice stays through refreshes.
 The Models card below the accounts table uses the same sort controls.
+Its role headings use the same colors as role labels in the Accounts table.
 It stores the viewer's sort choice separately and starts in model order.
 The card shows the model ID and its swatch at the start of each consecutive group of that model.
 The model ID and swatch use the theme ink color when no model color is set.
@@ -1250,7 +1376,7 @@ One click opens the picker: a saturation and brightness area, a hue slider, a la
 The popup uses the console theme and stays inside the viewport.
 Try paints every swatch and word of that key without a request.
 Cancel or Escape restores the saved color.
-The page pauses refresh while the popup is open or a save is pending.
+While the popup is open or a save is pending, the status shows Paused and a refresh checks only the script version.
 Save closes the popup at once and posts `key` and a lowercase `#rrggbb` value to `/console/accounts.html` as form data.
 Saves of one key publish in order; saves of different keys run at the same time.
 The server accepts configured `account.` keys, configured keys in `ROLE_COLOR_KEYS`, and valid `model.<id>` keys.
@@ -1288,29 +1414,44 @@ The mode is **self-actualizing** while `quota_state.no_worker_mode()` is on, and
 The mode and the quota are separate facts.
 Other lines show a gray Lucide minus icon; the total cell stays empty.
 An unavailable queue shows gray `unavailable`; selected Claude groups retain their buttons.
-The page uses the first targets from the status read.
-The menu title is **When <account> reaches <percent>%, move <group> to**.
-`next_move_percent` in `config/accounts.conf` sets the percent.
-The menu lists the other Claude accounts in board order, each with its weekly percent left when known.
-The current target has a highlight and `aria-checked="true"` with `role="menuitemradio"`.
-Arrow keys, Home and End move between the items.
-Escape, Tab, a click outside, a scroll, or a resize closes the menu.
-Focus returns to the arrow button.
-The menu stays inside the viewport.
-The page pauses refresh while the menu is open and while a move save is pending.
-A choice posts `group` and `to` to `/console/accounts.html` as form data.
-The server checks the group and the account note, then calls `next_moves.set_first_next_move()`.
-The new entry replaces the group's first next move, or becomes its only one, with no hold.
-When the group has an entry, **No next move** posts `group` and `clear=first`.
-The server calls `next_moves.remove_next_move()` at `FIRST_GROUP_POSITION`.
-It refuses a clear for an empty group.
-The cell then shows the next queued target, or `none`.
-Success clears the cached page and refreshes the `next` cell.
-A refused request returns 400 and a failed write returns 503, each with its reason.
+The page uses the first queued entry for each group from the status read.
+The arrow opens the **Next move of <group>** dialog.
+The radio group lists the other Claude accounts in board order.
+Each account shows its weekly percent left when known.
+The first queued entry supplies the target, percent, and quota measure.
+An empty group uses `next_move_percent` from `config/accounts.conf` and the **all models** measure.
+An unreadable queue shows **The next moves cannot be read now.**
+The dialog disables **Save** and **Move now** in that case.
+Editing a field changes only the form.
+Tab stays inside the dialog. Cancel and Escape discard edits and return focus to the arrow.
+The page pauses refresh while the dialog is open.
+**Save** sets the first entry to the selected target, percent, and measure.
+The dialog checks the percent range from 0 to 100.
+An invalid percent keeps the dialog open and shows **The settings were not saved. Try again.**
+**Save** with **No next move** removes the first entry and keeps later entries.
+**Move now** starts the CLI hand move in a detached process with the selected account as its target.
+The POST returns when the launcher accepts the request.
+The detached command claims the move before it changes the selected account.
+The Moves card shows the console origin and reports a refusal if another move holds the claim.
+The click leaves the next-move log unchanged. **No next move** disables the button.
+A failure shows a short message in the dialog and keeps the edits.
+Success closes the dialog and refreshes the board.
+Save sends `group`, `to`, `percent`, and `measure`. Clear sends `group` and `clear`.
+Move now sends `group` and `move_now` and requires the console origin.
+The POST logs the exact cause of a dialog action failure. The dialog uses its own messages.
 
 The Roles table columns are role, swatch, **busy, last 24 h**, account, next, busy, idle and total.
+The selected account appears first for each role and shows its own counts.
+Other accounts with sessions appear directly below it, ordered by descending total and then by account label.
+These rows show their own counts and `none` in the next column.
+They leave the role, swatch and busy line cells empty.
+The table sorts each role as a group.
+The busy, idle and total columns sort by the sum across all accounts for the role.
+The other columns sort by the first row.
+The summary row includes counts from all accounts.
+An unassigned role with one observed account keeps its count tooltip.
 The busy line column has no sort control.
-Each role row draws its busy count from `role_activity.read()` as an inline SVG line in the role color.
+The first row of each role draws its busy history from `role_activity.read()` as an inline SVG line in the role color.
 The page reads the samples once for each render, at the reading's check time.
 The x axis is the 24-hour window. The y axis scales to the largest count of that role in the window, at least 1.
 The line has one point for each pixel column at most: 288 columns of 5 minutes each.
@@ -1321,7 +1462,7 @@ Under the line, the hours in the user's zone show as numbers every 3 hours and a
 With no samples, the cell shows only the base line and the hour marks.
 The summary row has an empty cell in this column.
 The Roles table has no paused or exited column.
-A Lucide `triangle-alert` icon in `--warning` follows a role total when that role has paused or exited sessions.
+A Lucide `triangle-alert` icon in `--warning` follows an account's total when it has paused or exited sessions of the role.
 The icon takes focus and shows a tooltip on hover and focus, for example **2 not running: 1 paused (tile), 1 exited (fix2)**.
 The icon is an image named **not running**.
 The names come from local sessions. A peer count without names shows `names unknown` for the rest.
@@ -1608,8 +1749,8 @@ A completed refresh fades the card out and closes the dialog.
 A revision replacement fades the old card out and slides the new card in.
 Both transitions use the configured card durations and respect reduced motion.
 If the List request fails or times out, the next periodic refresh can update the row.
-List and Review refresh, counts, and linked record requests use `page_request_timeout_seconds`.
-Periodic and console visibility refreshes skip a pending List action.
+List and Review refresh, save, counts, and linked record requests use `page_request_timeout_seconds`.
+During a pending List action, periodic and console visibility refreshes check only the script version.
 A refused List action restores the confirmed row and shows the reason.
 A refresh for a saved Review change or a new item waits until pending List actions end.
 An explicit item target joins the linked selection and opens its card.
@@ -1901,6 +2042,7 @@ The picker aligns with the right edge of the text box.
 The server publishes the earliest active parking deadline.
 The List refreshes at that deadline.
 If the Park menu or picker is open, the List refreshes when it closes.
+While the picker is open, a refresh checks only the script version.
 **Save** sends the chosen time in UTC.
 Park writes a date, a time, or `delivered` through `the_list.park` with the List page source.
 List and Review use the same Later code to read and write their saved values.
@@ -1928,7 +2070,7 @@ If clearing parking removes the row from Parked, the page shows “Item #N unpar
 The page shows confirmations for hidden rows next to the Show filter.
 It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
-If All is active when Unpark saves, the row stays open.
+If All is active when Unpark saves, the item row stays open.
 After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
@@ -2278,8 +2420,7 @@ On a narrow screen the panel goes above the cards and scrolls with them, and its
 When no images wait for an answer, the page shows **No images registered.**
 The page refreshes its cards when the console shows it again and when the tab becomes visible.
 A hidden frame makes no request.
-The card list carries `data-script`, the page script hash.
-When a refresh brings a different hash, the page loads again in place of the swap.
+When a refresh brings a newer page script, the shared `reloadForNewScript` loads the page again in place of the swap.
 An older script does not bind the new card forms, so a form would post outside the script.
 
 Each answer button posts the image id, the button's answer, the feedback text and a token signed with the console browser token.
@@ -2290,7 +2431,7 @@ A card loaded before that change can still post `not approved`; the server refus
 The card leaves the page when the shared Undo toast appears.
 **Undo** restores the card and focuses the feedback field with the typed words.
 The server saves no answer for an undone send.
-The page skips its refresh while a send runs.
+While a send runs, a refresh checks only the script version.
 An image leaves the page while each open question has a live sender or confirmed acceptance.
 The page also hides an image while the server recovers its verified delivery on startup.
 A failed or unconfirmed delivery returns the card.
@@ -2343,6 +2484,7 @@ Other pictures can accept a request during this time.
 A confirmed send or Retry clears its matching draft if the draft has the same revision.
 A refresh keeps each Retry error with its saved attempt.
 The linked answer stays in the List log if delivery fails or the owner deletes the image.
+A timeout shows **No answer in N s. The save can still finish.**
 An agent deletes an image with this command:
 
 ```sh
@@ -2566,6 +2708,7 @@ The recorded action returns the change to Open.
 Each answer uses a background `fetch` POST.
 After the save, the row leaves the view without opening another card.
 A failed save keeps the row and typed text and shows **Not saved: <reason>**.
+A save that ends by its time limit shows **No answer in N s. The save can still finish.** in place of that line.
 
 The fixed `console/` folder holds the all-list browser's private `.review-link-browser.json` and no HTML file.
 The first `change_page.page_url` call creates the folder and the manifest with a hard link, so two first requests keep one secret.
@@ -2880,7 +3023,10 @@ The server uses this ID for the hold. A repeated POST returns the same hold and 
 The server saves the body, with the Content-Type, Origin, Host and Accept headers, in `<root>/.review-link-holds/<id>.json`.
 Only the owner can read the folder and its files. The server answers 202 with `X-Send-Hold: held`.
 The 202 body gives the hold ID and the remaining Undo time in `seconds`.
-If no time remains, the page reads the result without an Undo toast.
+The server allows a one-second grace period for late Undo requests.
+After a visible Undo window, the browser waits for the remaining grace period before it reads the result.
+If the reply gives zero Undo time, the browser reads the result at once and allows for any remaining grace in the deadline.
+The result reads and retry delays share the request timeout from the page or dialog settings.
 Nothing is saved and nothing is sent before the time ends.
 When `undo_seconds` is zero, the server does not hold the send and handles it at once.
 
@@ -2946,7 +3092,7 @@ When the console page or the card frame closes, the page removes the toast and p
 The server sends the request at once. If the release arrives first, the server records it until the POST arrives.
 A failed Undo leaves release on close active.
 
-One second after the time ends, the server sends the saved request to its own bound address.
+When the grace period ends, the server sends the saved request to its own bound address.
 The normal handler then saves and sends, as for a send that does not wait.
 If delivery fails after a confirmed save, the toast shows the delivery failure. The action stays saved.
 An Undo after release gets 409.

@@ -30,15 +30,12 @@ def context(prompt: str) -> str:
     """Give one copy command for each Mac path on natedev."""
     if sys.platform != "linux":
         return ""
-    machine = remote.local_machine()
-    if machine.casefold() != "natedev":
+    if remote.local_machine().casefold() != "natedev":
         return ""
     paths = find_paths(prompt)
     if not paths:
         return ""
-    settings = conf.settings((conf.directory() / "production.conf").read_text(encoding="utf-8"))
-    route_key = conf.effective_key(settings, "mac_run_host", host_name=machine)
-    route = settings[route_key].value
+    route = conf.read("production").text("mac_run_host")
     lines: list[str] = []
     for path in paths:
         # Escape the SFTP pattern before quoting the shell argument.

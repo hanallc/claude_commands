@@ -116,6 +116,8 @@ class ServerFixture(unittest.TestCase):
         self.folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.folder / "producer_map.conf"
         _ = self.config.write_text("# The producer of a showrunner or of a unit.\n", encoding="utf-8")
+        _ = write_config_fixture(self.folder / "review_links.conf")
+        _ = write_config_fixture(self.folder / "user_zone.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.folder),
                                                                         "XDG_STATE_HOME": str(self.folder / "state")})))
         self.server = FakeServer()
@@ -299,13 +301,13 @@ class NewItemTests(ServerFixture):
                 draft_id = new_item_dialog.ScheduledDraftId("s1-" + "c" * 32)
                 request = new_item_dialog.ScheduledSubmission(
                     draft_id, MORTY.id, f"{words} {monday}", "list")
-                saved = new_item.submit_scheduled(request)
+                saved = new_item.submit_scheduled(request, live_words_limit=100)
                 closed = the_list.close(MORTY.id, saved.id, "The user cancelled this item.", source="morty")
                 receipts = list((folder / "review-attachments").glob(f"**/{draft_id.value}/receipt.json"))
                 self.assertEqual(len(receipts), 2)
                 for receipt in receipts:
                     receipt.unlink()
-                self.assertEqual(new_item.submit_scheduled(request), saved)
+                self.assertEqual(new_item.submit_scheduled(request, live_words_limit=100), saved)
                 self.assertEqual(the_list.load(MORTY.id, saved.id), closed)
                 self.assertEqual(closed.new_item_draft_id, review_submissions.NewItemDraft(draft_id, saved.claim))
                 self.assertCountEqual(the_list.records(MORTY.id, include_closed=True), [*before, closed])
@@ -612,6 +614,34 @@ class NewItemTests(ServerFixture):
 
 
 class NewItemServerTests(unittest.TestCase):
+    def test_scheduled_send_checks_the_live_words_limit_only_on_first_filing(self) -> None:
+        server = test_serve.ReviewLinksServerTests()
+        self.addCleanup(server.doCleanups)
+        server.setUp()
+        _ = server.review_fixture()
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
+        configuration = conf.path("review_links")
+        words = ("Check the Scheduled item and confirm the current notes and times on the List."
+                 " Start 2099-11-30T09:00Z.")
+        self.assertEqual(len(words), 102)
+        request = {"token": server.server.new_item_token, "kind": new_item_dialog.SCHEDULED_KIND,
+                   "page": "list", "page_recipient": "producer", "recipient_id": morty.id, "words": words}
+        saved_body = json.dumps({**request, "request_id": "s1-" + "a" * 32}).encode()
+        fresh_body = json.dumps({**request, "request_id": "s1-" + "b" * 32}).encode()
+
+        _ = write_config_fixture(configuration, "new_item.max_words_chars=102\n")
+        saved = server.new_item_http(saved_body, finished=True)
+        self.assertEqual(saved.status, 200, saved.body)
+
+        _ = write_config_fixture(configuration, "new_item.max_words_chars=100\n")
+        refusal = server.new_item_http(fresh_body, finished=True)
+        self.assertEqual(refusal.status, 400, refusal.body)
+        self.assertEqual(json.loads(refusal.body), {"error": "Your words must be text with at most 100 characters."})
+        replay = server.new_item_http(saved_body, finished=True)
+        self.assertEqual((replay.status, replay.body), (200, saved.body))
+        self.assertEqual([item.id for item in the_list.records(morty.id)], [json.loads(saved.body)["id"]])
+
     def test_report_filing_writes_the_number_and_owner_together(self) -> None:
         server = test_serve.ReviewLinksServerTests()
         self.addCleanup(server.doCleanups)

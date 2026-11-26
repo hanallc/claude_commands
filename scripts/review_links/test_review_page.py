@@ -13,6 +13,7 @@ import json
 import re
 import os
 import selectors
+import signal
 import socket
 import subprocess
 import tempfile
@@ -26,7 +27,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Self, TextIO, cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import atomic_file, conf, conf_reads, urgency
-from scripts.lib import user_zone as user_zone_config
 from scripts.lib.process_group import run_process_group, stop_process_group
 from scripts.lib.user_zone import user_zone
 import unittest
@@ -48,10 +48,12 @@ from scripts.production import the_list
 from scripts.production.staff_test_support import fixture_member
 from scripts.production import change_review, change_routing, footer_counts, investigation, next_item, proposal_issue, record_store, staff, update_registration
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_page
-from scripts.review_links import question_path, question_record, review_link
-from scripts.review_links import list_page, staff_names, test_change_page
+from scripts.review_links import page_version, question_path, question_record, review_link
+from scripts.review_links import list_page, send_hold, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
-from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
+from scripts.review_links.browser_test_support import (
+    UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results, newer_script_reload_results,
+)
 from scripts.review_links.test_record_table import save_notice_failures
 from scripts.statusline import counts_row
 
@@ -95,6 +97,16 @@ BODY_READY_SCRIPT = r"""async function readyReviewCard(row){
  return recordDetails(row).querySelector('[data-review-form]');
 }
 """
+
+CONTROL_SAVE_TIMEOUT = r"""
+const saveTimeout=new AbortController(),originalTimeout=AbortSignal.timeout;
+AbortSignal.timeout=milliseconds=>{
+ AbortSignal.timeout=originalTimeout;
+ check(milliseconds===5000,'The save uses the 5 s timeout.');
+ return saveTimeout.signal;
+};
+"""
+EXPIRE_SAVE = "saveTimeout.abort(new DOMException('The save timed out.','TimeoutError'));"
 
 SNAPSHOT_FETCH_SCRIPT = r"""<script>
 const snapshots=SNAPSHOTS;
@@ -1748,6 +1760,55 @@ window.fetch=(url,options)=>{
                              (0, str(int(local_after.replace(tzinfo=ZoneInfo('America/New_York')).timestamp()))))
             _, entries = review_items.next_queue('question', self.fixture.production, False, snapshot.members)
             self.assertNotIn(item.queue_key, {entry.key for entry in entries})
+    def test_script_version_hashes_the_fixed_shell_that_a_refresh_never_reads(self) -> None:
+        page = review_page.render(self.root).decode()
+        for part in review_page.SHELL_PARTS:
+            self.assertIn(part, page)
+        # A shell part that leaves the hash fails here, so a shell change always reloads an open page.
+        self.assertEqual(review_page.SCRIPT_VERSION, page_version.script_version(
+            change_page.DOCUMENT_ASSETS, record_table.STYLE, record_table.DATE_TIME_STYLE, review_page.STYLE,
+            review_page.CARD_REQUEST_SCRIPT, *review_page.SHELL_PARTS, review_page.SCRIPT))
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        change = next(item for item in review_items.read(self.root) if item.type == review_items.ReviewType.CHANGE)
+        records = [replace(change, key=f'page-owner/C{number}', id=f'page-owner/C{number}',
+                           state=review_items.ReviewState.OPEN) for number in range(1, 46)]
+        with patch.object(review_items, 'read', return_value=records):
+            markup = browser_markup(self.root)
+        self.assertEqual(markup.count(f'data-script-version="{review_page.SCRIPT_VERSION}"'), 1)
+        # Review reads the snapshot version as JSON, so the newer script version comes in that answer.
+        newer = r"""(url,options)=>{
+ const query=new URL(url,location.href).searchParams;
+ if(!query.has('version') || query.has('index') || query.has('body')) return undefined;
+ return Promise.resolve(Response.json({version:document.querySelector('[data-review]').dataset.version,
+  script:'newer-script',facts:pageRefreshFacts()}));
+}"""
+        # The rows are drawn in a window after load, so the scroll place must outlast that first draw.
+        place = r"""scrollTo({top:1200,behavior:'instant'});await new Promise(resolve=>setTimeout(resolve,200));
+  const row=[...document.querySelectorAll('[data-review] [data-list-item]')].find(row=>row.getBoundingClientRect().top>0);
+  row.querySelector('.list-toggle').click();await readyReviewCard(row);"""
+        words = "recordDetails(row).querySelector('[data-review-form]').elements.feedback"
+        toggle = "row.querySelector('.list-toggle').click();"
+        closed = "check(!recordIsOpen(row),'the item closes');"
+        opened = "!!document.querySelector('[data-review] .list-toggle[aria-expanded=\"true\"]')"
+        with self.subTest(hold='the words of an open item'):
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, placed=opened, start=f"type({words},'typed words');",
+                end=f"type({words},'');"), [[]])
+        with self.subTest(hold='none, for the words of a closed item'):
+            self.assertEqual(newer_script_reload_results(
+                markup, newer=newer, place=place, holds=False, start=f"type({words},'typed words');" + toggle + closed),
+                [[]])
+        with self.subTest(hold='an Ask save that never answers'):
+            # The item closes while the save runs, so only the save holds the reload.
+            short = markup.replace('data-request-timeout-seconds="15"', 'data-request-timeout-seconds="5"', 1)
+            self.assertNotEqual(short, markup)
+            save = (f"type({words},'Which check passed?');const form={words}.form;"
+                    + "form.requestSubmit(form.querySelector('[value=\"question\"]'));" + toggle + closed)
+            self.assertEqual(newer_script_reload_results(
+                short, newer=newer, place=place, start=CONTROL_SAVE_TIMEOUT+save,
+                saves=True, end=EXPIRE_SAVE), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_review_ask_keeps_later_edits_and_ignores_a_response_after_reopen(self) -> None:
@@ -2721,10 +2782,10 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
         steps = UNDO_ACTION_SCRIPT + r"""
   const undo=fixtureUndo();
   const fixtureFetch=window.fetch,content=document.querySelector('[data-review]');
-  let versionReads=0;
+  let indexReads=0;
   window.fetch=(url,options)=>{
    const query=new URL(url,location.href).searchParams;
-   if(!query.has('body') && !query.has('index') && query.has('version')) versionReads++;
+   if(query.has('index')) indexReads++;
    return fixtureFetch(url,options);
   };
   summary(2).querySelector('.list-toggle').click();
@@ -2736,7 +2797,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   shown='fresh';
   summary(1).querySelector('.list-toggle').click();
   await readyReviewCard(row(1));await frame();
-  check(content.dataset.version===snapshots.initial.version && versionReads===0,
+  check(content.dataset.version===snapshots.initial.version && indexReads===0,
    'The held send blocks the index refresh.');
   check(toast()===held && undo.posts.length===1,'The new body leaves the other send held.');
   await undo.undo();
@@ -4593,11 +4654,8 @@ window.fetch=async(url,options)=>{
                         self.send_response(200)
                         self.send_header('Content-Type', 'text/html; charset=utf-8')
                         self.end_headers()
-                        if path == '/complete':
-                            _ = complete.wait(20)
-                        else:
-                            _ = self.wfile.write(base.encode() if path == '/reload' else body if path == '/page' else
-                                b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe><img hidden src="/complete">')
+                        _ = self.wfile.write(base.encode() if path == '/reload' else body if path == '/page' else
+                            b'<iframe src="/page" style="border:0;width:100vw;height:100vh"></iframe>')
 
                     def do_POST(self) -> None:
                         results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
@@ -4614,10 +4672,14 @@ window.fetch=async(url,options)=>{
                     thread.start()
                     try:
                         with tempfile.TemporaryDirectory(dir=self.fixture.temporary) as profile:
-                            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', profile,
-                                '--window-size', f'{width},900', '--screenshot', str(self.fixture.temporary/'show-chips.png'),
-                                f'http://127.0.0.1:{server.server_port}/'], timeout=30)
-                        self.assertEqual(done.returncode, 0, done.stderr)
+                            environment = {**os.environ, 'MOZ_HEADLESS_WIDTH': str(width), 'MOZ_HEADLESS_HEIGHT': '900'}
+                            firefox = subprocess.Popen(['firefox', '--headless', '--no-remote', '--profile', profile,
+                                f'http://127.0.0.1:{server.server_port}/'], env=environment, start_new_session=True)
+                            try:
+                                self.assertTrue(complete.wait(30), 'Firefox did not report the Show probe result.')
+                            finally:
+                                stop_process_group(firefox)
+                            self.assertIn(firefox.returncode, (0, -signal.SIGTERM), 'Firefox exited with an error.')
                     finally:
                         server.shutdown()
                         thread.join(TEST_HANG_GUARD_SECS)
@@ -6681,13 +6743,12 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertFalse(updated.unread_answer)
 
         with self.subTest(count='six legacy Efficiency rows'):
-            zone_path = self.fixture.temporary / 'user_zone.conf'
-            _ = zone_path.write_text('zone=America/New_York\n')
-            with (patch.dict(os.environ), patch.object(user_zone_config, 'CONF', str(zone_path)),
-                  patch.object(conf_reads, 'read_text', wraps=conf_reads.read_text) as reads):
+            _ = write_config_fixture(conf.path('user_zone'), 'zone=America/New_York\n')
+            reads = self.fixture.temporary / 'efficiency-reads'
+            with patch.dict(os.environ), conf_reads.record_reads(reads):
                 _ = os.environ.pop('USER_ZONE', None)
                 self.assertEqual(review_items.efficiency(document, record=snapshot.members), 3)
-            self.assertEqual(sum(call.args[0] == str(zone_path) for call in reads.call_args_list), 1)
+            self.assertEqual(reads.read_text().splitlines().count('user_zone'), 1)
 
     def test_an_answer_returns_a_later_investigation_until_mark_read(self) -> None:
         for legacy_answer in (False, True):
@@ -6710,16 +6771,17 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         if legacy_answer:
             lines = path.read_text().splitlines(keepends=True)
             _ = path.write_text(''.join(earlier_log + '\n' if line.startswith('review_log: ') else line for line in lines))
-        zone_path = self.fixture.temporary / 'user_zone.conf'
-        _ = zone_path.write_text('zone=America/New_York\n')
-        with patch.dict(os.environ), patch.object(user_zone_config, 'CONF', str(zone_path)):
+        _ = write_config_fixture(conf.path('user_zone'), 'zone=America/New_York\n')
+        with patch.dict(os.environ):
             _ = os.environ.pop('USER_ZONE', None)
             answered = review_page.build_snapshot(self.root)
-            with patch.object(conf_reads, 'read_text', wraps=conf_reads.read_text) as reads:
+            reads = self.fixture.temporary / 'index-reads'
+            _ = reads.write_text('')
+            with conf_reads.record_reads(reads):
                 self.assertTrue(answered.records[key].for_you(now))
                 entries = unpack_index(review_page.index_json(answered.entries))
                 self.assertTrue(answered.records[key].unread_answer)
-            self.assertEqual([call for call in reads.call_args_list if call.args[0] == str(zone_path)], [])
+            self.assertNotIn('user_zone', reads.read_text().splitlines())
         self.assertTrue(next(entry for entry in entries if entry['key'] == key).get('unreadAnswer'))
         self.assertIn(b'value="read"', answered.body(key))
         self.assertEqual(review_later.times()[key], until)
@@ -7874,6 +7936,194 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
   filterControl.ownerId(document.querySelector('[data-filter-row="owner"] [data-filter-value][aria-pressed="true"]'))===filters.owner &&
   document.querySelector('#list-search').value===filters.q,'The card submit keeps each selected control.');
 """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_held_save_timeout_bounds_result_reads_and_retries(self) -> None:
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const realFetch=window.fetch;
+ try{
+  for(const mode of ['stall','pending','disconnect']){
+   const hold='a'.repeat(24);
+   let reads=0,postSignal,resultSignal;
+   window.fetch=async(url,options)=>{
+    if(url==='/save'){
+     postSignal=options.signal;
+     check(postSignal instanceof AbortSignal,mode+': the POST has a timeout signal');
+     return Response.json({hold,seconds:.05},{status:202,headers:{'X-Send-Hold':'held'}});
+    }
+    check(url==='/send-hold/'+hold,mode+': the read uses the returned hold ID');
+    if(reads===0) resultSignal=options.signal;
+    check(resultSignal instanceof AbortSignal && resultSignal!==postSignal,mode+': the result has a fresh signal');
+    check(options.signal===resultSignal,mode+': each read uses the same result signal');
+    reads++;
+    if(reads===1 && mode==='pending')
+     return Response.json({}, {headers:{'X-Send-Hold':'pending'}});
+    if(reads===1 && mode==='disconnect') throw new TypeError('The connection closed.');
+    return new Promise((_,reject)=>{
+     options.signal?.throwIfAborted();
+     options.signal?.addEventListener('abort',()=>reject(options.signal.reason),{once:true});
+    });
+   };
+   let guard;
+   const result=await Promise.race([
+    heldFetch('/save',{method:'POST',body:mode,requestTimeoutSeconds:.18},null).catch(error=>error),
+    new Promise(resolve=>{guard=setTimeout(()=>resolve('The result wait did not end.'),1900);}),
+   ]);
+   clearTimeout(guard);
+   check(result?.name==='TimeoutError' && result===resultSignal?.reason,mode+': the wait ends at the result timeout');
+   check(reads===(mode==='pending' ? 2 : 1),mode+': no retry starts after the timeout');
+  }
+ }catch(error){failures.push(String(error));}
+ window.fetch=realFetch;
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        html = '<!doctype html><html><body><script>' + page_frame.HELD_SEND_SCRIPT + '</script>' + probe + '</body></html>'
+        self.assertEqual(firefox_probe_results(html.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_held_save_starts_the_result_timeout_after_natural_undo_expiry(self) -> None:
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const realFetch=window.fetch,host=window.top.document;
+ try{
+  for(const stalled of [false,true]){
+   const label=stalled ? 'Stalled' : 'Healthy';
+   const hold='b'.repeat(24),requestTimeoutSeconds=.18;
+   let postSignal,resultSignal,reads=0,readStarted;
+   window.fetch=async(url,init)=>{
+    if(url==='/save'){
+     postSignal=init.signal;
+     return Response.json({hold,seconds:.4},{status:202,headers:{'X-Send-Hold':'held'}});
+    }
+    reads++;
+    resultSignal=init.signal;
+    readStarted=performance.now();
+    check(url==='/send-hold/'+hold,label+': the read uses the hold ID');
+    check(!host.querySelector('[data-send-undo] button'),label+': the read starts after Undo');
+    check(postSignal?.aborted,label+': the POST timeout expired during Undo');
+    check(resultSignal && resultSignal!==postSignal && !resultSignal.aborted,label+': the read starts with a fresh timeout');
+    if(!stalled) return Response.json({saved:true});
+    return new Promise((_,reject)=>{
+     resultSignal?.throwIfAborted();
+     resultSignal?.addEventListener('abort',()=>reject(resultSignal.reason),{once:true});
+    });
+   };
+   let guard;
+   const result=await Promise.race([
+    heldFetch('/save',{method:'POST',body:label,requestTimeoutSeconds},null,()=>{
+     check(host.querySelector('[data-send-undo] button')?.textContent==='Undo',label+': the hold shows Undo');
+    }).catch(error=>error),
+    new Promise(resolve=>{guard=setTimeout(()=>resolve('The result wait did not end.'),2100);}),
+   ]);
+   clearTimeout(guard);
+   check(reads===1,label+': the page reads the result once');
+   if(stalled){
+    check(result?.name==='TimeoutError' && result===resultSignal?.reason,label+': the stalled read reaches its timeout');
+    check(performance.now()-readStarted>=150,label+': the stalled read gets a full timeout');
+   }else{
+    check(result instanceof Response && (await result.json()).saved,label+': the page reads the saved result');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ window.fetch=realFetch;
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        html = '<!doctype html><html><body><script>' + page_frame.HELD_SEND_SCRIPT + '</script>' + probe + '</body></html>'
+        self.assertEqual(firefox_probe_results(html.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_held_save_reads_the_result_at_the_minimum_timeout(self) -> None:
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const realFetch=window.fetch;
+ const hold='c'.repeat(24),undoSeconds=.2;
+ let releaseDueAt,readStarted;
+ window.fetch=async(url,options)=>{
+  if(url==='/save'){
+   releaseDueAt=performance.now()+(undoSeconds+__RELEASE_GRACE_SECONDS__)*1000;
+   return Response.json({hold,seconds:undoSeconds},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  check(url==='/send-hold/'+hold,'The read uses the hold ID.');
+  readStarted=performance.now();
+  return new Promise((resolve,reject)=>{
+   const delay=Math.max(0,releaseDueAt-readStarted)+200;
+   const ready=setTimeout(()=>resolve(Response.json({saved:true})),delay);
+   options.signal?.addEventListener('abort',()=>{
+    clearTimeout(ready);
+    reject(options.signal.reason);
+   },{once:true});
+  });
+ };
+ let guard;
+ try{
+  const response=await Promise.race([
+   heldFetch('/save',{method:'POST',body:'Minimum timeout',requestTimeoutSeconds:1}),
+   new Promise((_,reject)=>{guard=setTimeout(()=>reject(new Error('The result wait did not end.')),2800);}),
+  ]);
+  check((await response.json()).saved,'The page reads the saved result at the one-second timeout.');
+  check(readStarted>=releaseDueAt,'The result read starts after the server grace period.');
+ }catch(error){failures.push(String(error));}
+ clearTimeout(guard);
+ window.fetch=realFetch;
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>""".replace('__RELEASE_GRACE_SECONDS__', str(send_hold.RELEASE_GRACE_SECONDS))
+        html = '<!doctype html><html><body><script>' + page_frame.HELD_SEND_SCRIPT + '</script>' + probe + '</body></html>'
+        self.assertEqual(firefox_probe_results(html.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_held_save_reads_a_zero_second_hold_at_once(self) -> None:
+        probe = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const realFetch=window.fetch,graceMs=__RELEASE_GRACE_SECONDS__*1000;
+ const hold='d'.repeat(24),resultPath='/send-hold/'+hold;
+ try{
+  for(const mode of ['ready','grace','stall']){
+   let replyAt,readAt,reads=0,resultSignal;
+   window.fetch=async(url,options)=>{
+    if(url==='/save'){
+     replyAt=performance.now();
+     return Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}});
+    }
+    check(url===resultPath,mode+' uses the returned hold ID.');
+    readAt=performance.now();reads++;resultSignal=options.signal;
+    if(mode==='ready') return Response.json({saved:true});
+    return new Promise((resolve,reject)=>{
+     const ready=mode==='grace' ? setTimeout(()=>resolve(Response.json({saved:true})),graceMs+200) : 0;
+     resultSignal?.addEventListener('abort',()=>{
+      clearTimeout(ready);
+      reject(resultSignal.reason);
+     },{once:true});
+    });
+   };
+   let guard;
+   const result=await Promise.race([
+    heldFetch('/save',{method:'POST',body:mode,requestTimeoutSeconds:1}).catch(error=>error),
+    new Promise(resolve=>{guard=setTimeout(()=>resolve('The result wait did not end.'),2750);}),
+   ]);
+   clearTimeout(guard);
+   check(reads===1 && readAt-replyAt<graceMs*.65,mode+' reads the result at once.');
+   if(mode==='stall'){
+    check(result?.name==='TimeoutError' && result===resultSignal?.reason,'A stalled read reaches its deadline.');
+    check(performance.now()-readAt>=graceMs+900,'The deadline includes the grace period and the timeout.');
+   }else{
+    check(result instanceof Response && (await result.json()).saved,mode+' reads the saved result.');
+   }
+  }
+ }catch(error){failures.push(String(error));}
+ window.fetch=realFetch;
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>""".replace('__RELEASE_GRACE_SECONDS__', str(send_hold.RELEASE_GRACE_SECONDS))
+        html = '<!doctype html><html><body><script>' + page_frame.HELD_SEND_SCRIPT + '</script>' + probe + '</body></html>'
+        self.assertEqual(firefox_probe_results(html.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
     def test_browser_undo_restores_later_and_validate_cards(self) -> None:
