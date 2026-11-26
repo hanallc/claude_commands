@@ -1984,7 +1984,7 @@ document.querySelector('#result').textContent = JSON.stringify(layouts);
             ("small head room", head_values, head(0.952, 0.948, 0.004, 0.005),
              ["3.0 GiB", "1.0 GiB", "1.0 GiB", "0.9 GiB", "<0.1 GiB", "<0.1 GiB", "<0.1 GiB"]),
             ("signed cancellation", outside_values, outside(0.149, 0.149, -0.696),
-             [["<0.1 GiB", "0.2 GiB", "0.2 GiB", "0.1 GiB", "0.1 GiB", "0.1 GiB", "-0.7 GiB"],
+             [["<0.1 GiB", "0.2 GiB", "0.2 GiB", "0.1 GiB", "0.1 GiB", "0.0 GiB", "0.1 GiB", "-0.7 GiB"],
               ["-0.7 GiB", "0.0 GiB", "-0.7 GiB"]]),
             ("signed part below the threshold",
              "amounts('unattributed')", outside(0.149, 0.149, -0.696, -0.099),
@@ -1998,22 +1998,22 @@ document.querySelector('#result').textContent = JSON.stringify(layouts);
                       "sccache_bytes": 0, "python_tests_bytes": 120 * MIB,
                       "waiting_runs_bytes": 70 * MIB, "other_build_tools_bytes": 70 * MIB}},
              ["0.4 GiB", "0.1 GiB", "0.0 GiB", "0.1 GiB", "<0.1 GiB", "<0.1 GiB"]),
-            ("compressed swap shares the Kernel reading",
-             "[amounts('kernel')[1], compressedSwapNote(shownReading(data).memory.kernel)]",
-             outside(0.146, 0.149, -0.729), ["0.2 GiB", "Of which compressed swap: 0.2 GiB."]),
+            ("Swap in RAM and Everything else share the swap reading",
+             "[amounts('g-else')[4], amounts('zram')[0], amounts('kernel')[0]]",
+             outside(0.146, 0.149, -0.729), ["0.2 GiB", "0.2 GiB", "0.0 GiB"]),
             ("head and cap share Builds",
              "[amounts('cap'), " + head_values + "]", head(0.952, 0.948, 0.004, 0.005, 1.049, 1.051),
              [["3.1 GiB", "1.0 GiB", "1.1 GiB", "1.0 GiB"],
               ["3.1 GiB", "1.0 GiB", "1.1 GiB", "0.9 GiB", "<0.1 GiB", "<0.1 GiB", "<0.1 GiB"]]),
             ("Kernel keeps its measured order beside Desktop",
-             "[amounts('g-else').slice(0, 5), amounts('kernel')]",
+             "[amounts('g-else').slice(0, 6), amounts('kernel')]",
              {"ram": {**RAM_FIXTURE, "desktop_bytes": 0.36 * GIB, "agents_bytes": 0,
                       "other_programs_bytes": 0, "programs": [], "smaller_program_count": 0,
                       "kernel_bytes": 0.41 * GIB, "compressed_swap_bytes": 0.137 * GIB,
                       "kernel_structures_bytes": 0.137 * GIB, "kernel_counters_bytes": 0.136 * GIB,
                       "cache_bytes": 0, "unattributed_bytes": 0}},
-             [["0.8 GiB", "0.4 GiB", "0.0 GiB", "0.0 GiB", "0.4 GiB"],
-              ["0.4 GiB", "0.2 GiB", "0.1 GiB", "0.1 GiB"]]),
+             [["0.8 GiB", "0.4 GiB", "0.0 GiB", "0.0 GiB", "0.1 GiB", "0.3 GiB"],
+              ["0.3 GiB", "0.2 GiB", "0.1 GiB"]]),
             ("Taken stays within the cap with small coverage and room",
              "[amounts('cap'), amounts('walksum')]",
              {"cap": 1.198, "ram": {**one_gib_build, "build_tools_bytes": 1.049 * GIB,
@@ -2027,14 +2027,14 @@ document.querySelector('#result').textContent = JSON.stringify(layouts);
                                    "build_covered_bytes": 0.099 * GIB, "build_target_bytes": 0.119 * GIB,
                                    "build_missing_bytes": 0.020 * GIB}},
              [["1.2 GiB", "1.1 GiB", "<0.1 GiB", "<0.1 GiB"], [11, 12, 13], ["1.2 GiB", "1.1 GiB", "0.1 GiB"]]),
-            ("Kernel stays in order with a small child", "[amounts('g-else').slice(0, 5), amounts('kernel')]",
+            ("Kernel stays in order with a small child", "[amounts('g-else').slice(0, 6), amounts('kernel')]",
              {"ram": {**RAM_FIXTURE, "desktop_bytes": 0.36 * GIB, "agents_bytes": 0.12 * GIB,
                       "other_programs_bytes": 0, "programs": [], "smaller_program_count": 0,
                       "kernel_bytes": 0.39 * GIB, "compressed_swap_bytes": 0.30 * GIB,
                       "kernel_structures_bytes": 0.09 * GIB, "kernel_counters_bytes": 0,
                       "cache_bytes": 0, "unattributed_bytes": 0}},
-             [["0.9 GiB", "0.4 GiB", "0.1 GiB", "0.0 GiB", "0.4 GiB"],
-              ["0.4 GiB", "0.3 GiB", "<0.1 GiB", "0.0 GiB"]]),
+             [["0.9 GiB", "0.4 GiB", "0.1 GiB", "0.0 GiB", "0.3 GiB", "<0.1 GiB"],
+              ["<0.1 GiB", "<0.1 GiB", "0.0 GiB"]]),
             ("status uses the displayed room", "[amounts('room')[0], statusLine(shownReading(data))]",
              {"cap": 2.295, "ram": {**one_gib_build, "build_covered_bytes": 1.03 * GIB, "room_bytes": 0.245 * GIB},
               "memory_status": {"code": "one_running_memory_wait", "next_need_bytes": 0.5 * GIB,
@@ -3234,7 +3234,7 @@ renderWalk = reading => { painted = reading; };
     def test_the_bar_and_legend_show_the_blocks_in_their_groups(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         builds, free, other = ["tools", "queued"], ["reserved", "room", "safety", "swap"], [
-            "desktop", "agents", "programs", "kernel", "cache", "unattributed"]
+            "desktop", "agents", "programs", "zram", "kernel", "cache", "unattributed"]
         bar = page[page.index('<div class="bar-wrap'):page.index('<div class="scale')]
         legend = page[page.index('<div class="legend">'):page.index('</details>', page.index('<div class="legend">'))]
         self.assertEqual([part.split('"')[0] for part in bar.split('id="s-')[1:]], [*builds, *free, *other])
@@ -3297,10 +3297,14 @@ renderWalk = reading => { painted = reading; };
                         pairs.append((label, text))
                     else:
                         self.assertEqual(cell.tag, "dd")
-                        if "caption" in classes or "long" in classes:
-                            self.assertNotRegex(cell.text or "", r"[.!?]$")
-                        if "caption" in classes:
-                            self.assertLessEqual(len(cell.text or ""), 44)
+                        if key == "zram" and "caption" in classes:
+                            self.assertEqual(cell.text, "Memory that nothing used for some time. "
+                                             + "Linux compresses it and keeps it in RAM.")
+                        else:
+                            if "caption" in classes or "long" in classes:
+                                self.assertNotRegex(cell.text or "", r"[.!?]$")
+                            if "caption" in classes:
+                                self.assertLessEqual(len(cell.text or ""), 44)
                         if "program-memory" in classes:
                             self.assertEqual(len(set(pairs)), len(pairs))
                             pairs.clear()
@@ -3317,13 +3321,22 @@ renderWalk = reading => { painted = reading; };
 
     def test_each_ram_block_tooltip_uses_the_design_text(self) -> None:
         keys = ["g-builds", "tools", "queued", "g-free", "reserved", "room", "system", "safety", "swap",
-                "g-else", "desktop", "agents", "programs", "kernel", "cache", "unattributed", "cap", "budget"]
+                "g-else", "desktop", "agents", "programs", "zram", "kernel", "cache", "unattributed", "cap", "budget"]
+        swap = {**SWAP_FIXTURE, "agents_bytes": GIB,
+                "builds_used_bytes": GIB, "builds_limit_bytes": GIB}
+        ended_row = {"name": "Left by runs that ended", "kind": "ended", "pool": "builds_ci", "bytes": GIB // 2}
         tips = cast(list[list[str]], self.page_expression(
-            "[" + ", ".join(f"tipText('{key}', data)" for key in keys) + "]", {"cap": 31, "cap_text": "fixture"}))
-        self.assertEqual(dict(zip(keys, tips, strict=True)), {'g-builds': ['Builds  7.0 GiB', 'RAM that builds use now\nBuild tools  4.0 GiB\n+ Queued builds  3.0 GiB'], 'tools': ['Build tools  4.0 GiB', 'RAM that build tools use now\nrust-analyzer  1.0 GiB\n+ sccache  0.5 GiB\n+ Other build tools  2.5 GiB'], 'queued': ['Queued builds  3.0 GiB', 'RAM of builds the queue started'], 'g-free': ['Free RAM  30.0 GiB', 'RAM that no program holds\nBuild reserved  6.0 GiB\n+ Free  18.0 GiB\n+ System reserved  6.0 GiB'], 'reserved': ['Build reserved  6.0 GiB', 'Held for running builds to grow into'], 'room': ['Free  18.0 GiB', 'Where the next step can start\nQueue cap  31.0 GiB\n− Builds  7.0 GiB\n− Build reserved  6.0 GiB'], 'system': ['System reserved  6.0 GiB', 'RAM kept outside the queue cap\nSafety net  4.0 GiB\n+ Swap coming back  2.0 GiB'], 'safety': ['Safety net  4.0 GiB', 'RAM the queue always leaves free'], 'swap': ['Swap coming back  2.0 GiB', 'RAM held for swap that comes back\nShare held  50.0%'], 'g-else': ['Everything else  27.0 GiB', 'RAM used outside builds\nDesktop  3.0 GiB\n+ Agents  8.0 GiB\n+ Other programs  4.0 GiB\n+ Kernel  3.0 GiB\n+ File and kernel cache  7.0 GiB\n+ Not attributed  2.0 GiB'], 'desktop': ['Desktop  3.0 GiB', 'RAM of the desktop session\nProtected  2.0 GiB'], 'agents': ['Agents  8.0 GiB', 'RAM of agent sessions and their tools'], 'programs': ['Other programs  4.0 GiB', 'RAM of all other programs\nfirefox  2.0 GiB\nzed  1.0 GiB\n5 smaller programs  1.0 GiB'], 'kernel': ['Kernel  3.0 GiB', 'RAM the kernel uses for itself\nCompressed swap (zram)  1.5 GiB\n+ Slab, stacks, page tables  1.0 GiB\n+ Other kernel counters  0.5 GiB'], 'cache': ['File and kernel cache  7.0 GiB', 'Estimated cache outside free RAM'], 'unattributed': ['Not attributed  2.0 GiB', 'RAM without an attribution\nKernel, no counter  1.5 GiB\n+ No program name  0.5 GiB'], 'cap': ['Queue cap  31.0 GiB', 'What builds may use\nBuilds  7.0 GiB\n+ Build reserved  6.0 GiB\n+ Free  18.0 GiB'], 'budget': ['RAM  64.0 GiB', 'Memory across this machine\nBuilds  7.0 GiB\n+ Free RAM  30.0 GiB\n+ Everything else  27.0 GiB']})
-        blocks = cast(int, self.page_expression("RAM_BLOCKS.reduce((sum, [, , amount]) => sum + amount(data.ram), 0)", {}))
+            "[" + ", ".join(f"tipText('{key}', data)" for key in keys) + "]",
+            {"cap": 31, "cap_text": "fixture", "swap": swap, "swap_by": [ended_row],
+             "ram": {**RAM_FIXTURE, "zram_original_bytes": 3 * GIB}}))
+        self.assertEqual(dict(zip(keys, tips, strict=True)), {'g-builds': ['Builds  7.0 GiB', 'RAM that builds use now\nBuild tools  4.0 GiB\n+ Queued builds  3.0 GiB'], 'tools': ['Build tools  4.0 GiB', 'RAM that build tools use now\nrust-analyzer  1.0 GiB\n+ sccache  0.5 GiB\n+ Other build tools  2.5 GiB'], 'queued': ['Queued builds  3.0 GiB', 'RAM of builds the queue started'], 'g-free': ['Free RAM  30.0 GiB', 'RAM that no program holds\nBuild reserved  6.0 GiB\n+ Free  18.0 GiB\n+ System reserved  6.0 GiB'], 'reserved': ['Build reserved  6.0 GiB', 'Held for running builds to grow into'], 'room': ['Free  18.0 GiB', 'Where the next step can start\nQueue cap  31.0 GiB\n− Builds  7.0 GiB\n− Build reserved  6.0 GiB'], 'system': ['System reserved  6.0 GiB', 'RAM kept outside the queue cap\nSafety net  4.0 GiB\n+ Swap coming back  2.0 GiB'], 'safety': ['Safety net  4.0 GiB', 'RAM the queue always leaves free'], 'swap': ['Swap coming back  2.0 GiB', 'RAM held for swap that comes back\nShare held  50.0%'], 'g-else': ['Everything else  27.0 GiB', 'RAM used outside builds\nDesktop  3.0 GiB\n+ Agents  8.0 GiB\n+ Other programs  4.0 GiB\n+ Swap in RAM  1.5 GiB\n+ Kernel  1.5 GiB\n+ File and kernel cache  7.0 GiB\n+ Not attributed  2.0 GiB'], 'desktop': ['Desktop  3.0 GiB', 'RAM of the desktop session\nProtected  2.0 GiB'], 'agents': ['Agents  8.0 GiB', 'RAM of agent sessions and their tools'], 'programs': ['Other programs  4.0 GiB', 'RAM of all other programs\nfirefox  2.0 GiB\nzed  1.0 GiB\n5 smaller programs  1.0 GiB'], 'zram': ['Swap in RAM  1.5 GiB', 'Memory that nothing used for some time. '
+            + 'Linux compresses it and keeps it in RAM.\nIt holds  3.0 GiB\nagent sessions  1.0 GiB'
+            + '\n+ builds and CI  1.0 GiB\nleft by runs that ended  512.0 MiB\n+ all other programs  1.0 GiB'
+            + '\nThe swap of builds is full: 1.0 of 1.0 GiB. 512.0 MiB is left by runs that ended.'],
+            'kernel': ['Kernel  1.5 GiB', 'RAM the kernel uses for itself\nSlab, stacks, page tables  1.0 GiB\n+ Other kernel counters  0.5 GiB'], 'cache': ['File and kernel cache  7.0 GiB', 'Estimated cache outside free RAM'], 'unattributed': ['Not attributed  2.0 GiB', 'RAM without an attribution\nKernel, no counter  1.5 GiB\n+ No program name  0.5 GiB'], 'cap': ['Queue cap  31.0 GiB', 'What builds may use\nBuilds  7.0 GiB\n+ Build reserved  6.0 GiB\n+ Free  18.0 GiB'], 'budget': ['RAM  64.0 GiB', 'Memory across this machine\nBuilds  7.0 GiB\n+ Free RAM  30.0 GiB\n+ Everything else  27.0 GiB']})
+        blocks = cast(int, self.page_expression("RAM_BLOCKS.reduce((sum, [, , amount]) => sum + amount(shownReading(data).ram), 0)", {}))
         self.assertEqual(blocks, 64 * GIB)
-        groups = cast(list[int], self.page_expression("['builds', 'free', 'else'].map(group => groupBytes(data.ram, group))", {}))
+        groups = cast(list[int], self.page_expression("['builds', 'free', 'else'].map(group => groupBytes(shownReading(data).ram, group))", {}))
         self.assertEqual(groups, [7 * GIB, 30 * GIB, 27 * GIB])
 
     def test_build_tool_parts_keep_the_displayed_total_and_hide_an_empty_remainder(self) -> None:
@@ -3520,6 +3533,89 @@ renderWalk = reading => { painted = reading; };
         self.assertEqual(list(caption), [])
         reason = next(cell for cell in grid if cell.tag == "dd" and "".join(cell.itertext()) == because)
         self.assertEqual([span.text for span in reason.findall("span")], ["builder"])
+
+    def test_swap_in_ram_uses_the_window_amounts(self) -> None:
+        used, builds, agents, outside, ended = (round(value * GIB) for value in (27.2, 8.2, 12.4, 19.0, 7.9))
+        swap = {**SWAP_FIXTURE, "used_bytes": used, "builds_ci_bytes": builds, "outside_bytes": outside}
+        rows = [{"name": name, "kind": kind, "pool": pool, "bytes": amount, "category": category}
+                for name, kind, pool, amount, category in (
+                    ("All swap used", "total", "all", used, ""),
+                    ("agent sessions (4)", "owner", "outside", agents, "agents"),
+                    ("Left by runs that ended", "ended", "builds_ci", ended, ""),
+                    ("agent sessions (1)", "owner", "builds_ci", builds - ended, "agents"))]
+        result = self.page_expression(
+            "[tipText('zram', data), ...['swap:0', 'swap-pool:builds_ci', 'swap:1', 'swap:2'].map(key => tipText(key, data)[0])]",
+            {"swap": swap, "swap_by": rows})
+        tooltip, total, build, agent, ended_row = cast(tuple[list[str], str, str, str, str], result)
+        self.assertEqual(tooltip[1].splitlines()[1:], [
+            "It holds  27.2 GiB", "agent sessions  12.4 GiB", "+ builds and CI  8.2 GiB",
+            "left by runs that ended  7.9 GiB", "+ all other programs  6.6 GiB"])
+        self.assertEqual([text.split("  ")[1] for text in (total, build, agent, ended_row)],
+                         ["27.2 GiB", "8.2 GiB", "12.4 GiB", "7.9 GiB"])
+
+    def test_swap_in_ram_clamps_other_programs_to_zero(self) -> None:
+        swap = {**SWAP_FIXTURE, "agents_bytes": 3 * GIB}
+        tip = self.page_expression("tipText('zram', data)", {"swap": swap})
+        self.assertIn("+ all other programs  0.0 GiB", str(tip))
+        self.assertIn("agent sessions  3.0 GiB", str(tip))
+        self.assertNotIn("Reading difference", str(tip))
+
+    def test_swap_in_ram_shows_unavailable_owner_values(self) -> None:
+        ram = {**RAM_FIXTURE, "compressed_swap_bytes": None, "zram_original_bytes": None}
+        swap = {name: None for name in SWAP_FIXTURE}
+        tooltip = cast(list[str], self.page_expression("tipText('zram', data)", {"ram": ram, "swap": swap}))
+        self.assertEqual(tooltip[0], "Swap in RAM  unavailable")
+        self.assertEqual(tooltip[1].splitlines()[1:], [
+            "It holds  unavailable", "agent sessions  unavailable", "+ builds and CI  unavailable",
+            "left by runs that ended  unavailable", "+ all other programs  unavailable"])
+
+    def test_swap_in_ram_tooltip_includes_disk_swap(self) -> None:
+        ram = {**RAM_FIXTURE, "zram_original_bytes": 2 * GIB}
+        swap = {**SWAP_FIXTURE, "agents_bytes": GIB}
+        result = self.page_expression("[tipText('zram', data), tipText('g-swap', data)]", {"ram": ram, "swap": swap})
+        tooltip, window = cast(list[list[str]], result)
+        self.assertEqual(tooltip[1].splitlines()[1:],
+                         ["It holds  3.0 GiB", "agent sessions  1.0 GiB",
+                          "+ builds and CI  1.0 GiB", "left by runs that ended  unavailable",
+                          "+ all other programs  1.0 GiB"])
+        self.assertIn("3.0", window[0])
+
+    def test_swap_in_ram_keeps_the_owner_values_when_zram_is_unavailable(self) -> None:
+        ram = {**RAM_FIXTURE, "compressed_swap_bytes": None, "zram_original_bytes": None}
+        swap = {**SWAP_FIXTURE, "agents_bytes": GIB}
+        tip = cast(list[str], self.page_expression("tipText('zram', data)", {"ram": ram, "swap": swap}))
+        self.assertEqual(tip[0], "Swap in RAM  unavailable")
+        self.assertIn("It holds  unavailable", tip[1])
+        self.assertIn("agent sessions  1.0 GiB", tip[1])
+        body = str(self.page_expression("tooltipHtml('zram', data)", {"ram": ram, "swap": swap}, walk=True))
+        cells = list(ElementTree.fromstring(body))
+        holds = next(index for index, cell in enumerate(cells) if cell.tag == "dt" and cell.text == "It holds")
+        self.assertEqual((cells[holds + 1].tag, cells[holds + 1].text), ("dd", "unavailable"))
+
+    def test_swap_warning_reuses_the_rounded_ended_run_row(self) -> None:
+        amounts = [round(share * GIB) for share in (7.94, 1.03, 1.03)]
+        rows: list[dict[str, object]] = [
+            {"name": name, "kind": kind, "pool": "builds_ci", "bytes": amount, "detail": "fixture"}
+            for name, kind, amount in zip(("Left by runs that ended", "a", "b"),
+                ("ended", "owner", "owner"), amounts, strict=True)]
+        swap = {**SWAP_FIXTURE, "used_bytes": sum(amounts), "builds_ci_bytes": sum(amounts), "outside_bytes": 0,
+                "agents_bytes": 0, "builds_used_bytes": 8 * GIB, "builds_limit_bytes": 8 * GIB}
+        result = self.page_expression("(() => { renderSwap(data); return [$('swaprows').innerHTML, "
+            + "$('pressure-reason').textContent, tipText('zram', data)]; })()",
+            {"swap": swap, "swap_by": rows, "pressure": "none", "psi": {"some": 0, "full": 0},
+             "limits": {"some": 1, "full": 1}}, walk=True, swap=True)
+        body, warning, tip = cast(tuple[str, str, list[str]], result)
+        row = ElementTree.fromstring(f"<root>{body}</root>").find(".//div[@data-tip='swap:0']/span[@class='v']")
+        assert row is not None
+        self.assertEqual(row.text, "8.0 GiB")
+        self.assertIn("8.0 GiB is left by runs that ended.", warning)
+        self.assertIn("left by runs that ended  8.0 GiB", str(tip))
+        warning_without_ended_swap = self.page_expression(
+            "(() => { renderSwap(data); return $('pressure-reason').textContent; })()",
+            {"swap": swap, "swap_by": [{**rows[0], "bytes": 0}, *rows[1:]],
+             "pressure": "none", "psi": {"some": 0, "full": 0}, "limits": {"some": 1, "full": 1}},
+            walk=True, swap=True)
+        self.assertEqual(warning_without_ended_swap, "The swap of builds is full: 8.0 of 8.0 GiB.")
 
     def test_swap_rows_use_their_own_text_and_show_one_owner_only(self) -> None:
         def row(name: str, kind: str, amount: int, **extra: object) -> dict[str, object]:

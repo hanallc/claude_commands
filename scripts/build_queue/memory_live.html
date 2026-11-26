@@ -121,6 +121,7 @@ __PAGE_FRAME_STYLE__
 .seg-room { background: var(--room); }
 .seg-programs { background: var(--programs); }
 .seg-kernel { background: var(--kernel); }
+.seg-zram, .sw.zram { background: color-mix(in srgb, var(--agents) 42%, var(--kernel)); }
 .seg-cache { background: var(--cache); }
 .seg-unattributed { background: radial-gradient(circle, var(--ink-3) 1px, transparent 1.4px) 0 0 / 5px 5px, var(--unattributed); }
 .seg-floor { background: var(--floor); }
@@ -168,6 +169,12 @@ __PAGE_FRAME_STYLE__
 .tip .title { font-weight: 700; padding-bottom: 4px; }
 .tip .caption { grid-column: 1 / -1; margin-top: -4px; padding: 0 0 4px; text-align: left; white-space: normal; opacity: 0.7; }
 .tip .group { margin-top: 6px; padding-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); }
+.tip .swap-ended, .swaprows .swap-ended :is(.name, .v), #pressure-reason.swap-full { color: var(--cap); }
+.tip dt.swap-ended { padding-left: 1.4em; }
+@media (min-width: 520px) { .tip dt.swap-ended { white-space: nowrap; } }
+.tip .swap-warning { grid-column: 1 / -1; margin-top: 8px; padding: 8px 0 0; text-align: left;
+  color: var(--cap); font-weight: 600; border-top: 1px solid color-mix(in srgb, currentColor 35%, transparent); }
+#pressure-reason.swap-full { font-weight: 600; }
 .tip .sum { font-weight: 700; }
 .tip .long { grid-column: 1 / -1; padding-left: 0; text-align: left; white-space: normal; opacity: 0.7; }
 .tip:has(dd.call) :is(dt, dd):not(.call, .folder) { white-space: normal; overflow-wrap: anywhere; }
@@ -706,6 +713,7 @@ small .aws-point { cursor: help; }
         <div class="seg-desktop" id="s-desktop" data-tip="desktop"><span class="lbl" id="l-desktop"></span></div>
         <div class="seg-agents" id="s-agents" data-tip="agents"><span class="lbl" id="l-agents"></span></div>
         <div class="seg-programs" id="s-programs" data-tip="programs"><span class="lbl" id="l-programs"></span></div>
+        <div class="seg-zram" id="s-zram" data-tip="zram"><span class="lbl" id="l-zram"></span></div>
         <div class="seg-kernel" id="s-kernel" data-tip="kernel"><span class="lbl" id="l-kernel"></span></div>
         <div class="seg-cache" id="s-cache" data-tip="cache"><span class="lbl" id="l-cache"></span></div>
         <div class="seg-unattributed" id="s-unattributed" data-tip="unattributed"><span class="lbl" id="l-unattributed"></span></div>
@@ -744,7 +752,8 @@ small .aws-point { cursor: help; }
       <div class="row" data-tip="desktop"><span class="sw desktop"></span><span class="name">Desktop</span><span class="v num" id="v-desktop">–</span></div>
       <div class="row" data-tip="agents"><span class="sw agents"></span><span class="name">Agents</span><span class="v num" id="v-agents">–</span></div>
       <div class="row" data-tip="programs"><span class="sw programs"></span><span class="name">Other programs</span><span class="v num" id="v-programs">–</span></div>
-      <div class="row" data-tip="kernel"><span class="sw kernel"></span><span class="name">Kernel</span><span class="v num" id="v-kernel">–</span><span class="note" id="kernel-note" hidden></span></div>
+      <div class="row" data-tip="zram"><span class="sw zram"></span><span class="name">Swap in RAM</span><span class="v num" id="v-zram">–</span></div>
+      <div class="row" data-tip="kernel"><span class="sw kernel"></span><span class="name">Kernel</span><span class="v num" id="v-kernel">–</span></div>
       <div class="row" data-tip="cache"><span class="sw cache"></span><span class="name">File and kernel cache</span><span class="v num" id="v-cache">–</span></div>
       <div class="row" data-tip="unattributed"><span class="sw unattributed"></span><span class="name">Not attributed</span><span class="v num" id="v-unattributed">–</span></div>
      </div>
@@ -886,10 +895,14 @@ const shownReadings = new WeakMap();
 function shownReading(data) {
   if (shownReadings.has(data)) return shownReadings.get(data);
   const ram = {...data.ram};
+  // Measure the kernel from its own counters, including in older readings.
+  if (recorded(ram.kernel_bytes) && recorded(ram.kernel_structures_bytes) && recorded(ram.kernel_counters_bytes)) {
+    ram.kernel_bytes = ram.kernel_structures_bytes + ram.kernel_counters_bytes;
+  }
   const reserves = reserveReadings(ram, data);
   ram.builds_bytes = sumMemory([buildToolBytes(ram), ram.queued_builds_bytes]);
   ram.outside_bytes = sumMemory([ram.desktop_bytes, ram.agents_bytes, ram.other_programs_bytes,
-    ram.kernel_bytes, ram.cache_bytes, ram.unattributed_bytes]);
+    ram.compressed_swap_bytes, ram.kernel_bytes, ram.cache_bytes, ram.unattributed_bytes]);
   const overCapBytes = hasCap(data) ? reserves.build.raw.shortfall - ram.room_bytes : 0;
   const memory = ramBreakdowns(ram, reserves, data, overCapBytes);
   const shown = {...data, ram, reserves, memory, waiters: data.waiters || [], overCapBytes};
@@ -1239,10 +1252,6 @@ function breakdownRows(amount, includeUnavailable = false) {
   return amount.parts.filter(([, child]) => recorded(child.bytes) ||
     (includeUnavailable && child.bytes?.kind === 'ReadingUnavailable')).map(([label, child]) => field(label, child.text));
 }
-function compressedSwapNote(kernel) {
-  const [, swap] = kernel.parts[0];
-  return swap.bytes > 0 ? `Of which compressed swap: ${swap.text}.` : "";
-}
 function ramBreakdowns(ram, reserves, data, overCapBytes) {
   const tools = buildToolBreakdown(ram);
   const runUses = new Map();
@@ -1265,9 +1274,9 @@ function ramBreakdowns(ram, reserves, data, overCapBytes) {
   const programs = memoryBreakdown(ram.other_programs_bytes, [
     ...(ram.programs || []).map(program => [program.name, program.bytes]),
     ...(ram.smaller_program_count ? [[`${ram.smaller_program_count} smaller programs`, ram.smaller_programs_bytes]] : [])]);
+  const zram = memoryBreakdown(ram.compressed_swap_bytes);
   const kernel = memoryBreakdown(ram.kernel_bytes, [
-    ['Compressed swap (zram)', ram.compressed_swap_bytes], ['+ Slab, stacks, page tables', ram.kernel_structures_bytes],
-    ['+ Other kernel counters', ram.kernel_counters_bytes]]);
+    ['Slab, stacks, page tables', ram.kernel_structures_bytes], ['+ Other kernel counters', ram.kernel_counters_bytes]]);
   const unnamed = recorded(ram.unattributed_bytes) && recorded(ram.kernel_no_counter_bytes)
     ? ram.unattributed_bytes - ram.kernel_no_counter_bytes : null;
   const unattributed = memoryBreakdown(ram.unattributed_bytes, [
@@ -1276,7 +1285,7 @@ function ramBreakdowns(ram, reserves, data, overCapBytes) {
   const cache = memoryBreakdown(ram.cache_bytes);
   const outside = memoryBreakdown(ram.outside_bytes, [
     ['Desktop', desktop], ['+ Agents', agents], ['+ Other programs', programs],
-    ['+ Kernel', kernel], ['+ File and kernel cache', cache], ['+ Not attributed', unattributed]]);
+    ['+ Swap in RAM', zram], ['+ Kernel', kernel], ['+ File and kernel cache', cache], ['+ Not attributed', unattributed]]);
   const room = memoryBreakdown(ram.room_bytes);
   const {build, system} = reserves;
   const capAvailable = hasCap(data);
@@ -1292,7 +1301,7 @@ function ramBreakdowns(ram, reserves, data, overCapBytes) {
     ['Builds', builds], [fullReserve ? '+ Full reserve' : '+ Build reserved', reserve]]);
   const overCap = memoryBreakdown(overCapBytes);
   if (overCapBytes > 0) addMemorySum(taken, cap, overCap);
-  return {tools, queued, builds, desktop, agents, programs, kernel, cache, unattributed,
+  return {tools, queued, builds, desktop, agents, programs, zram, kernel, cache, unattributed,
     outside, room, free, cap, taken, overCap, budget, runUses};
 }
 const RESERVES = [
@@ -1789,6 +1798,7 @@ const TIPS = {
     recorded(d.memory.protected.bytes) ? [field('Protected', d.memory.protected.text)] : [], d.memory.desktop.text),
   agents: d => breakdownTip('Agents', d.memory.agents, 'RAM of agent sessions and their tools'),
   programs: d => breakdownTip('Other programs', d.memory.programs, 'RAM of all other programs'),
+  zram: swapInRamTip,
   kernel: d => breakdownTip('Kernel', d.memory.kernel, 'RAM the kernel uses for itself'),
   cache: d => breakdownTip('File and kernel cache', d.memory.cache, 'Estimated cache outside free RAM'),
   unattributed: d => breakdownTip('Not attributed', d.memory.unattributed, 'RAM without an attribution'),
@@ -1818,7 +1828,8 @@ const TIPS = {
   ticks: d => legendTip('Scale', d.ram.total_bytes, 'One scale for both charts',
     [field('Start', '0.0 GiB'), field('Red line', hasCap(d) ? 'queue cap' : '')], d.memory.budget.text),
   swaphead: () => [field('Swap and pressure', '', 'title'), field('Swap', 'memory on disk'), field('Stall', 'waiting for memory')],
-  pill: d => [field('Memory pressure', ({ok:'none',warn:'near a limit',hold:'queue holds',neutral:'unavailable'})[level(d)], 'title')],
+  pill: d => [field('Memory pressure', buildsSwapFull(d) ? 'swap of builds is full'
+    : ({ok:'none',warn:'near a limit',hold:'queue holds',neutral:'unavailable'})[level(d)], 'title')],
   'g-some': d => pressureTip('Some tasks stall', d.psi.some, d.limits.some, 'Memory waits of at least one task'),
   'g-full': d => pressureTip('All tasks stall', d.psi.full, d.limits.full, 'Memory waits of all active tasks'),
   'g-swap': d => {
@@ -1839,7 +1850,8 @@ const RAM_BLOCKS = [
   ["safety", "Safety net", r => r.safety_covered_bytes, "free", "safety"],
   ["swap", "Swap coming back", r => r.swap_covered_bytes, "free", "swap"],
   ["desktop", "Desktop", r => r.desktop_bytes, "else"], ["agents", "Agents", r => r.agents_bytes, "else"],
-  ["programs", "Other programs", r => r.other_programs_bytes, "else"], ["kernel", "Kernel", r => r.kernel_bytes, "else"],
+  ["programs", "Other programs", r => r.other_programs_bytes, "else"],
+  ["zram", "Swap in RAM", r => r.compressed_swap_bytes, "else"], ["kernel", "Kernel", r => r.kernel_bytes, "else"],
   ["cache", "File and kernel cache", r => r.cache_bytes, "else"], ["unattributed", "Not attributed", r => r.unattributed_bytes, "else"],
 ];
 // Bar widths exclude unavailable readings and negative values.
@@ -1920,10 +1932,15 @@ function swapReadings(d, add) {
   const used = add(swapAmount(d.swap?.used_bytes)), capacity = add(swapAmount(d.swap?.capacity_bytes));
   const pools = {builds_ci: add(swapAmount(d.swap?.builds_ci_bytes)), outside: add(swapAmount(d.swap?.outside_bytes))};
   addMemorySum(used, pools.builds_ci, pools.outside);
+  const buildsUsed = add(swapAmount(d.swap?.builds_used_bytes));
+  const buildsLimit = add(swapAmount(d.swap?.builds_limit_bytes));
   const rows = new Map(), members = new Map(), groups = {builds_ci: [], outside: []};
+  let agentRow, endedRow;
   for (const row of d.swap_by ?? []) {
     const amount = row.kind === 'total' && row.bytes === used.bytes ? used : add(swapAmount(row.bytes));
     rows.set(row, amount);
+    if (row.pool === 'outside' && row.category === 'agents') agentRow = amount;
+    if (row.kind === 'ended') endedRow = amount;
     groups[row.pool]?.push(amount);
     const children = (row.members ?? []).map(member => {
       const reading = add(swapAmount(member.bytes));
@@ -1935,7 +1952,34 @@ function swapReadings(d, add) {
   for (const [pool, children] of Object.entries(groups)) {
     if (children.length) addMemorySum(pools[pool], ...children);
   }
-  return {used, capacity, pools, rows, members};
+  const agents = (d.swap?.agents_bytes !== null && agentRow) || add(swapAmount(d.swap?.agents_bytes));
+  const outside = pools.outside.bytes;
+  const otherBytes = recorded(outside) && recorded(agents.bytes) ? Math.max(0, outside - agents.bytes) : null;
+  const other = add(otherBytes === 0 ? memoryBreakdown(0) : swapAmount(otherBytes));
+  const ended = endedRow ?? add(swapAmount(null));
+  return {used, capacity, pools, agents, other, ended, buildsUsed, buildsLimit, rows, members};
+}
+function buildsSwapFull(d) {
+  const used = d.swap?.builds_used_bytes, limit = d.swap?.builds_limit_bytes;
+  return recorded(used) && recorded(limit) && used > 0 && used >= limit;
+}
+function swapLimitWarning(d, display) {
+  if (!buildsSwapFull(d)) return '';
+  const {buildsUsed, buildsLimit, ended} = display;
+  const used = buildsUsed.unit === buildsLimit.unit ? buildsUsed.text.split(' ')[0] : buildsUsed.text;
+  return `The swap of builds is full: ${used} of ${buildsLimit.text}.`
+    + (ended.bytes > 0 ? ` ${ended.text} is left by runs that ended.` : '');
+}
+function swapInRamTip(d) {
+  const display = d.swapDisplay, {used, agents, pools, ended, other} = display;
+  const holds = recorded(d.memory.zram.bytes) ? used.text : 'unavailable';
+  const warning = swapLimitWarning(d, display);
+  return [field('Swap in RAM', d.memory.zram.text, 'title'),
+    field('', 'Memory that nothing used for some time. Linux compresses it and keeps it in RAM.', 'caption'),
+    ...groupRows([field('It holds', holds), field('agent sessions', agents.text),
+      field('+ builds and CI', pools.builds_ci.text), field('left by runs that ended', ended.text, 'swap-ended'),
+      field('+ all other programs', other.text)]),
+    ...(warning ? [field('', warning, 'swap-warning')] : [])];
 }
 function swapRowAmount(row, display) {
   const text = display.rows.get(row).text;
@@ -1945,6 +1989,9 @@ function swapTip(row, display) {
   const captions = {total:'Swap across this machine', difference:'Group readings above the host total',
     unattributed:'Swap without a matching group', ungrouped:'Swap without a program name', smaller:'Swap of the smaller named groups'};
   const amount = swapRowAmount(row, display);
+  if (row.kind === 'ended') {
+    return [field(row.name, amount, 'title'), field('', row.detail, 'caption')];
+  }
   return [row.title_kind === 'staff' ? staffTitle(row.name, amount) : field(row.name, amount, 'title'),
     field('', captions[row.kind] || 'Swap charged to this program', 'caption'),
     ...(row.owner_count === 1 ? groupRows(ownerFields(row)) : [])];
@@ -1968,10 +2015,18 @@ function formatPercent(value, complete = true) {
   return `${((complete ? tenths : Math.min(tenths, 999)) / 10).toFixed(1)}%`;
 }
 function level(d) {
+  if (buildsSwapFull(d)) return "hold";
   if (!recorded(d.psi.some) || !recorded(d.psi.full)) return "neutral";
   if (d.pressure !== "none") return "hold";
   const L = d.limits;
   return (d.psi.some >= L.some * 0.6 || d.psi.full >= L.full * 0.6) ? "warn" : "ok";
+}
+
+function renderPressurePill(d) {
+  const lv = level(d);
+  $("pill").className = `pill ${lv}`;
+  $("pill-t").textContent = buildsSwapFull(d) ? "swap of builds is full"
+    : ({ok:"no memory pressure", warn:"memory pressure near limit", hold:"pressure: queue holds", neutral:"stall not recorded"})[lv];
 }
 
 function macRow(row) {
@@ -2213,7 +2268,7 @@ function tipCellsHtml(rows) {
       : row.kind === 'folder' ? row.value.split(/(?<=\/)(?=.)/).map(segment => `<span>${esc(segment)}</span>`).join('<wbr/>')
       : row.valueParts ? nameParts(row.valueParts) : row.valueStaffNames ? row.valueStaffNames.map(name => staffName(name)).join(', ') : esc(row.value);
     const cell = `<dd${attr}>${value}</dd>`;
-    if (['caption','long'].includes(row.kind)) return cell;
+    if (['caption','long','swap-warning'].includes(row.kind)) return cell;
     const label = row.labelParts ? nameParts(row.labelParts)
       : row.labelStaffName ? staffName(row.labelStaffName) + esc(row.labelSuffix)
       : row.labelRole ? roleLabel(row.labelRole, row.label) : esc(row.label);
@@ -2345,8 +2400,13 @@ function placeTipAt(tip, x, y, fit, anchor) {
   let top = above < inset ? y + 18 : above;
   if (anchor) {
     const bounds = anchor.getBoundingClientRect();
-    left = bounds.right + inset <= rightEdge ? bounds.right + inset : bounds.left - inset - w;
-    top = bounds.top - 4;
+    if (anchor.id === 's-zram') {
+      left = bounds.left - 40;
+      top = bounds.bottom + 10;
+    } else {
+      left = bounds.right + inset <= rightEdge ? bounds.right + inset : bounds.left - inset - w;
+      top = bounds.top - 4;
+    }
   }
   tip.style.left = `${Math.max(inset, Math.min(left, rightEdge))}px`;
   tip.style.top = `${Math.max(inset, Math.min(top, clientHeight - h - inset))}px`;
@@ -2526,7 +2586,7 @@ const tips = hoverTips(tip, key => {
   const host = document.querySelector("dialog[open]") ?? document.body;
   if (tip.parentElement !== host) host.append(tip);
   return currentBuildsTooltip(key);
-}, undefined, trigger => trigger?.classList.contains("move-mark") ? trigger : undefined);
+}, undefined, trigger => trigger?.id === "s-zram" || trigger?.classList.contains("move-mark") ? trigger : undefined);
 const showTip = tips.show, hideTip = tips.hide;
 document.getElementById("pill").addEventListener("click", hideTip);
 function placeTip(x, y) { placeTipAt(tip, x, y); }
@@ -2614,7 +2674,7 @@ function render(d) {
   renderTargets(d.targets || []);
   const shown = shownReading(d), {memory} = shown;
   const {build, system, swap} = shown.reserves;
-  const r = d.ram;
+  const r = shown.ram;
   $("ram-missing").textContent = r.missing.length ? `Missing readings: ${r.missing.join("; ")}.` : "";
   $("ram-missing").hidden = !r.missing.length;
   document.body.classList.remove("queue-unavailable");
@@ -2643,9 +2703,6 @@ function render(d) {
   $("v-cap-reserved").textContent = build.covered.text;
   $("v-system").textContent = system.text;
   $("v-cap").textContent = memory.cap.text;
-  const kernelNote = compressedSwapNote(memory.kernel);
-  $("kernel-note").textContent = kernelNote;
-  $("kernel-note").hidden = !kernelNote;
   $("cap-value").textContent = !hasCap(d) ? "Queue cap unavailable" : `Queue cap ${shown.memory.cap.text}`;
   const freeShown = groupBytes(r, "free");
   const capBytes = hasCap(d) ? d.cap * GIB : 0;
@@ -2864,15 +2921,16 @@ function renderSwap(d) {
   for (const toggle of document.querySelectorAll("#swaprows .pool-toggle")) {
     swapView.set(toggle.dataset.ownerKey, toggle.getAttribute("aria-expanded") === "true");
   }
-  const lv = level(d);
-  $("pill").className = `pill ${lv}`;
-  $("pill-t").textContent = ({ ok: "no memory pressure", warn: "memory pressure near limit", hold: "pressure: queue holds", neutral: "stall not recorded" })[lv];
+  renderPressurePill(d);
   const display = shownReading(d).swapDisplay;
   const {used, capacity} = display;
   const [usedValue, usedUnit] = used.text.split(" ");
   $("swap-sum").textContent = `${usedUnit === capacity.text.split(" ")[1] ? usedValue : used.text} / ${capacity.text}`;
   const missing = Object.values(d.psi).filter(value => value && !recorded(value)).map(value => value.reason);
   if (d.pressure !== "none") missing.unshift(d.pressure);
+  const warning = swapLimitWarning(d, display);
+  if (warning) missing.unshift(warning);
+  $("pressure-reason").classList.toggle("swap-full", Boolean(warning));
   $("pressure-reason").textContent = [...new Set(missing)].join(" · ");
   const g = { some: [d.psi.some, d.limits.some], full: [d.psi.full, d.limits.full] };
   for (const [k, [v, lim]] of Object.entries(g)) {
@@ -2888,9 +2946,13 @@ function renderSwap(d) {
   placeLimitLabels();
   const titleHtml = row => row.title_kind === "staff" ? staffName(row.name) : esc(row.name);
   const detailHtml = row => row.detail_parts ? nameParts(publicParts(row.detail_parts)) : esc(visibleDetail(row));
-  const rowHtml = ({row, index}) => `<div class="row ${row.kind}" data-tip="swap:${index}" data-pool="${row.pool}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller"
+  const rowHtml = ({row, index}) => {
+    const ended = row.kind === 'ended';
+    return `<div class="row ${row.kind}${ended ? " swap-ended" : ""}" data-tip="swap:${index}" data-pool="${row.pool}" data-bytes="${row.bytes}"><span class="name">${row.kind === "smaller"
     ? `<details data-owner-key="smaller:${esc(row.pool)}"><summary><span class="chev">▶</span>${esc(row.name)}</summary><div class="swap-members">${row.members.map(member => `<div>${titleHtml(member)}: ${display.members.get(member).text}</div>`).join("")}</div></details>`
-    : titleHtml(row)}</span><span class="v">${swapRowAmount(row, display)}</span><small>${row.kind === "owner" && visibleDetail(row) !== row.name ? detailHtml(row) : ""}</small></div>`;
+    : titleHtml(row)}</span><span class="v">${swapRowAmount(row, display)}</span><small>${ended ? detailHtml(row)
+      : row.kind === "owner" && visibleDetail(row) !== row.name ? detailHtml(row) : ""}</small></div>`;
+  };
   const indexed = d.swap_by.map((row, index) => ({row, index}));
   const pools = [["outside", "Outside builds and CI"], ["builds_ci", "Builds and CI"]];
   $("swaprows").innerHTML = pools.map(([pool, name]) => {
@@ -4219,10 +4281,7 @@ async function tick(supersede=false,current=()=>true) {
       || killInfo.results.length || pendingKills.size)) void refreshKill();
   if (d.report_version !== reportVersion) await loadReport(d.report_version,current);
   if (!current() || paused) return;
-  const lv=level(latest);
-  $("pill").className=`pill ${lv}`;
-  $("pill-t").textContent=({ok:"no memory pressure",warn:"memory pressure near limit",
-    hold:"pressure: queue holds",neutral:"stall not recorded"})[lv];
+  renderPressurePill(latest);
   return {readAt:d.read_at,answeredAt:d.fresh_until,renderSeconds:d.render_seconds,
     failure:d.read_error ? "The queue did not answer." : ""};
 }

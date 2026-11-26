@@ -2900,6 +2900,207 @@ const refresh = createPageRefresh(tick);
         _ = (self.root / "proc/meminfo").write_text(
             f"SwapTotal: {total // 1024} kB\nSwapFree: {(total - used) // 1024} kB\n")
 
+    def test_swap_counts_empty_leaves_and_removed_groups_as_ended(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(12 * gib, 10 * gib)
+        _ = self.cgroup("builds.slice", 8 * gib)
+        live = self.cgroup("builds.slice/live.scope", 3 * gib)
+        empty = self.cgroup("builds.slice/empty.scope", gib)
+        _ = (live / "cgroup.events").write_text("populated 1\n")
+        _ = (empty / "cgroup.events").write_text("populated 0\n")
+        _ = self.cgroup("hana.slice", 2 * gib)
+        ci = self.cgroup("hana.slice/job.scope", gib)
+        _ = (ci / "cgroup.events").write_text("populated 1\n")
+        reading = memory_feed.read_swap((), {}, 6, read_step_names())
+        assert isinstance(reading, memory_feed.SwapReading)
+        self.assertEqual(reading.builds_ci, 10 * gib)
+        self.assertEqual({row["name"]: row["bytes"] for row in reading.rows if row["pool"] == "builds_ci"}, {
+            "live": 3 * gib, "hana CI": gib, "Left by runs that ended": 6 * gib})
+
+    def test_swap_keeps_the_saved_difference_out_of_the_ended_amount(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 5 * gib)
+        _ = self.cgroup("builds.slice", 4 * gib)
+        live = self.cgroup("builds.slice/live.scope", 3 * gib)
+        _ = (live / "cgroup.events").write_text("populated 1\n")
+        host = memory_feed.RecordedHostSwap(5 * gib, 8 * gib, 5 * gib)
+        reading = memory_feed.read_swap((), {}, 6, read_step_names(), host)
+        assert isinstance(reading, memory_feed.SwapReading)
+        self.assertEqual({row["name"]: row["bytes"] for row in reading.rows if row["pool"] == "builds_ci"}, {
+            "live": 3 * gib, "Left by runs that ended": gib, "Not attributed": gib})
+
+    def test_swap_rows_add_up_to_the_live_and_saved_builds_subtotals(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 4 * gib)
+        _ = self.cgroup("builds.slice", 4 * gib)
+        _ = self.cgroup("builds.slice/nested.slice", 6 * gib)
+        first = self.cgroup("builds.slice/nested.slice/first.scope", 3 * gib)
+        second = self.cgroup("builds.slice/nested.slice/second.scope", 2 * gib)
+        for live in (first, second):
+            _ = (live / "cgroup.events").write_text("populated 1\n")
+        saved = memory_feed.RecordedHostSwap(4 * gib, 8 * gib, 3 * gib)
+        names = read_step_names()
+        for host, subtotal, difference in ((memory_feed.LIVE_HOST_SWAP, 4 * gib, None), (saved, 3 * gib, -gib)):
+            with self.subTest(host=host):
+                reading = memory_feed.read_swap((), {}, 6, names, host)
+                assert isinstance(reading, memory_feed.SwapReading)
+                rows = [row for row in reading.rows if row["pool"] == "builds_ci"]
+                self.assertEqual((sum(row["bytes"] for row in rows), reading.builds_ci), (subtotal, subtotal))
+                self.assertEqual([row["bytes"] for row in rows if row["kind"] == "owner"], [3 * gib, 2 * gib])
+                self.assertEqual([row["bytes"] for row in rows if row["kind"] == "ended"], [gib])
+                self.assertEqual([row["bytes"] for row in rows if row["kind"] == "difference"],
+                                 [] if difference is None else [difference])
+
+    def test_swap_keeps_the_same_category_in_separate_pools(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 5 * gib)
+        _ = self.cgroup("system.slice", 3 * gib)
+        _ = self.cgroup("user.slice", 2 * gib)
+        _ = self.cgroup("user.slice/builds.slice", 2 * gib)
+        empty = self.cgroup("user.slice/builds.slice/system.slice", 2 * gib)
+        names = read_step_names()
+        saved = memory_feed.RecordedHostSwap(5 * gib, 8 * gib, 2 * gib)
+
+        for populated, expected_builds in ((0, [("", "ended", 2 * gib)]),
+                                            (1, [("system", "owner", 2 * gib), ("", "ended", 0)])):
+            _ = (empty / "cgroup.events").write_text(f"populated {populated}\n")
+            for host in (memory_feed.LIVE_HOST_SWAP, saved):
+                with self.subTest(host=host, populated=populated):
+                    reading = memory_feed.read_swap((), {}, 6, names, host)
+                    assert isinstance(reading, memory_feed.SwapReading)
+                    outside = [row for row in reading.rows if row["pool"] == "outside"]
+                    builds = [row for row in reading.rows if row["pool"] == "builds_ci"]
+                    self.assertEqual(reading.builds_ci, 2 * gib)
+                    self.assertEqual(sum(row["bytes"] for row in outside), reading.used - reading.builds_ci)
+                    self.assertEqual(sum(row["bytes"] for row in builds), reading.builds_ci)
+                    self.assertEqual([(row["category"], row["kind"], row["bytes"]) for row in outside],
+                                     [("system", "owner", 3 * gib)])
+                    self.assertEqual([(row["category"], row["kind"], row["bytes"]) for row in builds], expected_builds)
+
+    def test_swap_leaves_a_group_with_unreadable_events_out_of_the_ended_amount(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 4 * gib)
+        _ = self.cgroup("hana.slice", 4 * gib)
+        empty = self.cgroup("hana.slice/empty.scope", gib)
+        _ = (empty / "cgroup.events").write_text("populated 0\n")
+        _ = self.cgroup("hana.slice/unknown.scope", 2 * gib)
+        reading = memory_feed.read_swap((), {}, 6, read_step_names())
+        assert isinstance(reading, memory_feed.SwapReading)
+        self.assertEqual(reading.event_reads, 2)
+        self.assertEqual({row["name"]: row["bytes"] for row in reading.rows if row["pool"] == "builds_ci"}, {
+            "hana CI": 2 * gib, "Left by runs that ended": 2 * gib})
+
+    def test_swap_reads_events_once_for_each_positive_build_leaf(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 4 * gib)
+        builds = self.cgroup("builds.slice", 3 * gib)
+        live = self.cgroup("builds.slice/live.scope", gib)
+        zero = self.cgroup("builds.slice/zero.scope", 0)
+        outside = self.cgroup("system.slice", gib)
+        _ = (live / "cgroup.events").write_text("populated 1\n")
+        original = Path.read_text
+        reads: Counter[Path] = Counter()
+        names = read_step_names()
+
+        def read(path: Path, *args: str, **kwargs: str) -> str:
+            reads[path] += 1
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", new=read):
+            reading = memory_feed.read_swap((), {}, 6, names)
+        assert isinstance(reading, memory_feed.SwapReading)
+        self.assertEqual({path: count for path, count in reads.items() if path.name == "cgroup.events"},
+                         {live / "cgroup.events": 1})
+        self.assertEqual(reading.event_reads, 1)
+        for group in (builds, live, zero, outside):
+            self.assertEqual(reads[group / "memory.swap.current"], 1)
+        self.assertEqual(next(row["bytes"] for row in reading.rows if row["name"] == "Left by runs that ended"),
+                         2 * gib)
+
+    def test_swap_summary_reads_the_builds_limit_and_counts_agents_and_ended_runs(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(39 * gib, 27 * gib)
+        builds = self.cgroup("builds.slice", 8 * gib)
+        _ = (builds / "memory.swap.max").write_text(str(8 * gib))
+        run = self.cgroup("builds.slice/run.scope", gib)
+        ci = self.cgroup("hana.slice", gib)
+        for path in (run, ci):
+            _ = (path / "cgroup.events").write_text("populated 1\n")
+        _ = self.cgroup("app-agents.slice", 12 * gib)
+        _ = self.cgroup("system.slice", 6 * gib)
+        reading = captured_reading()
+        inputs = reading.explanation.decided_from
+        host = replace(inputs.host, swap_total=39 * gib, swap_free=12 * gib, build_and_ci_swap=9 * gib)
+        reading = replace(reading, explanation=replace(reading.explanation, decided_from=replace(inputs, host=host)))
+        with (mock.patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(builds)}),
+              mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading))):
+            page = memory_feed.reading()
+        swap = page["swap"]
+        self.assertEqual({name: swap.get(name) for name in (
+            "used_bytes", "agents_bytes", "builds_ci_bytes", "outside_bytes",
+            "builds_used_bytes", "builds_limit_bytes")}, {
+            "used_bytes": 27 * gib, "agents_bytes": 12 * gib, "builds_ci_bytes": 9 * gib, "outside_bytes": 18 * gib,
+            "builds_used_bytes": 8 * gib, "builds_limit_bytes": 8 * gib})
+        ended, = (row for row in page["swap_by"] if row["kind"] == "ended")
+        self.assertEqual(ended["bytes"], 7 * gib)
+
+    def test_swap_leaves_a_remainder_unclassified_when_a_running_counter_is_unreadable(self) -> None:
+        gib = admission_records.GIB
+        self.host_swap(8 * gib, 4 * gib)
+        builds = self.cgroup("builds.slice", 4 * gib)
+        scope = self.cgroup("builds.slice/run.scope", gib)
+        _ = (scope / "memory.swap.current").write_text("unreadable")
+        reading = reservation_reading()
+        running, = reading.view.running
+        measured = running.measured
+        assert isinstance(measured, admission_records.MeasuredMemory)
+        running = replace(running, measured=replace(measured, anonymous_source=admission_records.ScopeSource(scope, frozenset())))
+        reading = replace(reading, view=replace(reading.view, running=(running,)))
+        with (mock.patch.dict(os.environ, {"BUILDLOG_BUILDS_CGROUP": str(builds)}),
+              mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading))):
+            page = memory_feed.reading()
+        row, = (row for row in page["swap_by"] if row["kind"] == "ungrouped")
+        self.assertEqual((row["name"], row["bytes"]), ("Unclassified groups", 4 * gib))
+        self.assertFalse(any(row["kind"] == "ended" for row in page["swap_by"]))
+
+    def test_swap_keeps_saved_host_totals_and_the_live_fallback(self) -> None:
+        gib = admission_records.GIB
+        self.ram_fixture()
+        self.host_swap(16 * gib, 12 * gib)
+        builds = self.cgroup("builds.slice", 3 * gib)
+        _ = (builds / "cgroup.events").write_text("populated 1\n")
+        _ = self.cgroup("app-agents.slice", 6 * gib)
+        original = Path.read_bytes
+        reads: list[Path] = []
+        meminfo = self.root / "proc/meminfo"
+
+        def read(path: Path) -> bytes:
+            if path == meminfo:
+                reads.append(path)
+            return original(path)
+
+        for saved, used, reads_expected in ((2 * gib, 4 * gib, 1),
+                (admission_records.ReadingUnavailable("fixture"), 12 * gib, 2)):
+            host = admission_records.HostMemory(30 * gib, 60 * gib, 16 * gib, 12 * gib, build_and_ci_swap=2 * gib)
+            reading = captured_reading(host=host)
+            explanation = reading.explanation
+            inputs = replace(explanation.decided_from, host=replace(host, build_and_ci_swap=saved))
+            reading = replace(reading, explanation=replace(explanation, decided_from=inputs))
+            reads.clear()
+            with (self.subTest(saved=saved),
+                  mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)),
+                  mock.patch.object(Path, "read_bytes", new=read)):
+                page = memory_feed.reading()
+                swap = page["swap"]
+                self.assertEqual((swap["used_bytes"], swap["agents_bytes"]), (used, 6 * gib))
+                self.assertEqual(swap["builds_ci_bytes"], saved if isinstance(saved, int) else 3 * gib)
+                self.assertEqual(page["swap_by"][-1]["bytes"], used)
+                build_rows = {row["kind"]: row["bytes"] for row in page["swap_by"] if row["pool"] == "builds_ci"}
+                self.assertEqual(build_rows["ended"], 0)
+                self.assertEqual(build_rows.get("difference"), -gib if isinstance(saved, int) else None)
+                self.assertEqual(page["ram"]["compressed_swap_bytes"], 3 * gib)
+                self.assertEqual(reads, [meminfo] * reads_expected)
+
     def test_swap_accounts_for_the_host_and_names_the_agent_owner_once(self) -> None:
         self.host_swap(32 * admission_records.GIB, 20 * admission_records.GIB)
         _ = self.cgroup("user.slice", 16 * admission_records.GIB)
@@ -3094,16 +3295,19 @@ const refresh = createPageRefresh(tick);
         self.assertTrue(all("between steps" in row["detail"] for row in swap.rows if row["kind"] == "owner"))
         self.assertTrue(all(row.get("title_kind") == "staff" for row in swap.rows if row["kind"] == "owner"))
 
-    def test_swap_leaves_detached_tool_scope_remainder_unclassified(self) -> None:
+    def test_swap_keeps_a_running_detached_tool_out_of_ended_swap(self) -> None:
         gib = admission_records.GIB
         self.host_swap(8 * gib, 4 * gib)
         builds = self.cgroup("builds.slice", 4 * gib)
         detached = "builds.slice/builds-detached.slice"
         _ = self.cgroup(detached, 4 * gib)
-        parent = self.cgroup(detached + "/tool.scope", 4 * gib)
-        child = self.cgroup(detached + "/tool.scope/cargo.scope", gib)
-        tool = admission_records.RunningStep("tool-owner", "tool owner", "between steps", str(parent), 0,
-            admission_records.UnownedSliceMemory(gib, cgroup=str(parent), pid=700001), pid=700001)
+        _ = self.cgroup(detached + "/tool.slice", 4 * gib)
+        child = self.cgroup(detached + "/tool.slice/cargo.scope", gib)
+        tool_scope = self.cgroup(detached + "/tool.slice/tool.scope", 3 * gib)
+        _ = (child / "cgroup.events").write_text("populated 1\n")
+        _ = (tool_scope / "cgroup.events").write_text("populated 1\n")
+        tool = admission_records.RunningStep("tool-owner", "tool owner", "between steps", str(tool_scope), 0,
+            admission_records.UnownedSliceMemory(gib, cgroup=str(tool_scope), pid=700001), pid=700001)
         cargo = reservation_reading().view.running[0]
         memory = cargo.measured
         assert isinstance(memory, admission_records.MeasuredMemory)
@@ -3114,9 +3318,11 @@ const refresh = createPageRefresh(tick);
             swap = memory_feed.read_swap((tool, cargo), {}, 6, names)
         assert isinstance(swap, memory_feed.SwapReading)
         self.assertEqual(swap, baseline)
-        remainder, = (row for row in swap.rows if row["kind"] == "ungrouped")
-        self.assertEqual((remainder["name"], remainder["bytes"]), ("Unclassified groups", 3 * gib))
-        owner, = (row for row in swap.rows if row["kind"] == "owner")
+        ended, = (row for row in swap.rows if row["name"] == "Left by runs that ended")
+        self.assertEqual(ended["bytes"], 0)
+        unregistered, = (row for row in swap.rows if row["name"] == "tool")
+        self.assertEqual(unregistered["bytes"], 3 * gib)
+        owner, = (row for row in swap.rows if row["kind"] == "owner" and row["name"] != "tool")
         self.assertEqual(owner["bytes"], gib)
         self.assertEqual(swap.builds_ci, 4 * gib)
 
@@ -5297,14 +5503,14 @@ const refresh = createPageRefresh(tick);
                 self.assertEqual(blocks["programs"], [{"id": "chrome", "name": "Chrome", "bytes": 3 * gib}])
                 self.assertEqual((blocks["smaller_program_count"], blocks["smaller_programs_bytes"]), (1, gib))
                 self.assertEqual(blocks["other_programs_bytes"], 4 * gib)
-                self.assertEqual((blocks["kernel_bytes"], blocks["cache_bytes"]), (6 * gib, 4 * gib))
+                self.assertEqual((blocks["kernel_bytes"], blocks["cache_bytes"]), (3 * gib, 4 * gib))
                 self.assertEqual((blocks["compressed_swap_bytes"], blocks["kernel_structures_bytes"],
                                   blocks["kernel_counters_bytes"], blocks["kernel_no_counter_bytes"]),
                                  (3 * gib, 2 * gib, gib, gib))
                 shown = (blocks["queued_builds_bytes"] + blocks["build_tools_bytes"]
                          + blocks["build_covered_bytes"] + blocks["room_bytes"]
                          + blocks["safety_covered_bytes"] + gib * 3 // 2 + blocks["swap_covered_bytes"] + 5 * gib
-                         + blocks["other_programs_bytes"] + 6 * gib + 4 * gib + blocks["unattributed_bytes"])
+                         + blocks["other_programs_bytes"] + 3 * gib + 3 * gib + 4 * gib + blocks["unattributed_bytes"])
                 self.assertEqual(shown, 64 * gib)
                 self.assertEqual((blocks["missing"], blocks["agreement"]), ([], "agree"))
 
@@ -5312,18 +5518,46 @@ const refresh = createPageRefresh(tick);
         gib = admission_records.GIB
         self.ram_fixture()
         values = memory_feed.meminfo_bytes()
-        self.assertEqual(memory_feed.kernel_ram(values), memory_feed.KernelRam(3 * gib, 2 * gib, gib, gib))
+        self.assertEqual(memory_feed.kernel_ram(values), memory_feed.KernelRam(3 * gib, 2 * gib, gib, gib, 9 * gib))
         mm_stat = self.root / "sys" / "block" / "zram0" / "mm_stat"
         mm_stat.unlink()
         mm_stat.parent.rmdir()
-        self.assertEqual(memory_feed.kernel_ram(values), memory_feed.KernelRam(0, 2 * gib, gib, 4 * gib))
+        self.assertEqual(memory_feed.kernel_ram(values), memory_feed.KernelRam(0, 2 * gib, gib, 4 * gib, 0))
         mm_stat.parent.mkdir()
         _ = mm_stat.write_text("9\n")
         kernel = memory_feed.kernel_ram(values)
-        self.assertIsInstance(kernel.total, admission_records.ReadingUnavailable)
+        self.assertEqual(kernel.total, 3 * gib)
+        self.assertIsInstance(kernel.compressed_swap, admission_records.ReadingUnavailable)
         self.assertEqual(kernel.no_counter, 0)
         (self.root / "proc" / "vmstat").unlink()
         self.assertIsInstance(memory_feed.kernel_ram(values).counters, admission_records.ReadingUnavailable)
+
+    def test_ram_blocks_show_swap_in_ram_outside_the_kernel(self) -> None:
+        self.ram_fixture()
+        gib = admission_records.GIB
+        blocks = memory_feed.ram_blocks(self.fixture_room(20 * gib), memory_feed.BuildToolRam(0, 0, 0), 100.0, 6)
+        self.assertEqual((blocks["compressed_swap_bytes"], blocks["kernel_bytes"], blocks["kernel_no_counter_bytes"]),
+                         (3 * gib, 3 * gib, gib))
+        physical, kernel = blocks["compressed_swap_bytes"], blocks["kernel_bytes"]
+        assert isinstance(physical, int) and isinstance(kernel, int)
+        self.assertEqual(physical + kernel, 6 * gib)
+
+    def test_ram_blocks_read_zram_original_and_physical_bytes_from_one_read(self) -> None:
+        self.ram_fixture()
+        gib = admission_records.GIB
+        path = self.root / "sys" / "block" / "zram0" / "mm_stat"
+        original = Path.read_text
+        reads: list[Path] = []
+
+        def read(source: Path) -> str:
+            if source == path:
+                reads.append(source)
+            return original(source)
+
+        with mock.patch.object(Path, "read_text", new=read):
+            blocks = memory_feed.ram_blocks(self.fixture_room(20 * gib), memory_feed.BuildToolRam(0, 0, 0), 100.0, 6)
+        self.assertEqual(reads, [path])
+        self.assertEqual((blocks.get("zram_original_bytes"), blocks["compressed_swap_bytes"]), (9 * gib, 3 * gib))
 
     def test_ram_blocks_name_a_missing_reading_and_a_disagreement(self) -> None:
         gib = admission_records.GIB
@@ -6345,6 +6579,10 @@ class BuildsPageProofTests(unittest.TestCase):
         self.assertEqual(verdict.get("rows"), 2)
         self.assertTrue((directory / "i390-page-after-dark.png").is_file())
 
+    def test_swap_in_ram_shows_the_owners_and_the_builds_swap_limit(self) -> None:
+        _, verdict = self.run_page_proof(gate=True, mode="--swap-in-ram")
+        self.assertEqual(verdict.get("proof"), "Swap in RAM")
+
 
 def machine_icons(row: str) -> list[tuple[str, str]]:
     """Return the state and name of each machine in the Machine cell of one rendered table row.
@@ -6593,7 +6831,8 @@ def write_browser_fixture(folder: Path) -> None:
             + "SUnreclaim: 524288 kB\nKernelStack: 131072 kB\nPageTables: 131072 kB\n"
             + "SecPageTables: 0 kB\nPercpu: 32768 kB\nVmallocUsed: 32768 kB\n"
             + "Active(anon): 12582912 kB\nInactive(anon): 12582912 kB\n"
-            + "Active(file): 2097152 kB\nInactive(file): 2097152 kB\nUnevictable: 0 kB\n")
+            + "Active(file): 2097152 kB\nInactive(file): 2097152 kB\nUnevictable: 0 kB\n"
+            + "SwapTotal: 8388608 kB\nSwapFree: 4194304 kB\n")
         _ = (fixture.root / "proc/vmstat").write_text("nr_memmap_pages 32768\n")
         cpu = memory_feed.OutsideCpuReadings()
         with (mock.patch.dict(os.environ, outside_queue_fixture_groups(fixture.root)),

@@ -48,7 +48,7 @@ from scripts.build_queue import admission_code
 # Preserve the schema check across the imports below.
 ADMISSION_VERSION_AT_IMPORT = admission_code.admission_code_version(installed.code_root / "scripts")
 
-from scripts.buildlog import aws_costs, charts, cost_actions, index, mac_idle, mac_idle_alert, machine_facts, parse
+from scripts.buildlog import aws_costs, cgroup_capture, charts, cost_actions, index, mac_idle, mac_idle_alert, machine_facts, parse
 from scripts.buildlog.store import host_name, root
 from scripts.build_queue import progress_profile as progress
 from scripts.build_queue import snapshot_codec as codec
@@ -168,6 +168,7 @@ SWAP_NAMES = {
     "difference_detail": "The named cgroup readings exceed the pool swap.",
     "host": "SwapTotal minus SwapFree from {path}",
     "recorded": "SwapTotal minus SwapFree in the recorded admission reading",
+    "ended": "Left by runs that ended",
 }
 SwapCategory = Literal["agents", "desktop", "system", "ci", ""]
 SWAP_OWNER_SLICES: dict[str, SwapCategory] = {"app-agents.slice": "agents", "session.slice": "desktop",
@@ -175,7 +176,7 @@ SWAP_OWNER_SLICES: dict[str, SwapCategory] = {"app-agents.slice": "agents", "ses
 SwapPool = Literal["outside", "builds_ci"]
 SWAP_POOLS: tuple[SwapPool, ...] = ("outside", "builds_ci")
 BUILDS_CI_SLICES = frozenset({"builds.slice", "hana.slice", "hana-ci.slice"})
-SwapRowKind = Literal["owner", "ungrouped", "unattributed", "difference", "smaller", "total"]
+SwapRowKind = Literal["owner", "ungrouped", "unattributed", "difference", "smaller", "total", "ended"]
 SwapTitleKind = Literal["staff", "program"]
 
 
@@ -1024,6 +1025,10 @@ class SwapReading:
     builds_ci: int
     rows: list[SwapRow]
     files_read: int
+    builds_used: int | None
+    builds_limit: int | None
+    agents: int | None
+    event_reads: int
 
 
 def public_owner_name(name: str, session: str = "") -> str:
@@ -1256,6 +1261,9 @@ class SwapTotals(TypedDict):
     capacity_bytes: int
     builds_ci_bytes: int
     outside_bytes: int
+    agents_bytes: int | None
+    builds_used_bytes: int | None
+    builds_limit_bytes: int | None
     reserve_share_percent: int
     # Swap-in within the window, at most the swap outside builds and CI.
     swap_in_window_bytes: int
@@ -2082,8 +2090,12 @@ class SwapReadingPass:
         self.owners: Mapping[Path, SwapOwner] = owners
         self.owner_ancestors: set[Path] = {parent for owner in owners for parent in owner.parents}
         self.counters: dict[Path, int | SwapUnavailable] = {}
-        self.rows: dict[str, SwapRow] = {}
-        self.agent_count: int = 0
+        self.rows: dict[tuple[SwapPool, str], SwapRow] = {}
+        self.agent_counts: Counter[SwapPool] = Counter()
+        self.ended_build_rows: dict[tuple[SwapPool, str], int] = {}
+        self.build_leaf_seen: bool = False
+        self.build_swap_readable: bool = True
+        self.event_reads: int = 0
 
     def counter(self, path: Path) -> int | SwapUnavailable:
         if path not in self.counters:
@@ -2091,6 +2103,8 @@ class SwapReadingPass:
                 self.counters[path] = int((path / "memory.swap.current").read_text())
             except (OSError, ValueError):
                 self.counters[path] = SwapUnavailable(SWAP_NAMES["unavailable"].format(path=path / "memory.swap.current"))
+                if swap_pool(path) == "builds_ci":
+                    self.build_swap_readable = False
         return self.counters[path]
 
     def children(self, path: Path) -> list[Path]:
@@ -2098,35 +2112,86 @@ class SwapReadingPass:
             with os.scandir(path) as entries:
                 return sorted(Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False))
         except OSError:
+            if swap_pool(path) == "builds_ci":
+                self.build_swap_readable = False
             return []
+
+    def build_subtree(self, path: Path, counter: int | SwapUnavailable, children: list[Path]) -> tuple[int, int]:
+        """Read the total and ended swap below a single displayed row."""
+        if children:
+            child_total = ended = 0
+            for child in children:
+                total, child_ended = self.build_subtree(child, self.counter(child), self.children(child))
+                child_total += total
+                ended += child_ended
+            if isinstance(counter, int):
+                return counter, ended + max(0, counter - child_total)
+            return child_total, ended
+        self.build_leaf_seen = True
+        if not isinstance(counter, int) or counter <= 0:
+            return 0, 0
+        self.event_reads += 1
+        try:
+            events = (path / "cgroup.events").read_text().splitlines()
+        except (OSError, UnicodeError):
+            return counter, 0
+        return counter, counter if any(event.split() == ["populated", "0"] for event in events) else 0
+
+    def ended_build_swap(self) -> SwapRow | None:
+        if not self.build_leaf_seen or not self.build_swap_readable:
+            return None
+        # See Documentation/admin-guide/cgroup-v2.rst, "Memory Ownership" and "No Internal Process Constraint".
+        # A charge stays with the cgroup that allocated it.
+        # A cgroup that enables memory for its children has no processes of its own.
+        # Use the swap in empty leaves and the positive parent remainders from this pass.
+        ended = sum(self.ended_build_rows.values())
+        for key, amount in self.ended_build_rows.items():
+            row = self.rows[key]
+            remaining = row["bytes"] - amount
+            if remaining:
+                row["bytes"], row["swap"] = remaining, gib(remaining)
+            else:
+                del self.rows[key]
+        return swap_row(SWAP_NAMES["ended"], "no running job owns it", ended, "builds_ci", "ended")
+
+    def agents_swap(self) -> int | None:
+        agents = [counter for path, counter in self.counters.items()
+                  if SWAP_OWNER_SLICES.get(path.name) == "agents" and swap_pool(path) == "outside"]
+        if not agents or any(isinstance(counter, SwapUnavailable) for counter in agents):
+            return None
+        row = self.rows.get(("outside", "agents"))
+        return row["bytes"] if row is not None else 0
 
     def add(self, key: str, name: str, path: Path, detail: str, amount: int,
             kind: Literal["owner", "ungrouped"] = "owner", category: SwapCategory = "", *,
-            detail_parts: Sequence[staff_names.NamePart] = ()) -> None:
-        if not amount:
+            detail_parts: Sequence[staff_names.NamePart] = (), ended_swap: int = 0) -> None:
+        if not amount and not ended_swap:
             return
         pool = swap_pool(path)
-        key = f"{key}:{pool}" if kind == "ungrouped" else key
-        if key in self.rows:
-            row = self.rows[key]
+        row_key = (pool, key)
+        if ended_swap:
+            self.ended_build_rows[row_key] = self.ended_build_rows.get(row_key, 0) + ended_swap
+        if row_key in self.rows:
+            row = self.rows[row_key]
             row["bytes"] += amount
             row["swap"] = gib(row["bytes"])
             row["detail"] += "; " + detail
             if "detail_parts" in row:
                 row["detail_parts"].extend([*staff_names.text_parts("; "), *detail_parts])
             return
-        self.rows[key] = swap_row(name, detail, amount, pool, kind, category)
+        row = swap_row(name, detail, amount, pool, kind, category)
+        self.rows[row_key] = row
         if detail_parts:
-            self.rows[key]["detail_parts"] = list(detail_parts)
+            row["detail_parts"] = list(detail_parts)
         owner = self.owners.get(Path(key))
         if owner is not None:
             identity = page_owner_labels(owner.identity)
-            self.rows[key]["showrunner"] = identity["showrunner"]
-            self.rows[key]["unit"] = owner.identity.unit
-            self.rows[key]["owner_count"] = 1
-            self.rows[key]["title_kind"] = owner.title_kind
+            row["showrunner"] = identity["showrunner"]
+            row["unit"] = owner.identity.unit
+            row["owner_count"] = 1
+            row["title_kind"] = owner.title_kind
         elif key == "ci":
-            self.rows[key]["ci_label"] = SWAP_NAMES["ci"]
+            row["ci_label"] = SWAP_NAMES["ci"]
 
     def visit(self, path: Path) -> int:
         counter = self.counter(path)
@@ -2135,38 +2200,50 @@ class SwapReadingPass:
         if path.name.startswith("session-") and path.name.endswith(".scope"):
             category = "desktop"
         leaf = path in self.owners or bool(category) or path.parent.name in ("app.slice", "background.slice")
-        children = self.children(path) if not leaf or nested_owner or category == "agents" else []
+        walk_children = not leaf or nested_owner or category == "agents"
+        pool = swap_pool(path)
+        in_builds = pool == "builds_ci"
+        subgroups = self.children(path) if walk_children or in_builds else []
+        children = subgroups if walk_children else []
+        ended_swap = 0
+        if in_builds and (not children or (leaf and not nested_owner)):
+            _, ended_swap = self.build_subtree(path, counter, subgroups)
         charged = 0
         shown = str(path.relative_to(CGROUP))
         if category == "agents":
-            self.agent_count += sum(child.name.endswith(".scope") for child in children)
+            self.agent_counts[pool] += sum(child.name.endswith(".scope") for child in children)
         if path in self.owners and not nested_owner:
             owner = self.owners[path]
             if isinstance(counter, int):
                 parts = [*owner.detail, *staff_names.text_parts(" · " + shown)]
-                self.add(str(path), owner.name, path, staff_names.parts_text(parts), counter, detail_parts=parts)
+                self.add(str(path), owner.name, path, staff_names.parts_text(parts), counter,
+                         detail_parts=parts, ended_swap=ended_swap)
         elif category and not nested_owner:
             if isinstance(counter, int):
-                self.add(category, SWAP_NAMES[category], path, shown, counter, category=category)
+                self.add(category, SWAP_NAMES[category], path, shown, counter, category=category, ended_swap=ended_swap)
         elif path.parent.name in ("app.slice", "background.slice") and not nested_owner:
             if isinstance(counter, int):
                 app = program_name(path)
                 name = codec.select_queue_name(codec.format_queue_name(SWAP_NAMES["apps"], app=app))
-                self.add(str(path), name, path, shown, counter)
+                self.add(str(path), name, path, shown, counter, ended_swap=ended_swap)
         elif children:
             charged = sum(self.visit(child) for child in children)
             if isinstance(counter, int):
+                remainder = counter - charged
+                ended_swap = max(0, remainder) if in_builds else 0
                 if path in self.owners:
                     owner = self.owners[path]
-                    self.add(str(path), owner.name, path, staff_names.parts_text(owner.detail), counter - charged,
-                             detail_parts=owner.detail)
+                    self.add(str(path), owner.name, path, staff_names.parts_text(owner.detail), remainder,
+                             detail_parts=owner.detail, ended_swap=ended_swap)
                 elif category:
-                    self.add(category, SWAP_NAMES[category], path, shown, counter - charged, category=category)
+                    self.add(category, SWAP_NAMES[category], path, shown, remainder, category=category,
+                             ended_swap=ended_swap)
                 else:
-                    self.add("ungrouped", SWAP_NAMES["ungrouped"], path, shown, counter - charged, "ungrouped")
+                    self.add("ungrouped", SWAP_NAMES["ungrouped"], path, shown, remainder, "ungrouped",
+                             ended_swap=ended_swap)
         elif isinstance(counter, int):
             self.add(str(path), path.name.removesuffix(".scope").removesuffix(".service").removesuffix(".slice"),
-                     path, shown, counter)
+                     path, shown, counter, ended_swap=ended_swap)
         return counter if isinstance(counter, int) else charged
 
 
@@ -2249,7 +2326,7 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
     reading = SwapReadingPass(owners)
     for child in reading.children(CGROUP):
         _ = reading.visit(child)
-    files_read = len(reading.counters)
+    host_reads = 0
     if isinstance(host, LiveHostSwap):
         path = PROC / "meminfo"
         try:
@@ -2260,7 +2337,7 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
             used = capacity - values["SwapFree"]
         except (OSError, ValueError, KeyError, IndexError):
             return SwapUnavailable(SWAP_NAMES["unavailable"].format(path=path))
-        files_read += 1
+        host_reads = 1
         builds_ci = sum(row["bytes"] for row in reading.rows.values() if row["pool"] == "builds_ci")
         pool_bytes: dict[SwapPool, int | LiveHostSwap] = {"outside": used - builds_ci, "builds_ci": host}
         source = SWAP_NAMES["host"].format(path=path)
@@ -2268,17 +2345,34 @@ def read_swap(steps: Sequence[admission_records.RunningStep], labels: Mapping[st
         used, capacity, builds_ci = host.used, host.capacity, host.builds_ci
         pool_bytes = {"outside": used - builds_ci, "builds_ci": builds_ci}
         source = SWAP_NAMES["recorded"]
-    if "agents" in reading.rows:
-        reading.rows["agents"]["name"] = SWAP_NAMES["agents"].format(count=reading.agent_count)
-        reading.rows["agents"]["owner_count"] = reading.agent_count
+    for pool in SWAP_POOLS:
+        agents = reading.rows.get((pool, "agents"))
+        if agents is not None:
+            count = reading.agent_counts[pool]
+            agents["name"] = SWAP_NAMES["agents"].format(count=count)
+            agents["owner_count"] = count
+    ended = reading.ended_build_swap()
+    if ended is not None:
+        reading.rows["builds_ci", "ended"] = ended
     rows = sorted((row for row in reading.rows.values() if row["kind"] == "owner"),
                   key=lambda row: row["bytes"], reverse=True)
     visible = [row for pool in SWAP_POOLS
                for row in pool_rows([row for row in rows if row["pool"] == pool],
-                                    [row for row in reading.rows.values() if row["kind"] == "ungrouped" and row["pool"] == pool],
+                                    [row for row in reading.rows.values() if row["kind"] in ("ungrouped", "ended")
+                                     and row["pool"] == pool],
                                     pool, pool_bytes[pool], row_limit)]
     visible.append(swap_row(SWAP_NAMES["total"], source, used, "all", "total"))
-    return SwapReading(used, capacity, builds_ci, visible, files_read)
+    files_read = len(reading.counters) + reading.event_reads + host_reads
+    builds_used = reading.counters.get(builds)
+    builds_limit = None
+    if isinstance(builds_used, int):
+        maximum = cgroup_capture.limit_file(builds / "memory.swap.max")
+        files_read += 1
+        if isinstance(maximum, int) and maximum >= 0:
+            builds_limit = maximum
+    return SwapReading(used, capacity, builds_ci, visible, files_read,
+                       builds_used if isinstance(builds_used, int) and builds_used >= 0 else None, builds_limit,
+                       reading.agents_swap(), reading.event_reads)
 
 
 def swap_text(rows: Sequence[SwapRow]) -> str:
@@ -2332,6 +2426,7 @@ class RamBlocks(TypedDict):
     smaller_program_count: int
     kernel_bytes: RamReading
     compressed_swap_bytes: RamReading
+    zram_original_bytes: RamReading
     kernel_structures_bytes: RamReading
     kernel_counters_bytes: RamReading
     kernel_no_counter_bytes: int
@@ -2354,6 +2449,7 @@ class MemoryStatus(TypedDict):
 RAM_NAMES = {
     "system": "system services", "background": "background services", "sessions": "login sessions",
     "agents": "Agents", "desktop": "Desktop programs", "kernel": "Kernel, measured", "cache": "File and kernel cache",
+    "compressed_swap": "Swap in RAM",
 }
 RUST_ANALYZER = "rust-analyzer"
 KERNEL_FIELDS = ("SUnreclaim", "KernelStack", "PageTables")
@@ -2440,15 +2536,18 @@ def kernel_reading(values: Mapping[str, int] | admission_records.ReadingUnavaila
     return sum(fields[name] for name in KERNEL_FIELDS)
 
 
-def compressed_swap_reading() -> RamReading:
-    """Read the RAM that holds compressed swap: mem_used_total, field 3 of each zram device mm_stat."""
-    total = 0
+def zram_reading() -> tuple[RamReading, RamReading]:
+    """Read physical RAM and original swap bytes from each zram device."""
+    physical = original = 0
     for path in sorted(SYS_BLOCK.glob("zram*/mm_stat")):
         try:
-            total += int(path.read_text().split()[2])
+            fields = path.read_text().split()
+            original += int(fields[0])
+            physical += int(fields[2])
         except (OSError, ValueError, IndexError) as error:
-            return admission_records.ReadingUnavailable(f"{path}: {error}")
-    return total
+            unavailable = admission_records.ReadingUnavailable(f"{path}: {error}")
+            return unavailable, unavailable
+    return physical, original
 
 
 def memmap_reading() -> RamReading:
@@ -2476,29 +2575,31 @@ def kernel_counters_reading(values: Mapping[str, int] | admission_records.Readin
 
 @dataclass(frozen=True)
 class KernelRam:
-    """Hold the three measured kernel parts and the kernel memory that no counter names."""
+    """Hold compressed swap and the measured and unmeasured kernel memory."""
     compressed_swap: RamReading
     structures: RamReading
     counters: RamReading
     no_counter: int
+    original_swap: RamReading
 
     @property
     def total(self) -> RamReading:
-        parts = (self.compressed_swap, self.structures, self.counters)
+        parts = (self.structures, self.counters)
         unavailable = next((part for part in parts if isinstance(part, admission_records.ReadingUnavailable)), None)
         return unavailable if unavailable is not None else sum(known_bytes(part) for part in parts)
 
 
 def kernel_ram(values: Mapping[str, int] | admission_records.ReadingUnavailable) -> KernelRam:
     """Measure the kernel parts; without every reading, the no-counter amount is 0."""
-    structures, counters, compressed = kernel_reading(values), kernel_counters_reading(values), compressed_swap_reading()
+    structures, counters = kernel_reading(values), kernel_counters_reading(values)
+    compressed, original_swap = zram_reading()
     fields = meminfo_fields(values, ("MemTotal", *COUNTED_FIELDS))
     no_counter = 0
     if isinstance(fields, Mapping) and all(isinstance(part, int) for part in (structures, counters, compressed)):
         counted = sum(fields[name] for name in COUNTED_FIELDS)
         no_counter = max(0, fields["MemTotal"] - counted - known_bytes(structures) - known_bytes(counters)
                          - known_bytes(compressed))
-    return KernelRam(compressed, structures, counters, no_counter)
+    return KernelRam(compressed, structures, counters, no_counter, original_swap)
 
 
 def cache_reading(values: Mapping[str, int] | admission_records.ReadingUnavailable) -> RamReading:
@@ -3421,9 +3522,10 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
     total: RamReading = (room.total if isinstance(room.total, int)
                          else admission_records.ReadingUnavailable("total RAM is not recorded"))
     named = (room.used + build_tools + known_bytes(agents) + known_bytes(desktop) + other_programs_bytes
-             + known_bytes(kernel.total) + known_bytes(cache))
+             + known_bytes(kernel.compressed_swap) + known_bytes(kernel.total) + known_bytes(cache))
     unattributed = total - available - named if isinstance(total, int) else 0
     readings = ((RAM_NAMES["agents"], agents), (RAM_NAMES["desktop"], desktop),
+                (RAM_NAMES["compressed_swap"], kernel.compressed_swap),
                 (RAM_NAMES["kernel"], kernel.total), (RAM_NAMES["cache"], cache))
     missing = [f"{name}: {value.reason}" for name, value in readings
                if isinstance(value, admission_records.ReadingUnavailable)]
@@ -3444,6 +3546,7 @@ def ram_blocks(room: admission_records.MemoryRoom, tools: BuildToolRam, capture_
         "other_programs_bytes": other_programs_bytes,
         "smaller_programs_bytes": sum(amount for _, amount in smaller), "smaller_program_count": len(smaller),
         "kernel_bytes": kernel.total, "compressed_swap_bytes": kernel.compressed_swap,
+        "zram_original_bytes": kernel.original_swap,
         "kernel_structures_bytes": kernel.structures, "kernel_counters_bytes": kernel.counters,
         "kernel_no_counter_bytes": min(kernel.no_counter, max(0, unattributed)), "cache_bytes": cache,
         "unattributed_bytes": unattributed, "missing": missing,
@@ -4110,6 +4213,8 @@ def reading(configuration: FeedConfiguration | conf.UseConfiguredValue = conf.Us
         "pressure": pressure_label,
         "swap": {"used_bytes": swap.used, "capacity_bytes": swap.total, "builds_ci_bytes": swap.builds_ci,
                  "outside_bytes": swap.used - swap.builds_ci,
+                 "agents_bytes": swap.agents,
+                 "builds_used_bytes": swap.builds_used, "builds_limit_bytes": swap.builds_limit,
                  "reserve_share_percent": explanation.policy.agent_swap_share_percent,
                  "swap_in_window_bytes": captured.returning_swap, "window_seconds": host.swap_in_window_seconds},
         "build_reserve": build_reserve_basis(captured, explanation.policy.build_reserve_share_percent),

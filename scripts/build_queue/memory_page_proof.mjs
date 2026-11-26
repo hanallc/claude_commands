@@ -76,6 +76,7 @@ const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
 const ciServicesProof = previousPage === '--ci-services';
 const outsideQueueProof = previousPage === '--outside-queue';
+const swapInRamProof = previousPage === '--swap-in-ram';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
 const guestTipProof = previousPage === '--guest-tip';
@@ -85,7 +86,7 @@ const killControlProof = previousPage === '--kill-control';
 const killBothShot = previousPage === '--kill-both-shot';
 const killProof = killShot || killControlProof || killBothShot;
 const focusedProof = verifyCallProof || buildToolsProof || ciServicesProof || queueDragProof || queueRowsProof || guestTipProof
-  || standingProof || outsideQueueProof || killProof;
+  || standingProof || outsideQueueProof || swapInRamProof || killProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
@@ -694,6 +695,103 @@ try {
           const shots = approvedAwsCostShot ? await captureApprovedAwsCosts(evaluate, call)
             : await captureAwsCosts(evaluate, call, base.report.aws_costs.today);
           console.log(JSON.stringify({shots,output:folder}));
+          break browserProof;
+        }
+        if (swapInRamProof) {
+          const gib = 1024 ** 3;
+          const reading = structuredClone(base);
+          reading.targets = [];
+          reading.psi = {some:0.5,full:0.5};
+          reading.pressure = 'none';
+          reading.total = 62;
+          reading.cap = 24;
+          reading.ram = {...reading.ram,total_bytes:62*gib,available_bytes:14*gib,missing:[],agreement:'agree',
+            build_tools_bytes:gib,queued_builds_bytes:14*gib,room_bytes:0,build_covered_bytes:9*gib,
+            safety_covered_bytes:3*gib,safety_target_bytes:3*gib,swap_covered_bytes:2*gib,swap_target_bytes:2*gib,
+            desktop_bytes:gib,agents_bytes:14*gib,other_programs_bytes:1.5*gib,compressed_swap_bytes:Math.round(8.2*gib),
+            zram_original_bytes:27*gib,
+            kernel_bytes:4*gib,kernel_structures_bytes:3*gib,kernel_counters_bytes:gib,cache_bytes:3.5*gib,
+            unattributed_bytes:gib};
+          const [used, builds, ended, agents, other] = [27.2, 8.2, 7.9, 12.4, 6.6].map(value => Math.round(value*gib));
+          reading.swap = {...reading.swap,used_bytes:used,capacity_bytes:39*gib,agents_bytes:agents,
+            builds_ci_bytes:builds,outside_bytes:19*gib,builds_used_bytes:8*gib,builds_limit_bytes:8*gib};
+          reading.swap_by = [
+            {name:'agent sessions (4)',bytes:agents,category:'agents',kind:'owner',pool:'outside',detail:''},
+            {name:'system services',bytes:other,kind:'owner',pool:'outside',detail:''},
+            {name:'hana CI',bytes:builds-ended,kind:'owner',pool:'builds_ci',detail:''},
+            {name:'Left by runs that ended',bytes:ended,kind:'ended',pool:'builds_ci',detail:'no running job owns it'},
+            {name:'All swap used',bytes:used,kind:'total',pool:'all',detail:''}
+          ];
+          servedReading = reading;
+          await navigate('memory_live.html');
+          const pointer = await evaluate(`(() => {
+            const segment = document.querySelector('#s-zram');
+            if (!segment) return null;
+            document.querySelector('.legend-box').open = false;
+            const box = segment.getBoundingClientRect();
+            return {x:box.left + box.width/2, y:box.top + box.height/2};
+          })()`);
+          assert.ok(pointer, 'The memory bar has no Swap in RAM part.');
+          await call('Input.dispatchMouseEvent', {type:'mouseMoved', ...pointer});
+          const shown = await evaluate(`(() => {
+            const tip = document.querySelector('#tip.on');
+            const bar = document.querySelector('#barwrap').closest('.card').getBoundingClientRect();
+            const box = tip.getBoundingClientRect();
+            const segment = document.querySelector('#s-zram').getBoundingClientRect();
+            const pill = document.querySelector('#pill');
+            const left = Math.max(0, Math.min(bar.left, box.left) - 8);
+            const top = Math.max(0, Math.min(bar.top, box.top, pill.getBoundingClientRect().top) - 8);
+            const right = Math.min(innerWidth, Math.max(bar.right, box.right) + 8);
+            const bottom = Math.min(innerHeight, Math.max(bar.bottom, box.bottom) + 8);
+            const kernelTip = document.createElement('div');
+            kernelTip.innerHTML = tooltipHtml('kernel', latest);
+            const {ram} = shownReading(latest);
+            return {tip:[...tip.querySelector('.tip').children].map(cell => cell.textContent),
+              swapUsed:document.querySelector('#swap-sum').textContent,
+              kernel:document.querySelector('#v-kernel').textContent,
+              kernelTip:[...kernelTip.querySelector('.tip').children].map(cell => cell.textContent),
+              combinedKernel:ram.kernel_bytes + ram.compressed_swap_bytes,
+              pill:pill.textContent,hold:pill.classList.contains('hold'),
+              below:box.top >= segment.bottom, fits:box.left >= 0 && box.right <= innerWidth && box.bottom <= innerHeight,
+              clip:{x:left+scrollX,y:top+scrollY,width:right-left,height:bottom-top,scale:1}};
+          })()`);
+          const warning = 'The swap of builds is full: 8.0 of 8.0 GiB. 7.9 GiB is left by runs that ended.';
+          assert.deepEqual(shown.tip, ['Swap in RAM','8.2 GiB',
+            'Memory that nothing used for some time. Linux compresses it and keeps it in RAM.',
+            'It holds','27.2 GiB','agent sessions','12.4 GiB','+ builds and CI','8.2 GiB',
+            'left by runs that ended','7.9 GiB','+ all other programs','6.6 GiB', warning]);
+          assert.equal(shown.swapUsed, '27.2 / 39.0 GiB');
+          assert.equal(shown.kernel, '4.0 GiB');
+          assert.deepEqual(shown.kernelTip, ['Kernel','4.0 GiB','RAM the kernel uses for itself',
+            'Slab, stacks, page tables','3.0 GiB','+ Other kernel counters','1.0 GiB']);
+          assert.equal(shown.combinedKernel, Math.round(12.2*gib));
+          assert.equal(shown.pill, 'swap of builds is full');
+          assert.equal(shown.hold, true);
+          assert.equal(shown.below && shown.fits, true);
+          if (requestedShot) {
+            const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip:shown.clip});
+            await writeFile(requestedShot, Buffer.from(shot.data,'base64'));
+          }
+          const swapWindow = await evaluate(`(() => {
+            document.querySelector('#pill').click();
+            const row = document.querySelector('.row.ended[data-pool="builds_ci"]');
+            const amount = selector => document.querySelector('#swaprows ' + selector).querySelector('.v').textContent;
+            return {open:document.querySelector('#builds-swap-dialog').open,
+              warning:document.querySelector('#pressure-reason').textContent,
+              name:row.querySelector('.name').textContent, detail:row.querySelector('small').textContent,
+              amounts:['.row.total', '.row.pool[data-tip="swap-pool:builds_ci"]',
+                '.row.owner[data-pool="outside"]', '.row.ended'].map(amount)};
+          })()`);
+          assert.deepEqual(swapWindow,{open:true, warning, name:'Left by runs that ended', detail:'no running job owns it',
+            amounts:[shown.tip[4], shown.tip[8], shown.tip[6], shown.tip[10]]});
+          const belowLimit = await evaluate(`(() => {
+            const reading = {...latest, swap:{...latest.swap, builds_used_bytes:latest.swap.builds_limit_bytes - 1}};
+            renderSwap(reading);
+            return {pill:document.querySelector('#pill-t').textContent,
+              warning:document.querySelector('#pressure-reason').textContent};
+          })()`);
+          assert.deepEqual(belowLimit,{pill:'no memory pressure', warning:''});
+          console.log(JSON.stringify({pass:true,proof:'Swap in RAM',shot:requestedShot}));
           break browserProof;
         }
         if (killProof) {
@@ -4570,7 +4668,7 @@ try {
                   text:tipText(${JSON.stringify(key)},latest),
                   htmlText:[...tip.querySelectorAll('dd')].map(cell=>cell.previousElementSibling?.tagName==='DT'?
                     (cell.previousElementSibling.textContent+'  '+cell.textContent).trimEnd():cell.textContent).join('\\n'),
-                  values:[...tip.querySelectorAll('dd:not(.caption):not(.long)')].map(cell=>({
+                  values:[...tip.querySelectorAll('dd:not(.caption):not(.long):not(.swap-warning)')].map(cell=>({
                   text:cell.textContent,align:getComputedStyle(cell).textAlign,
                   right:cell.getBoundingClientRect().right,group:cell.parentElement.className})),
                   labels:[...tip.querySelectorAll('dt')].map(cell=>({text:cell.textContent,
@@ -4582,7 +4680,13 @@ try {
               assert.ok(!alignment.rows.some(row=>/:$/.test(row.label)||/[a-z]\.$/.test(row.value)),
                 `${kind} ${key}: sentence punctuation`);
               assert.equal(alignment.htmlText,alignment.text.filter(Boolean).join('\n'));
-              for(const row of alignment.rows) if(row.kind==='caption') assert.ok(row.value.length<=44);
+              for (const row of alignment.rows.filter(row => row.kind === 'caption')) {
+                if (key === 'zram') {
+                  assert.equal(row.value, 'Memory that nothing used for some time. Linux compresses it and keeps it in RAM.');
+                } else {
+                  assert.ok(row.value.length <= 44);
+                }
+              }
               assert.equal(new Set(alignment.rows.map(row=>row.label+'  '+row.value)).size,alignment.rows.length,
                 `${kind} ${key}: a repeated row`);
               assert.ok(alignment.values.length>0,`${kind} ${key} has no value cells.`);
