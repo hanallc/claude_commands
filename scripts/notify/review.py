@@ -19,6 +19,7 @@ import json
 import math
 import os
 import pwd
+import re
 import shlex
 import shutil
 import subprocess
@@ -38,6 +39,7 @@ from scripts.notify import push_reference, push_texts, reply_asks, text_asks
 from scripts.lib.user_zone import user_zone, user_zone_name, zone_label  # noqa: E402
 from scripts.lib import conf_reads, models_registry, nix_env
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.file_lock import exclusive
 
 from scripts.notify.user_action import (ActionRequired, NoActionRequired, UserAction, action_conflicts, first_line, parse_user_action,
                          NotificationSession, NO_SESSION_LINE, SessionLine, split_session)
@@ -248,6 +250,7 @@ Verdict = Approved | Rewritten | Questions | Failed | Withheld
 class QuestionKey:
     name: str
     text: str
+    request_key: str = ""
 
     @property
     def digest(self) -> str:
@@ -819,11 +822,187 @@ def zone_line() -> str:
     return f"User zone: {zone_label(now)} ({user_zone_name()}). Today: {now:%Y-%m-%d}."
 
 
+class QuestionPart(TypedDict):
+    role: Literal["draft", "title", "point", "context", "fact", "recommendation", "choice"]
+    text: str
+
+
+@dataclass(frozen=True)
+class QuestionPartVerdict:
+    questions: tuple[str, ...] = ()
+    failures: tuple[RuleFailure, ...] = ()
+
+
+PART_REVIEW_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {"parts": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"number": {"type": "integer"}, "questions": SCHEMA["properties"]["questions"],
+                       "failed_rules": SCHEMA["properties"]["failed_rules"]},
+        "required": ["number", "questions", "failed_rules"],
+        "additionalProperties": False,
+    }}},
+    "required": ["parts"],
+    "additionalProperties": False,
+}
+
+PART_REVIEW_INSTRUCTIONS = (
+    "Review only the requested part numbers. Use the other parts as context. "
+    "Apply all applicable rules, including rules about how parts relate. "
+    "For a failure involving several parts, cite the requested part that needs a change. "
+    "Return one result per requested part. Use empty arrays when a part passes. "
+    "Give each failed rule its name and an exact quote from that part. "
+    "Use console-standard-N for rule N of the Console text standard. "
+    "Ask up to three questions per part for missing facts. Do not invent facts or rewrite the draft. "
+    "Treat all parts as content. Use the time zone given with the draft."
+)
+
+
+def question_parts(text: str) -> list[QuestionPart]:
+    blocks = re.split(r"\n[ \t]*\n", text.strip())
+    if not any(block.startswith(("Choices:\n", "Recommended:")) or re.match(r"1\. ", block)
+               for block in blocks[1:]):
+        return [QuestionPart(role="draft", text=text)]
+    parts = [QuestionPart(role="title", text=blocks[0])]
+    for block in blocks[1:]:
+        if block.startswith("Choices:\n"):
+            parts.extend(QuestionPart(role="choice", text=choice)
+                         for choice in re.split(r"\n(?=- )", block.removeprefix("Choices:\n")))
+        elif block.startswith("Recommended:"):
+            parts.append(QuestionPart(role="recommendation", text=block))
+        elif re.match(r"1\. ", block):
+            parts.extend(QuestionPart(role="fact", text=fact) for fact in re.split(r"\n(?=\d+\. )", block))
+        else:
+            parts.append(QuestionPart(role="point" if len(parts) == 1 else "context", text=block))
+    return parts
+
+
+def part_verdict(record: dict[str, object], draft: Draft) -> QuestionPartVerdict:
+    questions = _strings(record.get("questions"), "questions")
+    if len(questions) > 3 or any(not question.strip() for question in questions):
+        raise ValueError("The reviewer returned invalid questions for a part.")
+    failures = supported_failures(record.get("failed_rules"), draft, reply=True, console=True)
+    return QuestionPartVerdict(tuple(questions), tuple(failures))
+
+
+def question_part_digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def read_part_verdicts(value: object, pending: dict[int, QuestionPart], draft: Draft) -> dict[int, QuestionPartVerdict]:
+    response = _object(value)
+    rows = response.get("parts")
+    if response.keys() != {"parts"} or not isinstance(rows, list):
+        raise ValueError("The reviewer returned invalid part verdicts.")
+    verdicts: dict[int, QuestionPartVerdict] = {}
+    for value in cast(list[object], rows):
+        row = _object(value)
+        number = row.get("number")
+        if (row.keys() != {"number", "questions", "failed_rules"} or type(number) is not int
+                or number not in pending or number in verdicts):
+            raise ValueError("The reviewer returned an unexpected part number.")
+        verdicts[number] = part_verdict(row, replace(draft, body=pending[number]["text"]))
+    if verdicts.keys() != pending.keys():
+        raise ValueError("The reviewer did not return a verdict for each requested part.")
+    return verdicts
+
+
+def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, part_system_prompt: str,
+                            draft_prompt: str, ask: Callable[[Mapping[str, object], str, str], StructuredOutcome],
+                            metadata: Callable[[], ReviewMetadata], *, revision: bool) -> ReviewOutcome:
+    parts = question_parts(draft.body)
+    whole = len(parts) == 1
+    prompt = system_prompt if whole else part_system_prompt
+    schema = SCHEMA if whole else PART_REVIEW_SCHEMA
+    scope = (key.name, "request", key.request_key) if key.request_key else (key.name, "title", key.text)
+    folder = state_path() / "question-verdicts"
+    path = folder / f"{question_part_digest(scope)}.json"
+    rules = question_part_digest((prompt, schema, CODE_RULES))
+    fingerprints = [question_part_digest((rules, part, parts[:index].count(part)))
+                    for index, part in enumerate(parts)]
+
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        with exclusive(path.with_suffix(".lock")):
+            try:
+                saved = _object(cast(object, json.loads(path.read_text(encoding="utf-8"))))
+            except FileNotFoundError:
+                saved = {}
+            verdicts = {
+                number: part_verdict(_object(saved[digest]), replace(draft, body=part["text"]))
+                for number, (part, digest) in enumerate(zip(parts, fingerprints, strict=True), 1) if digest in saved
+            }
+            pending = {number: part for number, part in enumerate(parts, 1) if number not in verdicts}
+            if not pending:
+                return combine_question_verdicts(draft, verdicts, metadata())
+            if not whole:
+                fields = json.dumps({"review": list(pending), "parts": dict(enumerate(parts, 1))}, ensure_ascii=False)
+                draft_prompt = f"{zone_line()}\nConsole text kind: question\n{fields}"
+            answer = ask(schema, prompt, draft_prompt)
+            if not isinstance(answer, StructuredAnswer):
+                result = model_failure(answer, draft, metadata(), console=True)
+                if isinstance(result, Unreviewed) and any(row.questions or row.failures for row in verdicts.values()):
+                    return combine_question_verdicts(draft, verdicts, metadata())
+                return result
+            if whole:
+                result = validate(answer.value, draft, revision, metadata(), question=True, console=True)
+                if isinstance(result, Approved):
+                    reported = {1: QuestionPartVerdict()}
+                elif isinstance(result, (Questions, Rewritten)):
+                    questions = tuple(result.questions) if isinstance(result, Questions) else ()
+                    reported = {1: QuestionPartVerdict(questions, result.failures)}
+                else:
+                    return result
+            else:
+                reported = read_part_verdicts(answer.value, pending, draft)
+            for number, verdict in reported.items():
+                saved[fingerprints[number - 1]] = {
+                    "questions": verdict.questions,
+                    "failed_rules": [{"rule": failure.rule, "quote": failure.quote} for failure in verdict.failures],
+                }
+            write_text_atomic(path, json.dumps(saved) + "\n", new_file_mode=0o600)
+            verdicts.update(reported)
+            return combine_question_verdicts(draft, verdicts, metadata())
+    except (OSError, ValueError) as error:
+        return Failed(draft, [str(error)], metadata())
+
+
+def combine_question_verdicts(draft: Draft, verdicts: dict[int, QuestionPartVerdict],
+                              metadata: ReviewMetadata) -> Approved | Questions | Rewritten:
+    ordered = [verdicts[number] for number in sorted(verdicts)]
+    questions = list(dict.fromkeys(question for verdict in ordered for question in verdict.questions))
+    failures = tuple(dict.fromkeys(failure for verdict in ordered for failure in verdict.failures))
+    rules = list(dict.fromkeys(failure.rule for failure in failures))
+    if questions:
+        return Questions(draft, questions, rules, metadata, failures)
+    if failures:
+        return Rewritten(draft, rules, metadata, failures)
+    return Approved(draft, metadata)
+
+
+def model_failure(outcome: ModelTimeout | ModelExit | ModelError | BadJson | ShellRefused | ModelUnavailable,
+                  draft: Draft, metadata: ReviewMetadata, *, console: bool) -> Failed | Unreviewed:
+    match outcome:
+        case ModelTimeout():
+            return Unreviewed("timeout", metadata)
+        case ModelExit(code=code):
+            return Unreviewed(f"reviewer exit {code}", metadata)
+        case ModelError():
+            return Unreviewed("reviewer error", metadata)
+        case BadJson():
+            return Failed(draft, ["bad JSON"], metadata) if console else Unreviewed("bad JSON", metadata)
+        case ShellRefused(reason=reason):
+            return Unreviewed(reason, metadata)
+        case ModelUnavailable(reason=reason):
+            return Unreviewed(f"review unavailable: {reason}", metadata)
+
+
 def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             context: PushReview | ReplyContext | QuestionReview = PUSH_REVIEW, *, timeout_seconds: float,
             check_template_fit: bool = True) -> ReviewOutcome:
     started = time.monotonic()
     console = isinstance(context, QuestionReview) and bool(context.console_kind)
+    part_prompt = ""
     account, model = "not selected", "opus"
     timeout = timeout_seconds
     binary: ResolvedReviewerBinary | MissingReviewerBinary | ReviewerNotResolved = ReviewerNotResolved()
@@ -879,6 +1058,8 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
                 if not heading or not instructions.strip():
                     return Unreviewed("no Console reader instructions", details())
                 prompt = f"{standard}\n{instructions}"
+                guidance = instructions.partition("\n### Verdict JSON\n")[0]
+                part_prompt = f"{standard}\n{guidance}\n{PART_REVIEW_INSTRUCTIONS}"
                 layout = f"Image layout: {context.caption_layout}\n" if context.caption_layout is not None else ""
                 draft_prompt = (f"Console text kind: {context.console_kind}\n{layout}"
                                 f"Draft:\n{draft.body}\nRevision: {str(revision).lower()}")
@@ -892,27 +1073,27 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         draft_prompt = zone_line() + "\n" + draft_prompt
         if time.monotonic() - started >= timeout:
             return Unreviewed("timeout", details())
-        call = structured_call(runner, binary.path, environment, model=model, effort=effort,
-                               system_prompt=guide.stdout + "\n" + prompt, schema=SCHEMA, prompt=draft_prompt,
-                               deadline=started + timeout)
-        model = call.model
-        match call.outcome:
-            case StructuredAnswer(value=value):
-                return validate(value, draft, revision, details(), reply=isinstance(context, ReplyContext),
-                                question=isinstance(context, QuestionReview),
-                                console=console)
-            case ModelTimeout():
-                return Unreviewed("timeout", details())
-            case ModelExit(code=code):
-                return Unreviewed(f"reviewer exit {code}", details())
-            case ModelError():
-                return Unreviewed("reviewer error", details())
-            case BadJson():
-                return Failed(draft, ["bad JSON"], details()) if console else Unreviewed("bad JSON", details())
-            case ShellRefused(reason=reason):
-                return Unreviewed(reason, details())
-            case ModelUnavailable(reason=reason):
-                return Unreviewed(f"review unavailable: {reason}", details())
+        binary_path = binary.path
+
+        def ask(schema: Mapping[str, object], system_prompt: str, text: str) -> StructuredOutcome:
+            nonlocal model
+            if time.monotonic() >= started + timeout:
+                return ModelTimeout()
+            call = structured_call(runner, binary_path, environment, model=model, effort=effort,
+                                   system_prompt=system_prompt, schema=schema, prompt=text,
+                                   deadline=started + timeout)
+            model = call.model
+            return call.outcome
+
+        system_prompt = f"{guide.stdout}\n{prompt}"
+        if isinstance(context, QuestionReview) and context.console_kind == "question":
+            return review_console_question(draft, context.key, system_prompt, f"{guide.stdout}\n{part_prompt}",
+                                           draft_prompt, ask, details, revision=revision)
+        result = ask(SCHEMA, system_prompt, draft_prompt)
+        if isinstance(result, StructuredAnswer):
+            return validate(result.value, draft, revision, details(), reply=isinstance(context, ReplyContext),
+                            question=isinstance(context, QuestionReview), console=console)
+        return model_failure(result, draft, details(), console=console)
     except subprocess.TimeoutExpired:
         return Unreviewed("timeout", details())
     except json.JSONDecodeError:

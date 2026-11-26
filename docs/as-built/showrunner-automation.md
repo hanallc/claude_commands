@@ -906,7 +906,7 @@ A missing folder uses its nearest existing parent until the folder appears.
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
   The [Console text standard](../console_text_standard.md) applies to `ask` and to answers and replies from the writer.
   The fast check tests text patterns before the existing model reviewer reads the draft.
-  The model approves a draft only with a `send` verdict.
+  A question passes when every part passes. If the rules and prompt stay the same, the model reviews changed parts with the full draft as context.
   The filing command returns the failed rules and quotes to the writer. The hold keeps the draft.
   A quote that differs from the draft keeps the draft on hold.
   If the model is unavailable, `ask` records the reason.

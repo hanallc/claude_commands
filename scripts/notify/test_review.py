@@ -320,6 +320,73 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(review.review_question(key, draft.body, runner=approved, console_kind="reply"),
                          review.QuestionAccepted(draft.body))
 
+    def test_console_question_reuses_the_verdict_until_the_rules_change(self) -> None:
+        key = review.QuestionKey("demo", "Retry the download?")
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry the download?", False)
+        failure = {"rule": "console-standard-3", "quote": draft.body}
+        runner = FakeReviewer(verdict(draft, "rewrite", body="Retry to finish the download?", failed_rules=[failure]))
+        standard = self.root / "standard.md"
+        _ = standard.write_text(review.CONSOLE_STANDARD.read_text())
+
+        with mock.patch.object(review, "CONSOLE_STANDARD", standard):
+            held = review.review_question(key, draft.body, runner=runner, console_kind="question")
+            self.assertEqual(held, review.QuestionReviewFailed(draft.body, (), (review.RuleFailure(**failure),)))
+            runner.value = verdict(draft)
+            self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind="question"), held)
+            self.assertEqual(len([call for call in runner.calls if Path(call.argv[0]).name == "claude"]), 1)
+
+            with standard.open("a") as output:
+                _ = output.write("\nA download question may omit its purpose.\n")
+            self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(draft.body))
+            self.assertEqual(len([call for call in runner.calls if Path(call.argv[0]).name == "claude"]), 2)
+
+    def test_console_question_revision_keeps_passed_and_held_parts(self) -> None:
+        title = "Retry the download?"
+        point = "The download stopped."
+        recommend = "Recommended: Yes."
+        choices = "Choices:\n- Yes, finish the download.\n- No, keep the partial file."
+        question = "\n\n".join((title, point, recommend, choices))
+        final_recommend = "Recommended: Yes. You get the full file."
+        key = review.QuestionKey("demo", title, request_key="download")
+        guide = FakeReviewer(verdict(self.draft))
+        failure = review.RuleFailure("console-standard-4", recommend)
+        requests: list[dict[str, object]] = []
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            request = cast(dict[str, object], json.loads(prompt.split("\n", 2)[2]))
+            requests.append(request)
+            if len(requests) == 2:
+                return review.StructuredCall("opus", review.ModelTimeout())
+            numbers = cast(list[int], request["review"])
+            parts = cast(dict[str, review.QuestionPart], request["parts"])
+            rows: list[dict[str, object]] = []
+            for number in numbers:
+                words = parts[str(number)]["text"]
+                problems = [{"rule": failure.rule, "quote": words}] if words == recommend else []
+                if len(requests) > 1 and parts[str(number)]["role"] == "choice":
+                    problems = [{"rule": "console-standard-10", "quote": words}]
+                rows.append({"number": number, "questions": [], "failed_rules": problems})
+            return review.StructuredCall("opus", review.StructuredAnswer({"parts": rows}))
+
+        with mock.patch.object(review, "structured_call", side_effect=judge):
+            self.assertEqual(review.review_question(key, question, runner=guide, console_kind="question"),
+                             review.QuestionReviewFailed(question, (), (failure,)))
+            revised_title = "Finish the download?"
+            revised = question.replace(title, revised_title).replace(point, "The connection stopped the download.")
+            key = replace(key, text=revised_title)
+            self.assertEqual(review.review_question(key, revised, runner=guide, console_kind="question"),
+                             review.QuestionReviewFailed(revised, (), (failure,)))
+            self.assertEqual(review.review_question(key, revised, runner=guide, console_kind="question"),
+                             review.QuestionReviewFailed(revised, (), (failure,)))
+            final = revised.replace(recommend, final_recommend)
+            self.assertEqual(review.review_question(key, final, runner=guide, console_kind="question"),
+                             review.QuestionAccepted(final))
+
+        self.assertEqual([request["review"] for request in requests], [[1, 2, 3, 4, 5], [1, 2], [1, 2], [3]])
+        revised_parts = cast(dict[str, review.QuestionPart], requests[1]["parts"])
+        self.assertIn("- No, keep the partial file.", [part["text"] for part in revised_parts.values()])
+
     def test_console_send_with_changed_text_accepts_the_original_draft(self) -> None:
         from scripts.console_text import check as console_text
 
