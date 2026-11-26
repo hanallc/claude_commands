@@ -5040,6 +5040,56 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(len(self.client.prompts), 1)
         self.assertEqual(errors.getvalue(), "")
 
+    def test_resume_rereads_another_sessions_registry_write(self) -> None:
+        directory = sessions.sessions_dir()
+        rewriting = directory / "4242.json"
+        _ = rewriting.write_text("{")
+        other = fixture_runtime_id("another registry session")
+        _ = (directory / "4243.json").write_text(json.dumps({
+            "pid": 4243, "sessionId": other, "procStart": "generation-1",
+        }))
+        finished = json.dumps({"pid": 4242, "sessionId": other, "procStart": "generation-1",
+                               "name": "other", "messagingSocketPath": "", "updatedAt": 1})
+        policy = sessions.retry_policy()
+        read_text = Path.read_text
+        reads = 0
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            nonlocal reads
+            if path == rewriting:
+                reads += 1
+                if reads == policy.registry_reads + 1:
+                    _ = rewriting.write_text(finished)
+            return read_text(path, encoding=encoding, errors=errors)
+
+        identity = self.entry["session_id"]
+
+        def start(*_command: str) -> str:
+            _ = (directory / "456.json").write_text(json.dumps({
+                "pid": 456, "sessionId": identity, "procStart": "generation-1",
+                "name": "alpha", "messagingSocketPath": "", "updatedAt": 2,
+            }))
+            return ""
+
+        self.start.side_effect = start
+        with (patch.object(Path, "read_text", read),
+              patch.object(sessions, "session_liveness", session_records.session_liveness)):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertEqual(result, stop_resume.ClaudeUp(identity, "w1:p2", "claude3"))
+        self.assertGreater(reads, policy.registry_reads)
+        self.start.assert_called_once()
+
+    def test_resume_refuses_an_unreadable_possible_target_record(self) -> None:
+        identity = self.entry["session_id"]
+        path = sessions.sessions_dir() / "4242.json"
+        for contents in ("{", json.dumps({"pid": 4242, "sessionId": identity, "procStart": "generation-1"})):
+            with (self.subTest(contents=contents),
+                  patch.object(sessions, "session_liveness", session_records.session_liveness)):
+                _ = path.write_text(contents)
+                result = stop_resume.resume("alpha", why="maintenance")
+                self.assertEqual(result, stop_resume.ResumeFailed(identity, f"session registry unreadable: {path}"))
+        self.start.assert_not_called()
+
     def test_resume_reports_identity_failure_once_at_the_deadline(self) -> None:
         errors = io.StringIO()
         identity = staff.StaffId(self.entry["session_id"])
