@@ -1380,6 +1380,8 @@ def _finish_pass(args: argparse.Namespace) -> CanceledWorkerPass | NoCanceledPan
     if instance_id := optional_arg(args, "pass_instance_id"):
         if current.get("instance_id") != instance_id:
             return NoCanceledPane.NONE
+    if status == "canceled" and (status_file := assignment_status_file(current)):
+        write_text_atomic(Path(status_file), "error\n")
     closed = close_slot_pass(session_dir, state, slot, status, now_epoch())
     if orphaned and not closed:
         raise SystemExit(
