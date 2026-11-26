@@ -200,13 +200,14 @@ class _Browser:
 
 
 class _Chrome(_Browser):
-    """Keep one Chrome target and start each probe in a new document."""
+    """Keep one fixture tab and close the extra tabs after each test."""
 
     def __init__(self, root: Path) -> None:
         self.root: Path = root
         self.pending: bytearray = bytearray()
         self.loaded: set[tuple[str, str]] = set()
         self.sequence: int = 0
+        self.blank: bool = True
         with (root / "chrome.log").open("wb") as log:
             process = subprocess.Popen(
                 ["sh", "-c", 'exec 3<&0 4>&1; exec "$@" 1>&2', "chrome-fixture",
@@ -222,10 +223,34 @@ class _Chrome(_Browser):
             os.set_blocking(writer.fileno(), False)
             context = self.command("Target.createBrowserContext", {})["browserContextId"]
             target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": context})
+            self.target: str = cast(str, target["targetId"])
             self.session: str = cast(str, self.command("Target.attachToTarget",
-                {"targetId": target["targetId"], "flatten": True})["sessionId"])
+                {"targetId": self.target, "flatten": True})["sessionId"])
             _ = self.command("Page.enable", {}, self.session)
             _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
+            # The fixture tab keeps Chrome open after the startup tab closes.
+            for tab in self.tabs():
+                if tab["targetId"] != self.target:
+                    _ = self.command("Target.closeTarget", {"targetId": tab["targetId"]})
+
+    def tabs(self) -> list[dict[str, str]]:
+        targets = cast(list[dict[str, str]], self.command("Target.getTargets", {})["targetInfos"])
+        return [target for target in targets if target["type"] == "page"]
+
+    def close_test_pages(self) -> None:
+        if self.closed:
+            return
+        with self.stop_on_error():
+            for opened in self.tabs():
+                if opened["targetId"] != self.target:
+                    _ = self.command("Target.closeTarget", {"targetId": opened["targetId"]})
+            self.reset_page()
+
+    def reset_page(self) -> None:
+        if not self.blank:
+            self.navigate("about:blank")
+            _ = self.command("Page.resetNavigationHistory", {}, self.session)
+        self.loaded.clear()
 
     def read(self, deadline: float) -> dict[str, object]:
         reader = self.process.stdout
@@ -285,6 +310,7 @@ class _Chrome(_Browser):
         deadline = time.monotonic() + 20
         while load not in self.loaded:
             _ = self.read(deadline)
+        self.blank = destination == "about:blank"
 
     def dom(self, page: Path | str, marker: str, *, reduced_motion: bool,
             window_size: tuple[int, int] | None) -> subprocess.CompletedProcess[str]:
@@ -321,9 +347,7 @@ class _Chrome(_Browser):
                 raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
             result = cast(dict[str, object], response["result"])
             _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
-            self.navigate("about:blank")
-            _ = self.command("Page.resetNavigationHistory", {}, session)
-            self.loaded.clear()
+            self.reset_page()
             return subprocess.CompletedProcess(destination, 0, str(result.get("value", "")), "")
 
 
@@ -428,6 +452,7 @@ class ListPageTests(unittest.TestCase):
     root: Path = Path()
     browser_root: ClassVar[Path]
     _chrome: ClassVar[_Chrome | None] = None
+    _test_chrome: _Chrome | None = None
     _firefox: ClassVar[_Firefox | None] = None
 
     @classmethod
@@ -475,16 +500,20 @@ class ListPageTests(unittest.TestCase):
             + "# range: 0.001..86400\nstatus.list.age_limit_seconds=45\n"
             + "# range: 0.001..86400\nstatus.review.age_limit_seconds=45\n")
 
-    @classmethod
-    def chrome(cls) -> _Chrome:
-        if cls._chrome is not None:
-            if not cls._chrome.closed and cls._chrome.process.poll() is None:
-                return cls._chrome
-            cls._chrome.close()
-        root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="chrome-"))
-        cls._chrome = _Chrome(root)
-        cls.addClassCleanup(cls._chrome.close)
-        return cls._chrome
+    def chrome(self) -> _Chrome:
+        cls = type(self)
+        browser = cls._chrome
+        if browser is None or browser.closed or browser.process.poll() is not None:
+            if browser is not None:
+                browser.close()
+            root = Path(tempfile.mkdtemp(dir=cls.browser_root, prefix="chrome-"))
+            browser = _Chrome(root)
+            cls._chrome = browser
+            cls.addClassCleanup(browser.close)
+        if self._test_chrome is not browser:
+            self._test_chrome = browser
+            self.addCleanup(browser.close_test_pages)
+        return browser
 
     @classmethod
     def firefox(cls) -> _Firefox:
@@ -501,6 +530,8 @@ class ListPageTests(unittest.TestCase):
                      complete: threading.Event | None = None, *, dark: bool = False
                      ) -> subprocess.CompletedProcess[str]:
         if width < FIREFOX_MIN_SHARED_WIDTH:
+            if self._chrome is not None:
+                self._chrome.close()
             with tempfile.TemporaryDirectory(dir=self.root, prefix="firefox-view-") as temporary:
                 root = Path(temporary)
                 command, environment = _private_firefox_command(root / "profile", width, height, dark=dark)
@@ -519,6 +550,16 @@ class ListPageTests(unittest.TestCase):
         except (OSError, RuntimeError) as error:
             raise RuntimeError(f"Firefox could not show {destination}") from error
         return subprocess.CompletedProcess(destination, 0, "", "")
+
+    def firefox_probe(self, page: bytes) -> list[list[str]]:
+        def load(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            environment = cast(dict[str, str], options["env"])
+            width = int(environment.get("MOZ_HEADLESS_WIDTH", "1366"))
+            height = int(environment.get("MOZ_HEADLESS_HEIGHT", "768"))
+            return self.firefox_view(arguments[-1], None, width, height)
+
+        with patch.object(browser_test_support, "run_process_group", side_effect=load):
+            return firefox_probe_results(page)
 
     def test_review_links_use_the_card_body_for_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
@@ -1547,11 +1588,15 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
 })();
 </script>'''
         page = page.replace(b"</body>", probe + b"</body>", 1)
+        if self._chrome is not None:
+            self._chrome.close()
         self.assertEqual(window_probe_results(
             {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_review_links_open_one_card_without_leaving_the_list(self) -> None:
+        if self._chrome is not None:
+            self._chrome.close()
         root = self.root / "reviews"
         doc = self.root / "sdlc.md"
         listing = self.root / f"{change_review.PREFIX}sdlc.md"
@@ -2119,9 +2164,6 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                             result = self.firefox_view(url + "&shot=1", Path(proof), width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         elif size == "390,900":
-                            for browser in (self._chrome, self._firefox):
-                                if browser is not None:
-                                    browser.close()
                             result = self.firefox_view(url, None, width, height, complete, dark=True)
                             self.assertEqual(result.returncode, 0, result.stderr)
                         else:
@@ -2949,7 +2991,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 markup = list_page.render(self.root / "reviews", include_counts=False, query=server_query).decode()
                 page = markup.replace(script, before.replace("CASE", case) + script, 1)
                 page = page.replace("</body>", after + "</body>", 1)
-                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+                self.assertEqual(self.firefox_probe(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_preserves_staff_ids_in_query_filters(self) -> None:
@@ -2971,7 +3013,7 @@ const firstPaint=visible();
             script = "<script>" + list_page.SCRIPT
             start = before.replace('ADDRESS', json.dumps(f"?{query}"))
             page = markup.replace(script, start + script, 1).replace("</body>", after + "</body>", 1)
-            self.assertEqual(firefox_probe_results(page.encode()), [[]])
+            self.assertEqual(self.firefox_probe(page.encode()), [[]])
 
         after = r'''<script>
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
@@ -4537,6 +4579,9 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_schedule_filters_repeat_menu_and_scopes(self) -> None:
+        # Close idle Firefox before this Chrome test uses several renderers.
+        if self._firefox is not None:
+            self._firefox.close()
         root = self.root / "reviews"
         start = the_list.ScheduledRun(datetime(2026, 11, 30, 14, tzinfo=UTC), "Compare the account predictions.")
         one_time = the_list.ScheduledRun(datetime(2026, 11, 27, 21, tzinfo=UTC), "Set the time zone to Eastern time.")
@@ -7941,7 +7986,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+        self.assertEqual(self.firefox_probe(markup.replace('</body>', probe+'</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_undo_unpark_restores_the_parked_row(self) -> None:
@@ -7967,7 +8012,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+        self.assertEqual(self.firefox_probe(markup.replace('</body>', probe+'</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_undo_unpark_restores_the_linked_row(self) -> None:
@@ -7997,7 +8042,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();
 </script>"""
-        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+        self.assertEqual(self.firefox_probe(markup.replace('</body>', probe+'</body>').encode()), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_explicit_actions_release_open_rows_from_unread_only(self) -> None:
@@ -10251,6 +10296,8 @@ window.fetch=async(_path,options={})=>{
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_sort_filters_hash_refresh_open_rows_and_phone_cards(self) -> None:
+        if self._chrome is not None:
+            self._chrome.close()
         _ = self.fixture_items()
         self.browser(list_page.render(self.root / "reviews").decode())
 
