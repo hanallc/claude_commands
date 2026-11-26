@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from scripts.agents import remote
 from scripts.lib import models_registry
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_models_registry import claude_catalog_environment, write_registry
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import hashlib
 import io
@@ -164,6 +166,7 @@ class LocalReviewTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
+        self.notify_config = Path()
         self.draft = review.Draft("writer one", "1", "Build needs a decision",
                                   ActionRequired("Choose in the natedev build terminal."),
                                   "The build stopped. Choose whether to retry.", True)
@@ -171,7 +174,8 @@ class LocalReviewTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        environment = source_environment(self.root / "sources")
+        environment = {**source_environment(self.root / "sources"), **config_environment(self.root / "config")}
+        self.notify_config = Path(environment["CONF_DIR"]) / "notify.conf"
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
         _ = self.enterContext(isolated_source_readers())
@@ -200,9 +204,7 @@ class LocalReviewTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(review, "schedule"))
         _ = self.enterContext(mock.patch.object(pushover, "http_post", side_effect=AssertionError("real post")))
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", self.root / "pushes.jsonl"))
-        config = self.root / "notify.conf"
-        _ = config.write_text("review_timeout_seconds=60\n")
-        _ = self.enterContext(mock.patch.object(review, "NOTIFY_CONFIG", config))
+        _ = write_config_fixture(self.notify_config, "review_timeout_seconds=60\n")
         binary = self.root / "bin/claude"
         binary.parent.mkdir()
         _ = binary.write_text("#!/bin/sh\nprintf '2.1.319 (Claude Code)\\n'\n")
@@ -726,30 +728,34 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertEqual([call.args[0] for call in access.call_args_list], list(candidates[:index + 1]))
 
     def test_review_config_accepts_positive_finite_seconds_and_logs_fallbacks(self) -> None:
-        for contents, expected in (("# local limit\nreview_timeout_seconds=90 # seconds\n", 90),
-                                   ("review_timeout_seconds=0.5\n", 0.5)):
-            _ = review.NOTIFY_CONFIG.write_text(contents)
+        with (mock.patch.object(subprocess, "run", REAL_PROCESS_RUN),
+              mock.patch.dict(os.environ, fixture_git_environment(self.root), clear=True)):
+            _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
+            _ = write_config_fixture(self.notify_config, "review_timeout_seconds=75\n")
+            _ = commit_repository(self.root, "Set the reviewer timeout", "config/notify.conf")
+            for value, expected in (("90 # seconds", 90), ("0.5", 0.5)):
+                with self.subTest(value=value), redirect_stderr(io.StringIO()) as errors:
+                    _ = write_config_fixture(self.notify_config, f"review_timeout_seconds={value}\n")
+                    self.assertEqual(review.review_timeout_seconds(), expected)
+                    self.assertEqual(errors.getvalue(), "")
+            for value, reason in (("oops", "expected a finite number"), ("0", "outside range"),
+                                  ("-1", "outside range"), ("nan", "expected a finite number"),
+                                  ("inf", "expected a finite number"), ("1e999", "expected a finite number")):
+                with self.subTest(value=value), redirect_stderr(io.StringIO()) as errors:
+                    _ = write_config_fixture(self.notify_config, f"review_timeout_seconds={value}\n")
+                    self.assertEqual(review.review_timeout_seconds(), 75)
+                    self.assertIn(reason, errors.getvalue())
+            _ = self.notify_config.write_text("# range: 1..60\ntext_ask_minutes=5\n", encoding="utf-8")
             with redirect_stderr(io.StringIO()) as errors:
-                self.assertEqual(review.review_timeout_seconds(), expected)
-            self.assertEqual(errors.getvalue(), "")
-        for contents, reason in (("OTHER=90\n", "missing review_timeout_seconds"),
-                                 ("review_timeout_seconds=oops", "could not convert"),
-                                 ("review_timeout_seconds=0", "positive and finite"),
-                                 ("review_timeout_seconds=-1", "positive and finite"),
-                                 ("review_timeout_seconds=nan", "positive and finite"),
-                                 ("review_timeout_seconds=inf", "positive and finite")):
-            _ = review.NOTIFY_CONFIG.write_text(contents)
+                self.assertEqual(review.review_timeout_seconds(), 75)
+            self.assertIn("key is missing", errors.getvalue())
+            self.notify_config.unlink()
             with redirect_stderr(io.StringIO()) as errors:
-                self.assertEqual(review.review_timeout_seconds(), 60)
-            self.assertIn(reason, errors.getvalue())
-            self.assertIn("using review_timeout_seconds=60", errors.getvalue())
-        review.NOTIFY_CONFIG.unlink()
-        with redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(review.review_timeout_seconds(), 60)
-        self.assertIn("No such file", errors.getvalue())
+                self.assertEqual(review.review_timeout_seconds(), 75)
+            self.assertIn("No such file", errors.getvalue())
 
     def test_all_delivery_waits_derive_from_the_configured_review_and_post_limits(self) -> None:
-        _ = review.NOTIFY_CONFIG.write_text("review_timeout_seconds=90\n")
+        _ = write_config_fixture(self.notify_config, "review_timeout_seconds=90\n")
         self.assertEqual(review.revision_seconds(), 195)
         self.assertEqual(review.user_send_seconds(), 205)
         self.assertEqual(review.claim_stale_seconds(), 205)
@@ -759,12 +765,12 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.user_send_seconds(), 220)
             self.assertEqual(review.claim_stale_seconds(), 220)
             self.assertEqual(review.posting_wait_seconds(), 110)
-        _ = review.NOTIFY_CONFIG.write_text("review_timeout_seconds=60\n")
+        _ = write_config_fixture(self.notify_config, "review_timeout_seconds=60\n")
         self.assertEqual(review.user_send_seconds(), 145)
         self.assertEqual(review.posting_wait_seconds(), 110)
 
     def test_stale_claim_recovery_respects_a_longer_configured_revision_budget(self) -> None:
-        _ = review.NOTIFY_CONFIG.write_text("review_timeout_seconds=150\n")
+        _ = write_config_fixture(self.notify_config, "review_timeout_seconds=150\n")
         held = self.held()
         review.hold(held)
         with mock.patch.object(time, "time", return_value=1301):

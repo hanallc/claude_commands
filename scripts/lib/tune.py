@@ -82,8 +82,7 @@ def main(arguments: list[str] | None = None) -> int:
         _one_line("--user-words", args.user_words)
         _one_line("file", args.file)
         _one_line("key", args.key)
-        if "\n" in args.value or "\r" in args.value:
-            raise main_publish.Refusal("value must fit on one line")
+        live_settings.check_value_line(args.file, args.key, args.value)
         if re.search(r"\s#", args.value) or args.value != args.value.strip():
             raise main_publish.Refusal("value must have no whitespace comment marker or outer whitespace")
         if platform.system() == "Darwin":

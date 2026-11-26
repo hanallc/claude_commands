@@ -23,7 +23,7 @@ from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlencode
 
 from scripts.console_text.test_support import accepting_console_text
-from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results, newer_script_reload_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.lib import atomic_file, conf, file_lock, process_start
 from scripts.lib.process_group import run_process_group
@@ -99,9 +99,14 @@ class ImagesFixture(unittest.TestCase):
                  *, look_for: tuple[str, ...] = ()) -> image_store.ImageRecord:
         return images.register(self.shot, title, self.owner_id(), "Phase console-images", look_for=look_for)
 
-    def list_item(self) -> tuple[staff.StaffRow, staff.StaffRow, the_list.ListItem]:
+    def configure_list(self) -> staff.StaffRow:
         self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.temporary / "state")}))
         keeper = fixture_member("producer", name="morty")
+        _ = write_config_fixture(self.temporary / "config" / "console.conf", f"page.list.owner={keeper.id}\n")
+        return keeper
+
+    def list_item(self) -> tuple[staff.StaffRow, staff.StaffRow, the_list.ListItem]:
+        keeper = self.configure_list()
         producer = fixture_member("producer", name="shot-producer")
         item = the_list.add(keeper.id, "Check the picture", owner=keeper.id, source="nate",
                             changes={"producer": producer.id, "state": the_list.ItemState.WAITING_FOR_NATE})
@@ -410,6 +415,7 @@ class ImagesTests(ImagesFixture):
         self.assertIn("await motion.removeCard(card, apply);", source)
         self.assertIn("const undone = error instanceof SendUndone;", source)
         self.assertIn("showActionFailure(status, message);", source)
+        self.assertIn("saveTimeoutWords(error) || 'Not sent: '", source)
         self.assertIn("new FormData(form, event.submitter)", source)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
@@ -430,14 +436,14 @@ class ImagesTests(ImagesFixture):
         older["registered_at"] = (datetime.now(UTC) - timedelta(days=9)).isoformat(timespec="seconds")
         image_store.write_record(images.images_root(self.root) / older["id"], older)
         current = images.render(self.status).decode()
-        marker = f'data-script="{images.SCRIPT_VERSION}"'
+        marker = f'data-script-version="{images.SCRIPT_VERSION}"'
         self.assertEqual(current.count(marker), 1)
         probe = """<script>
 (async () => {
  const wait = ms => new Promise(done => setTimeout(done, ms));
  const report = failures => fetch('/results', {method: 'POST', body: JSON.stringify(failures)});
  const list = () => document.querySelector('[data-images]');
- if (list().dataset.script === 'older-script') {
+ if (document.querySelector('[data-page-status]').dataset.scriptVersion === 'older-script') {
   document.dispatchEvent(new Event('visibilitychange'));
   await wait(5000);
   await report(['an update from a newer script did not reload the page']);
@@ -599,7 +605,7 @@ class ImagesTests(ImagesFixture):
                     self.send_error(503, "The list is unavailable.")
                     return
                 if len(gets) == 1:
-                    page = current.replace(marker, 'data-script="older-script"')
+                    page = current.replace(marker, 'data-script-version="older-script"')
                 elif words == "Routine feedback.":
                     page = images.render(fixture.status).decode()
                 else:
@@ -642,6 +648,33 @@ class ImagesTests(ImagesFixture):
             (["feedback"], ["Retry after refresh fails."]), (["feedback"], ["Keep until next feedback."]),
             (["feedback"], ["Routine feedback."]),
         ])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        _ = write_config_fixture(self.temporary / "config/review_links.conf", "page_request_timeout_seconds=5\n")
+        for caption in ("First shot", "Second shot", "Third shot"):
+            _ = self.register(caption)
+        current = images.render(self.status).decode()
+        self.assertEqual(current.count(f'data-script-version="{images.SCRIPT_VERSION}"'), 1)
+        newer = "(url,options)=>options?.cache==='no-store' ? Promise.resolve({ok:true,text:async()=>NEWER_PAGE}) : undefined"
+        newer = newer.replace("NEWER_PAGE", json.dumps(current.replace(images.SCRIPT_VERSION, "newer-script"))
+                              .replace("</", "<\\/"))
+        place = "scrollTo({top:120,behavior:'instant'});"
+        field = "document.querySelectorAll('[data-images] textarea')[1]"
+        with self.subTest(hold="a visible draft"):
+            self.assertEqual(newer_script_reload_results(
+                current, newer=newer, place=place, start=f"type({field},'typed words');",
+                end=f"type({field},'');"), [[]])
+        with self.subTest(hold="none, for a hidden draft"):
+            self.assertEqual(newer_script_reload_results(
+                current, newer=newer, place=place, holds=False,
+                start=f"type({field},'typed words');{field}.closest('article').hidden=true;"), [[]])
+        with self.subTest(hold="an Approved save that never answers"):
+            # The last card leaves and comes back below the viewport, so the scroll place stays.
+            save = ("const form=[...document.querySelectorAll('[data-images] form[data-image-form]')].at(-1);"
+                    + "form.requestSubmit(form.querySelector('[value=\"approved\"]'));")
+            self.assertEqual(newer_script_reload_results(
+                current, newer=newer, place=place, start=save, saves=True), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_undo_returns_the_card_and_says_edit_and_send_again(self) -> None:
@@ -861,8 +894,7 @@ class ImagesTests(ImagesFixture):
                 self.assertNotIn(record["id"], images.render(self.status).decode())
 
     def test_linked_answers_save_before_delivery_and_survive_owner_delete(self) -> None:
-        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.temporary / "state")}))
-        morty = fixture_member("producer", name="morty")
+        morty = self.configure_list()
         producer = fixture_member("producer", name="shot-producer")
         owner = self.owner
         assert owner is not None
@@ -1050,16 +1082,18 @@ window.fetch = async (url, options) => {
  const realFetch = window.fetch.bind(window);
  const fresh = FRESH;
  const update = () => document.dispatchEvent(new Event('visibilitychange'));
- const version = document.querySelector('[data-images]').dataset.script;
+ const version = document.querySelector('[data-page-status]').dataset.scriptVersion;
  window.fetch = async (url, options) => {
    if (url !== location.pathname) return realFetch(url, options);
    if (options?.method === 'POST') return new Response('{"state":"done"}');
    return new Response(phase === 'sending' ? fresh : fresh.replace(
-     'data-script="' + version + '"', 'data-script="new-script"'));
+     'data-script-version="' + version + '"', 'data-script-version="new-script"'));
  };
  if (!phase) {
    first.value = firstWords;
    second.value = secondWords;
+   first.closest('article').hidden = true;
+   second.closest('article').hidden = true;
    sessionStorage.setItem('probe-phase', 'sending');
    update();
    return;

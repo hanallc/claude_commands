@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from urllib.parse import urlencode
+
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
@@ -18,6 +20,13 @@ from scripts.review_links import send_hold, setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
+LIST_PAGE_PATH = "/console/list.html"
+
+
+def list_item_fragment(keeper: str, number: int) -> str:
+    return "#" + urlencode({"item": f"{keeper}/L{number}"})
+
+
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
                          "rebuilds", "review", "studio"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
@@ -367,8 +376,8 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str, *, status_companion: str = "") -> str:
-    """Build the title and refresh status with an optional control."""
+def title(text: str, page: str, version: str = "", *, status_companion: str = "") -> str:
+    """Build the title and refresh status with a script version and an optional control."""
     settings = conf.read_or_repository("console")
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
@@ -381,7 +390,8 @@ def title(text: str, page: str, *, status_companion: str = "") -> str:
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
     return (PAGE_TOP + heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
-            + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
+            + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" '
+            + (f'data-script-version="{version}" ' if version else '') + 'data-page-facts>'
             + '<span class="page-status-state">' + icons + '<span data-status-word>Reading…</span></span>'
             + '<span data-status-age hidden></span><span data-status-trip hidden></span>'
             + '<span data-status-render hidden></span><span data-status-reason hidden></span>'
@@ -424,7 +434,61 @@ CONSOLE_READY_SCRIPT = """(() => {
 })();"""
 
 
-REFRESH_SCRIPT = r'''function pageRefreshFacts(page=document){
+# A save that ends by its timeout can still finish on the server, so its words do not say that it failed.
+# The card frame has no refresh script, so it passes its own seconds.
+SAVE_TIMEOUT_SCRIPT = r'''function saveTimeoutWords(error,seconds=pageRequestSeconds()){
+ return error?.name==='TimeoutError' ? 'No answer in '+seconds+' s. The save can still finish.' : '';
+}
+'''
+REFRESH_SCRIPT = r'''// Only what the user can see now holds a script reload: a field with unsaved text, an open dialog, menu or picker, or a selection.
+function pageHoldsInput(){
+ const shown=node=>node.checkVisibility ? node.checkVisibility() : node.getClientRects().length>0;
+ if([...document.querySelectorAll('dialog[open],[role=dialog],[role=menu]')].some(shown)) return true;
+ // A selection in a hidden row or a closed dialog has no client rects, so it does not hold the reload.
+ const selection=getSelection();
+ if(selection && !selection.isCollapsed && selection.rangeCount && selection.getRangeAt(0).getClientRects().length) return true;
+ // The address restores a [data-reload-safe] field after a short wait, so its text is a draft only while it has focus.
+ const draft=field=>!field.hasAttribute('data-reload-safe') || field===document.activeElement && document.hasFocus();
+ return [...document.querySelectorAll('textarea,input:is([type=text],[type=search],[type=url],[type=email],[type=number],:not([type]))')]
+  .some(field=>shown(field) && field.value!==field.defaultValue && draft(field));
+}
+// A fragment from a changed page script can need a newer script than this page runs.
+// Each page refresh calls this first, before any page early return.
+// `page` is the fetched page, or the script version that a JSON read names (none from an older server).
+// `held` is the page's own hold, such as a save in flight; pageHoldsInput always adds the visible edit.
+// Returns refresh facts when the fresh page has another script version, else null.
+// A held reload returns only the busy reason, so the status keeps the data and answer times it has.
+// The page keeps the held reload and loads the newer page as soon as the hold ends.
+let pageReloadHeld=null,pageReloadListening=false;
+function reloadForNewScript(page,held=()=>false){
+ const version=root=>root.querySelector('[data-page-status]')?.dataset.scriptVersion;
+ const fresh=page instanceof Document ? version(page) : page,own=version(document);
+ if(!fresh || !own || fresh===own){pageReloadHeld=null;return null;}
+ if(held() || pageHoldsInput()){pageReloadHeld=held;listenForHoldEnd();return {busy:'A newer page loads when your edit ends.'};}
+ location.reload();
+ return pageRefreshFacts();
+}
+// The 1 s status clock, an edit, a dialog close, a selection change and each save end call this.
+function reloadWhenHoldEnds(){
+ if(pageReloadHeld && !pageReloadHeld() && !pageHoldsInput()){pageReloadHeld=null;location.reload();}
+}
+// The first held reload adds these listeners, so the script has no top-level page effects.
+// The bubble phase lets the page's own handlers run first. A close event does not bubble, so its check waits one task.
+function listenForHoldEnd(){
+ if(pageReloadListening) return;
+ pageReloadListening=true;
+ for(const name of ['input','change','selectionchange']) document.addEventListener(name,reloadWhenHoldEnds);
+ document.addEventListener('close',()=>setTimeout(reloadWhenHoldEnds,0),true);
+}
+function pageRequestSeconds(){
+ return Number(document.querySelector('[data-request-timeout-seconds]')?.dataset.requestTimeoutSeconds);
+}
+// A save fetch ends after the page_request_timeout_seconds that the page writes in data-request-timeout-seconds.
+// So a save in flight holds a script reload for a limited time.
+function pageRequestSignal(){
+ return AbortSignal.timeout(pageRequestSeconds()*1000);
+}
+''' + SAVE_TIMEOUT_SCRIPT + r'''function pageRefreshFacts(page=document){
  const line=page.querySelector('[data-page-status]');
  if(!line || !line.dataset.readAt) throw new Error('The page has no data time.');
  return {readAt:Number(line.dataset.readAt),renderSeconds:Number(line.dataset.renderSeconds),
@@ -446,7 +510,7 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  const options=line ? JSON.parse(line.dataset.statusOptions) : {};
  const hidden=()=>document.visibilityState!=='visible' || window.frameElement?.hidden===true;
  const frame=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
- let last=null,failure='',reading=false,busy='';
+ let last=null,failure='',reading=false,busy='',heldBeforeData='';
  let request=0,active=false,started=0,pending=null,timer,clock,delay;
  let trip=null,state='',nextAt=0;
  const duration=value=>Number(value)<10 ? Number(value).toFixed(2) : Number(value).toFixed(0);
@@ -456,14 +520,15 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
   const reason=held(),age=last ? Math.max(0,Math.floor(Date.now()/1000-last.readAt)) : 0;
   // An on-demand page can report a server answer separately from the data time.
   const unanswered=last ? Math.max(0,Math.floor(Date.now()/1000-(last.answeredAt ?? last.readAt))) : 0;
-  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late' : busy || last?.busy ? 'Paused' : reading || !last ? 'Reading' : 'Live';
+  const next=reason ? 'Paused' : failure ? 'Failed' : last && unanswered>options.ageLimit ? 'Late'
+   : busy || last?.busy || heldBeforeData ? 'Paused' : reading || !last ? 'Reading' : 'Live';
   line.dataset.state=next;
   line.querySelectorAll('[data-status-icon]').forEach(icon=>icon.hidden=icon.dataset.statusIcon!==next);
   line.querySelector('[data-status-word]').textContent=next==='Reading' ? 'Reading…' : next;
   if(next!==state){line.querySelector('[data-status-announcement]').textContent=next;state=next;}
   const part=(key,text)=>{const node=line.querySelector('[data-status-'+key+']');node.hidden=!text;node.textContent=text;return node;};
   part('age',last ? age<60 ? age+' s ago' : Math.floor(age/60)+' min ago' : '');
-  const why=next==='Paused' ? reason || busy || last?.busy : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
+  const why=next==='Paused' ? busy || last?.busy || heldBeforeData || reason : next==='Failed' ? failure : next==='Late' ? 'The feed has stopped.' : '';
   part('reason',why);
   const timings=last && !why;
   const round=part('trip',timings && trip!==null ? 'round trip '+duration(trip)+' s' : '');
@@ -475,10 +540,17 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
  function failed(error,own){if(own===request){failure=error.message || 'The read failed.';reading=false;draw();}}
  async function present(value,began,own,initial=false){
   try{
+  // A busy answer without data keeps the shown data and counts as an answer now, as setStatus does.
+  // A page hold does not keep it back, because it has no new data. Before the first data, it shows only its reason.
+  const status=value.readAt===undefined;
+  if(status){
+   if(!last){heldBeforeData=value.busy;failure='';reading=false;draw();return;}
+   value={...last,busy:value.busy,answeredAt:Date.now()/1000};
+  }else heldBeforeData='';
   if(!Number.isFinite(value.readAt) || !Number.isFinite(value.renderSeconds)) throw new Error('The data has no render time.');
   if(initial){last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;failure=value.failure || '';draw();}
   await frame();if(own!==request) return;
-  if(held()){pending={value,began,own};draw();return;}
+  if(held() && !status){pending={value,began,own};draw();return;}
   last=value;if(line) line.dataset.renderSeconds=value.renderSeconds;
   trip=(performance.now()-began)/1000;failure=value.failure || '';reading=false;pending=null;draw();
   }catch(error){failed(error,own);}
@@ -505,6 +577,7 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
   draw();
  }
  function changed(){
+  reloadWhenHoldEnds();
   if(pending && !held()){const value=pending;pending=null;void present(value.value,value.began,value.own);}
   draw();
  }
@@ -620,6 +693,32 @@ border-radius:8px;background:var(--card);color:var(--ink)}
 @media(max-width:960px){.review-action-group+.review-action-group{padding-left:0;border:0}}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''' + HEADING_STYLE + PAGE_TOP_STYLE)
+
+class VerdictAction(StrEnum):
+    WORKS = "works"
+    NOT_FIXED = "not works"
+
+
+class VerdictItemType(StrEnum):
+    CHANGE = "outcome"
+    LIST_REPAIR = "action"
+
+
+NEGATIVE_VERDICT_LABELS = {
+    VerdictItemType.CHANGE: "Does not work",
+    VerdictItemType.LIST_REPAIR: "Not fixed",
+}
+
+
+def verdict_button(item_type: VerdictItemType, action: VerdictAction, *,
+                   primary: bool = False, selected: bool = False) -> str:
+    """Render the verdict for a change or a List repair."""
+    label = "Works" if action is VerdictAction.WORKS else NEGATIVE_VERDICT_LABELS[item_type]
+    pressed = 'aria-pressed="true" ' if selected else ""
+    style = ' class="primary"' if primary else ""
+    disabled = ' disabled' if item_type is VerdictItemType.LIST_REPAIR and action is VerdictAction.NOT_FIXED else ""
+    return f'<button {pressed}name="{item_type}" value="{action}"{style}{disabled}>{label}</button>'
+
 
 def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
                    before_body: str = '', footer: str = '', form: bool = False, body_class: str = '') -> str:
@@ -1028,18 +1127,27 @@ return ()=>document.querySelector('[data-send-undo-stack]') || createSendUndoSta
 
 HELD_SEND_SCRIPT = (f'window.heldFetch || (() => {{\nconst SEND_HOLD_PATH={json.dumps(send_hold.HOLD_PATH)},'
                     f'SEND_REQUEST_HEADER={json.dumps(send_hold.REQUEST_HEADER)},'
+                    f'RELEASE_GRACE_SECONDS={send_hold.RELEASE_GRACE_SECONDS},'
                     f'SEND_UNDO_STACK_SCRIPT={json.dumps(SEND_UNDO_STACK_SCRIPT)};\n') + r'''class SendUndone extends Error{
  constructor(){super('Undone. Edit and send again.');this.name='SendUndone';}
 }
 function sendUndoHost(){
  try{ return window.top.document; }catch{ return document; }
 }
-const pause=(ms,view=window)=>new Promise(resolve=>view.setTimeout(resolve,ms));
+const pause=(ms,view=window,signal)=>new Promise((resolve,reject)=>{
+ signal?.throwIfAborted();
+ const abort=()=>{view.clearTimeout(timer);reject(signal.reason);};
+ const timer=view.setTimeout(()=>{signal?.removeEventListener('abort',abort);resolve();},ms);
+ signal?.addEventListener('abort',abort,{once:true});
+});
+const undoRequestSignal=()=>AbortSignal.timeout(30000);
+const releaseGraceEndsAt=()=>performance.now()+RELEASE_GRACE_SECONDS*1000;
 const RETRY_LIMIT_MS=120_000,KEEPALIVE_LIMIT=64*1024;
 const heldRequests=new Map();
-function trackHeldRequest(key){
+const newHoldId=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),
+ byte=>byte.toString(16).padStart(2,'0')).join('');
+function trackHeldRequest(key,id){
  const view=sendUndoHost().defaultView || window;
- const id=Array.from(crypto.getRandomValues(new Uint8Array(12)),byte=>byte.toString(16).padStart(2,'0')).join('');
  const started=Date.now(),elapsed=performance.now();
  const expired=()=>Date.now()-started>=RETRY_LIMIT_MS || performance.now()-elapsed>=RETRY_LIMIT_MS;
  const request={id,hold:id,expired,closed:false,closeToast:null,finish};
@@ -1060,7 +1168,7 @@ function trackHeldRequest(key){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver){
+function showSendUndo(request,seconds,receiver,resumable,onExpiry){
  const {hold}=request,host=sendUndoHost();
  const view=host.defaultView;
  if(!view.getSendUndoStack){
@@ -1079,7 +1187,7 @@ function showSendUndo(request,seconds,receiver){
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
  const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
  const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
- return new Promise(resolve=>{
+ return new Promise((resolve,reject)=>{
   let done=false,removalTimer=0;
   const remove=()=>{
    view.clearTimeout(removalTimer);
@@ -1115,16 +1223,26 @@ function showSendUndo(request,seconds,receiver){
    if(done) return;
    done=true;
    button.remove();bar.remove();toast.hidden=true;
+   onExpiry();
    resolve(reportResult);
   },()=>{});
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();
+   const signal=resumable ? undoRequestSignal() : undefined;
    let answer=null;
-   for(let tries=0;tries<2 && !answer;tries++){
-    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'}); }catch{ await pause(500); }
+   for(let tries=0;tries<2 && !answer && !signal?.aborted;tries++){
+    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST',signal}); }
+    catch{ if(!signal?.aborted) await pause(500); }
    }
-   if(answer?.ok){finish(true);return;}
+   if(answer?.ok && (!resumable || (await answer.json().catch(()=>null))?.outcome==='undone')){
+    finish(true);return;
+   }
    if(request.closed) return;
+   if(signal?.aborted){
+    done=true;remove();
+    reject(new Error('The Undo response timed out. The send can still leave.'));
+    return;
+   }
    done=true;
    button.remove();bar.remove();fade.cancel();
    if(answer?.status===409){
@@ -1139,16 +1257,18 @@ function showSendUndo(request,seconds,receiver){
   });
  });
 }
-async function heldFetch(url,init={},receiver,onHold){
+async function heldFetch(url,{requestTimeoutSeconds,...init}={},receiver,onHold,holdId){
+ const postSignal=init.signal ?? (requestTimeoutSeconds===undefined ? undefined : AbortSignal.timeout(requestTimeoutSeconds*1000));
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
- const key=JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
- const request=heldRequests.get(key) || trackHeldRequest(key);
+ const key=holdId ?? JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
+ const request=heldRequests.get(key) || trackHeldRequest(key,holdId ?? newHoldId());
  headers.set(SEND_REQUEST_HEADER,request.id);
  const keepalive=body.length<=KEEPALIVE_LIMIT && new TextEncoder().encode(body).length<=KEEPALIVE_LIMIT;
  const post=async keepalive=>{
   if(request.expired()) throw new Error('The retry time ended. The send may have left.');
-  return fetch(url,{...init,headers,keepalive});
+  postSignal?.throwIfAborted();
+  return fetch(url,{...init,headers,keepalive,signal:postSignal});
  };
  const first=await post(keepalive).catch(error=>{
   if(!keepalive) throw error;
@@ -1159,34 +1279,63 @@ async function heldFetch(url,init={},receiver,onHold){
   return first;
  }
  const {hold,seconds}=await first.json();
+ const resumable=Boolean(holdId);
+ if(resumable && hold!==holdId) throw new Error('The send hold does not match this request.');
+ request.releaseDueAt=releaseGraceEndsAt()+seconds*1000;
+ let undoExpired=false;
  request.hold=hold;
  let undo=false;
  if(!request.closed && seconds>0){
-  const shown=showSendUndo(request,seconds,receiver);
+  const shown=showSendUndo(request,seconds,receiver,resumable,()=>{
+   undoExpired=true;
+   request.releaseDueAt=Math.min(request.releaseDueAt,releaseGraceEndsAt());
+  });
   onHold?.();
   undo=await shown;
  }
  if(undo===true){request.finish();throw new SendUndone();}
- // A server restart drops the connection; the held send waits in its file, so read its result again.
- for(let failures=0;;){
-  try{
-   const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store'});
-   if(response.headers.get('X-Send-Hold')!=='pending'){
-    if(response.status!==404 || !request.expired()) request.finish();
+ return readHeldResult(hold,request,undo,resumable,{requestTimeoutSeconds,undoExpired});
+}
+async function readHeldResult(hold,request,undo,resumable,{requestTimeoutSeconds,undoExpired=false,configuredUndoSeconds=0}){
+ let signal;
+ if(requestTimeoutSeconds!==undefined){
+  // A pending result does not give the remaining Undo time.
+  const releaseDueAt=request?.releaseDueAt ?? (releaseGraceEndsAt()+configuredUndoSeconds*1000);
+  const remainingReleaseMs=request?.closed ? 0 : Math.max(0,Math.ceil(releaseDueAt-performance.now()));
+  // Read at once if Undo was uncertain or the hold had no Undo time.
+  if(undoExpired && remainingReleaseMs>0) await pause(remainingReleaseMs);
+  signal=AbortSignal.timeout(requestTimeoutSeconds*1000+(undoExpired ? 0 : remainingReleaseMs));
+ }
+ try{
+  for(let failures=0;;){
+   signal?.throwIfAborted();
+   try{
+    const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store',signal});
+    if(response.headers.get('X-Send-Hold')==='pending') continue;
+    if(resumable || response.status!==404 || !request?.expired()) request?.finish();
     if(typeof undo==='function') await undo(response);
+    if(resumable && response.status===404 && response.headers.get('X-Send-Hold-Outcome')==='undone')
+     throw new SendUndone();
     return response;
+   }catch(error){
+    if(error instanceof SendUndone || ++failures>=30) throw error;
+    await pause(1000,window,signal);
    }
-  }catch(error){
-   if(++failures>=30){
-    if(typeof undo==='function') await undo();
-    throw error;
-   }
-   await pause(1000);
   }
+ }catch(error){
+  if(!(error instanceof SendUndone) && typeof undo==='function') await undo();
+  throw error;
  }
 }
+heldFetch.newId=newHoldId;
+heldFetch.resume=(id,limits)=>{
+ const request=heldRequests.get(id);
+ return readHeldResult(request?.hold ?? id,request,false,true,limits);
+};
 function sendActionReceiver(form,data){
- const action=data.get('outcome');
+ const action=data.get('outcome') ?? data.get('action');
+ if(data.get('action')==='works') return null;
+ if(data.get('action')==='not works') return form.dataset.repairReceiver;
  const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
  if(action==='approve' && data.get('assignee')){
   const option=form.elements.assignee?.selectedOptions[0];
@@ -1221,7 +1370,7 @@ function holdCard(card,changed){
   return true;
  }
  return {
-  post:(url,init,receiver)=>heldFetch(url,init,receiver,()=>setHeld(true)),
+  post:(url,init,receiver,id)=>heldFetch(url,init,receiver,()=>setHeld(true),id),
   restore:()=>setHeld(false),
  };
 }

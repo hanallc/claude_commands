@@ -780,16 +780,18 @@ elif name == 'cargo':
         self.assertIn('nextest setup error\ninvalid: \ufffd', diagnostic)
 
     def test_nextest_tail_stops_at_the_byte_limit_on_a_large_log(self) -> None:
-        payload = b'outside the byte limit\n' + b'x' * (3 * trial.NEXTEST_LOG_TAIL_BYTES) + b'\nfinal diagnostic\n'
+        limit = 131_071
+        override_fixture_settings(conf.path('cloud_gate'), f'gpu_size_trial.nextest_log_tail_bytes={limit}\n')
+        payload = b'outside the byte limit\n' + b'x' * (3 * limit) + b'\nfinal diagnostic\n'
         reader = LogReadProbe(payload)
-        with mock.patch.object(Path, 'open', return_value=reader) as opened:
-            tail = trial.nextest_log_tail(self.root / 'nextest.log')
+        opened = mock.Mock(return_value=reader)
+        tail = trial.nextest_log_tail(mock.Mock(spec=Path, open=opened))
         opened.assert_called_once_with('rb')
         sizes = reader.read_sizes
-        self.assertEqual(sum(sizes), trial.NEXTEST_LOG_TAIL_BYTES)
+        self.assertEqual(sum(sizes), limit)
         self.assertTrue(all(0 < size <= trial.NEXTEST_LOG_TAIL_CHUNK_BYTES for size in sizes))
         offsets = reader.offsets
-        self.assertEqual(min(offsets), len(payload) - trial.NEXTEST_LOG_TAIL_BYTES)
+        self.assertEqual(min(offsets), len(payload) - limit)
         self.assertEqual(offsets, sorted(offsets, reverse=True))
         self.assertTrue(tail.endswith('\nfinal diagnostic\n'))
         self.assertNotIn('outside the byte limit', tail)
@@ -800,8 +802,7 @@ elif name == 'cargo':
                 lines = [f'{number}: ' + 'x' * 1000 for number in range(500)]
                 payload = ('\n'.join(lines) + ending).encode()
                 reader = LogReadProbe(payload)
-                with mock.patch.object(Path, 'open', return_value=reader):
-                    tail = trial.nextest_log_tail(self.root / 'nextest.log')
+                tail = trial.nextest_log_tail(mock.Mock(spec=Path, open=mock.Mock(return_value=reader)))
                 self.assertEqual(tail, '\n'.join(lines[-200:]) + ending)
                 sizes = reader.read_sizes
                 self.assertLess(sum(sizes), len(payload))

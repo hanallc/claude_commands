@@ -75,6 +75,7 @@ class MacRunTests(unittest.TestCase):
         _ = (self.root / "build_folders.conf").write_text("# whole: 1..\nnames.repository_key_length=8\n")
         self.enterContext(mock.patch.dict(os.environ, {
             "CONF_DIR": str(self.root), "COPIES_CONFIG": str(copies_config),
+            "USER_ZONE": "UTC",
             "MAC_TEST_STATE_DIR": str(self.root / "state"),
         }))
         _ = self.enterContext(mock.patch.object(claim_state, "submitting_session", return_value=NoOwningSession()))

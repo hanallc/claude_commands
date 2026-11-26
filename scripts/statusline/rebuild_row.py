@@ -18,10 +18,10 @@ from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import quote
 
-from scripts.lib import atomic_file, conf_reads
+from scripts.lib import atomic_file, conf
 from scripts.rebuild import need
 
-DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config/statusline.conf"
+DEFAULT_CONFIG: str | Path = "statusline"
 MACHINES = ("natedev", "mac")
 CHANGE_LIMIT = 5
 SHORT_REASON_LIMIT = 60
@@ -66,7 +66,7 @@ class RebuildSettings:
     eval_retry_seconds: int
 
     @classmethod
-    def read(cls, path: Path) -> RebuildSettings:
+    def read(cls, path: str | Path = "statusline") -> RebuildSettings:
         values = config_values(path)
         settings = cls(Path(values["rebuild.repo"]), values["rebuild.ref"],
                        values["rebuild.natedev"], values["rebuild.mac"],
@@ -258,18 +258,16 @@ class RebuildAnswer:
         return self.failure.commit if isinstance(self.failure, EvaluationFailure) else ""
 
 
-def config_values(path: Path) -> Mapping[str, str]:
-    values: dict[str, str] = {}
-    contents = conf_reads.read_text(path)
-    for line in contents.splitlines():
-        key, sep, value = line.partition("#")[0].partition("=")
-        if sep:
-            values[key.strip()] = value.strip()
-    return conf_reads.trace_values(path, contents, values)
+def config_values(path: str | Path = "statusline") -> dict[str, str]:
+    return conf.read(path).values()
 
 
-def cache_path(config: Path) -> Path:
-    path = Path(config_values(config)["rebuild.cache"]).expanduser()
+def cache_path(config: str | Path) -> Path:
+    return _configured_cache_path(conf.read(config))
+
+
+def _configured_cache_path(settings: conf.ConfigRead) -> Path:
+    path = Path(settings.text("rebuild.cache")).expanduser()
     if not path.is_absolute():
         raise ValueError("The rebuild cache path must be absolute")
     return path
@@ -433,7 +431,7 @@ def machine_changes(settings: RebuildSettings, system: need.ActiveSystem, known:
     return ComparedChanges(system.path, system.revision, configured, tuple(changes))
 
 
-def write_changes(config: Path, run: CommandRunner | None = None) -> None:
+def write_changes(config: str | Path, run: CommandRunner | None = None) -> None:
     """Record pending changes and the session that wrote each commit."""
     output = command_output if run is None else run
 
@@ -543,7 +541,7 @@ def _read_changes(cache: Path, watch: need.SourceWatch | None = None) -> dict[st
     return {}
 
 
-def read_recorded_changes(config: Path, *, watch: need.SourceWatch | None = None) -> dict[str, CachedChanges]:
+def read_recorded_changes(config: str | Path, *, watch: need.SourceWatch | None = None) -> dict[str, CachedChanges]:
     """Read both the current and legacy forms of the changes cache."""
     try:
         return _read_changes(cache_path(config), watch)
@@ -553,7 +551,7 @@ def read_recorded_changes(config: Path, *, watch: need.SourceWatch | None = None
         return {}
 
 
-def read_changes(config: Path = DEFAULT_CONFIG) -> dict[str, tuple[Change, ...]]:
+def read_changes(config: str | Path = DEFAULT_CONFIG) -> dict[str, tuple[Change, ...]]:
     """Read the recorded commit list for each machine."""
     return {machine: changes.commits if isinstance(changes, ComparedChanges) else changes
             for machine, changes in read_recorded_changes(config).items()}
@@ -577,7 +575,7 @@ def read_compared_changes(config: Path, answer: RebuildAnswer, *,
             if (changes := matched_changes(answer, machine, cached)) is not None}
 
 
-def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.time,
+def read(config: str | Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.time,
          watch: need.SourceWatch | None = None) -> RebuildAnswer:
     """Combine the cached comparison with open rebuild needs."""
     answer = _read_cache(config, clock, watch=None if watch is None else watch.watch)
@@ -591,12 +589,13 @@ def read(config: Path = DEFAULT_CONFIG, *, clock: Callable[[], float] = time.tim
                    needs=RebuildNeedsUnavailable("\n".join(errors), needs) if errors else needs)
 
 
-def _read_cache(config: Path, clock: Callable[[], float], *,
+def _read_cache(config: str | Path, clock: Callable[[], float], *,
                 watch: Callable[[Path], None] | None = None) -> RebuildAnswer:
     """Read the configured comparison cache without evaluating systems."""
     try:
+        source = conf.path(config)
         if watch is not None:
-            watch(config)
+            watch(source)
         cache = cache_path(config)
     except (OSError, ValueError, KeyError):
         return RebuildAnswer((), False)
@@ -607,7 +606,7 @@ def _read_cache(config: Path, clock: Callable[[], float], *,
         if len(lines) < 2 or not lines[1].isascii() or not lines[1].isdecimal():
             return RebuildAnswer((), True)
         deadline = int(lines[1])
-        refresh_due = deadline <= clock() or config.stat().st_mtime_ns > cache.stat().st_mtime_ns
+        refresh_due = deadline <= clock() or source.stat().st_mtime_ns > cache.stat().st_mtime_ns
         items = lines[0].split(", ") if lines[0] else []
         if any(item not in ("rebuild natedev", "rebuild mac") for item in items):
             return RebuildAnswer((), True)
@@ -669,7 +668,7 @@ def write_status_cache(cache: Path, line: str, due: str, sources: list[Path], be
     _ = scratch.replace(cache)
 
 
-def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[[], float] = time.time) -> None:
+def write(config: str | Path, run: CommandRunner = command_output, *, clock: Callable[[], float] = time.time) -> None:
     """Refresh the configured cache without concurrent evaluations."""
     try:
         cache = cache_path(config)
@@ -722,15 +721,15 @@ def write(config: Path, run: CommandRunner = command_output, *, clock: Callable[
             fields["running_system_probes"] = {"natedev": probes.natedev, "mac": probes.mac}
             fields["running_system_paths"] = running_paths
             details = json.dumps(fields)
-        write_status_cache(cache, line, due, [config], began, details)
+        write_status_cache(cache, line, due, [conf.path(config)], began, details)
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("mode", choices=("read", "refresh"))
-    _ = parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    _ = parser.add_argument("--config", type=Path)
     args = parser.parse_args(argv)
-    config = cast(Path, getattr(args, "config"))
+    config = cast("Path | None", getattr(args, "config")) or DEFAULT_CONFIG
     mode = cast(str, getattr(args, "mode"))
     if mode == "read":
         for machine in read(config).machines:

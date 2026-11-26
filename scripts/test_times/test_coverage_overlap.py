@@ -21,6 +21,7 @@ from scripts.lib.checkout_test_support import copy_test_runner
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.test_times.coverage_overlap import TestCoverage, select_candidates
 
 if TYPE_CHECKING:
@@ -211,15 +212,17 @@ class CoverageOverlapTests(unittest.TestCase):
                 (CHILD_STARTUP / "sitecustomize.py", tooling / "coverage_child" / "sitecustomize.py"),
                 (TOOL.parents[1] / "lib" / "code_kind.py", library / "code_kind.py"),
                 *((TOOL.parents[1] / relative, root / "scripts" / relative) for relative in (
-                    "lib/terminal_cells.py", "buildlog/treekey.py", "production/gate_modules.py",
+                    "lib/terminal_cells.py", "buildlog/treekey.py",
+                    "production/gate_modules.py", "production/production_names.py",
                 )),
             ):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 _ = shutil.copy2(source, destination)
             _ = (root / "scripts/__init__.py").write_text("")
+            _ = write_config_fixture(root / "config" / "test_times.conf",
+                                     "coverage_leaf_programs=git\nmodule_cost.max_output_replay_bytes=1048576\n")
             sources = {
                 "scripts/fixture/product.py": PRODUCT,
-                "config/test_times.conf": "coverage_leaf_programs=git\n",
                 **sources,
             }
             for relative, source in sources.items():

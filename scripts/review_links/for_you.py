@@ -159,10 +159,6 @@ def action_row(record: UserAction, requester: str) -> ForYouRow:
                      requester_reference=record.requested_by)
 
 
-def rebuild_config() -> Path:
-    return conf.path("statusline") if "CONF_DIR" in os.environ else rebuild_row.DEFAULT_CONFIG
-
-
 def action_source_paths() -> tuple[Path, Path, Path]:
     needs = need.needs_folder()
     return ActionStore().folder, needs, needs / "done"
@@ -170,7 +166,7 @@ def action_source_paths() -> tuple[Path, Path, Path]:
 
 def source_paths(config: Path | None = None) -> tuple[Path, ...]:
     """Watch the native action sources and the rebuild comparison."""
-    config = rebuild_config() if config is None else config
+    config = conf.path(rebuild_row.DEFAULT_CONFIG) if config is None else config
     paths = (*action_source_paths(), config)
     try:
         cache = rebuild_row.cache_path(config)
@@ -213,7 +209,7 @@ def read(config: Path | None = None, *,
          include_running_revision: bool = True, include_status_reasons: bool = False,
          watch: need.SourceWatch | None = None) -> ForYouSnapshot:
     """Project both stores and the comparison cache without running a rebuild or a refresh."""
-    config = rebuild_config() if config is None else config
+    config = conf.path(rebuild_row.DEFAULT_CONFIG) if config is None else config
     unavailable: list[UnavailableSource] = []
     names: dict[str, str] = {}
     members_by_reference: dict[str, staff.StaffRow] = {}
@@ -327,7 +323,7 @@ def read_for_status_line(config: Path | None = None, *,
                          rebuild: rebuild_row.RebuildAnswer | None = None, include_reasons: bool = False,
                          watch: need.SourceWatch | None = None) -> ForYouSnapshot:
     """Keep rebuild reasons when the action count is unavailable."""
-    config = rebuild_config() if config is None else config
+    config = conf.path(rebuild_row.DEFAULT_CONFIG) if config is None else config
     try:
         return read(config, rebuild=rebuild, include_running_revision=False, include_status_reasons=include_reasons,
                     watch=watch)
@@ -342,7 +338,7 @@ def read_for_status_line(config: Path | None = None, *,
 def global_action_count(rebuild: rebuild_row.RebuildAnswer | None = None) -> str:
     """Return a complete action count or an explicit unavailable result."""
     try:
-        count = read(rebuild_row.DEFAULT_CONFIG, rebuild=rebuild, include_running_revision=False).open_count
+        count = read(rebuild=rebuild, include_running_revision=False).open_count
     except (OSError, ValueError):
         return "unavailable"
     return str(count.value) if isinstance(count, KnownOpenCount) else "unavailable"
