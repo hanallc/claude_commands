@@ -14,18 +14,19 @@ from collections.abc import Callable, Collection, Generator, Iterable, Iterator,
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from io import StringIO
 from itertools import chain
 from pathlib import Path
 from threading import Lock
 from typing import NamedTuple, cast
 
-from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
+from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, existing_writer_lock, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
 from scripts.lib import conf, git_files
 from scripts.lib.showrunner_state import state_root as state_root
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
-from scripts.production.issues import ALL_FIELDS, Issue, header_fields, source_paths
+from scripts.production.issues import ALL_FIELDS, Issue, source_paths
 from scripts.production.production_doc import (
     Refusal, document_history_file, former_live_documents, legacy_document_path,
     production_backup_checkout, production_field,
@@ -463,9 +464,13 @@ def _review_scan_entries(folder: Path) -> tuple[os.DirEntry[str], ...]:
         return tuple(stream)
 
 
+def configured_review_vaults() -> tuple[Path, ...]:
+    return (*_configured_vault("staff", "producer_folder_root"), *_configured_vault("issue_score", "vault_root"))
+
+
 def local_review_paths(extra_roots: Iterable[Path] = ()) -> Iterator[Path]:
     """Scan configured vaults, native stores, and registered or explicit stores."""
-    vaults = (*_configured_vault("staff", "producer_folder_root"), *_configured_vault("issue_score", "vault_root"))
+    vaults = configured_review_vaults()
     state = state_root()
     native = owner_state_paths(state, "questions", "investigations", "proposals", strict=True)
     archives = owner_state_paths(state, "archive", strict=True)
@@ -536,14 +541,7 @@ def number_fields(path: Path, keys: frozenset[str]) -> Issue:
 
 
 def record_text_fields(path: Path, text: str, keys: frozenset[str] = ALL_FIELDS) -> Issue:
-    first, _, tail = text.partition("\n")
-    if first.strip() == "---":
-        header: list[str] = []
-        for line in tail.split("\n"):
-            if line.strip() == "---":
-                return Issue(path, header_fields(header, keys))
-            header.append(line.removesuffix("\r"))
-    return Issue(path, {})
+    return Issue(path, issues.issue_text_header(text).decoded_fields(keys))
 
 
 def _sequence_path(kind: RecordKind) -> Path:
@@ -711,14 +709,20 @@ class LockedRecordNumbers:
 
     @contextmanager
     def write(self, path: Path, identity: str, owner: staff.StaffId, *,
-              folder: Path | None = None, new_record: bool = False,
+              folder: Path | None = None, new_record: bool = False, preview: bool = False,
               before_write: Callable[[], None] = lambda: None) -> Generator[None]:
-        """Read the registry before the callback. Reserve the ID before publication."""
+        """Check the registry and reserve the ID unless this is a preview."""
         try:
             root = (path.parent if folder is None else folder).resolve()
             ceiling = self.number(identity)
             registry = _folder_registry(owner, self.kind)
             folders = _registered_folders(registry)
+            if preview:
+                _ = _file_bytes(registry)
+                if not new_record:
+                    _ = _file_bytes(path)
+                yield
+                return
             with keep_file_on_error(registry):
                 before_write()
                 if ceiling > self.high_water:
@@ -745,11 +749,14 @@ class LockedRecordNumbers:
 
 
 @contextmanager
-def record_numbers(kind: RecordKind, read_id: Callable[[Path], str]) -> Generator[LockedRecordNumbers]:
+def record_numbers(kind: RecordKind, read_id: Callable[[Path], str], *,
+                   existing_only: bool = False) -> Generator[LockedRecordNumbers]:
     """Hold one sequence lock across its checks and native publication."""
     path = _sequence_path(kind)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with exclusive(path.with_suffix(".lock")):
+    if not existing_only:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with existing_writer_lock(lock_path) if existing_only else exclusive(lock_path):
         yield LockedRecordNumbers(kind, read_id, _read_high_water(path))
 
 
@@ -825,9 +832,8 @@ def section(name: str) -> str:
 
 
 def lines_with_endings(text: str) -> list[str]:
-    """Split at LF and keep each line ending."""
-    *lines, tail = text.split("\n")
-    return [*(line + "\n" for line in lines), *([tail] if tail else [])]
+    """Split at CR or LF and keep each line ending."""
+    return list(StringIO(text, newline=""))
 
 
 def has_line_break(text: str) -> bool:
@@ -963,19 +969,11 @@ class NumberedRecords:
 
     def parse_text(self, identity: str, text: str) -> RecordText:
         try:
-            if not text.startswith("---\n"):
-                raise ValueError("missing frontmatter")
-            header, body = text[4:].split("\n---\n\n", 1)
-            fields: dict[str, str] = {}
-            for line in header.split("\n"):
-                key, value = line.split(": ", 1)
-                decoded = cast(object, json.loads(value))
-                if not isinstance(decoded, str) or key in fields:
-                    raise ValueError("invalid field")
-                fields[key] = decoded
-            if fields["id"] != identity:
+            note = issues.located_numbered_note(text)
+            record = RecordText(note.decoded_fields(), note.body)
+            if record.fields["id"] != identity:
                 raise ValueError("record ID differs from the selected ID")
-            return RecordText(fields, body)
+            return record
         except (ValueError, KeyError) as error:
             raise self.invalid(identity, error) from None
 
@@ -983,16 +981,13 @@ class NumberedRecords:
         """Read one header field before loading the record body or log."""
         try:
             with (self.path(identity) if path is None else path).open(encoding="utf-8", newline="\n") as stream:
-                if stream.readline() != "---\n":
+                if stream.readline().rstrip("\r\n") != "---":
                     raise ValueError("missing frontmatter")
                 for line in stream:
-                    if line.rstrip("\n") == "---":
+                    if line.rstrip("\r\n") == "---":
                         break
                     if line.startswith(name+": "):
-                        value = cast(object, json.loads(line[len(name)+2:]))
-                        if isinstance(value, str):
-                            return value
-                        raise ValueError("invalid field")
+                        return issues.decode_numbered_field(line[len(name)+2:])
             raise ValueError("missing "+name)
         except FileNotFoundError:
             raise self.error_type(f"{identity}: no {self.noun} for owner {self.owner}") from None

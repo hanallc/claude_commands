@@ -598,6 +598,8 @@ class ReviewSnapshotCache:
         if self.initialize_on_start:
             try:
                 _ = review_submissions.move_reply_proofs(review_submissions.LocalProofMove(self.root), dry_run=False)
+            except review_submissions.ProofMoveNoteFailure as error:
+                raise OSError(f"Cannot start Review links because the reply proof move failed. {error}") from None
             except (OSError, ValueError, update_registration.RegistrationFailure):
                 raise OSError("Cannot start Review links because the reply proof move failed.") from None
         elif (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():

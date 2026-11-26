@@ -1,6 +1,7 @@
 """Publish complete file content and persist its directory entry."""
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import secrets
@@ -18,6 +19,19 @@ TEMPORARY_NAME = re.compile(r"\.(?P<target>.+)\.(?P<pid>\d+)\.[^.]+\.tmp", re.DO
 class StagingFile(Enum):
     UNIQUE = auto()
     WRITER_LOCKED = auto()
+
+
+@contextmanager
+def existing_writer_lock(path: Path) -> Generator[None]:
+    """Hold a writer lock if its file exists. Leave a missing path alone."""
+    try:
+        stream = path.open("rb")
+    except FileNotFoundError:
+        yield
+        return
+    with stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
 
 
 def temporary_target(name: str) -> str | None:

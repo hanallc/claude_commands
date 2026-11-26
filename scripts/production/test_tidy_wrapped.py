@@ -352,12 +352,19 @@ class TidyWrappedTests(unittest.TestCase):
         marker = b'"images": []'
         legacy = (', ' + json.dumps({"reply_token": token})[1:-1]).encode()
         self.assertTrue(marker in clean)
-        _ = sent.path.write_bytes(clean.replace(marker, marker + legacy, 1))
+        original = clean.replace(marker, marker + legacy, 1)
+        _ = sent.path.write_bytes(original)
 
         _ = self.write(doc, doc.read_text().replace("— running.**", "— wrapped.**"))
         result = self.run_tidy(doc)
         self.assertEqual(result.returncode, 0)
         self.assertFalse(sent.path.exists())
+        backups = self.state / "review-reply-proof-backups"
+        backup, = (path for path in backups.iterdir() if path.is_dir())
+        copy = backup / sent.path.relative_to(sent.path.anchor)
+        self.assertTrue(copy.read_bytes() == original)
+        report = reply_proofs.move_journal_path()
+        self.assertEqual(json.loads(report.read_text()), {"path": str(sent.path), "fields": ["reply_token"]})
         expected_proof = reply_tokens.LegacyReplyProof(reply_tokens.digest(reply_tokens.RawReplyToken(token)))
         self.assertTrue(reply_proofs.read(identity).reply == expected_proof)
         moved = review_submissions.submit(request)

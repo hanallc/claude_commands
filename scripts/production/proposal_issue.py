@@ -20,7 +20,7 @@ import stat
 import sys
 import tempfile
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from functools import cached_property
@@ -33,7 +33,7 @@ from scripts.console_text import check as console_text
 
 from scripts.lib import atomic_file, urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production.issues import PROPOSAL_TAG, Issue, frontmatter, header_fields
+from scripts.production.issues import PROPOSAL_TAG, Issue, frontmatter, header_fields, issue_text_header
 from scripts.production import record_store, staff, unit_names
 from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens, review_events
 from scripts.review_links.review_events import MarkChange, NoMark, ReviewLog, ReviewMark, StoredReviewLog
@@ -72,10 +72,10 @@ def _value_line(key: str, value: str) -> str:
 
 
 def _closing_fence(lines: list[str], path: Path) -> int:
-    if not lines or lines[0].rstrip("\r\n") != FENCE:
+    if not lines or lines[0].strip() != FENCE:
         raise Refusal(f"{path} has no frontmatter")
     for index in range(1, len(lines)):
-        if lines[index].rstrip("\r\n") == FENCE:
+        if lines[index].strip() == FENCE:
             return index
     raise Refusal(f"{path} has no closing --- for its frontmatter")
 
@@ -250,12 +250,17 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
 
 
 @contextmanager
-def issue_lock(path: Path) -> Generator[None]:
+def issue_lock(path: Path, *, existing_only: bool = False) -> Generator[None]:
     """Hold an exclusive lock on the issue. The lock file is named from the issue's resolved path."""
     folder = Path.home() / ".local/state/proposal-issue/locks"
-    folder.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:32]
-    with (folder / f"proposal-issue-{digest}.lock").open("a") as lock:
+    lock_path = folder / f"proposal-issue-{digest}.lock"
+    if existing_only:
+        with atomic_file.existing_writer_lock(lock_path):
+            yield
+        return
+    folder.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
@@ -272,8 +277,9 @@ def _proposal_id(path: Path) -> str:
 
 
 @contextmanager
-def proposal_numbers() -> Generator[record_store.LockedRecordNumbers]:
-    with record_store.record_numbers(record_store.RecordKind.PROPOSAL, _proposal_id) as numbers:
+def proposal_numbers(*, existing_only: bool = False) -> Generator[record_store.LockedRecordNumbers]:
+    with record_store.record_numbers(record_store.RecordKind.PROPOSAL, _proposal_id,
+                                     existing_only=existing_only) as numbers:
         try:
             yield numbers
         except record_store.RecordAllocationRefused as error:
@@ -608,52 +614,50 @@ def read_issue(path: Path) -> str:
         return source.read()
 
 
-def write_issue(path: Path, text: str) -> None:
-    lines = record_store.lines_with_endings(text)
-    fields = Issue(path, header_fields(lines[1:_closing_fence(lines, path)]))
+def write_issue(path: Path, text: str, *, preview: bool = False) -> None:
+    header = issue_text_header(text)
+    if not header.closing:
+        raise Refusal(f"{path} has no complete frontmatter")
+    fields = Issue(path, header.decoded_fields())
     identity = fields.value(NUMBER_FIELD)
     if not re.fullmatch(r"P[1-9][0-9]*", identity):
-        _replace_issue(path, text)
+        _replace_issue(path, text, preview=preview)
         return
     owner = proposal_owner(fields, fields.value("proposed_by") if fields.value("review_submission") else "")
     if not owner:
         owner = _proposal_owner(path.parent, fields.value("proposed_by"))
-    with proposal_numbers() as numbers, numbers.write(path, identity, owner):
-        _replace_issue(path, text)
+    with proposal_numbers(existing_only=preview) as numbers, numbers.write(path, identity, owner, preview=preview):
+        _replace_issue(path, text, preview=preview)
 
 
-def move_reply_proof(path: Path, *, dry_run: bool) -> int:
-    with nullcontext() if dry_run else issue_lock(path):
+def move_reply_proof(path: Path, *, run: reply_proofs.ProofMoveRun) -> int:
+    with issue_lock(path, existing_only=run.dry_run):
         text = record_store.read_note_for_proof_move(path)
         if isinstance(text, record_store.VanishedReviewNote):
             return 0
-        lines = record_store.lines_with_endings(text)
-        issue = Issue(path, header_fields(lines[1:_closing_fence(lines, path)]))
-        raw = issue.value("review_submission")
-        if not raw:
+        issue = record_store.record_text_fields(path, text)
+        removal = reply_proofs.prepare_note_removal(text, reply_proofs.ProofNoteLayout.PROPOSAL)
+        if not removal.fields:
             return 0
-        updated, proof, count = reply_proofs.extract_submission(cast(dict[str, object], json.loads(raw)))
-        if count:
-            details = new_item_dialog.read_submission(updated)
-            identity = details.proof_identity(issue.value(NUMBER_FIELD))
-            if not dry_run:
-                changed, _ = set_fields(text, {"review_submission": json.dumps(updated)}, path)
-                with reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=proof), moving=True):
-                    write_issue(path, changed)
-        return count
+        details = new_item_dialog.read_submission(removal.submission)
+        identity = details.proof_identity(issue.value(NUMBER_FIELD))
+        return run.apply(path, text, removal, [(identity, removal.proof)],
+                         lambda changed: write_issue(path, changed, preview=run.dry_run),
+                         open_item=not review_is_done(issue))
 
 
 def _require_moved(path: Path, text: str) -> None:
     if "review_submission:" in text:
-        lines = record_store.lines_with_endings(text)
-        issue = Issue(path, header_fields(lines[1:_closing_fence(lines, path)]))
+        issue = record_store.record_text_fields(path, text)
         raw = issue.value("review_submission")
         if raw and reply_proofs.has_legacy_submission(cast(dict[str, object], json.loads(raw))):
             raise Refusal("Move the reply proof before editing this note.")
 
 
-def _replace_issue(path: Path, text: str) -> None:
+def _replace_issue(path: Path, text: str, *, preview: bool = False) -> None:
     _require_moved(path, text)
+    if preview:
+        return
     temporary_name = ""
     try:
         with tempfile.NamedTemporaryFile(

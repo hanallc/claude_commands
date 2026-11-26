@@ -9,7 +9,6 @@ try:
 except FileNotFoundError:
     pass
 
-import json
 import os
 import re
 import shutil
@@ -20,7 +19,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from scripts.lib import atomic_file  # noqa: E402
 from scripts.production import investigation, log_backup, record_store, showrunners, staff, unit_lookup  # noqa: E402
@@ -65,44 +64,14 @@ class PreparedReviewNote:
 
     content: bytes = field(repr=False)
     proof: reply_proofs.NoteProof = field(default_factory=reply_proofs.NoteProof, repr=False)
+    fields: tuple[str, ...] = ()
 
 
-def _prepare_review_note(content: bytes, header_end: int, kind: new_item_dialog.SubmissionKind) -> PreparedReviewNote:
-    question = kind == new_item_dialog.SubmissionKind.QUESTION
-    field_name = b"registration" if question else b"review_submission"
-    match = re.search(rb"(?m)^" + field_name + rb": ([^\r\n]*)", content[:header_end])
-    if match is None:
-        raise TidyRefused("The moving record has no submission field.")
-    value = cast(object, json.loads(match[1]))
-    registration: dict[str, object] = {}
-    if question and isinstance(value, dict):
-        registration = cast(dict[str, object], value)
-        value = registration.get("review_submission")
-    elif not question and isinstance(value, str):
-        value = cast(object, json.loads(value))
-    if not isinstance(value, dict):
-        raise TidyRefused("The moving record has invalid submission fields.")
-    fields = cast(dict[str, object], value)
-    clean, reply, count = reply_proofs.extract_submission(fields)
-    request = (reply_proofs.legacy_request(registration.pop("request_key")).request
-               if "request_key" in registration else reply_proofs.NO_STAFF_REQUEST)
-    if not count and isinstance(request, reply_proofs.NoStaffQuestionRequest):
-        return PreparedReviewNote(content)
-    if question:
-        registration["review_submission"] = clean
-        encoded = json.dumps(registration, ensure_ascii=False)
-    else:
-        encoded = json.dumps(json.dumps(clean), ensure_ascii=False)
-    clean_content = content[:match.start(1)] + encoded.encode() + content[match.end(1):]
-    return PreparedReviewNote(clean_content, reply_proofs.NoteProof(reply, request))
-
-
-def _header_end(content: bytes, path: Path) -> int:
-    start = content.index(b"\n") + 1
-    fence = re.search(rb"(?m)^---\r?$", content[start:])
-    if fence is None:
-        raise TidyRefused(f"{path}: the record has no closing header fence")
-    return start + fence.start()
+def _prepare_review_note(content: bytes, kind: new_item_dialog.SubmissionKind) -> PreparedReviewNote:
+    layout = (reply_proofs.ProofNoteLayout.QUESTION if kind == new_item_dialog.SubmissionKind.QUESTION
+              else reply_proofs.ProofNoteLayout.SUBMISSION)
+    removal = reply_proofs.prepare_note_removal(content.decode(), layout)
+    return PreparedReviewNote(removal.content.encode(), removal.proof, removal.fields)
 
 
 @dataclass(frozen=True)
@@ -119,26 +88,28 @@ class ReviewRecordMove:
     source_digest: str
     note: PreparedReviewNote
     accepted_target: bytes = field(repr=False)
+    source_content: bytes = field(repr=False)
+    source_fields: tuple[str, ...]
 
     @classmethod
     def plan(cls, source: Path, target: Path, source_owner: staff.StaffId, owner: staff.StaffId, identity: str,
              kind: new_item_dialog.SubmissionKind, submission: new_item_dialog.ReviewSubmission) -> ReviewRecordMove:
-        field = b"production_id" if kind == new_item_dialog.SubmissionKind.QUESTION else b"owner"
-        value = owner.encode() if field == b"production_id" else b'"' + owner.encode() + b'"'
+        field = "production_id" if kind == new_item_dialog.SubmissionKind.QUESTION else "owner"
+        value = owner if field == "production_id" else f'"{owner}"'
         content = source.read_bytes()
-        end = _header_end(content, source)
-        header, count = re.subn(rb"(?m)^" + field + rb": [^\r\n]*", field + b": " + value, content[:end])
+        text = content.decode()
+        _, end = reply_proofs.note_header_bounds(text)
+        header, count = re.subn(rf"(?m)^{field}: [^\r\n]*", f"{field}: {value}", text[:end])
         if count != 1:
             raise TidyRefused(f"{source}: the record has no unique owner field")
-        accepted_target = header + content[end:]
-        note = _prepare_review_note(accepted_target, len(header), kind)
+        accepted_target = (header + text[end:]).encode()
+        note = _prepare_review_note(accepted_target, kind)
         return cls(source.resolve(), target.parent.resolve() / target.name, source_owner, owner, identity, kind,
-                   submission, sha256(content).hexdigest(), note, accepted_target)
+                   submission, sha256(content).hexdigest(), note, accepted_target, content, note.fields)
 
     def keep_target(self, content: bytes, submission: new_item_dialog.ReviewSubmission) -> ReviewRecordMove:
         """Keep changes to the destination and carry over proof for the same wait."""
-        end = _header_end(content, self.target)
-        note = _prepare_review_note(content, end, self.kind)
+        note = _prepare_review_note(content, self.kind)
         proof = note.proof
         if (isinstance(proof.reply, reply_tokens.MissingReplyProof)
                 and submission.reply_wait_revision == self.submission.reply_wait_revision):
@@ -153,8 +124,8 @@ class ReviewRecordMove:
         if self.note.proof == reply_proofs.NoteProof():
             return False
         try:
-            end = _header_end(content, self.target)
-            return _prepare_review_note(content, end, self.kind) == self.note
+            candidate = _prepare_review_note(content, self.kind)
+            return (candidate.content, candidate.proof) == (self.note.content, self.note.proof)
         except (TidyRefused, ValueError):
             return False
 
@@ -236,26 +207,35 @@ class ReviewRecordMove:
             has_capture_intent=isinstance(self.submission.capture_intent, new_item_dialog.DeferredCaptureIntent))
 
     def apply(self, numbers: record_store.LockedRecordNumbers, later: Path, journal: Path,
-              destination: SubmissionMove) -> None:
+              destination: SubmissionMove, run: reply_proofs.ProofMoveRun) -> None:
         from scripts.review_links import review_submissions
 
         folder = journal.parent
         receipt, pending = folder / "receipt.json", folder / "pending.json"
         moves_later = self.kind != new_item_dialog.SubmissionKind.QUESTION
-        with (self.publish_proofs(),
-              self.publish_record(numbers),
-              record_store.keep_file_on_error(receipt),
-              record_store.keep_file_on_error(pending),
-              record_store.keep_file_on_error(self.source),
-              record_store.keep_file_on_error(later) if moves_later else nullcontext()):
-            review_submissions._write_location(receipt, destination)  # pyright: ignore[reportPrivateUsage]
-            pending.unlink(missing_ok=True)
-            atomic_file.sync_folder(folder)
-            if moves_later:
-                review_later.move_locked(later, f"investigation/{self.source_owner}/{self.identity}",
-                                        f"investigation/{self.owner}/{self.identity}")
-            self.source.unlink()
-            atomic_file.sync_folder(self.source.parent)
+        run.backup(self.source, self.source_content, self.source_fields)
+        target_fields: tuple[str, ...] = ()
+        if self.target.is_file():
+            original_target = self.target.read_bytes()
+            target_fields = _prepare_review_note(original_target, self.kind).fields
+            run.backup(self.target, original_target, target_fields)
+        with self.publish_proofs():
+            run.record_rewrite((self.source, self.source_fields), (self.target, target_fields))
+            with (self.publish_record(numbers),
+                  record_store.keep_file_on_error(receipt),
+                  record_store.keep_file_on_error(pending),
+                  record_store.keep_file_on_error(self.source),
+                  record_store.keep_file_on_error(later) if moves_later else nullcontext()):
+                if self.target.read_bytes() != self.note.content:
+                    raise OSError("Cannot verify the transferred Review note.")
+                review_submissions._write_location(receipt, destination)  # pyright: ignore[reportPrivateUsage]
+                pending.unlink(missing_ok=True)
+                atomic_file.sync_folder(folder)
+                if moves_later:
+                    review_later.move_locked(later, f"investigation/{self.source_owner}/{self.identity}",
+                                            f"investigation/{self.owner}/{self.identity}")
+                self.source.unlink()
+                atomic_file.sync_folder(self.source.parent)
         _finish_move(journal)
 
 
@@ -270,6 +250,7 @@ def recover_review_moves(root: Path) -> None:
     from scripts.production import update_registration as questions
     from scripts.review_links import review_submissions as submissions
 
+    run = reply_proofs.ProofMoveRun(False, record_store.configured_review_vaults)
     for journal in submissions.pending_submission_moves(root):
         try:
             move = submissions._read_request_file(journal, journal.parent.name)  # pyright: ignore[reportPrivateUsage]
@@ -311,7 +292,7 @@ def recover_review_moves(root: Path) -> None:
                 numbers = (questions.question_numbers() if move.kind == new_item_dialog.SubmissionKind.QUESTION
                            else investigation.investigation_numbers())
                 with numbers as locked:
-                    plan.apply(locked, later, journal, move)
+                    plan.apply(locked, later, journal, move, run)
         except (TidyRefused, OSError, ValueError, investigation.InvestigationError, questions.RegistrationFailure) as error:
             print(f"Review move {journal}: {error}", file=sys.stderr)
 
@@ -366,7 +347,9 @@ def apply_review_moves(moves: list[ReviewRecordMove], parent_doc: Path, identiti
     from scripts.review_links import review_submissions
 
     owner = moves[0].owner
-    with investigation.investigation_numbers() as investigation_numbers, questions.question_numbers() as question_numbers:
+    run = reply_proofs.ProofMoveRun(False, record_store.configured_review_vaults)
+    with (investigation.investigation_numbers() as investigation_numbers,
+          questions.question_numbers() as question_numbers):
         occupied: dict[tuple[record_store.RecordKind, str], set[Path]] = {}
         if any(move.kind == new_item_dialog.SubmissionKind.QUESTION for move in moves):
             for record in questions.question_records_for_document(parent_doc, identities, strict=True):
@@ -386,7 +369,7 @@ def apply_review_moves(moves: list[ReviewRecordMove], parent_doc: Path, identiti
             review_submissions._write_location(journal, destination)  # pyright: ignore[reportPrivateUsage]
             atomic_file.sync_folder(journal.parent.parent)
             numbers = question_numbers if move.kind == new_item_dialog.SubmissionKind.QUESTION else investigation_numbers
-            move.apply(numbers, later, journal, destination)
+            move.apply(numbers, later, journal, destination, run)
 
 
 def tidy(production_name: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:
