@@ -17,7 +17,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -4837,6 +4837,18 @@ window.fetch=(url,options)=>{
             send.assert_called_once()
             self.assertEqual(send.call_args.args[2], message)
 
+    def test_remove_alerts_the_showrunner_after_an_unconfirmed_send(self) -> None:
+        item = self.add("Remove this duplicate")
+        fields = self.fields(item, "remove")
+        delivery = list_page.submit(self.root / "reviews", urlencode(fields))
+        with (patch.object(change_page, "send_to_staff", side_effect=change_page.UnconfirmedSend("offline")),
+              patch.object(change_page, "alert_delivery_failures", return_value=True) as alert):
+            list_page.deliver(delivery)
+        alert.assert_called_once()
+        self.assertEqual(alert.call_args.kwargs["recipients"], (OWNER.id,))
+        feedback = the_list.feedback_requests(the_list.load(MORTY.id, item.id))[fields["request"]]
+        self.assertEqual((feedback.state, feedback.alerted_to), ("alerted", OWNER.name))
+
     def test_remove_retries_a_receipt_with_a_trimmed_reason(self) -> None:
         root = self.root / "reviews"
         reason = "  Keep the original.  \n"
@@ -5832,6 +5844,8 @@ window.fetch=async(_path,options={})=>{
     def test_browser_park_opens_the_shared_picker_and_submits_the_chosen_time(self) -> None:
         self.browser_action_sequence(r"""
  Date.now=()=>Date.parse('2026-12-02T13:00:00Z');
+ form.elements.words.value='Check both rows.';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
  const toggle=form.querySelector('[data-later-toggle]');
  check(!form.querySelector('input[type=date]'),'Park has no native date input');
  toggle.click();
@@ -5850,6 +5864,7 @@ window.fetch=async(_path,options={})=>{
  check(sheet.hidden && requests.length===1,'Enter in Time closes the picker and submits once');
  check(requests[0]?.get('action')==='park' && requests[0].get('until')==='2026-12-04T00:30:00.000Z',
   'Save sends the selected instant');
+ check(requests[0]?.get('words')==='Check both rows.','Save sends the words in the box.');
  finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 19:30 EST'});
  await flush();
  check(row.querySelector('[data-parked-note]').textContent===summary.replace('Parks until','Parked until'),
@@ -5857,6 +5872,54 @@ window.fetch=async(_path,options={})=>{
  check(form.querySelector('[data-parked-detail]').textContent==='Parked until Dec 3 19:30 EST',
   'The expanded form uses the same saved time.');
 """)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_preset_keeps_the_words_when_delivery_fails(self) -> None:
+        self.browser_action_sequence(r"""
+ const words=form.elements.words;
+ words.value='Check both rows.\nKeep the headings.';
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+ form.querySelector('[data-later-toggle]').click();
+ form.querySelector('[data-later-preset="soon"]').click();
+ check(requests[0]?.get('words')===words.value,'The preset sends the words in the box.');
+ finishPost({item_state:'Working',parked:'true',parked_until:'Dec 3 19:30 EST',
+  send_failure:'Delivery failed: The producer is unavailable.'});
+ await flush();
+ check(words.value==='Check both rows.\nKeep the headings.','A failed send keeps the draft.');
+ check(form.querySelector('[data-send-status]').textContent.includes('The producer is unavailable.'),
+  'A failed send shows its reason.');
+""")
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_park_reuses_the_pending_words_request_after_reopening(self) -> None:
+        self.browser_action_sequence(r"""
+ show('all');
+ const current=()=>recordDetails(row).querySelector('form');
+ form.elements.words.value='Keep this result.';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ submit('park-until-delivered');
+ const first=requests[0];
+ finishPost({item_state:'Working',parked:'true',parked_until:'delivered',words_receipt:true,delivery:'check-1'});
+ await flush();await finishRowMotion();
+ check(wordsStatusRequests[0]?.get('words-status')==='1','Park checks the saved words separately.');
+ check(wordsStatusRequests[0]?.get('request')===first.get('request') && wordsStatusRequests[0].get('delivery')==='check-1',
+  'The status checks the original delivery.');
+ finishWordsStatus?.({words_receipt:true,send_failure:'The showrunner was alerted.'});
+ await flush();
+ if(!recordIsOpen(row)) row.querySelector('.list-toggle').click();
+ await finishRowMotion();
+ check(current().elements.words.value==='Keep this result.','Reopening keeps the words.');
+ current().elements.words.value='Keep these newer words.';
+ current().elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ const retry=current().querySelector('[data-action-words-retries] button');
+ check(retry?.textContent==='Retry words','The item offers a words retry.');
+ retry?.click();
+ check(requests[1]?.get('action')==='retry-words' && requests[1].get('request')===first.get('request'),
+  'Retry addresses the original delivery without pressing Park.');
+ if(requests[1]) finishPost({words_receipt:true});
+ await flush();
+ check(current().elements.words.value==='Keep these newer words.','Retry keeps the newer draft.');
+""", reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_parks_until_delivered_with_one_post(self) -> None:
@@ -6023,7 +6086,7 @@ window.fetch=async(_path,options={})=>{
  const replay=requests[1];
  check(notice.hidden && !form.querySelector('[value="retry-park"]'),
   'The pending retry shows no failure line or Retry Park button');
- check(replay?.toString()===first.toString() && replay.get('words')==='' && words.value==='Edited words',
+ check(replay?.toString()===first.toString() && replay.get('words')==='Original words' && words.value==='Edited words',
   'The automatic retry sends the original request and keeps the edited draft');
  losePost();await flush();await finishRowMotion();
  const above=document.querySelector('[data-hidden-action-status]');
@@ -6035,7 +6098,7 @@ window.fetch=async(_path,options={})=>{
  week.click();
  const second=requests[2];
  check(requests.length===3 && second.get('request')!==first.get('request') &&
-  second.get('until')==='2026-12-07T14:00:00.000Z' && second.get('words')==='',
+  second.get('until')==='2026-12-07T14:00:00.000Z' && second.get('words')==='Edited words',
   'A new preset click sends a fresh request with a new deadline');
  if(second){finishPost({parked:'true',parked_until:'Dec 7 09:00 EST'});await flush();}
  check(notice.hidden && requests.length===3,'A confirmed save leaves no failure or retry');
@@ -6356,7 +6419,7 @@ window.fetch=async(_path,options={})=>{
  refreshMarkup=fixture.saved;
  submit('park-until-delivered');
  check(document.querySelector('[data-record-inline-view]') && recordIsOpen(item()),'The item stays active while Park waits for its result.');
- check(!requests[0].get('words'),'Park does not send the draft.');
+ check(requests[0].get('words')==='Keep these unsent words.','Park sends the words in the box.');
  if(fixture.lost){readback=()=>({...fixture.response,park_request_saved:true});await loseParkPost();losePost();}
  else finishPost(fixture.response);
  await flush();
@@ -10426,8 +10489,23 @@ const settle=async (done,message)=>{
   await settle(()=>box.isConnected && !button.disabled &&
    win.recordDetails(row).querySelector('[data-send-status]')?.textContent.includes("Could not check natedev's addresses."),
    'The row shows the address error and the ask stays open.');
+  const words=win.recordDetails(row).querySelector('[data-feedback-form] textarea[name=words]');
+  words.value='Check the merge result.';
+  words.dispatchEvent(new win.Event('input',{bubbles:true}));
   button.click();
   await settle(()=>!box.isConnected && row.hidden,'A Go closes the box and the item leaves Needs me.');
+  doc.getElementById('filter-show-all').click();
+  await settle(()=>!row.hidden,'All shows the saved item.');
+  row.querySelector('.list-toggle').click();
+  const retry=()=>win.recordDetails(row).querySelector('[data-action-words-retries] button');
+  await settle(()=>retry()?.textContent==='Retry Go delivery','The item offers a delivery retry.');
+  const draft=win.recordDetails(row).querySelector('[data-feedback-form] textarea[name=words]');
+  check(draft.value==='Check the merge result.','The box keeps the words after a failed send.');
+  draft.value='Keep the newer words.';
+  draft.dispatchEvent(new win.Event('input',{bubbles:true}));
+  retry().click();
+  await settle(()=>!retry(),'Retry finishes the saved Go delivery.');
+  check(draft.value==='Keep the newer words.','Retry keeps the newer words.');
   check(doc.getElementById('filter-show-needs-me').dataset.filterCount==='0','The Needs me count is 0 after the Go.');
   check(row.dataset.state==='Working' && row.querySelector('.list-state').textContent==='Working',
    'The Go on the last ask sets the waiting row to Working in place.');
@@ -10453,13 +10531,24 @@ const settle=async (done,message)=>{
                 else:
                     super().do_POST()
 
+        target_sends = 0
+
+        def send_to_target(recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
+            nonlocal target_sends
+            if recipient == OWNER.id:
+                target_sends += 1
+                if target_sends <= 3:
+                    raise OSError("The target is offline.")
+
         with (patch.object(serve, "ReviewLinksHandler", Probe),
               patch.object(review_page.ReviewSnapshotCache, "start"),
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(review_link, "tailscale_ip",
-                           side_effect=["192.0.2.1", ValueError("No IPv6 address."), "192.0.2.1", "2001:db8::1"]),
+                           side_effect=["192.0.2.1", ValueError("No IPv6 address."),
+                                        "192.0.2.1", "2001:db8::1", "192.0.2.1", "2001:db8::1",
+                                        "192.0.2.1", "2001:db8::1"]),
               patch.object(list_page, "counts_strip", return_value=""),
-              patch.object(change_page, "send_to_staff") as delivery,
+              patch.object(change_page, "send_to_staff", side_effect=send_to_target) as delivery,
               patch.object(go_ledger, "natedev_address", return_value=False),
               serve.ReviewLinksServer(("127.0.0.1", 0), root) as server):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
@@ -10475,7 +10564,173 @@ const settle=async (done,message)=>{
         saved = the_list.load(MORTY.id, item.id)
         self.assertEqual((the_list.open_asks(saved), saved.state), ((), the_list.ItemState.WORKING))
         self.assertIn(the_list.GoGiven(saved.asks[0]), [change.what for change in saved.log])
-        self.assertEqual(sorted(cast(str, sent.args[0]) for sent in delivery.call_args_list), sorted([OWNER.id, MORTY.id]))
+        self.assertEqual(sorted(cast(str, sent.args[0]) for sent in delivery.call_args_list),
+                         sorted([OWNER.id] * 4 + [MORTY.id]))
+        target_calls = [sent for sent in delivery.call_args_list if sent.args[0] == OWNER.id]
+        self.assertEqual(len({(sent.args[2], sent.kwargs["key"]) for sent in target_calls}), 1)
+        self.assertIn("Nate's words:\nCheck the merge result.", cast(str, target_calls[-1].args[2]))
+
+    def test_browser_reload_restores_pending_park_and_go_words(self) -> None:
+        parked = self.add("Park the item", number=1)
+        asked = self.add("Approve the check", number=2)
+        for what in ("Run the first check.", "Run the second check."):
+            _ = the_list.add_ask(MORTY.id, asked.id, kind=the_list.AskKind.GO, target=OWNER.id, what=what,
+                                 why="The check needs approval.", config=False, requester=MORTY.id, source="morty")
+        root = self.root / "reviews"
+        results: list[list[str]] = []
+        complete = threading.Event()
+        probe = r"""<!doctype html><meta charset="utf-8">
+<style>iframe{width:100%;height:95vh;border:0}</style><iframe></iframe><script>
+const frame=document.querySelector('iframe'),errors=[];
+const navigate=action=>new Promise(resolve=>{frame.onload=resolve;action();});
+const current=number=>frame.contentDocument.querySelector('[data-number="'+number+'"]');
+const detail=number=>frame.contentWindow.recordDetails(current(number));
+const retries=number=>[...detail(number).querySelectorAll('[data-words-retry]')];
+const retryText=row=>row.querySelector('[data-words-retry-text]').textContent;
+const retryWhat=row=>row.querySelector('[data-words-retry-what]');
+async function until(condition,message){
+ for(let tries=0;tries<160;tries++){
+  if(condition()) return;
+  await new Promise(resolve=>setTimeout(resolve,25));
+ }
+ throw new Error(message);
+}
+function draft(number,words){
+ const field=detail(number).querySelector('textarea[name=words]');
+ field.value=words;
+ field.dispatchEvent(new frame.contentWindow.Event('input',{bubbles:true}));
+}
+function openIfClosed(number){
+ const row=current(number);
+ if(!frame.contentWindow.recordIsOpen(row)) row.querySelector('.list-toggle').click();
+}
+async function openItem(number){
+ const key='KEEPER/L'+number;
+ await navigate(()=>{frame.src='STUDIO_PATH?item-test='+number+'#'+new URLSearchParams({show:'all',item:key});});
+ await until(()=>frame.contentWindow.recordIsOpen?.(current(number)),'Open item '+number);
+}
+async function pressWithWords(number,words,count,press){
+ openIfClosed(number);
+ draft(number,words);
+ press(detail(number));
+ await until(()=>[...frame.contentDocument.querySelectorAll('[role=status]')]
+  .some(status=>status.textContent.includes('The sender has not confirmed delivery.')),'Wait for the delivery status.');
+ await until(()=>{openIfClosed(number);return retries(number).length===count;},'Show the pending retries.');
+}
+async function reloadAndRetry(number,expected){
+ const previous=frame.contentDocument;
+ await navigate(()=>frame.contentWindow.location.reload());
+ if(frame.contentDocument===previous) throw new Error('The browser did not reload.');
+ openIfClosed(number);
+ await until(()=>retries(number).length===expected.length,'Restore the pending retries.');
+ draft(number,'New draft.');
+ for(const [words,recipient,label,what=''] of expected){
+  const matches=row=>retryText(row)===words && (retryWhat(row)?.textContent ?? '')===what;
+  const row=retries(number).find(matches);
+  if(!row || row.querySelector('[data-words-retry-recipients]')?.textContent!=='To '+recipient)
+   throw new Error('Show the saved words, recipient, and What text for '+(what || words));
+  const button=row.querySelector('button');
+  const description=frame.contentDocument.getElementById(button.getAttribute('aria-describedby'));
+  if(button.textContent!==label || !description?.contains(row.querySelector('[data-words-retry-text]')) ||
+     (what && !description.contains(retryWhat(row)))) throw new Error('Describe the retry for '+(what || words));
+  button.click();
+  await until(()=>!retries(number).some(matches) &&
+   detail(number).querySelector('[data-send-status]')?.textContent==='Sent the saved words.',
+   'Confirm the retry for '+(what || words));
+ }
+ if(detail(number).querySelector('textarea[name=words]').value!=='New draft.') throw new Error('Keep the new draft.');
+}
+const park=preset=>card=>{
+ card.querySelector('[data-later-toggle]').click();
+ card.querySelectorAll('[data-later-preset]')[preset].click();
+};
+(async()=>{
+ try{
+  await openItem(1);
+  await pressWithWords(1,'Words for first Park.',1,park(0));
+  const change=await fetch('/change-producer',{method:'POST'});
+  if(!change.ok) throw new Error('Change the producer in the fixture.');
+  await pressWithWords(1,'Words for second Park.\nCheck line two.',2,park(1));
+  await reloadAndRetry(1,[['Words for second Park.\nCheck line two.','dwight','Retry words'],
+                          ['Words for first Park.','morty','Retry words']]);
+  await openItem(2);
+  await pressWithWords(2,'Proceed.',1,card=>card.querySelector('[data-ask="A1"] [data-go-form] button').click());
+  await pressWithWords(2,'Proceed.',2,card=>card.querySelector('[data-ask="A2"] [data-go-form] button').click());
+  await reloadAndRetry(2,[['Proceed.','sdlc','Retry Go delivery','What: Run the second check.'],
+                          ['Proceed.','sdlc','Retry Go delivery','What: Run the first check.']]);
+ }catch(error){errors.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
+})();</script>""".replace('KEEPER', MORTY.id).replace('STUDIO_PATH', studio_page.PAGE_PATH).encode()
+
+        class Probe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == '/proof':
+                    self.html_response(200, probe)
+                    return None
+                return super().send_head()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == '/results':
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
+                    self.json_response(200, {})
+                    complete.set()
+                elif self.path == '/change-producer':
+                    _ = the_list.update(MORTY.id, parked.id, {"producer": DWIGHT.id}, source="morty")
+                    self.json_response(200, {})
+                else:
+                    super().do_POST()
+
+        tries = conf.read("review_links").whole("delivery_tries")
+        attempts: dict[tuple[staff.StaffId, str], int] = {}
+
+        def send(recipient: staff.StaffId, _sender: str, message: str, *, key: str) -> Literal["pending"] | None:
+            delivery = recipient, key
+            attempts[delivery] = attempts.get(delivery, 0) + 1
+            pending_tries = tries if "Words for second Park." in message else int(
+                "Words for first Park." in message or recipient == OWNER.id)
+            return "pending" if attempts[delivery] <= pending_tries else None
+
+        with (patch.object(serve, "ReviewLinksHandler", Probe),
+              patch.object(review_page.ReviewSnapshotCache, "start"),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(review_link, "tailscale_ip", side_effect={4: "192.0.2.1", 6: "2001:db8::1"}.__getitem__),
+              patch.object(go_ledger, "natedev_address", return_value=False),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(change_page, "send_to_staff", side_effect=send) as sender,
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                browser = self.firefox_view(f'http://127.0.0.1:{server.server_port}/proof', None, 1440, 900, complete)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                complete.set()
+                server.shutdown()
+                thread.join()
+        first_park = [call for call in sender.call_args_list if "Words for first Park." in cast(str, call.args[2])]
+        second_park = [call for call in sender.call_args_list if "Words for second Park." in cast(str, call.args[2])]
+        first_go = [call for call in sender.call_args_list if "What: Run the first check.\n" in cast(str, call.args[2])]
+        second_go = [call for call in sender.call_args_list if "What: Run the second check.\n" in cast(str, call.args[2])]
+        self.assertEqual([call.args[0] for call in first_park], [MORTY.id, MORTY.id])
+        self.assertEqual([call.args[0] for call in second_park], [DWIGHT.id] * (tries + 1))
+        self.assertEqual(first_park[0], first_park[1])
+        self.assertEqual(second_park, [second_park[0]] * (tries + 1))
+        self.assertNotEqual(first_park[0].kwargs["key"], second_park[0].kwargs["key"])
+        for sends in (first_go, second_go):
+            self.assertEqual([call.args[0] for call in sends], [OWNER.id, MORTY.id, OWNER.id])
+            self.assertEqual(sends[0], sends[-1])
+            self.assertIn("Nate's words:\nProceed.", cast(str, sends[-1].args[2]))
+        self.assertNotEqual(first_go[0].kwargs["key"], second_go[0].kwargs["key"])
+        self.assertEqual(sender.call_args_list[-2:], [second_go[-1], first_go[-1]])
+        self.assertEqual(len(sender.call_args_list), tries + 10)
+        park_log = the_list.load(MORTY.id, parked.id).log
+        go_log = the_list.load(MORTY.id, asked.id).log
+        self.assertEqual(sum(isinstance(change.what, the_list.FieldChange) and change.what.action == "Parked"
+                             for change in park_log), 2)
+        self.assertEqual(sum(isinstance(change.what, the_list.GoGiven) for change in go_log), 2)
 
     def browser_action_sequence(self, steps: str, *, reduced_motion: bool = False, add_item: bool = True,
                                 window_size: tuple[int, int] | None = None, in_frame: bool = False,
@@ -10488,11 +10743,15 @@ const settle=async (done,message)=>{
         markup = re.sub(r'data-refresh-seconds="[^"]+"', 'data-refresh-seconds="0"', markup, count=1)
         markup = re.sub(r'data-park-retry-seconds="[^"]+"', 'data-park-retry-seconds="0"', markup, count=1)
         setup = '''<script>
-const requests=[],itemSnapshots=new Map();
-let finishPost,losePost,lostHold,failPostBody,refreshMarkup,readback,deliveryPending,pageReads=0;
+const requests=[],wordsStatusRequests=[],itemSnapshots=new Map();
+let finishPost,finishWordsStatus,losePost,lostHold,failPostBody,refreshMarkup,readback,deliveryPending,pageReads=0;
 window.fetch=async(path,options={})=>{
  if(options.method!=='POST'){
   const query=new URL(path,location.href).searchParams;
+  if(query.has('words-status')){
+   wordsStatusRequests.push(query);
+   return new Promise(resolve=>{finishWordsStatus=result=>resolve({ok:true,json:async()=>result});});
+  }
   if(query.has('item-state')){
    const key=query.get('keeper')+'/'+query.get('item-state');
    return {ok:true,json:async()=>readback ? readback(key,query.get('park-request')) : {
@@ -10764,6 +11023,395 @@ window.fetch=async(path,options={})=>{
                 self.assertEqual(send.call_args.args[0], MORTY.id)
                 self.assertEqual(notice.recipient_id(MORTY.id), MORTY.id)
                 self.assertEqual(notice.state, "sent")
+
+    def page_action_messages(self, item: the_list.ListItem, action: str, **fields: str
+                             ) -> list[tuple[staff.StaffId, str]]:
+        with patch.object(change_page, "send_to_staff") as send:
+            submission, _ = list_page.save_action(
+                self.root / "reviews", urlencode(self.fields(item, action, **fields)),
+                top_priority=list_page.TopPriority.SHOWN)
+            list_page.deliver(submission)
+        return [(cast(staff.StaffId, call.args[0]), cast(str, call.args[2])) for call in send.call_args_list]
+
+    def test_mark_read_adds_words_to_the_producers_message(self) -> None:
+        for state in (the_list.ItemState.WAITING_FOR_NATE, the_list.ItemState.WORKING):
+            with self.subTest(state=state):
+                item = self.add("Read the figures", state)
+                item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                recipient, message = self.page_action_messages(item, "read", words=" Use this.\nKeep both lines.  ")[0]
+                self.assertEqual(recipient, DWIGHT.id)
+                self.assertTrue(message.endswith("\n\nNate's words:\nUse this.\nKeep both lines."))
+                if state is the_list.ItemState.WAITING_FOR_NATE:
+                    self.assertIn("Write its next step:", message)
+                else:
+                    self.assertEqual(message.splitlines()[0], f"Studio: feedback for item {item.number}.")
+                    self.assertEqual(self.page_action_messages(item, "read", words=" \n "), [])
+
+    def test_park_presets_and_date_save_send_words_to_the_producer(self) -> None:
+        for until in ("delivered", "2026-12-03", (NOW + timedelta(hours=1)).isoformat()):
+            with self.subTest(until=until):
+                item = self.add("Park after the check")
+                item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                blank, = self.page_action_messages(item, "park", until=until, words=" \n ")
+                _ = the_list.unpark(MORTY.id, item.id, source="nate")
+                legacy, copy = self.page_action_messages(item, "park", until=until, words="See the check.")
+                self.assertEqual(legacy, blank)
+                self.assertEqual(copy, (DWIGHT.id, f"Studio: feedback for item {item.number}.\n\n"
+                                                 + "Nate's words:\nSee the check."))
+
+    def test_unpark_sends_words_to_the_producer(self) -> None:
+        item = self.add("Unpark after the check")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        legacy = (MORTY.id, f"Studio: nate unparked item {item.number}.")
+        copy = (DWIGHT.id, f"Studio: feedback for item {item.number}.\n\nNate's words:\nCheck this.")
+        for words, notices in (("  ", [legacy]), ("Check this.", [legacy, copy])):
+            parked = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="nate")
+            self.assertEqual(self.page_action_messages(parked, "unpark", words=words), notices)
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(self.page_action_messages(saved, "unpark", words="Check this anyway."),
+                         [(DWIGHT.id, f"Studio: feedback for item {item.number}.\n\n"
+                                      + "Nate's words:\nCheck this anyway.")])
+
+    def test_unschedule_sends_words_to_the_producer(self) -> None:
+        for words in (" \n ", "Check this today."):
+            with self.subTest(words=words):
+                item = the_list.add(MORTY.id, "Clear the schedule", owner=OWNER.id, source="nate", changes={
+                    "producer": DWIGHT.id, "state": the_list.ItemState.SCHEDULED,
+                    "schedule": the_list.ScheduledRun(NOW + timedelta(days=1), "Check the result."),
+                })
+                sent = self.page_action_messages(item, "unschedule", words=words)
+                expected = [(DWIGHT.id, f"Studio: feedback for item {item.number}.\n\nNate's words:\n{words}")]
+                self.assertEqual(sent, expected if words.strip() else [])
+                self.assertIs(the_list.load(MORTY.id, item.id).schedule, the_list.NoSchedule.UNSET)
+
+    def test_make_top_priority_sends_words_to_the_producer(self) -> None:
+        item = self.add("Check the priority")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        self.assertEqual(self.page_action_messages(item, "top", words=" \n "), [])
+        self.assertEqual(self.page_action_messages(item, "top", words="Check it first."),
+                         [(DWIGHT.id, f"Studio: feedback for item {item.number}.\n\n"
+                                      + "Nate's words:\nCheck it first.")])
+
+    def test_parking_notices_use_the_producer_at_write(self) -> None:
+        for action, writer in (("park", "park"), ("unpark", "unpark"), ("unschedule", "save_page_schedule")):
+            with self.subTest(action=action):
+                item = self.add("Check the producer at write")
+                if action == "unpark":
+                    item = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="nate")
+                if action == "unschedule":
+                    item = the_list.add(MORTY.id, "Clear the schedule", owner=OWNER.id, source="nate", changes={
+                        "state": the_list.ItemState.SCHEDULED,
+                        "schedule": the_list.ScheduledRun(NOW + timedelta(days=1), "Check the result."),
+                    })
+                original = cast(Callable[..., object], getattr(the_list, writer))
+
+                def change_producer(*args: object, **kwargs: object) -> object:
+                    _ = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                    return original(*args, **kwargs)
+
+                with patch.object(the_list, writer, side_effect=change_producer):
+                    sent = self.page_action_messages(item, action, words="Check the result.",
+                                                     until="delivered" if action == "park" else "")
+                self.assertEqual([recipient for recipient, _ in sent],
+                                 [DWIGHT.id] if action == "unschedule" else [MORTY.id, DWIGHT.id])
+
+    def test_replaying_top_priority_preserves_the_newer_item(self) -> None:
+        root = self.root / "reviews"
+        first = self.add("First priority")
+        second = self.add("Second priority")
+        fields = self.fields(first, "top", words="Check this item.")
+        with patch.object(change_page, "send_to_staff", side_effect=OSError("offline")):
+            first_send, _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+            self.assertIsInstance(list_page.deliver_with_outcome(first_send), change_page.FailedDelivery)
+        _ = the_list.make_top_priority(MORTY.id, second.id)
+        replay, _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+        assert isinstance(replay, list_page.ListActionWithWords)
+        self.assertTrue(replay.action_result_unknown)
+        with (patch.object(change_page, "send_to_staff") as send,
+              patch.object(the_list, "make_top_priority", side_effect=AssertionError("Priority repeated"))):
+            list_page.deliver(replay)
+            send.assert_not_called()
+            retry = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+            assert isinstance(retry, list_page.ListFeedbackDelivery)
+            self.assertIsInstance(list_page.deliver_with_outcome(retry, retry_words=True), change_page.DeliveryConfirmed)
+            list_page.deliver(retry)
+        send.assert_called_once()
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(second.number))
+
+    def test_priority_words_retry_reports_no_receipt_after_an_interrupted_save(self) -> None:
+        root = self.root / "reviews"
+        first = self.add("First priority")
+        second = self.add("Second priority")
+        fields = self.fields(first, "top", words="Check this item.")
+        original = cast(Callable[..., None], getattr(the_list, "_save"))
+
+        def stop_notice(store: object, item: the_list.ListItem, **options: object) -> None:
+            if any(feedback.action == "action-words" for feedback in the_list.feedback_requests(item).values()):
+                raise OSError("The words write stopped.")
+            original(store, item, **options)
+
+        with patch.object(the_list, "_save", side_effect=stop_notice):
+            with self.assertRaisesRegex(OSError, "The words write stopped"):
+                _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(first.number))
+        _ = the_list.make_top_priority(MORTY.id, second.id)
+        with patch.object(the_list, "make_top_priority", side_effect=AssertionError("Priority repeated")):
+            retry = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+            self.assertIsInstance(retry, change_page.NoMessageDelivery)
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(second.number))
+
+    def test_priority_words_retry_cannot_apply_a_refused_priority_write(self) -> None:
+        root = self.root / "reviews"
+        first = self.add("First priority")
+        second = self.add("Second priority")
+        _ = the_list.make_top_priority(MORTY.id, second.id)
+        fields = self.fields(first, "top", words="Check this item.")
+        with patch.object(staff, "set_producer_top_item", side_effect=OSError("The staff write stopped.")):
+            with self.assertRaisesRegex(OSError, "The staff write stopped"):
+                _ = list_page.save_action(root, urlencode(fields), top_priority=list_page.TopPriority.SHOWN)
+        with patch.object(the_list, "make_top_priority", side_effect=AssertionError("Priority repeated")):
+            retry = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+            self.assertIsInstance(retry, change_page.NoMessageDelivery)
+        producer = staff.snapshot().by_id(MORTY.id)
+        assert producer is not None
+        self.assertEqual(producer.top_item, staff.TopItem(second.number))
+
+    def test_pending_park_notice_waits_for_confirmation_and_recovers(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Check pending Park delivery")
+        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+        request = self.fields(item, "park", until="delivered", words="Keep the full result.")
+        submission = list_page.submit(root, urlencode(request))
+        with patch.object(change_page, "send_to_staff", return_value="pending") as pending:
+            outcome = list_page.deliver_with_outcome(submission)
+        self.assertIsInstance(outcome, change_page.DeliveryUnconfirmed)
+        saved = the_list.load(MORTY.id, item.id)
+        notices = the_list.feedback_requests(saved)
+        self.assertEqual(notices[request["request"]].state, "sent")
+        self.assertEqual(notices[request["request"] + "-words"].state, "pending")
+        keeper_send, *words_sends = pending.call_args_list
+        self.assertEqual(keeper_send.args[0], MORTY.id)
+        self.assertTrue(all(attempt.args[0] == DWIGHT.id for attempt in words_sends))
+        with (patch.object(change_page, "send_to_staff") as send,
+              patch.object(the_list, "park", side_effect=AssertionError("Park repeated"))):
+            list_page.recover_pending(root)
+            list_page.recover_pending(root)
+        send.assert_called_once()
+        self.assertEqual(send.call_args, words_sends[-1])
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(saved)[request["request"] + "-words"].state, "sent")
+
+    def test_park_words_retry_sends_after_alert_without_parking_again(self) -> None:
+        root = self.root / "reviews"
+        for separate in (False, True):
+            with self.subTest(separate=separate):
+                item = self.add("Park with notes")
+                if separate:
+                    item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                fields = self.fields(item, "park", until="delivered", words="Check the notes.")
+                first = list_page.submit(root, urlencode(fields))
+                alert_target = DWIGHT.id
+                with (patch.object(change_page, "send_to_staff", side_effect=OSError("offline")) as send,
+                      patch.object(change_page, "alert_delivery_failures", return_value=True) as alert):
+                    self.assertIsInstance(list_page.deliver_with_outcome(first), change_page.FailedDelivery)
+                self.assertEqual(alert.call_count, 2 if separate else 1)
+                previous_key = cast(str, send.call_args.kwargs["key"])
+                delivery = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+                assert isinstance(delivery, list_page.ListFeedbackDelivery)
+                _ = the_list.unpark(MORTY.id, item.id, source="morty")
+                with (patch.object(change_page, "send_to_staff") as retry,
+                      patch.object(the_list, "park", side_effect=AssertionError("Park repeated"))):
+                    self.assertIsInstance(list_page.deliver_with_outcome(delivery, retry_words=True),
+                                          change_page.DeliveryConfirmed)
+                retry.assert_called_once()
+                self.assertEqual(retry.call_args.args[0], alert_target if separate else MORTY.id)
+                self.assertEqual(retry.call_args.kwargs["key"], previous_key)
+                self.assertIn("Nate's words:\nCheck the notes.", cast(str, retry.call_args.args[2]))
+                self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
+
+    def test_park_words_stay_retryable_when_the_keepers_send_is_pending(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Park with notes")
+        fields = self.fields(item, "park", until="delivered", words="Check the notes.")
+        submission = list_page.submit(root, urlencode(fields))
+        delivery = list_page.action_words_request(root, {key: [value] for key, value in fields.items()})
+        assert isinstance(delivery, list_page.ListFeedbackDelivery)
+        self.assertEqual(delivery.request, fields["request"])
+        with (patch.object(change_page, "send_to_staff", return_value="pending") as pending,
+              patch.object(change_page, "alert_delivery_failures") as alert):
+            self.assertIsInstance(list_page.deliver_with_outcome(submission), change_page.DeliveryUnconfirmed)
+            self.assertIsInstance(list_page.words_delivery_status(delivery), change_page.DeliveryUnconfirmed)
+            list_page.recover_pending(root)
+        pending.assert_called_once()
+        alert.assert_not_called()
+        self.assertEqual(pending.call_args.args[0], MORTY.id)
+        self.assertIn("Nate's words:\nCheck the notes.", cast(str, pending.call_args.args[2]))
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(the_list.feedback_requests(saved)[delivery.request].state, "sent")
+        log = list_page.item_log(list_page.ListRecord(MORTY.id, saved), NOW,
+                                 staff_names.StaffNames(staff.snapshot()), frozenset()).markup
+        self.assertIn("Feedback delivery unconfirmed to", log)
+        self.assertIn("Check the notes.", log)
+        self.assertNotIn("Feedback sent to", log)
+        _ = the_list.unpark(MORTY.id, item.id, source="morty")
+        with (patch.object(change_page, "send_to_staff") as send,
+              patch.object(the_list, "park", side_effect=AssertionError("Park repeated"))):
+            for _ in range(2):
+                self.assertIsInstance(list_page.deliver_with_outcome(delivery, retry_words=True),
+                                      change_page.DeliveryConfirmed)
+        self.assertEqual(send.call_args_list, pending.call_args_list)
+        self.assertIsInstance(list_page.words_delivery_status(delivery), change_page.DeliveryConfirmed)
+        self.assertIs(the_list.load(MORTY.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
+
+    def test_blank_actions_keep_the_original_delivery_rules(self) -> None:
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=3\ndelivery_pause_seconds=0\n")
+        for action in ("park", "unpark", "read", "tell", "remove"):
+            for box in ("", " \n "):
+                for transport, alert_ok in ((None, True), ("pending", True), ("uncertain", True),
+                                            ("offline", True), ("offline", False), ("uncertain", False)):
+                    with self.subTest(action=action, box=box, transport=transport, alert_ok=alert_ok):
+                        state = the_list.ItemState.WAITING_FOR_NATE if action == "read" else the_list.ItemState.WORKING
+                        item = self.add("Check the existing notice", state)
+                        item = the_list.update(MORTY.id, item.id, {"producer": DWIGHT.id}, source="morty")
+                        if action == "unpark":
+                            item = the_list.park(MORTY.id, item.id, NOW + timedelta(days=1), source="morty")
+                        words = box + "Keep these words." + box if action == "tell" else box
+                        fields = self.fields(item, action, until="delivered" if action == "park" else "", words=words)
+                        submission = list_page.submit(root, urlencode(fields))
+                        error = (change_page.UnconfirmedSend("uncertain") if transport == "uncertain"
+                                 else OSError("offline") if transport == "offline" else None)
+                        with (patch.object(change_page, "send_to_staff",
+                                           return_value=transport, side_effect=error) as send,
+                              patch.object(change_page, "alert_delivery_failures", return_value=alert_ok) as alert):
+                            list_page.deliver(submission)
+                        count = 3 if error is not None else 1
+                        self.assertEqual(send.call_count, count)
+                        self.assertEqual(alert.call_count, int(error is not None))
+                        saved = the_list.load(MORTY.id, item.id)
+                        notice, = the_list.feedback_requests(saved).values()
+                        recipient = DWIGHT.id if action in ("read", "tell") else MORTY.id
+                        self.assertEqual(notice.recipient_id(MORTY.id), recipient)
+                        self.assertTrue(all(attempt.args[0] == recipient for attempt in send.call_args_list))
+                        source = the_list.folder(MORTY.id) / f"{item.id}.md"
+                        key = change_page.review_delivery_key(source, item.id, fields["request"])
+                        self.assertTrue(all(attempt.kwargs["key"] == key for attempt in send.call_args_list))
+                        expected = "sent" if error is None else "alerted" if alert_ok else "pending"
+                        self.assertEqual(notice.state, expected)
+                        self.assertNotIn("Nate's words:", notice.words)
+                        if action == "park":
+                            self.assertIs(saved.parked_until, the_list.ParkUntilDelivered.DELIVERED)
+                        elif action == "unpark":
+                            self.assertIs(saved.parked_until, the_list.NoTimestamp.UNSET)
+                        elif action == "remove":
+                            self.assertIs(saved.state, the_list.ItemState.CLOSED)
+                        else:
+                            self.assertIs(saved.state, the_list.ItemState.WORKING)
+        for words in ("", " \n "):
+            item = self.add("Skip blank Tell")
+            with self.assertRaises(ValueError):
+                _ = list_page.submit(root, urlencode(self.fields(item, "tell", words=words)))
+
+    def test_start_now_uses_only_the_current_press_words(self) -> None:
+        item = the_list.add(MORTY.id, "Start the check", owner=OWNER.id, source="nate", changes={
+            "producer": DWIGHT.id, "state": the_list.ItemState.SCHEDULED,
+            "schedule": the_list.ScheduledRun(NOW + timedelta(days=1), "Keep the saved instruction."),
+        })
+        self.assertEqual(self.page_action_messages(item, "start-now", words="Old box words."), [])
+        item = the_list.load(MORTY.id, item.id)
+        self.assertEqual(self.page_action_messages(item, "start-now", words=" \n "), [])
+        saved = the_list.load(MORTY.id, item.id).schedule
+        self.assertEqual(saved, the_list.ScheduledRun(NOW, "Keep the saved instruction."))
+        assert isinstance(saved, the_list.ScheduledRun)
+        self.assertEqual(saved.start_feedback, "")
+
+    def test_start_now_adds_words_to_the_saved_instruction_message(self) -> None:
+        for words in (" \n ", "Keep both rows.\nCheck the total."):
+            with self.subTest(words=words):
+                item = the_list.add(MORTY.id, "Start the check", owner=OWNER.id, source="nate", changes={
+                    "producer": DWIGHT.id, "state": the_list.ItemState.SCHEDULED,
+                    "schedule": the_list.ScheduledRun(NOW + timedelta(days=1), "Check the result."),
+                })
+                self.assertEqual(self.page_action_messages(item, "start-now", words=words, schedule_words="Draft."), [])
+                scheduled = the_list.load(MORTY.id, item.id).schedule
+                assert isinstance(scheduled, the_list.ScheduledRun)
+                self.assertEqual(scheduled.words, "Check the result.")
+                self.assertEqual(scheduled.start.astimezone(UTC), NOW)
+                command = cast(Callable[[str, the_list.RunDelivery, the_list.RunNotice], list[str]],
+                               getattr(the_list, "_scheduled_notice_command"))
+                run = the_list.RunDelivery("0" * 32, scheduled, item.title, OWNER.id, DWIGHT.id, 0,
+                                           the_list.AwaitingInstruction.OWNER, ())
+                for notice, recipient in ((the_list.RunNotice.OWNER_START, OWNER.id),
+                                          (the_list.RunNotice.PRODUCER_START, DWIGHT.id)):
+                    argv = command(item.id, run, notice)
+                    self.assertEqual(argv[argv.index("--to") + 1], f"staff:{recipient}")
+                    message = argv[argv.index("--text") + 1]
+                    self.assertIn("\nDo this: Check the result.\n", message)
+                    self.assertNotIn("Draft.", message)
+                    self.assertEqual(message.partition("\n\nNate's words:\n")[2], words.strip())
+
+    def test_go_and_approved_add_words_to_the_targets_message(self) -> None:
+        root = self.root / "reviews"
+        for kind in (the_list.AskKind.GO, the_list.AskKind.APPROVAL):
+            for words in (" \n ", "Check the figures."):
+                with self.subTest(kind=kind, words=words):
+                    item = self.add("Check the ask")
+                    ask = the_list.add_ask(MORTY.id, item.id, kind=kind, target=OWNER.id, what="Run the check.",
+                                           why="The check needs approval.", config=False, requester=MORTY.id, source="morty")
+                    token = list_page.signed_token(list_page.form_secret(root), MORTY.id, item.id,
+                                                   go_ledger.token_prefix(ask.ask_id))
+                    fields = dict(keeper=MORTY.id, id=item.id, ask=ask.ask_id, token=token, page="/console/list.html",
+                                  words=words)
+                    go_id, _ = list_page.save_go(root, root, urlencode(fields), "192.0.2.2")
+                    with patch.object(change_page, "send_to_staff") as send:
+                        _ = list_page.deliver_go(root, go_id)
+                    message, = [cast(str, call.args[2]) for call in send.call_args_list if call.args[0] == OWNER.id]
+                    self.assertIn("What: Run the check.\n", message)
+                    self.assertEqual(message.partition("\n\nNate's words:\n")[2], words.strip())
+
+    def test_go_words_keep_the_original_delivery_rules(self) -> None:
+        root = self.root / "reviews"
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=3\ndelivery_pause_seconds=0\n")
+        for words in ("", " \n ", "Check the result."):
+            for transport, alert_ok in ((None, True), ("pending", True), ("uncertain", True),
+                                        ("offline", True), ("offline", False), ("uncertain", False)):
+                with self.subTest(words=words, transport=transport, alert_ok=alert_ok):
+                    item = self.add("Check the ask")
+                    ask = the_list.add_ask(MORTY.id, item.id, kind=the_list.AskKind.GO, target=OWNER.id,
+                                           what="Run the check.", why="The check needs approval.",
+                                           config=False, requester=MORTY.id, source="morty")
+                    token = list_page.signed_token(list_page.form_secret(root), MORTY.id, item.id,
+                                                   go_ledger.token_prefix(ask.ask_id))
+                    fields = dict(keeper=MORTY.id, id=item.id, ask=ask.ask_id, token=token, page="/console/list.html")
+                    if words:
+                        fields["words"] = words
+                    go_id, _ = list_page.save_go(root, root, urlencode(fields), "192.0.2.2")
+                    error = (change_page.UnconfirmedSend("uncertain") if transport == "uncertain"
+                             else OSError("offline") if transport == "offline" else None)
+                    with (patch.object(change_page, "send_to_staff",
+                                       return_value=transport, side_effect=error) as send,
+                          patch.object(change_page, "alert_delivery_failures", return_value=alert_ok) as alert):
+                        _ = list_page.deliver_go(root, go_id)
+                    recipients = (OWNER.id, MORTY.id)
+                    self.assertEqual([attempt.args[0] for attempt in send.call_args_list],
+                                     list(recipients) * (1 if error is None else 3))
+                    self.assertEqual(alert.call_count, int(error is not None))
+                    entry = go_ledger.read(root, go_id)
+                    self.assertEqual(entry["sent"], dict.fromkeys(recipients, error is None))
+                    self.assertEqual(entry["reported"], dict.fromkeys(recipients, error is not None))
+                    self.assertTrue(all(cast(str, attempt.args[2]).partition("\n\nNate's words:\n")[2] == words.strip()
+                                        for attempt in send.call_args_list))
+                    source = the_list.folder(MORTY.id) / f"{item.id}.md"
+                    key = change_page.review_delivery_key(source, item.id, go_id)
+                    self.assertTrue(all(attempt.kwargs["key"] == key for attempt in send.call_args_list))
+                    closed, = the_list.load(MORTY.id, item.id).asks
+                    self.assertEqual((closed.is_open, closed.go_id), (False, go_id))
 
     def test_signed_actions_use_the_keeper_of_each_visible_item(self) -> None:
         root = self.root / "reviews"

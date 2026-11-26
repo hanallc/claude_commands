@@ -43,7 +43,7 @@ from scripts.lib.user_zone import user_zone, zone_label
 from scripts.message import send_result, session_send
 from scripts.notify import push_texts
 from scripts.production import delivery_state, goal, investigation, producer_map, record_store, repeat_rule, session_pane, staff
-from scripts.review_links import change_page, list_draft, page_frame, page_question, question_path, question_record
+from scripts.review_links import change_page, list_draft, new_item_dialog, page_frame, page_question, question_path, question_record
 from scripts.review_links.review_items import LegacyValidationLog, ValidationLogStart
 
 
@@ -234,7 +234,8 @@ class PageRequest:
     """Identify the action and its input for a retry."""
 
     request: str
-    action: Literal["tell", "remove", "park", "unpark", "read", "question", ReportVerdict.WORKS, ReportVerdict.NOT_FIXED]
+    action: Literal["tell", "remove", "park", "unpark", "read", "question", "scheduled-assignee", "action-words",
+                    ReportVerdict.WORKS, ReportVerdict.NOT_FIXED]
     words: str
     form_words: str = ""
     parked_until: Parking = NoTimestamp.UNSET
@@ -284,13 +285,15 @@ class PageFeedback:
     state: Literal["pending", "sent", "alerted"] = "pending"
     alerted_to: str = ""
     read_update: UnreadUpdate | NoUnreadUpdate = NoUnreadUpdate.ABSENT
-    action: Literal["tell", "remove", "park", "unpark", "read", ReportVerdict.NOT_FIXED] = "tell"
+    action: Literal["tell", "remove", "park", "unpark", "read", "scheduled-assignee", "action-words", ReportVerdict.NOT_FIXED] = "tell"
     form_words: str = ""
     parked_until: Parking = NoTimestamp.UNSET
     recipient: FeedbackRecipient = LegacyFeedbackRecipient.KEEPER
 
     additional_recipient: staff.StaffId | NoAdditionalRecipient = NoAdditionalRecipient.ABSENT
     origin: PageNoticeOrigin = PageNoticeOrigin.LIST_PAGE
+    carries_action_words: bool = False
+    action_words_unconfirmed: bool = False
 
     def key(self) -> PageRequest:
         return PageRequest(self.request, self.action, self.words, self.form_words, self.parked_until)
@@ -317,6 +320,19 @@ class PageItemNotice:
     parked_until: Parking = NoTimestamp.UNSET
     recipient: FeedbackRecipient = LegacyFeedbackRecipient.KEEPER
     origin: PageNoticeOrigin = PageNoticeOrigin.LIST_PAGE
+
+
+@dataclass(frozen=True)
+class ScheduledAssigneeCopy:
+    """Send the original New item words to the selected Scheduled assignee."""
+
+    draft: new_item_dialog.ScheduledDraftId
+    recipient: staff.StaffId
+    words: str
+
+
+class NoScheduledAssigneeCopy(Enum):
+    ABSENT = "no separate Scheduled assignee"
 
 
 class AskKind(StrEnum):
@@ -363,6 +379,7 @@ class NoSchedule(StrEnum):
 class ScheduledRun:
     start: datetime
     words: str
+    start_feedback: str = ""
 
 
 @dataclass(frozen=True)
@@ -607,6 +624,9 @@ class RunDelivery:
                 owner = next(notice for notice in self.notices if notice.kind is RunNotice.OWNER_START)
                 status = ("Instruction sent. Waiting for confirmation." if owner.state is NoticeState.ACCEPTED
                           else "Instruction uncertain. Waiting for confirmation.")
+        if self.run.start_feedback and any(notice.kind in _START_NOTICES and notice.state is NoticeState.UNCERTAIN
+                                           for notice in self.notices):
+            status += " Delivery of Nate's words is uncertain."
         return f"Scheduled run due {due}. {status}"
 
 
@@ -664,6 +684,7 @@ class ScheduleExpectation:
 class ScheduleChanges(TypedDict, total=False):
     start: datetime
     words: str
+    start_feedback: str
     repeat: repeat_rule.RepeatRule | RemoveRepeat
 
 
@@ -907,7 +928,8 @@ class GoNotDelivered:
     recipient: staff.StaffId
 
 
-PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt | UnparkNoChangeReceipt
+PageReceipt = PageRequest | QuestionRequestReceipt | UnparkNoChangeReceipt
+PageActivity = PageFeedback | PageReceipt
 ListEvent = (FieldChange | QuestionAnswered | QuestionClosed | MarkedRead | Reopened | Unparked
              | ReviewLinksChanged | EvidenceCopyRemoved | AskOpened | AskWithdrawn | GoGiven | GoNotDelivered | PageActivity)
 LogContent = str | ListEvent
@@ -1014,11 +1036,24 @@ def _schedule_time_text(value: datetime) -> str:
     return value.isoformat() + (f"[{zone.key}]" if isinstance(zone, ZoneInfo) else "")
 
 
+def _scheduled_run_fields(run: ScheduledRun) -> dict[str, object]:
+    fields: dict[str, object] = {"start": _schedule_time_text(run.start), "do": run.words}
+    if run.start_feedback:
+        fields["start_feedback"] = run.start_feedback
+    return fields
+
+
+def _read_scheduled_run(fields: dict[str, object]) -> ScheduledRun:
+    return ScheduledRun(_scheduled_time(_field_text(fields.get("start"), "start")),
+                        _field_text(fields.get("do"), "do"),
+                        _field_text(fields.get("start_feedback", ""), "start_feedback"))
+
+
 def _schedule_fields(schedule: Schedule) -> dict[str, object] | None:
     if isinstance(schedule, NoSchedule):
         return None
     first = schedule.first if isinstance(schedule, ScheduledSeries) else schedule
-    fields: dict[str, object] = {"start": _schedule_time_text(first.start), "do": first.words}
+    fields = _scheduled_run_fields(first)
     if isinstance(schedule, ScheduledSeries):
         fields.update(repeat=schedule.rule.rrule, run_allowance=schedule.run_allowance,
                       runs_before=schedule.run_number_offset, runs_used=schedule.runs_used,
@@ -1027,7 +1062,7 @@ def _schedule_fields(schedule: Schedule) -> dict[str, object] | None:
             fields["following_runs"] = sorted(schedule.following_runs.numbers)
         fields["exceptions"] = [
             {"number": entry.number, "removed": True, "words": entry.run.words} if isinstance(entry.run, SkippedRun)
-            else {"number": entry.number, "start": _schedule_time_text(entry.run.start), "do": entry.run.words}
+            else {"number": entry.number, **_scheduled_run_fields(entry.run)}
             for entry in schedule.exceptions
         ]
     return fields
@@ -1047,12 +1082,12 @@ def _read_schedule(raw: object, legacy_allowance: Callable[[], int]) -> Schedule
     if raw is None:
         return NoSchedule.UNSET
     fields = _json_fields(raw)
-    first = ScheduledRun(_scheduled_time(_field_text(fields.get("start"), "start")), _field_text(fields.get("do"), "do"))
+    first = _read_scheduled_run(fields)
     schedule: Schedule = first
-    if fields.keys() != {"start", "do"}:
+    if fields.keys() - {"start_feedback"} != {"start", "do"}:
         required = {"start", "do", "repeat", "runs_before", "exceptions"}
         with_progress = required | {"runs_used", "finished_runs"}
-        schedule_keys = fields.keys() - {"run_allowance"}
+        schedule_keys = fields.keys() - {"run_allowance", "start_feedback"}
         if schedule_keys not in (required, required | {"runs_used"}, with_progress, with_progress | {"following_runs"}):
             raise ListError("invalid schedule fields")
         run_allowance = fields["run_allowance"] if "run_allowance" in fields else legacy_allowance()
@@ -1072,8 +1107,8 @@ def _read_schedule(raw: object, legacy_allowance: Callable[[], int]) -> Schedule
                 raise ListError("a schedule exception needs a run number")
             if entry.keys() in ({"number", "removed"}, {"number", "removed", "words"}) and entry["removed"] is True:
                 run: ScheduledRun | SkippedRun = SkippedRun(_field_text(entry.get("words", ""), "skip words"))
-            elif entry.keys() == {"number", "start", "do"}:
-                run = ScheduledRun(_scheduled_time(_field_text(entry["start"], "start")), _field_text(entry["do"], "do"))
+            elif entry.keys() - {"start_feedback"} == {"number", "start", "do"}:
+                run = _read_scheduled_run(entry)
             else:
                 raise ListError("invalid schedule exception")
             exceptions.append(RunException(number, run))
@@ -1095,7 +1130,7 @@ def _read_schedule(raw: object, legacy_allowance: Callable[[], int]) -> Schedule
 
 def _run_delivery_fields(delivery: RunDelivery) -> dict[str, object]:
     confirmation = delivery.confirmation
-    return {"key": delivery.key, "start": _schedule_time_text(delivery.run.start), "do": delivery.run.words,
+    return {"key": delivery.key, **_scheduled_run_fields(delivery.run),
             "title": delivery.title, "owner": delivery.owner, "producer": delivery.producer,
             "log_index": delivery.log_index,
             "confirmation": "waiting for confirmation" if isinstance(confirmation, AwaitingConfirmation) else confirmation,
@@ -1143,8 +1178,7 @@ def _read_run_delivery(raw: object) -> RunDelivery:
         notices = [ScheduledNotice(kind, NoticeState.SENDING if kind in outstanding else NoticeState.ACCEPTED)
                    for kind in kinds]
     return RunDelivery(_field_text(fields.get("key"), "key"),
-                       ScheduledRun(_scheduled_time(_field_text(fields.get("start"), "start")),
-                                    _field_text(fields.get("do"), "do")),
+                       _read_scheduled_run(fields),
                        _field_text(fields.get("title"), "title"),
                        staff_id(_field_text(fields.get("owner"), "owner"), "run owner"),
                        staff_id(_field_text(fields.get("producer"), "producer"), "run producer"),
@@ -1577,7 +1611,7 @@ def _validate(item: ListItem) -> None:
                 raise ListError("invalid image answer log")
         elif isinstance(change.what, str):
             _log_line(change.what, "log text")
-        if isinstance(change.what, (PageFeedback, PageRequest, QuestionRequestReceipt, UnparkNoChangeReceipt)):
+        if isinstance(change.what, PageActivity):
             _validate_page_source(change.source)
         _log_line(change.source, "source")
         if " — " in change.source or change.time.utcoffset() is None:
@@ -1840,7 +1874,7 @@ def _log_content(content: LogContent) -> dict[str, object]:
     if isinstance(content, GoNotDelivered):
         return {"action": "Go not delivered", "ask": _stored_ask(content.ask), "recipient": content.recipient}
     if isinstance(content, PageFeedback):
-        fields = _request_fields(content.key())
+        fields: dict[str, object] = {**_request_fields(content.key())}
         fields.update(state=content.state, alerted_to=content.alerted_to)
         if isinstance(content.read_update, UnreadUpdate):
             fields["read_update"] = content.read_update.fingerprint
@@ -1850,6 +1884,10 @@ def _log_content(content: LogContent) -> dict[str, object]:
             fields["additional_recipient"] = staff_id(content.additional_recipient, "additional feedback recipient")
         if content.origin is PageNoticeOrigin.STUDIO:
             fields["origin"] = content.origin
+        if content.carries_action_words:
+            fields["carries_action_words"] = True
+        if content.action_words_unconfirmed:
+            fields["action_words_unconfirmed"] = True
         return {"feedback": fields}
     if isinstance(content, QuestionRequestReceipt):
         return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id)}}
@@ -2238,6 +2276,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         number: int | NextNumber = NextNumber.AVAILABLE, requested_by: RequestedBy = _CREATION_DEFAULTS["requested_by"],
         assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
         new_item_draft_id: list_draft.ListDraftOrigin = list_draft.NoNewItemDraft.ABSENT,
+        assignee_copy: ScheduledAssigneeCopy | NoScheduledAssigneeCopy = NoScheduledAssigneeCopy.ABSENT,
         before_save: Callable[[int], None] | None = None,
         ) -> ListItem:
     """Create an item. Call before_save with its reserved number under the allocation lock."""
@@ -2268,6 +2307,13 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
             raise ListError(f"{identity}: the next available number is L{next_number}")
         item = _new_item(chosen, title, owner, keeper, source, changes, requested_by=requested_by,
                          new_item_draft_id=new_item_draft_id)
+        if isinstance(assignee_copy, ScheduledAssigneeCopy):
+            assert isinstance(item.opened, datetime)
+            message = new_item_dialog.append_feedback(
+                f"New Scheduled item {item.id}. You are the assignee.", assignee_copy.words)
+            notice = PageFeedback(assignee_copy.draft.value, message,
+                                  action="scheduled-assignee", recipient=assignee_copy.recipient)
+            item = replace(item, log=(*item.log, ItemChange(item.opened, notice, PAGE_SOURCE)))
         _check_series_limit(item.schedule)
         _check_links(item.number, changes, require_related=require_related,
                      read_dependency=lambda number: read_reference(number, scope=assigned_to))
@@ -2560,6 +2606,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             unread: bool | Callable[[ListItem], bool] = True,
             page_action: PageItemNotice | PageRequest | NoPageRequest = NoPageRequest.ABSENT,
             assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
+            action_words: str = "",
             follow: Callable[[ListItem, ListItem, datetime], tuple[ItemChange, ...]] | None = None) -> ListEdit:
     """Save one edit and its log entry under the write lock.
 
@@ -2610,23 +2657,31 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
                 changed = replace(changed, parked_until=NoTimestamp.UNSET)
                 entries.append(ItemChange(moment, UnparkedForDelivery(ItemDelivered.RECORDED), source))
         if isinstance(request, PageRequest):
+            notice: PageFeedback | NoPageRequest = NoPageRequest.ABSENT
             if entries and isinstance(page_action, PageItemNotice):
-                pending = PageFeedback(page_action.request, page_action.words, action=page_action.action,
-                                       form_words=request.form_words, parked_until=request.parked_until,
-                                       recipient=page_action.recipient, origin=page_action.origin)
+                notice = PageFeedback(page_action.request, page_action.words, action=page_action.action,
+                                      form_words=request.form_words, parked_until=request.parked_until,
+                                      recipient=page_action.recipient, origin=page_action.origin)
                 if page_action.action == ReportVerdict.NOT_FIXED:
                     assert not isinstance(item.owner, UnassignedOwner)
-                    pending = replace(pending, recipient=item.producer, additional_recipient=item.owner)
-                entries.append(ItemChange(moment, pending, PAGE_SOURCE))
+                    notice = replace(notice, recipient=item.producer, additional_recipient=item.owner)
             elif request.action == "read" and changed.state != item.state:
                 notice = _next_step_notice(keeper, request.request, "nate read", changed, form_words=request.words)
-                entries.append(ItemChange(moment, notice, PAGE_SOURCE))
             elif request.action == "unpark":
                 reason = (UnparkNoChangeReason.EXPIRED if isinstance(item.parked_until, datetime)
                           else UnparkNoChangeReason.NO_ACTIVE_PARKING)
                 entries.insert(0, ItemChange(moment, UnparkNoChangeReceipt(request, reason), PAGE_SOURCE))
             else:
                 entries.insert(0, ItemChange(moment, request, PAGE_SOURCE))
+            if isinstance(notice, PageFeedback):
+                if action_words and notice.recipient_id(keeper) == item.producer:
+                    notice = replace(notice, words=new_item_dialog.append_feedback(notice.words, action_words),
+                                     carries_action_words=True)
+                    action_words = ""
+                entries.append(ItemChange(moment, notice, PAGE_SOURCE))
+            if action_words:
+                entries.append(ItemChange(moment, _producer_words(item, request.request, item.producer, action_words),
+                                          PAGE_SOURCE))
         if not entries:
             return UnchangedEdit(item)
         changed = replace(changed, log=(*changed.log, *entries))
@@ -2886,7 +2941,7 @@ def _schedule_edit(schedule: Schedule, edits: ScheduleChanges, scope: ScheduleSc
                 zone = schedule.first.start.tzinfo
             assert zone is not None
             start = start.astimezone(zone)
-        return ScheduledRun(start, edits.get("words", run.words))
+        return ScheduledRun(start, edits.get("words", run.words), edits.get("start_feedback", run.start_feedback))
 
     if isinstance(schedule, NoSchedule):
         if "start" not in edits or "words" not in edits:
@@ -3091,6 +3146,7 @@ def _scheduled_notice_command(identity: str, delivery: RunDelivery, notice: RunN
         heading = f"Scheduled List item {number} starts now: {delivery.title}"
         message = (f"{heading}\nDo this: {delivery.run.words}\nDue: {due}.\n"
                    f"Confirm with `{_LAUNCHER} confirm --id {identity} --run {delivery.key}`.")
+        message = new_item_dialog.append_feedback(message, delivery.run.start_feedback)
     else:
         heading = f"Scheduled List item {number} has no confirmation"
         message = f"{heading}. {delivery.title} was due at {due}."
@@ -3336,7 +3392,7 @@ def fire_scheduled(interval: timedelta) -> None:
 
 def save_page_schedule(keeper: staff.StaffId, identity: str, operation: ScheduleOperation,
                        edits: ScheduleChanges, *, scope: ScheduleScope, expected: ScheduleExpectation,
-                       repeat_zone: ZoneInfo, receipt: PageRequest) -> ListEdit:
+                       repeat_zone: ZoneInfo, receipt: PageRequest, action_words: str = "") -> ListEdit:
     """Save the schedule and the page receipt in one write."""
     def edit(item: ListItem, moment: datetime) -> ListItem:
         if item.state is ItemState.CLOSED:
@@ -3349,7 +3405,8 @@ def save_page_schedule(keeper: staff.StaffId, identity: str, operation: Schedule
             state = ItemState.SCHEDULED if isinstance(remaining, ScheduledSeries) else ItemState.WORKING
             return replace(item, schedule=remaining, state=state)
         if operation is ScheduleOperation.START_NOW:
-            schedule = _schedule_edit(existing, {"start": moment}, scope, moment,
+            start: ScheduleChanges = {"start": moment, "start_feedback": edits.get("start_feedback", "")}
+            schedule = _schedule_edit(existing, start, scope, moment,
                                       repeat_zone=repeat_zone, expected=expected)
         else:
             if not edits.get("words", "").strip():
@@ -3360,7 +3417,8 @@ def save_page_schedule(keeper: staff.StaffId, identity: str, operation: Schedule
         _check_series_limit(schedule)
         return replace(item, state=ItemState.SCHEDULED, schedule=schedule, parked_until=NoTimestamp.UNSET)
 
-    return _change(keeper, identity, edit, FieldChange("Updated", {}), PAGE_SOURCE, page_action=receipt)
+    return _change(keeper, identity, edit, FieldChange("Updated", {}), PAGE_SOURCE, page_action=receipt,
+                   action_words=action_words)
 
 
 def _say_schedule(schedule: Schedule) -> None:
@@ -3549,7 +3607,7 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
 
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
-         notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+         notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT, action_words: str = "",
          check_deadline: Callable[[datetime], None] | None = None,
          assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED,
          schedule_scope: ScheduleScope = ScheduleScope.UNSPECIFIED,
@@ -3581,7 +3639,8 @@ def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
     def parking_event(changed: ListItem) -> FieldChange:
         return FieldChange("Updated", {}) if isinstance(changed.schedule, ScheduledSeries) else event
 
-    return _change(keeper, identity, edit, parking_event, source, page_action=notice, assigned_to=assigned_to).item
+    return _change(keeper, identity, edit, parking_event, source, page_action=notice, assigned_to=assigned_to,
+                   action_words=action_words).item
 
 
 def unread_delivery(item: ListItem) -> bool:
@@ -3597,7 +3656,7 @@ def unread_delivery(item: ListItem) -> bool:
 
 
 def unpark(keeper: staff.StaffId, identity: str, *, source: str,
-           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT,
+           notice: PageItemNotice | NoPageRequest = NoPageRequest.ABSENT, action_words: str = "",
            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListEdit:
     """Clear an active parking time and save its notice in the same write."""
     def edit(item: ListItem, moment: datetime) -> ListItem:
@@ -3605,7 +3664,8 @@ def unpark(keeper: staff.StaffId, identity: str, *, source: str,
             return item
         _open(item)
         return replace(item, parked_until=NoTimestamp.UNSET)
-    return _change(keeper, identity, edit, Unparked(), source, page_action=notice, assigned_to=assigned_to)
+    return _change(keeper, identity, edit, Unparked(), source, page_action=notice, assigned_to=assigned_to,
+                   action_words=action_words)
 
 
 def close(keeper: staff.StaffId, identity: str, words: str, *, source: str,
@@ -3748,7 +3808,8 @@ def mark_read_edit(keeper: staff.StaffId, identity: str, *, source: str,
         if not isinstance(page_request, PageRequest) or not _waits_for_nate(item, moment):
             return read
         return _start_working(read, moment, source)
-    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request)
+    return _change(keeper, identity, edit, MarkedRead(), source, unread=False, page_action=page_request,
+                   action_words=page_request.words if isinstance(page_request, PageRequest) else "")
 
 
 def add_ask(keeper: staff.StaffId, identity: str, *, kind: AskKind, target: staff.StaffId, what: str, why: str,
@@ -3899,11 +3960,12 @@ def _next_step_notice(keeper: staff.StaffId, request: str, done: str, item: List
     keeper_option = "" if default_keeper is not None and keeper == default_keeper.id else f" --keeper {shlex.quote(keeper)}"
     words = (f"Studio: {done} item {item.number}, so it is now Working. Write its next step: "
              + f"`{_LAUNCHER} update --id {item.id}{keeper_option} --source {name} --next-step \"<step>\"`.")
-    return PageFeedback(request, words, action="read", form_words=form_words, recipient=item.producer)
+    return PageFeedback(request, words, action="read",
+                        form_words=form_words, recipient=item.producer)
 
 
 def is_page_request_receipt(entry: ItemChange) -> bool:
-    return entry.source == PAGE_SOURCE and (isinstance(entry.what, (PageRequest, QuestionRequestReceipt, UnparkNoChangeReceipt))
+    return entry.source == PAGE_SOURCE and (isinstance(entry.what, PageReceipt)
         or isinstance(entry.what, str) and entry.what.startswith(_LEGACY_RECEIPT))
 
 
@@ -3948,7 +4010,7 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     state, alerted_to, target = fields.get("state"), fields.get("alerted_to", ""), fields.get("read_update", "")
     if state not in ("pending", "sent", "alerted") or not isinstance(alerted_to, str) or not isinstance(target, str):
         raise ListError("invalid List feedback log")
-    if action not in ("tell", "remove", "park", "unpark", "read", "not works") or not words.strip():
+    if action not in ("tell", "remove", "park", "unpark", "read", "scheduled-assignee", "action-words", "not works") or not words.strip():
         raise ListError("invalid List feedback action")
     recipient = _field_text(fields.get("recipient", ""), "feedback recipient")
     additional = _field_text(fields.get("additional_recipient", ""), "additional feedback recipient")
@@ -3959,16 +4021,17 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
                         form_words, parked_until,
                         recipient=staff_id(recipient, "feedback recipient") if recipient else LegacyFeedbackRecipient.KEEPER,
                         additional_recipient=(staff_id(additional, "additional feedback recipient")
-                                              if additional else NoAdditionalRecipient.ABSENT), origin=origin)
+                                              if additional else NoAdditionalRecipient.ABSENT), origin=origin,
+                        carries_action_words=fields.get("carries_action_words") is True,
+                        action_words_unconfirmed=fields.get("action_words_unconfirmed") is True)
 
 
 def _page_requests(item: ListItem) -> dict[str, PageActivity]:
     requests: dict[str, PageActivity] = {}
     for entry in item.log:
         content = entry.what
-        if entry.source == PAGE_SOURCE and isinstance(content, (PageRequest, PageFeedback, QuestionRequestReceipt, UnparkNoChangeReceipt)):
-            identity = (content.request.request if isinstance(content, (QuestionRequestReceipt, UnparkNoChangeReceipt))
-                        else content.request)
+        if entry.source == PAGE_SOURCE and isinstance(content, PageActivity):
+            identity = content.request if isinstance(content, (PageRequest, PageFeedback)) else content.request.request
             requests[identity] = content
     return requests
 
@@ -4003,6 +4066,36 @@ def unpark_no_change_reason(item: ListItem, request: str) -> UnparkNoChangeReaso
     raise ListError("the List item has no Unpark receipt for this request")
 
 
+def _producer_words(item: ListItem, request: str, producer: staff.StaffId, words: str) -> PageFeedback:
+    message = new_item_dialog.append_feedback(f"Studio: feedback for item {item.number}.", words)
+    return PageFeedback(request + "-words", message, action="action-words", recipient=producer, form_words=words)
+
+
+def action_words_notice(item: ListItem, request: str) -> PageFeedback | NoPageRequest:
+    """Find the saved words or the existing notice that carries them."""
+    notices = feedback_requests(item)
+    copy = notices.get(request + "-words")
+    if copy is not None and copy.action == "action-words":
+        return copy
+    notice = notices.get(request)
+    if notice is not None and notice.carries_action_words:
+        return notice
+    return NoPageRequest.ABSENT
+
+
+def save_priority_words(keeper: staff.StaffId, item: ListItem, request: str, words: str) -> ListItem:
+    """Save words for the producer selected by Make top priority."""
+    store = _store(keeper)
+    with store.locked():
+        current = load(keeper, item.id)
+        if isinstance(action_words_notice(current, request), PageFeedback):
+            return current
+        notice = _producer_words(current, request, item.producer, words)
+        changed = replace(current, log=(*current.log, ItemChange(now(), notice, PAGE_SOURCE)))
+        _save(store, changed)
+        return changed
+
+
 def _previous_page_request(
         item: ListItem, request: PageRequest) -> PageActivity | NoPageRequest:
     previous = _page_requests(item).get(_request_id(request.request), NoPageRequest.ABSENT)
@@ -4012,10 +4105,10 @@ def _previous_page_request(
             key = PageRequest(previous.request, "read", previous.form_words)
         elif isinstance(previous, PageFeedback):
             key = previous.key()
-        elif isinstance(previous, (QuestionRequestReceipt, UnparkNoChangeReceipt)):
-            key = previous.request
-        else:
+        elif isinstance(previous, PageRequest):
             key = previous
+        else:
+            key = previous.request
         if key.action == request.action == "park" and request.parked_until is not NoTimestamp.UNSET:
             target = key.parked_until
             if target is NoTimestamp.UNSET:
@@ -4027,7 +4120,7 @@ def _previous_page_request(
                 raise ListError("this request already has a different parking time")
             if key.form_words != request.form_words:
                 raise ListError("this request already has a different action or words")
-        elif key.action == request.action == "unpark":
+        elif key.action == request.action and request.action == "unpark":
             if key.form_words != request.form_words:
                 raise ListError("this request already has a different action or words")
         elif key != request:
@@ -4275,7 +4368,7 @@ def save_feedback(keeper: staff.StaffId, identity: str, feedback: PageFeedback) 
 
 
 def deliver_feedback(keeper: staff.StaffId, identity: str, request: str,
-                     send: Callable[[ListItem, PageFeedback], PageFeedback]) -> None:
+                     send: Callable[[ListItem, PageFeedback], PageFeedback], *, retry_words: bool = False) -> None:
     """Claim one request in this process and release the List lock before sending."""
     store = _store(keeper)
     claim = store.path(identity), request
@@ -4287,8 +4380,12 @@ def deliver_feedback(keeper: staff.StaffId, identity: str, request: str,
         with store.locked():
             item = load(keeper, identity)
             feedback = feedback_requests(item).get(request)
-        if feedback is None or not (feedback.state == "pending"
-                                    or (feedback.state == "alerted" and feedback.action is ReportVerdict.NOT_FIXED)):
+        if feedback is None:
+            return
+        words_retry = retry_words and feedback.carries_action_words
+        if not (feedback.state == "pending"
+                or (feedback.state == "alerted" and (feedback.action is ReportVerdict.NOT_FIXED or words_retry))
+                or (words_retry and feedback.action_words_unconfirmed)):
             return
         result = send(item, feedback)
         if result == feedback or result.state == "pending":

@@ -1351,8 +1351,10 @@ def render_shell(snapshot: ReviewSnapshot, index: str, started: float, read_at: 
 def review_fields(body: str) -> dict[str, list[str]]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     required = {'row', 'token', 'outcome', 'feedback'}
-    if not required <= fields.keys() <= required | {'later', 'revision', 'assignee'} or any(len(values)!=1 for values in fields.values()):
+    if not required <= fields.keys() <= required | {'later', 'revision', 'assignee', 'feedback_retry'} or any(len(values)!=1 for values in fields.values()):
         raise question_record.AnswerRefused('use the answer form on this page')
+    if 'feedback_retry' in fields and fields['feedback_retry'] != ['1']:
+        raise question_record.AnswerRefused('use Retry to send the saved words')
     return fields
 
 
@@ -1398,6 +1400,13 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     key, token, outcome, words = (fields[field][0] for field in ('row', 'token', 'outcome', 'feedback'))
     if not secrets.compare_digest(token, change_browser.row_token(snapshot.browser, key)):
         raise question_record.AnswerRefused('row or page token does not match this page')
+    revision = fields.get('revision', [''])[0]
+    until = fields.get('later', [''])[0]
+    retry = review_actions.retry_action_feedback(status, key, outcome, words, revision, until)
+    if not isinstance(retry, review_actions.NoActionFeedbackReceipt):
+        return retry
+    if 'feedback_retry' in fields:
+        raise question_record.AnswerRefused('No saved Review words were found.')
     retained = snapshot.records.get(key)
     if retained is None:
         raise review_items.ReviewRecordMissing('This item is no longer on the list.')
@@ -1415,7 +1424,6 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
             retain_asset(current, assets)
         except FileNotFoundError:
             raise review_items.ReviewRecordMissing('This item is no longer on the list.') from None
-        revision = fields.get('revision', [''])[0]
         if revision != record_revision(current, assets) and not (
                 outcome == 'feedback' and _matches_feedback_retry(current, assets, revision, token, words)):
             raise review_items.ReviewRecordChanged('This item changed. Check it again before saving.')
@@ -1453,8 +1461,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     if waiting_change(item) or (item.state == ReviewState.VALIDATING and outcome != 'question'):
         raise change_page.ChangeHandoffRefused(change_page.WITH_SHOWRUNNER)
     if outcome == 'later':
-        return change_page.NoMessageDelivery(), review_actions.later(
-            item, fields.get('later', [''])[0], words, verify_revision=validate, root=root)
+        return review_actions.later_action(item, until, words, status,
+                                         verify_revision=validate, root=root, feedback_revision=revision)
     if outcome not in item.actions:
         raise question_record.AnswerRefused('choose an action on this card')
     source = item.source
@@ -1487,10 +1495,12 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
                 question, cast(change_page.QuestionOutcome, outcome), words, status,
                 save=change_browser.ExactQuestionSave(validate))
     elif isinstance(source, review_items.InvestigationSource):
-        delivery, answer = review_actions.investigation_action(item, outcome, words, status, verify_revision=validate)
+        delivery, answer = review_actions.investigation_action(
+            item, outcome, words, status, verify_revision=validate, feedback_revision=revision)
     else:
         delivery, answer = review_actions.decision_action(
-            item, outcome, words, status, assignee=fields.get('assignee', [''])[0], verify_revision=validate)
+            item, outcome, words, status, assignee=fields.get('assignee', [''])[0], verify_revision=validate,
+            feedback_revision=revision)
     if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery) and item.type == ReviewType.QUESTION:
         with review_items.after_store_write(item.key):
             delivery = review_actions.track_question(delivery, key, words, status)
@@ -1521,6 +1531,12 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
     if not secrets.compare_digest(fields['token'][0],change_browser.row_token(browser,key)):
         raise question_record.AnswerRefused('row or page token does not match this page')
     outcome, words = fields['outcome'][0], fields['feedback'][0]
+    until = fields.get('later', [''])[0]
+    retry = review_actions.retry_action_feedback(status, key, outcome, words, '', until)
+    if not isinstance(retry, review_actions.NoActionFeedbackReceipt):
+        return retry
+    if 'feedback_retry' in fields:
+        raise question_record.AnswerRefused('No saved Review words were found.')
     if key.startswith('question/'):
         question_item = next((item for item in review_items.read(root, kinds=review_items.QUESTION_TYPES)
                               if item.key == key), None)
@@ -1555,8 +1571,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus, *,
                 with status.locked():
                     path = change_routing.delivery_path(root, source.path, source.row['#'])
                     change_page.require_user_turn(change_routing.delivery_slots(path))
-                    return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
-            return change_page.NoMessageDelivery(),review_actions.later(item,fields.get('later',[''])[0],words)
+                    return review_actions.later_action(item,until,words,status)
+            return review_actions.later_action(item,until,words,status)
         if outcome not in item.actions:
             raise question_record.AnswerRefused('choose an action on this card')
         delivery, answer = (review_actions.investigation_action(item,outcome,words,status)
@@ -1768,11 +1784,23 @@ function bindReviewForm(form,{zone,settings,remember=()=>rememberReviewDraft(for
  const words=form.elements.feedback,later=form.elements.later,assignee=form.elements.assignee;
  const row=recordFromDetail(form);
  const stored=reviewDrafts.get(row.dataset.key);
+ form.retryFeedback=data=>{
+  let retry=form.querySelector('[data-review-feedback-retry]');
+  if(!retry){
+   retry=document.createElement('button');
+   retry.type='button';
+   retry.dataset.reviewFeedbackRetry='';
+   retry.textContent='Retry';
+   form.append(retry);
+  }
+  retry.onclick=()=>void send(data.get('outcome'),new URLSearchParams(data),true);
+ };
  if(stored) restoreReviewDraft(form,stored.draft);
  const choices=recordDetails(row).querySelectorAll('input[name=choice]');
  const submit=(outcome,until)=>{
   const data=new URLSearchParams(new FormData(form));data.set('outcome',outcome);
   if(outcome==='later') data.set('later',until);
+  else data.delete('later');
   if(outcome!=='approve') data.delete('assignee');
   void send(outcome,data);
  };
@@ -1871,21 +1899,48 @@ async function recoverReviewRevision(reason,{form,notice,reload,current=()=>true
   refreshError(error);
  }
 }
-async function saveReviewAction(data,{hold,receiver,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
- let conflict=false,confirmed=false;
+async function saveReviewAction(data,{form,hold,receiver,retrying,sending,confirmedSave,saved,failed,undone=failed,displayFailed,recover,finished}){
+ let conflict=false,confirmed=false,refused=false;
+ const carriesOptionalWords=['later','read','decline'].includes(data.get('outcome')) && data.get('feedback')?.trim();
  try{
   const saveAction=['later','validate'].includes(data.get('outcome'));
   sending?.();
-  const response=await hold.post(location.pathname,{method:'POST',body:data},saveAction ? null : receiver);
+  const body=new URLSearchParams(data);
+  if(retrying) body.set('feedback_retry','1');
+  const options={method:'POST',body};
+  const response=await hold.post(location.pathname,options,saveAction || retrying ? null : receiver);
   conflict=response.status===409;
+  refused=!response.ok && response.status<500;
   confirmed=response.ok;
-  if(confirmed) confirmedSave?.();
+  if(confirmed && !carriesOptionalWords) confirmedSave?.();
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+  if(result.send_failure && result.action_feedback){
+   hold.restore();
+   form.retryFeedback(data);
+   failed(result.send_failure,true);
+   return;
+  }
+  const words=form.elements.feedback.value;
+  if(retrying && words.trim() && words!==data.get('feedback')){
+   form.dataset.reviewSavedDraft='';
+   form.querySelector('[data-review-feedback-retry]')?.remove();
+   const status=document.createElement('p');
+   status.setAttribute('role','status');
+   status.textContent='Sent the original words. Your new words are in the box.';
+   form.append(status);
+   hold.restore();
+   return;
+  }
+  if(carriesOptionalWords) confirmedSave?.();
   await saved(result);
  }catch(error){
   const wasHeld=hold.restore();
   if(error instanceof SendUndone) await undone(error.message);
+  else if(carriesOptionalWords && !refused && (retrying || !confirmed || error instanceof SyntaxError)){
+   form.retryFeedback(data);
+   failed('The action or delivery could not be confirmed. Retry words to check the saved delivery.',true);
+  }
   else if(confirmed) displayFailed(wasHeld);
   else if(conflict) await recover(error.message);
   else failed(error.message);
@@ -1988,6 +2043,8 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
  };
  const busy=active=>{
   setCardSubmitting(form,active);
+  if(form.hasAttribute('data-review-saved-draft'))
+   form.querySelectorAll('button').forEach(button=>button.disabled=true);
   if(frame){
    frame.toggleAttribute('data-saving',active);
    frame.dispatchEvent(new Event('review-card-busy'));
@@ -2014,8 +2071,8 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
    return {revision:body.querySelector('[name="revision"]')?.value,show:()=>mountCard(page,true)};
   }});
  };
- const send=async(_outcome,data)=>{
-  if(cardSubmitBlocked(form) || !showUpdates.hidden) return;
+ const send=async(_outcome,data,retrying=false)=>{
+  if(cardSubmitBlocked(form) || form.hasAttribute('data-review-saved-draft') || !showUpdates.hidden) return;
   rememberReviewDraft(form);
   busy(true);
   if(conflict){
@@ -2026,9 +2083,10 @@ function bindCard(row,zone,settings,requestTimeoutSeconds){
   report('');
   let saved=false;
   await saveReviewAction(data,{
+   form,retrying,
    hold:holdCard(row),
    receiver:sendActionReceiver(form,data),
-   sending:()=>boxFrame?.dispatchEvent(new Event('review-card-sending')),
+   sending:()=>{if(!retrying) boxFrame?.dispatchEvent(new Event('review-card-sending'));},
    saved:()=>{
     saved=true;
     reviewDrafts.delete(row.dataset.key);
@@ -2458,7 +2516,8 @@ function drawSaveControls(form){
  const pending=pendingSaves.has(key);
  setCardSubmitting(form,pending);
  if(pending) return;
- const disabled=row.dataset.bodyLoaded!=='true' || !index.has(key) || recoveringForm(key,form);
+ const disabled=row.dataset.bodyLoaded!=='true' || !index.has(key) || recoveringForm(key,form) ||
+  form.hasAttribute('data-review-saved-draft');
  form.querySelectorAll('button').forEach(button=>button.disabled=disabled);
 }
 function drawSaveState(key,form=recordDetails(reviewRow(key))?.querySelector('[data-review-form]')){
@@ -2472,11 +2531,12 @@ function bindForm(row){
  const key=row.dataset.key;
  drawSaveState(key,form);
  if(!form.elements.feedback) return;
- const send=async(outcome,data)=>{
+ const send=async(outcome,data,retrying=false)=>{
+   if(retrying) await view.rowSettled(recordFromDetail(form));
    const current=recordFromDetail(form);
    if(!view.canSubmit(form,data.get('row')) || view.openItem!==current || current.dataset.bodyLoaded!=='true' ||
     !index.has(key) || cardSubmitBlocked(form,view.rowFading(key)) ||
-    pendingSaves.has(key) || recoveringForm(key,form)) return;
+    pendingSaves.has(key) || recoveringForm(key,form) || form.hasAttribute('data-review-saved-draft')) return;
    const row=current;
    recovering.delete(key);
    const draftAtSubmit=rememberForm(form);
@@ -2486,8 +2546,9 @@ function bindForm(row){
    const handed=row.dataset.type==='change' && ['validate','question','feedback'].includes(outcome);
    // A question or feedback on a change or a proposal shows its own result, so its row stays open through the save.
    const keepOpen=['question','feedback'].includes(outcome) && ['change','proposal'].includes(row.dataset.type);
-   const held=content.dataset.undoEnabled==='true' && ['later','validate'].includes(outcome);
-   const pending={saved:false,departing:!validationQuestion,held,keepOpen,toast:false,top:scrollY};
+   const held=!retrying && content.dataset.undoEnabled==='true' && ['later','validate'].includes(outcome);
+   const pending={saved:false,departing:!retrying && !validationQuestion,held,
+    keepOpen:keepOpen || retrying,toast:false,top:scrollY};
    pendingSaves.set(key,pending);pageRefresh.abandon();drawSaveState(key);
    const request=view.startItemRequest(key),session=view.openSession;
    const closes=outcome==='later' || !['question','feedback','validate'].includes(outcome);
@@ -2520,6 +2581,7 @@ function bindForm(row){
     view.preserveRecordRowTop(()=>showResult({kind:'failure',message:'Not saved: '+reason}));
    };
    await saveReviewAction(data,{
+   form,retrying,
    hold,
    receiver:sendActionReceiver(form,data),
    confirmedSave:()=>{
@@ -2668,7 +2730,9 @@ async function refresh(_supersede=false,current=()=>true){
  }
 }
 async function refreshReview(current){
- const canApply=()=>!pendingSaves.size && !dateTimePickerOpen(document) && current();
+ const hasOpenDraft=()=>Boolean(recordDetails(view.openItem)?.querySelector(
+  '[data-review-feedback-retry],[data-review-saved-draft]'));
+ const canApply=()=>!pendingSaves.size && !dateTimePickerOpen(document) && !hasOpenDraft() && current();
  if(!canApply()) return;
  const options={cache:'no-store',signal:reviewRequestSignal()};
  const delivery=view.deliveryRequest(),query=new URLSearchParams({version:'1'});

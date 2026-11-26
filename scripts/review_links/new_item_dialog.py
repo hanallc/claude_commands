@@ -870,6 +870,20 @@ def read_words(value: object, label: str, *, kind: SubmissionKind | Literal["enh
     return f"Enhancement: {words.lstrip()}" if kind == "enhancement" else words
 
 
+def optional_feedback(words: str) -> str:
+    """Apply the Tell limit and trim the outside of the words."""
+    words = words.strip()
+    return _text(words, "Your words", 10000) if words else ""
+
+
+ACTION_WORDS_HEADING = "\n\nNate's words:\n"
+
+
+def append_feedback(message: str, words: str) -> str:
+    """Add the words from the box to an action message."""
+    return message + ACTION_WORDS_HEADING + words if words.strip() else message
+
+
 SCHEDULED_KIND = "scheduled"
 SCHEDULED_DRAFT_ID = re.compile(r"s1-[0-9a-f]{32}")
 

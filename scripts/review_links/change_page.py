@@ -188,6 +188,13 @@ def scoped_reply_exchange(command: ScopedReplyCommand) -> str:
     return command.get("exchange", command.get("token_sha256", ""))
 
 
+class ReviewActionFeedback(TypedDict):
+    """Keep the result of an action while its words await confirmation."""
+
+    answer: str
+    delivered: bool
+
+
 class StoredReviewMessage(TypedDict):
     saved: bool
     source: str
@@ -198,6 +205,7 @@ class StoredReviewMessage(TypedDict):
     image_question_dispatch: NotRequired[ImageQuestionDispatch]
     submission_request: NotRequired[str]
     submission_delivered: NotRequired[bool]
+    action_feedback: NotRequired[ReviewActionFeedback]
     scoped_reply: NotRequired[ScopedReplyCommand]
 
 
@@ -354,6 +362,13 @@ class ReviewMessagePage(ReviewPage):
     """A Review record and its saved message use the existing delivery slots."""
 
     saved: StoredReviewMessage
+
+    def needs_confirmation(self) -> bool:
+        return bool(self.saved.get("submission_request")) or "action_feedback" in self.saved
+
+    def delivery_confirmed(self) -> bool:
+        feedback = self.saved.get("action_feedback")
+        return bool(self.saved.get("submission_delivered")) or (feedback is not None and feedback["delivered"])
 
 
 class QuestionAnswerRefused(question_record.AnswerRefused):
@@ -1434,7 +1449,7 @@ class DeliveryStatus:
                       file=sys.stderr)
                 return False
             failed = fields.get("failed_delivery")
-            if not (isinstance(page, ReviewMessagePage) and page.saved.get("submission_request")
+            if not (isinstance(page, ReviewMessagePage) and page.needs_confirmation()
                     and failed is not None and failed["attempt"] == intent.attempt):
                 self.finish_intent_locked(delivery, slots, intent)
                 return False
@@ -1665,7 +1680,7 @@ class DeliveryStatus:
                     tracked_question = is_change_question(delivery, slots, current)
                     self.record_result_locked(delivery, result, alerts, question_relayed=question_relayed)
                     if isinstance(result, FailedDelivery) and ((tracked_question and not question_relayed) or (
-                            isinstance(page, ReviewMessagePage) and page.saved.get("submission_request"))):
+                            isinstance(page, ReviewMessagePage) and page.needs_confirmation())):
                         return
                     self.finish_intent_locked(delivery, slots, current)
                     return
@@ -1676,8 +1691,12 @@ class DeliveryStatus:
             updated = replace(slots, validation=ValidationRequested(intent.attempt, intent.feedback))
         else:
             updated = slots.updated(intent.kind, NoDelivery())
-        if intent.kind == "verdict" and isinstance(page, ReviewMessagePage) and page.saved.get("submission_request"):
-            page = replace(page, saved={**page.saved, "submission_delivered": True})
+        if intent.kind == "verdict" and isinstance(page, ReviewMessagePage):
+            if "action_feedback" in page.saved:
+                feedback: ReviewActionFeedback = {**page.saved["action_feedback"], "delivered": True}
+                page = replace(page, saved={**page.saved, "action_feedback": feedback})
+            elif page.saved.get("submission_request"):
+                page = replace(page, saved={**page.saved, "submission_delivered": True})
         self.write_slots(page, row, updated)
         if is_change_question(delivery, slots, intent) or (
                 intent.kind == "verdict" and isinstance(page, (ReviewMessagePage, UserQuestionPage))):
@@ -2724,6 +2743,7 @@ def review_delivery_key(source: Path, row: str, attempt: str, *, purpose: str = 
 def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], message: str, tries: int,
                       pause: float, *, key: str,
                       skipped: set[staff.StaffId] | None = None,
+                      pending_recipients: set[staff.StaffId] | None = None,
                       errors: tuple[type[Exception], ...] = SEND_ERRORS,
                       confirm: bool = False) -> list[DeliveryFailure]:
     """Retry only failed sends. The sender keeps queued and unconfirmed sends."""
@@ -2736,11 +2756,16 @@ def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], messag
         for target in remaining:
             try:
                 result = send_to_staff(target, sender, message, key=key)
-                if result == "pending" and confirm:
-                    failures.append(UnconfirmedDelivery(target, "The sender has not confirmed delivery."))
+                if result == "pending":
+                    if confirm:
+                        failures.append(UnconfirmedDelivery(target, "The sender has not confirmed delivery."))
+                    elif pending_recipients is not None:
+                        pending_recipients.add(target)
                 if result == "skipped" and skipped is not None:
                     skipped.add(target)
-            except errors as error:
+            except Exception as error:
+                if not isinstance(error, errors):
+                    raise
                 failure = UnconfirmedDelivery if confirm and isinstance(error, UnconfirmedSend) else DeliveryFailure
                 failures.append(failure(target, str(error)))
         remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
@@ -3043,7 +3068,7 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
         return deliver_page_question(delivery, status)
     tracked_review = False
     page = delivery.page
-    confirm = isinstance(page, ReviewMessagePage) and bool(page.saved.get("submission_request"))
+    confirm = isinstance(page, ReviewMessagePage) and page.needs_confirmation()
     tries, pause = 0, 0.0
     with status.locked():
         slots = status.slots(delivery.page, delivery.row)
@@ -3329,13 +3354,13 @@ def recover_review_messages(status: DeliveryStatus) -> None:
                 saved = fields.get('review_message')
                 if saved is None:
                     continue
-                if saved.get('submission_delivered'):
-                    continue
                 source = Path(saved['source'])
                 row = saved.get('row',source.stem)
                 if row.startswith((IMAGE_QUESTION_ROW_PREFIX, "List item ")):
                     continue
                 page = ReviewMessagePage(source,source.parent,(row,),'',saved)
+                if page.delivery_confirmed():
+                    continue
                 slots = status.slots(page,row)
                 if not saved['saved']:
                     if row.startswith(IMAGE_QUESTION_ROW_PREFIX):

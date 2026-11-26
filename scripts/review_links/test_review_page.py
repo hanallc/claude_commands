@@ -6601,6 +6601,152 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             with self.subTest(legacy_answer=legacy_answer):
                 self.check_later_investigation_answer(legacy_answer)
 
+    def assert_optional_action_words(self, item: review_items.ReviewItem, action: str, words: str,
+                                     *, later: str = '') -> None:
+        snapshot = review_page.build_snapshot(self.root)
+        body = self.card_body(snapshot, item.key, action, words)
+        if later:
+            body += '&' + urlencode({'later': later})
+        delivery, _ = review_page.submit(self.root, body, self.status, snapshot=snapshot)
+        if not words.strip():
+            self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+            return
+        self.assertIsInstance(delivery, change_page.MessageDelivery)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertEqual(delivery.recipients, (item.owner,))
+        self.assertTrue(delivery.message.endswith("\n\nNate's words:\n" + words.strip()))
+        with patch.object(change_page, 'send_to_staff') as send:
+            change_page.deliver(delivery, self.status)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[2], delivery.message)
+
+    def test_mark_read_sends_investigation_and_bug_words_to_the_owner(self) -> None:
+        owner = self.fixture.unit.id
+        for kind in investigation.InvestigationKind:
+            for words in (' \n ', 'Keep this.\nCheck the next result.'):
+                with self.subTest(kind=kind, words=words):
+                    report = investigation.file(owner, 'Check the result', 'Which result passed?',
+                                                waiting_why='The owner must check the result.', kind=kind)
+                    report = investigation.answer(report.owner, report.id, 'The first result passed.')
+                    item = review_page.build_snapshot(self.root).records[review_items.investigation_record_key(report)]
+                    self.assert_optional_action_words(item, 'read', words)
+                    self.assertIs(investigation.load(report.owner, report.id).state, investigation.InvestigationState.READ)
+
+    def test_later_presets_and_date_save_send_words_to_the_owner(self) -> None:
+        now = datetime.now(user_zone()).replace(second=0, microsecond=0)
+        for delay in (timedelta(hours=1), timedelta(days=2)):
+            for words in (' \n ', 'Read both rows.\nCheck the next result.'):
+                with self.subTest(delay=delay, words=words):
+                    key = self.question('Check the other result?')
+                    item = review_page.build_snapshot(self.root).records[key]
+                    until = now + delay
+                    self.assert_optional_action_words(item, 'later', words, later=until.isoformat())
+                    self.assertEqual(review_later.times()[key], until)
+
+    def test_efficiency_decline_sends_words_to_its_owner(self) -> None:
+        _, efficiency = self.decisions()
+        ledger = self.fixture.temporary / 'decision-efficiency.md'
+        _ = ledger.write_text(ledger.read_text() + '- 2026-11-02 tests: Slower checks — proposed\n')
+        items = review_page.build_snapshot(self.root).records
+        self.assert_optional_action_words(items[efficiency], 'decline', ' \n ')
+        second = next(item for item in items.values() if item.id == 'page-owner/E2')
+        self.assert_optional_action_words(second, 'decline', 'Use the other check.')
+        self.assertTrue(all(line.endswith(' — declined') for line in ledger.read_text().splitlines()))
+
+    def test_review_action_words_retry_after_a_failed_send(self) -> None:
+        _, efficiency = self.decisions()
+        record = self.investigation(False)
+        record = investigation.answer(record.owner, record.id, 'The first result passed.')
+        read = review_items.investigation_record_key(record)
+        later = self.question('Check the other result?')
+        until = (datetime.now(user_zone()) + timedelta(days=1)).isoformat()
+        for key, action in ((efficiency, 'decline'), (read, 'read'), (later, 'later')):
+            with self.subTest(action=action):
+                cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+                self.addCleanup(cache.close)
+                body = self.card_body(cache.get(), key, action, 'Use the saved words.')
+                if action == 'later':
+                    body += '&' + urlencode({'later': until})
+                first = cache.save(body, self.status)
+                assert isinstance(first.delivery, change_page.MessageDelivery)
+                with patch.object(change_page, 'send_to_staff', side_effect=OSError('The owner is offline.')):
+                    outcome = change_page.deliver_with_outcome(first.delivery, self.status)
+                self.assertIsInstance(outcome, change_page.FailedDelivery)
+                restarted = change_page.DeliveryStatus(self.status.root)
+                with patch.object(change_page, 'send_to_staff') as send:
+                    if action == 'later':
+                        change_page.recover_review_messages(restarted)
+                    else:
+                        retry = cache.save(body + '&feedback_retry=1', restarted)
+                        self.assertEqual(retry.answer, first.answer)
+                        assert isinstance(retry.delivery, change_page.MessageDelivery)
+                        self.assertEqual(retry.delivery.attempt, first.delivery.attempt)
+                        change_page.deliver(retry.delivery, restarted)
+                    replay = cache.save(body + '&feedback_retry=1', restarted)
+                    self.assertIsInstance(replay.delivery, change_page.NoMessageDelivery)
+                    self.assertEqual(replay.answer, first.answer)
+                messages = [call.args[2] for call in send.call_args_list if call.args[0] == first.delivery.recipients[0]]
+                self.assertEqual(messages, [first.delivery.message])
+
+    def test_review_retry_ignores_a_later_date_for_read_and_decline(self) -> None:
+        _, efficiency = self.decisions()
+        record = self.investigation(False)
+        record = investigation.answer(record.owner, record.id, 'The first result passed.')
+        read = review_items.investigation_record_key(record)
+        until = (datetime.now(user_zone()) + timedelta(days=1)).isoformat()
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        for key, action in ((efficiency, 'decline'), (read, 'read')):
+            with self.subTest(action=action):
+                body = self.card_body(cache.get(), key, action, 'Use the saved words.') + '&' + urlencode({'later': until})
+                first = cache.save(body, self.status)
+                assert isinstance(first.delivery, change_page.MessageDelivery)
+                with patch.object(change_page, 'send_to_staff', side_effect=OSError('The owner is offline.')):
+                    outcome = change_page.deliver_with_outcome(first.delivery, self.status)
+                self.assertIsInstance(outcome, change_page.FailedDelivery)
+                retry = cache.save(body + '&feedback_retry=1', self.status)
+                self.assertEqual(retry.delivery, first.delivery)
+                self.assertEqual(retry.answer, first.answer)
+                with patch.object(change_page, 'send_to_staff') as send:
+                    change_page.deliver(retry.delivery, self.status)
+                send.assert_called_once()
+
+    def test_review_words_retry_without_a_receipt_never_applies_the_action(self) -> None:
+        _, efficiency = self.decisions()
+        investigation_record = self.investigation(False)
+        key = review_items.investigation_record_key(investigation_record)
+        question = self.question('Check the pending result?')
+        until = (datetime.now(user_zone()) + timedelta(days=1)).isoformat()
+        cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
+        self.addCleanup(cache.close)
+        for row, action in ((efficiency, 'decline'), (key, 'read'), (question, 'later')):
+            with self.subTest(action=action):
+                body = self.card_body(cache.get(), row, action, 'Send these saved words.')
+                if action == 'later':
+                    body += '&' + urlencode({'later': until})
+                with self.assertRaisesRegex(ValueError, 'No saved Review words'):
+                    _ = cache.save(body + '&feedback_retry=1', self.status)
+                self.assertIn(row, cache.get().records)
+
+    def test_legacy_skip_keeps_its_original_notice(self) -> None:
+        self.assertEqual(review_page.legacy_url('/console/changes.html', 'type=questions'),
+                         '/console/review.html?type=question')
+        for words in (' \n ', 'Keep the results.\nCheck the second row.'):
+            with self.subTest(words=words):
+                key = self.question('Choose the layout for Skip?')
+                path, forms, _ = self.fixture.browser('questions')
+                fields = self.fixture.browser_fields(forms, key, 'skip', words)
+                browser = change_browser.page_at(self.root, path + '?type=questions')
+                delivery, _ = change_browser.submit(browser, urlencode(fields), self.status)
+                assert isinstance(delivery, change_page.MessageDelivery)
+                self.assertEqual(delivery.recipients, (self.fixture.unit.id,))
+                message = ('From the user (via the review page), skipped for now; it stays open at the end of the list: '
+                           + 'Choose the layout for Skip?\nFor: ' + self.fixture.unit.name)
+                with patch.object(change_page, 'send_to_staff') as send:
+                    change_page.deliver(delivery, self.status)
+                send.assert_called_once()
+                self.assertEqual(send.call_args.args[2], message)
+
     def check_later_investigation_answer(self, legacy_answer: bool) -> None:
         record = self.investigation(False)
         key = f'investigation/{record.owner}/{record.id}'
@@ -7074,7 +7220,8 @@ window.fetch=async(url,options={})=>{
             delivery, result = review_page.submit(self.root, self.body(items['page-owner/E2'].key, 'decline', 'Too slow.'),
                                                   self.status)
             self.assertEqual(result, 'declined')
-            self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            self.assertTrue(delivery.message.endswith("\n\nNate's words:\nToo slow."))
             self.assertRegex(ledger.read_text().splitlines()[1], ' — declined', 'Decline writes the ledger outcome at once.')
             declined = next(item for item in review_items.read(self.root) if item.id == 'page-owner/E2')
             self.assertEqual(declined.state, review_items.ReviewState.DONE)
@@ -7094,7 +7241,8 @@ window.fetch=async(url,options={})=>{
                 delivery, result = review_page.submit(self.root, self.body(item.key, 'decline', 'Too slow.'), self.status)
             summary.assert_called_once()
             self.assertEqual(result, 'declined')
-            self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+            assert isinstance(delivery, change_page.MessageDelivery)
+            self.assertTrue(delivery.message.endswith("\n\nNate's words:\nToo slow."))
             self.assertTrue(nightly_ledger.read_text().splitlines()[0].endswith(' — declined'))
             declined = next(record for record in review_items.read(self.root) if record.key == item.key)
             self.assertEqual(declined.state, review_items.ReviewState.DONE)
@@ -7849,6 +7997,55 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
 })();
 </script>"""
         markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_browser_review_retry_preserves_newer_words(self) -> None:
+        _ = self.decisions()
+        setup = r"""<script>
+const realFetch=fetch,posts=[];
+window.setInterval=()=>0;
+window.fetch=async(url,options)=>{
+ if(options?.method!=='POST') return realFetch(url,options);
+ posts.push(new URLSearchParams(options.body));
+ if(posts.length===1) return Response.json({action_feedback:true,send_failure:'The owner is offline.'});
+ return Response.json({action_feedback:true,answer:'declined',state:'Done',detail_closed:true,later:0});
+};
+</script>"""
+        probe = r"""<script>
+(async()=>{
+ const failures=[];
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>setTimeout(resolve,20));
+  }
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const row=document.querySelector('[data-list-item][data-type="efficiency"]:not([hidden])');
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row);
+  const words=form.elements.feedback;
+  words.value='Send these words.';
+  form.requestSubmit(form.querySelector('[value="decline"]'));
+  const retry=()=>form.querySelector('[data-review-feedback-retry]:not([disabled])');
+  await until(retry,'The card did not offer Retry.');
+  words.value='Keep these new words.';
+  words.dispatchEvent(new Event('input',{bubbles:true}));
+  await until(()=>retry() && !document.querySelector('[data-record-motion]'),'The card did not settle.');
+  retry().click();
+  await until(()=>posts.length===2 && !form.dataset.sending,'Retry did not finish.');
+  if(posts[1].get('feedback_retry')!=='1') failures.push('Retry did not use the words delivery path.');
+  if(posts[1].get('feedback')!=='Send these words.') failures.push('Retry changed the original words.');
+  if(words.value!=='Keep these new words.') failures.push('Retry cleared the newer words.');
+  if(!form.getClientRects().length || !recordIsOpen(row)) failures.push('Retry hid the box with the newer words.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        markup = browser_markup(self.root).replace('<head>', '<head>'+setup, 1).replace('</body>', probe+'</body>')
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
