@@ -3444,42 +3444,63 @@ $("walk").addEventListener("keydown", event => {
 
 const KILL_PATH = "/console/build-kill";
 const KILL_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.86 2h8.28L22 7.86v8.28L16.14 22H7.86L2 16.14V7.86zM15 9l-6 6m0-6 6 6"/></svg>';
-let killInfo = {token: "", offers: {}, results: []};
+let killInfo = null;
 let killRequest = 0;
 let nextKillRead = 0;
 let killRead = false;
 let killRefreshSeconds = SECONDS;
 let killConfirmation = null;
-const pendingKills = new Map();
-const outsideKillFailures = new Map();
+const killItems = new Map();
+
+function killStatusCell(cell) {
+  return cell.closest(".outside-queue-row")?.querySelector(".outside-command") ?? cell;
+}
+
+function showKillLabel(cell, text) {
+  const label = document.createElement("span");
+  label.className = "kill-state";
+  label.textContent = text;
+  const previous = cell.querySelector(".kill-state");
+  if (previous) previous.replaceWith(label);
+  else cell.append(label);
+}
+
+function killView(row, item, outside) {
+  const unavailable = "Kill is not available for this run yet";
+  const offer = row?.offer, status = row?.status;
+  if (row && item && (status?.kill_number ?? 0) <= item.number) {
+    if (!item.error) return {text: "Stopping", button: false, title: ""};
+    return {text: `Not stopped: ${item.error}`, button: Boolean(offer), title: offer || status ? "" : unavailable};
+  }
+  if (!status) return {text: "", button: Boolean(offer), title: offer ? "" : unavailable};
+  if (status.stop === "Stop unconfirmed") {
+    const reason = status.reason || status.stop;
+    return {text: outside ? `Not stopped: ${reason}` : reason, button: Boolean(outside && offer), title: ""};
+  }
+  if (status.stop !== "Stopped") return {text: status.stop, button: false, title: ""};
+  const delivery = status.delivery === "Message sent" ? `${status.recipient_role} ${status.recipient_name} informed`
+    : status.delivery === "Message queued" ? `Message queued for ${status.recipient_role} ${status.recipient_name}`
+    : status.delivery === "Message failed" ? `Message failed for ${status.recipient_role} ${status.recipient_name}`
+    : "Message pending";
+  return {text: `Killed by you at ${status.time} · ${delivery}`, button: false, title: ""};
+}
 
 function showKillResults() {
   const visible = new Set();
-  const statuses = new Map(killInfo.results.map(result => [result.reference, result]));
-  for (const [reference, result] of pendingKills) {
-    statuses.set(reference, result);
+  const rows = new Map(killInfo?.listed.map(reference => [reference, {offer: killInfo.offers[reference]}]));
+  for (const status of killInfo?.results ?? []) {
+    const row = rows.get(status.reference);
+    rows.set(status.reference, {offer: row?.offer, status});
   }
-  const statusText = result => {
-    if (result.stop === "Stop unconfirmed" && result.reason) return result.reason;
-    if (result.stop !== "Stopped") return result.stop;
-    const delivery = result.delivery === "Message sent" ? `${result.recipient_role} ${result.recipient_name} informed`
-      : result.delivery === "Message queued" ? `Message queued for ${result.recipient_role} ${result.recipient_name}`
-      : result.delivery === "Message failed" ? `Message failed for ${result.recipient_role} ${result.recipient_name}`
-      : "Message pending";
-    return `Killed by you at ${result.time} · ${delivery}`;
-  };
   for (const cell of document.querySelectorAll("td[data-kill-ref]")) {
     const reference = cell.dataset.killRef;
-    const offer = killInfo.offers[reference], status = statuses.get(reference);
-    const outside = cell.closest(".outside-queue-row");
-    const failure = outside && (status?.stop === "Stop unconfirmed" ? status.reason || status.stop
-      : !status ? outsideKillFailures.get(reference) : "");
+    const view = killView(rows.get(reference), killItems.get(reference), cell.closest(".outside-queue-row"));
     visible.add(reference);
     const oldControl = cell.querySelector("button");
-    const available = offer && (!status || failure);
-    const statusCell = outside ? outside.querySelector(".outside-command") : cell;
-    statusCell.querySelector(".kill-state")?.remove();
-    if (!available) {
+    const statusCell = killStatusCell(cell);
+    if (view.text) showKillLabel(statusCell, view.text);
+    else statusCell.querySelector(".kill-state")?.remove();
+    if (!view.button) {
       oldControl?.remove();
     } else if (!oldControl) {
       const control = document.createElement("button");
@@ -3491,21 +3512,17 @@ function showKillResults() {
       control.innerHTML = KILL_ICON;
       cell.append(control);
     }
-    if (status || failure) {
-      const label = document.createElement("span");
-      label.className = "kill-state";
-      label.textContent = failure ? `Not stopped: ${failure}` : statusText(status);
-      statusCell.append(label);
-    }
-    cell.title = offer || status ? "" : "Kill is not available for this run yet";
-  }
-  const outsideRefs = new Set(latest?.outside_queue?.map(row => row.kill_ref));
-  for (const reference of outsideKillFailures.keys()) {
-    if (!outsideRefs.has(reference)) outsideKillFailures.delete(reference);
+    cell.title = view.title;
   }
   const strip = $("kill-results");
-  const text = [...statuses.values()].filter(result => !visible.has(result.reference))
-    .map(result => `${result.step} (pid ${result.pid}) · ${statusText(result)}`).join("\n");
+  const outside = new Set(killInfo?.outside);
+  const text = [...rows].flatMap(([reference, row]) => {
+    if (visible.has(reference)) return [];
+    const details = row.status ?? row.offer;
+    const view = killView(row, killItems.get(reference), outside.has(reference));
+    if (!view.text) return [];
+    return [details ? `${details.step} (pid ${details.pid}) · ${view.text}` : view.text];
+  }).join("\n");
   if (strip && strip.textContent !== text) strip.textContent = text;
 }
 
@@ -3522,12 +3539,16 @@ async function refreshKill() {
       nextKillRead = started + killRefreshSeconds * 1000;
     }
     killRead = response.status === 403 || response.ok;
-    if (info?.offers && Array.isArray(info.results)) killInfo = info;
-    else killInfo = {...killInfo, token: "", offers: {}};
-    if (response.status === 403) killInfo.results = [];
+    killInfo = info?.offers && Array.isArray(info.results) && Array.isArray(info.listed) ? info : null;
+    if (killInfo) {
+      const listed = new Set(killInfo.listed);
+      for (const reference of killItems.keys()) {
+        if (!listed.has(reference)) killItems.delete(reference);
+      }
+    }
   } catch {
     if (request !== killRequest) return;
-    killInfo = {...killInfo, token: "", offers: {}};
+    killInfo = null;
   }
   showKillResults();
   fitLabels();
@@ -3560,7 +3581,7 @@ document.addEventListener("click", event => {
   const control = event.target.closest?.(".kill-run");
   if (!control) return;
   const reference = control.closest("td").dataset.killRef;
-  const offer = killInfo.offers[reference];
+  const offer = killInfo?.offers[reference];
   const running = latest?.walk.find(row => row.kill_ref === reference);
   const outside = latest?.outside_queue?.find(row => row.kill_ref === reference);
   if (!offer || (!running && !outside) || killConfirmation) return;
@@ -3582,8 +3603,7 @@ document.addEventListener("click", event => {
   $("kill-recipient").textContent = offer.recipient_name;
   $("kill-message").textContent = offer.message;
   $("kill-words").value = "";
-  killConfirmation = {reference, offer, token: killInfo.token, step: running?.name ?? outside.command,
-    outside: Boolean(outside)};
+  killConfirmation = {reference, offer, token: killInfo.token, outside: Boolean(outside)};
   control.setAttribute("aria-expanded", "true");
   hideTip();
   const dialog = $("kill-dialog");
@@ -3607,40 +3627,30 @@ $("kill-dialog").addEventListener("close", () => {
 });
 $("kill-form").addEventListener("submit", async event => {
   event.preventDefault();
-  if (!killConfirmation || pendingKills.has(killConfirmation.reference)) return;
-  const {reference, offer, token, step, outside} = killConfirmation;
-  const body = new URLSearchParams({reference, token, handle: offer.handle, words: $("kill-words").value});
-  const stopping = {reference, pid: offer.pid, step, stop: "Stopping", delivery: ""};
-  pendingKills.set(reference, stopping);
-  outsideKillFailures.delete(reference);
-  if (outside) killInfo.results = killInfo.results.filter(row => row.reference !== reference);
+  if (!killConfirmation) return;
+  const {reference, offer, token} = killConfirmation;
+  const item = {number: offer.kill_number, error: ""};
+  const body = new URLSearchParams({reference, token, handle: offer.handle, words: $("kill-words").value,
+    kill_number: String(item.number)});
+  killItems.set(reference, item);
   $("kill-dialog").close();
   showKillResults();
-  const failed = reason => {
-    if (outside) outsideKillFailures.set(reference, reason);
-    else killInfo.results = [...killInfo.results.filter(row => row.reference !== reference),
-      {...stopping, stop: "Stop unconfirmed"}];
-  };
+  let reason = "";
   try {
-    const response = await fetch(KILL_PATH, {method: "POST", body});
+    const reply = fetch(KILL_PATH, {method: "POST", body});
+    void refreshKill();
+    const response = await reply;
     const payload = await response.json();
-    if (response.ok && payload.result) {
-      killInfo.results = [...killInfo.results.filter(row => row.reference !== reference), payload.result];
-    } else {
-      failed(payload.reason || "The request failed.");
-    }
+    if (!response.ok) reason = payload.reason || "The request failed.";
   } catch {
-    failed("The request failed.");
-  } finally {
-    ++killRequest;
-    delete killInfo.offers[reference];
-    pendingKills.delete(reference);
-    showKillResults();
-    if (outside && (outsideKillFailures.has(reference)
-        || killInfo.results.some(row => row.reference === reference && row.stop === "Stop unconfirmed"))) {
-      void refreshKill();
-    }
+    reason = "The request failed.";
   }
+  if (killItems.get(reference) !== item) return;
+  if (reason) {
+    item.error = reason;
+    showKillResults();
+  }
+  await refreshKill();
 });
 
 function renderWalk(d) {
@@ -4216,7 +4226,7 @@ async function tick(supersede=false,current=()=>true) {
   if (!d.ok || d.error) throw new Error(d.error || "The queue did not answer.");
   render(d);
   if (performance.now() >= nextKillRead && (!killRead || d.walk.some(row => row.kill_ref) || d.outside_queue?.some(row => row.kill_ref)
-      || killInfo.results.length || pendingKills.size)) void refreshKill();
+      || killInfo?.results.length || killItems.size)) void refreshKill();
   if (d.report_version !== reportVersion) await loadReport(d.report_version,current);
   if (!current() || paused) return;
   const lv=level(latest);
