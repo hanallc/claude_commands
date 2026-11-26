@@ -11315,17 +11315,9 @@ class ScopedMemoryTrace:
 
 
 class MemoryTraceCaptureTests(unittest.TestCase):
-    def grant(self, fixture: AdmissionFixture, *, repository: str = "hana",
-              step: str = "nextest", scoped: bool = True, need: int = 8 * GIB,
-              argv: tuple[str, ...] = ("cargo", "nextest", "run", "--test-threads", "8"),
-              policy: memory_trace.MemoryTracePolicy = TRACE_POLICY) -> ScopedMemoryTrace:
+    def start_trace_reader(self, fixture: AdmissionFixture,
+                           policy: memory_trace.MemoryTracePolicy) -> service.OperatingSystemReader:
         server = fixture.server
-        request = fixture.request(step=step, need=need, width=records.RequestedTestWidth(8))
-        sidecar = fixture.root / f"sample-{request.owner.pid}.cgroup"
-        request = replace(request, sidecar=str(sidecar) if scoped else "",
-                          argv=argv,
-                          profile=replace(request.profile, repo=repository,
-                              repository=records.RepositoryIdentity(f"git-root:{repository}", repository)))
         _ = server.run_pass()
         server.trace_policy = policy
         with mock.patch.object(threading.Thread, "start"):
@@ -11338,7 +11330,20 @@ class MemoryTraceCaptureTests(unittest.TestCase):
                 server.close()
 
         _ = fixture.callback(close_server)
-        grant = only_admitted(server.handle_request(request))
+        return reader
+
+    def grant(self, fixture: AdmissionFixture, *, repository: str = "hana",
+              step: str = "nextest", scoped: bool = True, need: int = 8 * GIB,
+              argv: tuple[str, ...] = ("cargo", "nextest", "run", "--test-threads", "8"),
+              policy: memory_trace.MemoryTracePolicy = TRACE_POLICY) -> ScopedMemoryTrace:
+        request = fixture.request(step=step, need=need, width=records.RequestedTestWidth(8))
+        sidecar = fixture.root / f"sample-{request.owner.pid}.cgroup"
+        request = replace(request, sidecar=str(sidecar) if scoped else "",
+                          argv=argv,
+                          profile=replace(request.profile, repo=repository,
+                              repository=records.RepositoryIdentity(f"git-root:{repository}", repository)))
+        reader = self.start_trace_reader(fixture, policy)
+        grant = only_admitted(fixture.server.handle_request(request))
         if scoped:
             _ = fixture.scope(request.owner, current=8 * GIB, anonymous=2 * GIB, swap=3 * GIB)
             stamp = round(fixture.clock.now() * 1_000_000_000)
@@ -11442,6 +11447,68 @@ class MemoryTraceCaptureTests(unittest.TestCase):
             self.assertEqual(trace.state.coverage, memory_trace.WholeRun())
             path, = (run.store.root / "finished").glob(f"*/*-{run.grant.reservation}.jsonl")
             print(f"General lint trace, 31 samples over 60 seconds: {path.stat().st_size} bytes")
+
+    def test_placed_gate_records_one_trace_for_modules_in_separate_scopes(self) -> None:
+        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+
+        for step in ("gate", "test-affected"):
+            with self.subTest(step=step), PlacementFixture() as fixture:
+                request = placement_request(fixture)
+                assert isinstance(request.local, wire.LocalAdmissionContext)
+                sidecar = fixture.root / "placement.cgroup"
+                argv = (step,)
+                repo = "/fixture/.claude"
+                request = replace(request, profile=replace(request.profile, repo=repo, step=step),
+                                  constraints=replace(request.constraints, command=argv,
+                                                      candidates=(local_candidate(fixture),)),
+                                  local=replace(request.local, argv=argv, sidecar=str(sidecar)))
+                reader = self.start_trace_reader(fixture, TRACE_POLICY)
+                reply, = fixture.server.handle_request(request)
+                assert isinstance(reply, wire.LocalPlacementGranted), reply
+                record = fixture.server.reservations[request.episode]
+                self.assertEqual(record.sidecar, str(sidecar))
+                self.assertIsInstance(record.place, wire.LocalPlace)
+                child_request = fixture.request(owner=wire.Owner(request.owner.pid, request.owner.start_time), step=step)
+                trace_store = memory_trace.TraceStore(fixture.state_dir / "memory_traces", TRACE_POLICY)
+                run = ScopedMemoryTrace(reader, child_request, reply.grant, sidecar,
+                                        fixture.root / "unused-scope", sidecar.with_suffix(".log"), trace_store)
+
+                def start_modules() -> None:
+                    for module, used in enumerate((2 * GIB, 3 * GIB), start=1):
+                        child = fixture.proc.spawn()
+                        write_process(fixture.proc.path, child.pid, used, parent=request.owner.pid, start=child.start_time)
+                        scope = fixture.root / f"module-{module}.scope"
+                        write_scope(scope, members=(child.pid,), current=used, anonymous=used)
+                    outsider = fixture.proc.spawn()
+                    write_process(fixture.proc.path, outsider.pid, 4 * GIB, start=outsider.start_time)
+
+                self.drive(fixture, run, 5, ((1, start_modules), (4.5, lambda: fixture.release(run.grant))))
+                self.assertFalse(sidecar.exists())
+                trace = self.sealed(run)
+                self.assertEqual(trace.header.general, memory_trace.GeneralTraceShape(
+                    fixture.server.host, request.profile.worktree, step, argv))
+                self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [0, 2000, 4000])
+                self.assertEqual([sample.program_bytes for sample in trace.compile_samples], [GIB, 6 * GIB, 6 * GIB])
+                self.assertEqual(trace.test_samples, ())
+                assert isinstance(trace.state, memory_trace.TraceEnd)
+                self.assertEqual(trace.state.coverage, memory_trace.WholeRun())
+
+    def test_general_trace_binds_a_scope_published_after_the_first_sample(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture, repository="fixture", step="lint")
+            run.sidecar.unlink()
+            published_at = fixture.clock.now() + 3
+
+            def publish_scope() -> None:
+                _ = run.sidecar.write_text(str(run.scope))
+                stamp = round(fixture.clock.now() * 1_000_000_000)
+                os.utime(run.sidecar, ns=(stamp, stamp))
+
+            self.drive(fixture, run, 7, ((3, publish_scope), (6.5, lambda: fixture.release(run.grant))))
+            trace = self.sealed(run)
+            self.assertEqual(trace.header.scope_started_at_ms, round(published_at * 1000))
+            self.assertEqual([sample.elapsed_ms for sample in trace.compile_samples], [1000, 3000])
+            self.assertIsNotNone(trace.header.general)
 
     def test_zero_need_scoped_steps_record_only_general_traces(self) -> None:
         for repository, step in (("fixture", "lint"), ("hana", "nextest")):

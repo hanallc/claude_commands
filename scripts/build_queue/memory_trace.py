@@ -6,6 +6,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, S
 from dataclasses import dataclass, fields, replace
 from enum import StrEnum
 import errno
+from functools import cache
 import hashlib
 import json
 from math import floor
@@ -966,6 +967,7 @@ class TraceGrant:
     row: records.Reservation
     wall: float
     monotonic: float
+    process_tree: bool = False
 
 
 @dataclass(frozen=True)
@@ -1010,7 +1012,7 @@ class _ScopeGeneration:
 
 @dataclass
 class _BoundTrace:
-    scope: _ScopeGeneration
+    scope: _ScopeGeneration | None
     started_monotonic: float
     started_wall: float
     writer: TraceWriter
@@ -1028,7 +1030,8 @@ class _BoundTrace:
             if self.log is not None:
                 self.log.close_trace_log()
         finally:
-            os.close(self.scope.descriptor)
+            if self.scope is not None:
+                os.close(self.scope.descriptor)
 
 
 @dataclass
@@ -1058,12 +1061,13 @@ class TraceCapture:
     """Own the traces, sampling deadlines, and files on the trace thread."""
 
     def __init__(self, store: TraceStore, capture_root: Path, boot_id: str, clock: TraceClock, *,
-                 process_start: Callable[[int], str | None] = records.process_start_time) -> None:
+                 process_start: Callable[[int], str | None] = records.process_start_time, proc: Path = gate.PROC) -> None:
         self.store = store
         self.capture_root = capture_root
         self.boot_id = boot_id
         self.clock = clock
         self.process_start = process_start
+        self.proc = proc
         self._reservations: dict[str, _TraceReservation] = {}
         self._pending_seals: dict[str, _PendingSeal] = {}
 
@@ -1132,26 +1136,34 @@ class TraceCapture:
             if not scope.matches(None) or not self._scope_populated(scope):
                 os.close(descriptor)
                 return None
-            grant = reservation.grant
             wall, monotonic = self.clock.now(), self.clock.monotonic()
             started = min(published, wall)
-            started_monotonic = max(grant.monotonic, monotonic - (wall - started))
-            general = grant.shape if isinstance(grant.shape, GeneralTraceShape) else None
-            header = TraceHeader(grant.reservation_id, shape_key(grant.shape), round(started * _MS_PER_SECOND),
-                                 self.store.policy.sample_interval_ms, grant.row["need"], general)
-            log = (progress.CaptureReader(self.capture_root, track_trace=True, scope_started_at=started)
-                   if general is None else None)
-            log_path = progress.progress_path(reservation.sidecar, "log")
-            writer = self.store.start(header)
-            if log is not None:
-                log.bind_trace_log(log_path)
-            return _BoundTrace(scope, started_monotonic, started, writer, log, log_path)
+            started_monotonic = max(reservation.grant.monotonic, monotonic - (wall - started))
+            return self._begin(reservation, scope, started, started_monotonic)
         except BaseException:
             os.close(descriptor)
             raise
 
+    def _begin(self, reservation: _TraceReservation, scope: _ScopeGeneration | None,
+               started: float, started_monotonic: float) -> _BoundTrace:
+        grant = reservation.grant
+        general = grant.shape if isinstance(grant.shape, GeneralTraceShape) else None
+        header = TraceHeader(grant.reservation_id, shape_key(grant.shape), round(started * _MS_PER_SECOND),
+                             self.store.policy.sample_interval_ms, grant.row["need"], general)
+        log = (progress.CaptureReader(self.capture_root, track_trace=True, scope_started_at=started)
+               if general is None else None)
+        log_path = progress.progress_path(reservation.sidecar, "log")
+        writer = self.store.start(header)
+        if log is not None:
+            log.bind_trace_log(log_path)
+        return _BoundTrace(scope, started_monotonic, started, writer, log, log_path)
+
     def sample_due(self, release_time: Callable[[str], float],
                    claim_expiry: Callable[[TraceRelease], TraceRelease | None]) -> None:
+        @cache
+        def processes() -> dict[int, gate.ProcessIdentity]:
+            return gate.process_table(self.proc)
+
         now = self.clock.monotonic()
         for identifier, seal in tuple(self._pending_seals.items()):
             if seal.due <= now:
@@ -1164,7 +1176,10 @@ class TraceCapture:
                     self._release(release)
                 continue
             try:
-                self._sample_scope(reservation, release_time)
+                if reservation.grant.process_tree:
+                    self._sample_tree(reservation, processes(), release_time)
+                else:
+                    self._sample_scope(reservation, release_time)
             except Exception as error:
                 if reservation.capture is None:
                     _report(error, action=f"bind {identifier}")
@@ -1174,12 +1189,30 @@ class TraceCapture:
                 if reservation.scope_loss is None:
                     reservation.due = self.clock.monotonic() + self.store.policy.sample_seconds
 
+    def _sample_tree(self, reservation: _TraceReservation, processes: dict[int, gate.ProcessIdentity],
+                     release_time: Callable[[str], float]) -> None:
+        grant = reservation.grant
+        row = grant.row
+        memory = gate.tree_memory(row["pid"], row["start_time"], processes, self.proc)
+        if isinstance(memory, records.GoneMemory):
+            self._scope_lost(reservation)
+            return
+        sampled_at = self.clock.monotonic()
+        capture = reservation.capture
+        if capture is None:
+            capture = reservation.capture = self._begin(reservation, None, grant.wall, grant.monotonic)
+        if capture.sampling:
+            self._append_memory(capture, memory, sampled_at, release_time(grant.reservation_id), progress.NoTraceCapture())
+
     def _sample_scope(self, reservation: _TraceReservation, release_time: Callable[[str], float]) -> None:
         if reservation.capture is None:
             reservation.capture = self._bind(reservation)
-        elif not reservation.capture.scope.matches(reservation.sidecar):
-            self._scope_lost(reservation)
-            return
+        else:
+            scope = reservation.capture.scope
+            assert scope is not None
+            if not scope.matches(reservation.sidecar):
+                self._scope_lost(reservation)
+                return
         capture = reservation.capture
         if capture is None or not capture.sampling:
             return
@@ -1202,9 +1235,14 @@ class TraceCapture:
         if reading is None:
             return
         memory, sampled_at = reading
+        self._append_memory(capture, memory, sampled_at, cutoff(), log)
+
+    def _append_memory(self, capture: _BoundTrace, memory: records.MeasuredMemory, sampled_at: float, cutoff: float,
+                       log: progress.TraceCaptureReading | progress.NoTraceCapture) -> None:
+        writer = capture.writer
         elapsed_ms = capture.elapsed_ms(sampled_at)
         if (not isinstance(memory.anonymous, records.AnonymousRunUse)
-                or elapsed_ms <= writer.last_sample_ms or sampled_at > cutoff()):
+                or elapsed_ms <= writer.last_sample_ms or sampled_at > cutoff):
             return
         sample = (TestSample(elapsed_ms, memory.anonymous.bytes) if isinstance(writer.test_start, TestStarted)
                   else self._compile_sample(elapsed_ms, memory.anonymous.bytes, log))
@@ -1213,6 +1251,7 @@ class TraceCapture:
     def _read_scope(self, reservation: _TraceReservation, capture: _BoundTrace
                     ) -> tuple[records.MeasuredMemory, float] | None:
         scope = capture.scope
+        assert scope is not None
         reading = None
         try:
             if self._scope_populated(scope):
@@ -1234,7 +1273,7 @@ class TraceCapture:
         return bool(members.read_text().strip())
 
     def _read_log(self, capture: _BoundTrace) -> progress.TraceCaptureReading | progress.NoTraceCapture:
-        assert capture.log is not None
+        assert capture.log is not None and capture.scope is not None
         reading = capture.log.trace_log(capture.log_path)
         if isinstance(reading, progress.TraceCaptureReading) or not self.boot_id:
             return reading

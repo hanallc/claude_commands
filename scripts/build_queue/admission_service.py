@@ -1249,8 +1249,10 @@ class OperatingSystemReader:
         else:
             shape = memory_trace.GeneralTraceShape(host, record.repo_identity or record.worktree or record.repo,
                                                   record.step, argv)
+        # Gate suite reservations cover modules that can run in separate scopes.
+        gate_suites = record.step in ("gate", "test-affected") and argv[:1] == (record.step,)
         worker.submit(memory_trace.TraceGrant(record.reservation_id, shape, reservation_row(record),
-                                              wall, self.clock.monotonic()))
+                                              wall, self.clock.monotonic(), process_tree=gate_suites))
 
     def release_trace(self, record: ReservationRecord, ending: ReservationEnding,
                       wall: float) -> None:
@@ -8027,7 +8029,7 @@ done
             if not isinstance(initial, SystemEvidence):
                 initial = read_system(plan, self.readings, self.proc, self.clock)
             traces = (memory_trace.TraceCapture(memory_trace.TraceStore(self.state_dir / "memory_traces", self.trace_policy),
-                        self.progress_captures.root, self.boot_id, self.clock)
+                        self.progress_captures.root, self.boot_id, self.clock, proc=self.proc.path)
                       if isinstance(self.trace_policy, memory_trace.MemoryTracePolicy) else self.trace_policy)
             self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock,
                                                        self.reading_events, traces=traces)
