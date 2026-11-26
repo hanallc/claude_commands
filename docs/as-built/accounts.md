@@ -940,6 +940,24 @@ It does not wait for the detached counts fetch.
 Local session counts still use current local registry evidence.
 The [console Accounts page](review-links.md#accounts-page) defines the display and refresh behavior.
 
+Accounts distinguishes four pane launch warnings in status diagnostics.
+
+- A row pane is starting.
+- A Codex pane is starting.
+- The row pane evidence is unknown.
+- The worker pane evidence is incomplete.
+
+These warnings do not appear in Accounts Problems.
+`~/.local/state/accounts/launch_warnings.json` records the first example, first and last capture times, and read count for each warning kind.
+An example includes the fixed warning text and a validated pane or process identifier when one is available.
+Each read counts each kind at most once.
+The first read of a new PST calendar day starts a new count and keeps pending reports.
+The stream saves each warning under an fcntl lock as it captures it.
+A detached sender reports the first example of each kind to brain once per PST calendar day.
+Delivery or durable acceptance clears a pending report.
+The sender writes failures to `launch_warnings.log` next to the record.
+A read moves a corrupt record to a file with a timestamp and a `.corrupt` suffix.
+
 Account notes use numbered filenames.
 Each note shows its roles and live session count.
 Existing session rows remain as history and supply no current staff facts.

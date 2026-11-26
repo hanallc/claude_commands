@@ -206,6 +206,335 @@ class AccountsConfigurationTests(unittest.TestCase):
                 self.assertFalse(cast(Callable[[datetime, datetime], bool], getattr(accounts, "_reading_is_old"))(now - timedelta(minutes=11), now))
 
 
+@final
+class LaunchWarningTests(unittest.TestCase):
+    warnings = (
+        "herdr agents:w16:p6BC: pane is starting",
+        "herdr pid 165: pane is starting",
+        "herdr agents:w16:p6BC tab w16:t4: pane evidence is unknown: two foreground processes; row placement retained",
+        "anomaly: worker-1: pane evidence is incomplete; absence is unproved; correct the evidence and retry",
+    )
+    account_notes = ("claude1: fixture account problem", "mac unavailable: counts are natedev only")
+    start = datetime(2026, 11, 26, 7, 56, tzinfo=timezone.utc)
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.record = Path()
+        self.config = conf.ConfigRead("accounts", Path("fixture-accounts.conf"), {}, repository_allowed=False)
+        self.reports: list[accounts.LaunchWarningReport] = []
+        self.fail_report = False
+        self.start_report = accounts._start_launch_warning_report  # pyright: ignore[reportPrivateUsage]
+        self.send_report = accounts._send_launch_warning  # pyright: ignore[reportPrivateUsage]
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.record = root / "launch_warnings.json"
+        _ = self.enterContext(patch.object(accounts, "_launch_warning_record", return_value=self.record))
+        _ = self.enterContext(patch.object(accounts, "_start_launch_warning_report", new=self.deliver))
+        _ = self.enterContext(patch.object(accounts, "_send_launch_warning", new=self.send))
+
+    def deliver(self, path: Path) -> None:
+        self.assertEqual(path, self.record)
+        _ = accounts._deliver_launch_warnings(path)  # pyright: ignore[reportPrivateUsage]
+
+    def send(self, report: accounts.LaunchWarningReport) -> None:
+        self.reports.append(report)
+        if self.fail_report:
+            raise OSError("fixture offline\nsecond line")
+
+    def read(self, now: datetime, *warnings: str) -> tuple[str, ...]:
+        reading = accounts.StatusReading((), self.account_notes, (), timezone.utc, now)
+
+        def emit(*_args: object, **_options: object) -> accounts.StatusReading:
+            for warning in warnings:
+                print(warning, file=sys.stderr)
+            return reading
+
+        with (patch.object(accounts, "_read_status", side_effect=emit),
+              patch.object(accounts, "_with_upcoming_moves", return_value=reading),
+              patch.object(accounts, "_launch_warning_now", return_value=now)):
+            return accounts.read_status(source=accounts.StoredUsageOnly(), account_config=self.config).notes
+
+    def test_launch_warning_kinds_never_appear_in_page_notes(self) -> None:
+        self.assertEqual(self.read(self.start, *self.warnings), self.account_notes)
+        self.assertEqual(self.read(self.start + timedelta(hours=23), *self.warnings), self.account_notes)
+
+    def test_each_read_counts_a_kind_once_and_the_next_pst_day_resets_counts(self) -> None:
+        first, unrelated = self.warnings[:2]
+        second = first.replace("p6BC", "p6BD")
+        later = self.start + timedelta(minutes=2)
+        midnight = self.start + timedelta(minutes=4)
+        _ = self.read(self.start, first, first, second, unrelated)
+        _ = self.read(later, second, first)
+        _ = self.read(later + timedelta(seconds=1))
+        self.assertEqual(cast(object, json.loads(self.record.read_text())), {"day": "2026-11-25", "warnings": {
+            "ROW_PANE_STARTING": {"first_line": first, "first_seen": self.start.isoformat(),
+                                  "last_seen": later.isoformat(), "read_count": 2, "reported": True},
+            "CODEX_PANE_STARTING": {"first_line": unrelated, "first_seen": self.start.isoformat(),
+                                    "last_seen": self.start.isoformat(), "read_count": 1, "reported": True},
+        }})
+        _ = self.read(midnight, second)
+        self.assertEqual(cast(object, json.loads(self.record.read_text())), {"day": "2026-11-26", "warnings": {
+            "ROW_PANE_STARTING": {"first_line": second, "first_seen": midnight.isoformat(),
+                                  "last_seen": midnight.isoformat(), "read_count": 1, "reported": True},
+        }})
+
+    def test_unrecognized_warning_appears_on_the_first_read(self) -> None:
+        line = self.warnings[0] + "; pane retained"
+        self.assertEqual(self.read(self.start, line), (*self.account_notes, f"accounts: read warning; {line}"))
+        self.assertEqual(self.reports, [])
+
+    def test_brain_gets_the_first_line_of_each_kind_per_pst_day(self) -> None:
+        other = self.warnings[0].replace("p6BC", "p6BD")
+        _ = self.read(self.start, *self.warnings, other)
+        self.assertEqual([report.kind for report in self.reports], list(accounts.LaunchWarningKind))
+        self.assertEqual(self.reports[0].text,
+            "accounts to brain: bug to track (Accounts page launch warning, item 483): "
+            + f"row pane starting seen; example: {self.warnings[0]}; first seen 2026-11-25 23:56:00 PST. "
+            + "The page shows no launch warning; the record ~/.local/state/accounts/launch_warnings.json "
+            + "has the first time and the count for each kind.")
+        _ = self.read(self.start + timedelta(minutes=1), other, *self.warnings)
+        self.assertEqual(len(self.reports), len(self.warnings))
+        _ = self.read(self.start + timedelta(minutes=4), other, *self.warnings)
+        self.assertEqual([report.kind for report in self.reports], list(accounts.LaunchWarningKind) * 2)
+        self.assertIn(f"example: {other};", self.reports[len(self.warnings)].text)
+
+    def test_failed_brain_report_retries_on_the_next_read(self) -> None:
+        line = self.warnings[1]
+        self.fail_report = True
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(self.read(self.start, line), self.account_notes)
+        self.assertEqual(errors.getvalue().splitlines(),
+                         ["accounts: launch warnings: could not report to brain: fixture offline second line"])
+        self.fail_report = False
+        _ = self.read(self.start + timedelta(seconds=1), line.replace("165", "166"))
+        _ = self.read(self.start + timedelta(seconds=2), line)
+        self.assertEqual(len(self.reports), 2)
+        self.assertEqual(self.reports[0], self.reports[1])
+
+    def test_a_pending_report_does_not_hold_the_record_lock(self) -> None:
+        line = self.warnings[0]
+
+        def start(_command: list[str], *, pass_fds: tuple[int, ...],
+                  start_new_session: bool, **_options: object) -> MagicMock:
+            self.assertTrue(start_new_session)
+            claimed, = pass_fds
+            self.addCleanup(os.close, os.dup(claimed))
+            with file_lock.exclusive(self.record.with_suffix(".lock"), wait=False) as lock:
+                self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+            return MagicMock()
+
+        with (patch.object(accounts, "_start_launch_warning_report", new=self.start_report),
+              patch.object(subprocess, "Popen", side_effect=start) as process):
+            self.assertEqual(self.read(self.start, line), self.account_notes)
+            self.assertEqual(self.read(self.start + timedelta(minutes=3), line), self.account_notes)
+        process.assert_called_once()
+
+    def test_detached_report_uses_a_private_log_and_no_input(self) -> None:
+        log = self.record.with_suffix(".log")
+
+        def start(_command: list[str], *, stdin: int, stdout: BinaryIO, stderr: BinaryIO,
+                  start_new_session: bool, **_options: object) -> MagicMock:
+            self.assertEqual(stdin, subprocess.DEVNULL)
+            self.assertIs(stdout, stderr)
+            self.assertTrue(start_new_session)
+            self.assertEqual(os.fstat(stdout.fileno()).st_ino, log.stat().st_ino)
+            _ = os.write(stdout.fileno(), b"fixture output\n")
+            _ = os.write(stderr.fileno(), b"fixture error\n")
+            return MagicMock()
+
+        with (redirect_stderr(io.StringIO()) as errors,
+              patch.object(accounts, "_start_launch_warning_report", new=self.start_report),
+              patch.object(subprocess, "Popen", side_effect=start) as process):
+            self.assertEqual(self.read(self.start, self.warnings[0]), self.account_notes)
+        process.assert_called_once()
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(log.read_text(), "fixture output\nfixture error\n")
+
+    def test_quiet_reads_retry_a_report_across_pst_midnight(self) -> None:
+        self.fail_report = True
+        midnight = self.start + timedelta(minutes=4)
+        with redirect_stderr(io.StringIO()):
+            _ = self.read(self.start, self.warnings[0])
+            _ = self.read(self.start + timedelta(seconds=1))
+            _ = self.read(midnight)
+        self.assertEqual(len(self.reports), 3)
+        self.assertIn('"pending": {"2026-11-25":', self.record.read_text())
+        self.fail_report = False
+        _ = self.read(midnight + timedelta(seconds=1))
+        _ = self.read(midnight + timedelta(seconds=2))
+        self.assertEqual(self.reports, [self.reports[0]] * 4)
+        self.assertEqual(cast(object, json.loads(self.record.read_text())), {"day": "2026-11-26", "warnings": {}})
+
+    def test_example_drops_the_free_reason_and_unvalidated_location(self) -> None:
+        email = "fixture@example.invalid"
+        line = self.warnings[2].replace("two foreground processes", f"unknown login {email}")
+        _ = self.read(self.start, line)
+        example = "herdr agents:w16:p6BC: pane evidence is unknown; row placement retained"
+        self.assertIn(example, self.record.read_text())
+        self.assertIn(example, self.reports[0].text)
+        self.assertNotIn(email, self.record.read_text())
+        self.assertNotIn(email, self.reports[0].text)
+        bad_location = line.replace("agents:w16:p6BC", f"agents:{email}")
+        self.assertEqual(self.read(self.start + timedelta(days=1), bad_location), self.account_notes)
+        self.assertIn('example: pane evidence is unknown; row placement retained;', self.reports[1].text)
+        self.assertNotIn(email, self.reports[1].text)
+        self.assertNotIn(email, self.record.read_text())
+
+    def test_failed_send_reports_both_output_streams(self) -> None:
+        rejected = subprocess.CompletedProcess(["send.py"], 1, stdout="fixture output\n", stderr="fixture error\n")
+        with (redirect_stderr(io.StringIO()) as errors,
+              patch.object(accounts, "_send_launch_warning", new=self.send_report),
+              patch.object(subprocess, "run", return_value=rejected)):
+            self.assertEqual(self.read(self.start, self.warnings[1]), self.account_notes)
+        self.assertEqual(errors.getvalue(), "accounts: launch warnings: could not report to brain: "
+                         + "stderr: fixture error stdout: fixture output\n")
+
+    def test_a_corrupt_record_moves_aside_and_reports_resume(self) -> None:
+        corrupt_contents = b'{"day":'
+        _ = self.record.write_bytes(corrupt_contents)
+        self.assertEqual(self.read(self.start, self.warnings[0]), self.account_notes)
+        saved, = self.record.parent.glob("launch_warnings.json.*.corrupt")
+        self.assertEqual(saved.read_bytes(), corrupt_contents)
+        self.assertEqual(len(self.reports), 1)
+        _ = self.read(self.start + timedelta(seconds=1))
+        self.assertEqual(len(self.reports), 1)
+        self.assertIn('"reported": true', self.record.read_text())
+
+    def test_a_corrupt_timestamp_moves_the_record_aside(self) -> None:
+        stamp = self.start.isoformat()
+        for first, last in (
+            ("0001-01-01T00:00:00+00:00", stamp),
+            (stamp, "9999-12-31T23:59:59-09:00"),
+            ((self.start - timedelta(days=1)).isoformat(), stamp),
+            (stamp, (self.start + timedelta(days=1)).isoformat()),
+        ):
+            with self.subTest(first=first, last=last):
+                contents = json.dumps({"day": "2026-11-25", "warnings": {"ROW_PANE_STARTING": {
+                    "first_line": self.warnings[0], "first_seen": first, "last_seen": last,
+                    "read_count": 1, "reported": False,
+                }}})
+                previous = set(self.record.parent.glob("launch_warnings.json.*.corrupt"))
+                _ = self.record.write_text(contents)
+                self.reports.clear()
+                self.assertEqual(self.read(self.start, self.warnings[1]), self.account_notes)
+                saved, = set(self.record.parent.glob("launch_warnings.json.*.corrupt")) - previous
+                self.assertEqual(saved.read_text(), contents)
+                self.assertEqual([report.kind for report in self.reports], [accounts.LaunchWarningKind.CODEX_PANE_STARTING])
+
+    def test_capture_before_midnight_keeps_its_day_after_the_lock_wait(self) -> None:
+        captured = self.start + timedelta(minutes=3, seconds=59)
+        after_midnight = captured + timedelta(seconds=2)
+        now = captured
+        exclusive = file_lock.exclusive
+
+        @contextmanager
+        def lock(path: Path) -> Generator[file_lock.LockResult]:
+            nonlocal now
+            now = after_midnight
+            with exclusive(path) as result:
+                yield result
+
+        with (patch.object(file_lock, "exclusive", new=lock),
+              patch.object(accounts, "_launch_warning_now", side_effect=lambda: now)):
+            stream = accounts.LaunchWarningStream(io.StringIO())
+            _ = stream.write(self.warnings[0] + "\n")
+            self.assertEqual(cast(object, json.loads(self.record.read_text())), {"day": "2026-11-25", "warnings": {
+                "ROW_PANE_STARTING": {"first_line": self.warnings[0], "first_seen": captured.isoformat(),
+                                      "last_seen": captured.isoformat(), "read_count": 1, "reported": False},
+            }})
+            stream.finish()
+
+        self.assertEqual(len(self.reports), 1)
+        self.assertEqual(self.reports[0].day.isoformat(), "2026-11-25")
+        self.assertIn("first seen 2026-11-25 23:59:59 PST", self.reports[0].text)
+
+    def test_unknown_pane_warning_with_no_tab_is_hidden(self) -> None:
+        line = self.warnings[2].replace("tab w16:t4:", "tab :")
+        self.assertEqual(self.read(self.start, line), self.account_notes)
+        self.assertEqual(self.reports[0].kind, accounts.LaunchWarningKind.ROW_PANE_EVIDENCE_UNKNOWN)
+        self.assertIn("example: herdr agents:w16:p6BC: pane evidence is unknown; row placement retained;",
+                      self.reports[0].text)
+
+    def test_later_read_can_save_before_the_first_captured_warning(self) -> None:
+        first, second = self.warnings[0], self.warnings[0].replace("p6BC", "p6BD")
+        later = self.start + timedelta(minutes=2)
+        reading = accounts.StatusReading((), self.account_notes, (), timezone.utc, later)
+
+        def emit(*_args: object, **_options: object) -> accounts.StatusReading:
+            _ = sys.stderr.write(first[:16])
+            _ = sys.stderr.write(first[16:] + "\n")
+            return reading
+
+        def finish(_reading: accounts.StatusReading) -> accounts.StatusReading:
+            self.assertEqual(self.read(later, second), self.account_notes)
+            self.assertIn(f'"last_seen": "{later.isoformat()}"', self.record.read_text())
+            return reading
+
+        with (patch.object(accounts, "_read_status", new=emit),
+              patch.object(accounts, "_with_upcoming_moves", new=finish),
+              patch.object(accounts, "_launch_warning_now", side_effect=(self.start, later)),
+              patch.object(accounts, "_start_launch_warning_report")):
+            self.assertEqual(accounts.read_status(source=accounts.StoredUsageOnly(), account_config=self.config).notes,
+                             self.account_notes)
+        _ = self.read(later)
+        self.assertEqual(len(self.reports), 1)
+        self.assertIn(f"example: {first}; first seen 2026-11-25 23:56:00 PST.", self.reports[0].text)
+        self.assertIn(f'"last_seen": "{later.isoformat()}", "read_count": 2', self.record.read_text())
+
+    def test_a_durably_queued_report_clears_the_pending_send(self) -> None:
+        queued = subprocess.CompletedProcess(["send.py"], 1, stdout="QUEUED: fixture mailbox\n", stderr="")
+        with (redirect_stderr(io.StringIO()) as errors,
+              patch.object(accounts, "_send_launch_warning", new=self.send_report),
+              patch.object(subprocess, "run", return_value=queued) as send):
+            _ = self.read(self.start, self.warnings[0])
+            _ = self.read(self.start + timedelta(seconds=1))
+        send.assert_called_once()
+        self.assertEqual(errors.getvalue(), "")
+        self.assertIn('"reported": true', self.record.read_text())
+
+    def test_a_read_that_finishes_first_sends_the_earlier_reads_example(self) -> None:
+        first = self.warnings[0]
+        later = self.start + timedelta(minutes=2)
+        reading = accounts.StatusReading((), self.account_notes, (), timezone.utc, later)
+
+        def emit(*_args: object, **_options: object) -> accounts.StatusReading:
+            print(first, file=sys.stderr)
+            self.assertIn(f'"first_line": "{first}"', self.record.read_text())
+            self.assertEqual(self.reports, [])
+            self.assertEqual(self.read(later, first.replace("p6BC", "p6BD")), self.account_notes)
+            self.assertEqual(len(self.reports), 1)
+            self.assertIn(f"example: {first}; first seen 2026-11-25 23:56:00 PST.", self.reports[0].text)
+            return reading
+
+        with (patch.object(accounts, "_read_status", new=emit),
+              patch.object(accounts, "_with_upcoming_moves", return_value=reading),
+              patch.object(accounts, "_launch_warning_now", side_effect=(self.start, later))):
+            self.assertEqual(accounts.read_status(source=accounts.StoredUsageOnly(), account_config=self.config).notes,
+                             self.account_notes)
+        self.assertEqual(len(self.reports), 1)
+        self.assertIn('"read_count": 2', self.record.read_text())
+
+    def test_a_durably_kept_report_clears_the_pending_send(self) -> None:
+        kept = subprocess.CompletedProcess(["send.py"], 0, stdout="KEPT: durable acceptance. fixture review\n", stderr="")
+        with (redirect_stderr(io.StringIO()) as errors,
+              patch.object(accounts, "_send_launch_warning", new=self.send_report),
+              patch.object(subprocess, "run", return_value=kept) as send):
+            _ = self.read(self.start, self.warnings[0])
+            _ = self.read(self.start + timedelta(seconds=1))
+        send.assert_called_once()
+        self.assertEqual(errors.getvalue(), "")
+        self.assertIn('"reported": true', self.record.read_text())
+
+    def test_unknown_pane_warning_with_no_pane_id_is_hidden(self) -> None:
+        line = self.warnings[2].replace("agents:w16:p6BC tab", "agents: tab")
+        self.assertEqual(self.read(self.start, line), self.account_notes)
+        self.assertEqual(self.reports[0].kind, accounts.LaunchWarningKind.ROW_PANE_EVIDENCE_UNKNOWN)
+        self.assertIn("example: pane evidence is unknown; row placement retained;", self.reports[0].text)
+        self.assertIn('"first_line": "pane evidence is unknown; row placement retained"', self.record.read_text())
+
+
 def failed_read_cell(read: datetime) -> str:
     """The Read cell after a failed attempt: a read from an earlier day in the status zone also shows its date.
 
