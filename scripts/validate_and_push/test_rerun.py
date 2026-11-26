@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
+from scripts.production import behavior_check
 
 
 class ValidationFixtureTests(unittest.TestCase):
@@ -99,13 +100,30 @@ print(Path({str(listings)!r}).read_text())
                 self.assertEqual(calls.read_text().splitlines(), gh_calls)
 
     def install_gh(self) -> None:
-        _ = self.stub("gh", '''import subprocess, sys
+        _ = self.stub("gh", '''import os, subprocess, sys
+from pathlib import Path
 args = sys.argv[1:]
+home = Path(os.environ["HOME"])
+def tip(branch):
+    return subprocess.check_output(["git", "ls-remote", "origin", "refs/heads/" + branch], text=True).split()[0]
 if args[:2] == ["repo", "view"]:
     print("main")
 elif args[:2] == ["pr", "view"]:
     if "mergeCommit" in args:
         subprocess.run(["git", "rev-parse", "main"], check=True)
+    elif "baseRefName,baseRefOid,headRefOid" in args:
+        base, head = tip("main"), tip("retry-pr")
+        marker = home / "pr-tip-read"
+        drift = os.environ.get("TEST_PR_DRIFT")
+        if drift == "initial head":
+            head = "a" * 40
+        elif marker.exists():
+            if drift == "base":
+                base = "b" * 40
+            if drift == "head":
+                head = "a" * 40
+        marker.touch()
+        print("main", base, head, sep="\t")
     elif "state" in args:
         print("MERGED")
     elif "headRefOid" in args:
@@ -115,12 +133,61 @@ elif args[:2] == ["pr", "view"]:
 elif args[:2] == ["pr", "checks"]:
     print("checks pass")
 elif args[:2] == ["pr", "merge"]:
+    if args[args.index("--match-head-commit") + 1] != tip("retry-pr"):
+        raise SystemExit("The merge must use the checked head")
+    (home / "pr-merge-called").touch()
     subprocess.run(["git", "switch", "main"], check=True)
     subprocess.run(["git", "merge", "--ff-only", "retry-pr"], check=True)
     subprocess.run(["git", "push", "origin", "main"], check=True)
 else:
     sys.exit("unexpected gh call")
 ''')
+
+    def test_pr_requires_the_exact_review_before_merge(self) -> None:
+        path = self.write(self.repo / "test_fixture.py", "def test_fixture():\n    assert 1\n")
+        self.seed()
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        _ = self.write(path, "def test_fixture():\n    assert 2\n")
+        _ = self.git("commit", "-am", "Change the assertion")
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.install_gh()
+        state = self.root / "review-state"
+        astra = self.root / "astra"
+        self.environment.update(SHOWRUNNER_STATE_DIR=str(state), ASTRA_REVIEW_DIR=str(astra))
+        script = "validate_and_push/push_pr_branch_and_merge.sh"
+        refused = self.script(script, "retry-pr")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("test_fixture.py::test_fixture", refused.stderr)
+        self.assertFalse((self.home / "pr-merge-called").exists())
+
+        changes = behavior_check.changed_tests(behavior_check.GitRange(self.repo, base, head))
+        assert isinstance(changes, behavior_check.ChangedTests)
+        folder = astra / "review"
+        reply = self.write(folder / "completed-reply.txt", '[{"test":"test_fixture.py::test_fixture","finding":"none"}]')
+        _ = self.write(folder / "review-key", changes.key)
+        with patch.dict(os.environ, SHOWRUNNER_STATE_DIR=str(state)):
+            behavior_check.write_record(changes.key, behavior_check.Clear(reply))
+            _ = self.write(behavior_check.record_path(changes.key).with_suffix(".run"), str(folder))
+        merged = self.script(script, "retry-pr")
+        self.assertEqual(merged.returncode, 0, merged.stdout + merged.stderr)
+        self.assertTrue((self.home / "pr-merge-called").exists())
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/retry-pr").stdout, "")
+
+    def test_pr_refuses_a_different_head_or_a_base_that_changes_after_the_check(self) -> None:
+        self.seed()
+        _ = self.write(self.repo / "seed.txt", "PR change\n")
+        _ = self.git("commit", "-am", "A change without tests")
+        self.install_gh()
+        for ref, reason in (("initial head", "differs from the published branch tip"),
+                            ("head", "changed during the behavior check"),
+                            ("base", "changed during the behavior check")):
+            with self.subTest(ref=ref):
+                (self.home / "pr-tip-read").unlink(missing_ok=True)
+                self.environment["TEST_PR_DRIFT"] = ref
+                result = self.script("validate_and_push/push_pr_branch_and_merge.sh", "retry-pr")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+                self.assertFalse((self.home / "pr-merge-called").exists())
 
     def install_autofix(self) -> None:
         lint = self.stub("lint", '''import os, sys
