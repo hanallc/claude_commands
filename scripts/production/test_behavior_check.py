@@ -1,13 +1,16 @@
 """Check test changes against fixture repositories."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+import io
+import json
 import os
 from typing import cast, override
 from unittest import mock
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
-from scripts.production import behavior_check
+from scripts.production import behavior_check, behavior_review
 
 
 class BehaviorCheckTests(ScriptRepositoryTestCase):
@@ -18,9 +21,9 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment, clear=True)))
         self.seed()
 
-    def commit_files(self) -> str:
+    def commit_files(self, message: str = "fixture") -> str:
         _ = self.git("add", "-A")
-        _ = self.git("commit", "--quiet", "-m", "fixture")
+        _ = self.git("commit", "--quiet", "-m", message)
         return self.git("rev-parse", "HEAD").stdout.strip()
 
     def changes(self, base: str, head: str) -> behavior_check.ChangedTests:
@@ -62,6 +65,19 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
                                       "    async def test_remove(self):\n        pass\n", ""),
         ))
 
+    def test_commands_ignore_tests_added_to_main_after_the_fork(self) -> None:
+        _ = self.git("switch", "-c", "topic")
+        _ = self.write(self.repo / "application.txt", "topic change\n")
+        topic = self.commit_files()
+        _ = self.git("switch", "main")
+        _ = self.write(self.repo / "test_main.py", "def test_new_on_main():\n    assert True\n")
+        _ = self.commit_files()
+        with mock.patch.object(behavior_review, "execute", side_effect=AssertionError("Unexpected review lookup")):
+            for action in ("find", "run", "check", "status"):
+                with self.subTest(action=action), redirect_stdout(io.StringIO()) as output, redirect_stderr(output):
+                    status = behavior_check.main([action, "--repo", str(self.repo), "--base", "main", "--commit", topic])
+                    self.assertEqual((status, output.getvalue()), (0, ""))
+
     def test_rust_checks_plain_and_qualified_attributes_and_skips_comments(self) -> None:
         original = """mod tests {
     /* #[test] fn commented() {} */
@@ -87,7 +103,7 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
         self.assertIn('let braces = r#"}"#;', result.tests[0].new)
         self.assertIn('assert!(false)', result.tests[0].new)
 
-    def test_merge_commit_keeps_the_key_for_the_same_patch(self) -> None:
+    def test_the_same_patch_keeps_its_key_across_a_merge_and_reword(self) -> None:
         test = self.repo / "test_example.py"
         _ = self.write(test, "def test_example():\n    assert 1\n")
         base = self.commit_files()
@@ -96,11 +112,79 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
         topic = self.commit_files()
         changes = self.changes(base, topic)
         _ = self.git("switch", "main")
-        _ = self.write(self.repo / "application.txt", "unrelated merge base change\n")
+        _ = self.write(self.repo / "test_main.py", "def test_new_on_main():\n    assert True\n")
         main = self.commit_files()
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(behavior_check.main(["find", "--repo", str(self.repo), "--base", "main", "--commit", topic]), 0)
+        self.assertEqual(cast(object, json.loads(output.getvalue())), {
+            "key": changes.key,
+            "tests": [{"test": entry.test, "old": entry.old, "new": entry.new} for entry in changes.tests],
+        })
         _ = self.git("merge", "--no-ff", "--no-edit", "topic")
         merged = self.git("rev-parse", "HEAD").stdout.strip()
-        self.assertEqual(self.changes(main, merged).key, changes.key)
+        merged_changes = self.changes(main, merged)
+        self.assertEqual((merged_changes.files, merged_changes.tests), (changes.files, changes.tests))
+        self.assertEqual(merged_changes.key, changes.key)
+
+        _ = self.git("commit", "--amend", "--no-edit", "--date=2025-01-01T00:00:00Z")
+        rebuilt = self.git("rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(rebuilt, merged)
+        self.assertEqual(self.changes(main, rebuilt).key, merged_changes.key)
+
+        _ = self.git("commit", "--amend", "-m", "Keep the current work before a move.")
+        reworded = self.changes(main, self.git("rev-parse", "HEAD").stdout.strip())
+        self.assertEqual((reworded.files, reworded.tests), (merged_changes.files, merged_changes.tests))
+        self.assertEqual(reworded.key, merged_changes.key)
+
+    def test_finding_authors_follow_each_test_across_file_edits_and_renames(self) -> None:
+        original = self.repo / "test_original.py"
+        unchanged = "VALUE = 'Text that stays in the file during each rename.'\n\n"
+        first = "def test_first():\n    assert 1\n\n"
+        second = "def test_second():\n    assert 2\n"
+        _ = self.write(original, unchanged + first + second)
+        base = self.commit_files()
+        _ = self.git("switch", "-c", "moves")
+        updated = first.replace("assert 1", "assert 3")
+        _ = self.write(original, unchanged + updated + second)
+        tip = self.commit_files("Change the first test.")
+        _ = self.git("switch", "main")
+        _ = self.git("merge", "--no-ff", "moves", "-m", f"Merge moves phase 7 ({tip[:7]}) into production")
+        prior = original
+        for name in ("test_intermediate.py", "test_final.py"):
+            current = prior.rename(self.repo / name)
+            _ = self.commit_files("Move the test file.")
+            prior = current
+        _ = self.write(prior, unchanged + updated)
+        removed = self.commit_files("Remove the second test.")
+        _ = self.write(prior, unchanged + updated + "\nOTHER = 4\n")
+        head = self.commit_files("Add a value to the test file.")
+        change = behavior_check.GitRange(self.repo, base, head)
+        tests = self.changes(base, head)
+        self.assertEqual(behavior_check.question_authors(change, tests, {test.test for test in tests.tests}), {
+            "test_original.py::test_first": "Ask moves (phase 7)",
+            "test_original.py::test_second": f"{removed} Remove the second test.",
+        })
+
+    def test_a_phase_merge_that_combines_edits_names_its_unit(self) -> None:
+        test = self.repo / "test_fixture.py"
+        original = "def test_move():\n    assert 1\n    assert 2\n    assert 3\n    assert 4\n"
+        _ = self.write(test, original)
+        _ = self.commit_files()
+        _ = self.git("switch", "-c", "moves")
+        _ = self.write(test, original.replace("assert 4", "assert 40"))
+        tip = self.commit_files("Change the final assertion.")
+        _ = self.git("switch", "main")
+        _ = self.write(test, original.replace("assert 1", "assert 10"))
+        main = self.commit_files("Change the first assertion.")
+        _ = self.git("merge", "--no-ff", "moves", "-m", f"Merge moves phase 7 ({tip[:7]}) into production")
+        _ = self.write(self.repo / "application.txt", "A change after the merge.\n")
+        head = self.commit_files("Change the application.")
+        tests = self.changes(main, head)
+        self.assertEqual([finding.new for finding in tests.tests],
+                         [original.replace("assert 1", "assert 10").replace("assert 4", "assert 40")])
+        change = behavior_check.GitRange(self.repo, main, head)
+        name = "test_fixture.py::test_move"
+        self.assertEqual(behavior_check.question_authors(change, tests, {name}), {name: "Ask moves (phase 7)"})
 
     def test_record_round_trip_keeps_a_negative_answer_and_its_time(self) -> None:
         key = "f" * 64

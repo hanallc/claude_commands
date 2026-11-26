@@ -2697,8 +2697,10 @@ def review_open_question(name: str, item: QuestionForReview, *,
     from scripts.console_text import check as console_text
     from scripts.notify import review
 
-    identity = f"{item.text} [{outgoing.request_key}]" if isinstance(outgoing, KeyedStaffQuestion) else item.text
-    key = review.QuestionKey(name, identity)
+    if isinstance(outgoing, KeyedStaffQuestion):
+        key = review.QuestionKey(name, f"{item.text} [{outgoing.request_key}]", request_key=outgoing.request_key)
+    else:
+        key = review.QuestionKey(name, item.text)
     outcome = console_text.check(item.question, "question", key=key, title=item.text)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)
