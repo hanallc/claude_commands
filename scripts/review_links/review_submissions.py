@@ -349,30 +349,37 @@ def _decode_images(images: tuple[PastedImage, ...]) -> tuple[_ImageUpload, ...]:
     return tuple(uploads)
 
 
-def _identify_image(extension: str, data: bytes) -> subprocess.CompletedProcess[bytes]:
+def _identify_image(extension: str, path: Path) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         ["magick", "identify", "-regard-warnings", "-limit", "width", "8192",
          "-limit", "height", "8192", "-limit", "area", "32MP",
          "-limit", "list-length", "32", "-limit", "memory", "128MiB",
          "-limit", "map", "128MiB", "-limit", "disk", "0",
-         "-format", "%m\n", extension + ":-"],
-        input=data, capture_output=True, timeout=4, check=False)
+         "-format", "%m\n", f"{extension}:{path}"],
+        capture_output=True, timeout=4, check=False)
 
 
 def _validate_image(upload: _ImageUpload) -> None:
     try:
-        result = _identify_image(upload.extension, upload.data)
+        with tempfile.NamedTemporaryFile(prefix="review-image-") as source:
+            path = Path(source.name)
+            _ = source.write(upload.data)
+            source.flush()
+            result = _identify_image(upload.extension, path)
     except subprocess.TimeoutExpired:
         raise SubmissionError("The pasted image could not be read in time.") from None
     if result.returncode:
-        stderr = result.stderr.decode(errors="replace")
-        lines = [line for line in stderr.splitlines() if line]
-        if "@ error/" in stderr or not lines or any(
-                not re.fullmatch(r"[^:]+: iCCP:.*? @ warning/png\.c/\S+", line) for line in lines):
-            diagnostic = (re.search(r"(?m)^[^:\r\n]+: (.+?) @ error/", stderr)
-                          or re.search(r"(?m)^[^:\r\n]+: (.+?) @ warning/", stderr))
-            reason = diagnostic[1] if diagnostic else f"ImageMagick exited with status {result.returncode}"
-            reason = re.sub(r"[ \t]*[`']/[^'\r\n]*'", "", reason).strip().removesuffix(".")
+        lines = [line for line in result.stderr.decode(errors="replace").splitlines() if line]
+        refused = next((line for line in lines if "@ error/" in line or
+                        not re.fullmatch(r"[^:]+: iCCP:.*? @ warning/png\.c/\S+", line)), "")
+        if refused or not lines:
+            reason = refused
+            display_path = os.fsencode(path).decode(errors="replace")
+            for quote in ("`", "'"):
+                quoted_path = f"{quote}{display_path}'"
+                reason = reason.replace(f" {quoted_path}", "").replace(quoted_path, "")
+            reason = re.sub(r"^[\w.-]+: | @ (?:warning|error)/.*$", "", reason).strip().removesuffix(".")
+            reason = reason or f"ImageMagick exited with status {result.returncode}"
             raise SubmissionError(f"The pasted image could not be read: {reason}.")
     names = result.stdout.decode("ascii", errors="replace").splitlines()
     if not names:
