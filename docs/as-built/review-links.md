@@ -2339,7 +2339,9 @@ The button posts the action `top`. `the_list.make_top_priority` names the item a
 The List path refuses `top`. The refresh after the save moves the flag and the band.
 
 The band appears on a producer tab and stays hidden on All.
-It shows the Top priority label with the flag, the item number and title in bold, the next step below, and the state and the short ETA on the right.
+It shows the Top priority label with the flag, a link with the item number and title, the next step, the state, and the ETA.
+Click the link or press Enter while it has focus to open the item and save its place in the address.
+The link uses the same filter rules as other item links to show an item outside the current results.
 A producer with no top item shows **No top priority item** and **Open an item and click "Make top priority".**
 The page renders one band for each top item and one band for no top item.
 A `:has()` rule for each band shows the band of the pressed Producer tab, so a tab click makes no request.
