@@ -351,12 +351,12 @@ def _decode_images(images: tuple[PastedImage, ...]) -> tuple[_ImageUpload, ...]:
 
 def _identify_image(extension: str, data: bytes) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["magick", "identify", "-regard-warnings", "-limit", "width", "8192",
+        ["magick", "identify", "-limit", "width", "8192",
          "-limit", "height", "8192", "-limit", "area", "32MP",
          "-limit", "list-length", "32", "-limit", "memory", "128MiB",
          "-limit", "map", "128MiB", "-limit", "disk", "0",
          "-format", "%m\n", extension + ":-"],
-        input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False)
+        input=data, capture_output=True, timeout=4, check=False)
 
 
 def _validate_image(upload: _ImageUpload) -> None:
@@ -364,9 +364,18 @@ def _validate_image(upload: _ImageUpload) -> None:
         result = _identify_image(upload.extension, upload.data)
     except subprocess.TimeoutExpired:
         raise SubmissionError("The pasted image could not be read in time.") from None
-    names = result.stdout.splitlines()
-    if result.returncode or not names or any(name != upload.extension.upper().encode() for name in names):
-        raise SubmissionError("The pasted image does not match its type or exceeds the image limits.")
+    if result.returncode:
+        error = re.search(r"(?m)^[^:\r\n]+: (.+?) @ error/", result.stderr.decode(errors="replace"))
+        reason = (re.sub(r" `[^\r\n]*'$", "", error[1]).removesuffix(".") if error
+                  else f"ImageMagick exited with status {result.returncode}")
+        raise SubmissionError(f"The pasted image could not be read: {reason}.")
+    names = result.stdout.decode("ascii", errors="replace").splitlines()
+    if not names:
+        raise SubmissionError("The pasted image could not be read: ImageMagick did not report an image format.")
+    expected = upload.extension.upper()
+    for name in names:
+        if name != expected:
+            raise SubmissionError(f"The pasted image is a {name}, not a {expected}.")
 
 
 def _attachment_root(snapshot_root: Path | None = None) -> Path:

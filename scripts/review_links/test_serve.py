@@ -23,6 +23,7 @@ import select
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,7 @@ import textwrap
 import threading
 import time
 import unittest
+import zlib
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
@@ -86,6 +88,11 @@ ROLE_COLOR_CONFIG = (
     "role.producer=#90fe42\n"
     "role.worker=#ff0404\n"
 )
+
+
+def png_chunk(kind: bytes, data: bytes) -> bytes:
+    chunk = kind + data
+    return struct.pack(">I", len(data)) + chunk + struct.pack(">I", zlib.crc32(chunk))
 
 
 @dataclass(frozen=True)
@@ -3296,6 +3303,59 @@ class ReviewLinksServerTests(unittest.TestCase):
         path, = folder.glob("*.json")
         self.assertEqual(json.loads(path.read_text())["screenshot"], review_submissions.PAGE_SCREENSHOT.id)
         self.assertIn(b"Screenshot of Review", cache.get().body(key))
+
+    def test_new_item_attaches_a_png_with_an_iccp_warning(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG
+
+        _, cache, request = self.page_bug_fixture()
+        original = base64.b64decode(PNG)
+        profile = bytearray(132)
+        struct.pack_into(">I", profile, 0, len(profile))
+        profile[8:12] = b"\x02\x10\0\0"
+        profile[12:24] = b"mntrRGB XYZ "
+        profile[36:40] = b"acsp"
+        struct.pack_into(">III", profile, 68, 0xF6D6, 0x10000, 0xD32D)
+        # Extra bytes after the zlib stream cause the libpng warning.
+        iccp = png_chunk(b"iCCP", b"profile\0\0" + zlib.compress(profile) + b"x" * 40)
+        image = original[:33] + iccp + original[33:]
+        request = replace(request, images=(new_item_dialog.PastedImage("image/png", base64.b64encode(image).decode()),))
+
+        with patch.object(change_page, "send_to_staff"):
+            response = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual(response.status, 200, response.body)
+        key = cast(dict[str, str], json.loads(response.body))["key"]
+        origin = review_items.submission_origin(cache.get().records[key])
+        assert isinstance(origin, new_item_dialog.ReviewSubmission)
+        attachment, = origin.images
+        reply = self.request(review_page.ATTACHMENT_PATH + "?" + urlencode({"key": key, "id": attachment.id}))
+        self.assertEqual(reply, HttpReply(200, "image/png", image))
+
+    def test_new_item_reports_the_image_error_for_an_oversized_png(self) -> None:
+        _, cache, request = self.page_bug_fixture()
+        width = 9000
+        image = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, 1, 1, 0, 0, 0, 0))
+                 + png_chunk(b"IDAT", zlib.compress(bytes(1 + (width + 7) // 8))) + png_chunk(b"IEND", b""))
+        request = replace(request, images=(new_item_dialog.PastedImage("image/png", base64.b64encode(image).decode()),))
+
+        with patch.object(change_page, "send_to_staff") as send:
+            reply = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual((reply.status, json.loads(reply.body)),
+                         (400, {"error": "The pasted image could not be read: Invalid IHDR data."}))
+        self.assertEqual(cache.get().records, {})
+        send.assert_not_called()
+
+    def test_new_item_names_both_image_types_when_the_decoder_reports_a_mismatch(self) -> None:
+        from scripts.review_links.test_review_submissions import PNG, identify_fixture_image
+
+        _, cache, request = self.page_bug_fixture()
+        request = replace(request, images=(new_item_dialog.PastedImage("image/jpeg", PNG),))
+        with (patch.object(review_submissions, "_identify_image", side_effect=identify_fixture_image),
+              patch.object(change_page, "send_to_staff") as send):
+            reply = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual((reply.status, json.loads(reply.body)),
+                         (400, {"error": "The pasted image is a PNG, not a JPEG."}))
+        self.assertEqual(cache.get().records, {})
+        send.assert_not_called()
 
     def test_bug_page_data_preserves_the_full_pasted_image_budget(self) -> None:
         folder, _, request = self.page_bug_fixture()
