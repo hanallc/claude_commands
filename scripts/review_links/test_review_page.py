@@ -2655,10 +2655,10 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
         steps = UNDO_ACTION_SCRIPT + r"""
   const undo=fixtureUndo();
   const fixtureFetch=window.fetch,content=document.querySelector('[data-review]');
-  let versionReads=0;
+  let indexReads=0;
   window.fetch=(url,options)=>{
    const query=new URL(url,location.href).searchParams;
-   if(!query.has('body') && !query.has('index') && query.has('version')) versionReads++;
+   if(query.has('index')) indexReads++;
    return fixtureFetch(url,options);
   };
   summary(2).querySelector('.list-toggle').click();
@@ -2670,7 +2670,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   shown='fresh';
   summary(1).querySelector('.list-toggle').click();
   await readyReviewCard(row(1));await frame();
-  check(content.dataset.version===snapshots.initial.version && versionReads===0,
+  check(content.dataset.version===snapshots.initial.version && indexReads===0,
    'The held send blocks the index refresh.');
   check(toast()===held && undo.posts.length===1,'The new body leaves the other send held.');
   await undo.undo();
