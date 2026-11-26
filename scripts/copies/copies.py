@@ -9,7 +9,7 @@ except FileNotFoundError:
 import argparse
 import ast
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -1703,9 +1703,10 @@ def list_trees() -> None:
     for path in held:
         number += 1
         print(f"{number}\t-\t-\t{host}\t{path}\t-\t-\tunknown\t-\t-")
-    mirrors = sorted(remote_mirrors(), key=lambda mirror: (mirror.host, mirror.path))
-    for mirror, lease in list_remote_leases(mirrors, staff_names):
-        if mirror.host == "localhost" and not floor_claims.mirror_local_path(mirror.path).exists():
+    registrations = sorted(remote_registrations(), key=lambda folder: (folder.host, folder.path))
+    for mirror, lease in list_remote_leases(registrations, staff_names):
+        if (isinstance(mirror, RemoteMirror) and mirror.host == "localhost"
+                and not floor_claims.mirror_local_path(mirror.path).exists()):
             unregister_remote(mirror.host, mirror.path)
             continue
         number += 1
@@ -1880,7 +1881,9 @@ def remove_trees(owner: str, repo: RepositoryScope = ALL_REPOSITORIES) -> None:
         for mirror in owned_mirrors:
             try:
                 locks.enter_context(remote_lease(mirror))
-                mirrors.append(mirror)
+                with suppress(FileNotFoundError):
+                    if read_remote_registration(remote_record_path(mirror)) == mirror:
+                        mirrors.append(mirror)
             except (CopyError, OSError) as error:
                 failures.append(str(error))
                 failure_type = RemoteMirrorKept
@@ -1938,6 +1941,20 @@ class RemoteMirror:
 
 
 @dataclass(frozen=True)
+class RemoteFixedFolder:
+    """A live holder's registration for a persistent build folder."""
+
+    owner: str
+    repository: SelectedRepository
+    host: str
+    path: str
+    session: str
+
+
+RemoteFolderRegistration = RemoteMirror | RemoteFixedFolder
+
+
+@dataclass(frozen=True)
 class CurrentHolderName:
     name: str
 
@@ -1982,15 +1999,15 @@ def remote_key(host: str, path: str) -> str:
     return hashlib.sha256(f"{host}\0{path}".encode()).hexdigest()
 
 
-def remote_record_path(mirror: RemoteMirror) -> Path:
+def remote_record_path(mirror: RemoteFolderRegistration) -> Path:
     return remote_registry() / (remote_key(mirror.host, mirror.path) + ".json")
 
 
-def remote_lease_path(mirror: RemoteMirror) -> Path:
+def remote_lease_path(mirror: RemoteFolderRegistration) -> Path:
     return remote_registry() / (remote_key(mirror.host, mirror.path) + ".lease")
 
 
-def _list_holder_name(mirror: RemoteMirror, pid: int, staff_names: ListStaffNames) -> MirrorHolderName:
+def _list_holder_name(mirror: RemoteFolderRegistration, pid: int, staff_names: ListStaffNames) -> MirrorHolderName:
     """Read the recorded pid and session together before resolving the live holder's name."""
     try:
         raw = cast(object, json.loads(remote_record_path(mirror).read_text(encoding="utf-8")))
@@ -2009,15 +2026,16 @@ def _list_holder_name(mirror: RemoteMirror, pid: int, staff_names: ListStaffName
     return CurrentHolderName(row.name) if row is not None else HolderNameUnavailable()
 
 
-def list_remote_leases(mirrors: Sequence[RemoteMirror], staff_names: ListStaffNames) -> list[tuple[RemoteMirror, MirrorLeaseState]]:
-    """Read the lock table once and preserve each mirror's held, idle, or unavailable state."""
+def list_remote_leases(mirrors: Sequence[RemoteFolderRegistration],
+                       staff_names: ListStaffNames) -> list[tuple[RemoteFolderRegistration, MirrorLeaseState]]:
+    """Read the lock table once to find the lease state of each registered folder."""
     if not mirrors:
         return []
     try:
         devices = file_lock.held_flock_keys()
     except OSError:
         return [(mirror, UnavailableMirrorLease()) for mirror in mirrors]
-    leases: list[tuple[RemoteMirror, MirrorLeaseState]] = []
+    leases: list[tuple[RemoteFolderRegistration, MirrorLeaseState]] = []
     for mirror in mirrors:
         try:
             device = file_lock.device_key(remote_lease_path(mirror))
@@ -2039,7 +2057,7 @@ def held_remote_mirrors() -> tuple[floor_claims.HeldMirror, ...]:
     except OSError:
         return ()
     held: list[floor_claims.HeldMirror] = []
-    for mirror in remote_mirrors():
+    for mirror in remote_registrations():
         try:
             device = file_lock.device_key(remote_lease_path(mirror))
         except OSError:
@@ -2049,17 +2067,18 @@ def held_remote_mirrors() -> tuple[floor_claims.HeldMirror, ...]:
     return tuple(held)
 
 
-def record_remote_holder(mirror: RemoteMirror) -> None:
-    """Publish ownership while the caller holds the mirror lease."""
+def record_remote_holder(mirror: RemoteFolderRegistration) -> None:
+    """Publish ownership while the caller holds the folder lease."""
     _ = checked_owner(mirror.owner)
     _ = repository_scope(mirror.repository)
     remote_registry().mkdir(parents=True, exist_ok=True)
     fields: dict[str, object] = {
-        "kind": "remote-mirror", "owner": mirror.owner, "repo": mirror.repository.name,
+        "kind": "remote-fixed-folder" if isinstance(mirror, RemoteFixedFolder) else "remote-mirror",
+        "owner": mirror.owner, "repo": mirror.repository.name,
         "host": mirror.host, "path": mirror.path, "session": mirror.session,
         "holder_pid": os.getpid(), "last_use": time.time(),
     }
-    if mirror.task:
+    if isinstance(mirror, RemoteMirror) and mirror.task:
         fields["task"] = mirror.task
     with file_lock.exclusive(remote_registry() / "records.lock"):
         write_text_atomic(remote_record_path(mirror), json.dumps(fields) + "\n")
@@ -2085,13 +2104,15 @@ def remove_deferred_mirrors(host: str) -> None:
     """Retry local removal requests after a successful use of the host."""
     for path in sorted(remote_registry().glob("*.json")):
         try:
-            mirror = read_remote_mirror(path)
-            if mirror.host != host or mirror.removal is not RemoteRemoval.DEFERRED:
+            mirror = read_remote_registration(path)
+            if not isinstance(mirror, RemoteMirror) or mirror.host != host or mirror.removal is not RemoteRemoval.DEFERRED:
                 continue
             with remote_lease(mirror):
-                current = read_remote_mirror(path)
-                if current.removal is RemoteRemoval.DEFERRED:
+                current = read_remote_registration(path)
+                if isinstance(current, RemoteMirror) and current.removal is RemoteRemoval.DEFERRED:
                     remove_remote_mirror(current)
+        except FileNotFoundError:
+            continue
         except (CopyError, OSError, subprocess.SubprocessError) as error:
             print(f"anomaly: deferred mirror removal: {' '.join(str(error).split())}", file=sys.stderr)
 
@@ -2103,20 +2124,32 @@ def unregister_remote(host: str, path: str) -> None:
         (remote_registry() / (key + ".json")).unlink(missing_ok=True)
 
 
-def decode_remote_mirror(record: str) -> RemoteMirror:
+def decode_remote_registration(record: str) -> RemoteFolderRegistration:
     raw = cast(object, json.loads(record))
     if not isinstance(raw, dict):
-        raise ValueError("expected a remote mirror record")
+        raise ValueError("expected a remote folder record")
     fields = cast(dict[str, object], raw)
     values = [fields.get(key) for key in ("owner", "repo", "host", "path", "session")]
     if not all(isinstance(value, str) for value in values):
-        raise ValueError("invalid remote mirror record")
+        raise ValueError("invalid remote folder record")
+    unit, repo, host, remote, session = cast(list[str], values)
+    kind = fields.get("kind", "remote-mirror")
+    if kind == "remote-fixed-folder":
+        return RemoteFixedFolder(unit, SelectedRepository(repo), host, remote, session)
+    if kind != "remote-mirror":
+        raise ValueError("invalid remote folder kind")
     task = fields.get("task", "")
     if not isinstance(task, str):
         raise ValueError("invalid remote mirror task")
-    unit, repo, host, remote, session = cast(list[str], values)
     return RemoteMirror(unit, SelectedRepository(repo), host, remote, session,
                         RemoteRemoval(fields.get("removal", "keep")), task=task)
+
+
+def decode_remote_mirror(record: str) -> RemoteMirror:
+    mirror = decode_remote_registration(record)
+    if not isinstance(mirror, RemoteMirror):
+        raise ValueError("expected a remote mirror record")
+    return mirror
 
 
 def read_remote_mirror(path: Path) -> RemoteMirror:
@@ -2127,13 +2160,30 @@ def read_remote_mirror(path: Path) -> RemoteMirror:
         raise CopyError(f"{path}: repair remote mirror record: {error}") from error
 
 
-def remote_mirrors(scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirror]:
-    found: list[RemoteMirror] = []
+def read_remote_registration(path: Path) -> RemoteFolderRegistration:
+    """Read a registry record. Propagate absence if a holder removes it."""
+    try:
+        return decode_remote_registration(path.read_text())
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError) as error:
+        raise CopyError(f"{path}: repair remote folder record: {error}") from error
+
+
+def remote_registrations(scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteFolderRegistration]:
+    found: list[RemoteFolderRegistration] = []
     for path in sorted(remote_registry().glob("*.json")):
-        mirror = read_remote_mirror(path)
+        try:
+            mirror = read_remote_registration(path)
+        except FileNotFoundError:
+            continue
         if isinstance(scope, AllRepositories) or scope.name == mirror.repository.name:
             found.append(mirror)
     return found
+
+
+def remote_mirrors(scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirror]:
+    return [mirror for mirror in remote_registrations(scope) if isinstance(mirror, RemoteMirror)]
 
 
 def owned_remote_mirrors(owner: str, scope: RepositoryScope = ALL_REPOSITORIES) -> list[RemoteMirror]:
@@ -2339,12 +2389,14 @@ def remote_host_lease(host: str, *, exclusive: bool) -> Generator[None]:
 
 
 @contextmanager
-def remote_lease(mirror: RemoteMirror) -> Generator[None]:
-    """Take the mirror lease before admission, claims and record locks."""
+def remote_lease(mirror: RemoteFolderRegistration) -> Generator[None]:
+    """Take the folder lease before admission, claims and record locks."""
     with _remote_mirror_lock(mirror.host, remote_lease_path(mirror)) as state:
         if state is file_lock.LockResult.BUSY:
             record = remote_record_path(mirror)
-            session = read_remote_mirror(record).session if record.exists() else mirror.session
+            session = mirror.session
+            with suppress(FileNotFoundError):
+                session = read_remote_registration(record).session
             raise BusyRemoteMirror(f"{mirror.host}:{mirror.path}: busy; held by session {session}")
         yield
 
@@ -2359,8 +2411,8 @@ def remote_mirror_lease(host: str, path: Path) -> Generator[None]:
         if state is file_lock.LockResult.BUSY:
             raise BusyRemoteMirror(f"{path}: the mirror lease is busy")
         record = path.with_suffix(".json")
-        if record.exists():
-            mirror = read_remote_mirror(record)
+        with suppress(FileNotFoundError):
+            mirror = read_remote_registration(record)
             if mirror.host != host or remote_lease_path(mirror) != path:
                 raise CopyError(f"{path}: the lease does not match the registered mirror")
         yield
@@ -2403,8 +2455,8 @@ def idle_remote_mirrors(host: str, select: Callable[[RemoteMirror], bool]) -> li
     for path in sorted(remote_registry().glob("*.json")):
         try:
             record = path.read_text()
-            mirror = decode_remote_mirror(record)
-            if (mirror.host != host or mirror.removal is not RemoteRemoval.KEEP
+            mirror = decode_remote_registration(record)
+            if (not isinstance(mirror, RemoteMirror) or mirror.host != host or mirror.removal is not RemoteRemoval.KEEP
                     or path != remote_record_path(mirror) or not select(mirror)):
                 continue
             with remote_lease(mirror):

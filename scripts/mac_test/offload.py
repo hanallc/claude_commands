@@ -1906,8 +1906,9 @@ def remote_fixed_folder(controller: ProcessController, config: OffloadConfig, re
                 if not isinstance(value, str) or not Path(value).is_absolute() or "\n" in value:
                     raise ValueError("the remote host reported an invalid build folder")
                 path = Path(value)
-                mirror = replace(request_mirror(config, request, repository), path=value)
-                _ = inventory.enter_context(copies.remote_lease(mirror))
+                scope = request_mirror(config, request, repository).repository
+                folder = copies.RemoteFixedFolder(request.owner, scope, config.host, value, request.holder_session)
+                _ = inventory.enter_context(copies.remote_lease(folder))
                 pending = pending_start_path(target, identity, scope_key=controller.claim_scope_key)
                 pending.parent.mkdir(parents=True, exist_ok=True)
                 write_text_atomic(pending, pending_start_key(identity))
@@ -1916,8 +1917,8 @@ def remote_fixed_folder(controller: ProcessController, config: OffloadConfig, re
                 holder.stdin.flush()
                 if next(replies, b"") != b"build_folder_confirmed\n":
                     raise ValueError("the remote host did not confirm the build folder lease")
-            copies.record_remote_holder(mirror)
-            _ = inventory.callback(copies.unregister_remote, mirror.host, mirror.path)
+            copies.record_remote_holder(folder)
+            _ = inventory.callback(copies.unregister_remote, folder.host, folder.path)
             token = offload_fixed_folder.set(HeldOffloadFolder(path))
             try:
                 yield

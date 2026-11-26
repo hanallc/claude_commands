@@ -87,6 +87,49 @@ class RemoteCopiesTests(unittest.TestCase):
         holder = fixture_worker("live-holder", owner.id)
         return owner, holder
 
+    def write_fixed_folder_record(self, folder: copies.RemoteMirror) -> Path:
+        record = copies.remote_record_path(folder)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        fields = {"kind": "remote-fixed-folder", "owner": folder.owner, "repo": folder.repository.name,
+                  "host": folder.host, "path": folder.path, "session": folder.session}
+        write_text_atomic(record, json.dumps(fields) + "\n")
+        return record
+
+    def test_owner_removal_leaves_the_fixed_folder_and_its_record(self) -> None:
+        folder = self.remote(path=str(self.root / "fixed-build"))
+        output = Path(folder.path) / "target" / "compiled"
+        output.parent.mkdir(parents=True)
+        _ = output.write_text("Cargo output\n")
+        record = self.write_fixed_folder_record(folder)
+        before = record.read_bytes()
+        mirror = self.remote()
+        copies.record_remote_holder(mirror)
+
+        def remove_mirror(selected: copies.RemoteMirror) -> None:
+            copies.unregister_remote(selected.host, selected.path)
+
+        with mock.patch.object(copies, "remove_remote_mirror", side_effect=remove_mirror) as remove:
+            copies.remove_trees(folder.owner)
+        self.assertEqual(record.read_bytes(), before)
+        self.assertEqual(output.read_text(), "Cargo output\n")
+        remove.assert_called_once_with(mirror)
+
+    def test_list_shows_other_rows_when_a_fixed_folder_record_disappears(self) -> None:
+        vanished = self.write_fixed_folder_record(self.remote(path=str(self.root / "fixed-build")))
+        mirror = self.remote()
+        copies.record_remote_holder(mirror)
+        read_text = Path.read_text
+
+        def remove_before_read(path: Path, **options: str | None) -> str:
+            if path == vanished:
+                path.unlink()
+            return read_text(path, **options)
+
+        with mock.patch.object(Path, "read_text", remove_before_read):
+            row, = self.list_rows()
+        self.assertFalse(vanished.exists())
+        self.assertEqual((row["owner"], row["host"], row["path"]), (mirror.owner, mirror.host, mirror.path))
+
     def test_mac_gate_reconciles_only_selected_mirrors_without_removal_markers(self) -> None:
         shim = Path.home() / ".claude/scripts/lib/py"
         shim.parent.mkdir(parents=True)
@@ -325,10 +368,13 @@ class RemoteCopiesTests(unittest.TestCase):
         try:
             fixture.wait_for_path(fixture.stub_directory / "run-started")
             with mock.patch.dict(os.environ, fixture.environment):
-                mirror, = copies.owned_remote_mirrors("verify")
+                folder, = copies.remote_registrations()
+                self.assertIsInstance(folder, copies.RemoteFixedFolder)
+                self.assertEqual(copies.owned_remote_mirrors("verify"), [])
                 fixed_path = (fixture.stub_directory / "fixed-checkout").read_text().strip()
-                self.assertEqual(mirror.path, fixed_path)
-                record = cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
+                self.assertEqual(folder.path, fixed_path)
+                record = cast(dict[str, object], json.loads(copies.remote_record_path(folder).read_text()))
+                self.assertEqual(record["kind"], "remote-fixed-folder")
                 self.assertEqual(record["holder_pid"], process.pid)
                 row, = self.list_rows()
                 self.assertEqual(row["owner"], "verify")

@@ -209,9 +209,11 @@ HANA = eligibility.KnownRepository("hana")
 
 FIXTURE_MIRROR_ROOT = ".local/state/mac-test/test-mirror"
 
-HANA_COMMAND_PATTERN = offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana([/'\"[:space:]]|$)"
+FIXTURE_MIRROR_PATTERN = "[.]local/state/mac-test/test-mirror"
 
-HANA_CWD_PATTERN = "^n.*/" + offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/hana(/|$)"
+HANA_COMMAND_PATTERN = FIXTURE_MIRROR_PATTERN + "/hana([/'\"[:space:]]|$)"
+
+HANA_CWD_PATTERN = "^n.*/" + FIXTURE_MIRROR_PATTERN + "/hana(/|$)"
 
 CLAIM_STUB = r'''
 from __future__ import annotations
@@ -437,7 +439,8 @@ class OffloadCommandFixture(unittest.TestCase):
         self.sync_config()
         self.sync_fixture()
         write_mac_target_registry(self.root, self.config_path.name)
-        _ = write_config_fixture(self.root / "build_folders.conf", "roots.build=~/build\nroots.build.natedev=~/build\n")
+        _ = write_config_fixture(self.root / "build_folders.conf",
+                                 "roots.build=~/build.fixture\nroots.build.natedev=~/build.fixture\n")
         _ = write_config_fixture(self.root / "config/copies.conf", "owner.verify=verify\n")
         home = self.root / "home"
         install_saved_folder_recovery(home)
@@ -803,7 +806,10 @@ raise SystemExit(offload.main())
     def fixed_selector_patterns(self) -> tuple[str, str]:
         path = (self.stub_directory / "fixed-checkout").read_text().strip()
         self.assertTrue(Path(path).is_absolute())
-        mirror = "[/]" + offload.extended_regex_literal(path[1:])
+        home = Path(self.environment["HOME"]).resolve()
+        self.assertEqual(path, str(home / "build.fixture" / "hana" / "mac"))
+        parent = str(home.parent).removeprefix("/").replace(".", "[.]")
+        mirror = f"[/]{parent}/home/build[.]fixture/hana/mac"
         return f"{mirror}([/'\"[:space:]]|$)", f"^n{mirror}(/|$)"
 
     def assert_leftover_selectors(self, remote: str) -> None:
@@ -818,7 +824,7 @@ raise SystemExit(offload.main())
         self.assertIn("awk -v pattern=\"$mirror_cwd_pattern\" '/^p/ { pid = substr($0, 2) } $0 ~ pattern { print pid }'", remote)
         self.assertNotIn("pkill", remote)
         self.assertNotIn("PIPESTATUS", remote)
-        self.assertNotIn(FIXTURE_MIRROR_ROOT + "/", remote.replace(offload.extended_regex_literal(FIXTURE_MIRROR_ROOT) + "/", ""))
+        self.assertNotIn(FIXTURE_MIRROR_ROOT + "/", remote.replace(FIXTURE_MIRROR_PATTERN + "/", ""))
 
     def remote_claim(self) -> RemoteClaimRecord:
         return cast(RemoteClaimRecord, json.loads(self.claim_file.read_text()))
