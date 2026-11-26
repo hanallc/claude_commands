@@ -1,8 +1,8 @@
 """Exercise the Mac gate route and the module list with private fixtures."""
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import fcntl
 from dataclasses import replace
 from io import StringIO
@@ -11,9 +11,11 @@ import os
 import signal
 import shutil
 from pathlib import Path
+import plistlib
 import subprocess
 import sys
 import tempfile
+import time
 from typing import cast, final, override
 import unittest
 from unittest import mock
@@ -25,7 +27,7 @@ from scripts.copies.copies_test_support import copies_environment
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
-from scripts.lib import scratch
+from scripts.lib import build_folders, scratch
 from scripts.lib.checkout_test_support import write_stdlib_tool
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.process_start import Started, Unreadable, process_start
@@ -39,6 +41,7 @@ from scripts.test_times import gate_record
 
 FAKE_QUEUE = """\
 import json, os, sys, time
+from contextlib import ExitStack
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -74,8 +77,29 @@ if case in ('attempt', 'commit', 'tree'):
     row[case] = 'wrong'
 if case == 'modules':
     row['gate']['jobs'][0]['module'] = 'test_wrong.py'
-print('mac_gate_result=' + json.dumps(row))
-print('mac_exit=0')
+if case in ('completed-cleanup-refused', 'cleanup-refused-before-exit'):
+    sys.path.insert(0, os.environ['MAC_GATE_FIXTURE_ROOT'])
+    from scripts.mac_test import mac_transport
+
+    ssh = '''
+import sys
+if sys.argv[2] == 'cleanup-refused-before-exit':
+    print('mac_exit=0', file=sys.stderr, flush=True)
+print(sys.argv[1], flush=True)
+if sys.argv[2] == 'cleanup-refused-before-exit':
+    sys.exit(255)
+print('mac_exit=0', flush=True)
+'''
+    with ExitStack() as stack:
+        status = mac_transport.stream_remote(
+            [sys.executable, '-c', ssh, 'mac_gate_result=' + json.dumps(row), case],
+            mac_transport.RemoteRun(), stack,
+        )
+    print(f'mac_gate_cleanup_error={folder.name}:The Mac kept its gate folder')
+    sys.exit(status or 2)
+else:
+    print('mac_gate_result=' + json.dumps(row))
+    print('mac_exit=0')
 """
 
 
@@ -272,18 +296,44 @@ class MacGateTests(unittest.TestCase):
         path.parent.mkdir(exist_ok=True, parents=True)
         _ = path.write_text('# fixture\n')
 
-    def run_case(self, case: str, job: gate.GateJobResult) -> gate.GateRun | str:
+    @contextmanager
+    def queue_case(self, case: str, job: gate.GateJobResult) -> Generator[None]:
         command = self.root / 'queue.py'
         _ = command.write_text(FAKE_QUEUE)
         payload = self.root / 'gate.json'
         _ = payload.write_text(json.dumps(gate_box.encode_run(gate.GateRun((job,), 1, 0))))
         timeout = 0.2 if case == 'timeout' else 15.0
-        with (mock.patch.dict(os.environ, {'MAC_GATE_CASE': case, 'MAC_GATE_RESULT': str(payload)}),
+        with (mock.patch.dict(os.environ, {'MAC_GATE_CASE': case, 'MAC_GATE_RESULT': str(payload),
+                                          'MAC_GATE_FIXTURE_ROOT': str(Path(__file__).resolve().parents[2])}),
               mock.patch.object(mac_gate, 'QUEUE_COMMAND', (sys.executable, str(command))),
               mock.patch.object(mac_gate, 'MAC_TIME_LIMIT_S', timeout)):
+            yield
+
+    def run_case(self, case: str, job: gate.GateJobResult) -> gate.GateRun | str:
+        with self.queue_case(case, job):
             selection = gate.TreeSelection((module_path(job),), self.tree)
             return mac_gate.route(self.repo, mode=gate.SuiteMode.GATE, full=False,
                                   module_time_limit_s=30, selected=selection)
+
+    def test_manual_run_selects_modules_from_head(self) -> None:
+        one, two = module_job('one'), module_job('two')
+        self.add_module(two)
+        _ = commit_repository(self.repo, 'second module')
+        tree = gate.checked_git(self.repo, 'rev-parse', 'HEAD^{tree}')
+        output = self.root / 'result.json'
+        result = mac_gate.MacGateResult({'tree': tree}, gate.GateRun((), 1, 0))
+        for paths in ((), (module_path(one),), (module_path(one), module_path(two))):
+            options = [word for path in paths for word in ('--module', path)]
+            words = ['mac_gate.py', 'run', str(self.repo), str(output), *options]
+            selected = gate.TreeSelection(paths, tree) if paths else gate.ALL_MODULES
+            with (self.subTest(paths=paths), mock.patch.object(sys, 'argv', words),
+                  mock.patch.object(mac_gate, 'run_remote', return_value=result) as run):
+                self.assertEqual(mac_gate.main(), 0)
+                run.assert_called_once_with(
+                    self.repo.resolve(), mode=gate.SuiteMode.GATE, full=True,
+                    module_time_limit_s=gate.DEFAULT_MODULE_TIME_LIMIT_S, selected=selected,
+                    cancellation=mac_gate.USE_CALLER_PROCESS_LIFETIME,
+                )
 
     def test_returns_pass_and_test_failure(self) -> None:
         for status in (0, 1):
@@ -309,6 +359,30 @@ class MacGateTests(unittest.TestCase):
     def test_queue_cleanup_failure_preserves_the_last_nonblank_line(self) -> None:
         self.assertEqual(self.run_case('cleanup-refused', module_job('one')),
                          'The Mac kept its gate folder: mac queue: the Mac run may still be live')
+
+    def test_cleanup_refusal_preserves_the_completed_result(self) -> None:
+        job = replace(module_job('one', status=1), output='Ran 10 tests\nFAILED (failures=1)\n')
+        refusal = 'The Mac kept its gate folder'
+        with redirect_stderr(StringIO()) as route_errors:
+            result = self.run_case('completed-cleanup-refused', job)
+        assert isinstance(result, gate.GateRun), result
+        self.assertEqual(result.jobs, (job,))
+        self.assertFalse(result.passed)
+        self.assertIn(refusal, route_errors.getvalue())
+
+        output = self.root / 'result.json'
+        words = ['mac_gate.py', 'run', str(self.repo), str(output), '--module', module_path(job)]
+        with (self.queue_case('completed-cleanup-refused', job), mock.patch.object(sys, 'argv', words),
+              redirect_stderr(StringIO()) as cli_errors):
+            self.assertEqual(mac_gate.main(), 2)
+        row = cloud_gate.read(output)
+        self.assertEqual(row['cleanup_error'], refusal)
+        self.assertEqual(gate_box.decode_run(row['gate']).jobs, (job,))
+        self.assertIn(refusal, cli_errors.getvalue())
+
+    def test_cleanup_refusal_requires_the_guest_exit_before_accepting_a_result(self) -> None:
+        self.assertEqual(self.run_case('cleanup-refused-before-exit', module_job('one')),
+                         'The Mac kept its gate folder')
 
     def test_uploaded_entry_point_starts_with_the_installed_scripts(self) -> None:
         entry = self.root / 'uploaded/mac_gate.py'
@@ -519,6 +593,234 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             self.assertTrue(child.is_dir())
             self.assertTrue((temporary / "child.lock").is_file())
 
+    def image_cleanup_fixture(self) -> tuple[Path, Path]:
+        folder = self.root.resolve() / 'gate-temporary'
+        folder.mkdir()
+        journal = self.root / 'run.json'
+        cloud_gate.save(journal, {'pid': 100, 'start': 'past', 'groups': {}, 'folders': [str(folder)]})
+        return folder, journal
+
+    def test_dead_guest_detaches_only_images_stored_in_the_gate_folder(self) -> None:
+        folder, journal = self.image_cleanup_fixture()
+        outside = folder.with_name('gate-temporary-other')
+        outside.mkdir()
+        (folder / 'link').symlink_to(outside, target_is_directory=True)
+
+        def image(source: Path, disk: str) -> dict[str, object]:
+            return {'image-path': str(source), 'system-entities': [
+                {'dev-entry': disk + 's1', 'mount-point': str(folder / disk.rsplit('/', 1)[-1])},
+                {'dev-entry': disk},
+            ]}
+
+        other = [image(outside / 'other.dmg', '/dev/disk8'), image(folder / 'link/other.dmg', '/dev/disk7')]
+        private = [image(folder / 'm0001/fixture/removal.dmg', '/dev/disk9'),
+                   image(folder / 'm0002/fixture/removal.dmg', '/dev/disk10')]
+        query = ['/usr/bin/hdiutil', 'info', '-plist']
+        first = ['/usr/bin/hdiutil', 'detach', '/dev/disk9']
+        second = ['/usr/bin/hdiutil', 'detach', '/dev/disk10']
+        both = subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': [*other, *private]}), b'')
+        one = subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': [*other, private[1]]}), b'')
+        with (mock.patch.object(sys, 'platform', 'darwin'),
+              mock.patch.object(Path, 'is_mount', return_value=True),
+              mock.patch.object(mac_gate, 'running_owner', return_value=False),
+              mock.patch.object(subprocess, 'run', side_effect=[
+                  both,
+                  both,
+                  subprocess.CompletedProcess(first, 0, b'', b''),
+                  one,
+                  one,
+                  subprocess.CompletedProcess(second, 0, b'', b''),
+                  subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': other}), b''),
+              ]) as hdiutil,
+              mock.patch.object(build_folders, 'remove_build_folder', return_value=True) as remove):
+            mac_gate.stop_guest(journal, 0)
+        self.assertEqual([call.args[0] for call in hdiutil.call_args_list], [query, query, first, query, query, second, query])
+        remove.assert_called_once_with(folder, wait=False, expected=folder.lstat())
+
+    def test_gate_cleanup_reports_a_busy_device_after_one_detach(self) -> None:
+        folder, journal = self.image_cleanup_fixture()
+        mount = folder / 'mounted'
+        device = '/dev/disk9'
+        query = ['/usr/bin/hdiutil', 'info', '-plist']
+        detach = ['/usr/bin/hdiutil', 'detach', device]
+        attached = subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': [{
+            'image-path': str(folder / 'removal.dmg'),
+            'system-entities': [{'dev-entry': device, 'mount-point': str(mount)}],
+        }]}), b'')
+        busy = subprocess.CompletedProcess(detach, 16, b'busy device', b'Resource busy\nextra hdiutil detail')
+        with (mock.patch.object(sys, 'platform', 'darwin'),
+              mock.patch.object(Path, 'is_mount', return_value=True),
+              mock.patch.object(mac_gate, 'running_owner', return_value=False),
+              mock.patch.object(time, 'monotonic', return_value=100.0),
+              mock.patch.object(time, 'sleep') as sleep,
+              mock.patch.object(subprocess, 'run', side_effect=[attached, attached, busy]) as hdiutil,
+              mock.patch.object(build_folders, 'remove_build_folder') as remove,
+              mock.patch.object(mac_gate, 'release_gate_folder_lease') as release,
+              self.assertRaisesRegex(GateRefused, 'is busy at') as failure):
+            mac_gate.stop_guest(journal, 0)
+        self.assertEqual([call.args[0] for call in hdiutil.call_args_list], [query, query, detach])
+        self.assertEqual([call.kwargs['timeout'] for call in hdiutil.call_args_list], [mac_gate.HDIUTIL_TIMEOUT_S] * 3)
+        sleep.assert_not_called()
+        detail = str(failure.exception)
+        self.assertIn(f'The Mac kept its gate folder {folder}', detail)
+        self.assertIn(f'{device} is busy at {mount}', detail)
+        self.assertIn('hdiutil exit status: 16\nstdout:\nbusy device\nstderr:\nResource busy\nextra hdiutil detail', detail)
+        remove.assert_not_called()
+        release.assert_called_once_with(folder, folder.lstat(), 100)
+        self.assertTrue(folder.is_dir())
+        self.assertTrue(journal.is_file())
+
+    def test_gate_cleanup_skips_a_device_reused_by_another_image(self) -> None:
+        folder, journal = self.image_cleanup_fixture()
+        device = '/dev/disk9'
+        query = ['/usr/bin/hdiutil', 'info', '-plist']
+
+        def attached(source: Path, mount: Path) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': [{
+                'image-path': str(source),
+                'system-entities': [{'dev-entry': device, 'mount-point': str(mount)}],
+            }]}), b'')
+
+        private = attached(folder / 'removal.dmg', folder / 'mounted')
+        reused = attached(folder.with_suffix('.dmg'), folder.with_name('other-mount'))
+        with (mock.patch.object(sys, 'platform', 'darwin'),
+              mock.patch.object(Path, 'is_mount', return_value=True),
+              mock.patch.object(mac_gate, 'running_owner', return_value=False),
+              mock.patch.object(time, 'sleep') as sleep,
+              mock.patch.object(subprocess, 'run', side_effect=[
+                  private, reused, reused,
+              ]) as hdiutil,
+              mock.patch.object(build_folders, 'remove_build_folder', return_value=True) as remove):
+            mac_gate.stop_guest(journal, 0)
+        self.assertEqual([call.args[0] for call in hdiutil.call_args_list], [query, query, query])
+        sleep.assert_not_called()
+        remove.assert_called_once_with(folder, wait=False, expected=folder.lstat())
+
+    def test_gate_cleanup_keeps_the_folder_when_detach_times_out(self) -> None:
+        folder, journal = self.image_cleanup_fixture()
+        mount = folder / 'mounted'
+        device = '/dev/disk9'
+        query = ['/usr/bin/hdiutil', 'info', '-plist']
+        detach = ['/usr/bin/hdiutil', 'detach', device]
+        attached = plistlib.dumps({'images': [{
+            'image-path': str(folder / 'removal.dmg'),
+            'system-entities': [{'dev-entry': device, 'mount-point': str(mount)}],
+        }]})
+        with (mock.patch.object(sys, 'platform', 'darwin'),
+              mock.patch.object(Path, 'is_mount', return_value=True),
+              mock.patch.object(mac_gate, 'running_owner', return_value=False),
+              mock.patch.object(subprocess, 'run', side_effect=[
+                  subprocess.CompletedProcess(query, 0, attached, b''),
+                  subprocess.CompletedProcess(query, 0, attached, b''),
+                  subprocess.TimeoutExpired(detach, mac_gate.HDIUTIL_TIMEOUT_S,
+                                            output=b'partial output', stderr=b'partial error'),
+              ]) as hdiutil,
+              mock.patch.object(build_folders, 'remove_build_folder') as remove,
+              self.assertRaises(GateRefused) as failure):
+            mac_gate.stop_guest(journal, 0)
+        self.assertEqual([call.args[0] for call in hdiutil.call_args_list], [query, query, detach])
+        self.assertIn(f'Cannot detach disk image {device} at {mount}', str(failure.exception))
+        self.assertIn('stdout:\npartial output\nstderr:\npartial error', str(failure.exception))
+        remove.assert_not_called()
+        self.assertTrue(folder.is_dir())
+
+    def test_gate_cleanup_distinguishes_removal_refusal_after_images_are_detached(self) -> None:
+        folder, journal = self.image_cleanup_fixture()
+        mount = folder / 'mounted'
+        device = '/dev/disk9'
+        query = ['/usr/bin/hdiutil', 'info', '-plist']
+        detach = ['/usr/bin/hdiutil', 'detach', device]
+        attached = plistlib.dumps({'images': [{
+            'image-path': str(folder / 'removal.dmg'),
+            'system-entities': [{'dev-entry': device, 'mount-point': str(mount)}],
+        }]})
+        with (mock.patch.object(sys, 'platform', 'darwin'),
+              mock.patch.object(Path, 'is_mount', return_value=True),
+              mock.patch.object(mac_gate, 'running_owner', return_value=False),
+              mock.patch.object(subprocess, 'run', side_effect=[
+                  subprocess.CompletedProcess(query, 0, attached, b''),
+                  subprocess.CompletedProcess(query, 0, attached, b''),
+                  subprocess.CompletedProcess(detach, 0, b'', b''),
+                  subprocess.CompletedProcess(query, 0, plistlib.dumps({'images': []}), b''),
+              ]) as hdiutil,
+              mock.patch.object(build_folders, 'remove_build_folder', return_value=False) as remove,
+              self.assertRaises(GateRefused) as failure):
+            mac_gate.stop_guest(journal, 0)
+        self.assertEqual([call.args[0] for call in hdiutil.call_args_list], [query, query, detach, query])
+        self.assertEqual(str(failure.exception), f'The Mac kept its gate folder {folder}. Its images are detached.')
+        remove.assert_called_once_with(folder, wait=False, expected=folder.lstat())
+        self.assertTrue(folder.is_dir())
+        self.assertTrue(journal.is_file())
+
+    def test_gate_detach_requires_a_live_mount_inside_the_folder(self) -> None:
+        folder, _ = self.image_cleanup_fixture()
+        outside = folder.with_name('gate-temporary-other')
+        outside.mkdir()
+        link = folder / 'link'
+        link.symlink_to(outside, target_is_directory=True)
+        stale = folder / 'stale-mount'
+        stale.mkdir()
+        query = ['/usr/bin/hdiutil', 'info', '-plist']
+        for mount in (Path('/dev/disk9'), outside, link, stale):
+            reply = plistlib.dumps({'images': [{
+                'image-path': str(folder / 'removal.dmg'),
+                'system-entities': [
+                    {'dev-entry': '/dev/disk9'},
+                    {'mount-point': str(mount)},
+                ],
+            }]})
+            reason = 'Cannot identify one disk device and a live mount' if mount == stale else 'Mount outside the gate folder'
+            with (self.subTest(mount=mount),
+                  mock.patch.object(Path, 'is_mount', autospec=True, return_value=False) as is_mount,
+                  mock.patch.object(subprocess, 'run',
+                                    return_value=subprocess.CompletedProcess(query, 0, reply, b'')) as hdiutil,
+                  self.assertRaisesRegex(GateRefused, reason)):
+                mac_gate.detach_gate_images(folder, folder.lstat())
+            self.assertEqual([call.args[0] for call in hdiutil.call_args_list], [query])
+            self.assertEqual(is_mount.call_args_list, [mock.call(stale)] if mount == stale else [])
+
+    def test_dead_guest_cleanup_releases_only_the_free_gate_folder_lease(self) -> None:
+        guest = self.sleeping_process()
+        guest.kill()
+        _ = guest.wait(timeout=TEST_HANG_GUARD_SECS)
+        temporary = self.root.resolve() / 'gate-temporary'
+        child = temporary / 'child'
+        child.mkdir(parents=True)
+        journal = self.root / 'run.json'
+        cloud_gate.save(journal, {'pid': guest.pid, 'start': 'past', 'groups': {}, 'folders': [str(temporary)]})
+        lease = build_folders.lease_path(temporary)
+        cloud_gate.save(lease, {'pid': guest.pid})
+        lock = temporary.with_suffix('.lock')
+        child_lock = child.with_suffix('.lock')
+        with child_lock.open('wb') as child_holder:
+            fcntl.flock(child_holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with lock.open('wb') as holder:
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(GateRefused, 'kept its gate folder'):
+                    mac_gate.stop_guest(journal, 0)
+                self.assertTrue(lock.is_file())
+                self.assertEqual(cloud_gate.read(lease)['pid'], guest.pid)
+            with self.assertRaisesRegex(GateRefused, 'kept its gate folder'):
+                mac_gate.stop_guest(journal, 0)
+        self.assertTrue(child.is_dir())
+        self.assertTrue(child_lock.is_file())
+        self.assertTrue(journal.is_file())
+        self.assertFalse(lock.exists())
+        self.assertFalse(lease.exists())
+
+    def test_retained_gate_folder_keeps_unverified_leases(self) -> None:
+        path = self.root.resolve() / 'gate-temporary'
+        path.mkdir()
+        lock = path.with_suffix('.lock')
+        lock.touch()
+        lease = build_folders.lease_path(path)
+        for pid in (os.getpid(), os.getpid() + 1, 'unknown'):
+            with self.subTest(pid=pid):
+                cloud_gate.save(lease, {'pid': pid})
+                mac_gate.release_gate_folder_lease(path, path.lstat(), os.getpid())
+                self.assertEqual(cloud_gate.read(lease), {'pid': pid})
+                self.assertTrue(lock.exists())
+
     def test_dead_guest_cleanup_requires_group_identity(self) -> None:
         root = self.root / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
         root.mkdir(parents=True)
@@ -677,6 +979,39 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
             self.assertEqual(mac_gate.lifecycle('cleanup', argv, folder, '1'), 0)
             unregister.assert_called_once_with('fixture-mac', checkout)
 
+    def test_lifecycle_stops_the_copied_gate_without_detach_settings(self) -> None:
+        home = self.root / 'Mac home'
+        folder = home / mac_gate.REMOTE_ROOT / 'mac-gate-fixture'
+        folder.mkdir(parents=True)
+        entry = folder / 'mac_gate.py'
+        _ = entry.touch()
+        shim = home / '.claude/scripts/lib/py'
+        shim.parent.mkdir(parents=True)
+        write_stdlib_tool(shim, """\
+import json, os, sys
+from pathlib import Path
+assert not (Path(os.environ["CONF_DIR"]) / "mac_gate.conf").exists()
+assert "MAC_GATE_DETACH_SECONDS" not in os.environ
+assert "MAC_GATE_DETACH_INTERVAL_SECONDS" not in os.environ
+print(json.dumps(sys.argv[1:]))
+""")
+        argv = self.root / 'argv.json'
+        run = subprocess.run
+
+        def ssh(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[:-1], ['ssh', '-n', '-o', 'BatchMode=yes', 'fixture-mac'])
+            self.assertTrue(capture_output and text and not check)
+            environment = {**os.environ, 'HOME': str(home), 'CONF_DIR': str(home / 'config')}
+            expanded = run(['/bin/sh', '-c', command[-1]], env=environment, capture_output=True, text=True,
+                           timeout=TEST_HANG_GUARD_SECS, check=True)
+            self.assertEqual(json.loads(expanded.stdout), [str(entry), 'stop', str(folder)])
+            return subprocess.CompletedProcess(command, 0, mac_gate.CheckoutCleanup.REMOVED + '\n', '')
+
+        with (mock.patch.dict(os.environ, {'MAC_QUEUE_HOST': 'fixture-mac'}),
+              mock.patch.object(subprocess, 'run', side_effect=ssh) as cleanup):
+            self.assertEqual(mac_gate.lifecycle('cleanup', argv, self.root / folder.name, '0'), 0)
+        cleanup.assert_called_once()
+
     def test_ended_lifecycle_stops_the_old_attempt_with_the_installed_gate(self) -> None:
         home = self.root / 'Mac home'
         folder = home / mac_gate.REMOTE_ROOT / 'mac-gate-old'
@@ -691,7 +1026,16 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
         installed = home / '.claude/scripts/mac_test/mac_gate.py'
         installed.parent.mkdir()
         _ = installed.touch()
-        write_stdlib_tool(shim, 'import json, sys\nprint(json.dumps(sys.argv[1:]))\n')
+        mac_environment = copies_environment(home)
+        _ = (Path(mac_environment['CONF_DIR']) / 'mac_gate.conf').write_text(
+            '# range: 0.1..\nterminate_grace_seconds=0.1\n'
+        )
+        write_stdlib_tool(shim, """\
+import json, os, sys
+assert "MAC_GATE_DETACH_SECONDS" not in os.environ
+assert "MAC_GATE_DETACH_INTERVAL_SECONDS" not in os.environ
+print(json.dumps(sys.argv[1:]))
+""")
         run = subprocess.run
 
         def ssh(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
@@ -701,11 +1045,12 @@ print(json.dumps([os.environ["PYTHONPATH"], *sys.argv[1:]]))
                            timeout=TEST_HANG_GUARD_SECS, check=True)
             words = cast(list[str], json.loads(expanded.stdout))
             self.assertEqual(words, [str(installed), 'stop', str(folder), '--checkout', str(checkout)])
-            with mock.patch.object(sys, 'argv', words), redirect_stdout(StringIO()) as output:
+            with (mock.patch.dict(os.environ, mac_environment),
+                  mock.patch.object(sys, 'argv', words), redirect_stdout(StringIO()) as output):
                 status = mac_gate.main()
             return subprocess.CompletedProcess(command, status, output.getvalue(), '')
 
-        with (mock.patch.dict(os.environ, {**copies_environment(home), 'MAC_QUEUE_HOST': 'fixture-mac'}),
+        with (mock.patch.dict(os.environ, {**mac_environment, 'MAC_QUEUE_HOST': 'fixture-mac'}),
               mock.patch.object(subprocess, 'run', side_effect=ssh),
               mock.patch.object(scratch, 'end', return_value=[]) as end,
               mock.patch.object(copies, 'unregister_remote') as unregister):

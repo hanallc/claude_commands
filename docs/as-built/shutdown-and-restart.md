@@ -25,7 +25,7 @@ A browser leaves helper processes after its own exit or a timeout, and a plain `
 
 The `/agents` skill uses the `agents` program.
 `agents` and `agents help` print the same usage and return status 0.
-The public commands are `help`, `status`, `pause`, `exit`, `resume`, `restart`, and `stop`.
+The public commands include `help`, `status`, `pause`, `exit`, `resume`, `clone`, `restart`, and `stop`.
 `agents status [ACCOUNT] [--json] [--here]` reports live sessions.
 `agents stop SESSION` stops the selected session and its workers.
 SESSION is a staff id, a session id, a unique name, or a staff path.
@@ -36,6 +36,26 @@ A path that matches more than one staff row stops nothing and returns status 2 w
 Add `--dry-run` to print their names without stopping them.
 `agents` runs `scripts/agents/shutdown.py`.
 All lifecycle scripts use `scripts/agents/`.
+
+`agents clone NAME --as NEW` forks a live conversation on the source machine.
+Use a staff name, saved launch name, staff ID, or native session ID.
+The command refuses a saved launch name that matches multiple sessions on this machine.
+The command requires one proved pane and opens the clone after its source tab on the same Herdr server.
+The live pane must show the current model and effort.
+For Codex, show Model with Reasoning in the status line.
+Claude uses `--resume --fork-session`.
+Codex uses `codex fork`.
+The first prompt names both sessions and asks the clone to wait for a request addressed to it.
+The command refuses occupied names and reserved message addresses.
+The fork uses the source account environment.
+An absent `CLAUDE_CONFIG_DIR` stays absent.
+Resume and restart keep the saved implicit Claude home unless an explicit account is selected.
+The command verifies the fork before it saves the launch or adds a root `session` row.
+It saves the launch before the staff write.
+A definite refusal closes only the fork terminal.
+The staff owner checks the name and ID together before it creates the row.
+The row stores the launch folder and account for ordinary restart and resume.
+Messages to each name resolve to that session's native ID.
 
 `agents pause NAME [--keep-workers] --why TEXT` pauses a director.
 The director finishes its current turn and holds at the prompt.
@@ -133,7 +153,8 @@ A Codex thread name is display text and selects no conversation.
 Unknown names return status 1.
 They list up to five close names from local units and showrunners when available.
 Ambiguous names return status 1 with up to five matching members.
-A remote member returns status 1 with its machine name.
+The command forwards a remote staff row to its configured workstation over SSH.
+The command returns status 1 when the row's machine is unknown or unreachable.
 A running session returns status 0 with an `unchanged` line that names its current account.
 Resume does not stop or move a running session.
 Unknown Codex process evidence prints an anomaly and does not block resume.
@@ -142,7 +163,7 @@ Without process evidence, its account remains unknown.
 Unknown process evidence without a pane that reports the id can allow a second process on the same conversation.
 A unit pane at its shell permits resume when no remaining process blocks it.
 Direct resume and watchdog recovery use the same wait while non-agent processes block the pane.
-`HOLDER_EXIT_SECONDS` in `config/shutdown.conf` allows 5 seconds by default.
+`holder_exit_seconds` in `config/shutdown.conf` allows 5 seconds by default.
 A live agent in the holder list causes an immediate refusal.
 The `no foreground agent` refusal lists each blocking command and its position relative to the shell tree.
 The default reason is `resumed by name`.
@@ -172,14 +193,14 @@ The pane receives one opening message after identity confirmation.
 
 Resume, restart and account moves start a session in its own pane.
 The own pane is a pane that runs the member, else the newest pane whose launch record names the member and no other member runs in.
-`herdr.saved_row_tab` waits within `OWN_PANE_SHELL_SECONDS` (`config/shutdown.conf`) for that pane to reach the shell, then reuses it.
+`herdr.saved_row_tab` waits within `own_pane_shell_seconds` (`config/shutdown.conf`) for that pane to reach the shell, then reuses it.
 When the wait ends first, the start is refused with one line.
 The line names the session, its own pane and `agents resume <name>`, and the session stays stopped.
 A new tab opens only for a session with no own pane.
-A producer whose own pane is outside `PRODUCER_WORKSPACE`, or shares its tab, gets a new tab in that workspace with no wait.
+A producer whose own pane is outside `producer_workspace`, or shares its tab, gets a new tab in that workspace with no wait.
 A restart never splits a pane beside a worker.
 `stop_resume._resume_once` and `restart.start_row` use `herdr.row_workspace` for new tabs.
-Producers use `PRODUCER_WORKSPACE` from `config/staff.conf`, normally `producers`.
+Producers use `producer_workspace` from `config/staff.conf`, normally `producers`.
 Other rows use their parent showrunner's workspace, the entry name, or the shared session.
 A role account change does not update an existing pane shell's `resume` alias.
 Each agent launch prepares the pane aliases through `herdr.agent_alias_script(kind)` for its selected family.
@@ -224,12 +245,11 @@ Delegated callers and sessions proved live on the target write nothing.
 
 A resume in the same pane skips the source close check.
 A resume in a different pane checks that the source contains no other work before it closes the source.
-A layout scan retains a pane without a notice when a new Claude process in its foreground group lacks arguments during `START_SECONDS`.
+A layout scan retains a pane without a notice when a new Claude process in its foreground group lacks arguments during `start_seconds`.
 If the arguments stay unreadable after that period, the next scan reports unknown evidence once per scan run.
 
 The notes timer delegates account moves to this detached batch before any stop.
-A move does not wait for build steps, queued runs, verify calls or Bash tool shells.
-It stops each session at once.
+A move stops each session at once, even during a build step, a queued run, a verify call, or a Bash tool shell.
 The resumed session must do its interrupted work again.
 A later group account selection applies to the next stop attempt.
 The batch writes its output to its move log.
@@ -286,7 +306,19 @@ While any restart is active, a user command waits for each row in the record, an
 A limit stops the wait for a holder that is hung.
 The limit counts from the start of the command, so the move of the free rows uses part of it.
 The detached child counts the limit from the start of its parent, from the `--waited-seconds` handoff value.
-The limit is the sum of `STOP_GRACE_SECONDS`, `KILL_GRACE_SECONDS`, `MOVE_STOP_MARGIN_SECONDS`, `UPKEEP_ROW_WAIT_SECONDS`, `RESTART_RECORD_LOCK_SECONDS`, `HOLDER_EXIT_SECONDS`, `OWN_PANE_SHELL_SECONDS`, `START_SECONDS`, `OPENING_PROMPT_SECONDS` and `STAY_SECONDS`.
+The limit is the sum of these settings in `config/shutdown.conf`.
+
+- `stop_grace_seconds`
+- `kill_grace_seconds`
+- `move_stop_margin_seconds`
+- `upkeep_row_wait_seconds`
+- `restart_record_lock_seconds`
+- `holder_exit_seconds`
+- `own_pane_shell_seconds`
+- `start_seconds`
+- `opening_prompt_seconds`
+- `stay_seconds`
+
 At the limit, the command tries the held rows one last time.
 For each row that is still held, it removes its request and gives the batch command with `--user-command`.
 The result names the holder pid and command when the row lock names them.
@@ -353,8 +385,11 @@ The batch keeps the showrunner notices and sends one phone push for the members 
 The push shows qualified names and gives a short command to retry pending moves.
 If the names and the phone footer exceed the push limit, the message gives a command to read the full list.
 The group and target identify the phone push for repeat suppression.
-`MOVE_ALERT_REPEAT_MINUTES` sets the repeat window to 1,440 minutes by default.
-A standalone resume failure still sends its own keyed push.
+`move_alert_repeat_minutes` sets the repeat window to 1,440 minutes by default.
+A standalone resume failure uses a keyed `shutdown.restart_failed` push.
+For a unit under watchdog recovery, the watchdog keeps the pending push with the outage.
+A failed detached start sends the push with its original key.
+A confirmed start clears the pending push.
 Each completed member records its outcome without waiting for other resumes.
 An early exit or failed resume uses the existing showrunner failure report.
 
@@ -392,7 +427,7 @@ A completed recovery rerun restores the workers again.
 `resume morty`, `resume brain`, and `resume dwight` use `stop_resume.resume`.
 Account moves and restart share the same resume arguments, account selection, and pane launch code.
 Each producer uses its own tab in the `producers` workspace of the shared herdr session.
-`config/staff.conf` supplies the workspace through `PRODUCER_WORKSPACE`.
+`config/staff.conf` supplies the workspace through `producer_workspace`.
 `restart.producer_launch(row)` resumes `row.current_session` with the producer's configured settings.
 `restart.producer_resume(row, entry)` preserves saved launch options through `pane_record.configured_resume_arguments`.
 It takes the family, model, and effort from the current producer settings.
@@ -461,6 +496,12 @@ A Claude compaction summary is one block. A Codex compaction summary is encrypte
 The reader finds transcripts through `scripts/lib/transcripts.py` and reads from the end of the file in windows that double.
 `config/catch_up.conf` sets the default block count, the characters kept from one message, the tool line length and the first read window. Times use the user's zone.
 
+`scripts/agents/catch_up.py NATIVE_ID --user-prompts --near ISO_TIME [--minutes N]` reads typed prompts from the saved transcript.
+`near_minutes` in `config/catch_up.conf` sets the default window on each side of `ISO_TIME` to 10 minutes.
+If `ISO_TIME` has no offset, the reader uses the user's time zone.
+The reader prints each prompt in full with its time in the user's zone, in `%m-%d %H:%M:%S` format.
+It skips tool results, hook text, system reminders and messages from other sessions.
+
 ### Create a producer
 
 `agents add-producer NAME` reads `producer_defaults.model` from `config/models.conf`.
@@ -506,7 +547,7 @@ The fixed-id lookup supplies their names for closed List items.
 
 `ProducerFirstStart(name, folder)` represents a configured producer before staff admission.
 It is separate from an admitted `StaffRow`.
-`PRODUCER_FOLDER_ROOT` in `config/staff.conf` defaults to `~/rust/hanadocs`.
+`producer_folder_root` in `config/staff.conf` defaults to `~/rust/hanadocs`.
 The first start requires `<root>/<name>/README.md`.
 Dwight uses `~/rust/hanadocs/dwight/README.md`.
 
@@ -832,7 +873,7 @@ Run `worker.py restore` in the owner session to see completed dispatches in open
 Herdr upkeep skips row work while a stop or restart holds the activity lock.
 Saved rows can remain after the activity lock closes.
 Stop pauses upkeep and waits for its producer row locks before reading fresh staff and liveness data.
-The `UPKEEP_ROW_WAIT_SECONDS` setting in `config/shutdown.conf` limits the wait.
+The `upkeep_row_wait_seconds` setting in `config/shutdown.conf` limits the wait.
 If the time expires, the report names the row and gives the command to run again.
 
 A restarted unit director or showrunner gets one continuation message in its current conversation.
@@ -890,10 +931,10 @@ The terminal, process, or composer can still change between the last check and t
 The launch deadline limits the pane queries and both transport calls.
 The prompt transport uses the remaining time after its process starts.
 If Herdr declines to send a resume prompt, the anomaly tells the operator to check the retained pane and send the prompt by hand.
-For a Claude launch with an opening prompt, restart uses the greater of `START_SECONDS` and `OPENING_PROMPT_SECONDS`.
+For a Claude launch with an opening prompt, restart uses the greater of `start_seconds` and `opening_prompt_seconds`.
 `config/shutdown.conf` sets these limits to 20 seconds and 90 seconds.
 The operation deadline can reduce either limit.
-Other launches use `START_SECONDS`.
+Other launches use `start_seconds`.
 The launch limit covers the start, input readiness, and proof of the opening prompt's user turn.
 The separate resume check then requires an assistant turn or tool call.
 The cursor skips complete historical records without parsing their JSON.
@@ -912,7 +953,7 @@ The reason can be a missing continuation message, no work after the message, or 
 The director checks the continuation message.
 It skips held directors, unchanged rows, failed starts, workers, producers, dry runs, and stop-only commands.
 It does not change the exit code, restart record, or staff.
-config/shutdown.conf sets RESUME_CHECK_SECONDS=180 and RESUME_CHECK_INTERVAL_SECONDS=5.
+config/shutdown.conf sets resume_check_seconds=180 and resume_check_interval_seconds=5.
 
 A paused or exited director stays stopped and keeps its hold record and restart entry.
 A running row gets no continuation message.
@@ -1098,7 +1139,7 @@ If an interrupt ends the reboot, the report lists the saved sessions that still 
 A folder move failure permits restart to proceed.
 The final report names the failed copy folder if available and assigns the move failure to the verify owner.
 
-The first output line gives the log path in the folder set by `REBOOT_LOG_FOLDER`.
+The first output line gives the log path in the folder set by `reboot_log_folder`.
 The default log folder is `~/.local/state/agents/reboot/`.
 The command adds the time to each log line. It keeps older logs and sets `latest.log` to the most recent run.
 A terminal shows each step on one line with an elapsed time and a spinner.

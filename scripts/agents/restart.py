@@ -735,8 +735,8 @@ class DirectorResumeChecks:
             return
         try:
             settings = conf.read("shutdown")
-            deadline = time.monotonic() + settings.number("RESUME_CHECK_SECONDS")
-            interval = settings.number("RESUME_CHECK_INTERVAL_SECONDS")
+            deadline = time.monotonic() + settings.number("resume_check_seconds")
+            interval = settings.number("resume_check_interval_seconds")
         except (OSError, ValueError):
             for check in self.checks:
                 self.report_check(check, ResumeCheckState.UNREADABLE)
@@ -1134,14 +1134,22 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
             kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name, record=record)
                 if original is not None else session_launch(str(row.current_session), row.name))
         selected = member_account.resume_account(kind, row, to=target_account)
-        if isinstance(selected, accounts.NamedAccount):
+        implicit = (member_account.implicit_claude_resume(row, projected, target_account)
+                    if projected is not None else pane_launch.SelectedClaudeAccount.USE_SELECTION)
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            environment = {}
+        elif isinstance(selected, accounts.NamedAccount):
             environment = named_account_environment(selected.dir)
         else:
             environment = {"CODEX_HOME": str(selected.home)}
         if projected is not None:
             environment = {**names.environment(projected), **environment}
+        remove = herdr.NO_ENVIRONMENT_REMOVALS
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            environment = implicit.environment(environment)
+            remove = frozenset({"CLAUDE_CONFIG_DIR"})
         settings = conf.read("shutdown")
-        start_seconds = settings.number("START_SECONDS")
+        start_seconds = settings.number("start_seconds")
         reuse_deadline = time.monotonic() + operation_deadline.remaining(start_seconds)
         workspace = herdr.row_workspace(row, record, row.name)
         destination = (client.producer_row_tab(str(row.id), row.name, workspace, record=record) if row.kind == "producer" else
@@ -1150,10 +1158,12 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(folder), selected_home)
         if row.kind == "producer":
             environment = expectation.environment(environment)
-        prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
-                                                      herdr.NO_ENVIRONMENT_REMOVALS)
+        prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment, remove)
         if isinstance(prepared, nix_env.Refused):
             raise OSError(str(prepared))
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            prepared = replace(prepared, env=implicit.environment(prepared.env), claude_home=implicit,
+                               unset_environment=(prepared.unset_environment | remove) - {"HOME"})
         target: herdr.NewTab | herdr.ExistingPane = destination
         source_pane: pane_launch.ResumeSourcePane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
         exiting_source: RetainedRestartPane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
@@ -1243,7 +1253,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         scope = (pane_launch.producer_launch_request(expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
-            launch_seconds = (max(start_seconds, settings.number("OPENING_PROMPT_SECONDS"))
+            launch_seconds = (max(start_seconds, settings.number("opening_prompt_seconds"))
                               if kind == "claude" and isinstance(opening, herdr.OpeningPrompt) else start_seconds)
             result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
                 trust_arguments(kind, str(folder), arguments),
@@ -1767,7 +1777,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     try:
         record = staff.initial_snapshot()
         if stop_all and not dry_run:
-            deadline = time.monotonic() + conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS")
+            deadline = time.monotonic() + conf.read("shutdown").number("upkeep_row_wait_seconds")
             only = tuple(str(row.id) if (row := record.by_member_reference(reference)) is not None else reference
                          for reference in only)
             for row in record.find(kind="producer"):
@@ -1940,7 +1950,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             _discovery_anomaly("The stop includes the session that runs this reboot")
             return 1
         return _detach_stop(command, selected, record)
-    lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
+    lock_wait = conf.read("shutdown").number("upkeep_row_wait_seconds") if holders else 0
     from scripts.herdr.worker_panes import (
         CheckedRolePolicy, StartRefused, checked_role_policy, dispatch_role, use_checked_resume_policies,
     )

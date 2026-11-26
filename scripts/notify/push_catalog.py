@@ -1,5 +1,6 @@
 """Script phone texts and named cases reviewed before delivery."""
 import re
+import shlex
 from functools import partial
 
 from scripts.notify.gpu_xid import XID_MEANINGS
@@ -36,6 +37,35 @@ def nightly_result_values(given: dict[str, str]) -> TemplateValues:
         raise ValueError(f"nightly.result: missing values {sorted(required - given.keys())}, "
                          + f"extra values {sorted(given.keys() - required)}")
     return TemplateValues({"outcome": given["outcome"]}, dict(given))
+
+
+RESTART_FAILED_TEXT_ID = "shutdown.restart_failed"
+_RESTART_FAILED_SUFFIX = " did not start on "
+
+
+def restart_failed_values(given: dict[str, str]) -> TemplateValues:
+    """Fit the session name in the title and keep the full resume argument."""
+    required = {"session", "identity", "account"}
+    extra = given.keys() - required - {"reference"}
+    missing = required - given.keys()
+    if missing or extra:
+        raise ValueError(f"{RESTART_FAILED_TEXT_ID}: missing values {sorted(missing)}, extra values {sorted(extra)}")
+    account = given["account"]
+    session = given["session"]
+    reference = given.get("reference") or session or given["identity"]
+    if not reference.strip() or not account.strip():
+        raise ValueError(f"{RESTART_FAILED_TEXT_ID}: the resume reference and account are required")
+    title_session = session or "A session"
+    width = 44 - len(_RESTART_FAILED_SUFFIX)
+    account_room = width - min(len(title_session), len("A session"))
+    title_account = account if len(account) <= account_room else account[:account_room - 1] + "…"
+    title_room = width - len(title_account)
+    if len(title_session) > title_room:
+        title_session = title_session[:title_room - 1].rstrip(" -_./:\t–—") + "…"
+    target = [f"--to={account}"] if account.startswith("-") else ["--to", account]
+    command = [*target, "--", reference] if reference.startswith("-") else [reference, *target]
+    return TemplateValues({"session": title_session, "account": title_account,
+                           "resume_arguments": shlex.join(command)}, dict(given))
 
 
 def hide_sender_values(given: dict[str, str], *, hidden: tuple[str, ...]) -> TemplateValues:
@@ -300,6 +330,11 @@ ENTRIES = (
             "recommendation_reason": "The small fix removes the stall without resuming the rest of the held cable work."}),),
         purpose="A decision with structured choices and a recommendation.", session=SessionTemplate("{session}"),
         agent_written=True, expand_values=decision_values),
+    PushText("hana_shot.mac_locked", "Hana screenshot", "blocked", "Hana screenshot waits for the Mac",
+        ActionTemplate("Unlock the Mac."),
+        "The screenshot starts when the Mac is ready. This alert stops on its own.",
+        (PushExample("typical", {}),),
+        purpose="A Hana screenshot waits for the Mac to unlock."),
     PushText("mac_idle.unreachable", "Mac idle watch", "blocked", "Mac does not answer; {tests}",
         ActionTemplate("Wake the Mac or check its network."),
         "",
@@ -335,18 +370,17 @@ ENTRIES = (
             "request": "edit send.py"})),
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}"), expand_values=permission_prompt_values),
-    PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work remains stopped",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /agents restart {account}.'),
-        "After your restart request, {stopped} on Claude account {account} did not restart on {machine}. "
-        + "Coding work stays stopped until the restart succeeds.\n\n"
-        + "The restart gave this error: {cause}.\n\n"
-        + "The command retries only stopped sessions. Running sessions keep their work.",
-        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "5 sessions",
-             "cause": "window failed to open"}),
-         PushExample("one_long_name", {"account": 'claude3', "machine": "Mac",
-             "stopped": "1 session",
-             "cause": "restart prompt not submitted"})),
-        purpose="One restart problem sends one push with the failed session count."),
+    PushText(RESTART_FAILED_TEXT_ID, "shutdown", "decision", "{session}" + _RESTART_FAILED_SUFFIX + "{account}",
+        ActionTemplate("In the natedev session, run: /agents resume {resume_arguments}"),
+        "",
+        (PushExample("typical", {"session": "trunk", "identity": "019b3a40-4250-7000-8000-000000000101",
+             "account": "claude4"}),
+         PushExample("one_long_name", {"session": "account-migration-verification", "identity": "019b3a40-4250-7000-8000-000000000102",
+             "account": "claude3"}),
+         PushExample("unnamed", {"session": "", "identity": "019b3a40-4250-7000-8000-000000000103",
+             "account": "codex2"})),
+        purpose="A session resume failed and needs a retry.",
+        expand_values=restart_failed_values),
     PushText("quota.claude_next_move", "quota_alert", "note", "{account} has {remaining} left with no move",
         ActionTemplate("In the natedev session, type /agents move <group> <account>."),
         "",
@@ -462,13 +496,6 @@ ENTRIES = (
         purpose="A new Rust compiler breaks the build repair tool. Upgrade or wait.",
         expand_values=partial(rust_result_values, hidden=("pin",),
             title="Rust {version} breaks the build repair tool", short_title="Rust {version} breaks build repair")),
-    PushText("codex.reset_ready", "codex-winddown", "decision", "Codex is ready for your reset",
-        ActionTemplate("At chatgpt.com/codex/settings/usage, redeem your limit reset."),
-        "All Codex coding agents on {machine}, your computer, have stopped. Redeeming your usage reset now will not interrupt any work. "
-        + "New Codex work stays paused until you give the all clear: in a Claude session on {machine}, run /codex_winddown clear.",
-        (PushExample("typical", {"machine": "natedev"}),
-         PushExample("long_machine", {"machine": "macbook-workstation"})),
-        purpose="All Codex agents stopped. You can redeem your usage reset now."),
     PushText("sweep.disk_floor", "disk_floor", "decision", "{machine} disk is low; {machine} tests can fail",
         ActionTemplate("{folder_action}"),
         "{machine} has {free} free, below the {floor} alert line, so {machine} test builds can fail. {recommendation}",
@@ -588,39 +615,6 @@ ENTRIES = (
             "count": "1", "noun": "command"})),
         purpose="Auto mode refused a session's commands. The commands wait for you.",
         session=SessionTemplate("{session}"), expand_values=auto_mode_refused_values),
-    # Permission root cause (user ask, 2026-10-23): rca.py sends these when the owner of a case starts it
-    # (`rca.py start`) and when its fix merges (`rca.py fixed`), with --key rca-<case id>. sender is the
-    # session's production, or messaging when it has none. rca.py fills time (silence.shown) and stop from the case.
-    # It removes a final period from cause and fix. Only the started push has the alert's waits_line.
-    # No owner, file, command or commit (user, 2026-10-23 19:20). Examples: the demo and handler cases of 2026-10-23.
-    PushText("permission.rca_started", "{sender}", "note", "{sender}: finding why {session} hit a check",
-        NoActionNeeded(),
-        "At {time} in the {session} session, {stop}.{waits_line} "
-        + "A session now finds the cause and fixes it, so this does not happen again. "
-        + "A second push comes when the fix is in.",
-        (PushExample("typical", {"sender": "hana", "session": "demo", "time": "14:23 AST",
-            "stop": "auto mode refused a file change", "waits_line": " The demo build waits for it."}),
-         PushExample("prompt", {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
-            "stop": "the session asked you to allow a shell command", "waits_line": ""})),
-        purpose="Someone starts to find the cause of a session's permission check."),
-    PushText("permission.rca_fixed", "{sender}", "note", "{sender}: fixed why {session} hit a check",
-        NoActionNeeded(),
-        "At {time} in the {session} session, {stop}.\nWhy: {cause}.\nNow: {fix}.",
-        (PushExample("typical", {"sender": "hana", "session": "demo", "time": "14:23 AST",
-            "stop": "auto mode refused a file change",
-            "cause": "the steps told the session to write a progress file by hand, which auto mode does not allow",
-            "fix": "a script writes that file, so the session never has to"}),
-         PushExample("prompt", {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
-            "stop": "the session asked you to allow a shell command",
-            "cause": "a helper ran a build command that needs your permission",
-            "fix": "helpers use the build command that is always allowed"})),
-        purpose="The fix merged: that check no longer stops or refuses the session."),
-    # rca.py fixed sends this when the push review refused the fixed text twice: the reviewer's own rewrite.
-    PushText("permission.rca_fixed_rewritten", "{sender}", "note", "{title}", NoActionNeeded(), "{body}",
-        (PushExample("typical", {"sender": "hana", "title": "hana: fixed why demo hit a check",
-            "body": "At 14:23 AST in the demo session, auto mode refused a file change.\n"
-            + "Why: its steps told it to write a progress file by hand.\nNow: a script writes that file."}),),
-        purpose="The fix merged; the push review wrote this text after two refusals."),
     # send.py fills the sender from the session or the script name.
     PushText("quota.paid_credits", "{sender}", "decision", "{title}",
         ActionTemplate(PAID_CREDIT_ACTION_PREFIX + "{credit_accounts}"),

@@ -11,21 +11,24 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 import contextlib
 import fcntl
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
 import io
 import json
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
+from collections.abc import Generator
 import unittest
 from pathlib import Path
-from typing import final, override
+from typing import cast, final, override
 from unittest import mock
 
 
 from scripts.production import fake_unit_host
-from scripts.production import production_lifecycle
+from scripts.production import merge_checkpoint, production_lifecycle, promotion as publication
 from scripts.production import showrunners
 from scripts.herdr import worker_panes
 from scripts.agents import stop_resume
@@ -33,12 +36,24 @@ from scripts.production import showrunner_tree
 from scripts.production.fake_unit_host import HostedUnit
 
 
-from scripts.production import staff, unit_config
-from scripts.production.production_doc import read_production, Refusal
+from scripts.production import log_backup, production_admission, production_doc, staff, unit_config, update_registration
+from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_names import (
+    BACKUP_CHECKOUT, CARGO_LINER_PRODUCTION, GUARD_READY_FILE, LEGACY_COPIES, LIVE_DOCUMENT_SUFFIX,
+    MERGE_CHECKOUT_FIELD, MOVE_RECORD,
+)
+from scripts.usage import agents_log
+from scripts.worktree import worktrees
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture
-from scripts.production.cli_fixture import production_paths
+from scripts.production.merge_checkpoint_test_support import save_promotion_verdict
+from scripts.production.cli_fixture import invoke_cli, production_paths
+from scripts.production.add_showrunner_test_support import write_guard_proof
+from scripts.lib import land_main
+from scripts.lib.atomic_file import prepared_replacement
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 
 
@@ -68,6 +83,98 @@ class ProductionReaderTests(StaffTestCase):
 
 @final
 class LifecycleTests(LifecycleFixture):
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        directory = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, {
+            **fixture_git_environment(directory), "GIT_CONFIG_SYSTEM": os.devnull,
+        }, clear=True)))
+        super().setUpClass()
+
+    def test_move_and_reverse_keep_the_original_cargo_liner_log_in_main(self) -> None:
+        target = staff.rename(self.owner_id(), CARGO_LINER_PRODUCTION)
+        executor = fixture_member("showrunner", name="executor")
+        merge_name = f"{target.name}-merges"
+        integration = self.root / merge_name / "integration"
+        staging = integration.parent / "staging"
+        integration.parent.mkdir()
+        _ = self.git("worktree", "add", "-b", f"{merge_name}-integration", str(integration), "main")
+        _ = self.git("worktree", "add", "-b", f"{merge_name}-staging", str(staging), "main")
+        _ = staff.ensure("unit", name=merge_name, parent=staff.ReportsTo(target.id),
+                         worktree=staff.PresentWorktree(remote.local_machine(), staging), unit_type="merge",
+                         runtime_id=fixture_runtime_id(merge_name))
+        _ = self.doc.write_text(self.doc.read_text().replace(
+            "- **Merge branch:** `production`", f"- **Merge branch:** `main`\n- **Repository:** `{self.checkout}`"))
+        original_doc = self.doc.read_bytes()
+        original_log = b"First entry\r\nSecond entry\n"
+        _ = self.log.write_bytes(original_log)
+        inode = self.log.stat().st_ino
+        live_doc = self.doc.with_name(self.doc.stem + LIVE_DOCUMENT_SUFFIX)
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        with (common / "info/exclude").open("a", encoding="utf-8") as output:
+            _ = output.write(f"\n/{self.log.name}\n/{live_doc.relative_to(self.checkout).as_posix()}\n")
+        made = worktrees.WorktreeRecord(1, str(staging), "merge-staging", str(self.checkout),
+                                         "main", "main", merge_name, "2026-11-20T00:00:00Z")
+        self.env["WORKTREES_STATE_DIR"] = str(self.state / "worktrees")
+        with mock.patch.dict(os.environ, self.env):
+            worktrees.write_record(made)
+            made_path = worktrees.record_file(staging)
+        tip, index = self.git("rev-parse", "main"), (common / "index").read_bytes()
+        offset = timezone(timedelta(hours=-5))
+        now = datetime.now(UTC).astimezone(offset)
+        with mock.patch.object(production_lifecycle, "require_approval_terminal"):
+            approved = self.run_lifecycle("approve-move", "--production", target.name,
+                "--executor", executor.name, "--window-start", (now - timedelta(minutes=1)).isoformat(),
+                "--window-end", (now + timedelta(minutes=10)).isoformat())
+        self.assertEqual(approved.returncode, 0, approved.stdout + approved.stderr)
+        approval = cast(dict[str, object], json.loads(approved.stdout))
+        self.assertEqual(approval["status"], {"kind": "open"})
+        self.assertEqual(approval["executor_staff_id"], executor.id)
+        self.assertEqual(approval["destinations"], {"live_doc": str(live_doc), "log": str(self.log)})
+        _ = self.env.pop("CODEX_THREAD_ID", None)
+        self.env["CLAUDE_CODE_SESSION_ID"] = executor.current_session
+        peer_bytes = b"Document published by another writer.\n"
+        link = os.link
+
+        def publish_peer_document(source: Path, destination: Path) -> None:
+            if destination == live_doc:
+                _ = destination.write_bytes(peer_bytes)
+            link(source, destination)
+
+        with mock.patch.object(os, "link", side_effect=publish_peer_document):
+            blocked = self.run_lifecycle("move-files", "--production", target.name)
+        self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
+        self.assertEqual(live_doc.read_bytes(), peer_bytes)
+        live_doc.unlink()
+        moved = self.run_lifecycle("move-files", "--production", target.name)
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        self.assertEqual(worktrees.read_record(made_path), replace(made, merge_branch=f"{merge_name}-integration"))
+        approval_path = self.state / "showrunner" / target.id / MOVE_RECORD
+        saved = cast(dict[str, object], json.loads(approval_path.read_text()))
+        self.assertEqual(cast(dict[str, object], saved["status"])["kind"], "closed")
+        self.assertEqual((self.doc.read_bytes(), self.log.read_bytes(), self.log.stat().st_ino),
+                         (original_doc, original_log, inode))
+        _ = staff.set_doc(target.id, staff.LiveDoc(remote.local_machine(), live_doc))
+        live = read_production(target.id)
+        self.assertEqual((live.checkout, live.log), (integration, self.log))
+        with mock.patch.dict(os.environ, self.env):
+            production_admission.require_admission(live)
+        with live.log.open("ab") as output:
+            _ = output.write(b"Entry after the move\n")
+        assert isinstance(target.doc, staff.LiveDoc)
+        _ = staff.set_doc(target.id, target.doc)
+        reversed_move = self.run_lifecycle("move-files", "--production", target.name, "--reverse")
+        self.assertEqual(reversed_move.returncode, 0, reversed_move.stdout + reversed_move.stderr)
+        self.assertEqual(worktrees.read_record(made_path), made)
+        restored = read_production(target.id)
+        self.assertEqual((restored.doc, restored.log), (self.doc, self.log))
+        with mock.patch.dict(os.environ, self.env):
+            production_admission.require_admission(restored)
+        self.assertEqual((restored.log.read_bytes(), restored.log.stat().st_ino),
+                         (original_log + b"Entry after the move\n", inode))
+        self.assertEqual((self.git("rev-parse", "main"), (common / "index").read_bytes()), (tip, index))
+
     def test_wrap_preserves_each_units_standing_responsibilities_in_its_parked_file(self) -> None:
         runner, alpha, beta, child = self.staff_tree()
         original = unit_config.read(self.alpha)
@@ -84,6 +191,26 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(staff.by_id(beta.id), replace(beta, worktree=staff.RemovedWorktree(remote.local_machine(), self.beta, staff.ParkedBranch("beta-branch"))))
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), self.doc)))
         self.assertEqual(staff.by_id(child.id), child)
+
+    def enroll_document(self) -> tuple[Path, Path]:
+        integration = self.root / "integration"
+        legacy = self.doc.read_text()
+        if self.git("branch", "--show-current") == "production":
+            _ = self.git("switch", "main")
+        _ = self.git("worktree", "add", "-B", "production", str(integration), "production"
+                     if self.git("branch", "--list", "production") else "main")
+        live = self.doc.with_name(self.doc.stem + LIVE_DOCUMENT_SUFFIX)
+        self.write(live, legacy.replace(
+            f"- **Showrunner checkout:** `{self.checkout}`",
+            f"- **Showrunner checkout:** `{integration}`\n- **Repository:** `{self.checkout}`\n"
+            + f"- **{MERGE_CHECKOUT_FIELD}:** `{self.checkout}`"))
+        with (self.checkout / ".git/info/exclude").open("a", encoding="utf-8") as output:
+            _ = output.write(f"\n/{live.relative_to(self.checkout).as_posix()}\n/{self.log.name}\n")
+        with mock.patch.dict(os.environ, self.env):
+            if (production_admission.admission_folder() / f"{self.owner_id()}.json").exists():
+                production_admission.record_verified_move(read_production(self.owner_id()), live)
+        _ = staff.set_doc(self.owner_id(), staff.LiveDoc(remote.local_machine(), live))
+        return live, integration
 
     def test_wrap_refuses_a_permanent_child_before_any_file_or_staff_change(self) -> None:
         runner, alpha, beta, child, permanent = self.permanent_staff_tree()
@@ -137,6 +264,10 @@ class LifecycleTests(LifecycleFixture):
         super().setUp()
         self.env["GATE_TEST_HOST"] = remote.local_machine()
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
+        _ = cast(object, self.enterContext(mock.patch.dict(
+            os.environ, {"SHOWRUNNER_STATE_DIR": self.env["SHOWRUNNER_STATE_DIR"]})))
+        with mock.patch.dict(os.environ, self.env):
+            _ = production_admission.capture_rollout_inventory([self.owner_id()])
 
     @override
     def reports_to(self, child: str, parent: str) -> Path:
@@ -186,8 +317,9 @@ class LifecycleTests(LifecycleFixture):
         runner, alpha, beta, child = self.staff_tree()
         target = runner.id if retire_showrunner else alpha.id
         original_doc, original_worktree = staff.set_doc, staff.set_worktree
-        def interrupted_doc(staff_id: staff.StaffId, value: staff.LiveDoc | staff.WrappedDoc) -> staff.StaffRow:
-            row = original_doc(staff_id, value)
+        def interrupted_doc(staff_id: staff.StaffId, value: staff.LiveDoc | staff.WrappedDoc, *,
+                            expected: staff.LiveDoc) -> staff.StaffRow:
+            row = original_doc(staff_id, value, expected=expected)
             if staff_id == target:
                 raise OSError("stopped after staff retirement")
             return row
@@ -516,6 +648,7 @@ class LifecycleTests(LifecycleFixture):
             session_staff.UnreadablePaneList("agents", "pane list denied"),))
         output = io.StringIO()
         with (mock.patch.object(unit_lookup, "every_labeled_session", return_value=every),
+              mock.patch.dict(os.environ, self.env),
               contextlib.redirect_stdout(output)):
             production_lifecycle.load(production, [], True, None)
         self.assertIn("alpha: unknown", output.getvalue())
@@ -550,9 +683,95 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("production.log", (self.checkout / common_dir / "info/exclude").read_text())
 
     def test_open_needs_no_session_name(self) -> None:
-        result = self.run_lifecycle("open")
-        self.assert_step(result, "ok")
-        self.assertIn("doc: ok — running", result.stdout)
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "fixture"
+        _ = shutil.copytree(self.root, snapshot)
+        staff_bytes = self.staff.staff_file.read_bytes()
+
+        def assert_registration_refused(name: str, checkout: Path) -> None:
+            with mock.patch.object(agents_log, "append") as usage:
+                denied = invoke_cli(update_registration, update_registration.main,
+                    ["register", "--production", name], self.env, checkout, production_state=True)
+                self.assert_step(denied, "failed")
+                self.assertIn(GUARD_READY_FILE, denied.stdout)
+                usage.assert_not_called()
+
+        for form in ("unlisted legacy", "legacy", "enrolled"):
+            with self.subTest(form=form):
+                if form != "unlisted legacy":
+                    shutil.rmtree(self.root)
+                    _ = shutil.copytree(snapshot, self.root)
+                    _ = self.staff.staff_file.write_bytes(staff_bytes)
+                if form == "unlisted legacy":
+                    new_doc = self.doc.with_name("new-production.md")
+                    self.write(new_doc, "\n".join(line for line in self.doc.read_text().splitlines()
+                                                  if not line.startswith("> **Status:")) + "\n")
+                    newcomer = fixture_member("showrunner", name="new", doc=staff.LiveDoc(remote.local_machine(), new_doc))
+                    _ = self.git("add", str(new_doc))
+                    _ = self.git("commit", "-m", "Add a legacy document without a status")
+                    assert_registration_refused(newcomer.name, self.checkout)
+                    timer = self.state / "notifier" / f"showrunner-{newcomer.id}"
+                    self.assertFalse(timer.exists())
+                    self.write(timer / "conf", f"TARGET=session:{newcomer.id}\n")
+                    self.write(new_doc, "> **Status: PRODUCTION — planned.**\n\n" + new_doc.read_text())
+                    _ = self.git("add", str(new_doc))
+                    _ = self.git("commit", "-m", "Add planned status to the unlisted production")
+                    before = new_doc.read_bytes(), self.git("rev-parse", "HEAD"), self.calls()
+                    assert_registration_refused(newcomer.name, self.checkout)
+                    for arguments in (("load",), ("load", "--resume"), ("open",)):
+                        result = self.run_lifecycle(arguments[0], *arguments[1:], "--production", newcomer.name)
+                        self.assert_step(result, "failed")
+                        self.assertIn(GUARD_READY_FILE, result.stdout)
+                    self.assertEqual((new_doc.read_bytes(), self.git("rev-parse", "HEAD"), self.calls()), before)
+                    self.assertFalse((self.state / "showrunner/admission" / f"{newcomer.id}.json").exists())
+                    continue
+                if form == "legacy":
+                    timer = self.state / "notifier" / f"showrunner-{self.owner_id()}"
+                    saved = timer.rename(timer.with_name("saved-fixture-timer"))
+                    result = self.run_lifecycle("open")
+                    _ = saved.rename(timer)
+                    self.assert_step(result, "ok")
+                    self.assertIn("doc: ok — running", result.stdout)
+                    continue
+                receipt = self.state / "showrunner/admission" / f"{self.owner_id()}.json"
+                receipt.unlink()
+                live, integration = self.enroll_document()
+                before = live.read_bytes(), self.git("rev-parse", "HEAD", cwd=integration)
+                timer = self.state / "notifier" / f"showrunner-{self.owner_id()}"
+                saved_timer = timer.rename(timer.with_name("saved-fixture-timer"))
+                calls = self.calls()
+                assert_registration_refused("example", integration)
+                self.assertFalse(timer.exists())
+                self.assertEqual(self.calls(), calls)
+                for action in ("load", "open"):
+                    result = self.run_lifecycle(action)
+                    self.assert_step(result, "failed")
+                    self.assertIn(GUARD_READY_FILE, result.stdout)
+                _ = saved_timer.rename(timer)
+                self.assertEqual((live.read_bytes(), self.git("rev-parse", "HEAD", cwd=integration)), before)
+                write_guard_proof(self.root, self.state / "showrunner", self.checkout)
+                for name, folder in (("alpha", self.alpha), ("beta", self.beta)):
+                    self.write(folder / ".unit.toml", f'plan = "docs/plans/{name}.md"\nresponsibilities = []\n')
+                _ = self.git("rm", "docs/plans/alpha.md", cwd=integration)
+                _ = self.git("commit", "-m", "Prepare an untracked unit plan", cwd=integration)
+                self.write(integration / "docs/plans/alpha.md", "# Alpha plan\n")
+                main = self.git("symbolic-ref", "HEAD"), self.git("rev-parse", "HEAD"), self.git("ls-files", "--stage")
+                with mock.patch.object(production_doc, "GUARD_REPOSITORY", self.checkout):
+                    result = self.run_lifecycle("open")
+                self.assert_step(result, "ok")
+                self.assertIn("doc: ok — running", result.stdout)
+                self.assertEqual(self.git("ls-files", "--", str(live), str(self.log)), "")
+                self.assertEqual(self.git("symbolic-ref", "HEAD"), main[0])
+                self.assertEqual(self.git("rev-parse", "HEAD"), main[1])
+                self.assertEqual(self.git("ls-files", "--stage"), main[2])
+                self.assertEqual(self.git("show", "--format=", "--name-only", "HEAD", cwd=integration),
+                                 "docs/plans/alpha.md")
+                self.assertIn('"basis": "guard and document"', receipt.read_text())
+                (self.state / "showrunner" / GUARD_READY_FILE).unlink()
+                with mock.patch.object(agents_log, "append"):
+                    registered = invoke_cli(update_registration, update_registration.main,
+                        ["register", "--production", "example"], self.env, integration, production_state=True)
+                self.assertEqual(registered.returncode, 0, registered.stdout + registered.stderr)
+                self.assertIn("registered", registered.stdout)
 
     def test_open_skips_missing_plan_then_commits_it_on_rerun(self) -> None:
         _ = self.git("rm", "--cached", "docs/plans/alpha.md")
@@ -707,7 +926,10 @@ class LifecycleTests(LifecycleFixture):
         _ = self.merge_tip()
         destination = self.promotion_checkout("installed")
         hook = destination / ".claude/config/post_push.sh"
-        self.write(hook, 'printf "%s\\n" "$LANDED_SHA" >> .git/hook-runs\n')
+        self.write(hook, 'test "$(git rev-parse HEAD)" = "$LANDED_SHA" || exit 9\n'
+                   + 'common=$(git rev-parse --git-common-dir)\n'
+                   + 'test ! -f "$common/hold-hook" || exit 9\n'
+                   + 'printf "%s\\n" "$LANDED_SHA" >> "$common/hook-runs"\n')
         self.production_doc("running", promote=f"`{destination}`")
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "declare promotion")
@@ -740,6 +962,105 @@ class LifecycleTests(LifecycleFixture):
                        "--production", "example", "--no-ci"]
             _ = publish_after_contender(self, self.checkout, self.origin, command, self.env, cwd=self.checkout)
             self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), self.git("rev-parse", "HEAD"))
+
+        for hook_state in ("done", "equal pending", "newer pending", "newer completion", "intervening fetch",
+                           "suffix match"):
+            with self.subTest(installed="newer integration commit", hook=hook_state):
+                base = self.git("rev-parse", "HEAD", cwd=destination)
+                earlier = self.git("commit-tree", "HEAD^{tree}", "-p", base, "-m", "Requested promotion")
+                later = self.git("commit-tree", "HEAD^{tree}", "-p", earlier, "-m", "Newer integration commit")
+                _ = self.git("push", "origin", f"{later}:refs/heads/production")
+                _ = self.git("fetch", "origin", "production", cwd=destination)
+                _ = self.git("merge", "--ff-only", later, cwd=destination)
+                hold = destination / ".git/hold-hook"
+                if hook_state != "done":
+                    hold.touch()
+                destinations = production_doc.PromoteTo((destination,), production_doc.NoMac())
+                with (mock.patch.dict(os.environ, self.env, clear=True), production_paths(self.env),
+                      contextlib.redirect_stdout(io.StringIO()) as output):
+                    _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), self.doc, earlier)
+                    _ = merge_checkpoint.promote_targets(destinations, "production", earlier, source=self.checkout,
+                                                         approval=publication.CollectedCi(self.doc),
+                                                         label="fixture checkpoint", local_only=True)
+                self.assertIn(f"{destination} main at {earlier}; local main remains at {later}", output.getvalue())
+                self.assertEqual(self.git("rev-parse", "main", cwd=destination), later)
+                self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), earlier)
+                runs = destination / ".git/hook-runs"
+                if hook_state == "done":
+                    self.assertIn("post-push hook: done", output.getvalue())
+                    self.assertEqual(runs.read_text().splitlines()[-1], earlier)
+                    continue
+                failure, = [line for line in output.getvalue().splitlines() if "rerun: " in line]
+                self.assertIn("post-push hook: failed (exit 9)", failure)
+                retry_command = failure.split("rerun: ", 1)[1]
+                self.assertIn(f"LANDED_SHA={earlier}", retry_command)
+                retry_env = self.env
+
+                def retry() -> subprocess.CompletedProcess[str]:
+                    return subprocess.run(["bash", "-c", retry_command], cwd=self.checkout, env=retry_env,
+                                          capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+
+                if hook_state in ("equal pending", "suffix match"):
+                    if hook_state == "suffix match":
+                        _ = self.git("push", "origin", f"{later}:refs/heads/archive/refs/heads/main")
+                    hold.unlink()
+                    result = retry()
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("post-push hook: done", result.stdout)
+                    self.assertEqual(runs.read_text().splitlines()[-1], earlier)
+                    completed = runs.read_bytes()
+                    result = retry()
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("post-push hook: skipped", result.stdout)
+                    self.assertEqual(runs.read_bytes(), completed)
+                    continue
+
+                record = destination / ".git/post-push-completed"
+                if hook_state in ("newer pending", "intervening fetch"):
+                    with mock.patch.dict(os.environ, self.env, clear=True):
+                        landed = land_main.land(destination, later)
+                    self.assertIsInstance(landed.hook, land_main.HookFailed)
+                    self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), later)
+                    refusal = f"origin/main has a newer publication {later}"
+                else:
+                    # Simulate the completion record left by a remote rewind.
+                    _ = record.write_text(later + "\n", encoding="utf-8")
+                    refusal = f"the hook completion record has a newer commit {later}"
+
+                fetch_marker = self.root / "intervening-fetch" / "fetched"
+                if hook_state == "intervening fetch":
+                    real_git = shutil.which("git", path=self.env["PATH"])
+                    if real_git is None:
+                        self.fail("Git is missing from the fixture PATH")
+                    shim = fetch_marker.with_name("git")
+                    # Fetch the earlier commit in the checkout after each origin read: the ls-remote and any SHA fetch.
+                    self.write(shim, '''#!/bin/sh
+"$FIXTURE_GIT" "$@" || exit $?
+[ "$1" = -C ] && [ "$2" = "$FIXTURE_DESTINATION" ] || exit 0
+shift 2
+while [ "$1" = -c ]; do shift 2; done
+case "$1" in
+ls-remote|fetch)
+    "$FIXTURE_GIT" -C "$FIXTURE_DESTINATION" fetch --quiet origin "$FIXTURE_EARLIER" || exit $?
+    touch "$FIXTURE_FETCH_MARKER"
+    ;;
+esac
+''')
+                    shim.chmod(0o755)
+                    retry_env = {
+                        **self.env, "PATH": str(shim.parent) + os.pathsep + self.env["PATH"],
+                        "FIXTURE_GIT": real_git, "FIXTURE_DESTINATION": str(destination),
+                        "FIXTURE_EARLIER": earlier, "FIXTURE_FETCH_MARKER": str(fetch_marker),
+                    }
+                hold.unlink()
+                before = runs.read_bytes(), record.read_bytes()
+                refused = retry()
+                if hook_state == "intervening fetch":
+                    self.assertTrue(fetch_marker.exists())
+                    self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), later)
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                self.assertIn(refusal, refused.stderr)
+                self.assertEqual((runs.read_bytes(), record.read_bytes()), before)
 
     def test_promote_main_holds_foreign_local_main_commit_without_push(self) -> None:
         self.running()
@@ -779,7 +1100,7 @@ class LifecycleTests(LifecycleFixture):
             calls = [line for line in self.calls().splitlines() if line.startswith("ssh ")]
             self.assertEqual(len(calls), 1)
             self.assertIn("ssh mac", calls[0])
-            self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{destination} main", calls[0])
+            self.assertIn(f"git fetch -q --no-write-fetch-head natedev:{destination} {tip}", calls[0])
         _ = (self.state / "mac-rc").write_text("1\n")
         failed = self.run_lifecycle("promote-main", "--no-ci")
         self.assert_step(failed, "failed")
@@ -890,6 +1211,24 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("ci: held", result.stdout)
         self.assertTrue(self.alpha.exists())
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), origin_before)
+
+        main_before = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+        check_ci = production_lifecycle.ci_steps
+
+        def advance_after_ci(production: Production, tip: str, no_ci: bool,
+                             ci: production_lifecycle.CommitVerdict | production_lifecycle.VerdictMissing,
+                             smoke: production_lifecycle.CommitVerdict | production_lifecycle.VerdictMissing) -> None:
+            check_ci(production, tip, no_ci, ci, smoke)
+            _ = self.git("commit", "--allow-empty", "-m", "Advance integration after CI")
+
+        with (self.subTest(verdict="tip changes after CI"),
+              mock.patch.object(production_lifecycle, "ci_steps", side_effect=advance_after_ci)):
+            changed = self.run_lifecycle("wrap", "--ci-green", tip, "--smoke-passed", tip)
+            self.assert_step(changed, "held")
+            self.assertIn("tip changed", changed.stdout)
+            self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main_before)
+            self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), origin_before)
+            self.assertTrue(self.alpha.exists())
 
         incompatible = self.run_lifecycle("wrap", "--no-ci", "--smoke-passed", tip)
         self.assert_step(incompatible, "failed")
@@ -1061,7 +1400,9 @@ class LifecycleTests(LifecycleFixture):
             snapshot = Path(temporary) / "snapshot"
             _ = shutil.copytree(self.root, snapshot)
             staff_bytes = self.staff.staff_file.read_bytes()
-            for landed in ("ancestor", "equal-patch", "separate-promotion"):
+            for landed in ("ancestor", "equal-patch", "separate-promotion", "enrolled", "protected local branch",
+                           "protected origin ref", "legacy branch from HEAD", "document edit at replace",
+                           "integration ref moves at promotion"):
                 with self.subTest(landed=landed):
                     shutil.rmtree(self.root)
                     _ = shutil.copytree(snapshot, self.root)
@@ -1078,18 +1419,167 @@ class LifecycleTests(LifecycleFixture):
                         _ = self.git("cherry-pick", "--no-commit", alpha)
                         _ = self.git("commit", "-m", "Copy alpha patch")
                     _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
-                    if landed == "separate-promotion":
+                    if landed == "protected local branch":
+                        _ = self.git("push", "origin", "production")
+                        document = self.root / "peer-production.md"
+                        self.write(document,
+                                   f"- **Showrunner checkout:** `{self.checkout}`\n- **Merge branch:** `alpha-branch`\n")
+                        _ = fixture_member("showrunner", name="peer", doc=staff.LiveDoc(remote.local_machine(), document))
+                        paths = (self.doc, self.log, self.staff.staff_file,
+                                 self.alpha / ".unit.toml", self.beta / ".unit.toml")
+                        before = tuple(path.read_bytes() for path in paths)
+                        local_refs = self.git("show-ref")
+                        origin_refs = self.git("show-ref", cwd=self.origin)
+                        with mock.patch.object(unit_config, "park", side_effect=AssertionError("park protected unit")):
+                            result = self.run_lifecycle("wrap", "--no-ci")
+                        self.assert_step(result, "held")
+                        self.assertIn("protected production branch alpha-branch", result.stdout)
+                        self.assertEqual(tuple(path.read_bytes() for path in paths), before)
+                        self.assertEqual(self.git("show-ref"), local_refs)
+                        self.assertEqual(self.git("show-ref", cwd=self.origin), origin_refs)
+                        continue
+                    if landed == "protected origin ref":
+                        peer = self.root / "peer"
+                        _ = self.git("clone", "-qb", "alpha-branch", str(self.origin), str(peer), cwd=self.root)
+                        document = peer / "peer-production.md"
+                        self.write(document, f"- **Showrunner checkout:** `{peer}`\n- **Merge branch:** `alpha-branch`\n")
+                        _ = fixture_member("showrunner", name="peer", doc=staff.LiveDoc(remote.local_machine(), document))
+                    if landed == "legacy branch from HEAD":
+                        _ = self.doc.write_text(self.doc.read_text().replace("- **Merge branch:** `production`\n", ""))
+                        _ = self.git("add", str(self.doc))
+                        _ = self.git("commit", "-m", "Use the legacy checkout branch")
+                    if landed in ("enrolled", "document edit at replace"):
+                        _ = self.git("push", "origin", "production")
+                        live, integration = self.enroll_document()
+                        runner = staff.by_id(self.owner_id())
+                        assert runner is not None
+                        if landed == "document edit at replace":
+                            edited = live.read_bytes() + b"\r\nOwner edit before replace.\r\n"
+
+                            @contextlib.contextmanager
+                            def edit_before_replace(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
+                                with prepared_replacement(path, content, mode=mode) as temporary:
+                                    if path == live:
+                                        _ = path.write_bytes(edited)
+                                    yield temporary
+
+                            with mock.patch.object(production_lifecycle, "prepared_replacement", side_effect=edit_before_replace):
+                                result = self.run_lifecycle("wrap", "--no-ci")
+                            self.assert_step(result, "held")
+                            self.assertIn("document changed during wrap", result.stdout)
+                            self.assertEqual(live.read_bytes(), edited)
+                            self.assertEqual(staff.by_id(runner.id), runner)
+                            continue
+                        staging = self.root / "merge-staging"
+                        _ = self.git("worktree", "add", "-b", "merge-staging", str(staging), "production")
+                        _ = self.git("push", "origin", "merge-staging")
+                        merge_unit = staff.ensure("unit", name="merges", parent=staff.ReportsTo(runner.id),
+                                                  worktree=staff.PresentWorktree(remote.local_machine(), staging), unit_type="merge",
+                                                  runtime_id=fixture_runtime_id("example-merges"))
+                        with mock.patch.dict(os.environ, self.env):
+                            _ = unit_config.write(staging, unit_config.UnitConfig(
+                                unit_config.PlanFile(Path("docs/plans/alpha.md")), unit_config.NoAppPort(), ()))
+                        refs = self.git("rev-parse", "production", "origin/production")
+                        state = self.state / "showrunner"
+                        old_log = state / runner.id / LEGACY_COPIES / "old-log.md"
+                        self.write(old_log, "")
+                        old_bytes = b"Legacy LOG\r\n"
+                        _ = old_log.write_bytes(old_bytes)
+                        backups = self.root / "backups"
+                        repository = backups / runner.id / BACKUP_CHECKOUT
+                        mirror = self.root / "mac-backup.git"
+                        document_bytes, log_bytes = live.read_bytes(), self.log.read_bytes()
+
+                        def backup_mirror(_identity: str) -> log_backup.BackupMirror:
+                            return log_backup.BackupMirror(str(mirror), lambda _repack: "fixture")
+
+                        with mock.patch.dict(os.environ, self.env):
+                            self.assertEqual(log_backup.backup_all(backups, state, staff.snapshot(), backup_mirror, 10), 1)
+                        tip = log_backup.git(repository, "rev-parse", "HEAD")
+                        self.assertFalse(mirror.exists())
+                        edit = b"\r\nAdded during CI.\r\n"
+                        check_ci = production_lifecycle.ci_steps
+
+                        def append_during_ci(production: Production, tip: str, no_ci: bool,
+                                             ci: production_lifecycle.CommitVerdict | production_lifecycle.VerdictMissing,
+                                             smoke: production_lifecycle.CommitVerdict | production_lifecycle.VerdictMissing) -> None:
+                            check_ci(production, tip, no_ci, ci, smoke)
+                            with live.open("ab") as output:
+                                _ = output.write(edit)
+
+                        with mock.patch.object(production_lifecycle, "ci_steps", side_effect=append_during_ci):
+                            result = self.run_lifecycle("wrap", "--no-ci")
+                        self.assert_step(result, "ok")
+                        self.assert_no_ci_skips(result.stdout)
+                        self.assertEqual(live.read_bytes(), document_bytes.replace(
+                            "**Status: PRODUCTION — running.**".encode(),
+                            "**Status: PRODUCTION — wrapped.**".encode(), 1) + edit)
+                        self.assertFalse(staging.exists())
+                        self.assertEqual(staff.by_id(merge_unit.id), replace(merge_unit, worktree=staff.RemovedWorktree(
+                            remote.local_machine(), staging, staff.ParkedBranch("merge-staging"))))
+                        self.assertTrue(integration.is_dir())
+                        self.assertEqual(self.git("rev-parse", "production", "origin/production"), refs)
+                        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc(remote.local_machine(), live)))
+                        self.assertFalse(old_log.exists())
+                        self.assertFalse((state / runner.id).exists())
+                        _ = self.git("init", "--bare", "--initial-branch=main", str(mirror), cwd=self.root)
+                        with mock.patch.dict(os.environ, self.env):
+                            self.assertEqual(log_backup.backup_all(backups, state, staff.snapshot(), backup_mirror, 10), 0)
+                        self.assertEqual(log_backup.git(mirror, "rev-parse", "HEAD"), tip)
+                        restored = self.root / "restored-backup"
+                        _ = self.git("clone", "--quiet", str(mirror), str(restored), cwd=self.root)
+                        self.assertEqual((restored / "document" / live.name).read_bytes(), document_bytes)
+                        self.assertEqual((restored / "log" / self.log.name).read_bytes(), log_bytes)
+                        self.assertEqual((backups / runner.id / LEGACY_COPIES / old_log.name).read_bytes(), old_bytes)
+                        self.assertFalse(self.alpha.exists())
+                        self.assertFalse(self.beta.exists())
+                        continue
+                    if landed in ("separate-promotion", "integration ref moves at promotion"):
                         destination = self.promotion_checkout("installed")
                         self.production_doc("running", promote=f"`{destination}`")
                         _ = self.git("add", str(self.doc))
                         _ = self.git("commit", "-m", "Declare promotion")
+                        if landed == "integration ref moves at promotion":
+                            verified = self.git("rev-parse", "HEAD")
+                            later = self.git("commit-tree", "HEAD^{tree}", "-p", verified, "-m", "Later integration tip")
+                            _ = self.git("fetch", str(self.checkout), later, cwd=destination)
+                            _ = self.git("merge", "--ff-only", later, cwd=destination)
+                            main = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+                            original_git = merge_checkpoint.git
+
+                            def move_integration_after_check(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+                                if checkout == self.checkout and args == (
+                                        "fetch", "origin", "+refs/heads/production:refs/remotes/origin/production"):
+                                    _ = self.git("update-ref", "refs/heads/production", later, verified)
+                                    _ = self.git("push", "origin", "production")
+                                return original_git(checkout, *args)
+
+                            with mock.patch.object(production_lifecycle, "git", side_effect=move_integration_after_check):
+                                result = self.run_lifecycle("wrap", "--ci-green", verified, "--smoke-passed", verified)
+                            self.assert_step(result, "held")
+                            self.assertIn("integration tip changed", result.stdout)
+                            self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
+                            self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=destination), later)
+                            self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), later)
+                            self.assertTrue(self.alpha.exists())
+                            self.assertTrue(self.beta.exists())
+                            continue
                     _ = self.git("push", "origin", "production")
                     result = self.run_lifecycle("wrap", "--no-ci")
                     self.assert_step(result, "ok")
                     self.assert_no_ci_skips(result.stdout)
                     self.assertFalse(self.alpha.exists())
                     self.assertFalse(self.beta.exists())
-                    self.assertEqual(self.git("ls-remote", "--heads", "origin", "alpha-branch", "beta-branch"), "")
+                    refs = self.git("ls-remote", "--heads", "origin", "alpha-branch", "beta-branch")
+                    if landed == "protected origin ref":
+                        self.assertEqual(refs, f"{alpha}\trefs/heads/alpha-branch")
+                        self.assertEqual(self.git("branch", "--list", "alpha-branch", "beta-branch"), "")
+                        self.assertIn("retire: kept — refs/heads/alpha-branch on origin", result.stdout)
+                    else:
+                        self.assertEqual(refs, "")
+                    if landed == "legacy branch from HEAD":
+                        self.assertIn("- **Merge branch:** `production`", self.doc.read_text())
+                        self.assertIn("recorded Merge branch production", result.stdout)
                     self.assertIn("wrapped", self.doc.read_text())
                     if landed == "equal-patch":
                         self.assertEqual(self.git("cherry", "origin/main", alpha).split()[0], "-")
@@ -1130,19 +1620,26 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(result.stderr.count("Worktree pair kept"), 1)
         self.assertEqual(self.git("ls-remote", "--heads", "origin", "alpha-branch", "beta-branch"), "")
 
+    def move_fixture_document(self, destination: Path) -> None:
+        owner = read_production(self.owner_id()).owner
+        binding = staff.LiveDoc(remote.local_machine(), destination)
+        with mock.patch.dict(os.environ, self.env):
+            production_admission.prepare_document_rebind(owner, binding)
+            _ = self.git("mv", str(self.doc), str(destination))
+            _ = production_admission.complete_document_rebind(owner, binding)
+
     def test_wrap_moves_a_doc_out_of_productions_into_the_archive(self) -> None:
         self.running()
         _ = self.side_commit(self.alpha, "alpha-branch", "alpha", "1")
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         kept = self.checkout / "productions/example-production.md"
         kept.parent.mkdir()
-        _ = self.git("mv", str(self.doc), str(kept))
+        self.move_fixture_document(kept)
         _ = self.git("commit", "-m", "keep the doc in productions/")
         _ = self.git("push", "origin", "production")
         self.doc = kept
 
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
-        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), kept))
         self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
                    f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
 
@@ -1165,12 +1662,11 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         kept = self.checkout / "productions/example-production.md"
         kept.parent.mkdir()
-        _ = self.git("mv", str(self.doc), str(kept))
+        self.move_fixture_document(kept)
         _ = self.git("commit", "-m", "keep the doc in productions/")
         _ = self.git("push", "origin", "production")
         self.doc = kept
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
-        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), kept))
         self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
                    f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
         real_checked = production_lifecycle.checked
@@ -1197,12 +1693,11 @@ class LifecycleTests(LifecycleFixture):
         _ = self.side_commit(self.beta, "beta-branch", "beta", "1")
         kept = self.checkout / "productions/different-production.md"
         kept.parent.mkdir()
-        _ = self.git("mv", str(self.doc), str(kept))
+        self.move_fixture_document(kept)
         _ = self.git("commit", "-m", "Move the production document")
         _ = self.git("push", "origin", "production")
         self.doc = kept
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "example")
-        _ = staff.set_doc(runner.id, staff.LiveDoc(remote.local_machine(), kept))
         self.write(self.state / "notifier" / f"showrunner-{self.owner_id()}" / "conf",
                    f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/production_check.sh {kept}\n")
         real_checked = production_lifecycle.checked

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from scripts.lib import atomic_file  # noqa: E402
-from scripts.production import investigation, record_store, showrunners, staff, unit_lookup  # noqa: E402
+from scripts.production import investigation, log_backup, record_store, showrunners, staff, unit_lookup  # noqa: E402
 from scripts.copies import copies  # noqa: E402
 from scripts.production.production_doc import WRAPPED  # noqa: E402
 from scripts.production.proposals_folder import issues_folder  # noqa: E402
@@ -354,6 +354,10 @@ def tidy(production_name: str, document: Path | None = None, *, identities: Ques
 
     identities = identities if identities is not None else QuestionStaff.read()
     row = identities.owner(document) if document is not None else showrunners.owner_for(production_name, identities.record)
+    try:
+        log_backup.preserve_legacy_logs(STATE_DIR, row.id)
+    except OSError as error:
+        raise TidyRefused(f"cannot preserve legacy LOG backups: {error}") from error
     paths = owned_paths(row)
     units = () if document is None else tuple(identities.record.find(kind="unit", parent=row.id))
     if document is not None:
