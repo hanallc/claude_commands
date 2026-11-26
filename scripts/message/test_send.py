@@ -57,6 +57,7 @@ from scripts.message.relay_identity import publish_relay_identity, relay_session
 from scripts.message.relay_test_support import write_relay_record
 from scripts.lib import conf, names, process_start, models_registry
 from scripts.production import fake_unit_host, session_staff, staff, stall_watch, unit_lookup
+from scripts.production.unit_lookup import checked_conversation
 from scripts.message import send_result
 from scripts.message.unit_labels import StaffRowAnomaly
 from scripts.message.recipient_test_support import staff_child_command
@@ -6148,6 +6149,32 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                       mock.patch.object(staff, "local_snapshot", side_effect=staff.StaffUnreadable("unavailable"))):
                     self.assertEqual(send.pending(target).count("Native queue body"), 1)
                     self.assertEqual(send.pending(target), "")
+
+    def test_send_queues_a_starting_claude_session_without_relaying(self) -> None:
+        from scripts.herdr import herdr
+
+        identity = fixture_runtime_id("starting-recipient")
+        address = f"session:{identity}"
+        place = HerdrPlace("fixture", "w1:p1")
+        pid = 998071
+        environment = fake_unit_host.environment(self.root)
+        fake_unit_host.process(environment, pid, 998070, [], {}, started=str(100 * os.sysconf("SC_CLK_TCK")))
+        _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
+        _ = write_config_fixture(self.root / "config/shutdown.conf", "start_seconds=20\n")
+        pane = {"pane_id": place.pane, "agent_session": {"kind": "id", "value": identity}}
+        info = {"process_info": {"shell_pid": 998070, "foreground_process_group_id": pid,
+                                 "foreground_processes": [{"pid": pid, "name": "claude"}]}}
+        with (mock.patch.dict(os.environ, environment),
+              mock.patch.object(herdr, "live_sessions", return_value=[{"name": place.session}]),
+              mock.patch.object(herdr, "herdr_processes", return_value=[]),
+              mock.patch.object(herdr.Herdr, "listed", return_value=[pane]),
+              mock.patch.object(herdr.Herdr, "result", return_value=info),
+              mock.patch.object(unit_lookup, "checked_conversation", new=checked_conversation)):
+            result = send.send(local_options(["--to", address, "--from", "fixture", "--text", "Wait for startup."]))
+
+        self.assertEqual(result, send.Result("queued", f"pane is starting; kept for {address}"))
+        self.assertIn("Wait for startup.", send.queue_path(f"session-{identity}").read_text())
+        self.assertEqual(self.relayed, [])
 
     def test_absent_staff_recipient_keeps_its_queue_until_claude_returns(self) -> None:
         member = self.staff_rows["recipient"]

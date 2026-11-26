@@ -976,7 +976,7 @@ class NativePaneSessionTests(StaffTestCase):
                         first = client.scan_row_panes(staff.initial_snapshot(), [pane])
                         second = client.scan_row_panes(staff.initial_snapshot(), [pane])
                         self.assertEqual(first.found, {})
-                        self.assertEqual(first.unknown, [herdr.UnknownPane("w1:p1", "w1:t1", "starting")])
+                        self.assertEqual(first.unknown, [herdr.StartingPane("w1:p1", "w1:t1")])
                         self.assertEqual(second, first)
                         self.assertEqual(notes.getvalue(), "herdr agents:w1:p1: pane is starting\n")
                         self.assertEqual(reads.call_count, run + 1)
@@ -8736,7 +8736,7 @@ class RowTabTests(StaffTestCase):
         for text in ("p2", "t1", "private process facts are unavailable"):
             self.assertIn(text, errors.getvalue())
 
-    def test_layout_scan_reports_missing_claude_arguments_only_after_start(self) -> None:
+    def test_layout_scan_reports_missing_agent_arguments_only_after_start(self) -> None:
         configuration = self.root / "configuration"
         _ = write_config_fixture(configuration / "shutdown.conf", "start_seconds=20\n")
         proc = self.root / "proc"
@@ -8747,44 +8747,54 @@ class RowTabTests(StaffTestCase):
         # The relaunch supervisor leads the foreground group.
         _ = (process / "stat").write_text("991000 (claude) S 990500 990500 990000 0 990500 "
                                           + "0 " * 13 + str(100 * ticks))
-        pane: dict[str, object] = dict(self.client.tabs[0])
+        row = self.rows["unit"]
+        pane: herdr.PaneIdentity = {"pane_id": "p0", "tab_id": "t0", "workspace_id": "w1",
+                                    "terminal_id": "terminal-0", "session_id": row.current_session}
         record = staff.snapshot()
         result = self.client.result
 
         def supervised(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
             payload = result(*arguments, deadline=deadline)
             if arguments[:2] == ("pane", "process-info"):
-                herdr.json_object(payload["process_info"], "test process info")["foreground_process_group_id"] = 990500
+                info = herdr.json_object(payload["process_info"], "test process info")
+                info["foreground_process_group_id"] = 990500
+                process, = herdr.json_items(info["foreground_processes"], "test foreground")
+                herdr.json_object(process, "test foreground process")["name"] = kind
             return payload
 
-        for arguments_arrive in (True, False):
-            with (self.subTest(arguments_arrive=arguments_arrive),
+        start_note = "herdr fixture:p0: pane is starting\n"
+        for kind, arguments_arrive in (("claude", True), ("claude", False), ("codex", False)):
+            with (self.subTest(kind=kind, arguments_arrive=arguments_arrive),
                   patch.dict(os.environ, config_environment(configuration)),
                   patch.object(self.client, "result", side_effect=supervised),
                   herdr.pane_evidence_run(), redirect_stderr(io.StringIO()) as errors):
                 self.client.missing_argv = {"p0"}
                 _ = uptime.write_text("101.0 0.0\n")
-                starting = self.client.scan_row_panes(record, [pane])
+                starting = self.client.scan_row_panes(record, [dict(pane)])
                 self.assertEqual(starting.found, {})
-                self.assertEqual(starting.unknown, [herdr.UnknownPane("p0", "t0", "starting")])
-                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(starting.unknown, [herdr.StartingPane("p0", "t0")])
+                self.assertEqual(errors.getvalue(), start_note)
+                with redirect_stderr(io.StringIO()) as retained:
+                    self.assertFalse(herdr.check_target(row.current_session, action="keys", client=self.client,
+                        place=herdr.HerdrPlace("fixture", "p0"), pane_info=pane))
+                self.assertIn("pane is starting; target retained", retained.getvalue())
 
                 if arguments_arrive:
                     self.client.missing_argv.clear()
                 else:
                     _ = uptime.write_text("120.0 0.0\n")
-                observed = self.client.scan_row_panes(record, [pane])
-                self.assertEqual(self.client.scan_row_panes(record, [pane]), observed)
+                observed = self.client.scan_row_panes(record, [dict(pane)])
+                self.assertEqual(self.client.scan_row_panes(record, [dict(pane)]), observed)
                 if arguments_arrive:
-                    self.assertEqual(observed.found, {self.rows["unit"].id: [pane]})
+                    self.assertEqual(observed.found, {row.id: [pane]})
                     self.assertEqual(observed.unknown, [])
-                    self.assertEqual(errors.getvalue(), "")
+                    self.assertEqual(errors.getvalue(), start_note)
                 else:
                     self.assertEqual(observed.found, {})
-                    self.assertEqual(observed.unknown, [
-                        herdr.UnknownPane("p0", "t0", "agent argv is unavailable")])
-                    self.assertEqual(errors.getvalue(),
-                        "herdr fixture:p0 tab t0: pane evidence is unknown: agent argv is unavailable; row placement retained\n")
+                    reason = "agent argv is unavailable" + (". Foreground programs are codex" if kind == "codex" else "")
+                    self.assertEqual(observed.unknown, [herdr.UnknownPane("p0", "t0", reason)])
+                    self.assertEqual(errors.getvalue(), start_note
+                        + f"herdr fixture:p0 tab t0: pane evidence is unknown: {reason}; row placement retained\n")
 
     def test_transfer_continues_for_a_proved_tab_and_keeps_an_unknown_tab(self) -> None:
         unknown = dict(self.client.tabs[2])
