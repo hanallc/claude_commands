@@ -16,7 +16,7 @@ from scripts.build_queue.queue_fixture import fixture_reservation
 TRACE_NOW = 10 * 86_400
 TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 64, 8_192, 2, 8, 65_536,
                                             final_replay_bytes=100000,
-                                            max_pending_commands=8,
+                                            max_pending_commands=8, general_trace_share_percent=50,
                                             scope_loss_grace_seconds=4, seal_retry_count=2)
 TRACE_SHAPE = "a" * 64
 

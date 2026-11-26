@@ -231,7 +231,8 @@ class SharedGateAdmissionTests(ServiceGateFixture):
                 place.status = 0
             self.assertEqual(calls, ["hold check", "connection attempt", "hold check"])
             acquire.assert_called_once_with("gate", self.checkout,
-                before_check=client.AdmissionHoldCheck(hold.wait_until_free, hold.admits))
+                before_check=client.AdmissionHoldCheck(hold.wait_until_free, hold.admits),
+                trace_sampling=wire.ProcessTreeTraceSampling())
             before_check.assert_not_called()
         self.assert_gate_released()
         row, = self.gate_history()
