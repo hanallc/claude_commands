@@ -2403,9 +2403,12 @@ def _assignment_hold(row: staff.StaffRow, record: staff.StaffSnapshot, detached:
     state = _worker_dispatch_state(row, record, detached, lock, read=reply_checks)
     if isinstance(state, worker_panes.DispatchHoldsWorker):
         return state
-    statuses = {status_file} if status_file and not isinstance(retry, RetryingAssignment) else set[str]()
+    statuses = {Path(status_file)} if status_file and not isinstance(retry, RetryingAssignment) else set[Path]()
+    latest_status_pass: dict[Path, tuple[float, bool]] = {}
     for directory in detached.launcher_runs.by_worker[row.id]:
-        for passed in _pass_records(read(directory)):
+        fields = read(directory)
+        current_passes = _pass_records(fields)
+        for passed in current_passes:
             if passed.get("worker_id") != row.id:
                 continue
             if passed.get("status") in ("active", "refused"):
@@ -2413,12 +2416,19 @@ def _assignment_hold(row: staff.StaffRow, record: staff.StaffSnapshot, detached:
                         and passed.get("instance_id") == state.dispatch_id):
                     continue
                 return worker_panes.DispatchHoldsWorker("a pass is open")
-            saved = passed.get("assign_status_file") or pass_recorder.dispatch_delivery(passed).actions.status_file
-            if isinstance(saved, str) and saved:
-                statuses.add(saved)
+            if saved := pass_recorder.dispatch_delivery(passed).actions.status_file:
+                statuses.add(Path(saved))
+        for passed in (*current_passes, *pass_recorder.retained_passes(fields).values()):
+            if passed.get("worker_id") == row.id and (saved := pass_recorder.dispatch_delivery(passed).actions.status_file):
+                path = Path(saved)
+                started = pass_recorder.number(passed.get("started_at"), float("-inf"))
+                blocks_assignment = passed.get("status") != "canceled"
+                latest_status_pass[path] = max(latest_status_pass.get(path, (float("-inf"), False)),
+                                               (started, blocks_assignment))
     for status in statuses:
+        _, blocks_assignment = latest_status_pass.get(status, (0, True))
         try:
-            if Path(status).read_text(encoding="utf-8").strip() == "running":
+            if status.read_text(encoding="utf-8").strip() == "running" and blocks_assignment:
                 return worker_panes.DispatchHoldsWorker("the assignment status is running")
         except FileNotFoundError:
             continue
