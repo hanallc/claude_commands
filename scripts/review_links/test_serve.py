@@ -5192,6 +5192,13 @@ class ReviewLinksServerTests(unittest.TestCase):
                                                   hashlib.sha256(target_bytes).hexdigest()))
         review_submissions._write_location(journal, move)  # pyright: ignore[reportPrivateUsage]
 
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+            self.assertEqual(review_submissions.main(["move-reply-proofs", "--dry-run"]), 1)
+        self.assertIn("The Review transfer must finish before its reply proof can move.", errors.getvalue())
+        self.assertTrue(saved.path.read_bytes() == source_bytes)
+        self.assertTrue(target.read_bytes() == target_bytes)
+        self.assertTrue(journal.exists())
+
         with (patch.object(serve, "loaded_module_stamps", return_value={}),
               patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending")):
             _ = self.enterContext(started_review_server(("127.0.0.1", 0), self.root, initialize_review=True))
@@ -5491,6 +5498,111 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertTrue(saved.path.read_bytes() == old)
             self.assertFalse(proof_path.exists())
 
+    def test_server_keeps_the_report_when_startup_stops_after_a_note_rewrite(self) -> None:
+        from scripts.review_links.test_review_submissions import request
+
+        owner = fixture_member("producer", name="report-restart")
+        members = staff.StaffSnapshot((owner,))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
+        self.enterContext(patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)}))
+        notes = [review_submissions.submit(request(new_item_dialog.SubmissionKind.INVESTIGATION, seed, recipient=owner.id))
+                 for seed in ("first", "second")]
+        clean: dict[Path, bytes] = {}
+        tokens: list[str] = []
+        for saved in notes:
+            _, token, content = self.put_legacy_reply_proof_in_note(saved)
+            clean[saved.path] = content
+            tokens.append(token)
+
+        journal = reply_proofs.move_journal_path()
+        rewritten: list[Path] = []
+        write_locked = atomic_file.write_locked_atomic
+        write = os.write
+        read_bytes = Path.read_bytes
+
+        def observe_write(path: Path, content: str | bytes, *, mode: int | None = None) -> None:
+            write_locked(path, content, mode=mode)
+            if path in clean:
+                rewritten.append(path)
+
+        def stop_late_append(descriptor: int, content: bytes) -> int:
+            if rewritten and journal.exists() and os.path.samestat(os.fstat(descriptor), journal.stat()):
+                raise OSError("The process stopped before a late journal append.")
+            return write(descriptor, content)
+
+        def stop_after_rewrite(path: Path) -> bytes:
+            if path in rewritten:
+                raise OSError("The process stopped after the note rewrite.")
+            return read_bytes(path)
+
+        with (patch.object(atomic_file, "write_locked_atomic", side_effect=observe_write),
+              patch.object(os, "write", side_effect=stop_late_append),
+              patch.object(Path, "read_bytes", autospec=True, side_effect=stop_after_rewrite),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve.ReviewLinksServer, "server_bind") as bind,
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(serve.main(["--port", "0"]), 1)
+        bind.assert_not_called()
+        self.assertIn("Cannot start Review links because the reply proof move failed.", errors.getvalue())
+        first, = rewritten
+        self.assertTrue(first.read_bytes() == clean[first])
+        names = ("reply_token_sha256", "reply_token_nonce")
+        self.assertEqual(reply_proofs.read_move_report(), {first: names})
+        prefix = journal.read_bytes()
+
+        with (patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              started_review_server(("127.0.0.1", 0), self.root, initialize_review=True) as server):
+            self.assertGreater(server.server_port, 0)
+        self.assertTrue(journal.read_bytes().startswith(prefix))
+        self.assertEqual(len(journal.read_bytes().splitlines()), 2)
+        self.assertEqual(reply_proofs.read_move_report(), dict.fromkeys(clean, names))
+        for saved, token in zip(notes, tokens, strict=True):
+            self.assertTrue(saved.path.read_bytes() == clean[saved.path])
+            self.assertTrue(review_submissions.answer(saved.key, "Reply after restart", token))
+
+    def test_server_reuses_a_synced_journal_line_when_startup_stops_before_rewrite(self) -> None:
+        from scripts.review_links.test_review_submissions import request
+
+        owner = fixture_member("producer", name="journal-restart")
+        members = staff.StaffSnapshot((owner,))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
+        self.enterContext(patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)}))
+        saved = review_submissions.submit(request(new_item_dialog.SubmissionKind.INVESTIGATION, recipient=owner.id))
+        _, token, clean = self.put_legacy_reply_proof_in_note(saved)
+        original = saved.path.read_bytes()
+        journal = reply_proofs.move_journal_path()
+        names = ("reply_token_sha256", "reply_token_nonce")
+        write_locked = atomic_file.write_locked_atomic
+
+        def stop_before_rewrite(path: Path, content: str | bytes, *, mode: int | None = None) -> None:
+            if path == saved.path:
+                self.assertEqual(reply_proofs.read_move_report(), {path: names})
+                raise OSError("The process stopped before the note rewrite.")
+            write_locked(path, content, mode=mode)
+
+        with (patch.object(atomic_file, "write_locked_atomic", side_effect=stop_before_rewrite),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve.ReviewLinksServer, "server_bind") as bind,
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(serve.main(["--port", "0"]), 1)
+        bind.assert_not_called()
+        self.assertIn("Cannot start Review links because the reply proof move failed.", errors.getvalue())
+        self.assertTrue(saved.path.read_bytes() == original)
+        line = journal.read_bytes()
+        inode = journal.stat().st_ino
+        self.assertEqual(len(line.splitlines()), 1)
+
+        with (patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              started_review_server(("127.0.0.1", 0), self.root, initialize_review=True) as server):
+            self.assertGreater(server.server_port, 0)
+        self.assertTrue(saved.path.read_bytes() == clean)
+        self.assertEqual(journal.read_bytes(), line)
+        self.assertEqual(journal.stat().st_ino, inode)
+        self.assertEqual(reply_proofs.read_move_report(), {saved.path: names})
+        self.assertTrue(review_submissions.answer(saved.key, "Reply after restart", token))
+
     def test_server_moves_reply_proofs_before_serving(self) -> None:
         from scripts.review_links.test_review_submissions import request
 
@@ -5519,6 +5631,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               redirect_stderr(StringIO()) as errors):
             self.assertEqual(serve.main(["--port", "0"]), 1)
         self.assertIn("Cannot start Review links because the reply proof move failed.", errors.getvalue())
+        self.assertIn(str(saved.path), errors.getvalue())
         bind.assert_not_called()
         serve_requests.assert_not_called()
         self.assertTrue(saved.path.read_text(newline="") == rejected)
@@ -5536,6 +5649,30 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)
         self.addCleanup(server.shutdown)
         self.assertEqual(self.request(review_page.PAGE_PATH).status, 200)
+
+    def test_preview_and_start_skip_unrelated_submission_fields(self) -> None:
+        vault = self.root.parent / "vault"
+        vault.mkdir()
+        notes = {
+            vault / "ordinary.md": '---\nreview_submission: complete\n---\n',
+            vault / "ordinary-with-id.md": '---\nid: "I1"\nreview_submission: complete\n---\n',
+            vault / "different-kind.md": ('---\nid: "I2"\nkind: "other"\n'
+                                          'review_submission: "{\\"reply_token_sha256\\":\\"example\\"}"\n---\n'),
+            vault / "proposal.md": '---\nrecord_type: proposal\nreview_submission: complete\n---\n',
+        }
+        for path, content in notes.items():
+            _ = path.write_text(content, encoding="utf-8")
+        with (patch.object(record_store, "configured_review_vaults", return_value=(vault,)),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
+            self.assertEqual(review_submissions.main(["move-reply-proofs", "--dry-run"]), 0)
+            self.assertEqual(output.getvalue(), "0 notes, 0 fields\n0 notes not in git\n0 open items\n")
+            self.assertEqual(errors.getvalue(), "")
+            with started_review_server(("127.0.0.1", 0), self.root, initialize_review=True) as server:
+                self.assertGreater(server.server_port, 0)
+        for path, content in notes.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), content)
 
     def test_server_initializes_review_on_a_fresh_root(self) -> None:
         with (patch.object(serve, "loaded_module_stamps", return_value={}),

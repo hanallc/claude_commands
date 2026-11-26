@@ -27,8 +27,8 @@ from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
-from scripts.production import investigation, producer_map, proposal_issue, record_store, staff, update_registration
-from scripts.production.issues import Issue, header_fields
+from scripts.production import investigation, issues, producer_map, proposal_issue, record_store, staff, update_registration
+from scripts.production.issues import Issue
 from scripts.production.production_doc import WRAPPED, Refusal
 from scripts.review_links import image_store, list_draft, new_item_dialog, page_frame, reply_proofs, reply_tokens, review_events, review_later, review_link
 from scripts.review_links.new_item_dialog import (
@@ -2858,39 +2858,62 @@ class LocalProofMove:
     extra_roots: tuple[Path, ...] = ()
 
 
+class ProofMoveNoteFailure(OSError):
+    """A refused note path and a message without field values."""
+
+    def __init__(self, path: Path, error: Exception) -> None:
+        reason = str(error) if isinstance(error, reply_proofs.ProofMoveRefusal) else "Cannot move the Review proof."
+        super().__init__(f"{str(path)!r}: {reason}")
+
+
+@dataclass(frozen=True)
+class ProofMoveReport:
+    summary: reply_proofs.ProofMoveSummary
+    refusals: tuple[ProofMoveNoteFailure, ...]
+
+
+def _is_proposal_header(issue: Issue) -> bool:
+    return issue.value("record_type") == "proposal" or "proposal" in issue.fields.get("tags", [])
+
+
+def _numbered_header_has_legacy_proof(header: issues.IssueHeaderSource, issue: Issue) -> bool:
+    fields = issues.encoded_numbered_header_values(header, frozenset(("id", "kind", "review_submission")))
+    explicit_kind = "kind" in fields
+    for encoded in fields.get("kind" if explicit_kind else "id", []):
+        try:
+            value = issues.decode_numbered_field(encoded)
+        except ValueError:
+            value = issues.plain(encoded)
+        if explicit_kind:
+            supported = value in (investigation.InvestigationKind.INVESTIGATION, investigation.InvestigationKind.BUG)
+        else:
+            supported = bool(re.fullmatch(r"I[1-9][0-9]*", value))
+        if supported:
+            return reply_proofs.numbered_header_has_legacy_proof(
+                header, fields.get("review_submission", []), issue.value("review_submission"))
+    return False
+
+
 def _proof_move_header(path: Path) -> Issue:
-    with path.open("rb") as stream:
-        if stream.readline().strip() == b"---":
-            lines: list[bytes] = []
-            has_proof_name = False
-            for line in stream:
-                if line.strip() == b"---":
-                    if has_proof_name:
-                        keys = frozenset(("record_type", "registration", "review_submission", "id", "production_id", "tags"))
-                        return Issue(path, header_fields([entry.decode("utf-8") for entry in lines], keys))
-                    break
-                lines.append(line)
-                has_proof_name |= (line.startswith((b"registration:", b"review_submission:"))
-                                   and (b"reply_token" in line or b"request_key" in line))
-            else:
-                if has_proof_name:
-                    raise ValueError("A note with legacy proof fields has no closing header fence.")
-    return Issue(path, {})
-
-
-def _has_legacy_proof_fields(issue: Issue) -> bool:
-    if issue.value("record_type") != "question":
-        return reply_proofs.header_has_legacy_submission(issue.value("review_submission"))
-    registration = issue.value("registration")
-    if not any(f'"{name}"' in registration for name in (*reply_proofs.SUBMISSION_FIELDS, "request_key")):
-        return False
-    parsed = cast(object, json.loads(registration))
-    if not isinstance(parsed, dict):
-        raise ValueError("A legacy Question has invalid registration fields.")
-    fields = cast(dict[str, object], parsed)
-    submission = fields.get("review_submission")
-    return "request_key" in fields or (isinstance(submission, dict)
-            and reply_proofs.has_legacy_submission(cast(dict[str, object], submission)))
+    with path.open(encoding="utf-8", errors="surrogateescape", newline="") as stream:
+        header = issues.read_issue_header(stream)
+    keys = frozenset(("record_type", "registration", "review_submission", "id", "production_id", "tags"))
+    fields = header.located_fields(keys)
+    issue = Issue(path, issues.decoded_header_fields(fields))
+    layout = reply_proofs.ProofNoteLayout
+    if issue.value("record_type") == "question":
+        legacy = reply_proofs.issue_header_has_legacy_proof(fields, layout.QUESTION)
+    elif _is_proposal_header(issue):
+        legacy = reply_proofs.issue_header_has_legacy_proof(fields, layout.PROPOSAL)
+    elif "id" in fields and "review_submission" in fields:
+        with path.open(encoding="utf-8", errors="surrogateescape", newline="\n") as stream:
+            header = issues.read_numbered_header(stream)
+        legacy = _numbered_header_has_legacy_proof(header, issue)
+    else:
+        legacy = False
+    if legacy and not header.closing:
+        raise reply_proofs.ProofMoveRefusal("The Review note has no closing header fence.")
+    return issue if legacy else Issue(path, {})
 
 
 def _require_legacy_transfers_finished(root: Path) -> None:
@@ -2902,8 +2925,11 @@ def _require_legacy_transfers_finished(root: Path) -> None:
                     issue = _proof_move_header(path)
                 except FileNotFoundError:
                     continue
-                if _has_legacy_proof_fields(issue):
-                    raise OSError("The Review transfer must finish before its reply proof can move.")
+                except (OSError, ValueError) as error:
+                    raise ProofMoveNoteFailure(path, error) from None
+                if issue.fields:
+                    raise ProofMoveNoteFailure(path, reply_proofs.ProofMoveRefusal(
+                        "The Review transfer must finish before its reply proof can move."))
 
 
 def _question_proof_roots(members: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[Path, ...]]:
@@ -2921,13 +2947,26 @@ def _question_proof_owners(path: Path, roots: Mapping[staff.StaffId, tuple[Path,
 
 
 def move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove, *, dry_run: bool) -> tuple[int, int]:
+    report = _run_reply_proof_move(discovery, dry_run=dry_run)
+    if report.refusals:
+        raise OSError("\n".join(map(str, report.refusals)))
+    return report.summary.notes, report.summary.fields
+
+
+def _run_reply_proof_move(discovery: staff.StaffSnapshot | LocalProofMove, *, dry_run: bool) -> ProofMoveReport:
     """Hold the same transfer lock as wrap through the complete move."""
-    with nullcontext() if dry_run else review_later.locked():
-        return _move_reply_proofs(discovery, dry_run=dry_run)
+    run = reply_proofs.ProofMoveRun(dry_run, record_store.configured_review_vaults)
+    run.check_backup_location()
+    lock = atomic_file.existing_writer_lock(review_later.path().with_suffix(".lock")) if run.dry_run else review_later.locked()
+    with lock:
+        run.check_journal()
+        refusals = _move_reply_proofs(discovery, run)
+        return ProofMoveReport(run.summary(), refusals)
 
 
-def _move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove, *, dry_run: bool) -> tuple[int, int]:
-    if isinstance(discovery, LocalProofMove) and not dry_run:
+def _move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove,
+                       run: reply_proofs.ProofMoveRun) -> tuple[ProofMoveNoteFailure, ...]:
+    if isinstance(discovery, LocalProofMove):
         _require_legacy_transfers_finished(discovery.review_root)
 
     @cache
@@ -2946,34 +2985,39 @@ def _move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove, *, dry_r
             members = staff.StaffSnapshot(())
         return _question_proof_roots(members)
 
-    notes = fields_moved = 0
     extra_roots = discovery.extra_roots if isinstance(discovery, LocalProofMove) else ()
+    refusals: list[ProofMoveNoteFailure] = []
     for path in record_store.local_review_paths(extra_roots):
         try:
-            fields = _proof_move_header(path)
-        except FileNotFoundError:
-            continue
-        if not _has_legacy_proof_fields(fields):
-            continue
-        if fields.value("record_type") == "question":
-            owner = staff.StaffId(fields.value("production_id"))
-            if not owner:
-                candidates = _question_proof_owners(path, local_owner_roots())
-                if len(candidates) != 1 and isinstance(discovery, LocalProofMove):
-                    candidates = _question_proof_owners(path, authority_roots())
-                if len(candidates) != 1:
-                    raise ValueError("Cannot resolve the owner of a legacy Question with reply proof fields.")
-                owner, = candidates
-            count = update_registration.move_reply_proof(path, dry_run=dry_run, legacy_owner=owner)
-        elif fields.value("record_type") == "proposal" or "proposal" in fields.fields.get("tags", []):
-            count = proposal_issue.move_reply_proof(path, dry_run=dry_run)
-        elif fields.value("id"):
-            count = investigation.move_reply_proof(path, dry_run=dry_run)
-        else:
-            raise ValueError("Cannot identify a note with reply proof fields.")
-        notes += bool(count)
-        fields_moved += count
-    return notes, fields_moved
+            try:
+                issue = _proof_move_header(path)
+            except FileNotFoundError:
+                continue
+            if not issue.fields:
+                continue
+            if issue.value("record_type") == "question":
+                owner = staff.StaffId(issue.value("production_id"))
+                if not owner:
+                    candidates = _question_proof_owners(path, local_owner_roots())
+                    if len(candidates) != 1 and isinstance(discovery, LocalProofMove):
+                        candidates = _question_proof_owners(path, authority_roots())
+                    if len(candidates) != 1:
+                        raise reply_proofs.ProofMoveRefusal("Cannot resolve the owner of a legacy Question.")
+                    owner, = candidates
+                _ = update_registration.move_reply_proof(path, run=run, legacy_owner=owner)
+            elif _is_proposal_header(issue):
+                _ = proposal_issue.move_reply_proof(path, run=run)
+            elif "id" in issue.fields:
+                _ = investigation.move_reply_proof(path, run=run)
+            else:
+                raise reply_proofs.ProofMoveRefusal("Cannot identify the kind of note.")
+        except (OSError, ValueError, KeyError, RecursionError, Refusal,
+                update_registration.RegistrationFailure, update_registration.InputError) as error:
+            failure = ProofMoveNoteFailure(path, error)
+            if not run.dry_run:
+                raise failure from None
+            refusals.append(failure)
+    return tuple(refusals)
 
 
 def main(argv: list[str]) -> int:
@@ -2984,13 +3028,23 @@ def main(argv: list[str]) -> int:
     _ = move.add_argument("--root", action="append", type=Path, default=[], metavar="FOLDER")
     options = parser.parse_args(argv)
     discovery = LocalProofMove(review_link.review_root(), tuple(cast(list[Path], options.root)))
+    dry_run = cast(bool, options.dry_run)
     try:
-        notes, fields = move_reply_proofs(discovery, dry_run=cast(bool, options.dry_run))
+        report = _run_reply_proof_move(discovery, dry_run=dry_run)
+    except (ProofMoveNoteFailure, reply_proofs.ProofMoveRefusal) as error:
+        print(error, file=sys.stderr)
+        return 1
     except (OSError, ValueError, update_registration.RegistrationFailure):
         print("Could not process the legacy Review reply proof fields.", file=sys.stderr)
         return 1
-    print(f"{notes} notes, {fields} fields")
-    return 0
+    result = report.summary
+    print(f"{result.notes} notes, {result.fields} fields")
+    if dry_run:
+        print(f"{result.outside_git} notes not in git")
+        print(f"{result.open_items} open items")
+    for refusal in report.refusals:
+        print(refusal, file=sys.stderr)
+    return int(bool(report.refusals))
 
 
 if __name__ == "__main__":

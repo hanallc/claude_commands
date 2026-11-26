@@ -16,6 +16,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
+from io import StringIO
 from pathlib import Path
 from typing import cast, override
 
@@ -24,7 +25,7 @@ from scripts.console_text import check as console_text
 from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_routing, delivery_state, record_store, staff
-from scripts.production.issues import Issue
+from scripts.production.issues import Issue, located_numbered_note
 from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens, review_events
 from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
@@ -84,13 +85,19 @@ class Investigations(record_store.NumberedRecords):
 
     @override
     @contextmanager
-    def locked(self, *, check: Callable[[], object] | None = None) -> Generator[None]:
+    def locked(self, *, check: Callable[[], object] | None = None, existing_only: bool = False) -> Generator[None]:
         path = self.lock_path().resolve()
         held = _held_recipients.get()
         if path in held:
             if check is not None:
                 _ = check()
             yield
+            return
+        if existing_only:
+            with atomic_file.existing_writer_lock(path):
+                if check is not None:
+                    _ = check()
+                yield
             return
         with super().locked():
             token = _held_recipients.set(held | {path})
@@ -145,8 +152,9 @@ def _seed_id(path: Path) -> str:
     return _record_id(path, strict=True)
 
 
-def investigation_numbers() -> AbstractContextManager[record_store.LockedRecordNumbers]:
-    return record_store.record_numbers(record_store.RecordKind.INVESTIGATION, _seed_id)
+def investigation_numbers(*, existing_only: bool = False) -> AbstractContextManager[record_store.LockedRecordNumbers]:
+    return record_store.record_numbers(record_store.RecordKind.INVESTIGATION, _seed_id,
+                                       existing_only=existing_only)
 
 
 def review_record_ids(owner: staff.StaffId, *, strict: bool = False) -> Iterator[tuple[Path, str]]:
@@ -311,7 +319,7 @@ def write_review_submission(path: Path, item: Investigation, details: new_item_d
 def _write_submission_fields(store: Investigations, identity: str, path: Path,
                              fields: dict[str, object], text: str) -> None:
     """Replace the submission field without rewriting the rest of the note."""
-    lines = record_store.lines_with_endings(text)
+    lines = list(StringIO(text, newline="\n"))
     for index, line in enumerate(lines[1:], 1):
         if line.rstrip("\r\n") == "---":
             break
@@ -330,30 +338,36 @@ def _require_moved(store: Investigations, identity: str, path: Path) -> None:
         raise InvestigationError("Move the reply proof before editing this note.")
 
 
-def move_reply_proof(path: Path, *, dry_run: bool) -> int:
+def move_reply_proof(path: Path, *, run: reply_proofs.ProofMoveRun) -> int:
     store = _store(review_owner(path))
-    with nullcontext() if dry_run else store.locked():
+    with store.locked(existing_only=run.dry_run):
         text = record_store.read_note_for_proof_move(path)
         if isinstance(text, record_store.VanishedReviewNote):
             return 0
-        identity = record_store.record_text_fields(path, text, frozenset(("id",))).value("id")
+        fields = located_numbered_note(text).decoded_fields()
+        identity = fields.get("id", "")
         if not store.valid_id(identity):
             raise InvestigationError("Invalid investigation ID.")
-        fields, _ = store.parse_text(identity, text)
         raw = fields.get("review_submission", "")
         if not raw:
             return 0
         header = Issue(path, {"owner": [fields["owner"]]} if "owner" in fields else {})
         if record_store.record_owner(record_store.RecordKind.INVESTIGATION, header, store.owner) != store.owner:
             raise InvestigationError("The selected investigation changed.")
-        updated, proof, count = reply_proofs.extract_submission(cast(dict[str, object], json.loads(raw)))
-        if count:
-            details = new_item_dialog.read_submission(updated)
-            proof_id = details.proof_identity(identity)
-            if not dry_run:
-                with reply_proofs.publishing(proof_id, reply_proofs.NoteProof(reply=proof), moving=True):
-                    _write_submission_fields(store, identity, path, updated, text)
-        return count
+        removal = reply_proofs.prepare_note_removal(text, reply_proofs.ProofNoteLayout.SUBMISSION)
+        if not removal.fields:
+            return 0
+        details = new_item_dialog.read_submission(removal.submission)
+        proof_id = details.proof_identity(identity)
+
+        def write(changed: str) -> None:
+            with investigation_numbers(existing_only=run.dry_run) as numbers, numbers.write(
+                    path, identity, store.owner, folder=store.folder(), preview=run.dry_run):
+                if not run.dry_run:
+                    atomic_file.write_locked_atomic(path, changed)
+
+        return run.apply(path, text, removal, [(proof_id, removal.proof)], write,
+                         open_item=fields["state"] in (InvestigationState.OPEN, InvestigationState.ANSWER_READY))
 
 
 def _now() -> str:

@@ -983,11 +983,23 @@ Send uses the transport result even if the server cannot save the delivery failu
 The dialog shows the error and keeps the draft for another Send.
 A retry after the wait ends returns the existing item without sending another message.
 
-Run `scripts/lib/py -m scripts.review_links.review_submissions move-reply-proofs --dry-run` to count legacy notes and fields.
+Run `scripts/lib/py -m scripts.review_links.review_submissions move-reply-proofs --dry-run` to preview the move.
+The preview prints three lines.
+
+1. The number of notes and legacy fields to move.
+2. The number of those notes with uncommitted changes or without a tracked Git path.
+3. The number of those notes that are open items.
+
+The preview validates the same byte changes as the move.
+The preview takes the writer locks that already exist.
+It reads a note without its lock when the lock file is absent.
+The move takes all writer locks and checks each note again.
 A wrap saves a legacy proof under the transfer locks before it publishes the destination note without proof fields.
 The server finishes interrupted transfers before it moves legacy proofs.
 The move holds the same transfer lock as wrap through the pending transfer check and the scan.
 The server checks note headers and reads the full record for each note with a legacy proof field.
+The move uses the Issue reader for Questions and Proposals.
+It uses the numbered record reader for Investigations and Bugs.
 The move scans the vaults in `staff.producer_folder_root` and `issue_score.vault_root`.
 It also scans the native state stores, the stores in the local folder registry, and both archive layouts.
 After you restore an external or former store, run this command with its root.
@@ -996,11 +1008,32 @@ After you restore an external or former store, run this command with its root.
 scripts/lib/py -m scripts.review_links.review_submissions move-reply-proofs --root <folder>
 ```
 
-Add `--dry-run` to count the notes and fields without moving them.
+Add `--dry-run` to preview the move without writing files or creating folders.
 The move skips source notes that vanish during discovery or a read.
 The move requests remote staff records only to resolve an unknown legacy Question owner.
 The server moves legacy proofs under the record writers' locks before it binds its socket.
-The move syncs the proof folder in its parent before it removes the fields from the note.
+Before rewriting a note, the move saves the entire original note under `review-reply-proof-backups` in the showrunner state folder.
+Each run uses a time-stamped folder with mode `0700` outside the vault and Git.
+The backup mirrors the note's absolute path inside that folder.
+Keep the backup until the director approves its removal.
+The move saves the proof and reads it back before it removes the legacy fields.
+It retains the original note bytes except for the removed fields and their JSON separators.
+It parses the planned rewrite again and checks the remaining values before it writes the note.
+It verifies the saved note against that rewrite.
+The move refuses duplicate proof containers, duplicate nested submissions, and duplicate proof members.
+It leaves a refused note unchanged and reports its path.
+The preview reports each refused path and exits with a failure status if any note is refused.
+The preview checks conflicts against saved proofs and proofs from earlier notes in the same run.
+Discovery checks the header for a proof container on a Question, Proposal, Investigation, or Bug.
+The move refuses a malformed container if it contains a legacy proof field name.
+The preview and the move check the backup location and the existing journal before scanning notes.
+Both check pending legacy transfers and the numbered record metadata that a rewrite uses.
+The report reads `review-reply-proof-backups/rewrites.jsonl` in the showrunner state folder.
+The journal has mode `0600`.
+Before each rewrite, the move appends the note path and field names and syncs the journal.
+A restart uses the same journal and reuses entries for notes that still need the rewrite.
+If an append stops before it writes a complete line, the next move discards the incomplete line and retries.
+The proof store keeps a verifier for each legacy raw token.
 A failed move stops the server before it can serve requests.
 Run the move before serving notes that still hold proof fields.
 Each server that handles scoped replies needs the proof store for the records it serves.

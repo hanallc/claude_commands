@@ -41,10 +41,10 @@ from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
 from scripts.production import record_store
 from scripts.production.record_store import has_line_break, state_root
-from scripts.production.issues import Issue, frontmatter
+from scripts.production.issues import Issue, frontmatter, issue_text_header
 from scripts.lib import urgency
 from scripts.lib.urgency import Urgency, UrgencyError
-from scripts.lib.atomic_file import write_locked_atomic, write_text_atomic
+from scripts.lib.atomic_file import existing_writer_lock, write_locked_atomic, write_text_atomic
 from scripts.lib.git_exclude import require_untracked_ignored
 from scripts.lib.user_zone import user_zone
 
@@ -1260,12 +1260,12 @@ def pending_review_reply(record: QuestionRecord) -> bool:
 
 
 @contextmanager
-def wrap_question_locks(*owners: staff.StaffId) -> Generator[None]:
+def wrap_question_locks(*owners: staff.StaffId, existing_only: bool = False) -> Generator[None]:
     """Lock Question stores in staff ID order."""
     with ExitStack() as locks:
         for owner in sorted(set(owners)):
-            _ = locks.enter_context(outstanding_lock(outstanding_path_for_owner(owner)))
-            _ = locks.enter_context(_question_number_lock(owner))
+            _ = locks.enter_context(outstanding_lock(outstanding_path_for_owner(owner), existing_only=existing_only))
+            _ = locks.enter_context(_question_number_lock(owner, existing_only=existing_only))
         yield
 
 
@@ -1317,8 +1317,9 @@ def _known_question_paths(owner: staff.StaffId, *folders: Path, document: Path |
     return record_store.stored_paths(roots, strict=strict)
 
 
-def _question_number_lock(owner: staff.StaffId) -> AbstractContextManager[None]:
-    return outstanding_lock(state_root() / "review-folders" / owner / "question-numbers")
+def _question_number_lock(owner: staff.StaffId, *, existing_only: bool = False) -> AbstractContextManager[None]:
+    return outstanding_lock(state_root() / "review-folders" / owner / "question-numbers",
+                            existing_only=existing_only)
 
 
 def _seed_question_id(path: Path) -> str:
@@ -1326,8 +1327,9 @@ def _seed_question_id(path: Path) -> str:
     return _stored_question_id(fields) if fields.value("record_type") == "question" else ""
 
 
-def question_numbers() -> AbstractContextManager[record_store.LockedRecordNumbers]:
-    return record_store.record_numbers(record_store.RecordKind.QUESTION, _seed_question_id)
+def question_numbers(*, existing_only: bool = False) -> AbstractContextManager[record_store.LockedRecordNumbers]:
+    return record_store.record_numbers(record_store.RecordKind.QUESTION, _seed_question_id,
+                                       existing_only=existing_only)
 
 
 def _publish_question(record: QuestionRecord, *, record_history: Callable[[], None] | None = None) -> str:
@@ -1410,16 +1412,18 @@ def write_question_record(record: QuestionRecord, *, assign_id: bool = False,
 
 def _write_question_text(record: QuestionRecord, text: str | None,
                          numbers: record_store.LockedRecordNumbers | None = None, *,
-                         write: Callable[[Path, str], None] = write_text_atomic) -> None:
+                         write: Callable[[Path, str], None] = write_text_atomic, preview: bool = False) -> None:
     if text is None:
         return
     identity = _numbered_question_id(record)
     if not identity:
-        write(record.path, text)
+        if not preview:
+            write(record.path, text)
         return
-    sequence = nullcontext(numbers) if numbers is not None else question_numbers()
-    with sequence as locked, locked.write(record.path, identity, record.owner):
-        write(record.path, text)
+    sequence = nullcontext(numbers) if numbers is not None else question_numbers(existing_only=preview)
+    with sequence as locked, locked.write(record.path, identity, record.owner, preview=preview):
+        if not preview:
+            write(record.path, text)
 
 
 def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str | None:
@@ -1483,15 +1487,11 @@ def _write_registration(record: QuestionRecord, item: OutstandingItem) -> Questi
 
 
 def _registration_text(record: QuestionRecord, item: OutstandingItem, text: str) -> str:
-    end = text.index("\n") + 1
-    lines = record_store.lines_with_endings(text[end:])
-    for index, line in enumerate(lines):
-        if line.rstrip("\r\n") == "---":
-            break
-        if line.startswith("registration:"):
-            newline = line[len(line.rstrip("\r\n")):]
-            lines[index] = "registration: " + json.dumps(item, ensure_ascii=False) + newline
-            return text[:end] + "".join(lines)
+    header = issue_text_header(text)
+    fields = header.located_fields(frozenset(("registration",))).get("registration", [])
+    if header.closing and fields and fields[-1].values:
+        value = fields[-1].values[0]
+        return text[:value.start] + json.dumps(item, ensure_ascii=False) + text[value.start + len(value.text):]
     raise RegistrationFailure("questions", f"{record.path}: the registration field is missing")
 
 
@@ -1509,15 +1509,15 @@ def question_request(record: QuestionRecord) -> reply_proofs.StaffQuestionReques
     return reply_proofs.read(_staff_question_identity(record)).request
 
 
-def move_reply_proof(path: Path, *, dry_run: bool, legacy_owner: str = "") -> int:
+def move_reply_proof(path: Path, *, run: reply_proofs.ProofMoveRun, legacy_owner: str = "") -> int:
     owner = staff.StaffId(legacy_owner)
     if not owner:
-        before_lock = record_store.read_note_for_proof_move(path)
-        if isinstance(before_lock, record_store.VanishedReviewNote):
+        try:
+            fields = frontmatter(path, sources=[], keys=frozenset(("production_id",)))
+        except FileNotFoundError:
             return 0
-        source = record_store.record_text_fields(path, before_lock)
-        owner = record_store.record_owner(record_store.RecordKind.QUESTION, source, legacy_owner)
-    with nullcontext() if dry_run else wrap_question_locks(owner):
+        owner = record_store.record_owner(record_store.RecordKind.QUESTION, Issue(path, fields), legacy_owner)
+    with wrap_question_locks(owner, existing_only=run.dry_run):
         text = record_store.read_note_for_proof_move(path)
         if isinstance(text, record_store.VanishedReviewNote):
             return 0
@@ -1527,25 +1527,18 @@ def move_reply_proof(path: Path, *, dry_run: bool, legacy_owner: str = "") -> in
         record = records[0]
         if record.owner != owner:
             raise RegistrationFailure("questions", f"{path}: the question owner changed")
-        original = cast(dict[str, object], cast(object, record.item))
-        updated = record.item.copy()
-        fields, proof, count = reply_proofs.extract_submission(updated.get("review_submission", {}))
-        staff_proof = reply_proofs.legacy_request(original["request_key"]) if "request_key" in original else reply_proofs.NoteProof()
-        with ExitStack() as publications:
-            if count:
-                details = new_item_dialog.read_submission(fields)
-                identity = details.proof_identity(updated.get("review_id", ""))
-                updated["review_submission"] = fields
-                if not dry_run:
-                    _ = publications.enter_context(reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=proof), moving=True))
-            if not isinstance(staff_proof.request, reply_proofs.NoStaffQuestionRequest):
-                _ = cast(dict[str, object], cast(object, updated)).pop("request_key")
-                count += 1
-                if not dry_run:
-                    _ = publications.enter_context(reply_proofs.publishing(_staff_question_identity(record), staff_proof, moving=True))
-            if count and not dry_run:
-                _write_question_text(record, _registration_text(record, updated, text), write=write_locked_atomic)
-        return count
+        removal = reply_proofs.prepare_note_removal(text, reply_proofs.ProofNoteLayout.QUESTION)
+        proofs: list[tuple[reply_proofs.NoteIdentity, reply_proofs.NoteProof]] = []
+        if not isinstance(removal.proof.reply, reply_tokens.MissingReplyProof):
+            details = new_item_dialog.read_submission(removal.submission)
+            identity = details.proof_identity(record.item.get("review_id", ""))
+            proofs.append((identity, reply_proofs.NoteProof(reply=removal.proof.reply)))
+        if not isinstance(removal.proof.request, reply_proofs.NoStaffQuestionRequest):
+            proofs.append((_staff_question_identity(record), reply_proofs.NoteProof(request=removal.proof.request)))
+        return run.apply(path, text, removal, proofs,
+                         lambda changed: _write_question_text(record, changed, write=write_locked_atomic,
+                                                              preview=run.dry_run),
+                         open_item=record.status == "open")
 
 
 def record_review_log(source: Path | QuestionRecord, words: str, who: str = "nate", *,
@@ -1718,12 +1711,16 @@ _held_outstanding_locks: ContextVar[frozenset[Path]] = ContextVar("held_outstand
 
 
 @contextmanager
-def outstanding_lock(outstanding: Path) -> Generator[None]:
+def outstanding_lock(outstanding: Path, *, existing_only: bool = False) -> Generator[None]:
     """Lock the owner's records. Reuse the lock in the same call context."""
     path = outstanding.with_suffix(".lock").resolve()
     held = _held_outstanding_locks.get()
     if path in held:
         yield
+        return
+    if existing_only:
+        with existing_writer_lock(path):
+            yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as lock:

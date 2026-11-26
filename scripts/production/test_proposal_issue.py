@@ -27,7 +27,7 @@ from scripts.production.issues import Issue, frontmatter
 from scripts.production import proposals_folder, record_store, staff, unit_names
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.user_zone import user_zone
-from scripts.review_links import new_item_dialog, reply_tokens
+from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens
 from scripts.review_links.review_events import NoMark, ReviewMark
 from scripts.style import rules
 
@@ -177,9 +177,11 @@ class ProposalIssueTests(unittest.TestCase):
         text, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": json.dumps(fields)}, self.issue)
         _ = self.issue.write_text(text)
 
-        self.assertEqual(proposal_issue.move_reply_proof(self.issue, dry_run=True), 1)
-        self.assertEqual(proposal_issue.move_reply_proof(self.issue, dry_run=False), 1)
-        self.assertEqual(proposal_issue.move_reply_proof(self.issue, dry_run=False), 0)
+        preview = reply_proofs.ProofMoveRun(True, record_store.configured_review_vaults)
+        self.assertEqual(proposal_issue.move_reply_proof(self.issue, run=preview), 1)
+        move = reply_proofs.ProofMoveRun(False, record_store.configured_review_vaults)
+        self.assertEqual(proposal_issue.move_reply_proof(self.issue, run=move), 1)
+        self.assertEqual(proposal_issue.move_reply_proof(self.issue, run=move), 0)
         note = self.issue.read_text()
         self.assertFalse("reply_token" in note)
         self.assertFalse(token in note)
