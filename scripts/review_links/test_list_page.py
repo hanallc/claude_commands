@@ -5025,6 +5025,28 @@ window.fetch=(url,options)=>{
             send.assert_called_once()
             self.assertEqual(send.call_args.args[2], message)
 
+    def test_remove_retries_a_receipt_with_a_trimmed_reason(self) -> None:
+        root = self.root / "reviews"
+        reason = "  Keep the original.  \n"
+        for scoped in (False, True):
+            with self.subTest(scoped=scoped), patch.object(change_page, "send_to_staff") as send:
+                if scoped:
+                    start = the_list.ScheduledRun(NOW + timedelta(days=1), "Check the figures.")
+                    series = the_list.ScheduledSeries(start, repeat_rule.parse("FREQ=DAILY"),
+                                                      the_list.series_run_limit())
+                    item = the_list.add(MORTY.id, "Check the figures", owner=OWNER.id, source="nate",
+                                        changes={"state": the_list.ItemState.SCHEDULED, "schedule": series})
+                    fields = self.fields(item, "remove", scope="this", run="1",
+                                         schedule_revision=the_list.schedule_revision(item.schedule))
+                else:
+                    item = self.add("Remove the duplicate")
+                    fields = self.fields(item, "remove")
+                list_page.deliver(list_page.submit(root, urlencode({**fields, "words": reason.strip()})))
+                saved = the_list.load(MORTY.id, item.id)
+                list_page.deliver(list_page.submit(root, urlencode({**fields, "words": reason})))
+                send.assert_called_once()
+                self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+
     def test_list_adds_the_next_number_after_a_page_remove(self) -> None:
         first = self.add("Keep the first item", number=206)
         removed = self.add("Remove the highest item", number=207)
@@ -8539,6 +8561,44 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
   'the refusal is visible on the reopened row');
  check(hiddenStatus.hidden,'the page hides the extra notice when the reopened row shows the refusal');
 ''')
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_clears_the_remove_draft_after_a_lost_reply_without_a_notice(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Remove the duplicate", number=1)
+        words = "Close the duplicate."
+        first = self.fields(item, "remove", words=words)
+        second = self.fields(item, "remove", words=words)
+        with patch.object(list_page, "signed_item_request", return_value=(second["request"], second["token"])):
+            initial = list_page.render(root, include_counts=False).decode()
+        _ = list_page.submit(root, urlencode(first))
+        delivery = list_page.submit(root, urlencode(second))
+        self.assertIsInstance(delivery, change_page.NoMessageDelivery)
+        closed = the_list.load(MORTY.id, item.id)
+        self.assertNotIn(second["request"], the_list.feedback_requests(closed))
+        state = list_page.saved_action_state(MORTY.id, item.id, park_request=second["request"], include_detail=True)
+        _ = the_list.reopen(MORTY.id, item.id, source="morty")
+        reopened = list_page.render(root, include_counts=False).decode()
+        self.browser_action_sequence('''
+ show('all');
+ form.elements.words.value='Close the duplicate.';
+ form.elements.words.dispatchEvent(new Event('input',{bubbles:true}));
+ readback=(key,request)=>{
+  check(key===row.dataset.key && request===EXPECTED_REQUEST,'Readback asks for the second Remove receipt.');
+  return SAVED_STATE;
+ };
+ submit('remove');losePost();await flush();
+ refreshMarkup=REOPENED_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ const reopened=document.querySelector('[data-number="1"]');
+ check(!reopened.hidden && reopened.dataset.state==='New','Refresh shows the reopened item.');
+ reopened.querySelector('.list-toggle').click();
+ check(recordDetails(reopened).querySelector('form').elements.words.value==='','Readback clears the saved draft.');
+'''.replace('EXPECTED_REQUEST', json.dumps(second["request"]))
+   .replace('SAVED_STATE', json.dumps(state).replace('</', '<\\/'))
+   .replace('REOPENED_PAGE', json.dumps(reopened).replace('</', '<\\/')),
+                                     reduced_motion=True, add_item=False, markup=initial)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_reads_the_saved_item_after_a_lost_park_or_remove_response(self) -> None:
