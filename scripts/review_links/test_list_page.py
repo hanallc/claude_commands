@@ -206,8 +206,10 @@ class _Chrome(_Browser):
         self.root: Path = root
         self.pending: bytearray = bytearray()
         self.loaded: set[tuple[str, str]] = set()
+        self.origins: set[str] = set()
         self.sequence: int = 0
         self.blank: bool = True
+        self.session_storage_written: bool = False
         with (root / "chrome.log").open("wb") as log:
             process = subprocess.Popen(
                 ["sh", "-c", 'exec 3<&0 4>&1; exec "$@" 1>&2', "chrome-fixture",
@@ -221,17 +223,24 @@ class _Chrome(_Browser):
             writer = process.stdin
             assert writer is not None
             os.set_blocking(writer.fileno(), False)
-            context = self.command("Target.createBrowserContext", {})["browserContextId"]
-            target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": context})
-            self.target: str = cast(str, target["targetId"])
-            self.session: str = cast(str, self.command("Target.attachToTarget",
-                {"targetId": self.target, "flatten": True})["sessionId"])
-            _ = self.command("Page.enable", {}, self.session)
-            _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
+            self.context: str = cast(str, self.command("Target.createBrowserContext", {})["browserContextId"])
+            self.target: str
+            self.session: str
+            self.open_fixture_tab()
             # The fixture tab keeps Chrome open after the startup tab closes.
             for tab in self.tabs():
                 if tab["targetId"] != self.target:
                     _ = self.command("Target.closeTarget", {"targetId": tab["targetId"]})
+
+    def open_fixture_tab(self) -> None:
+        target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": self.context})
+        self.target = cast(str, target["targetId"])
+        self.session = cast(str, self.command("Target.attachToTarget",
+            {"targetId": self.target, "flatten": True})["sessionId"])
+        _ = self.command("Page.enable", {}, self.session)
+        _ = self.command("Page.setLifecycleEventsEnabled", {"enabled": True}, self.session)
+        _ = self.command("DOMStorage.enable", {}, self.session)
+        self.blank = True
 
     def tabs(self) -> list[dict[str, str]]:
         targets = cast(list[dict[str, str]], self.command("Target.getTargets", {})["targetInfos"])
@@ -244,13 +253,24 @@ class _Chrome(_Browser):
             for opened in self.tabs():
                 if opened["targetId"] != self.target:
                     _ = self.command("Target.closeTarget", {"targetId": opened["targetId"]})
-            self.reset_page()
-
-    def reset_page(self) -> None:
-        if not self.blank:
-            self.navigate("about:blank")
+            if not self.blank:
+                self.navigate("about:blank")
+            if self.session_storage_written:
+                # Closing the tab discards session storage for all its documents.
+                old_target = self.target
+                self.open_fixture_tab()
+                _ = self.command("Target.closeTarget", {"targetId": old_target})
             _ = self.command("Page.resetNavigationHistory", {}, self.session)
-        self.loaded.clear()
+            _ = self.command("Emulation.clearDeviceMetricsOverride", {}, self.session)
+            _ = self.command("Emulation.setEmulatedMedia", {"media": "", "features": []}, self.session)
+            _ = self.command("Network.clearBrowserCookies", {}, self.session)
+            _ = self.command("Network.clearBrowserCache", {}, self.session)
+            for origin in sorted(self.origins):
+                _ = self.command("Storage.clearDataForOrigin",
+                                 {"origin": origin, "storageTypes": "all"}, self.session)
+            self.origins.clear()
+            self.loaded.clear()
+            self.session_storage_written = False
 
     def read(self, deadline: float) -> dict[str, object]:
         reader = self.process.stdout
@@ -263,10 +283,20 @@ class _Chrome(_Browser):
             if end >= 0:
                 reply = cast(dict[str, object], json.loads(self.pending[:end]))
                 del self.pending[:end + 1]
-                if reply.get("method") == "Page.lifecycleEvent":
-                    parameters = cast(dict[str, str], reply["params"])
-                    if parameters["name"] == "DOMContentLoaded":
-                        self.loaded.add((cast(str, reply["sessionId"]), parameters["loaderId"]))
+                method = reply.get("method")
+                if method == "Page.lifecycleEvent":
+                    lifecycle = cast(dict[str, str], reply["params"])
+                    if lifecycle["name"] == "DOMContentLoaded":
+                        self.loaded.add((cast(str, reply["sessionId"]), lifecycle["loaderId"]))
+                elif method == "Page.frameNavigated":
+                    navigation = cast(dict[str, dict[str, str]], reply["params"])
+                    origin = navigation["frame"]["securityOrigin"]
+                    if urlsplit(origin).scheme in {"http", "https", "file"}:
+                        self.origins.add(origin)
+                elif method in {"DOMStorage.domStorageItemAdded", "DOMStorage.domStorageItemUpdated"}:
+                    storage = cast(dict[str, dict[str, bool]], reply["params"])
+                    if not storage["storageId"]["isLocalStorage"]:
+                        self.session_storage_written = True
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Chrome did not answer")
                 return reply
@@ -303,6 +333,8 @@ class _Chrome(_Browser):
                 return cast(dict[str, object], reply["result"])
 
     def navigate(self, destination: str) -> None:
+        self.blank = False
+        self.loaded.clear()
         navigation = self.command("Page.navigate", {"url": destination}, self.session)
         if "errorText" in navigation:
             raise RuntimeError(f"Page.navigate: {navigation['errorText']}")
@@ -347,7 +379,7 @@ class _Chrome(_Browser):
                 raise TimeoutError(f"Chrome did not find {marker} in {destination}") from error
             result = cast(dict[str, object], response["result"])
             _ = self.command("Page.removeScriptToEvaluateOnNewDocument", {"identifier": hook["identifier"]}, session)
-            self.reset_page()
+            self.navigate("about:blank")
             return subprocess.CompletedProcess(destination, 0, str(result.get("value", "")), "")
 
 
@@ -551,15 +583,14 @@ class ListPageTests(unittest.TestCase):
             raise RuntimeError(f"Firefox could not show {destination}") from error
         return subprocess.CompletedProcess(destination, 0, "", "")
 
-    def firefox_probe(self, page: bytes) -> list[list[str]]:
-        def load(arguments: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            environment = cast(dict[str, str], options["env"])
-            width = int(environment.get("MOZ_HEADLESS_WIDTH", "1366"))
-            height = int(environment.get("MOZ_HEADLESS_HEIGHT", "768"))
+    def firefox_probe(self, page: bytes, *, window_size: tuple[int, int] | None = None) -> list[list[str]]:
+        width, height = window_size or (1366, 768)
+
+        def load(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             return self.firefox_view(arguments[-1], None, width, height)
 
         with patch.object(browser_test_support, "run_process_group", side_effect=load):
-            return firefox_probe_results(page)
+            return firefox_probe_results(page, window_size=(width, height))
 
     def test_review_links_use_the_card_body_for_every_state(self) -> None:
         source = review_items.ProposalLedgerSource(self.root / "proposals.md")
