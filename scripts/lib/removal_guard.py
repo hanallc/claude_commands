@@ -492,11 +492,13 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
 
 
 def remove_proved_copy(checked: CheckedCleanupPath, proof: ProvedCopyCleanup, approved_target: Path, *,
-                       before_delete: Callable[[], None]) -> None:
+                       before_delete: Callable[[], None], after_copy_check: Callable[[], None]) -> None:
     """Remove only the checked source after verifying its approved copy."""
     _remove(checked, proof, None, mode=RemovalPass.CHECK)
     proof.require_unchanged_destination(approved_target)
     before_delete()
+    proof.require_unchanged_destination(approved_target)
+    after_copy_check()
     _delete_cleanup_entries(checked, proof, ())
 
 
