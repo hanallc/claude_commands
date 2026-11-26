@@ -23,6 +23,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.lib.file_lock import exclusive
 from typing import BinaryIO, Literal, TypedDict, cast, final, override
@@ -324,7 +325,7 @@ class LocalReviewTests(unittest.TestCase):
     def test_console_rewrite_with_an_unmatched_quote_holds_the_draft(self) -> None:
         key = review.QuestionKey("demo", "Open the page")
         draft = review.Draft("demo", "0", "", NoActionRequired(), "Step B opens the page.", False)
-        reason = "The reviewer gave a quote that does not match the draft."
+        reason = 'The reviewer gave a quote that does not match the draft: omit-team-words: "Step C" (draft)'
         runner = FakeReviewer(verdict(draft, "rewrite", body="The page opens.",
                                       failed_rules=[{"rule": "omit-team-words", "quote": "Step C"}]))
 
@@ -335,6 +336,80 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(json.loads(hold.read_text(encoding="utf-8")), {
             "slug": key.name, "text": key.text, "question": draft.body, "details": [reason],
         })
+
+    def test_console_replies_are_saved_and_expire(self) -> None:
+        folder = review.state_path() / "console-replies"
+        folder.mkdir(parents=True)
+        expired = folder / "old.json"
+        _ = expired.write_text("{}")
+        stale = time.time() - review.QUESTION_VERDICT_MAX_AGE.total_seconds() - 1
+        os.utime(expired, (stale, stale))
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Open the page?", False)
+        for kind in ("question", "reply"):
+            with self.subTest(kind=kind):
+                before = set(folder.glob("*.json"))
+                key = review.QuestionKey(f"demo/{kind}", draft.body)
+                value = verdict(draft)
+                runner = FakeReviewer(value)
+                self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind=kind),
+                                 review.QuestionAccepted(draft.body))
+                path, = set(folder.glob("*.json")) - before
+                record = cast(dict[str, object], json.loads(path.read_text()))
+                written = datetime.fromisoformat(cast(str, record.pop("time")))
+                self.assertIsNotNone(written.tzinfo)
+                argv = runner.calls[-1].argv
+                self.assertEqual(record, {
+                    "key": key.name,
+                    "kind": kind,
+                    "system_prompt": argv[argv.index("--system-prompt") + 1],
+                    "prompt": argv[-1],
+                    "reply": value,
+                })
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(expired.exists())
+        self.assertEqual(len(list(folder.glob("*.json"))), 2)
+
+    def test_console_reply_write_failure_keeps_the_review_result(self) -> None:
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Open the page?", False)
+
+        def refuse_reply(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+            if path.parent.name == "console-replies":
+                raise OSError("reply write failed")
+            write_text_atomic(path, text, new_file_mode=new_file_mode)
+
+        with mock.patch.object(review, "write_text_atomic", side_effect=refuse_reply) as writer:
+            for kind in ("question", "reply"):
+                with self.subTest(kind=kind):
+                    key = review.QuestionKey(f"demo/{kind}", draft.body)
+                    self.assertEqual(review.review_question(key, draft.body, runner=FakeReviewer(verdict(draft)),
+                                                           console_kind=kind),
+                                     review.QuestionAccepted(draft.body))
+        written = [cast(Path, call.args[0]) for call in writer.call_args_list]
+        self.assertEqual(sum(path.parent.name == "console-replies" for path in written), 2)
+
+    def test_console_question_refuses_a_quote_from_another_part(self) -> None:
+        title = "Retry the download?"
+        quote = "The download stopped."
+        draft = f"{title}\n\n1. {quote}\n\nRecommended: Yes."
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+        failure = review.RuleFailureRecord(rule="console-standard-5", quote=quote)
+        row = PartVerdictJSON(number=3, questions=[], failed_rules=[failure])
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            return question_batch(question_request(prompt), parts=[row])
+
+        reason = f'The reviewer gave a quote that does not match the draft: console-standard-5: "{quote}" (part 3)'
+        with mock.patch.object(review, "structured_call", side_effect=judge):
+            result = review.review_question(key, draft, runner=runner, console_kind="question")
+        self.assertEqual(result, review.QuestionReviewFailed(draft, (reason,)))
+        saved, = (review.state_path() / "console-replies").glob("*.json")
+        record = cast(dict[str, object], json.loads(saved.read_text()))
+        prompt = cast(str, record["prompt"])
+        self.assertEqual(question_request(prompt)["draft"], draft)
+        answer = question_batch(question_request(prompt), parts=[row]).outcome
+        assert isinstance(answer, review.StructuredAnswer)
+        self.assertEqual(record["reply"], answer.value)
 
     def test_console_rewrite_without_failed_rules_holds_the_draft(self) -> None:
         key = review.QuestionKey("demo", "Open the page")
