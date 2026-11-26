@@ -16,6 +16,7 @@ from scripts.astra import astra_review
 from scripts.direct import pass_record, progress_history
 from scripts.lib import process_start, unit_runs
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
+from scripts.lib.transcript_test_support import compressed_copy
 from scripts.notify import review
 from scripts.production import behavior_check, behavior_review, session_staff, staff, update_registration, worker
 from scripts.review_links import review_events
@@ -74,10 +75,19 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             commit = self.git("rev-parse", "HEAD").stdout.strip()
         else:
             commit = test_edit
+        return self.review_range(base, commit)
+
+    def review_range(self, base: str, commit: str) -> tuple[list[str], str]:
         tests = behavior_check.changed_tests(behavior_check.GitRange(self.repo, base, commit))
         assert isinstance(tests, behavior_check.ChangedTests)
         key = tests.key
         return ["--repo", str(self.repo), "--base", base, "--commit", commit], key
+
+    def two_changed_tests(self) -> tuple[list[str], str]:
+        original = "def test_move():\n    assert 'move now'\n\ndef test_refresh():\n    assert 'refresh later'\n"
+        base = self.commit("test_fixture.py", original)
+        updated = original.replace("move now", "wait first").replace("refresh later", "refresh now")
+        return self.review_range(base, self.commit("test_fixture.py", updated))
 
     def cli(self, *args: str) -> tuple[int, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(output):
@@ -113,6 +123,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("Never call `write_stdin`.", prompt)
         self.assertIn("rg --search-zip --files-with-matches --hidden --no-ignore", prompt)
         self.assertIn("Parse only those files for matching user turns.", prompt)
+        self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)
+        self.assertIn('Use "specified" when the change departs from those words or you cannot tell', prompt)
         self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
         self.assertIn("move now", (self.folder / "tests.json").read_text())
         self.assertIn("+    assert 'wait first'", (self.folder / "code.diff").read_text())
@@ -131,6 +143,95 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("no valid proof", self.cli("check", *args)[1])
         saved.unlink()
         self.assertIn("no valid proof", self.cli("check", *args)[1])
+
+    def test_verified_requests_clear_the_range_and_list_each_quote(self) -> None:
+        args, key = self.two_changed_tests()
+        move_quote = "Wait for the running step before moving."
+        move_source = self.write(self.root / "decision.md", f"## Decision\n{move_quote}\n")
+        refresh_quote = 'Refresh "now" when an item opens.'
+        turn = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": refresh_quote}]}}
+        refresh_source = self.write(self.root / "conversation.jsonl", json.dumps(turn) + "\n")
+        compressed = compressed_copy(refresh_source)
+        self.reply(json.dumps([
+            {"test": "test_fixture.py::test_move", "finding": "requested", "quote": move_quote,
+             "source": str(move_source), "date": "2026-11-24", "change": "The move waits for the running step."},
+            {"test": "test_fixture.py::test_refresh", "finding": "requested", "quote": refresh_quote,
+             "source": str(refresh_source), "date": "2026-11-25", "change": "An open item refreshes at once."},
+        ]))
+        output = (f"{key} clear\ntest_fixture.py::test_move\n"
+                  f"Nate's request (2026-11-24, {move_source}): {move_quote}\n"
+                  f"test_fixture.py::test_refresh\nNate's request (2026-11-25, {refresh_source}): {refresh_quote}\n")
+
+        with (mock.patch.object(astra_review, "run_review", return_value=0) as runner,
+              mock.patch.object(update_registration, "ask") as ask):
+            self.assertEqual(self.cli("run", *args), (0, output))
+            self.assertEqual(self.cli("run", *args), (0, output))
+            self.assertEqual(self.cli("status", "--key", key), (0, output))
+        runner.assert_called_once()
+        ask.assert_not_called()
+        self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
+        self.assertEqual(self.cli("check", *args), (0, ""))
+        compressed.unlink()
+        self.assertIn("no valid proof", self.cli("check", *args)[1])
+        self.assertEqual(self.cli("status", "--key", key), (1, f"{key}: the saved approval has no valid proof.\n"))
+
+    def test_an_unverified_request_requires_a_question(self) -> None:
+        args, key = self.changed_range()
+        quote = "Wait for the running step."
+        missing = self.write(self.root / "decision.md", "The move starts at once.")
+        transcript = self.write(self.root / "conversation.jsonl", "\n".join(json.dumps(turn) for turn in (
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": quote}]}},
+            {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": quote}]}},
+            {"type": "user", "message": {"role": "user", "content": f'<system-reminder source="script">{quote}</system-reminder>'}},
+        )) + "\n")
+        for source in (missing, transcript, self.root / "missing.md"):
+            with (self.subTest(source=source), mock.patch.object(astra_review, "run_review", return_value=0),
+                  mock.patch.object(update_registration, "ask") as ask):
+                behavior_check.record_path(key).with_suffix(".run").unlink(missing_ok=True)
+                (self.folder / "completed-reply.txt").unlink(missing_ok=True)
+                self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "requested", "quote": quote,
+                                        "source": str(source), "date": "2026-11-23",
+                                        "change": "The move waits for the running step."}]))
+                code, output = self.cli("run", *args)
+                self.assertEqual(code, 1)
+                self.assertIn(f"Nate's words (2026-11-23, {source}): {quote}", output)
+                self.assertIn("Nate was not asked.", output)
+                ask.assert_not_called()
+                self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+                self.assertEqual(self.cli("check", *args)[0], 1)
+
+    def test_mixed_findings_need_a_question_only_for_specified_behavior(self) -> None:
+        args, key = self.two_changed_tests()
+        refresh_quote = "Refresh at once when an item opens."
+        source = self.write(self.root / "decision.md", f"{MOVE_QUOTE}\n{refresh_quote}\n")
+        self.reply(json.dumps([
+            {"test": "test_fixture.py::test_move", "finding": "specified", "quote": MOVE_QUOTE,
+             "source": str(source), "date": "2026-11-23", "change": "The move waits for the running step."},
+            {"test": "test_fixture.py::test_refresh", "finding": "requested", "quote": refresh_quote,
+             "source": str(source), "date": "2026-11-25", "change": "An open item refreshes at once."},
+        ]))
+        draft = self.question_file(MOVE_QUESTION)
+
+        def accept(_key: review.QuestionKey, question: str, *, console_kind: str) -> review.QuestionAccepted:
+            self.assertEqual(console_kind, "question")
+            return review.QuestionAccepted(question)
+
+        with (mock.patch.object(astra_review, "run_review", return_value=0) as runner,
+              mock.patch.object(review, "review_question", side_effect=accept) as text_check):
+            code, output = self.cli("run", *args)
+            self.assertEqual(code, 1)
+            self.assertIn("test_fixture.py::test_move", output)
+            self.assertIn(MOVE_QUOTE, output)
+            self.assertNotIn("test_fixture.py::test_refresh", output)
+            self.assertNotIn(refresh_quote, output)
+            code, output = self.cli("run", *args, "--production", self.producer.name, "--question", str(draft))
+            self.assertEqual(code, 1)
+            self.assertIn("The land waits", output)
+        runner.assert_called_once()
+        text_check.assert_called_once()
+        self.assertIsInstance(behavior_check.read_record(key), behavior_check.Waiting)
+        records = update_registration.question_records_for_owner(self.producer.id, strict=True)
+        self.assertEqual([record.item.get("parts") for record in records], [MOVE_QUESTION])
 
     def test_a_submitted_review_is_collected_without_starting_another_worker(self) -> None:
         args, key = self.changed_range()
