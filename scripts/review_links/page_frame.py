@@ -1294,12 +1294,13 @@ async function heldFetch(url,{requestTimeoutSeconds,...init}={},receiver,onHold,
   undo=await shown;
  }
  if(undo===true){request.finish();throw new SendUndone();}
- return readHeldResult(hold,request,undo,resumable,requestTimeoutSeconds,undoExpired);
+ return readHeldResult(hold,request,undo,resumable,{requestTimeoutSeconds,undoExpired});
 }
-async function readHeldResult(hold,request,undo,resumable,requestTimeoutSeconds,undoExpired=false){
+async function readHeldResult(hold,request,undo,resumable,{requestTimeoutSeconds,undoExpired=false,configuredUndoSeconds=0}){
  let signal;
  if(requestTimeoutSeconds!==undefined){
-  const releaseDueAt=request?.releaseDueAt ?? releaseGraceEndsAt();
+  // A pending result does not give the remaining Undo time.
+  const releaseDueAt=request?.releaseDueAt ?? (releaseGraceEndsAt()+configuredUndoSeconds*1000);
   const remainingReleaseMs=request?.closed ? 0 : Math.max(0,Math.ceil(releaseDueAt-performance.now()));
   // Read at once if Undo was uncertain or the hold had no Undo time.
   if(undoExpired && remainingReleaseMs>0) await pause(remainingReleaseMs);
@@ -1327,9 +1328,9 @@ async function readHeldResult(hold,request,undo,resumable,requestTimeoutSeconds,
  }
 }
 heldFetch.newId=newHoldId;
-heldFetch.resume=(id,requestTimeoutSeconds)=>{
+heldFetch.resume=(id,limits)=>{
  const request=heldRequests.get(id);
- return readHeldResult(request?.hold ?? id,request,false,true,requestTimeoutSeconds);
+ return readHeldResult(request?.hold ?? id,request,false,true,limits);
 };
 function sendActionReceiver(form,data){
  const action=data.get('outcome') ?? data.get('action');

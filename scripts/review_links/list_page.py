@@ -2298,7 +2298,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
-    undo_enabled = settings.whole("undo_seconds") > 0
+    undo_seconds = settings.whole("undo_seconds")
     delivery_window = record_table.delivery_window_seconds(settings)
     park_retry = settings.number("frame_retry_seconds")
     card_motion = page_frame.CardMotion.read(settings)
@@ -2321,7 +2321,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' data-park-retry-seconds="{park_retry}"' + deadline_attr
-               + f' data-undo-enabled="{str(undo_enabled).lower()}"'
+               + f' data-undo-seconds="{undo_seconds}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
@@ -2766,7 +2766,8 @@ const repairRequests=(()=>{
     let missing=false;
     if(!accepted){
      try{
-      const previous=await heldFetch.resume(holdId,listRequestSeconds());
+      const previous=await heldFetch.resume(holdId,{
+       requestTimeoutSeconds:listRequestSeconds(),configuredUndoSeconds:Number(content.dataset.undoSeconds)});
       const outcome=await reply(previous);
       if(outcome.delivered || outcome.refusal) return outcome;
       missing=previous.status===404 && previous.headers.get('X-Send-Hold-Outcome')==='missing';
@@ -3482,7 +3483,7 @@ function bindFeedbackForm(form){
    const rejectsRepair=action==='not works';
    const usesWords=action==='tell' || action==='question' || rejectsRepair;
    const saveAction=changesParking || action==='read' || action==='remove' || action==='works';
-   const heldSave=saveAction && content.dataset.undoEnabled==='true';
+   const heldSave=saveAction && Number(content.dataset.undoSeconds)>0;
    const asksQuestion=action==='question';
    const retryRepair=rejectsRepair && Boolean(repairRequests.get(key));
    if(rejectsRepair && repairRequests.sending(key)) return;

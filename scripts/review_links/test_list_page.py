@@ -8975,7 +8975,7 @@ window.fetch=async(_url,options)=>{
     def test_list_repair_undo_restores_the_draft_and_works_leaves_needs_me(self) -> None:
         _ = self.file_repaired_report("Fix the menu", "Open the menu and count all six choices.")
         steps = r"""
- document.querySelector('[data-undo-enabled]').dataset.undoEnabled='true';
+ document.querySelector('[data-undo-seconds]').dataset.undoSeconds='30';
  const originalFetch=window.fetch;let undos=0;
  const undoOutcome=UNDO_OUTCOME;
  let undoPath='';
@@ -9131,6 +9131,78 @@ window.fetch=async(_url,options)=>{
 """
         self.browser_action_sequence(steps.replace("RELEASE_GRACE_MS", str(send_hold.RELEASE_GRACE_SECONDS * 1000)),
                                      add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_not_fixed_recovers_when_the_held_post_response_is_lost(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\nundo_seconds=10\n")
+        settings = conf.read("review_links")
+        undo_seconds = settings.whole("undo_seconds")
+        wait_seconds = settings.whole("page_request_timeout_seconds") + undo_seconds + send_hold.RELEASE_GRACE_SECONDS
+        item = self.file_repaired_report("Fix the menu")
+        root = self.root / "reviews"
+        script = r"""
+(async()=>{
+ const row=document.querySelector('[data-number="ITEM_NUMBER"]');
+ row.querySelector('.list-toggle').click();
+ const form=recordDetails(row).querySelector('[data-feedback-form]');
+ const button=form.querySelector('[value="not works"]'),words=form.elements.words;
+ const actualFetch=window.fetch,postedHolds=[];
+ let result;
+ window.fetch=async(path,options={})=>{
+  const response=await actualFetch(path,options);
+  if(options.method==='POST' && new URLSearchParams(options.body).get('action')==='not works'){
+   if(response.status!==202) throw new Error('The server did not hold the Not fixed POST.');
+   const held=await response.json();
+   if(!postedHolds.length && held.seconds!==UNDO_SECONDS) throw new Error('The server used the wrong Undo time.');
+   postedHolds.push(held.hold);
+   throw new TypeError('The fixture lost the held POST response.');
+  }
+  if(String(path)==='/send-hold/'+postedHolds[0] && response.status===200){
+   result=await response.clone().json();
+  }
+  return response;
+ };
+ const settled=async()=>{
+  const deadline=performance.now()+WAIT_SECONDS*1000;
+  while(form.dataset.sending){
+   if(performance.now()>deadline) throw new Error('The Not fixed request did not settle.');
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ words.value='The last menu choice still disappears.';
+ words.dispatchEvent(new Event('input'));
+ button.click();
+ await settled();
+ if(postedHolds.length!==2 || postedHolds[0]!==postedHolds[1] || result)
+  throw new Error('Both lost responses must refer to the same hold.');
+ button.click();
+ await settled();
+ return {posts:postedHolds.length,state:result?.not_fixed_receipt?.state ?? 'no result'};
+})()
+""".replace("ITEM_NUMBER", str(item.number)).replace("UNDO_SECONDS", str(undo_seconds))
+        script = script.replace("WAIT_SECONDS", str(wait_seconds))
+        with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(root)}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(list_page, "counts_strip", return_value=""),
+              patch.object(list_page, "recover_pending"),
+              patch.object(change_page, "send_to_staff", return_value=None) as send,
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            chrome = self.chrome()
+            try:
+                chrome.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}")
+                reply = chrome.command("Runtime.evaluate", {"expression": script, "awaitPromise": True,
+                                       "returnByValue": True}, chrome.session)
+                self.assertNotIn("exceptionDetails", reply)
+                self.assertEqual(cast(dict[str, object], reply["result"])["value"],
+                                 {"posts": 2, "state": "delivered"})
+            finally:
+                chrome.navigate("about:blank")
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+        self.assertCountEqual([call.args[0] for call in send.call_args_list], (OWNER.id, DWIGHT.id))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_not_fixed_undo_times_out_while_reading_the_body(self) -> None:
