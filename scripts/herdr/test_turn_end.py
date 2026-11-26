@@ -2887,6 +2887,7 @@ class TurnEndTests(unittest.TestCase):
 
                 with (patch.object(self.case.fixture.world, "run", side_effect=submit),
                       patch.object(self.case.fixture.world, "wait_turn_end", side_effect=wait_for_idle),
+                      patch.object(detached_runs, "_retry_result_delivery"),
                       patch.object(detached_runs, "_stopped_group_has_ended", return_value=True),
                       patch.object(detached_runs, "_run", return_value=143 if self_stop else 0),
                       patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver)):

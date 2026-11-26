@@ -877,6 +877,11 @@ ENDED_PASS_RESULT_QUEUED = "queued: the director has a notice for the ended pass
 INTERRUPTED_PASS_DELIVERY = "interrupted pass result: "
 
 
+class CompletionPaneWait(StrEnum):
+    ALLOW = "allow the completion event to wait for input readiness"
+    READY_NOW = "submit only when the pane can accept input now"
+
+
 @dataclass
 class OrphanReapResult:
     """Keep reaped run IDs and the completion events that must follow the admission lock."""
@@ -889,7 +894,7 @@ class OrphanReapResult:
         path.with_suffix(".completion.lock").touch(exist_ok=True)
         self.pending_completions.append((path, record))
 
-    def complete(self) -> None:
+    def complete(self, *, pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW) -> None:
         for path, _ in self.pending_completions:
             # Pruning can remove the claim file after collection. Do not create it here.
             try:
@@ -904,7 +909,7 @@ class OrphanReapResult:
                         continue
                     current = _read_record(path)
                     if _needs_completion(current):
-                        _ = _replay_completion(path, current)
+                        _ = _replay_completion(path, current, pane_wait=pane_wait)
                 if _needs_push_retry(_read_record(path)):
                     _alert_failed_push(path, check_receipt=True)
             except (SystemExit, worker_lifecycle.WorkerStateUnreadable) as error:
@@ -1029,7 +1034,8 @@ def _finish_record(path: Path, record: RunRecord) -> CompletionReplay:
         return _settle_completion_diagnostics(path, current)
 
 
-def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
+def _replay_completion(path: Path, record: RunRecord, *,
+                       pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW) -> CompletionReplay:
     """Keep an unresolved completion available for the next event."""
     delivery = record.get("delivery", "")
     try:
@@ -1042,7 +1048,8 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
             delivery = _complete_stopped_run(path, record)
             if delivery is CompletionReplay.RETRY or _worker_result_pending(delivery):
                 return CompletionReplay.RETRY
-            if _stop_fallback_delivered(record, delivery) and _complete_worker_dispatch(record) == CompletionReplay.RETRY:
+            if (_stop_fallback_delivered(record, delivery)
+                    and _complete_worker_dispatch(record, pane_wait) == CompletionReplay.RETRY):
                 return CompletionReplay.RETRY
             if delivery.startswith("finished: the pane pass "):
                 pending_close = cast(Callable[[staff.StaffId, Path], bool],
@@ -1054,12 +1061,16 @@ def _replay_completion(path: Path, record: RunRecord) -> CompletionReplay:
                 return CompletionReplay.RETRY
         else:
             if delivery == ORPHAN_RESULT_PENDING:
-                delivery = deliver(record, command_result(record))
+                if pane_wait == CompletionPaneWait.READY_NOW:
+                    submitted = _deliver(record, command_result(record), pane_wait=pane_wait)
+                    delivery = submitted.delivery if isinstance(submitted, ConfirmedPaneResult) else submitted
+                else:
+                    delivery = deliver(record, command_result(record))
                 if _worker_result_pending(delivery) and delivery not in (PARKED_WORKER_RESULT, WORKER_READINESS_PENDING):
                     return CompletionReplay.RETRY
             if (not record.get("ended_pass_result_released")
                     and delivery not in (OTHER_PASS_DELIVERY, ENDED_PASS_RESULT_QUEUED)
-                    and _complete_worker_dispatch(record) == CompletionReplay.RETRY):
+                    and _complete_worker_dispatch(record, pane_wait) == CompletionReplay.RETRY):
                 return CompletionReplay.RETRY
             if delivery == PARKED_WORKER_RESULT and _worker_result_pending(_read_record(path).get("delivery", "")):
                 return CompletionReplay.RETRY
@@ -1212,7 +1223,7 @@ def _result_pass_changed(record: RunRecord) -> bool:
     return result_is_from_another_pass(record, passed.get("instance_id"))
 
 
-def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
+def _complete_worker_dispatch(record: RunRecord, pane_wait: CompletionPaneWait) -> CompletionReplay:
     """Recheck the pass after the finished record becomes visible."""
     if not record["staff_id"] or _result_pass_changed(record):
         return CompletionReplay.HANDLED
@@ -1220,6 +1231,9 @@ def _complete_worker_dispatch(record: RunRecord) -> CompletionReplay:
     if isinstance(member, staff.StaffRow) and member.kind == "worker":
         module = import_module("scripts.herdr.turn_end")
         link = record.get("pane_dispatch_id", "")
+        if pane_wait == CompletionPaneWait.READY_NOW:
+            return cast(Callable[[staff.StaffId, str, CompletionPaneWait], CompletionReplay],
+                        module.run_finished)(member.id, link if isinstance(link, str) else "", pane_wait)
         if isinstance(link, str) and link:
             return cast(Callable[[staff.StaffId, str], CompletionReplay], module.run_finished)(member.id, link)
         return cast(Callable[[staff.StaffId], CompletionReplay], module.run_finished)(member.id)
@@ -1493,6 +1507,7 @@ PARKED_WORKER_RESULT = DEFERRED_WORKER_RESULT + "the worker is parked"
 BUSY_WORKER_RESULT = DEFERRED_WORKER_RESULT + "worker is working"
 WORKER_INPUT_NOT_READY = "worker is not ready for input"
 WORKER_READINESS_PENDING = DEFERRED_WORKER_RESULT + WORKER_INPUT_NOT_READY
+WORKER_INPUT_LOCK_HELD = DEFERRED_WORKER_RESULT + "the worker lock is held"
 FAILED_WORKER_SUBMISSION = "submission failed: "
 LEGACY_WORKER_READINESS_FAILURE = FAILED_WORKER_SUBMISSION + WORKER_INPUT_NOT_READY
 UNCONFIRMED_WORKER_RESULT = "unconfirmed: "
@@ -1514,6 +1529,11 @@ def _result_push_failed(delivery: str) -> bool:
 def _needs_push_retry(record: RunRecord) -> bool:
     return (record["status"] == "finished" and not record.get("push_alert_attempted")
             and _result_push_failed(record.get("delivery", "")))
+
+
+def _needs_pane_input_retry(record: RunRecord) -> bool:
+    return record["status"] == "finished" and record.get("delivery") in (
+        BUSY_WORKER_RESULT, WORKER_READINESS_PENDING, LEGACY_WORKER_READINESS_FAILURE, WORKER_INPUT_LOCK_HELD)
 
 
 def _unconfirmed_pass_result(record: RunRecord) -> bool:
@@ -2285,10 +2305,10 @@ def command_start(args: argparse.Namespace) -> int:
                 )
             record["pid"] = supervisor.pid
             _ = _write_record(record_path, record)
+        print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
+              + "its result arrives as your next message", flush=True)
     finally:
-        reaped.complete()
-    print(f"run {run_id} started detached for {name} (pid {supervisor.pid}, log {log_path}); "
-          + "its result arrives as your next message", flush=True)
+        reaped.complete(pane_wait=CompletionPaneWait.READY_NOW)
     try:
         _ = prune_finished(runs)
     except (OSError, ValueError, recorder_state.OldRecorderState) as error:
@@ -2553,6 +2573,7 @@ def deliver(record: RunRecord, result: CommandResult) -> str:
 def _deliver(record: RunRecord, result: CommandResult, *,
              resume_parked: Callable[[], bool] | ParkedWorkerDelivery = ParkedWorkerDelivery.DEFER,
              input_lock: HeldWorkerInputLock | AcquireWorkerInputLock = AcquireWorkerInputLock.ACQUIRE,
+             pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW,
              ) -> str | ConfirmedPaneResult:
     """Deliver the command result to its current worker or director."""
     runs = _runs_dir(record["session_dir"])
@@ -2691,8 +2712,7 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                 try:
                     _ = locks.enter_context(worker_panes.worker_id_lock(worker.id))
                 except BlockingIOError as error:
-                    raise _WorkerPassDeliveryBlocked(
-                        DEFERRED_WORKER_RESULT + "the worker lock is held") from error
+                    raise _WorkerPassDeliveryBlocked(WORKER_INPUT_LOCK_HELD) from error
             try:
                 current_membership = staff.local_snapshot()
             except staff.StaffUnreadable as error:
@@ -2739,7 +2759,8 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             _ = validate_transport()
             _ = _save_delivery(path, checkpoint)
 
-        request = send.WorkerResultSubmission(worker_only=self_stop, before_input=before_input,
+        request = send.WorkerResultSubmission(worker_only=self_stop or pane_wait == CompletionPaneWait.READY_NOW,
+                                              before_input=before_input,
                                               before_holder=before_holder)
         reason = ""
         try:
@@ -2890,6 +2911,7 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
                                   worker_input: WorkerResultInput,
                                   resume_parked: Callable[[], bool] | ParkedWorkerDelivery = ParkedWorkerDelivery.DEFER,
                                   input_lock: HeldWorkerInputLock | AcquireWorkerInputLock = AcquireWorkerInputLock.ACQUIRE,
+                                  pane_wait: CompletionPaneWait = CompletionPaneWait.ALLOW,
                                   ) -> WorkerResultReplay | ConfirmedPaneResult:
     """Submit one waiting result. The next turn can receive the next result."""
     from scripts.herdr import worker_panes
@@ -2907,7 +2929,8 @@ def submit_finished_worker_result(run: Path, worker: staff.StaffRow, *,
             continue
         path = runs / f"{record['run_id']}.json"
         try:
-            delivery = _deliver(record, command_result(record), resume_parked=resume_parked, input_lock=input_lock)
+            delivery = _deliver(record, command_result(record), resume_parked=resume_parked, input_lock=input_lock,
+                                pane_wait=pane_wait)
         except (Exception, SystemExit, KeyboardInterrupt) as error:
             detail = " ".join(str(error).splitlines()) or type(error).__name__
             _alert_late_delivery_failure(path, detail)
@@ -2990,30 +3013,44 @@ def _alert_failed_push_locked(path: Path, record: RunRecord, *, check_receipt: b
         write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
-def _retry_failed_push(path: Path) -> None:
-    """Retry a pending result after the supervisor releases the completion lock."""
+def _retry_result_delivery(path: Path) -> None:
+    """Retry this run's delivery after releasing the completion lock."""
+    waited_for_pane = False
+
+    def pane_retry(record: RunRecord) -> bool:
+        delivery = record.get("delivery", "")
+        return _needs_pane_input_retry(record) or (
+            waited_for_pane and record["status"] == "finished" and delivery.startswith(DEFERRED_WORKER_RESULT)
+            and delivery not in (PARKED_WORKER_RESULT, "deferred: worker is stopped", "deferred: worker pane is closed"))
+
     settings = conf.read("detached_runs")
     limit = settings.whole("result_push_retries")
     delay = settings.number("result_push_retry_seconds")
     while True:
         with record_lock(path):
             record = _read_record(path)
-            if not _needs_push_retry(record):
-                return
-            retries = record.get("push_retries", 0)
-            if retries >= limit:
-                break
-            record["push_retries"] = retries + 1
-            write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
+            if pane_retry(record):
+                waited_for_pane = True
+            else:
+                if not _needs_push_retry(record):
+                    return
+                retries = record.get("push_retries", 0)
+                if retries >= limit:
+                    break
+                record["push_retries"] = retries + 1
+                write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
         time.sleep(delay)
-        record = _read_record(path)
-        if not _needs_push_retry(record):
+        current = worker_lifecycle.read_json_object(path)
+        if not _is_run_record(current):
+            return
+        waited_for_pane = pane_retry(current)
+        if not (waited_for_pane or _needs_push_retry(current)):
             return
         try:
-            _ = deliver(record, command_result(record))
+            _ = deliver(current, command_result(current))
         except (Exception, SystemExit) as error:
             detail = " ".join(str(error).splitlines())
-            print(f"detached_runs: {record['run_id']}: result retry failed: {detail}", file=sys.stderr)
+            print(f"detached_runs: {current['run_id']}: result retry failed: {detail}", file=sys.stderr)
     _alert_failed_push(path)
 
 
@@ -3300,10 +3337,10 @@ def command_supervise(args: argparse.Namespace) -> int:
                 record_path, FAILED_RESULT_PUSH + f"delivery process exited {delivery_exit}", if_current="")
         completion = _finish_record(record_path, record)
         saved = worker_lifecycle.read_json_object(record_path)
-        if _is_run_record(saved) and _needs_push_retry(saved):
-            _retry_failed_push(record_path)
+        if _is_run_record(saved) and (_needs_pane_input_retry(saved) or _needs_push_retry(saved)):
+            _retry_result_delivery(record_path)
             saved = worker_lifecycle.read_json_object(record_path)
-            if _is_run_record(saved) and _needs_completion(saved):
+            if _is_run_record(saved) and not _needs_pane_input_retry(saved) and _needs_completion(saved):
                 completion = _finish_record(record_path, saved)
         if _result_push_failed(str(saved.get("delivery", ""))):
             return 1
