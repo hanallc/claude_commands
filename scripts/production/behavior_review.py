@@ -1,6 +1,7 @@
 """Collect independent reviews and save answers for the behavior check."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -15,13 +16,13 @@ from scripts.direct import pass_record, progress_history, recorder_state
 from scripts.lib import file_lock, unit_runs, urgency
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
-from scripts.production import behavior_check, staff, update_registration, worker
+from scripts.production import behavior_check, behavior_request, staff, update_registration, worker
 from scripts.production.production_doc import Refusal
 from scripts.review_links import review_events
 
 
 @dataclass(frozen=True)
-class SpecifiedBehavior:
+class BehaviorEvidence:
     test: str
     quote: str
     source: Path
@@ -30,12 +31,35 @@ class SpecifiedBehavior:
 
 
 @dataclass(frozen=True)
+class NateRequest(BehaviorEvidence):
+    """The reviewer found a request. The source proves its words and date."""
+
+
+@dataclass(frozen=True)
+class ClaimedNateRequest(BehaviorEvidence):
+    """The reviewer found a request. The source still needs verification."""
+
+
+@dataclass(frozen=True)
+class NateSpecified(BehaviorEvidence):
+    """The change needs a decision from Nate."""
+
+
+@dataclass(frozen=True)
+class NoNateDecision:
+    test: str
+
+
+type BehaviorFinding = NoNateDecision | NateRequest | NateSpecified
+type ReviewFinding = NoNateDecision | ClaimedNateRequest | NateSpecified
+
+
+@dataclass(frozen=True)
 class ReviewPending:
     run: Path
 
 
-def parse_reply(text: str, tests: behavior_check.ChangedTests) -> list[SpecifiedBehavior]:
-    """Require exactly one finding for each existing test."""
+def read_findings(text: str) -> dict[str, ReviewFinding]:
     try:
         lines = text.strip().splitlines()
         if lines and re.fullmatch(r"DONE \S+", lines[-1]):
@@ -46,31 +70,58 @@ def parse_reply(text: str, tests: behavior_check.ChangedTests) -> list[Specified
         result = cast(object, json.loads(payload))
         if not isinstance(result, list):
             raise ValueError("expected a list of findings")
-        missing = {change.test for change in tests.tests}
-        evidence: list[SpecifiedBehavior] = []
+        findings: dict[str, ReviewFinding] = {}
         for value in cast(list[object], result):
             if not isinstance(value, dict):
                 raise ValueError("expected an object for each finding")
             row = cast(dict[str, object], value)
             match row:
                 case {"test": str(test), "finding": "none"} if len(row) == 2:
-                    pass
-                case {"test": str(test), "finding": "specified", "quote": str(quote), "source": str(source),
+                    finding = NoNateDecision(test)
+                case {"test": str(test), "finding": "specified" | "requested" as kind, "quote": str(quote), "source": str(source),
                       "date": str(day), "change": str(change)} if len(row) == 6:
                     path = Path(source)
                     if not path.is_absolute() or not quote.strip() or not change.strip() or len(change.splitlines()) != 1:
                         raise ValueError(f"{test}: expected a quote, an absolute source path and one line about the change")
-                    evidence.append(SpecifiedBehavior(test, quote, path, date.fromisoformat(day), change.strip()))
+                    evidence = ClaimedNateRequest if kind == "requested" else NateSpecified
+                    finding = evidence(test, quote, path, date.fromisoformat(day), change.strip())
                 case _:
                     raise ValueError("invalid finding")
-            if test not in missing:
-                raise ValueError(f"unexpected or repeated finding for {test}")
-            missing.remove(test)
-        if missing:
-            raise ValueError(f"missing findings for {', '.join(sorted(missing))}")
+            if test in findings:
+                raise ValueError(f"repeated finding for {test}")
+            findings[test] = finding
     except ValueError as error:
         raise behavior_check.BehaviorCheckError(f"Invalid reviewer reply. {error}") from error
-    return evidence
+    return findings
+
+
+def verify_requests(findings: Iterable[ReviewFinding]) -> list[BehaviorFinding]:
+    rows = list(findings)
+    quotes: dict[Path, set[str]] = {}
+    for finding in rows:
+        if isinstance(finding, ClaimedNateRequest):
+            quotes.setdefault(finding.source, set()).add(finding.quote)
+    verified = {source: behavior_request.verified_dates(source, words) for source, words in quotes.items()}
+    results: list[BehaviorFinding] = []
+    for finding in rows:
+        if not isinstance(finding, ClaimedNateRequest):
+            results.append(finding)
+        elif (day := verified[finding.source].get(finding.quote)) is not None:
+            results.append(NateRequest(finding.test, finding.quote, finding.source, day, finding.change))
+        else:
+            results.append(NateSpecified(finding.test, finding.quote, finding.source, finding.day, finding.change))
+    return results
+
+
+def parse_reply(text: str, tests: behavior_check.ChangedTests) -> list[BehaviorFinding]:
+    """Require exactly one finding for each existing test."""
+    findings = read_findings(text)
+    expected = {change.test for change in tests.tests}
+    if unexpected := findings.keys() - expected:
+        raise behavior_check.BehaviorCheckError(f"Invalid reviewer reply. unexpected finding for {min(unexpected)}")
+    if missing := expected - findings.keys():
+        raise behavior_check.BehaviorCheckError(f"Invalid reviewer reply. missing findings for {', '.join(sorted(missing))}")
+    return verify_requests(findings.values())
 
 
 def prepare_review(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, folder: Path) -> str:
@@ -108,14 +159,21 @@ Use these sources:
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
 
 Count only words that Nate used to set the affected behavior. Check who wrote the words.
+Find Nate's newest words that set each affected behavior. Check for later words that set it differently.
 Quote only the words that apply to the changed behavior.
 In `change`, write one plain line for the author about how the behavior changes.
 If you cannot complete the review, report the blocker instead of a finding.
 
 Return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
-Otherwise use {{"test":"ID","finding":"specified","quote":"exact words","source":"/absolute/path",
+Use "requested" only when Nate's newest words on the behavior ask for this change.
+Use "specified" when the change departs from those words or you cannot tell whether it follows them.
+For "requested", cite a typed Claude turn, a sent List Tell from Nate, or Nate's saved answer.
+Quote one or more complete sentences or lines in order. Use the source date.
+Use "specified" when you cannot cite one of these sources.
+Use {{"test":"ID","finding":"requested","quote":"exact words","source":"/absolute/path",
 "date":"YYYY-MM-DD","change":"how the behavior changes"}}
+Use the same fields for "specified".
 
 Read only. Do not edit files, run builds or tests, send messages, or file a question.
 """
@@ -215,7 +273,7 @@ def first_word(text: str) -> str:
     return word[:end]
 
 
-def read_question(path: Path, evidence: list[SpecifiedBehavior]) -> update_registration.QuestionParts:
+def read_question(path: Path, evidence: list[NateSpecified]) -> update_registration.QuestionParts:
     parts = update_registration.read_parts(cast(object, json.loads(path.read_text(encoding="utf-8"))), str(path))
     choices = parts["choices"]
     yes_start = "Yes (the change goes in"
@@ -304,14 +362,33 @@ def refresh_answer(key: str, waiting: behavior_check.Waiting | behavior_check.In
     return answer
 
 
-def verify_approval(tests: behavior_check.ChangedTests, record: behavior_check.Clear | behavior_check.Answered) -> bool:
+class InvalidClearProof:
+    """The saved reply does not prove the range is clear."""
+
+
+def read_clear_reply(key: str, record: behavior_check.Clear) -> str:
+    folder = review_folder(behavior_check.record_path(key).with_suffix(".run"))
+    reply = folder / "completed-reply.txt"
+    if (record.reply != reply or reply.resolve() != reply
+            or (folder / "review-key").read_text(encoding="ascii").strip() != key):
+        raise behavior_check.BehaviorCheckError("The saved approval has no valid proof.")
+    return reply.read_text(encoding="utf-8")
+
+
+def clear_proof(tests: behavior_check.ChangedTests, record: behavior_check.Clear) -> tuple[NateRequest, ...] | InvalidClearProof:
     try:
-        if isinstance(record, behavior_check.Clear):
-            folder = review_folder(behavior_check.record_path(tests.key).with_suffix(".run"))
-            reply = folder / "completed-reply.txt"
-            return (record.reply == reply and reply.resolve() == reply
-                    and (folder / "review-key").read_text(encoding="ascii").strip() == tests.key
-                    and not parse_reply(reply.read_text(encoding="utf-8"), tests))
+        findings = parse_reply(read_clear_reply(tests.key, record), tests)
+    except (behavior_check.BehaviorCheckError, OSError, ValueError):
+        return InvalidClearProof()
+    if any(isinstance(finding, NateSpecified) for finding in findings):
+        return InvalidClearProof()
+    return tuple(finding for finding in findings if isinstance(finding, NateRequest))
+
+
+def verify_approval(tests: behavior_check.ChangedTests, record: behavior_check.Clear | behavior_check.Answered) -> bool:
+    if isinstance(record, behavior_check.Clear):
+        return isinstance(clear_proof(tests, record), tuple)
+    try:
         answer = question_answer(tests.key, record.owner, record.question_id)
         return isinstance(answer, behavior_check.Answered) and answer.approval is behavior_check.Approval.YES
     except (behavior_check.BehaviorCheckError, update_registration.InputError, update_registration.RegistrationFailure,
@@ -319,9 +396,12 @@ def verify_approval(tests: behavior_check.ChangedTests, record: behavior_check.C
         return False
 
 
-def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoReview) -> int:
+def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoReview,
+           requests: Iterable[NateRequest] = ()) -> int:
     if isinstance(record, behavior_check.Clear):
         print(f"{key} clear")
+        for finding in requests:
+            print(finding.test, f"Nate's request ({finding.day}, {finding.source}): {finding.quote}", sep="\n")
         return 0
     if isinstance(record, behavior_check.Answered):
         print(f"{key} {record.approval} ({record.question_id})")
@@ -336,7 +416,7 @@ def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoRev
 
 
 def print_findings(change: behavior_check.GitRange, tests: behavior_check.ChangedTests,
-                   evidence: list[SpecifiedBehavior]) -> None:
+                   evidence: list[NateSpecified]) -> None:
     for finding in evidence:
         print(finding.test, f"Nate's words ({finding.day}, {finding.source}): {finding.quote}",
               f"Change: {finding.change}", sep="\n", file=sys.stderr)
@@ -367,7 +447,10 @@ def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key
         record = behavior_check.read_record(key)
         if isinstance(record, (behavior_check.Waiting, behavior_check.InvalidAnswer)):
             return report(key, refresh_answer(key, record))
-        if isinstance(record, behavior_check.Clear) and not verify_approval(tests, record):
+        if isinstance(record, behavior_check.Clear):
+            proof = clear_proof(tests, record)
+            if not isinstance(proof, InvalidClearProof):
+                return report(key, record, proof)
             path.unlink()
         elif record is not behavior_check.NoReview.MISSING:
             return report(key, record)
@@ -381,10 +464,11 @@ def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key
             print(f"After the reply arrives, run {change.command('run', production=reference, question=question)}")
             return 1
         try:
-            evidence = parse_reply(reply.read_text(encoding="utf-8"), tests)
+            findings = parse_reply(reply.read_text(encoding="utf-8"), tests)
         except behavior_check.BehaviorCheckError:
             pointer.unlink()
             raise
+        evidence = [finding for finding in findings if isinstance(finding, NateSpecified)]
         if not evidence:
             record = behavior_check.Clear(reply)
         elif question is behavior_check.NoQuestionDraft.OMITTED:
@@ -403,7 +487,7 @@ def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key
                 print(f"Nate was not asked. Revise {question} and run again.", file=sys.stderr)
                 return 1
         behavior_check.write_record(key, record)
-        return report(key, record)
+        return report(key, record, (finding for finding in findings if isinstance(finding, NateRequest)))
     finally:
         lock.close()
 
@@ -421,6 +505,15 @@ def status(key: str) -> int:
             record = recover_question(key)
         elif isinstance(record, (behavior_check.Waiting, behavior_check.InvalidAnswer)):
             record = refresh_answer(key, record)
+        elif isinstance(record, behavior_check.Clear):
+            try:
+                evidence = verify_requests(read_findings(read_clear_reply(key, record)).values())
+            except (behavior_check.BehaviorCheckError, OSError, ValueError):
+                evidence = []
+            if not evidence or any(isinstance(finding, NateSpecified) for finding in evidence):
+                print(f"{key}: the saved approval has no valid proof.")
+                return 1
+            return report(key, record, (finding for finding in evidence if isinstance(finding, NateRequest)))
         return report(key, record)
 
 
