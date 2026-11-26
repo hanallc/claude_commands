@@ -43,7 +43,10 @@ _SENTENCE_END = re.compile(
     r"""(?:(?<!\b[A-Z])(?<!\b[A-Z][a-z])(?<!\b[A-Z][a-z]{2})\.|[!?])[.!?]*["'’”)]*(?=\s|$)"""
 )
 _YES_NO = re.compile(r"Choices:\s*\n- (yes|no)\b[^\n]*\n- (yes|no)\b[^\n]*\s*\Z", re.I)
-_COMMAND_LABEL = "Run this command:"
+_COMMAND_LABEL = re.compile(r"(?<![\w`])(?i:run) this command:")
+_LABELED_CODE_COMMAND = re.compile(
+    rf"{_COMMAND_LABEL.pattern}[ \t]*({_CODE_COMMAND.pattern}|`[\w.~+-]*/[\w./~+-]+`)(?!`)"
+)
 
 
 def _length_failures(text: str, kind: Kind) -> list[review.RuleFailure]:
@@ -68,15 +71,40 @@ def _length_failures(text: str, kind: Kind) -> list[review.RuleFailure]:
     return failures
 
 
+def _check_visible_text(content: str, failures: list[review.RuleFailure]) -> None:
+    visible = _URL.sub(" ", content)
+    for rule, pattern in (("omit-run-id", _RUN), ("omit-session-id", _SESSION),
+                          ("omit-file-path", _PATH), ("omit-commit-hash", _COMMIT)):
+        for match in pattern.finditer(visible):
+            failures.append(review.RuleFailure(rule, match[0]))
+        visible = pattern.sub(" ", visible)
+
+
 def fast_check(text: str, kind: Kind) -> tuple[review.RuleFailure, ...]:
     """Return failed patterns with quotes. Put the question title in the first block."""
     failures = _length_failures(text, kind)
     command_allowed = used_command = shell_fence = False
     for line in text.splitlines():
         content = _ITEM.sub("", line.strip(), count=1)
-        if content.startswith(_COMMAND_LABEL):
+        parts = _LABELED_CODE_COMMAND.split(content) if not shell_fence else [content]
+        if len(parts) > 1:
+            for command in parts[1::2]:
+                if used_command:
+                    failures.append(review.RuleFailure("command-for-user-only", command))
+                used_command = True
+            command_allowed = False
+            for prose in parts[::2]:
+                for command in _CODE_COMMAND.finditer(prose):
+                    failures.append(review.RuleFailure("command-for-user-only", command[0]))
+                prose = _CODE_COMMAND.sub(" ", prose).strip()
+                if _SHELL_LINE.match(prose):
+                    failures.append(review.RuleFailure("command-for-user-only", prose))
+                else:
+                    _check_visible_text(prose, failures)
+            continue
+        if label := _COMMAND_LABEL.match(content):
             command_allowed = not used_command
-            content = content.removeprefix(_COMMAND_LABEL).strip()
+            content = content[label.end():].strip()
         if not content:
             continue
         if _SHELL_FENCE.fullmatch(content):
@@ -93,12 +121,7 @@ def fast_check(text: str, kind: Kind) -> tuple[review.RuleFailure, ...]:
             command_allowed = False
             continue
         command_allowed = False
-        visible = _URL.sub(" ", content)
-        for rule, pattern in (("omit-run-id", _RUN), ("omit-session-id", _SESSION),
-                              ("omit-file-path", _PATH), ("omit-commit-hash", _COMMIT)):
-            for match in pattern.finditer(visible):
-                failures.append(review.RuleFailure(rule, match[0]))
-            visible = pattern.sub(" ", visible)
+        _check_visible_text(content, failures)
     return tuple(failures)
 
 

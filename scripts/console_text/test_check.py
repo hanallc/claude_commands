@@ -39,6 +39,24 @@ class ConsoleTextCheckTests(unittest.TestCase):
         self.assertEqual(check.fast_check(text, "reply"),
                          (review.RuleFailure("command-for-user-only", "`git status`"),))
 
+        script = "`~/.claude/scripts/agents/foo.sh`"
+        inline = f"On the Mac, run this command: {script}"
+        for text in (
+                f"Run this command: {script}",
+                "On the Mac, run this command: `~/.claude/scripts/lib/py ~/.claude/scripts/agents/foo.py --x 1`",
+                f"On the Mac, RUN this command: {script}."):
+            with self.subTest(text=text):
+                self.assertEqual(check.fast_check(text, "reply"), ())
+
+        for text, rule, quote in (
+                (f"{inline}\nRun this command: `git status`", "command-for-user-only", "`git status`"),
+                (f"{inline}. Run this command: `git status`", "command-for-user-only", "`git status`"),
+                (f"{inline} and `git status`", "command-for-user-only", "`git status`"),
+                (f"{inline} and see /tmp/result", "omit-file-path", "/tmp/result"),
+                (f"On the Mac, use {script}", "omit-file-path", script.strip("`"))):
+            with self.subTest(text=text):
+                self.assertEqual(check.fast_check(text, "reply"), (review.RuleFailure(rule, quote),))
+
     def test_paths_commits_runs_and_sessions(self) -> None:
         for rule, rejected, accepted in (
                 ("omit-file-path", "/tmp/layout.toml", "the layout settings"),
