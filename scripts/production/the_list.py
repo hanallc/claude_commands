@@ -2392,15 +2392,14 @@ class ReportRoute:
 
 def report_route(owner: staff.StaffId, members: staff.StaffSnapshot) -> ReportRoute:
     """Find the keeper, producer and unit for a report without a saved route."""
-    from scripts.review_links import review_submissions
-
-    keeper = producer_id(members, 'morty')
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    if keeper is None:
+        raise ListError("The List has no active producer.")
     member = members.by_id(owner)
     unit = member.name if member is not None and member.kind == "unit" else ""
     mapped = producer_map.producer_for(owner, members)
-    fallback = (mapped.producer if isinstance(mapped, producer_map.MappedProducer)
-                else review_submissions.list_producer(conf.read("console"), members))
-    return ReportRoute(keeper, fallback.id if isinstance(fallback, staff.StaffRow) else keeper, unit)
+    producer = mapped.producer if isinstance(mapped, producer_map.MappedProducer) else keeper
+    return ReportRoute(keeper.id, producer.id, unit)
 
 
 @contextmanager
@@ -3887,7 +3886,8 @@ def _next_step_notice(keeper: staff.StaffId, request: str, done: str, item: List
     members = staff.snapshot()
     producer = members.by_id(item.producer)
     name = shlex.quote(producer.name if producer is not None else item.producer)
-    keeper_option = "" if keeper in record_store.morty_ids(members) else f" --keeper {shlex.quote(keeper)}"
+    default_keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    keeper_option = "" if default_keeper is not None and keeper == default_keeper.id else f" --keeper {shlex.quote(keeper)}"
     words = (f"List page: {done} item {item.number}, so it is now Working. Write its next step: "
              + f"`{_LAUNCHER} update --id {item.id}{keeper_option} --source {name} --next-step \"<step>\"`.")
     return PageFeedback(request, words, action="read", form_words=form_words, recipient=item.producer)
@@ -4814,7 +4814,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"answered {identity} {question}")
             return 0
         morty = producer_id(record, "morty")
-        keeper = morty
+        list_keeper = record_store.list_keeper(conf.read_or_repository("console"), record)
+        if list_keeper is None:
+            raise ListError("The List keeper is unavailable.")
+        keeper = list_keeper.id
         if name in ("ask", "withdraw-ask"):
             identity = cast(str, args.id)
             identity = f"L{identity}" if identity.isascii() and identity.isdecimal() else identity
@@ -4864,11 +4867,11 @@ def main(argv: list[str] | None = None) -> int:
         schedule_scope = cast(ScheduleScope, getattr(args, "scope", ScheduleScope.UNSPECIFIED))
         if name == "update":
             identity = _cli_item_id(cast(str, args.id))
-            keeper = _record_keeper(morty, caller.id, identity, cast(staff.StaffId | None, args.keeper),
+            keeper = _record_keeper(list_keeper.id, caller.id, identity, cast(staff.StaffId | None, args.keeper),
                                     policy=_KeeperRouting.UPDATE)
             reassigns = cast(str | None, args.producer) is not None or cast(str | None, args.owner) is not None
             # A producer gets the field refusal below, because it never changes these fields.
-            if assigned_to is AllItems.INCLUDED and keeper != morty and reassigns:
+            if assigned_to is AllItems.INCLUDED and keeper != list_keeper.id and reassigns:
                 raise ListError("move the item to morty's List before you change its producer or owner")
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))

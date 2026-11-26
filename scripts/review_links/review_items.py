@@ -951,7 +951,9 @@ def on_list(item: ReviewItem) -> bool:
 
 
 def list_move_event(event: ReviewLog) -> bool:
-    return event.who == 'nate' and re.fullmatch(r'moved to List item [1-9][0-9]*', event.words) is not None
+    words = cast(object, event.words)
+    return (event.who == 'nate' and isinstance(words, str)
+            and re.fullmatch(r'moved to List item [1-9][0-9]*', words) is not None)
 
 
 def change_on_list(row: dict[str, str]) -> bool:

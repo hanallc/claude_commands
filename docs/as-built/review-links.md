@@ -688,6 +688,10 @@ The writer checks the current state under its lock before it stores the reason.
 Questions use the canonical owner lock, including questions without a current owner.
 The command prints one plain error line for a refused update.
 `investigation.py file` requires `--waiting-why` and files an Investigation on the List.
+The caller owns the investigation.
+The command saves the List row in the folder of the producer set in `page.list.owner`.
+A producer who files an investigation also produces it.
+For other callers, the command uses the producer map or the configured List producer if the map has no active producer.
 The Python `followup` API stores the follow-up words as the reason.
 `proposal_issue.record_review` and `efficiency_reviews.record` require `waiting_why` when setting the Waiting mark.
 `candidates.py outcome E<n> deferred --waiting-why "<reason>"` stores the reason beside the ledger.
@@ -1634,6 +1638,18 @@ Parked items also match the word `Parked`.
 The address retains the owner, producer, status chip, unread switch, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
+HTTP and HTTPS links in the open row's item text and log open in a new tab.
+Whitespace, angle brackets, double quotes, and the start of the next URL scheme end a link.
+Only HTTP and HTTPS URLs become links.
+Trailing punctuation stays outside the link. Asterisks and apostrophes within a URL stay in the link.
+The Links section follows the item fields and precedes the actions.
+The section includes jumps to related and blocking items on the List.
+URLs in blocking conditions appear as links beside the blocking item.
+The section lists each distinct URL from the fields, log, and answers in order of first appearance.
+The section uses the Next step label for URLs in schedule instructions.
+Each URL row shows a link label, the oldest source field, and the full URL.
+The Links section uses the original question time after the question closes.
+The section is absent when the item has no jumps or URLs.
 The log shows its newest entry first.
 On a wide page, the log is to the right of the current fields.
 On a narrow page, the log is below the current fields.

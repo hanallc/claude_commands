@@ -881,13 +881,13 @@ def _legacy_list_question_store(listing: record_store.NumberedRecords,
         inferred = replace(listing, owner=staff.StaffId(folder.parent.name))
         if inferred.path(source.item_id).resolve() == path:
             return inferred
-    keepers = record_store.morty_ids(staff.snapshot())
-    if len(keepers) != 1:
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), staff.snapshot())
+    if keeper is None:
         raise ValueError("The List keeper is unavailable.")
-    morty = replace(listing, owner=keepers[0])
-    if morty.path(source.item_id).resolve() != path:
+    configured = replace(listing, owner=keeper.id)
+    if configured.path(source.item_id).resolve() != path:
         raise ValueError("The List question source has moved.")
-    return morty
+    return configured
 
 
 def _open_list_question(listing: record_store.NumberedRecords,

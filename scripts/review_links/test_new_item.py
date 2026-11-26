@@ -185,6 +185,7 @@ class NewItemTests(ServerFixture):
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [
             row.to_json() for row in staff.active(members, "producer")
         ]}))
+        _ = write_config_fixture(folder / "console.conf", f"page.list.owner={MORTY.id}\n")
         _ = (folder / "the_list.conf").write_text("# whole: 1..\nseries_run_limit=730\n")
         _ = (folder / "review_links.conf").write_text("review_attachments_root=review-attachments\n")
         self.map_row(NATEDEV, DWIGHT)
@@ -898,11 +899,16 @@ class NewItemServerTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_review_recovers_two_report_drafts_after_reload(self) -> None:
         probe = test_new_item_dialog.TWO_LIST_DRAFTS_PROBE.replace(
-            "console.list.pending-send.", "console.report.pending-send.page:review.").replace(
-            "sessionStorage.getItem(prefix + first.item.request_id) === 'other'",
-            "JSON.parse(sessionStorage.getItem(prefix + first.item.request_id)).recipient === 'other'").replace(
-            "sessionStorage.getItem(prefix + second.item.request_id) === 'owner'",
-            "JSON.parse(sessionStorage.getItem(prefix + second.item.request_id)).recipient === 'owner'")
+            "const prefix = 'console.list.pending-send.', probeKey = 'test-list-drafts';",
+            """const probeKey = 'test-list-drafts';
+const submitted = 'console.new-item.submitted';
+function storedRecipient(id) {
+ for (const key of [submitted, submitted + '.' + id]) {
+  const draft = JSON.parse(sessionStorage.getItem(key) || 'null');
+  if (draft?.payload.request_id === id) return draft.payload.recipient_id;
+ }
+ return null;
+}""").replace("sessionStorage.getItem(prefix + ", "storedRecipient(")
         self.assertEqual(firefox_probe_results(test_new_item_dialog.bug_fixture_page(script=probe)), [[]])
 
     def test_resend_reply_reads_each_native_type_and_refuses_completed_or_unknown_items(self) -> None:
