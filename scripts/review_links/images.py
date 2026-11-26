@@ -128,7 +128,7 @@ def read_image_decision(root: Path, path: Path) -> ImageDecision | NoImageDecisi
     raise ValueError(f"{path}: Invalid Images answer record.")
 
 
-def _save_image_decision(root: Path, identity: str, key: str, answer: str, feedback: str) -> None:
+def _save_image_decision(root: Path, identity: str, key: str, answer: str, feedback: str, image_text: str) -> None:
     """Save the first signed answer for this request while the Images lock is held."""
     folder = decision_root(root)
     folder.mkdir(mode=0o700, exist_ok=True)
@@ -140,8 +140,8 @@ def _save_image_decision(root: Path, identity: str, key: str, answer: str, feedb
     if path.exists():
         atomic_file.sync_folder(folder)
     else:
-        fields = {"image_id": identity, "source": the_list.IMAGE_ANSWER_SOURCE, "answer": answer,
-                  "feedback": feedback, "time": datetime.now(UTC).isoformat()}
+        fields = {"image_id": identity, "source": the_list.IMAGE_ANSWER_SOURCE, "image_text": image_text,
+                  "answer": answer, "feedback": feedback, "time": datetime.now(UTC).isoformat()}
         atomic_file.write_text_atomic(path, json.dumps(fields) + "\n", new_file_mode=0o600)
     atomic_file.sync_folder(root)
 
@@ -568,7 +568,9 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
                     raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.") from None
             message = answer_message(record, answer, feedback)
         if new_answer and origin is ImageAnswerOrigin.SIGNED_FORM and "list_item" not in saved:
-            _save_image_decision(directory.parent, identity, key, answer, feedback)
+            heading = saved.get("heading")
+            image_text = "\n".join((heading["title"], *image_store.look_for_message_lines(heading))) if heading else ""
+            _save_image_decision(directory.parent, identity, key, answer, feedback, image_text)
         attempts[key] = {"message": message, "words": words, "answered": sorted(previous),
                          "recipients": [], "confirmed": []}
         image_store.write_answers(directory, saved)

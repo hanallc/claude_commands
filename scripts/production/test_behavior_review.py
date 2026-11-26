@@ -21,7 +21,7 @@ from scripts.notify import review
 from scripts.production import (
     behavior_check, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
 )
-from scripts.review_links import list_draft, question_record, review_events
+from scripts.review_links import images, list_draft, question_record, review_events
 
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
@@ -138,7 +138,9 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def test_clear_requires_a_saved_reply_for_this_patch_and_each_test(self) -> None:
         args, key = self.changed_range()
         self.reply(CLEAR_REPLY)
-        with mock.patch.object(astra_review, "run_review", return_value=0) as runner:
+        review_root = self.root / "review-links"
+        with (mock.patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(review_root)}),
+              mock.patch.object(astra_review, "run_review", return_value=0) as runner):
             code, output = self.cli("run", *args)
             self.assertEqual(code, 0, output)
             self.assertEqual(self.cli("run", *args), (0, output))
@@ -149,6 +151,10 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("Never call `write_stdin`.", prompt)
         self.assertIn("rg --search-zip --files-with-matches --hidden --no-ignore", prompt)
         self.assertIn("Parse only those files for matching user turns.", prompt)
+        self.assertIn(f"Nate's Images page answers in {images.decision_root(review_root)}/*.json.", prompt)
+        self.assertIn('A log entry with source "nate via Images" contains Nate\'s words.', prompt)
+        self.assertIn("Use `image_text` for context. Quote only `answer` and `feedback`.", prompt)
+        self.assertIn("You can cite Nate's Images page answer from the store or the List log.", prompt)
         self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)
         self.assertIn('Use "specified" when the change departs from those words or you cannot tell', prompt)
         self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))

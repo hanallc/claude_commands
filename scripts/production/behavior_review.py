@@ -18,7 +18,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
 from scripts.production import behavior_check, behavior_request, staff, update_registration, worker
 from scripts.production.production_doc import Refusal
-from scripts.review_links import review_events
+from scripts.review_links import images, review_events, review_link
 
 
 @dataclass(frozen=True)
@@ -149,6 +149,7 @@ If a search times out, split its input into smaller groups and search each group
 
 Use these sources:
 1. List records and their questions and answers in {state_root()}/*/list/L*.md.
+   A log entry with source "nate via Images" contains Nate's words.
 2. Question records from scripts/production/update_registration.py and change review verdicts.
    Follow the store paths in the showrunner documents and the showrunner state root.
 3. User turns in Claude session transcripts. Do not count assistant, tool, or peer messages.
@@ -157,6 +158,8 @@ Use these sources:
    Select files by terms for the affected behaviors. Parse only those files for matching user turns.
 4. Commit messages in {change.repo}.
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
+6. Nate's Images page answers in {images.decision_root(review_link.review_root())}/*.json.
+   Use `image_text` for context. Quote only `answer` and `feedback`.
 
 Count only words that Nate used to set the affected behavior. Check who wrote the words.
 Find Nate's newest words that set each affected behavior. Check for later words that set it differently.
@@ -169,6 +172,7 @@ Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
 Use "specified" when the change departs from those words or you cannot tell whether it follows them.
 For "requested", cite a typed Claude turn, a sent List Tell from Nate, or Nate's saved answer.
+You can cite Nate's Images page answer from the store or the List log.
 Quote one or more complete sentences or lines in order. Use the source date.
 Use "specified" when you cannot cite one of these sources.
 Use {{"test":"ID","finding":"requested","quote":"exact words","source":"/absolute/path",

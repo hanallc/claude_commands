@@ -47,9 +47,13 @@ class BehaviorRequestImagesTests(TestCase):
         fields = {"image_id": identity, "source": "nate via Images", "answer": "approved",
                   "feedback": feedback, "time": "2026-11-23T19:40:00+00:00"}
         _ = source.write_text(json.dumps(fields))
-        quotes = {"approved", feedback}
-        self.assertEqual(behavior_request.verified_dates(source, quotes),
-                         {quote: date(2026, 11, 23) for quote in quotes})
+        expected = {quote: date(2026, 11, 23) for quote in ("approved", feedback)}
+        self.assertEqual(behavior_request.verified_dates(source, set(expected)), expected)
+        question = "Should we remove the second row?"
+        fields["image_text"] = question
+        _ = source.write_text(json.dumps(fields))
+        quotes = {*expected, question}
+        self.assertEqual(behavior_request.verified_dates(source, quotes), expected)
         copy = self.root / source.name
         _ = copy.write_bytes(source.read_bytes())
         self.assertEqual(behavior_request.verified_dates(copy, quotes), {})

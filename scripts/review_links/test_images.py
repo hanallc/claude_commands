@@ -849,7 +849,7 @@ class ImagesTests(ImagesFixture):
                  ("Feedback: The counts are wrong.",))):
             with self.subTest(action=action, feedback=feedback):
                 self.sent.clear()
-                record = self.register("After: the panel.")
+                record = self.register("Should we keep the new panel?", look_for=("Check the counts.",))
                 accepted_after = datetime.now(UTC)
                 self.submit(self.feedback_body(record, feedback, action))
                 archive = images.decision_root(self.root)
@@ -866,7 +866,8 @@ class ImagesTests(ImagesFixture):
                 self.assertEqual([message for _, _, message in self.sent], ["\n".join((
                     f"From the user (via the Images page): {first}", *lines,
                     f"Image: http://127.0.0.1:8765/images/{record['id']}/image.png",
-                    "Title: After: the panel.", "For: Phase console-images",
+                    "Title: Should we keep the new panel?", "Look for:", "- Check the counts.",
+                    "For: Phase console-images",
                     "After you act on it, delete the image: "
                     + f"~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py delete --id {record['id']}"))])
                 self.assertIn("feedback_at", image_store.read_record(self.root / image_store.IMAGES_FOLDER / record["id"]))
@@ -875,6 +876,8 @@ class ImagesTests(ImagesFixture):
                 directory = images.images_root(self.root)
                 (directory / f".review-link-image-answers-{record['id']}.json").unlink()
                 self.assertEqual(images.read_image_decision(self.root, path), decision)
+                self.assertEqual(delivery_state.read_fields(path)["image_text"],
+                                 "Should we keep the new panel?\nLook for:\n- Check the counts.")
 
     def test_linked_answers_save_before_delivery_and_survive_owner_delete(self) -> None:
         self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.temporary / "state")}))
