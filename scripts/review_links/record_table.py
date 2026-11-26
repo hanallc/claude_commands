@@ -71,11 +71,13 @@ def filter_facets(fields: Mapping[str, str]) -> tuple[FilterFacet, ...]:
 
 def count_filter_row(facets: tuple[FilterFacet, ...], data: Mapping[str, str],
                      selected: Mapping[str, str], counts: Mapping[str, Counter[str]], *,
-                     staff_filters: tuple[str, ...]) -> bool:
-    """Count an eligible row for every facet and return whether it matches."""
+                     staff_filters: tuple[str, ...], count_eligible: bool = True) -> bool:
+    """Return whether the row matches the facets. Count it if eligible."""
     excluded = sum(bit for name, field, bit, _ in facets
                    if (choice := selected.get(name)) and choice != data[field]
                    and (name != "show" or choice != "all"))
+    if not count_eligible:
+        return not excluded
     for name, field, _, count_mask in facets:
         if excluded & count_mask:
             continue
@@ -88,7 +90,7 @@ def count_filter_row(facets: tuple[FilterFacet, ...], data: Mapping[str, str],
 
 
 OWNER_QUERY_KEYS = ("owner", "showrunner")
-LIST_QUERY_FIELDS = ("show", "unread", *OWNER_QUERY_KEYS, "producer", "q", "key", "item", "reveal", "state")
+LIST_QUERY_FIELDS = ("show", "unread", *OWNER_QUERY_KEYS, "producer", "q", "key", "item", "reveal", "state", "tag")
 
 
 def identity_attribute(value: str) -> str:

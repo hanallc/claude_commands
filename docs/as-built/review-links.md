@@ -1514,6 +1514,8 @@ The List excludes Closed records from rows, filters, and counts.
 
 Tags appear as chips under each item title.
 The Tag row counts open items that match the words and the other filters.
+The server applies the `tag` query before the first paint.
+The server and browser ignore query tags that contain control characters or lone surrogates.
 Select a chip in the Tag row or under a title to filter the items.
 Each item must have every selected tag.
 Type the first letters of a tag to find it in the suggestions.
@@ -1527,6 +1529,7 @@ Type a tag and press Enter, or select a suggestion.
 The suggestions show matching tags first and offer Create for a new tag.
 The field keeps focus after a save.
 The field shows the tag validation error for invalid text.
+Tags cannot contain Unicode control characters (`Cc`) or lone surrogates (`Cs`).
 Select × to remove a tag, or press Backspace in the empty field to remove the last tag.
 The editor offers Undo only for a removal that the server confirms.
 If another session already removed the tag, the editor shows the current tags.
