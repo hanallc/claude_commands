@@ -61,7 +61,8 @@ GUEST_CLAIM_TARGET = eligibility.MAC_LINUX_CLAIM_TARGET
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
 BOOTSTRAP_DIR = '.git/mac-linux'
-BOOTSTRAP_PLACEMENT_PENDING = '.git/mac-linux-placement-pending'
+BOOTSTRAP_RESET_PENDING = 'main-reset-pending'
+BOOTSTRAP_RESET_COMPLETE = 'main-reset-complete'
 PLACEMENT_OLD_GIT = 'placement-old-git'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 CONNECT_ATTEMPTS = 3
@@ -1023,14 +1024,31 @@ def guest_group_signal_command() -> str:
     return shlex.join(('python3', '-I', '-S', '-c', Path(process_group.__file__).read_text(encoding='utf-8')))
 
 
+BOOTSTRAP_COMPLETION_CHECK = f'''bootstrap_completed_for() {{
+    local owner record="$bootstrap/{BOOTSTRAP_RESET_COMPLETE}"
+    [[ ! -L "$bootstrap" && ! -L "$record" && -f "$record" ]] &&
+        IFS= read -r -d '' owner < "$record" &&
+        [[ "$owner" == "$1" ]]
+}}'''
+
+
+def bootstrap_publication_owner(armed: ArmedGuestAttempt) -> str:
+    """Identify one arm of a guest attempt."""
+    return f'{armed.boot_id}.{armed.deadline_ns}.{armed.attempt}'
+
+
 def run_shell(settings: GuestSettings, source: CheckoutSource, bootstrap_bytes: int, armed: ArmedGuestAttempt) -> str:
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
-    reset_main = f'''git config remote.origin.url {shlex.quote(source.origin_url)}
-git symbolic-ref HEAD refs/heads/main
-git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
-printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$1" "$1" | git update-ref --stdin
-git reset --hard -q "$1"'''
-    check_placement = reset_main + f'\nexec "$2/scripts/lib/py" "$2/{RUNNER_PATH}" "$2/request.json" --check-placement'
+    reset_main = f'''reset_guest_main() {{
+    git config remote.origin.url "$2"
+    git symbolic-ref HEAD refs/heads/main
+    git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
+    printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$1" "$1" | git update-ref --stdin
+    git reset --hard -q "$1"
+}}'''
+    check_placement = reset_main + f'''
+reset_guest_main "$1" "$3"
+exec "$2/scripts/lib/py" "$2/{RUNNER_PATH}" "$2/request.json" --check-placement'''
     checkout = f'''set -euo pipefail
 if [ ! -f .git/mac-linux-owned ]; then
     if [ -n "$(find . -mindepth 1 -maxdepth 1 ! -name .git -print -quit)" ] ||
@@ -1053,8 +1071,29 @@ if [ ! -f .git/HEAD ]; then
     git init -q --initial-branch=main --object-format={object_format}
 fi
 bootstrap="$PWD/{BOOTSTRAP_DIR}"
-placement_pending={BOOTSTRAP_PLACEMENT_PENDING}
-: > "$placement_pending"
+bootstrap_owner={shlex.quote(bootstrap_publication_owner(armed))}
+if [[ -L "$bootstrap" || ( -e "$bootstrap" && ! -d "$bootstrap" ) ]]; then
+    printf 'The guest bootstrap must be a directory.\\n' >&2
+    exit 1
+fi
+{reset_main}
+{BOOTSTRAP_COMPLETION_CHECK}
+finish_guest_main_reset() {{
+    local pending="$bootstrap/{BOOTSTRAP_RESET_PENDING}" complete="$bootstrap/{BOOTSTRAP_RESET_COMPLETE}"
+    local -a reset_record
+    if [[ -L "$pending" || ! -f "$pending" || -e "$complete" || -L "$complete" ]]; then
+        printf 'The guest main reset record is invalid.\\n' >&2
+        exit 1
+    fi
+    mapfile -d '' -t reset_record < "$pending"
+    if (( ${{#reset_record[@]}} != 3 )) ||
+       [[ ! "${{reset_record[0]}}" =~ ^[0-9a-z.-]+$ || ! "${{reset_record[1]}}" =~ ^[0-9a-f]{{{len(source.commit)}}}$ ]]; then
+        printf 'The guest main reset record is invalid.\\n' >&2
+        exit 1
+    fi
+    reset_guest_main "${{reset_record[1]}}" "${{reset_record[2]}}"
+    mv -T -- "$pending" "$complete"
+}}
 stage=$(mktemp -d "$bootstrap-stage.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 mkdir -- "$stage/tmp"
@@ -1073,10 +1112,12 @@ fi
 read -r group _ < "/proc/$$/fd/{RUN_LOCK_FD}"
 {{ while read -r _; do :; done; exec setsid {guest_group_signal_command()} "$group" KILL; }} <&0 >/dev/null 2>&1 {RUN_LOCK_FD}>&- &
 watcher=$!
-trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$stage"' EXIT
+trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$stage";
+      if bootstrap_completed_for "$bootstrap_owner"; then rm -rf -- "$bootstrap"; fi' EXIT
 exec </dev/null
 commit={shlex.quote(source.commit)}
 origin_main={shlex.quote(source.origin_main)}
+origin_url={shlex.quote(source.origin_url)}
 tree=$(git rev-parse --verify "$commit^{{tree}}")
 if [ "$tree" != {shlex.quote(source.tree)} ]; then
     printf 'The bundle tree %s differs from the requested tree.\\n' "$tree" >&2
@@ -1084,25 +1125,35 @@ if [ "$tree" != {shlex.quote(source.tree)} ]; then
 fi
 git cat-file -e "$origin_main^{{commit}}"
 git archive {shlex.quote(source.runner_commit)} scripts config | tar -xf - -C "$stage"
+umask 022
+"$stage/scripts/lib/py" "$stage/{RUNNER_PATH}" "$stage/request.json" --check-live-reset
+if [[ -e "$bootstrap/{BOOTSTRAP_RESET_PENDING}" || -L "$bootstrap/{BOOTSTRAP_RESET_PENDING}" ]]; then
+    TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache" finish_guest_main_reset
+fi
 incoming="$stage/checkout"
 mkdir -p -- "$incoming/.git/objects" "$incoming/.git/worktrees" "$incoming/{BOOTSTRAP_DIR}" "$stage/{PLACEMENT_OLD_GIT}"
 find . -mindepth 1 -maxdepth 1 ! -name .git \\
     -exec cp -a --reflink=auto --target-directory="$incoming" -- {{}} +
 find .git -mindepth 1 -maxdepth 1 ! -name objects ! -name worktrees ! -name mac-linux \\
     ! -name 'mac-linux-stage.*' -exec cp -a --reflink=auto --target-directory="$incoming/.git" -- {{}} +
-export TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache"
-umask 022
 # Mount the private checkout at the live path so Cargo and config use their final paths.
+TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache" \\
 bwrap --die-with-parent --ro-bind / / --unshare-pid --dev /dev --proc /proc \\
     --bind "$incoming" "$PWD" --bind "$stage" "$bootstrap" \\
     --ro-bind "$PWD/.git/objects" "$PWD/.git/objects" --ro-bind-try "$PWD/.git/worktrees" "$PWD/.git/worktrees" \\
     --ro-bind "$PWD/.git" "$bootstrap/{PLACEMENT_OLD_GIT}" --chdir "$PWD" \\
-    -- bash -euo pipefail -c {shlex.quote(check_placement)} placement "$origin_main" "$bootstrap"
-rm -f -- "$placement_pending"
-rm -rf -- "$bootstrap"
-mv -T -- "$stage" "$bootstrap"
-trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$bootstrap"' EXIT
-bash -euo pipefail -c {shlex.quote(reset_main)} publish "$origin_main"
+    -- bash -euo pipefail -c {shlex.quote(check_placement)} placement "$origin_main" "$bootstrap" "$origin_url"
+"$stage/scripts/lib/py" "$stage/{RUNNER_PATH}" "$stage/request.json" --check-live-reset
+# Keep the previous bootstrap until the rename publishes its replacement.
+printf '%s\\0' "$bootstrap_owner" "$origin_main" "$origin_url" > "$stage/{BOOTSTRAP_RESET_PENDING}"
+if [[ -d "$bootstrap" ]]; then
+    mv --exchange --no-copy -T -- "$stage" "$bootstrap"
+else
+    mv --no-copy -T -- "$stage" "$bootstrap"
+fi
+rm -rf -- "$stage"
+export TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache"
+finish_guest_main_reset
 "$bootstrap/scripts/lib/py" "$bootstrap/{RUNNER_PATH}" "$bootstrap/request.json"'''
     lock = guest_attempt_command('lock', armed, RUN_LOCK_FD)
     start = guest_attempt_command('start', armed, RUN_LOCK_FD)
@@ -1118,14 +1169,15 @@ def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
     send_group = guest_group_signal_command()
     cleanup = f'''set -euo pipefail
 lock="/proc/$$/fd/8"
-placement_pending={BOOTSTRAP_PLACEMENT_PENDING}
+bootstrap="$PWD/{BOOTSTRAP_DIR}"
+{BOOTSTRAP_COMPLETION_CHECK}
 prove_end() {{
     flock -x -n 8 || return 1
     if ! {cancel}; then
         exit {GUEST_END_PENDING_STATUS}
     fi
-    if [ ! -e "$placement_pending" ]; then
-        rm -rf -- {BOOTSTRAP_DIR} || exit {GUEST_END_PENDING_STATUS}
+    if bootstrap_completed_for {shlex.quote(bootstrap_publication_owner(armed))}; then
+        rm -rf -- "$bootstrap" || exit {GUEST_END_PENDING_STATUS}
     fi
     printf 'ended\\n'
     exit 0
@@ -2940,6 +2992,15 @@ def save_guest_build_folder(source: Path, checkout: Path, attempt: str) -> None:
     atomic_file.write_text_atomic(marker, str(record) + '\n', new_file_mode=0o600)
 
 
+def check_live_guest_reset(request_path: Path) -> int:
+    """Refuse a reset if the live checkout contains a fixed folder."""
+    try:
+        build_folders.require_no_fixed_build_folders(Path.cwd())
+    except (OSError, ValueError) as error:
+        return refuse_run(str(error), guest_request(request_path)['attempt'])
+    return 0
+
+
 def check_guest_placement(request_path: Path) -> int:
     """Check placement in the staged checkout before publishing it."""
     request = guest_request(request_path)
@@ -3108,6 +3169,8 @@ if __name__ == '__main__':
         reconcile_guest_end(sys.argv[2], int(sys.argv[3]))
     elif sys.argv[2:3] == [RUN_COPY]:
         run_copy(Path(sys.argv[1]), int(sys.argv[3]))
+    elif sys.argv[2:3] == ['--check-live-reset']:
+        raise SystemExit(check_live_guest_reset(Path(sys.argv[1])))
     elif sys.argv[2:3] == ['--check-placement']:
         raise SystemExit(check_guest_placement(Path(sys.argv[1])))
     else:

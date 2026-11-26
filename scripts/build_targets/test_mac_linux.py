@@ -244,6 +244,7 @@ import subprocess
 import sys
 
 if sys.argv[1:3] == ['--die-with-parent', '--ro-bind']:
+    assert not os.environ.get('FIXTURE_REFUSE_BEFORE_STAGED_RESET')
     real = os.environ['FIXTURE_PLACEMENT_BWRAP']
     os.execv(real, [real, *sys.argv[1:]])
 
@@ -427,7 +428,7 @@ from scripts.aws_target import gate_box, ledger
 
 os.chdir(sys.argv[1])
 socket.gethostname = lambda: 'nixos'
-if ('--check-placement' not in sys.argv
+if (not {'--check-placement', '--check-live-reset'}.intersection(sys.argv)
         and os.environ['FIXTURE_GUEST_RESULT'] in ('disconnect-before-copy', 'interrupted-before-copy')):
     print('fixture pause before take_copy', file=sys.stderr, flush=True)
     signal.pause()
@@ -3271,6 +3272,8 @@ with (patch.object(conf, 'read', read_config),
         runner = lock.parent / 'mac-linux' / mac_linux.RUNNER_PATH
         runner.parent.mkdir(parents=True)
         runner.touch()
+        complete = lock.parent / 'mac-linux' / mac_linux.BOOTSTRAP_RESET_COMPLETE
+        _ = complete.write_bytes(mac_linux.bootstrap_publication_owner(armed).encode() + b'\0')
 
         with lock.open('w') as held:
             fcntl.flock(held, fcntl.LOCK_EX)
@@ -3993,6 +3996,106 @@ with (patch.object(conf, 'read', read_config),
         self.assertIn('inside a Git checkout', self.not_started(result))
         self.assertFalse((self.guest_home / '.claude/build').exists())
         self.assertFalse((self.guest_home / 'build').exists())
+
+    @contextmanager
+    def stop_guest_before(self, *statements: str, live_only: bool = False) -> Generator[None]:
+        run_shell = mac_linux.run_shell
+
+        def interrupted_run(settings: mac_linux.GuestSettings, source: mac_linux.CheckoutSource,
+                            bootstrap_bytes: int, armed: mac_linux.ArmedGuestAttempt) -> str:
+            shell = run_shell(settings, source, bootstrap_bytes, armed)
+            statement = next((line for line in statements if line in shell), '')
+            self.assertTrue(statement, statements)
+            stop = (f'read -r stopped_group _ < "/proc/$$/fd/{mac_linux.RUN_LOCK_FD}"\n'
+                    + 'kill -KILL -- "-$stopped_group"\n')
+            if live_only:
+                old_git = f'{mac_linux.BOOTSTRAP_DIR}/{mac_linux.PLACEMENT_OLD_GIT}'
+                stop = f'if [[ ! -f {old_git}/HEAD ]]; then\n{stop}fi\n'
+            return shell.replace(statement, '\n' + stop + statement)
+
+        with patch.object(mac_linux, 'run_shell', interrupted_run):
+            yield
+
+    def test_rows_23_27_stop_before_the_marker_preserves_the_old_bootstrap(self) -> None:
+        self.assertIsInstance(self.route(), GateRun)
+        main = self.guest_home / '.claude'
+        old_bootstrap = main / mac_linux.BOOTSTRAP_DIR / 'old-data'
+        old_bootstrap.parent.mkdir()
+        _ = old_bootstrap.write_text('Keep the earlier bootstrap.')
+
+        with self.stop_guest_before(f'bootstrap="$PWD/{mac_linux.BOOTSTRAP_DIR}"\n'):
+            reason = self.unconfirmed(self.route())
+
+        self.assertIn('Guest cleanup: ended', reason)
+        self.assertEqual(old_bootstrap.read_text(), 'Keep the earlier bootstrap.')
+
+    def test_rows_23_27_stop_before_publication_preserves_the_old_bootstrap(self) -> None:
+        self.assertIsInstance(self.route(), GateRun)
+        main = self.guest_home / '.claude'
+        old_bootstrap = main / mac_linux.BOOTSTRAP_DIR / 'old-data'
+        old_bootstrap.parent.mkdir()
+        _ = old_bootstrap.write_text('Keep the earlier bootstrap.')
+
+        with self.stop_guest_before('    mv --exchange --no-copy -T -- "$stage" "$bootstrap"\n',
+                                    '\nrm -rf -- "$bootstrap"\n'):
+            reason = self.unconfirmed(self.route())
+
+        self.assertIn('Guest cleanup: ended', reason)
+        self.assertEqual(old_bootstrap.read_text(), 'Keep the earlier bootstrap.')
+
+    def test_rows_23_27_stop_between_ref_update_and_reset_replays_the_pending_reset(self) -> None:
+        self.assertIsInstance(self.route(), GateRun)
+        main = self.guest_home / '.claude'
+        bootstrap = main / mac_linux.BOOTSTRAP_DIR
+        _ = (self.repo / 'history.txt').write_text('The interrupted revision.\n')
+        _ = self.git('commit', '-qam', 'change the guest main file')
+        interrupted = self.git('rev-parse', 'HEAD')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', interrupted)
+
+        with self.stop_guest_before('git reset --hard -q "$1"', live_only=True):
+            reason = self.unconfirmed(self.route())
+
+        self.assertIn('Guest cleanup: ended', reason)
+        self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD'), interrupted)
+        self.assertEqual(self.git_at(main, 'rev-parse', 'origin/main'), interrupted)
+        self.assertEqual((main / 'history.txt').read_text(), 'old source\n')
+        self.assertTrue((bootstrap / mac_linux.BOOTSTRAP_RESET_PENDING).is_file())
+
+        config = self.repo / 'config/build_folders.conf'
+        _ = write_config_fixture(config, 'roots.build=~/.claude/build\n')
+        _ = self.git('commit', '-qam', 'configure an invalid guest build root')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+        self.assertIn('inside a Git checkout', self.not_started(self.route()))
+        self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD'), interrupted)
+        self.assertEqual((main / 'history.txt').read_text(), 'The interrupted revision.\n')
+        self.assertTrue((bootstrap / mac_linux.BOOTSTRAP_RESET_COMPLETE).is_file())
+
+    def test_row_26_refuses_a_former_fixed_folder_before_reset(self) -> None:
+        self.assertIsInstance(self.route(), GateRun)
+        main = self.guest_home / '.claude'
+        old_head = self.git_at(main, 'rev-parse', 'HEAD')
+        old_bootstrap = main / mac_linux.BOOTSTRAP_DIR / 'old-data'
+        old_bootstrap.parent.mkdir()
+        _ = old_bootstrap.write_text('Keep the earlier bootstrap.')
+
+        build = self.guest_home / 'build'
+        folder = Path('claude/mac-linux')
+        _ = (build / folder / 'proof').write_text('Keep the former build folder.')
+        _ = build.rename(main / 'replacement')
+        _ = (self.repo / 'replacement').write_text('The incoming file.')
+        _ = self.git('add', 'replacement')
+        _ = self.git('commit', '-qm', 'replace the directory with a tracked file')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+        with patch.dict(os.environ, {'FIXTURE_REFUSE_BEFORE_STAGED_RESET': '1'}):
+            result = self.route()
+
+        self.assertIn('cannot remove a fixed build folder', self.not_started(result))
+        self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD'), old_head)
+        self.assertEqual(self.git_at(main, 'rev-parse', 'origin/main'), old_head)
+        self.assertEqual((main / 'replacement' / folder / 'proof').read_text(), 'Keep the former build folder.')
+        self.assertEqual(old_bootstrap.read_text(), 'Keep the earlier bootstrap.')
 
     def test_rows_23_26_guest_checks_placement_before_removal_and_reset(self) -> None:
         self.assertIsInstance(self.route(), GateRun)
