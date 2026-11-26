@@ -1481,7 +1481,403 @@ if(example.filterOn){
         browser.navigate(place)
         self.assertIs(evaluate(opened), True)
 
-    def browser_row_expansion(self, steps: str) -> None:
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_chips_have_counts_and_match_every_selected_tag(self) -> None:
+        for number, tags in enumerate((("review flow", "keyboard"), ("review flow",), ("keyboard",), ()), 1):
+            item = self.add(f"Item {number}", number=number)
+            for name in tags:
+                _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(name), source="morty")
+        self.browser_row_expansion(r'''
+ const tagRow=document.querySelector('#list-tag');
+ const all=tagRow.querySelector('[data-tag-all]');
+ const tag=name=>[...tagRow.querySelectorAll('[data-tag-filter]')].find(chip=>chip.dataset.listTag===name);
+ const visible=()=>rows.filter(row=>!row.hidden).map(row=>row.dataset.number).sort().join(',');
+ const pressed=node=>node.getAttribute('aria-pressed')==='true';
+ const first=rows.find(row=>row.dataset.number==='1');
+ const title=first.querySelector('[data-label="Item"]');
+ const review=title.querySelector('[data-tag-row][data-list-tag="review flow"]');
+ check(title.querySelector('strong').textContent==='Item 1' && review && title.children.length===2,
+       'Tag chips are under the title.');
+ check(pressed(all) && all.querySelector('b').textContent==='4' &&
+       tag('review flow').querySelector('b').textContent==='2' && tag('keyboard').querySelector('b').textContent==='2',
+       'The Tag row shows All followed by the tags and their counts.');
+ review.click();
+ check(visible()==='1,2' && pressed(tag('review flow')) && !pressed(all) && !recordIsOpen(first),
+       'A row chip selects the tag without opening the item.');
+ const input=tagRow.querySelector('[data-tag-input]');
+ input.value='KEY';
+ input.dispatchEvent(new Event('input',{bubbles:true}));
+ const choices=[...tagRow.querySelectorAll('[data-tag-choice]')];
+ check(choices.length===1 && choices[0].dataset.listTag==='keyboard','The search matches the first letters.');
+ choices[0].click();
+ check(visible()==='1' && pressed(tag('review flow')) && pressed(tag('keyboard')),
+       'Two selected tags require both tags on each item.');
+ all.click();
+ check(visible()==='1,2,3,4' && pressed(all),'All clears the Tag selection.');
+''')
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_editor_adds_suggestions_and_displays_validation_errors(self) -> None:
+        item = self.add("Edit tags", number=1)
+        other = self.add("Existing tags", number=2)
+        _ = the_list.add_tag(MORTY.id, other.id, the_list.Tag("review flow"), source="morty")
+        self.check_list_tag_editor(r'''
+ let original=summary();
+ enter('  Phone   Layout  ');
+ await wait(()=>summary()!==original && tags().join()==='phone layout');
+ check(!input().value && document.activeElement===input(),'A new tag clears the field and keeps focus.');
+ type('Re');
+ const choices=[...editor().querySelectorAll('[data-tag-choices] button')];
+ check(choices.map(button=>button.textContent).join('|')==='review flow|Create "re"',
+       'An existing match appears before Create.');
+ original=summary();
+ choices[0].click();
+ await wait(()=>summary()!==original && tags().join()==='phone layout,review flow');
+ check(!input().value && document.activeElement===input(),'Selecting a suggestion keeps the field ready.');
+ for(const [text,error] of [['bad,tag','a tag cannot contain a comma'],
+  ['none',"'none' is reserved for an empty tag list"],['','tag must have one nonempty line']]){
+  enter(text);
+  await wait(()=>editor().querySelector('[data-tag-error]').textContent===error);
+  check(input().value===text && tags().join()==='phone layout,review flow',
+        'The Tag error preserves the text and saved tags.');
+ }
+''')
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("phone layout"), the_list.Tag("review flow")))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_editor_removes_with_cross_and_backspace_and_can_undo(self) -> None:
+        item = self.add("Edit tags", number=1)
+        for text in ("review flow", "keyboard"):
+            _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(text), source="morty")
+        self.check_list_tag_editor(r'''
+ const notice=()=>document.querySelector('.list-tag-notice');
+ const undo=()=>notice()?.querySelector('button');
+ let original=summary();
+ editor().querySelector('[aria-label="Remove tag keyboard"]').click();
+ await wait(()=>summary()!==original && tags().join()==='review flow' && undo());
+ check(notice().textContent.includes('Removed "keyboard".') && notice().getAnimations().length===1,
+       'The chip goes away and the Undo notice fades.');
+ original=summary();
+ undo().click();
+ await wait(()=>summary()!==original && tags().join()==='review flow,keyboard' && !undo());
+ check(editor().querySelector('[aria-label="Remove tag keyboard"]'),'Undo adds the chip back.');
+ original=summary();
+ input().focus();input().dispatchEvent(new KeyboardEvent('keydown',{key:'Backspace',bubbles:true,cancelable:true}));
+ await wait(()=>summary()!==original && tags().join()==='review flow' && undo());
+ check(undo().getAttribute('aria-label')==='Undo removal of keyboard' && document.activeElement===input(),
+       'Backspace removes the last tag and keeps focus.');
+''')
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("review flow"),))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_removal_elsewhere_clears_the_chip_without_undo(self) -> None:
+        item = self.add("Read the current tags", number=1)
+        tag = the_list.Tag("review flow")
+        _ = the_list.add_tag(MORTY.id, item.id, tag, source="morty")
+        self.check_list_tag_editor(r"""
+ const [keeper,id]=row().dataset.key.split('/');
+ const query=new URLSearchParams({'tag-fields':id,keeper});
+ const signed=await (await fetch(location.pathname+'?'+query)).json();
+ const body=new URLSearchParams({...signed,keeper,id,until:'',action:'remove-tag',words:'review flow'});
+ const other=await fetch(location.pathname,{method:'POST',body});
+ check(other.ok && (await other.json()).tags.length===0,'Another session removes the tag.');
+ const chip=editor().querySelector('[data-tag-remove]');
+ check(chip && tags().join()==='review flow','The first page still shows the stale chip.');
+ chip.click();
+ await wait(()=>!tags().length && editor().querySelector('[data-tag-pending]').hidden);
+ check(!row().querySelector('[data-row-tags]') && !editor().querySelector('[data-tag-remove]'),
+       'The save clears the stale chip from the row and editor.');
+ check(!document.querySelector('[aria-label="Undo removal of review flow"]'),
+       'A removal that saves nothing has no Undo.');
+""")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved.tags, ())
+        self.assertEqual([entry.what for entry in saved.log if isinstance(entry.what, the_list.TagsChanged)],
+                         [the_list.TagsChanged((tag,)), the_list.TagsChanged(())])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_edits_wait_for_each_save_in_order(self) -> None:
+        item = self.add("Queue tag edits", number=1)
+        self.check_list_tag_editor(r"""
+ const sent=[],fetchPage=window.fetch;
+ let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ window.fetch=async (url,options)=>{
+  const action=options?.body?.get?.('action');
+  if(action!=='add-tag') return fetchPage(url,options);
+  sent.push(options.body.get('words'));
+  const response=await fetchPage(url,options);
+  if(sent.length===1) await held;
+  return response;
+ };
+ enter('first tag');
+ enter('second tag');
+ const pending=()=>editor().querySelector('[data-tag-pending]');
+ check(!pending().hidden && pending().textContent==='2 tag edits pending.',
+       'The field reports both pending edits.');
+ await Promise.resolve();
+ check(sent.join()==='first tag','Only the first request starts before its response.');
+ release();
+ await wait(()=>pending().hidden && tags().join()==='first tag,second tag');
+ check(sent.join()==='first tag,second tag' && !input().value && document.activeElement===input(),
+       'Both edits finish in order and the field stays ready.');
+""")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual([entry.what for entry in saved.log[-2:]], [
+            the_list.TagsChanged((the_list.Tag("first tag"),)),
+            the_list.TagsChanged((the_list.Tag("first tag"), the_list.Tag("second tag")))])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_backspace_uses_pending_removals(self) -> None:
+        item = self.add("Remove two tags", number=1)
+        for text in ("alpha", "beta"):
+            _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(text), source="morty")
+        self.check_list_tag_editor(r"""
+ const removed=[],fetchPage=window.fetch;
+ let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ window.fetch=async (url,options)=>{
+  if(options?.body?.get?.('action')!=='remove-tag') return fetchPage(url,options);
+  removed.push(options.body.get('words'));
+  if(removed.length===1) await held;
+  return fetchPage(url,options);
+ };
+ const backspace=()=>input().dispatchEvent(new KeyboardEvent('keydown',{key:'Backspace',bubbles:true,cancelable:true}));
+ backspace();
+ await Promise.resolve();
+ backspace();
+ release();
+ await wait(()=>editor().querySelector('[data-tag-pending]').hidden);
+ check(removed.join()==='beta,alpha' && tags().length===0,'Each Backspace removes the last remaining tag.');
+ const undo=[...document.querySelectorAll('.list-tag-notice button')];
+ check(undo.map(button=>button.getAttribute('aria-label')).join()==='Undo removal of beta,Undo removal of alpha',
+       'Each removed tag has one Undo notice.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, ())
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_success_clears_an_older_queued_error(self) -> None:
+        item = self.add("Replace a tag error", number=1)
+        self.check_list_tag_editor(r"""
+ const fetchPage=window.fetch;
+ let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ window.fetch=async (url,options)=>{
+  if(options?.body?.get?.('words')==='bad,tag') await held;
+  return fetchPage(url,options);
+ };
+ enter('bad,tag');
+ enter('valid');
+ release();
+ await wait(()=>editor().querySelector('[data-tag-pending]').hidden && tags().join()==='valid');
+ const error=editor().querySelector('[data-tag-error]');
+ check(error.hidden && !error.textContent,'Only the latest edit can show an error.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("valid"),))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_removal_reads_the_record_after_a_lost_response(self) -> None:
+        item = self.add("Read the tag after a lost response", number=1)
+        _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag("review flow"), source="morty")
+        self.check_list_tag_editor(r"""
+ const calls=[],fetchPage=window.fetch;
+ window.fetch=async (url,options)=>{
+  if(options?.body?.get?.('action')==='remove-tag'){
+   calls.push('remove');
+   const response=await fetchPage(url,options);
+   check(response.ok,'The server saved the removal.');
+   throw new Error('The save response was lost.');
+  }
+  const query=new URL(url,location.href).searchParams;
+  if(query.has('item-state')){
+   calls.push('read');
+   return fetchPage(url,options);
+  }
+  if(String(url)===location.pathname) throw new Error('The full page refresh is unavailable.');
+  return fetchPage(url,options);
+ };
+ editor().querySelector('[data-tag-remove]').click();
+ const error=()=>editor().querySelector('[data-tag-error]');
+ await wait(()=>!error().hidden);
+ check(calls.join()==='remove,read','The browser immediately reads the saved item.');
+ check(!row().querySelector('[data-row-tags]') && !editor().querySelector('[data-tag-remove]'),
+       'The row and editor show the tags from the saved item.');
+ check(error().textContent==='The save response was lost.' &&
+       document.querySelector('[aria-label="Undo removal of review flow"]'),
+       'The browser shows the error and offers Undo for the removal.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, ())
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_counts_follow_the_other_filters(self) -> None:
+        for number, owner, state, tags in (
+                (1, OWNER.id, the_list.ItemState.WORKING, ("review flow", "keyboard")),
+                (2, OWNER.id, the_list.ItemState.BLOCKED, ("blocked tag",)),
+                (3, OTHER.id, the_list.ItemState.WORKING, ("other tag",))):
+            item = self.add(f"Item {number}", state, number=number, owner=owner)
+            for tag in tags:
+                _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(tag), source="morty")
+        probe = r"""
+ const count=selector=>document.querySelector('#list-tag '+selector).querySelector('b').textContent;
+ const tagCount=tag=>count('[data-tag-filter][data-list-tag="'+tag+'"]');
+ selectOwner(OWNER);
+ check(count('[data-tag-all]')==='2' && tagCount('other tag')==='0' && tagCount('blocked tag')==='1',
+       'Owner limits the All and tag counts.');
+ chip('show','working').click();
+ check(count('[data-tag-all]')==='1' && tagCount('blocked tag')==='0' && tagCount('review flow')==='1',
+       'Show also limits the tag counts.');
+ document.querySelector('[data-tag-filter][data-list-tag="keyboard"]').click();
+ check(count('[data-tag-all]')==='1' && tagCount('review flow')==='1' &&
+       rows.filter(row=>!row.hidden).map(row=>row.dataset.number).join()==='1',
+       'Tag counts use the other filters and the rows still require the selected tag.');
+"""
+        self.browser_row_expansion(probe.replace("OWNER", json.dumps(OWNER.id)))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_menu_stays_inside_the_card_at_390_pixels(self) -> None:
+        item = self.add("Mobile tag editor", number=1)
+        other = self.add("Long tag", number=2)
+        _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag("existing tag first"), source="morty")
+        _ = the_list.add_tag(MORTY.id, other.id,
+            the_list.Tag("suggest a tag name long enough to need the full width"), source="morty")
+        self.browser_row_expansion(r"""
+ const row=rows.find(row=>row.dataset.number==='1');
+ toggle(row).click();
+ const detail=recordDetails(row),editor=detail.querySelector('[data-tag-editor]');
+ const field=editor.querySelector('input'),menu=editor.querySelector('[data-tag-choices]');
+ const card=detail.querySelector('.list-panel');
+ check(innerWidth===390,'The viewport is 390 pixels wide.');
+ for(const theme of ['dark','light']){
+  document.documentElement.dataset.theme=theme;
+  field.value='suggest';field.dispatchEvent(new Event('input',{bubbles:true}));
+  const bounds=card.getBoundingClientRect(),box=menu.getBoundingClientRect();
+  check(!menu.hidden && menu.querySelector('[data-tag-choice]') && box.width>0 &&
+        box.left>=bounds.left && box.right<=bounds.right && box.top>=bounds.top && box.bottom<=bounds.bottom,
+        'The '+theme+' menu fits within the card.');
+ }
+""", window_size=(390, 980))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_list_tag_editor_uses_one_template_and_treats_tags_as_text(self) -> None:
+        first = self.add("One template", number=1)
+        _ = self.add("Keep this item closed", number=2)
+        tag = the_list.Tag('<em data-example="tag">tag text</em>')
+        _ = the_list.add_tag(MORTY.id, first.id, tag, source="morty")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        self.assertEqual(markup.count("data-tag-editor>"), 1)
+        self.assertNotIn("data-tag-token=", markup)
+        probe = r"""
+ const label=TAG;
+ const row=rows.find(row=>row.dataset.number==='1');
+ const editor=()=>recordDetails(row).querySelector('[data-tag-editor]');
+ const exact=chip=>chip.dataset.listTag===label &&
+  chip.querySelector('[data-tag-label]').textContent===label && !chip.querySelector('em');
+ check(exact(row.querySelector('[data-tag-row]')) && exact(document.querySelector('[data-tag-filter]')),
+       'The title and filter show the tag as text.');
+ check(!editor(),'A closed row has no editor.');
+ toggle(row).click();
+ check(exact(editor().querySelector('[data-tag-remove]')) &&
+       document.querySelectorAll('[data-tag-editor]').length===1,'The open row has one editor with text chips.');
+ toggle(row).click();
+ check(!editor(),'Closing the row removes the editor.');
+ toggle(rows.find(row=>row.dataset.number==='2')).click();
+ const field=document.querySelector('[data-tag-editor] input');
+ field.value='<em';field.dispatchEvent(new Event('input',{bubbles:true}));
+ check(exact(document.querySelector('[data-tag-editor] [data-tag-choice]')),
+       'The editor suggestion shows the tag as text.');
+"""
+        self.browser_row_expansion(probe.replace("TAG", json.dumps(tag.text)))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_list_tag_editor_saves_on_a_waiting_row_without_feedback_actions(self) -> None:
+        item = self.add("Wait for an answer", number=1)
+        root = self.root / "reviews"
+        with patch.object(change_page, "send_question", return_value=question_outcome()):
+            delivery = list_page.submit(root, urlencode(self.fields(item, "question", words="What changed?")))
+            list_page.deliver(delivery)
+        waiting = the_list.load(MORTY.id, item.id)
+        entries = [list_page.ListRecord(MORTY.id, replace(waiting, number=number)) for number in range(1, 321)]
+        with (patch.object(list_page, "records", return_value=entries),
+              patch.object(the_list, "question_visibility", return_value=the_list.WaitingForAnswer())):
+            markup = list_page.render(root, include_counts=False).decode()
+        self.assertEqual(markup.count('data-waiting-for-answer="true"'), 320)
+        self.assertEqual(markup.count('name="token"'), 0)
+        self.check_list_tag_editor(r"""
+ const detail=recordDetails(row());
+ check(!detail.querySelector('[data-feedback-form]'),'The waiting item has no feedback controls.');
+ enter('waiting tag');
+ await wait(()=>tags().join()==='waiting tag');
+ const requests=performance.getEntriesByType('resource').filter(entry=>
+  new URL(entry.name).searchParams.has('tag-fields'));
+ check(requests.length===1,'The opened item requests its signed fields once.');
+""")
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, (the_list.Tag("waiting tag"),))
+
+    def check_list_tag_editor(self, steps: str) -> None:
+        root = self.root / "reviews"
+        config = self.root / "config" / "review_links.conf"
+        _ = config.write_text(config.read_text().replace("undo_seconds=0", "undo_seconds=10"))
+        results: list[list[str]] = []
+        complete = threading.Event()
+        probe = r'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const row=()=>document.querySelector('[data-list-item][data-number="1"]');
+ const summary=()=>row().querySelector('.list-row');
+ const editor=()=>recordDetails(row()).querySelector('[data-tag-editor]');
+ const input=()=>editor().querySelector('[data-tag-input]');
+ const tags=()=>JSON.parse(row().dataset.tags ?? '[]');
+ const type=text=>{input().value=text;input().dispatchEvent(new Event('input',{bubbles:true}));};
+ const enter=text=>{type(text);input().dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));};
+ const wait=ready=>new Promise((resolve,reject)=>{
+  const observer=new MutationObserver(read);
+  const timer=setTimeout(()=>{observer.disconnect();reject(new Error('The tag edit did not finish. Tags: '+tags().join(', ')));},8000);
+  function read(){if(ready()){observer.disconnect();clearTimeout(timer);resolve();}}
+  observer.observe(document.body,{attributes:true,childList:true,subtree:true,characterData:true});read();
+ });
+ try{
+  row().querySelector('.list-toggle').click();
+  input().focus();
+''' + steps + '''
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+
+        class TagProbe(serve.ReviewLinksHandler):
+            @override
+            def send_head(self) -> BinaryIO | None:
+                if self.path == list_page.PAGE_PATH:
+                    markup = list_page.render(root, include_counts=False).decode()
+                    self.html_response(200, markup.replace("</body>", probe + "</body>").encode())
+                    return None
+                return super().send_head()
+
+            @override
+            def do_POST(self) -> None:
+                if self.path == "/results":
+                    results.append(cast(list[str], json.loads(self.rfile.read(int(self.headers["Content-Length"])))))
+                    self.json_response(200, {})
+                    complete.set()
+                else:
+                    super().do_POST()
+
+        with (patch.object(serve, "ReviewLinksHandler", TagProbe),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              started_review_server(("127.0.0.1", 0), root) as server):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            try:
+                page = f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}"
+                browser = self.firefox_view(page, None, 1440, 1000, complete)
+                self.assertEqual(browser.returncode, 0, browser.stderr)
+                self.assertEqual(results, [[]])
+            finally:
+                server.shutdown()
+                thread.join(TEST_HANG_GUARD_SECS)
+
+    def browser_row_expansion(self, steps: str, *,
+                              window_size: tuple[int, int] | None = None) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         probe = r'''<script>
 (async()=>{
@@ -1498,7 +1894,7 @@ const result=document.createElement('p');
 result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>'''
-        self.browser_actions(markup, "", probe)
+        self.browser_actions(markup, "", probe, window_size=window_size)
 
     def test_new_item_opens_above_the_review_box_and_its_screenshot_shows_the_box(self) -> None:
         from scripts.review_links.test_page_frame import WINDOW_BROWSERS, WINDOW_PROBE, window_probe_results

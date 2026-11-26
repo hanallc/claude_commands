@@ -2160,6 +2160,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if path == list_page.PAGE_PATH:
             self.redirect(studio_page.PAGE_PATH + (f"?{query}" if query else ""))
             return
+        if "tag-fields" in fields:
+            self.list_tag_fields(fields)
+            return
         delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
         try:
             with server.list_store_access(), server.staff_read_scope():
@@ -2478,6 +2481,21 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     content += '<template data-list-review-read-error></template>'
             self.html_response(200, content.encode())
 
+    def list_tag_fields(self, fields: dict[str, list[str]]) -> None:
+        """Sign the tag request for an open List item."""
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            (identity,) = fields["tag-fields"]
+            (keeper,) = fields.get("keeper", [])
+            with server.list_store_access():
+                signed = list_page.signed_tag_request(server.root, staff.StaffId(keeper), identity)
+        except ValueError as error:
+            self.browser_failure(400, "The List item is unavailable.", error)
+        except OSError as error:
+            self.browser_failure(503, "The List item cannot be read. Try again.", error)
+        else:
+            self.json_response(200, signed)
+
     def list_action_state(self, fields: dict[str, list[str]]) -> None:
         """Read the current item after an action response is lost."""
         server = cast(ReviewLinksServer, self.server)
@@ -2494,12 +2512,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             (keeper,) = fields.get("keeper", [])
             (park_request,) = fields.get("park-request", [""])
             (not_fixed_request,) = fields.get("not-fixed-request", [""])
+            tag_removal: list_page.TagRemoval | list_page.NoTagRemoval = list_page.NoTagRemoval.CHECK_CURRENT_TAGS
+            if "tag-removal-request" in fields:
+                (request,) = fields["tag-removal-request"]
+                (tag,) = fields.get("tag-removal", [])
+                tag_removal = list_page.TagRemoval(request, the_list.Tag(tag))
             with server.list_store_access(), server.staff_read_scope():
                 current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
                                                        park_request=park_request, include_detail=True,
                                                        not_fixed_request=not_fixed_request,
                                                        review_records=server.list_review_records(),
-                                                       top_priority=list_page.TopPriority.SHOWN)
+                                                       top_priority=list_page.TopPriority.SHOWN, tag_removal=tag_removal)
         except ValueError as error:
             self.browser_failure(400, "The List item is unavailable.", error)
         except OSError as error:
@@ -2551,7 +2574,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         pending = not isinstance(delivery, change_page.NoMessageDelivery)
         repair_feedback = action == the_list.ReportVerdict.NOT_FIXED
         has_words = isinstance(submission, list_page.ListActionWithWords)
-        state = "saved" if repair_feedback else {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
+        state = "saved" if repair_feedback else {"read": "read", "question": "saved", "top": "saved",
+                 list_page.ListTagAction.ADD: "saved", list_page.ListTagAction.REMOVE: "saved"}.get(action, "sent")
         reply = {"state": state, "delivery_pending": pending, **saved_fields}
         if isinstance(submission, list_page.ListActionWithWords):
             reply["words_receipt"] = True

@@ -1042,9 +1042,23 @@ function filterSelection(name){
   };
  }
  const control=content.querySelector('#list-'+name);
- return {
+ if(control.matches('input[type="checkbox"]')) return {
   set(value){control.checked=value===control.value;return control.checked ? control.value : '';},
   bind(change){control.addEventListener('change',()=>change(control.checked ? control.value : ''));}
+ };
+ const attribute='data-'+name+'-chip';
+ return {
+  set(value){
+   for(const button of control.querySelectorAll('['+attribute+']'))
+    button.setAttribute('aria-pressed',String(button.getAttribute(attribute)===value));
+   return value;
+  },
+  bind(change){
+   control.addEventListener('click',event=>{
+    const button=event.target.closest('['+attribute+']');
+    if(button) change(button.getAttribute(attribute));
+   });
+  }
  };
 }
 function placeParams(){
