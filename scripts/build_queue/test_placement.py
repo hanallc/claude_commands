@@ -1674,6 +1674,15 @@ class PlacementTests(unittest.TestCase):
                     assert isinstance(reply, wire.Assignment), reply
                     self.assertEqual(reply.assignment.destination, guest.destination)
                     continue
+                if case == "stale":
+                    assert isinstance(reply, wire.PlacementWait), reply
+                    self.assertEqual(reply.wait, wire.PlacementEvidenceWait())
+                    self.assertEqual(reply.eligibility, (
+                        placement.CandidateEligibility(guest.destination, placement.EvidenceNeeded(reason)),
+                        placement.CandidateEligibility(local_candidate(fixture).destination, ALLOWED_HOST),
+                    ))
+                    self.assertNotIn(request.episode, fixture.server.reservations)
+                    continue
                 assert isinstance(reply, wire.LocalPlacementGranted), reply
                 self.assertEqual(reply.assignment.destination, local_candidate(fixture).destination)
                 self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
@@ -1743,7 +1752,7 @@ class PlacementTests(unittest.TestCase):
                 waiting, = fixture.server.handle_request(request)
                 assert isinstance(waiting, wire.PlacementWait), waiting
                 self.assertEqual(waiting.eligibility[0].eligibility,
-                                 placement.TemporaryExclusion("mac_linux_reading_required"))
+                                 placement.EvidenceNeeded("mac_linux_reading_required"))
                 _ = publish_candidate(fixture, request)
                 _ = fixture.run_pass()
                 assignment = assignment_for(fixture, request)
