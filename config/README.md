@@ -552,6 +552,7 @@ Natedev reads the SSH host from each active target's settings file before each r
 Set `notices.mac=off` to disable the Mac push.
 The allowed values are `on` and `off`.
 The default is `on`.
+`off` stops a new push only. A push that was already sent can repeat until its alert clears.
 The machine watch ignores keys for machines outside its target list.
 
 `unreachable_wait_seconds` is one value for every machine that the queue sends a run to.

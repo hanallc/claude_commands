@@ -541,6 +541,7 @@ An empty value hides the alert on the page.
 `scripts/buildlog/machine_watch.py` reads `notices.<machine>` in `build_targets.conf` when it prepares a phone push for a machine that does not answer.
 Set `notices.mac=off` to suppress that push for the Mac.
 The default is `on`.
+`off` stops a new push only. A push that was already sent can repeat until its alert clears.
 The Builds page continues to use the saved alert.
 
 The Build limits section shows one facts line under each machine heading, in `<div class="build-limit-facts">` below the state.
