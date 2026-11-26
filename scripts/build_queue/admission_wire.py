@@ -213,6 +213,19 @@ class SessionNotSent:
 
 
 @dataclass(frozen=True)
+class ScopeTraceSampling:
+    """Sample memory in the scope published by the caller."""
+
+
+@dataclass(frozen=True)
+class ProcessTreeTraceSampling:
+    """Sample the reservation owner and its descendants across scopes."""
+
+
+TraceSampling = ScopeTraceSampling | ProcessTreeTraceSampling
+
+
+@dataclass(frozen=True)
 class AdmitRequest(CallerCode):
     """The request holds the command, caller, run, and memory profile for admission."""
     episode: str
@@ -232,6 +245,7 @@ class AdmitRequest(CallerCode):
     route: target_config.StepRoute = field(default_factory=lambda: records.DIRECT_CARGO, kw_only=True)
     # The session that owns the run; a natedev hold of this session does not hold the step.
     session: OwningSession | NoOwningSession | SessionNotSent = field(default=SessionNotSent(), kw_only=True)
+    trace_sampling: TraceSampling = field(default=ScopeTraceSampling(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -521,6 +535,7 @@ class LocalAdmissionContext:
     test_width: records.TestWidth
     fresh_test: bool
     token_back_at: float = 0.0
+    trace_sampling: TraceSampling = field(default=ScopeTraceSampling(), kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -829,6 +844,9 @@ def _write_wire_record(value: object) -> object:
     # An older reader has no session field; a request with no session leaves it out.
     if record.get("kind") == "AdmitRequest" and record.get("session") == {"kind": "SessionNotSent"}:
         del record["session"]
+    if (record.get("kind") in ("AdmitRequest", "LocalAdmissionContext")
+            and record.get("trace_sampling") == {"kind": "ScopeTraceSampling"}):
+        del record["trace_sampling"]
     if record.get("kind") == "ConsumePermission" and record.get("guest_proof_required") is False:
         del record["guest_proof_required"]
     if record.get("kind") == "CloudPlace" and record.get("group") == codec.snapshot_value(NO_CLOUD_GROUP):
