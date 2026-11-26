@@ -1,12 +1,16 @@
 """Read module times and append gate runs to the build log."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 import hashlib
+import io
 import json
 import math
+import os
 import sqlite3
+import stat
 import statistics
 from pathlib import Path
 import sys
@@ -14,6 +18,8 @@ import time
 from typing import Final, Literal, NotRequired, TypedDict, cast, get_args
 
 from scripts.lib import conf
+from scripts.lib.boot_identity import boot_identity
+from scripts.lib.process_start import Started, process_start
 
 
 TestStatus = Literal["pass", "fail", "error", "skip", "expected_failure", "unexpected_success"]
@@ -75,8 +81,34 @@ class SuiteRun(TypedDict):
     status: int
 
 
+GateEnd = Literal["normal", "red", "sigterm"]
+
+
+class GateFolderOwner(TypedDict):
+    pid: int
+    process_start: NotRequired[str]
+    boot_id: NotRequired[str]
+
+
+class GateFolderStart(GateFolderOwner):
+    folder: str
+    sha: str
+    branch: str
+    step: str
+
+
+class GateFolderEnd(GateFolderOwner):
+    suite_folders: list[str]
+    end: GateEnd
+
+
 class GateRun(TypedDict):
     vcpus: NotRequired[int]
+    pid: NotRequired[int]
+    process_start: NotRequired[str]
+    boot_id: NotRequired[str]
+    suite_folders: NotRequired[list[str]]
+    end: NotRequired[GateEnd]
     step: str
     dirty_paths: list[str]
     dirty_path_count: int
@@ -356,10 +388,15 @@ def module_runs(executions: Sequence[Execution], slow_test_s: float) -> list[Mod
     return modules
 
 
-def report_not_written(error: BaseException) -> None:
-    """Report a failed record on one line."""
+def _report_record_error(message: str, error: BaseException) -> None:
     detail = " ".join(str(error).splitlines())
-    print(f"gate run not written: {detail}", file=sys.stderr)
+    with suppress(OSError, ValueError):
+        print(f"{message}: {detail}", file=sys.stderr, flush=True)
+
+
+def report_not_written(error: BaseException, *, record_name: str = "gate run") -> None:
+    """Report a failed record on one line."""
+    _report_record_error(f"{record_name} not written", error)
 
 
 def keep_failure_logs(record_id: str, host: str, epoch: float, modules: Sequence[ModuleRun],
@@ -387,6 +424,7 @@ def keep_failure_logs(record_id: str, host: str, epoch: float, modules: Sequence
 
 def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
     """Append one gate record without failing the caller."""
+    row_written = False
     try:
         # This import keeps gate_record free of an import cycle with index.py.
         from scripts.buildlog import record, store
@@ -397,9 +435,210 @@ def write_gate_run(run: GateRun, executions: Sequence[Execution]) -> None:
                                 "id": record.new_id(host, epoch), "host": host, **run,
                                 "tests_run": sum(module["tests_run"] for module in run["modules"])}
         keep_failure_logs(entry["id"], host, epoch, run["modules"], executions)
-        store.append_line(store.host_file(host, epoch), entry)
+        with store.locked_append(store.host_file(host, epoch)) as handle:
+            store.append_locked(handle, entry)
+            row_written = True
     except Exception as error:
+        if row_written:
+            _report_record_error("gate run sync failed", error)
+            return
         report_not_written(error)
+        if "pid" in run and "suite_folders" in run and run["suite_folders"] and "end" in run:
+            end: GateFolderEnd = {"pid": run["pid"], "suite_folders": run["suite_folders"], "end": run["end"]}
+            if "process_start" in run:
+                end["process_start"] = run["process_start"]
+            if "boot_id" in run:
+                end["boot_id"] = run["boot_id"]
+            write_gate_folder_event(end, report_failure=False)
+
+
+def write_gate_folder_event(event: GateFolderStart | GateFolderEnd, *, report_failure: bool = True) -> None:
+    """Append a folder start or an end without timing history."""
+    kind = "gate_folder_start" if "folder" in event else "gate_folder_end"
+    try:
+        from scripts.buildlog import record, store
+
+        epoch = time.time()
+        host = store.host_name()
+        store.append_line(store.host_file(host, epoch), {
+            "kind": kind, "v": record.RECORD_VERSION, "id": record.new_id(host, epoch),
+            "host": host, "at": store.utc_iso(epoch), **event,
+        })
+    except Exception as error:
+        if report_failure:
+            report_not_written(error, record_name=kind)
+
+
+@dataclass(frozen=True)
+class _GateLeaseOwner:
+    """Identify a process on one boot."""
+
+    pid: int
+    process_start: str
+    boot_id: str
+
+
+def _lease_owner(fields: Mapping[str, object]) -> _GateLeaseOwner | None:
+    pid, start, boot = fields.get("pid"), fields.get("process_start"), fields.get("boot_id")
+    if type(pid) is int and pid > 0 and isinstance(start, str) and start and isinstance(boot, str) and boot:
+        return _GateLeaseOwner(pid, start, boot)
+    return None
+
+
+GateFolderOutcome = GateEnd | Literal["running", "killed", "no record"]
+
+
+class GateFolderStatus(TypedDict):
+    folder: str
+    pid: int | None
+    sha: NotRequired[str]
+    step: NotRequired[str]
+    end: GateFolderOutcome
+
+
+class _FolderLogChanged(OSError):
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"log changed during the read ({str(path)!r})")
+
+
+def _folder_log_rows(path: Path) -> Iterator[dict[str, object]]:
+    """Read the complete prefix of a log without holding a lock."""
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        return
+    with handle:
+        descriptor = handle.fileno()
+        before = os.fstat(descriptor)
+        remaining = before.st_size
+        # Log writers can cut the unfinished tail. Each observed newline protects its prefix.
+        while remaining:
+            offset = max(0, remaining - io.DEFAULT_BUFFER_SIZE)
+            block = os.pread(descriptor, remaining - offset, offset)
+            if len(block) != remaining - offset:
+                raise _FolderLogChanged(path)
+            if (newline := block.rfind(b"\n")) >= 0:
+                remaining = offset + newline + 1
+                break
+            remaining = offset
+        had_unfinished_tail = remaining < before.st_size
+        while remaining:
+            line = handle.readline(remaining)
+            if not line.endswith(b"\n"):
+                raise _FolderLogChanged(path)
+            remaining -= len(line)
+            try:
+                row = cast(object, json.loads(line.decode("utf-8")))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if isinstance(row, dict):
+                yield cast(dict[str, object], row)
+        try:
+            named = path.stat()
+        except FileNotFoundError as error:
+            raise _FolderLogChanged(path) from error
+        after = os.fstat(descriptor)
+        if ((named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
+                or min(named.st_size, after.st_size) < before.st_size
+                or (had_unfinished_tail and after.st_mtime_ns != before.st_mtime_ns)):
+            raise _FolderLogChanged(path)
+
+
+def _matches_leased_folder(folder: Path, fields: Mapping[str, object]) -> bool:
+    device, inode = fields.get("device"), fields.get("inode")
+    if type(device) is not int or type(inode) is not int:
+        return False
+    try:
+        info = folder.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(info.st_mode) and (device, inode) == (info.st_dev, info.st_ino)
+
+
+def gate_folder_status(root: Path) -> list[GateFolderStatus]:
+    """Join direct suite folders to the local host log without changing either."""
+    from scripts.buildlog import store
+    from scripts.lib.build_folders import gate_folder_lease_fields
+
+    root = root.expanduser().resolve()
+    statuses: list[GateFolderStatus] = []
+    candidates: dict[tuple[str, _GateLeaseOwner], GateFolderStatus] = {}
+    for folder in sorted(root.iterdir()):
+        if not folder.name.startswith(("g-", "t-")) or folder.is_symlink() or not folder.is_dir():
+            continue
+        try:
+            fields = gate_folder_lease_fields(folder, root)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            print(f"cannot read the lease for {folder}: {error}", file=sys.stderr)
+            fields = {}
+        pid = fields.get("pid")
+        status: GateFolderStatus = {"folder": str(folder), "pid": pid if type(pid) is int else None, "end": "no record"}
+        statuses.append(status)
+        owner = _lease_owner(fields)
+        if owner is not None and _matches_leased_folder(folder, fields):
+            candidates[str(folder), owner] = status
+    if not candidates:
+        return statuses
+
+    current_boot = ""
+    with suppress(OSError, ValueError):
+        current_boot = boot_identity()
+    live: set[_GateLeaseOwner] = set()
+    for owner in {owner for _, owner in candidates}:
+        if owner.boot_id == current_boot:
+            start = process_start(owner.pid)
+            if isinstance(start, Started) and start.start == owner.process_start:
+                live.add(owner)
+
+    ends: dict[tuple[str, _GateLeaseOwner], GateEnd] = {}
+    host_logs = store.root() / store.host_name()
+    for path in sorted(host_logs.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl")):
+        for row in _folder_log_rows(path):
+            kind = row.get("kind")
+            if kind not in ("gate_folder_start", "gate_run", "gate_folder_end"):
+                continue
+            owner = _lease_owner(row)
+            if owner is None:
+                continue
+            if kind == "gate_folder_start":
+                folder, sha, step = row.get("folder"), row.get("sha"), row.get("step")
+                if isinstance(folder, str) and isinstance(sha, str) and isinstance(step, str):
+                    if (candidate := candidates.get((folder, owner))) is not None:
+                        candidate.update(sha=sha, step=step)
+            else:
+                folders, end = row.get("suite_folders"), row.get("end")
+                if isinstance(folders, list) and end in ("normal", "red", "sigterm"):
+                    for folder in cast(list[object], folders):
+                        if isinstance(folder, str) and (folder, owner) in candidates:
+                            ends[folder, owner] = end
+    for key, candidate in candidates.items():
+        if "sha" not in candidate:
+            continue
+        if (end := ends.get(key)) is not None:
+            candidate["end"] = end
+            continue
+        candidate["end"] = "running" if key[1] in live else "killed"
+    return statuses
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+
+    from scripts.lib.build_folders import configured_gate_root
+
+    parser = argparse.ArgumentParser(description="Read suite folders and their gate outcomes.")
+    _ = parser.add_argument("root", nargs="?", type=Path, help="suite parent (default: the configured gate root)")
+    args = parser.parse_args(argv)
+    try:
+        root = cast(Path | None, args.root)
+        for status in gate_folder_status(configured_gate_root() if root is None else root):
+            print(json.dumps(status))
+    except (OSError, ValueError) as error:
+        print(f"gate folder status: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 @dataclass(frozen=True)
@@ -460,3 +699,7 @@ def history_time_limit(connection: sqlite3.Connection, vcpus: int, modules: Sequ
     if medians:
         return GateTimeLimit(factor * max(max(medians), sum(medians) / jobs))
     return NoGateTimeLimit(f"no passing module history for {vcpus} vCPUs")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
