@@ -5375,7 +5375,7 @@ class HerdrTests(unittest.TestCase):
                             ignore=shutil.ignore_patterns("__pycache__", "test_*"))
         for relative in ("agents/remote.py", "agents/worker_lifecycle.py", "message/session_send.py",
                          "production/production_doc.py", "production/production_names.py",
-                         "production/showrunners.py", "production/staff.py"):
+                         "production/showrunners.py", "production/staff.py", "production/behavior_check.py"):
             destination = isolated.parent / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)

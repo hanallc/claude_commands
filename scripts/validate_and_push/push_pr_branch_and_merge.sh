@@ -93,6 +93,35 @@ if ! watch_pr_checks_until_settled "$PR_NUMBER"; then
   exit 1
 fi
 
+pr_tips() {
+  gh pr view "$PR_NUMBER" --json baseRefName,baseRefOid,headRefOid \
+    --jq '[.baseRefName, .baseRefOid, .headRefOid] | @tsv'
+}
+
+PR_TIPS="$(pr_tips)"
+IFS=$'\t' read -r PR_BASE BASE_SHA HEAD_SHA <<< "$PR_TIPS"
+if [[ "$PR_BASE" != "$DEFAULT_BRANCH" || ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ || ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "ERROR: cannot identify the default-branch range for PR #${PR_NUMBER}." >&2
+  exit 1
+fi
+if [[ "$HEAD_SHA" != "$BRANCH_TIP" ]]; then
+  echo "ERROR: the head of PR #${PR_NUMBER} differs from the published branch tip." >&2
+  exit 1
+fi
+
+git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+PR_ANCESTOR="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+"${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../production/behavior_check.py" \
+  check --repo "$PWD" --base "$PR_ANCESTOR" --commit "$HEAD_SHA"
+
+BASE_REF="refs/heads/${PR_BASE}"
+CURRENT_TIPS="$(pr_tips)"
+CURRENT_BASE="$(git ls-remote --exit-code origin "$BASE_REF")"
+if [[ "$CURRENT_TIPS" != "$PR_TIPS" || "$CURRENT_BASE" != "$BASE_SHA"$'\t'"$BASE_REF" ]]; then
+  echo "ERROR: the head or base of PR #${PR_NUMBER} changed during the behavior check." >&2
+  exit 1
+fi
+
 echo "Merging PR #${PR_NUMBER}..."
 set +e
 MERGE_OUTPUT="$(gh pr merge "$PR_NUMBER" --rebase --match-head-commit "$BRANCH_TIP" 2>&1)"

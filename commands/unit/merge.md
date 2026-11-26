@@ -146,6 +146,13 @@ Run Hana smoke with `copies.py run --repo <integration> --commit <sha> -- bash <
 
 ## Gates
 
+<BehaviorCheck>
+Before a land, run `scripts/lib/py scripts/production/behavior_check.py run --repo CHECKOUT --base BASE --commit COMMIT --production OWNER`.
+Use the fetched destination tip for BASE and the exact commit to push for COMMIT.
+If the review starts, collect its reply with the same command when it completes.
+Wait for exit 0 before the land.
+</BehaviorCheck>
+
 <MergeGates>
 Dispatch the production's gate commands against the exact staged commit.
 The nightly run checks types.
