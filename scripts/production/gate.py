@@ -510,7 +510,8 @@ def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait | NoBuildH
         program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
         before_check = (no_hold_wait if isinstance(hold, NoBuildHoldCheck)
                         else AdmissionHoldCheck(hold.wait_until_free, hold.admits))
-        with queue_place(program, repo, before_check=before_check) as place:
+        with queue_place(program, repo, before_check=before_check,
+                         trace_sampling=admission_wire.ProcessTreeTraceSampling()) as place:
             yield place
     except QueuePlaceRefused as error:
         raise GateRefused(str(error)) from error
