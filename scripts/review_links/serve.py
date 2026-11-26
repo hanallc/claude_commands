@@ -2469,8 +2469,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.accounts_post_failure(409, "An account move is in progress.", {"state": "move-in-progress"})
         elif isinstance(result, (accounts_page.Refused, accounts_page.SaveFailed)):
             status = 400 if isinstance(result, accounts_page.Refused) else 503
-            if action in (save_fields, clear_fields, move_fields):
+            if action == move_fields:
                 self.accounts_post_failure(status, result.reason, {})
+            elif action in (save_fields, clear_fields):
+                self.accounts_post_failure(status, result.reason, {"reason": result.reason})
             else:
                 self.json_response(status, {"reason": result.reason})
         else:

@@ -253,10 +253,6 @@ LITERAL_INVENTORY: tuple[TunableLiteral | ExternalLiteral | InternalLiteral, ...
         "Bound the process walk that collects memory readings.",
     ),
     InternalLiteral(
-        "scripts/build_queue/memory_trace.py", "_GENERAL_TRACE_LIMIT_DIVISOR",
-        "Each general trace uses two slots, so general traces use at most half of all slots.",
-    ),
-    InternalLiteral(
         "scripts/build_queue/progress_profile.py", "_LOG_CHUNK_BYTES",
         "Read a progress log in fixed chunks.",
     ),
