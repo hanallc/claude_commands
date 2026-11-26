@@ -1173,6 +1173,37 @@ FILES = collect(Path(__file__).parent)
                 assert isinstance(result, affected.FullSuite)
                 self.assertIn("embedded null", result.reason)
 
+    def test_deep_scan_call_chain_preserves_the_full_suite_fallback(self) -> None:
+        source = "scripts/component/subject.py"
+        invalid_path = str(self.repo / "bad") + "\0"
+        chain = "".join(f"def hop_{index}():\n    hop_{index + 1}()\n" for index in range(983))
+        self.write(source, "from pathlib import Path\n" + chain
+                   + f"def hop_983():\n    ignored(Path({invalid_path!r}))\n")
+        _ = self.commit()
+        for historical in (False, True):
+            with self.subTest(historical=historical):
+                if historical:
+                    self.certify()
+                    (self.repo / source).unlink()
+                    _ = self.commit()
+                result = affected.select_affected(self.repo, self.base, self.modules, set())
+                self.assertIsInstance(result, affected.FullSuite)
+                assert isinstance(result, affected.FullSuite)
+                self.assertIn("embedded null", result.reason)
+
+    def test_deep_scan_call_chain_resolves_the_leaf_scan(self) -> None:
+        self.write("assets/subject.txt", "before\n")
+        chain = "".join(f"def hop_{index}(root):\n    hop_{index + 1}(root)\n" for index in range(983))
+        self.write("scripts/component/subject.py", chain
+                   + "def hop_983(root):\n    return list((root / 'assets').glob('*.txt'))\n")
+        self.add_test("checks/test_reader.py", "from pathlib import Path\n"
+                      + "from scripts.component.subject import hop_0\n"
+                      + "hop_0(Path(__file__).resolve().parents[2])\n")
+        self.certify()
+        self.write("assets/subject.txt", "after\n")
+        _ = self.commit()
+        self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_reader.py",))
+
     def test_cached_duplicate_scope_names_keep_every_scan_root(self) -> None:
         self.write("assets/subject.md", "before\n")
         self.add_test("checks/test_reader.py", "from pathlib import Path\n"

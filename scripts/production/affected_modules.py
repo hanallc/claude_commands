@@ -665,6 +665,8 @@ class RepositoryDirectory:
 type ScanScopeKey = tuple[str, str]
 type ResolvedDirectory = RepositoryDirectory | UnrootedPath | OutsideRepository
 type ScanBindings = frozenset[tuple[str, ResolvedDirectory]]
+type ScanRequest = tuple[ScanScopeKey, ScanBindings, bool, frozenset[ScanScopeKey]]
+type ScanTarget = tuple[str, ScanScope, dict[str, ResolvedDirectory], bool]
 
 
 def unresolved_scan_paths(facts: dict[str, SourceFacts]) -> bool:
@@ -803,13 +805,8 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
 
     if (unresolved_scan_paths(facts)
             or any(len(source.scan_scopes) != len(scopes[path]) for path, source in facts.items())):
-        def all_called_scans(source: str, scope: ScanScope, parameters: dict[str, ResolvedDirectory],
-                             follow_imports: bool, seen: frozenset[ScanScopeKey]) -> Iterator[RepositoryScan]:
-            key = source, scope.name
-            if key in seen:
-                return
-            visited = seen | {key}
-            yield from direct_scans(source, scope, parameters)
+        def all_scan_targets(source: str, scope: ScanScope, parameters: dict[str, ResolvedDirectory],
+                             follow_imports: bool) -> Iterator[ScanTarget]:
             for call in scope.calls:
                 arguments, keywords = scan_arguments(source, call, parameters)
                 local = call.target in scopes[source]
@@ -821,10 +818,32 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
                     callee = scopes[path].get(name)
                     if callee is not None:
                         bound = {**dict(zip(callee.parameters, arguments)), **keywords}
-                        yield from all_called_scans(path, callee, bound, follow_imports and local, visited)
+                        yield path, callee, bound, follow_imports and local
 
-        return {path: frozenset(scan for scope in source.scan_scopes
-                                for scan in all_called_scans(path, scope, {}, True, frozenset()))
+        def all_called_scans(source: str, scope: ScanScope) -> set[RepositoryScan]:
+            result: set[RepositoryScan] = set()
+            visited: set[ScanScopeKey] = set()
+            stack: list[tuple[ScanScopeKey, Iterator[ScanTarget]]] = []
+
+            def visit(path: str, scope: ScanScope, parameters: dict[str, ResolvedDirectory], follow_imports: bool) -> None:
+                key = path, scope.name
+                if key not in visited:
+                    visited.add(key)
+                    result.update(direct_scans(path, scope, parameters))
+                    stack.append((key, all_scan_targets(path, scope, parameters, follow_imports)))
+
+            visit(source, scope, {}, True)
+            while stack:
+                key, targets = stack[-1]
+                target = next(targets, None)
+                if target is None:
+                    _ = stack.pop()
+                    visited.remove(key)
+                else:
+                    visit(*target)
+            return result
+
+        return {path: frozenset(scan for scope in source.scan_scopes for scan in all_called_scans(path, scope))
                 for path, source in facts.items()}
 
     all_scopes = {(path, scope.name): scope for path, names in scopes.items() for scope in names.values()}
@@ -850,14 +869,10 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
                    if (reachable := tuple(target for target in targets if target in components))]
              for key, invocations in calls.items() if key in components}
 
-    @cache
-    def called_scans(key: ScanScopeKey, bindings: ScanBindings,
-                     follow_imports: bool, seen: frozenset[ScanScopeKey]) -> frozenset[RepositoryScan]:
+    def scan_requests(key: ScanScopeKey, parameters: dict[str, ResolvedDirectory],
+                      follow_imports: bool, seen: frozenset[ScanScopeKey]) -> Iterator[ScanRequest]:
         source = key[0]
-        scope = all_scopes[key]
-        parameters = dict(bindings)
         seen = seen | {key}
-        result = set(direct_scans(source, scope, parameters))
         for call, local, targets in calls.get(key, ()):
             if not local and not follow_imports:
                 continue
@@ -868,17 +883,40 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
                 if target not in seen:
                     bound = {**dict(zip(all_scopes[target].parameters, arguments)), **keywords}
                     # A path can return to a visited scope only within the same component.
-                    result.update(called_scans(target, frozenset(bound.items()), follow_imports and local,
-                                               seen & components[target]))
-        return frozenset(result)
+                    yield target, frozenset(bound.items()), follow_imports and local, seen & components[target]
+
+    results: dict[ScanRequest, frozenset[RepositoryScan]] = {}
+
+    def scan_frame(request: ScanRequest) -> tuple[ScanRequest, set[RepositoryScan], Iterator[ScanRequest]]:
+        key, bindings, follow_imports, seen = request
+        parameters = dict(bindings)
+        return (request, set(direct_scans(key[0], all_scopes[key], parameters)),
+                scan_requests(key, parameters, follow_imports, seen))
+
+    def called_scans(request: ScanRequest) -> frozenset[RepositoryScan]:
+        if request in results:
+            return results[request]
+        stack = [scan_frame(request)]
+        while stack:
+            current, scans, children = stack[-1]
+            child = next(children, None)
+            if child is None:
+                results[current] = frozenset(scans)
+                _ = stack.pop()
+                if stack:
+                    stack[-1][1].update(scans)
+            elif child in results:
+                scans.update(results[child])
+            else:
+                stack.append(scan_frame(child))
+        return results[request]
 
     no_bindings: ScanBindings = frozenset()
     no_visited: frozenset[ScanScopeKey] = frozenset()
     graph = {path: frozenset(scan for scope in source.scan_scopes
                              if (key := (path, scope.name)) in components
-                             for scan in called_scans(key, no_bindings, True, no_visited))
+                             for scan in called_scans((key, no_bindings, True, no_visited)))
              for path, source in facts.items()}
-    called_scans.cache_clear()
     return graph
 
 
