@@ -1471,9 +1471,9 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
         members = staff.snapshot()
         return validate_revision(review_items.read_current(root, retained, members), members)
 
+    members = staff.snapshot()
+    item = review_items.read_current(root, retained, members)
     if retained.type == ReviewType.FOR_YOU:
-        members = staff.snapshot()
-        item = review_items.read_current(root, retained, members)
         source = item.source
         if (outcome != 'done' or not isinstance(source, review_items.ForYouSource)
                 or source.row.kind != 'action'):
@@ -1493,11 +1493,10 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
                 raise
         return change_page.NoMessageDelivery(), 'Done'
 
-    retained_source = retained.source
-    if (isinstance(retained_source, review_items.QuestionSource) and retained.type == ReviewType.QUESTION
+    if (isinstance(item.source, review_items.QuestionSource) and item.type == ReviewType.QUESTION
             and outcome in ('answer', 'feedback', 'question')):
         with (status.locked(), update_registration.outstanding_lock(
-                update_registration.outstanding_path_for_owner(retained.owner))):
+                update_registration.outstanding_path_for_owner(item.owner))):
             members = staff.snapshot()
             item = review_items.read_current(root, retained, members)
             source = item.source
@@ -1523,7 +1522,7 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
                 return delivery, 'question sent'
             return delivery, 'feedback sent' if outcome == 'feedback' else answer
 
-    item = validate()
+    item = validate_revision(item, members)
     if outcome == 'read' and can_acknowledge_answer(item):
         return acknowledge_answer(root, item, validate)
     if item.type == ReviewType.RESPONSE:

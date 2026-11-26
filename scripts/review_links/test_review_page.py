@@ -4122,6 +4122,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(marked ? [] : ['The Ope
         for kind in ('question','change','investigation'):
             self.assertIn(f'data-filter-value="{kind}"',source)
         cards = ''.join(review_page.build_snapshot(self.root).body(item.key).decode() for item in review_items.read(self.root))
+        cards = re.sub(r'<template data-send-with-words\b[^>]*></template>', '', cards)
         for action in ('Answer','Works','Does not work','Ask showrunner to check','Ask question','Send feedback','Mark read'):
             self.assertIn('>'+action+'</button>',cards)
         self.assertIn('data-later-toggle>Later <span',cards)
@@ -9393,7 +9394,6 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
         key = 'page-owner/C1'
         snapshot = review_page.build_snapshot(self.root)
         single = snapshot.body(key, view=review_page.ReviewBodyView.CARD).decode()
-        expected = single.split('<template data-card-body>', 1)[1].split('</template>', 1)[0]
         probe = r"""<script>
 (async()=>{
  const failures=[];
@@ -9401,8 +9401,8 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
   const row=document.querySelector('[data-key="page-owner/C1"]');
   row.querySelector('.list-toggle').click();
   const form=await readyReviewCard(row);
-  const template=document.createElement('template');
-  template.innerHTML=EXPECTED;
+  const page=new DOMParser().parseFromString(SINGLE_CARD,'text/html');
+  const template=page.querySelector('[data-card-body]');
   const rendered=recordDetails(row).cloneNode(true);
   // The picker adds the suggestion list ID when it binds the form.
   rendered.querySelector('[data-later-time]').removeAttribute('aria-controls');
@@ -9414,7 +9414,7 @@ window.fetch=async()=>({headers:new Headers(),ok:true,text:async()=>MARKUP});
   if(!form.elements.revision.value) failures.push('The Review action has no revision.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
-})();</script>""".replace("EXPECTED", json.dumps(expected).replace('</', '<\\/'))
+})();</script>""".replace("SINGLE_CARD", json.dumps(single).replace('</', '<\\/'))
         markup = browser_markup(self.root).replace('</body>', probe + '</body>')
         self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 

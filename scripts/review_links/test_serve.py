@@ -5436,11 +5436,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         case = self.review_fixture(changes=1)
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         key = 'page-owner/C1'
-        form = case.card_body(cache.get(), key, 'works', 'The fixture passes.')
+        words = 'The fixture passes.'
+        form = case.card_body(cache.get(), key, 'works', words)
         doc = case.fixture.temporary / 'destination.md'
         _ = doc.write_text(case.fixture.production.read_text())
         new_owner = fixture_member('showrunner', name='destination', doc=staff.LiveDoc(local_machine(), doc))
         _ = staff.move(case.fixture.unit.id, staff.ReportsTo(new_owner.id))
+        before = case.fixture.review_list.read_bytes()
         complete = threading.Event()
         deliveries: list[change_page.MessageDelivery] = []
 
@@ -5451,6 +5453,13 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(self.server, 'review_cache', cache), patch.object(self.server, 'delivery_status', case.status), patch.object(
                 serve, 'tailscale_ip', return_value='127.0.0.1'), patch.object(change_page, 'deliver', side_effect=deliver):
             status, body = self.post(review_page.PAGE_PATH, form)
+            self.assertEqual(status, 409, body)
+            self.assertEqual(cast(object, json.loads(body)),
+                             {'reason': 'This item changed. Check it again before saving.'})
+            self.assertEqual(case.fixture.review_list.read_bytes(), before)
+            self.assertEqual(deliveries, [])
+            fresh_form = case.card_body(cache.get(), key, 'works', words)
+            status, body = self.post(review_page.PAGE_PATH, fresh_form)
             self.assertEqual(status, 200, body)
             self.assertTrue(complete.wait(TEST_HANG_GUARD_SECS))
         delivery, = deliveries
