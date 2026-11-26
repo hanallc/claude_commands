@@ -381,7 +381,7 @@ def result_status(word: str) -> str:
 
 def nextest_slow_test_s() -> float:
     """Read the nextest recording threshold at use."""
-    return conf.read("test_times").number("NEXTEST_SLOW_TEST_S")
+    return conf.read("test_times").number("nextest_slow_test_s")
 
 
 @dataclass(frozen=True)

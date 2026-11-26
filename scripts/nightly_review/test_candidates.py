@@ -99,6 +99,24 @@ class CandidatesTests(unittest.TestCase):
             code = candidates.main(arguments)
         return code, out.getvalue(), err.getvalue()
 
+    def test_record_refuses_a_draft_before_writing_any_candidate(self) -> None:
+        report = self.root / "2026-10-12" / "report.md"
+        report.parent.mkdir()
+        revision = "# Check the display sooner\n**Target:** Display\n**Also found:**\n"
+        _ = report.write_text(revision + "- **Read /tmp/proof.txt.**\n")
+        code, _, errors = self.run_main(["record", str(report)])
+        self.assertEqual(code, 1)
+        self.assertIn("Revise the efficiency candidate draft. omit-file-path: /tmp/proof.txt", errors)
+        ledger = self.root / "ledger.md"
+        self.assertFalse(ledger.exists())
+        self.assertFalse(self.note.exists())
+
+        _ = report.write_text(revision + "- **Keep the display visible.**\n")
+        code, _, errors = self.run_main(["record", str(report)])
+        self.assertEqual(code, 0, errors)
+        self.assertIn("Check the display sooner", ledger.read_text())
+        self.assertIn("Keep the display visible", ledger.read_text())
+
     def test_record_repairs_an_interrupted_last_heading_before_queueing_it(self) -> None:
         report = self.root / "2026-10-12/report.md"
         report.parent.mkdir()

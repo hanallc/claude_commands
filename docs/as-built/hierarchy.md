@@ -19,7 +19,7 @@ The hierarchy connects the user's product choices to work in separate repository
 
 Morty, brain, and dwight have staff kind `producer` and no parent.
 They remain individual operators; their shared kind defines management.
-Each producer's job is in `<PRODUCER_FOLDER_ROOT>/<name>/README.md`.
+Each producer's job is in `<producer_folder_root>/<name>/README.md`.
 `commands/producer/greenlight.md` and `commands/producer/to_production.md` define production preparation separately.
 The [staff contract](staff-accessors.md#producer-rows-and-commands) defines their commands and document folders.
 
@@ -157,6 +157,17 @@ Prerequisites retain that list qualification.
 Row commands accept both displayed IDs and existing list-based IDs.
 An ambiguous displayed ID requires `--list <path>`.
 Saved pins therefore survive attachment changes without copying or renumbering rows.
+
+`change_review.py withdraw --row <id> --reason <text>` records the caller's staff name and preserves any prior verdict.
+The event uses `unknown` when the current session has no staff name.
+Withdrawal of an open row keeps its staff ID, urgency, and check instructions.
+`reopen --row <id> --reason <text>` restores the row to To review.
+It keeps the row ID and review log. It adds an event with the caller's name and reason.
+The change queue uses the saved urgency and move-to-end time to order the row.
+The command refuses a row without a withdrawn verdict.
+If an older withdrawal lacks the saved urgency or check instructions, the command names the missing fields and refuses to reopen it.
+`correct-withdraw-who --row <id> --at <ISO timestamp> --who <staff name>` corrects one withdrawal event in either table.
+Use the full timestamp from the log, with its offset. The correction keeps the other log entries.
 
 `record_verdict` returns `VerdictRecorded`, `VerdictAlreadyRecorded`, or `VerdictConflict`.
 An identical retry repeats the result and scratch cleanup.

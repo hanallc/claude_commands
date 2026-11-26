@@ -3609,7 +3609,7 @@ try {
             word:part('word').textContent,
             icons:[...line.querySelectorAll('[data-status-icon]')].filter(icon=>!icon.hidden).map(icon=>icon.dataset.statusIcon),
             timingsHidden:part('trip').hidden&&part('render').hidden,
-            position:getComputedStyle(line).position});
+            position:getComputedStyle(line.closest('.page-top')).position});
           const good=async()=>{
             reading.read_at=now/1000;
             reading.fresh_until=reading.read_at+ageLimit;
