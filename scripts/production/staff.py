@@ -34,6 +34,7 @@ if __name__ == "__main__":
     sys.modules["scripts.production.staff"] = sys.modules[__name__]
 # The status line imports this module on each refresh. Defer imports for other paths.
 if TYPE_CHECKING:
+    from scripts.lib import lock_holder
     import argparse
     from scripts.accounts import role_map
 
@@ -199,10 +200,11 @@ class StaffAbsent(StaffUnreadable):
 class StaffRefused(Exception):
     """A requested change would break the staff rules."""
 
-    def __init__(self, *args: object, holder: str = "") -> None:
+    def __init__(self, *args: object, holder: str = "", slot_key: str = "") -> None:
         super().__init__(*args)
         # The process that holds a busy row, as "pid N: command"; empty when unknown.
         self.holder: str = holder
+        self.slot_key: str = slot_key
 
 
 class UpkeepRowBusy(StaffRefused):
@@ -1065,7 +1067,9 @@ def row_operation(reference: str) -> Generator[None]:
 
 
 def _holder_fields() -> dict[str, object]:
-    return {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+    from scripts.lib import lock_holder
+
+    return lock_holder.own_fields()
 
 
 def _write_slot_holder(lock: IO[bytes]) -> None:
@@ -1080,20 +1084,24 @@ def _clear_slot_holder(lock: IO[bytes]) -> None:
         os.ftruncate(lock.fileno(), 0)
 
 
-def _slot_holder(lock: IO[bytes]) -> tuple[int, str] | None:
-    try:
-        _ = lock.seek(0)
-        line = lock.read(4096).partition(b"\n")[0]
-        holder = cast(object, json.loads(line))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(holder, dict):
-        return None
-    record = cast(dict[str, object], holder)
-    pid, command = record.get("pid"), record.get("command")
-    if type(pid) is not int or pid <= 0 or not isinstance(command, str) or not command:
-        return None
-    return pid, command
+def _slot_holder(lock: IO[bytes]) -> lock_holder.HolderRecord | None:
+    from scripts.lib import lock_holder
+
+    return lock_holder.read_record(lock)
+
+
+def prove_slot_holder(key: str) -> lock_holder.ProvedLockHolder | None:
+    """Prove a holder of the current row lock."""
+    from scripts.lib import lock_holder
+
+    path, _ = _row_lock(key)
+    with path.open("rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = _slot_holder(lock)
+            return lock_holder.prove(path, [holder] if holder is not None else [])
+    return None
 
 
 _UPKEEP_LOCK_WAIT: ContextVar[float | None] = ContextVar("_UPKEEP_LOCK_WAIT", default=None)
@@ -1108,15 +1116,15 @@ def upkeep_lock_wait(seconds: float) -> Generator[None]:
         _UPKEEP_LOCK_WAIT.reset(token)
 
 
-def _upkeep_pid(holder: tuple[int, str]) -> int | None:
+def _upkeep_pid(holder: lock_holder.HolderRecord) -> int | None:
     with suppress(ValueError):
-        arguments = shlex.split(holder[1])
+        arguments = shlex.split(holder.command)
         if "--work" in arguments and any(Path(arg).name == "herdr_upkeep.py" for arg in arguments):
-            return holder[0]
+            return holder.pid
     return None
 
 
-def _acquire_slot(lock: IO[bytes], name: str) -> None:
+def _acquire_slot(lock: IO[bytes], name: str, *, slot_key: str = "") -> None:
     seconds = _UPKEEP_LOCK_WAIT.get()
     deadline = time.monotonic() + seconds if seconds is not None else 0.0
     upkeep_pid: int | None = None
@@ -1135,9 +1143,9 @@ def _acquire_slot(lock: IO[bytes], name: str) -> None:
                         raise UpkeepRowBusy(f"Herdr upkeep still holds {name} (pid {upkeep_pid})") from error
                     time.sleep(min(0.05, remaining))
                     continue
-            named = f"pid {holder[0]}: {holder[1]}" if holder else ""
+            named = holder.description if holder else ""
             raise StaffRefused(f"{name}: another operation holds this row" + (f" ({named})" if named else ""),
-                               holder=named) from error
+                               holder=named, slot_key=slot_key) from error
 
 
 def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
@@ -1188,7 +1196,7 @@ def slot_operation(key: str, name: str, *, join: bool = True) -> Generator[None]
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b", buffering=0) as lock:
-        _acquire_slot(lock, name)
+        _acquire_slot(lock, name, slot_key=key)
         previous = os.environ.get(variable)
         _write_slot_holder(lock)
         try:
@@ -1251,8 +1259,6 @@ def row_activity(key: str) -> RowAvailable | RowBusy | RowMoving:
 @contextmanager
 def mark_row_move(key: str, target: str) -> Generator[None]:
     """Publish the move while the caller holds the row lock."""
-    from scripts.lib import process_start
-
     path, variable = _row_lock(key)
     if not _joined_operation(path, variable):
         raise StaffRefused("the move does not hold the row")
@@ -1264,8 +1270,7 @@ def mark_row_move(key: str, target: str) -> Generator[None]:
             stream.flush()
 
         holder = _holder_fields()
-        owner = process_start.process_start(os.getpid())
-        write(holder | {"start": owner.start, "target": target} if isinstance(owner, process_start.Started) else holder)
+        write(holder | {"target": target} if holder.get("start") else holder)
         try:
             yield
         finally:

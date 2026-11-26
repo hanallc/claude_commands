@@ -7,7 +7,7 @@ import unittest
 from typing import override
 from unittest.mock import patch
 
-from scripts.production import autocompact
+from scripts.lib import autocompact
 
 
 class AutocompactTests(unittest.TestCase):

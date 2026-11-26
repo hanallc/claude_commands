@@ -435,6 +435,9 @@ class LaunchPolicy:
     settings: models_registry.LaunchSettings
     sandbox: str
     permission: str
+    compact_window: tuple[str, ...] = ()
+    configuration: models_registry.LaunchModelConfiguration | models_registry.FreshLaunchConfiguration = (
+        models_registry.FreshLaunchConfiguration())
     tools: ToolAccess = ToolAccess.ROLE_DEFAULT
 
 
@@ -1287,15 +1290,22 @@ def can_close(worker: OpenWorker | StoppedWorker | ClosedWorker, *,
     return completion
 
 
-def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned"] = "assigned") -> LaunchPolicy:
-    """Read the role's launch policy; a named family reads that family's row instead of the assigned one."""
-    from scripts.astra import design_roles
+def role_launch_settings(role: WorkerRole, family: Literal["claude", "codex", "assigned"],
+                         configuration: models_registry.LaunchModelConfiguration) -> models_registry.LaunchSettings:
+    """Read the worker model settings from the launch configuration."""
     section, key = ("design_roles", role.removeprefix("astra-")) if role.startswith("astra-") else ("direct", role)
-    settings = models_registry.launch_settings(section, key, family)
+    return models_registry.launch_settings(section, key, family, configuration=configuration)
+
+
+def launch_policy(role: WorkerRole, family: Literal["claude", "codex", "assigned"] = "assigned") -> LaunchPolicy:
+    """Read the launch policy for the selected worker role and family."""
+    from scripts.astra import design_roles
+    configuration = models_registry.launch_snapshot()
+    settings = role_launch_settings(role, family, configuration)
     sandbox = READ_ONLY_SANDBOX if role in REVIEW_ROLES else WORKER_SANDBOX
     if role == "astra-designer":
         sandbox = design_roles.DESIGNER_SANDBOX
-    return _launch_policy(settings, sandbox)
+    return _launch_policy(settings, sandbox, configuration)
 
 
 def checked_role_policy(role: WorkerRole | WorkerRoleUnavailable,
@@ -1323,13 +1333,13 @@ def parked_launch_policy(row: staff.StaffRow, passed: dict[str, object]
             or saved.thread != row.current_session):
         return progress_history.ParkedLaunchUnavailable.MISSING
     settings = models_registry.LaunchSettings(saved.family, saved.model, saved.effort, saved.service_tier)
-    return LaunchPolicy(settings, saved.sandbox, saved.permission)
+    return replace(_launch_policy(settings, saved.sandbox), permission=saved.permission)
 
 
 def astra_review_policy(model: str, effort: str) -> LaunchPolicy:
     """Use the supplied review settings with fixed read-only Codex access."""
     settings = models_registry.LaunchSettings("codex", model, effort, "")
-    return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan")
+    return LaunchPolicy(settings, READ_ONLY_SANDBOX, "plan", ())
 
 
 def worker_policy(settings: models_registry.LaunchSettings) -> LaunchPolicy:
@@ -1337,9 +1347,14 @@ def worker_policy(settings: models_registry.LaunchSettings) -> LaunchPolicy:
     return _launch_policy(settings, WORKER_SANDBOX)
 
 
-def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str) -> LaunchPolicy:
+def _launch_policy(settings: models_registry.LaunchSettings, sandbox: str,
+                   configuration: models_registry.LaunchModelConfiguration | None = None) -> LaunchPolicy:
     permission = "plan" if sandbox == READ_ONLY_SANDBOX else "bypassPermissions"
-    return LaunchPolicy(settings, sandbox, permission)
+    if settings.kind == "codex":
+        return LaunchPolicy(settings, sandbox, permission, ())
+    configuration = models_registry.optional_launch_snapshot() if configuration is None else configuration
+    window = models_registry.compact_window_arguments("worker", configuration=configuration)
+    return LaunchPolicy(settings, sandbox, permission, tuple(window), configuration)
 
 
 def turn_end_command() -> list[str]:
@@ -1367,6 +1382,7 @@ def _policy_arguments(policy: LaunchPolicy) -> list[str]:
         arguments = ["--model", settings.model, "--permission-mode", policy.permission]
         if settings.effort and settings.effort != "unset":
             arguments += ["--effort", settings.effort]
+        arguments += policy.compact_window
         if policy.tools is ToolAccess.SHOWRUNNER_REVIEW:
             arguments += CLAUDE_REVIEW_ARGUMENTS
     return arguments + _turn_end_arguments(settings.kind)
@@ -1850,6 +1866,8 @@ def _start_locked(owner: staff.StaffRow, name: WorkerName, role: WorkerRole, pol
     environment = launch_environment(policy, account, row is not None and not switching)
     if isinstance(environment, StartRefused):
         return environment
+    if isinstance(policy.configuration, models_registry.LaunchModelConfiguration):
+        environment = policy.configuration.environment(environment)
     launch_home = (staff.SessionHome(Path(environment["CODEX_HOME"]))
                    if policy.settings.kind == "codex" else staff.HomeUnknown())
     environment["UNIT_TEAM_ROLE"] = name.value

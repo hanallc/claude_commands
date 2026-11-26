@@ -94,36 +94,19 @@ fi
 
 # Read the layout settings that the fast path can verify.
 cargo_output_roots() {
+    local CONF_DIR=${CONF_DIR-}
+    if [[ -n "$CONF_DIR" && ! -e "$CONF_DIR/build_folders.conf" && ! -L "$CONF_DIR/build_folders.conf" ]]; then
+        CONF_DIR="$wrapper_dir/../../config"
+    fi
     local config="${CONF_DIR:-$HOME/.claude/config}/build_folders.conf"
-    local host line key value
-    local base_build= base_workspace= host_build= host_workspace=
-    if [[ -n "${CONF_DIR-}" && ! -e "$config" && ! -L "$config" ]]; then
-        config="$wrapper_dir/../../config/build_folders.conf"
-    fi
     [[ -f "$config" && -r "$config" ]] || return 1
-    host=$(hostname -s) || return 1
-    host=${host%%.*}
-    if [[ "$host" == *[[:upper:]]* ]]; then
-        host=$(printf '%s' "$host" | LC_ALL=C tr '[:upper:]' '[:lower:]') || return 1
+    # shellcheck source=/dev/null
+    source "$wrapper_dir/../lib/conf.sh" || return 1
+    build_root=$(conf_value build_folders roots.build) || return 1
+    workspace_root=$(conf_value build_folders roots.workspace) || return 1
+    if [[ "$checkout" == "$HOME/.claude" ]]; then
+        claude_repo_word=$(conf_value build_folders repo_word.claude_commands) || return 1
     fi
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" =~ ^[[:space:]]*(roots\.(build|workspace)(\.[^[:space:]=]+)?)[[:space:]]*=[[:space:]]*([^[:space:]#]+)[[:space:]]*($|[[:space:]]#) ]]; then
-            key=${BASH_REMATCH[1]}
-            value=${BASH_REMATCH[4]}
-            case "$key" in
-                roots.build) : "${base_build:=$value}" ;;
-                roots.workspace) : "${base_workspace:=$value}" ;;
-                "roots.build.$host") : "${host_build:=$value}" ;;
-                "roots.workspace.$host") : "${host_workspace:=$value}" ;;
-            esac
-        elif [[ "$line" =~ ^[[:space:]]*repo_word\.claude_commands[[:space:]]*=[[:space:]]*([^[:space:]#]+)[[:space:]]*($|[[:space:]]#) ]]; then
-            : "${claude_repo_word:=${BASH_REMATCH[1]}}"
-        elif [[ "$line" =~ ^[[:space:]]*(roots\.(build|workspace)([[:space:].=]|$)|repo_word\.claude_commands[[:space:].=]) ]]; then
-            return 1
-        fi
-    done < "$config"
-    build_root=${host_build:-$base_build}
-    workspace_root=${host_workspace:-$base_workspace}
     [[ "$build_root" != '~/'* ]] || build_root="$HOME/${build_root:2}"
     [[ "$workspace_root" != '~/'* ]] || workspace_root="$HOME/${workspace_root:2}"
     [[ "$build_root" == /* && "$workspace_root" == /* ]] || return 1

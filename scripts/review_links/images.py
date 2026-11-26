@@ -27,7 +27,8 @@ from scripts.production.delivery_state import QuestionSendState
 from scripts.production import staff, the_list
 from scripts.review_links import staff_names
 from scripts.review_links import question_record
-from scripts.review_links import change_browser, change_page, console, image_store, page_frame, page_question, review_link
+from scripts.review_links import change_browser, change_page, console, image_store, page_frame, page_question, page_version
+from scripts.review_links import review_link
 
 PAGE_NAME = "images.html"
 PAGE_PATH = f"/{change_page.CONSOLE_FOLDER}/{PAGE_NAME}"
@@ -339,13 +340,14 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     answer_refresh_seconds = settings.number("page_refresh_seconds")
     refresh_seconds = answer_refresh_seconds if refresh_needed else 0
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
-    content = (STYLE + page_frame.title("Images", "images")
+    request_timeout = settings.whole("page_request_timeout_seconds")
+    content = (STYLE + page_frame.title("Images", "images", SCRIPT_VERSION)
                + page_frame.action_failure("image-action-failure")
                + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
                + '<p hidden data-image-notice role="status"></p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
-               + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
-               + f' {card_motion.attributes()}'
+               + f'<div><div data-images data-refresh-seconds="{refresh_seconds}"'
+               + f' {card_motion.attributes()} data-request-timeout-seconds="{request_timeout}"'
                + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
                + '<template data-image-draft-template><article><h2 class="image-title"></h2>'
@@ -827,7 +829,8 @@ async function submit(event) {
   const hold = holdCard(card, hidden => { if (hidden) apply(); });
   let postFailed = false, retryable = true;
   try {
-    const response = await hold.post(location.pathname, {method: 'POST', body}, card.dataset.sendReceiver);
+    const response = await hold.post(location.pathname, {method: 'POST', body, requestTimeoutSeconds: pageRequestSeconds()},
+                                     card.dataset.sendReceiver);
     if (!response.ok) {
       retryable = response.status >= 500;
       const reason = await response.json().then(body => body.reason, () => '');
@@ -864,7 +867,7 @@ async function submit(event) {
     hold.restore();
     postFailed = true;
     const undone = error instanceof SendUndone;
-    const message = undone ? error.message : 'Not sent: ' + error.message;
+    const message = undone ? error.message : saveTimeoutWords(error) || 'Not sent: ' + error.message;
     if (request.key) state.attempts.set(request.key, message);
     else {
       state.draftError = message;
@@ -881,6 +884,7 @@ async function submit(event) {
     state.active = null;
     setPictureSubmitting(image, false);
     if (field) field.readOnly = false;
+    pageRefresh.changed();
     if (question && !postFailed) void pageRefresh.refresh(true);
     else void refresh().catch(error => {
       if (!postFailed) showActionFailure(actionFailure, 'Update failed: ' + error.message);
@@ -889,26 +893,24 @@ async function submit(event) {
 }
 const sending = () => [...pictureStates.values()].some(state => state.active);
 async function refresh(_supersede=false,current=()=>true) {
-  if (sending()) return;
   const own = ++refreshRequest;
-  const isCurrent = () => own === refreshRequest && !sending() && current();
+  const isCurrent = () => own === refreshRequest && current();
   try {
     const response = await fetch(location.pathname, {cache: 'no-store'});
     if (!response.ok) throw new Error('HTTP ' + response.status);
     const page = new DOMParser().parseFromString(await response.text(), 'text/html');
     const fresh = page.querySelector('[data-images]');
     if (!isCurrent()) return;
-    if (!fresh) throw new Error('The page has no image list.');
     const previous = forms(list);
-    for (const form of previous) {
-      if (form.elements.feedback) readEdit(form, pictureState(imageId(form)));
+    if (!sending()) {
+      for (const form of previous) {
+        if (form.elements.feedback) readEdit(form, pictureState(imageId(form)));
+      }
     }
-    const saved = saveDrafts();
-    if (fresh.dataset.script !== list.dataset.script) {
-      if (!saved) throw new Error('Could not save the draft before reloading.');
-      location.reload();
-      return;
-    }
+    const newer = reloadForNewScript(page, () => sending() || !saveDrafts());
+    if (newer || sending()) return newer;
+    saveDrafts();
+    if (!fresh) throw new Error('The page has no image list.');
     const facts = pageRefreshFacts(page);
     showActionFailure(actionFailure);
     restoreForms(fresh, previous);
@@ -927,7 +929,7 @@ async function refresh(_supersede=false,current=()=>true) {
     if (wasWaiting && waiting.hidden) scrollToLinkedImage();
     return facts;
   } catch (error) {
-    if (isCurrent()) throw error;
+    if (isCurrent() && !sending()) throw error;
   }
 }
 function selectImage(target) {
@@ -950,7 +952,8 @@ bind(list);
 apply();
 scrollToLinkedImage();
 })();"""
-SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
+VERSION_PARTS = (change_page.DOCUMENT_ASSETS, STYLE, SCRIPT)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)
 
 
 def main(arguments: list[str]) -> int:

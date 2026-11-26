@@ -2768,7 +2768,7 @@ assert not loaded, loaded
             return fallback if stem == "build_folders" else original_path(stem)
 
         with (mock.patch.object(conf, "_repository_path", side_effect=repository_path),
-              mock.patch("scripts.lib.conf.subprocess.run", side_effect=AssertionError("Git must not run"))):
+              mock.patch("subprocess.run", side_effect=AssertionError("Git must not run"))):
             self.assertEqual(folders.FOLDER_PREFIXES["verify-hold"], "verify-hold.{owner}.")
             path = folders.create_build_folder(folders.UniqueBuildFolder("private-"))
         self.assertTrue(path.is_dir())

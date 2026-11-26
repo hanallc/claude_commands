@@ -64,9 +64,9 @@ from scripts.hooks.context_usage import (
 DEBUG_LOG = Path("/tmp/claude/context-hook-debug.jsonl")
 
 
-def message_enabled() -> bool:
+def message_enabled(configuration: conf.ConfigRead) -> bool:
     """Only a live off value disables the context message."""
-    settings = conf.read("context_usage").settings
+    settings = configuration.settings
     if not isinstance(settings, dict):
         return True
     setting = settings.get("message")
@@ -186,13 +186,14 @@ def log_debug(
 def main() -> None:
     payload = cast(HookInput, json.loads(sys.stdin.read()))
     transcript = resolve_transcript(payload)
-    reading = None if transcript is None else latest_reading(transcript)
+    configuration = conf.read("context_usage")
+    reading = None if transcript is None else latest_reading(transcript, configuration)
     # The window depends on the model, and only the transcript names it, so this
     # has to come after the reading.
     window = auto_compact_window(None if reading is None else reading["model"])
     response = response_bytes(payload)
     log_debug(payload, transcript, reading, window, response)
-    if reading is None or not message_enabled():
+    if reading is None or not message_enabled(configuration):
         return
     tokens = estimate_tokens(reading, response)
     is_subagent = bool(payload.get("agent_id"))

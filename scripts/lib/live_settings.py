@@ -66,12 +66,18 @@ class UnchangedSave:
     """The requested value is already live under the journal lock."""
 
 
+def check_value_line(stem: str, key: str, value: str) -> None:
+    if value and value.splitlines() != [value]:
+        raise conf.Unusable(f"{stem}: {key}: value must fit on one line")
+
+
 def editable_setting(stem: str, key: str, value: str, *, accepted: bool = False,
                      comment: str | None = None) -> ExistingSetting | NewModelColor | NamedRow:
     """Validate the change and identify the current setting; only the Mac takes natedev's name comment unchecked."""
     current_stem, _ = migrated_setting_name(stem, key)
     if current_stem != stem:
         raise conf.Unusable(f"Use {current_stem} for this Save.")
+    check_value_line(stem, key, value)
     if stem == NAMED_ROWS:
         current = conf.settings(conf.path(stem).read_text(encoding="utf-8")).get(key)
         trusted = comment if comment is not None and platform.system() == "Darwin" else None
