@@ -2273,9 +2273,12 @@ Change history files verified earlier pairs and checks the current slot separate
 One verifier reads the source owner, terminal events, slot state, saved pairs, tags, and reply digests.
 It reports verified ownership, conflicting evidence, or missing evidence.
 Approval, decline, or supersession ends the request for every type of reply proof.
+Feedback or a replacement question also ends the initial submitted Question request.
+Each submitted Question and Investigation reply must match its owner.
 An open slot cannot supply proof of an answer.
-One exchange can claim a reply digest in each source.
-A saved slot answer also reserves the reply by its author, time, and words.
+A bound reply or an authoritative slot answer reserves its author ID, time, and words.
+Distinct stable request IDs can establish separate replies with the same author, time, and words.
+If an Investigation restores its original answer to the log, Review uses the verified log position and keeps the saved binding.
 A conflicting or unverified log reply stays in Review.
 The native question and answer can still file when the log association remains unresolved.
 A verified exchange keeps its filed ID.
@@ -2294,6 +2297,7 @@ Old bindings keep their encoded form for receipt checks.
 Migration rewrites verified bindings in place and issues receipts after the new List data is durable.
 An unverified Investigation binding remains visible in Review and requires a separate repair.
 Review checks a save receipt before it hands off each exchange.
+A failed pending exchange read leaves that card in Review.
 A unique reply digest can verify a moved log event without a change to the receipt.
 Review locates a moved log question in the verified reply's request interval.
 A new reply uses its digest as its ID when a saved reply owns the position ID.
