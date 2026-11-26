@@ -41,6 +41,7 @@ class ConfiguredFirstPeak:
 
 
 CONFIGURED_FIRST_PEAK = ConfiguredFirstPeak()
+_SCOPE_TRACE_SAMPLING = wire.ScopeTraceSampling()
 
 
 class ProgramPurpose(Enum):
@@ -487,7 +488,7 @@ def request_place(request: QueueRequest | RefreshedLaunch, output: admission_cli
 def local_context(local: wire.AdmitRequest) -> wire.LocalAdmissionContext:
     """The local part of a placement request: what a local grant admits."""
     return wire.LocalAdmissionContext(local.argv, local.cwd, local.sidecar, local.call, local.test_width,
-                                      local.fresh_test, local.token_back_at)
+                                      local.fresh_test, local.token_back_at, trace_sampling=local.trace_sampling)
 
 
 PlacementEnd = wire.LocalPlacementGranted | wire.Assignment | wire.DispatchStatus | admission_client.LeftQueue
@@ -499,7 +500,8 @@ def refreshed_placement(request: wire.PlacementRequest, local: wire.LocalAdmissi
                else admission_records.INFER_FROM_ARGV)
     refreshed = admission_client.step_request(list(local.argv), local.cwd, wire.Owner(request.owner.pid, request.owner.start_time),
                                               request.since, local.sidecar, request.episode, profile, run=request.run)
-    return replace(request, profile=refreshed.profile, local=local_context(refreshed))
+    return replace(request, profile=refreshed.profile,
+                   local=replace(local_context(refreshed), trace_sampling=local.trace_sampling))
 
 
 def wait_for_placement(request: wire.PlacementRequest, cancel_reason: str) -> PlacementEnd:
@@ -612,7 +614,8 @@ class PlaceSetup:
 
 @contextmanager
 def place_setup(program: str | Sequence[str], repo: Path, *, batch: bool = False,
-                sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK
+                sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
+                trace_sampling: wire.TraceSampling = _SCOPE_TRACE_SAMPLING
                 ) -> Generator[PlaceSetup]:
     """Use full commands for purpose selection; retain named batch reservations.
 
@@ -657,7 +660,9 @@ def place_setup(program: str | Sequence[str], repo: Path, *, batch: bool = False
             owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
 
             def refresh() -> wire.AdmitRequest:
-                return admission_client.step_request(list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
+                request = admission_client.step_request(
+                    list(arguments) or [name], str(repo), owner, since, str(sidecar), episode, profile)
+                return replace(request, trace_sampling=trace_sampling)
             request = refresh
         yield PlaceSetup(temporary, sidecar, config, purpose, arguments, request)
 
@@ -665,10 +670,12 @@ def place_setup(program: str | Sequence[str], repo: Path, *, batch: bool = False
 @contextmanager
 def queue_place(program: str | Sequence[str], repo: Path, *, batch: bool = False,
                 sizing: admission_records.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
-                before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
+                before_check: Callable[[], None] = no_hold_wait,
+                trace_sampling: wire.TraceSampling = _SCOPE_TRACE_SAMPLING) -> Generator[QueuePlace]:
     """Wait for the reservation of the program in the queue, and hold it while the program runs."""
     # The reservation ends before its folder: the service can read the sidecar until release.
-    with place_setup(program, repo, batch=batch, sizing=sizing) as setup, ExitStack() as reservation:
+    with (place_setup(program, repo, batch=batch, sizing=sizing, trace_sampling=trace_sampling) as setup,
+          ExitStack() as reservation):
         grant: HeldReservation | UnreservedProgram = UnreservedProgram()
         if setup.request is not None:
             grant = reservation.enter_context(held_reservation(RefreshedRequest(setup.request), before_check=before_check))

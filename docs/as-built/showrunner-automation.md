@@ -906,7 +906,11 @@ A missing folder uses its nearest existing parent until the folder appears.
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
   The [Console text standard](../console_text_standard.md) applies to `ask` and to answers and replies from the writer.
   The fast check tests text patterns before the existing model reviewer reads the draft.
-  The model approves a draft only with a `send` verdict.
+  The model checks how the parts relate on each review of a structured question.
+  The cache reuses independent checks for unchanged parts with the same rules, date, and time zone.
+  It keeps the latest valid verdicts and removes drafts inactive for seven days.
+  If a cache lock stays busy until the deadline, the filing command holds the draft.
+  The review allows at most three questions for missing facts across all verdicts.
   The filing command returns the failed rules and quotes to the writer. The hold keeps the draft.
   A quote that differs from the draft keeps the draft on hold.
   If the model is unavailable, `ask` records the reason.
