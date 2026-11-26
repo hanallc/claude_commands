@@ -7938,7 +7938,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(code, 200, reply)
         fields = cast(dict[str, str], json.loads(reply))
         self.assertEqual((fields["item_state"], fields["open_ask"], fields["unread"]), ("Working", "false", "false"))
-        self.assertNotIn('value="top"', fields["detail_html"])
+        self.assertIn('<button name="action" value="top">Make top priority</button>', fields["detail_html"])
         go_id = self.go_ledger_records()[0].stem
         command = f"update --id {item.id} --source morty --next-step"
         messages = self.sent_messages(delivery)
