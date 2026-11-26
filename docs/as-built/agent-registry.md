@@ -35,6 +35,26 @@ gpt-5.6-sol=low,medium,high,xhigh,max,ultra
 codex_service_tier=fast
 ```
 
+`[compact_windows]` sets the Claude auto-compact window for producer, showrunner, unit, or worker.
+`scripts/lib/autocompact.py` validates a token count from 100k to 1M.
+A valid count adds `--autocompact <tokens>` to the launch.
+Shell reviews use the worker key from the launch configuration.
+A Herdr resume by session ID uses the registered role unless the caller supplies `--autocompact`.
+An explicit Herdr resume reads one launch configuration from the target environment after direnv.
+It uses that configuration for the model and role window.
+When a launch already has its model and the registry read fails, the launcher reports one anomaly.
+The launch keeps the supplied model and omits the configured window option.
+A unit session's record from `add_unit --autocompact` takes precedence over the unit key.
+A readable unit record still applies when the registry is unreadable.
+The value `auto` or an absent key leaves the window to Claude.
+An invalid role key or an invalid value for the launched role prints one `anomaly:` line.
+An invalid role value leaves the window to Claude.
+
+```ini
+[compact_windows]
+producer=300000
+```
+
 Options sections hold launch flags instead of agent rows.
 `[<function>.options]` can set `codex_service_tier` and `codex_service_tier.<subtask>`.
 It can also set `claude_account` and `claude_account.<subtask>`: the Claude launch account, `workers` (the default) or `caller`. `agent_exec.sh` runs a `caller` task on the caller's own account; `[direct.options] claude_account.simplify=caller` keeps the /simplify review there.

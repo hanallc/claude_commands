@@ -17,10 +17,15 @@ except FileNotFoundError:
 import json
 import os
 import re
+import subprocess
+import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NamedTuple, TypedDict, cast
 
-from scripts.lib import models_registry  # noqa: E402
+from scripts.agents import pane_record  # noqa: E402
+from scripts.lib import autocompact, conf, models_registry  # noqa: E402
+from scripts.lib.agent_program import is_claude_process  # noqa: E402
 
 # Auto-compaction does NOT wait for the window. Reconstructed from the 2.1.220
 # binary (`Hds`/`Sfo`/`CSe`, still `W9`/`Bye`/`SQo` in 2.1.233), the trigger is
@@ -125,8 +130,7 @@ RESPONSE_TOKENS_CAP = 25_000
 BASE64_RUN = re.compile(r"[A-Za-z0-9+/=]{4096,}")
 IMAGE_TOKENS = 1_600
 
-# Bytes of transcript tail to scan for the most recent usage record.
-TAIL_BYTES = 512 * 1024
+# Maximum bytes for the retry scan.
 TAIL_BYTES_RETRY = 4 * 1024 * 1024
 
 # A compaction writes two adjacent entries: a `system` record carrying
@@ -314,13 +318,13 @@ def model_context_window(model: str | None) -> int:
     return rule["window"] if version >= rule["floor"] else default
 
 
-def auto_compact_window(model: str | None = None) -> int | None:
+def auto_compact_window(model: str | None = None, *, pid: int | None = None) -> int | None:
     """Effective auto-compact window for `model`.
 
-    Env override wins over settings.json, then the result is clamped to the
-    model's own context window exactly as the CLI clamps it.
+    The session's `--autocompact` wins over the env override, which wins over settings.json.
+    The result is clamped to the model's own context window exactly as the CLI clamps it.
     """
-    configured = configured_window()
+    configured = configured_window(pid=pid)
     if configured is None:
         return None
     return min(configured, model_context_window(model))
@@ -335,8 +339,84 @@ def read_settings() -> Settings:
         return {}
 
 
-def configured_window() -> int | None:
-    """The raw configured window, before the model clamp."""
+# Allow the hook dispatcher, its child, and shell wrappers between the hook and Claude.
+ANCESTOR_LIMIT = 6
+
+
+class ProcessRow(NamedTuple):
+    parent: int
+    arguments: list[str]
+
+
+ProcessRead = Callable[[int], ProcessRow | None]
+
+
+def _process(pid: int) -> ProcessRow | None:
+    try:
+        return ProcessRow(pane_record.process_parent(pid), pane_record.process_arguments(pid))
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def _process_reader() -> ProcessRead:
+    if sys.platform != "darwin":
+        return _process
+    try:
+        listing = subprocess.run([os.environ.get("HERDR_PS", "ps"), "-axww", "-o", "pid=,ppid=,args="],
+                                 capture_output=True, text=True, errors="replace", check=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        listing = ""
+    parents: dict[int, int] = {}
+    for line in listing.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            parents[int(fields[0])] = int(fields[1])
+
+    def read(pid: int) -> ProcessRow | None:
+        if pid not in parents:
+            return None
+        try:
+            # Use the kernel argument reader to preserve spaces in each argument.
+            return ProcessRow(parents[pid], pane_record.process_arguments(pid))
+        except (OSError, ValueError, IndexError):
+            return None
+
+    return read
+
+
+def launched_window(processes: ProcessRead, start: int) -> int | None:
+    """The `--autocompact` window of the nearest Claude process at or above `start`, or None.
+
+    None when no Claude process is near, or when it runs without the option or with `auto`.
+    """
+    pid = start
+    for _ in range(ANCESTOR_LIMIT):
+        row = processes(pid)
+        if row is None:
+            return None
+        if is_claude_process(row.arguments):
+            value = pane_record.parse_claude_arguments(row.arguments).value(frozenset({"--autocompact"}))
+            if not value or value == autocompact.AUTO:
+                return None
+            try:
+                return parse_window(autocompact.checked(value))
+            except autocompact.BadAutocompact:
+                return None
+        if row.parent <= 1:
+            return None
+        pid = row.parent
+    return None
+
+
+def configured_window(*, pid: int | None = None) -> int | None:
+    """The raw configured window, before the model clamp.
+
+    Check Claude at or above the given PID, or above this hook.
+    Then check `CLAUDE_CODE_AUTO_COMPACT_WINDOW` and settings.json.
+    """
+    launched = launched_window(_process_reader(), os.getppid() if pid is None else pid)
+    if launched is not None:
+        return launched
     from_env = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
     if from_env:
         parsed = parse_window(from_env)
@@ -422,7 +502,7 @@ def pending_line_bytes(text: str) -> int:
     return len(stripped) + 1 + images * IMAGE_TOKENS * int(PENDING_BYTES_PER_TOKEN)
 
 
-def latest_reading(path: Path) -> Reading | None:
+def latest_reading(path: Path, configuration: conf.ConfigRead) -> Reading | None:
     """Tokens in the context window as of the most recent assistant turn.
 
     Usage records only exist for turns that have already been sent, so the raw
@@ -445,7 +525,11 @@ def latest_reading(path: Path) -> Reading | None:
     refuses to err in everywhere else. Staying silent costs exactly one tool
     call, because the next assistant turn writes a real post-compaction record.
     """
-    for size in (TAIL_BYTES, TAIL_BYTES_RETRY):
+    try:
+        scan_sizes = (configuration.whole("transcript.tail_bytes"), TAIL_BYTES_RETRY)
+    except conf.Unusable:
+        scan_sizes = (TAIL_BYTES_RETRY,)
+    for size in scan_sizes:
         lines = read_tail(path, size)
         for offset, line in enumerate(reversed(lines)):
             if any(marker in line for marker in COMPACT_MARKERS):
@@ -520,7 +604,7 @@ def measure(payload: HookInput) -> Measurement | None:
     transcript = resolve_transcript(payload)
     if transcript is None:
         return None
-    reading = latest_reading(transcript)
+    reading = latest_reading(transcript, conf.read("context_usage"))
     if reading is None:
         return None
     return {

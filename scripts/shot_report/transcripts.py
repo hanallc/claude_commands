@@ -10,6 +10,7 @@ import pickle
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
@@ -19,6 +20,7 @@ from functools import partial
 from pathlib import Path
 from typing import Literal, cast, override
 
+from scripts.lib import conf
 from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
 
 Agent = Literal["Claude", "Codex"]
@@ -282,7 +284,6 @@ PREFILTER = (
 CODEX_PREFILTER = PREFILTER[:-3]
 CLAUDE_CANDIDATE_BYTES = tuple(pattern.encode() for pattern in PREFILTER)
 CODEX_CANDIDATE_BYTES = tuple(pattern.encode() for pattern in CODEX_PREFILTER)
-PARALLEL_SCAN_BYTES = 1_000_000_000
 RELATED_WRITE = (
     r"(?:\*\*\* (?:Add|Update) File:|cat\s*>{1,2}|tee\s+|\"name\"\s*:\s*\"Write\")" +
     r"[^\n]*(?:rpc|call|invoke|send_request|method|brp\.(?:sh|py)).{0,48}"
@@ -2266,6 +2267,16 @@ def _joined_tool_events(evidence: Iterable[TranscriptEvidence]) -> list[Transcri
     )
 
 
+def _should_scan_in_parallel(total_bytes: int) -> bool:
+    if total_bytes == 0:
+        return False
+    try:
+        return total_bytes > conf.read("shot_report").whole("transcripts.parallel_scan_bytes")
+    except conf.Unusable as error:
+        print(f"shot_report: {error}. Scan transcripts in series.", file=sys.stderr)
+        return False
+
+
 def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSource,
                  cache: PersistentScanCache, source_host: str, scratchpad_roots: tuple[Path, ...]) -> TranscriptScan:
     roots = (str(claude_root), str(codex_root))
@@ -2279,7 +2290,7 @@ def _cached_scan(claude_root: Path, codex_root: Path, timing_source: TimingSourc
         tasks: list[tuple[Agent, Path, str]] = [(inventory[name][0], inventory[name][1], source_host)
                                                 for name in candidates if name in inventory]
         tasks.sort(key=lambda item: inventory[str(item[1])][2].st_size, reverse=True)
-        if sum(inventory[str(path)][2].st_size for _, path, _ in tasks) > PARALLEL_SCAN_BYTES:
+        if _should_scan_in_parallel(sum(inventory[str(path)][2].st_size for _, path, _ in tasks)):
             with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as workers:
                 parse_file = partial(_new_file_evidence, scratchpad_roots=scratchpad_roots)
                 initial_results = dict(zip((str(path) for _, path, _ in tasks), workers.map(parse_file, tasks)))
@@ -2376,7 +2387,7 @@ def scan_calls(claude_root: Path, codex_root: Path, timings_path: Path | TimingS
     sized: list[tuple[int, Agent, Path]] = sorted(((path.stat().st_size, agent, path) for agent, path in files), reverse=True)
     ordered: list[tuple[Agent, Path]] = [(agent, path) for _, agent, path in sized]
     evidence: list[TranscriptEvidence] = []
-    if sum(size for size, _, _ in sized) > PARALLEL_SCAN_BYTES:
+    if _should_scan_in_parallel(sum(size for size, _, _ in sized)):
         with ProcessPoolExecutor(max_workers=min(4, os.cpu_count() or 2)) as workers:
             evidence.extend(workers.map(partial(_scan_file, scratchpad_roots=scratchpad_roots), ordered))
     else:

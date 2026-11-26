@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
 from decimal import Decimal
+from functools import cached_property
 import time
 from typing import Literal, NamedTuple, cast
 from zoneinfo import ZoneInfo
@@ -86,15 +87,10 @@ TESTS_PER_EDIT_TARGET = 0.5
 EDIT_BINS = ("0", "1", "2–3", "4–7", "8+")
 NO_REBUILD_CRATES = 0
 EDITED_CRATE_MIN_CRATES = NO_REBUILD_CRATES + 1
-EDITED_CRATE_MAX_CRATES = 3
-CASCADE_MIN_CRATES = EDITED_CRATE_MAX_CRATES + 1
 CASCADE_MAX_CRATES = COLD_BUILD_MIN_CRATES - 1
 NO_REBUILD_LABEL = "none"
-EDITED_CRATE_LABEL = f"edited crate ({EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates)"
-CASCADE_LABEL = f"cascade ({CASCADE_MIN_CRATES}–{CASCADE_MAX_CRATES} crates)"
 FIRST_BUILD_LABEL = f"first build here ({EDITED_CRATE_MIN_CRATES}–{CASCADE_MAX_CRATES} crates)"
 COLD_BUILD_LABEL = f"cold ({COLD_BUILD_MIN_CRATES}+ crates)"
-REBUILD_LABELS = (NO_REBUILD_LABEL, EDITED_CRATE_LABEL, CASCADE_LABEL, FIRST_BUILD_LABEL, COLD_BUILD_LABEL)
 PACKAGE_PATTERN = re.compile(r"package\(([^)&|\s]+)\)")
 COPY_WON = "won"
 COPY_NATEDEV_WON = "natedev_won"
@@ -667,16 +663,34 @@ def warm_step_clause() -> str:
     )
 
 
-def rebuild_bin(crates_compiled: int, warm: bool) -> str:
-    if crates_compiled == NO_REBUILD_CRATES:
-        return NO_REBUILD_LABEL
-    if crates_compiled < COLD_BUILD_MIN_CRATES and not warm:
-        return FIRST_BUILD_LABEL
-    if crates_compiled <= EDITED_CRATE_MAX_CRATES:
-        return EDITED_CRATE_LABEL
-    if crates_compiled < COLD_BUILD_MIN_CRATES:
-        return CASCADE_LABEL
-    return COLD_BUILD_LABEL
+class RebuildClasses:
+    """Keep one edited-crate limit for the sections of a report."""
+
+    @cached_property
+    def edited_crate_max(self) -> int:
+        return conf.read("buildlog").whole("report.max_edited_crates")
+
+    @cached_property
+    def edited_label(self) -> str:
+        return f"edited crate ({EDITED_CRATE_MIN_CRATES}–{self.edited_crate_max} crates)"
+
+    @cached_property
+    def cascade_label(self) -> str:
+        return f"cascade ({self.edited_crate_max + 1}–{CASCADE_MAX_CRATES} crates)"
+
+    def labels(self) -> tuple[str, ...]:
+        return (NO_REBUILD_LABEL, self.edited_label, self.cascade_label, FIRST_BUILD_LABEL, COLD_BUILD_LABEL)
+
+    def label(self, crates_compiled: int, warm: bool) -> str:
+        if crates_compiled == NO_REBUILD_CRATES:
+            return NO_REBUILD_LABEL
+        if crates_compiled >= COLD_BUILD_MIN_CRATES:
+            return COLD_BUILD_LABEL
+        if not warm:
+            return FIRST_BUILD_LABEL
+        if crates_compiled <= self.edited_crate_max:
+            return self.edited_label
+        return self.cascade_label
 
 
 def known_crate_steps(connection: sqlite3.Connection, day: str) -> list[KnownCrateStep]:
@@ -704,10 +718,10 @@ def known_crate_steps(connection: sqlite3.Connection, day: str) -> list[KnownCra
     return steps
 
 
-def rebuild_timings(steps: Sequence[KnownCrateStep]) -> dict[str, RebuildTiming]:
-    timings = {label: RebuildTiming() for label in REBUILD_LABELS}
+def rebuild_timings(steps: Sequence[KnownCrateStep], classes: RebuildClasses) -> dict[str, RebuildTiming]:
+    timings = {label: RebuildTiming() for label in classes.labels()}
     for step in steps:
-        timings[rebuild_bin(step.crates_compiled, step.is_warm)].add(step)
+        timings[classes.label(step.crates_compiled, step.is_warm)].add(step)
     return timings
 
 
@@ -719,8 +733,7 @@ def rebuild_rows(timings: dict[str, RebuildTiming]) -> list[list[str]]:
     all_compile = sum(timing.compile_s for timing in timings.values())
     all_time = sum(timing.total_s for timing in timings.values())
     rows: list[list[str]] = []
-    for label in REBUILD_LABELS:
-        timing = timings[label]
+    for label, timing in timings.items():
         if not timing.steps:
             rows.append([label, "0", "—", "—", "—", "—", "—"])
             continue
@@ -757,10 +770,10 @@ def rebuild_package(argv: str) -> str:
     return matched.group(1) if matched else "(unknown)"
 
 
-def package_rebuild_rows(steps: Sequence[KnownCrateStep]) -> list[list[str]]:
+def package_rebuild_rows(steps: Sequence[KnownCrateStep], classes: RebuildClasses) -> list[list[str]]:
     packages: dict[str, PackageRebuilds] = {}
     for step in steps:
-        if step.kind != "nextest" or rebuild_bin(step.crates_compiled, step.is_warm) != EDITED_CRATE_LABEL:
+        if step.kind != "nextest" or classes.label(step.crates_compiled, step.is_warm) != classes.edited_label:
             continue
         packages.setdefault(rebuild_package(step.argv), PackageRebuilds()).add(step)
     ranked = sorted(packages.items(), key=lambda item: (-item[1].compile_s, item[0]))[:5]
@@ -776,10 +789,10 @@ def package_rebuild_rows(steps: Sequence[KnownCrateStep]) -> list[list[str]]:
     ]
 
 
-def rebuilds_section(connection: sqlite3.Connection, day: str) -> list[str]:
+def rebuilds_section(connection: sqlite3.Connection, day: str, classes: RebuildClasses) -> list[str]:
     steps = known_crate_steps(connection, day)
-    timings = rebuild_timings(steps)
-    packages = package_rebuild_rows(steps)
+    timings = rebuild_timings(steps, classes)
+    packages = package_rebuild_rows(steps, classes)
     section = ["### Rebuilds", ""]
     nextest = nextest_rebuild_lines(steps)
     if nextest:
@@ -795,7 +808,7 @@ def rebuilds_section(connection: sqlite3.Connection, day: str) -> list[str]:
             "Edited-crate rebuilds by package (nextest):",
             "",
             *table(["Package", "Steps", "p50", "p95", "Compile"], packages),
-            f"Source: warm nextest steps that compiled {EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates (the edited-crate row), by the first package(…) in the test filter; p50 and p95 are of compile time.",
+            f"Source: warm nextest steps that compiled {EDITED_CRATE_MIN_CRATES}–{classes.edited_crate_max} crates (the edited-crate row), by the first package(…) in the test filter; p50 and p95 are of compile time.",
             "",
         ]
     return section
@@ -1305,7 +1318,8 @@ def profile_changes(connection: sqlite3.Connection) -> list[ProfileChange]:
 
 
 def profile_step_durations(
-    connection: sqlite3.Connection, start: datetime, end: datetime, *, hana_only: bool = False,
+    connection: sqlite3.Connection, start: datetime, end: datetime, classes: RebuildClasses, *,
+    hana_only: bool = False,
 ) -> dict[tuple[str, str, str], list[float]]:
     """Group passing steps by the kind, caller and rebuild class we compare."""
     groups: dict[tuple[str, str, str], list[float]] = {}
@@ -1322,7 +1336,7 @@ def profile_step_durations(
     ):
         if hana_only and str(step_id) not in hana_ids:
             continue
-        rebuild = rebuild_bin(cast(int, crates), bool(warm)) if crates is not None else "—"
+        rebuild = classes.label(cast(int, crates), bool(warm)) if crates is not None else "—"
         key = (str(kind), str(caller), rebuild)
         groups.setdefault(key, []).append(cast(float, duration))
     return groups
@@ -1516,7 +1530,7 @@ def memory_overlap_lines(window: moments.ComparisonWindow, events: Sequence[mome
     return lines
 
 
-def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
+def moments_section(connection: sqlite3.Connection, day: str, classes: RebuildClasses) -> list[str]:
     """One comparison window rule for build interventions and observed profiles."""
     end = report_end(day, datetime.now(UTC))
     profiles = [change for change in profile_changes(connection) if call_time(change.at) < end]
@@ -1567,7 +1581,7 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
     def grouped(start: datetime, finish: datetime, hana_only: bool) -> dict[tuple[str, str, str], list[float]]:
         key = start, finish, hana_only
         if key not in p50_groups:
-            p50_groups[key] = profile_step_durations(connection, start, finish, hana_only=hana_only)
+            p50_groups[key] = profile_step_durations(connection, start, finish, classes, hana_only=hana_only)
         return p50_groups[key]
 
     ascending = sorted((event for event in events if not isinstance(event, moments.PendingMemoryMoment)
@@ -1607,7 +1621,7 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
 
 def power_profile_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """Compatibility entry point for the generalized comparison section."""
-    return moments_section(connection, day)
+    return moments_section(connection, day, RebuildClasses())
 
 
 def day_range(day: str) -> tuple[str, str]:
@@ -2571,6 +2585,7 @@ def linked_steps_section(connection: sqlite3.Connection, day: str) -> list[str]:
 @target_predicate_scope()
 def report(connection: sqlite3.Connection, day: str, *,
            day_selection: ReportDaySelection = ReportDaySelection.EXPLICIT_DATE) -> str:
+    classes = RebuildClasses()
     found = kinds(connection, day)
     hosts = cast(
         int,
@@ -2588,7 +2603,7 @@ def report(connection: sqlite3.Connection, day: str, *,
     copies = daily_mac_copies(connection, day, test_calls)
     lines += lead_block(connection, day, test_calls, waits, copies)
     lines += waiting_lines(waits)
-    lines += rebuilds_section(connection, day)
+    lines += rebuilds_section(connection, day, classes)
     lines += linked_steps_section(connection, day)
     lines += launches_section(connection, day)
     for kind in found:
@@ -2602,7 +2617,7 @@ def report(connection: sqlite3.Connection, day: str, *,
     lines += (
         calls
         + test_builds_section(connection, day)
-        + moments_section(connection, day)
+        + moments_section(connection, day, classes)
         + tests_by_target_lines(test_calls)
         + mac_section(connection, day)
         + aws_section(connection, day, day_selection=day_selection)

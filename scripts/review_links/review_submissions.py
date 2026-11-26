@@ -32,7 +32,7 @@ from scripts.review_links import image_store, list_draft, new_item_dialog, page_
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
     ScopedSubmissionKey, read_submission_key, require_request_binding, submission_key as submission_key,
-    IMAGE_FORMATS, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES, ImageReference, max_base64_size,
+    IMAGE_FORMATS, ImageReference, NewItemLimits, NoBugPageState,
     read_kind, read_request_id, read_words, read_submission,
     ByRequestId, BuildCell as BuildCell, BuildStepEvidence as BuildStepEvidence, Evidence as Evidence,
     MemoryReading as MemoryReading,
@@ -305,10 +305,11 @@ type ListPreviewRequest = RequestedListPreview | NoRequestedListPreview
 
 @dataclass(frozen=True)
 class ListDraftSend:
-    """A List draft with fields to read for filing or retry comparison."""
+    """Read a List draft for filing or verify a retry against the saved item."""
 
     request_id: str
-    prepare: Callable[[], ListDraftFiling]
+    prepare: Callable[[NewItemLimits], ListDraftFiling]
+    check_first_send: Callable[[], None] = lambda: None
     preview: ListPreviewRequest = NoRequestedListPreview.ABSENT
 
 
@@ -323,26 +324,26 @@ class _ImageUpload:
         return hashlib.sha256(self.data).hexdigest()
 
 
-def _decode_images(images: tuple[PastedImage, ...]) -> tuple[_ImageUpload, ...]:
-    if len(images) > MAX_IMAGES:
-        raise SubmissionError(f"Paste up to {MAX_IMAGES} images.")
+def _decode_images(images: tuple[PastedImage, ...], limits: NewItemLimits) -> tuple[_ImageUpload, ...]:
+    if len(images) > limits.images:
+        raise SubmissionError(f"Paste up to {limits.images} images.")
     uploads: list[_ImageUpload] = []
     total = 0
     for image in images:
         extension = IMAGE_FORMATS.get(image.media_type)
         if extension is None:
             raise SubmissionError("Paste PNG, JPEG, GIF or WebP images.")
-        if len(image.base64_data) > max_base64_size():
-            raise SubmissionError("Each image must be at most 5 MiB.")
+        if len(image.base64_data) > limits.base64_image_chars:
+            raise SubmissionError(f"Each image must be at most {limits.image_bytes} bytes.")
         try:
             data = base64.b64decode(image.base64_data, validate=True)
         except (binascii.Error, ValueError):
             raise SubmissionError("The pasted image data is invalid.") from None
-        if not data or len(data) > MAX_IMAGE_BYTES:
-            raise SubmissionError("Each image must contain at most 5 MiB of image data.")
+        if not data or len(data) > limits.image_bytes:
+            raise SubmissionError(f"Each image must contain at most {limits.image_bytes} bytes of image data.")
         total += len(data)
-        if total > MAX_TOTAL_IMAGE_BYTES:
-            raise SubmissionError("The pasted images must total at most 12 MiB.")
+        if total > limits.total_image_bytes:
+            raise SubmissionError(f"The pasted images must total at most {limits.total_image_bytes} bytes.")
         reference = ImageReference(f"{len(uploads) + 1:012x}", f"image.{extension}")
         uploads.append(_ImageUpload(reference, extension, data))
     return tuple(uploads)
@@ -437,6 +438,7 @@ def _verify_saved_images(saved: NativeSubmissionDestination, record: NativeSubmi
     details = native_origin(record)
     if not isinstance(details, ReviewSubmission):
         raise OSError(f"Cannot read the native Review origin for {saved.id}.")
+    total_image_bytes = new_item_dialog.read_saved_item_limits().total_image_bytes
     images = image_folder(details)
     originals = dict(details.image_digests)
     candidates = {upload.reference: upload for upload in retry_uploads}
@@ -461,10 +463,10 @@ def _verify_saved_images(saved: NativeSubmissionDestination, record: NativeSubmi
         digest = originals.get(reference.id)
         try:
             with path.open("rb") as stream:
-                data = stream.read(MAX_TOTAL_IMAGE_BYTES + 1)
+                data = stream.read(total_image_bytes + 1)
         except FileNotFoundError:
             data = b""
-        if description is not None and 0 < len(data) <= MAX_TOTAL_IMAGE_BYTES:
+        if description is not None and 0 < len(data) <= total_image_bytes:
             if digest is not None:
                 if hashlib.sha256(data).hexdigest() == digest:
                     continue
@@ -1196,10 +1198,21 @@ class ListFilingRoute(TypedDict):
 
 
 @dataclass(frozen=True)
+class PendingProducerFiling:
+    """Keep the selected List owner and producer while the keeper is unavailable."""
+
+    owner: staff.StaffId
+    producer: staff.StaffId
+    unit: str
+    source: str
+
+
+@dataclass(frozen=True)
 class ListFilingUnavailable:
     """The List row has no producer that can take it."""
 
     reason: str
+    retry: ListCommandAssignee | ListWindowAssignee | PendingProducerFiling = ListWindowAssignee.RECIPIENT
 
 
 def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
@@ -1239,9 +1252,9 @@ def _list_filing_producer(member: staff.StaffRow, members: staff.StaffSnapshot
 
 def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipient: staff.StaffRow,
                       members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
-    keeper = producer_map.find_member("morty", members, ("producer",))
-    if isinstance(keeper, producer_map.UnknownMember) or keeper.name != "morty":
-        return ListFilingUnavailable("The List needs one active producer named morty.")
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+    if keeper is None:
+        return ListFilingUnavailable("The List has no active producer.", assignee)
     member = recipient
     source = "nate via New item"
     if isinstance(assignee, ListCommandAssignee):
@@ -1252,7 +1265,7 @@ def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipi
         source = "nate via /new_item"
     producer = _list_filing_producer(member, members)
     if isinstance(producer, ListFilingUnavailable):
-        return producer
+        return replace(producer, retry=assignee)
     unit = member.name if member.kind == "unit" else ""
     return ListFilingRoute(keeper=keeper.id, owner=recipient.id, producer=producer.id,
                            unit=unit, source=source)
@@ -1269,15 +1282,13 @@ def assigned_member(assignment: new_item_dialog.Assignment, recipient: staff.Sta
     return row
 
 
-def _plan_producer_filing(member: staff.StaffRow, recipient: staff.StaffRow, request: NewItemRequest,
+def _plan_producer_filing(filing: PendingProducerFiling,
                           members: staff.StaffSnapshot) -> ListFilingRoute | ListFilingUnavailable:
     keeper = list_producer(conf.read_or_repository("console"), members)
     if isinstance(keeper, PageOwnerUnavailable):
-        return ListFilingUnavailable("The List has no active producer.")
-    source = ("nate via /new_item" if isinstance(request.notice, new_item_dialog.SubmissionNotice)
-              and request.notice.from_command else "nate via New item")
-    return ListFilingRoute(keeper=keeper.id, owner=member.id, producer=recipient.id,
-                           unit=member.name if member.kind == "unit" else "", source=source)
+        return ListFilingUnavailable("The List has no active producer.", filing)
+    return ListFilingRoute(keeper=keeper.id, owner=filing.owner, producer=filing.producer,
+                           unit=filing.unit, source=filing.source)
 
 
 @dataclass(frozen=True)
@@ -1286,7 +1297,7 @@ class NoListFiling:
 
 
 def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUnavailable | NoListFiling:
-    """Read the List filing plan for the first Send."""
+    """Read the saved List filing route or the assignee that still needs a route."""
     folder = _request_folder(saved.request_id)
     try:
         routing = (folder / "list-filing.json").read_text(encoding="utf-8")
@@ -1300,7 +1311,17 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
         return NoListFiling()
     reason = values.get("unavailable")
     if isinstance(reason, str):
-        return ListFilingUnavailable(reason)
+        if "owner" in values:
+            owner, producer = values["owner"], values.get("producer")
+            unit, source = values.get("unit"), values.get("source")
+            if not (isinstance(owner, str) and isinstance(producer, str)
+                    and isinstance(unit, str) and isinstance(source, str)):
+                raise OSError(f"Invalid List route for request {saved.request_id}.")
+            return ListFilingUnavailable(reason, PendingProducerFiling(
+                staff.StaffId(owner), staff.StaffId(producer), unit, source))
+        assignee = (list_command_assignee(values["assignee"]) if "assignee" in values
+                    else ListWindowAssignee.RECIPIENT)
+        return ListFilingUnavailable(reason, assignee)
     keeper, owner, producer = values.get("keeper"), values.get("owner"), values.get("producer")
     unit, source = values.get("unit"), values.get("source")
     if not (isinstance(keeper, str) and isinstance(owner, str) and isinstance(producer, str)
@@ -1308,6 +1329,23 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
         raise OSError(f"Invalid List route for request {saved.request_id}.")
     return ListFilingRoute(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner), producer=staff.StaffId(producer),
                            unit=unit, source=source)
+
+
+def retry_list_filing_route(saved: SavedSubmission, unavailable: ListFilingUnavailable,
+                            members: staff.StaffSnapshot) -> ListFilingRoute:
+    """Resolve the assignee again and save the route before reserving a List number."""
+    retry = unavailable.retry
+    if isinstance(retry, PendingProducerFiling):
+        route = _plan_producer_filing(retry, members)
+    else:
+        recipient = members.by_id(saved.owner)
+        if recipient is None:
+            raise OSError(f"The recipient for {saved.id} is unavailable.")
+        route = _plan_list_filing(retry, recipient, members)
+    if isinstance(route, ListFilingUnavailable):
+        raise OSError(f"Cannot file {saved.id} on the List: {route.reason}")
+    _write_request_file(_request_folder(saved.request_id) / "list-filing.json", route)
+    return route
 
 
 def list_filing_reservation(saved: SavedSubmission) -> Path:
@@ -1459,12 +1497,13 @@ def _page_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> 
 def page_owners(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> PageOwners:
     """Resolve the owner to show and the recipient for new items."""
     key = f"page.{page}.owner"
-    label_key = f"page.{page}.label"
+    label_page = "studio" if page == "list" else page
+    label_key = f"page.{label_page}.label"
     values = settings.values(key, label_key, "owner.default")
     designated = staff.StaffId(values.get(key, ""))
     default = staff.StaffId(values.get("owner.default", ""))
     # A page outside the console navigation, such as rebuilds, has no label setting.
-    label = values.get(label_key) or page.replace("_", " ").title()
+    label = values.get(label_key) or label_page.replace("_", " ").title()
     route = _page_owner_route(label, designated, default, members)
     shown = members.rows_by_id.get(designated)
     if shown is not None and shown.kind in ("unit", "showrunner", "producer") and _page_owner_is_active(shown, members):
@@ -1535,28 +1574,16 @@ def _available_page_owner(identity: staff.StaffId, members: staff.StaffSnapshot,
     return PageOwnerUnavailable()
 
 
-def _configured_list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
-    configured = settings.origin("page.list.owner", str)
-    if isinstance(configured, conf.UnavailableValue):
-        return PageOwnerUnavailable()
-    row = members.by_id(staff.StaffId(configured.value))
-    return row if row is not None and row.kind == "producer" else PageOwnerUnavailable()
-
-
 def list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | PageOwnerUnavailable:
     """Find the active producer that owns the List."""
-    row = _configured_list_producer(settings, members)
-    if (isinstance(row, PageOwnerUnavailable) or row.id not in members.rows_by_id
-            or not _page_owner_is_active(row, members)):
-        return PageOwnerUnavailable()
-    return row
+    return record_store.list_keeper(settings, members) or PageOwnerUnavailable()
 
 
 def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffSnapshot,
                     choice: new_item_dialog.PageRecipient) -> staff.StaffRow:
     identity = address.recipient_id
     if choice == new_item_dialog.PageRecipient.LIST_OWNER:
-        configured = _configured_list_producer(conf.read_or_repository("console"), members)
+        configured = record_store.configured_list_producer(conf.read_or_repository("console"), members)
         if not isinstance(configured, staff.StaffRow) or configured.id != identity:
             raise SubmissionConflict("The List owner is unavailable. Open New item again.")
     elif choice in (new_item_dialog.PageRecipient.SELECTED, new_item_dialog.PageRecipient.PRODUCER):
@@ -2145,16 +2172,17 @@ class ListDraftReplay:
 
 
 def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialog.SubmissionCaptureIntent,
-                       item: LocatedSubmission, delivery: InitialDelivery | NoInitialDelivery) -> ListDraftReplay:
+                       item: LocatedSubmission, delivery: InitialDelivery | NoInitialDelivery,
+                       limits: NewItemLimits) -> ListDraftReplay:
     try:
-        filing = send.prepare()
+        filing = send.prepare(limits)
         request = filing.request
         if request.kind == SubmissionKind.PROPOSAL and request.page_recipient != new_item_dialog.PageRecipient.PRODUCER:
             request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
         if request.page != "list" or request.request_id != send.request_id or filing.refusal is not None:
             return ListDraftReplay()
-        evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
-        words = read_words(request.words, "Your words", kind=request.kind)
+        evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence), limits.page_data)
+        words = read_words(request.words, "Your words", limits.words_chars, kind=request.kind)
         screenshot = filing.screenshot
         committed = _committed_list_preview(folder)
         requested = send.preview
@@ -2167,7 +2195,7 @@ def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialo
                 return ListDraftReplay()
         elif isinstance(requested, RequestedListPreview) and isinstance(screenshot, new_item_dialog.NoPageScreenshot):
             return ListDraftReplay()
-        uploads = _decode_images(request.images)
+        uploads = _decode_images(request.images, limits)
         saved_digest = item.destination.payload_hash
         if item.destination.request_id.startswith(send.request_id + "-"):
             digest = _browser_payload_hash(request, words, evidence, uploads, screenshot, delivery)
@@ -2191,6 +2219,7 @@ def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialo
 
 
 def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None, *,
+                       limits: NewItemLimits,
                        capture_intent: new_item_dialog.SubmissionCaptureIntent,
                        capture_target: ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget,
                        initial_delivery: InitialDelivery | NoInitialDelivery) -> SavedSubmission:
@@ -2204,7 +2233,8 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                     raise DraftAlreadyFiled(item.destination.id)
                 saved = item.destination
                 _check_capture_target(capture_target, saved)
-                replay = _list_draft_replay(folder, send, capture_intent, item, initial_delivery)
+                replay = _list_draft_replay(folder, send, capture_intent, item, initial_delivery,
+                                            new_item_dialog.read_saved_item_limits())
                 earlier = _is_earlier_native_draft(folder, saved)
                 receipt_folder = _request_folder(saved.request_id) if earlier else folder
                 completed = _complete_receipt(receipt_folder, saved, lookup.hint, item.record,
@@ -2215,11 +2245,12 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
                 return completed
         if isinstance(capture_target, ScopedSubmissionKey):
             raise SubmissionConflict("This screenshot belongs to another item.")
-        filing = send.prepare()
+        send.check_first_send()
+        filing = send.prepare(limits)
         request = filing.request
         if request.page != "list" or request.request_id != send.request_id:
             raise SubmissionError("Invalid List draft request.")
-        return _submit(request, members=members, screenshot=filing.screenshot,
+        return _submit(request, members=members, limits=limits, screenshot=filing.screenshot,
                        capture_requested=filing.capture_requested, refusal=filing.refusal,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery,
                        list_preview=send.preview)
@@ -2296,6 +2327,7 @@ def refuse_scheduled_draft_reuse(
 
 def submit(
     request: NewItemRequest | new_item_dialog.UnverifiedDraftRetry | ListDraftSend, *, members: staff.StaffSnapshot | None = None,
+    limits: NewItemLimits | None = None,
     screenshot: new_item_dialog.SubmissionScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT,
     capture_requested: bool = False, refusal: SubmissionError | None = None,
     capture_intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT,
@@ -2312,26 +2344,27 @@ def submit(
         raise SubmissionError("The screenshot belongs to another draft.")
     if isinstance(request, new_item_dialog.UnverifiedDraftRetry):
         return _recover_unverified_draft(request.request_id, members, request.error, capture_target=capture_target)
+    limits = limits if limits is not None else new_item_dialog.read_new_item_limits()
     if isinstance(request, ListDraftSend):
-        return _submit_list_draft(request, members, capture_intent=capture_intent, capture_target=capture_target,
+        return _submit_list_draft(request, members, limits=limits, capture_intent=capture_intent, capture_target=capture_target,
                                   initial_delivery=initial_delivery)
     if request.page == "list":
         if BROWSER_DRAFT_ID.fullmatch(request.request_id):
             filing = ListDraftFiling(request, screenshot, capture_requested, refusal)
-            return _submit_list_draft(ListDraftSend(request.request_id, lambda: filing), members,
+            return _submit_list_draft(ListDraftSend(request.request_id, lambda _: filing), members, limits=limits,
                                       capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
-        return _submit(request, members=members, screenshot=screenshot,
+        return _submit(request, members=members, limits=limits, screenshot=screenshot,
                        capture_requested=capture_requested, refusal=refusal,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
     try:
-        return _submit(request, members=members, screenshot=screenshot,
+        return _submit(request, members=members, limits=limits, screenshot=screenshot,
                        capture_requested=capture_requested, refusal=refusal,
                        capture_intent=capture_intent, capture_target=capture_target, initial_delivery=initial_delivery)
     except SubmissionError as error:
         return _recover_unverified_draft(request.request_id, members, error, capture_target=capture_target)
 
 
-def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
+def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None, limits: NewItemLimits,
             screenshot: new_item_dialog.SubmissionScreenshot, capture_requested: bool,
             refusal: SubmissionError | None, capture_intent: new_item_dialog.SubmissionCaptureIntent,
             capture_target: ScopedSubmissionKey | new_item_dialog.NoBoundCaptureTarget,
@@ -2363,9 +2396,9 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
         raise SubmissionError("Invalid draft request ID.")
     address = (SubmissionAddress(kind, request.recipient_id, request_id) if legacy_draft or browser_draft
                else _request_address(kind, request.recipient_id, request_id))
-    words = read_words(request.words, "Your words", kind=request.kind)
-    evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
-    uploads = _decode_images(request.images)
+    words = read_words(request.words, "Your words", limits.words_chars, kind=request.kind)
+    evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence), limits.page_data)
+    uploads = _decode_images(request.images, limits)
     if list_draft:
         previous = _recover_pre_upgrade_native_draft(_request_folder(request_id), address, words, uploads, members,
                                                     request=request, capture_target=capture_target)
@@ -2388,7 +2421,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
         payload_hash = _submission_fingerprint(replace(request, evidence=evidence), words, uploads)
     if isinstance(screenshot, new_item_dialog.PageScreenshot):
         total = len(screenshot.png) + sum(len(upload.data) for upload in uploads)
-        if len(uploads) >= MAX_IMAGES or total > MAX_TOTAL_IMAGE_BYTES:
+        if (len(uploads) >= limits.images or len(screenshot.png) > limits.image_bytes
+                or total > limits.total_image_bytes):
             raise SubmissionError("The screenshot and pasted images exceed the attachment limits.")
         uploads = (*uploads, _ImageUpload(PAGE_SCREENSHOT, "png", screenshot.png))
         if kind != SubmissionKind.BUG and isinstance(evidence, new_item_dialog.PageDataEvidence):
@@ -2467,6 +2501,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 raise SubmissionConflict("This screenshot belongs to another item.")
             if refusal is not None:
                 raise refusal
+            if isinstance(capture_intent, new_item_dialog.DeferredCaptureIntent) and len(uploads) >= limits.images:
+                raise SubmissionError("The screenshot and pasted images exceed the attachment limits.")
             if (folder / "receipt.json").is_file():
                 raise OSError(f"Cannot find the native record for request {request_id}.")
             if isinstance(hint, UnreadableRequestFile):
@@ -2493,14 +2529,17 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             if producer_route:
                 member = assigned_member(request.assignment, recipient, current)
                 if isinstance(initial_delivery, InitialDelivery):
-                    route = _plan_producer_filing(member, recipient, request, current)
+                    source = ("nate via /new_item" if isinstance(notice, new_item_dialog.SubmissionNotice)
+                              and notice.from_command else "nate via New item")
+                    unit = member.name if member.kind == "unit" else ""
+                    route = _plan_producer_filing(PendingProducerFiling(member.id, recipient.id, unit, source), current)
             elif request.page == "list" and isinstance(initial_delivery, InitialDelivery):
                 route = _plan_list_filing(initial_delivery.list_assignee, recipient, current)
             pending_file = folder / "pending.json"
             images = tuple(upload.reference for upload in uploads)
             proof = reply_tokens.mint()
             details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
-                                       page=request.page, page_state=request.page_state, capture_intent=capture_intent,
+                                       page=request.page, page_state=request.page_state or NoBugPageState(), capture_intent=capture_intent,
                                        reply_token_nonce=proof.nonce, notice=notice, assignment=request.assignment,
                                        image_digests=tuple((upload.reference.id, upload.digest) for upload in uploads))
             title = submission_title(words)
@@ -2536,7 +2575,13 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                 if isinstance(route, dict):
                     _write_request_file(folder / "list-filing.json", route)
                 elif isinstance(route, ListFilingUnavailable):
-                    _write_request_file(folder / "list-filing.json", {"unavailable": route.reason})
+                    fields = {"unavailable": route.reason}
+                    retry = route.retry
+                    if isinstance(retry, ListCommandAssignee):
+                        fields["assignee"] = retry.id
+                    elif isinstance(retry, PendingProducerFiling):
+                        fields.update(owner=retry.owner, producer=retry.producer, unit=retry.unit, source=retry.source)
+                    _write_request_file(folder / "list-filing.json", fields)
                 if isinstance(list_preview, RequestedListPreview) and isinstance(screenshot, new_item_dialog.PageScreenshot):
                     _write_request_file(folder / "list-preview.json",
                                         {"key": list_preview.key, "digest": screenshot.digest})
@@ -2622,13 +2667,14 @@ def committed_page_captures() -> Iterator[tuple[ScopedSubmissionKey, new_item_di
 def read_attached_page_screenshot(target: ScopedSubmissionKey, request: new_item_dialog.PageCaptureRequest
                                   ) -> new_item_dialog.PageScreenshot:
     """Read the PNG already attached to the native record."""
+    limit = new_item_dialog.read_stored_image_byte_limit()
     with scoped_submission(target) as located:
         if PAGE_SCREENSHOT not in located.details.images:
             raise SubmissionError("The screenshot is no longer attached.")
         path = image_folder(located.details) / PAGE_SCREENSHOT.id / PAGE_SCREENSHOT.file
         with path.open("rb") as stream:
-            image = stream.read(MAX_IMAGE_BYTES + 1)
-    if len(image) > MAX_IMAGE_BYTES or not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            image = stream.read(limit + 1)
+    if len(image) > limit or not image.startswith(b"\x89PNG\r\n\x1a\n"):
         raise SubmissionError("The attached screenshot is invalid.")
     return new_item_dialog.PageScreenshot(image, new_item_dialog.PageViewport(request.width, request.height, request.dark))
 
@@ -2679,21 +2725,26 @@ def _with_screenshot(details: ReviewSubmission, owner: staff.StaffId,
                      image: bytes | new_item_dialog.PageScreenshot) -> ReviewSubmission:
     """Store the screenshot and keep the page data for a Bug report."""
     state = details.page_state
-    evidence = details.evidence if state is not None else NoEvidence()
+    evidence = details.evidence if isinstance(state, new_item_dialog.BugPageState) else NoEvidence()
     if isinstance(image, new_item_dialog.PageScreenshot):
-        if state is not None:
+        if isinstance(state, new_item_dialog.BugPageState):
             state = replace(state, viewport=image.viewport, include_screenshot=True)
         evidence = details.evidence
         image = image.png
     reference = PAGE_SCREENSHOT
-    if ((details.page_state is None and not isinstance(details.evidence, (new_item_dialog.PageDataEvidence, NoEvidence)))
-            or len(details.images) >= MAX_IMAGES or reference in details.images):
+    if ((isinstance(details.page_state, NoBugPageState)
+         and not isinstance(details.evidence, (new_item_dialog.PageDataEvidence, NoEvidence)))
+            or reference in details.images):
+        return details
+    settings = conf.read("review_links")
+    if len(details.images) >= settings.whole_upper_bound("new_item.max_images"):
         return details
     images = image_folder(details)
     used = sum((images / item.id / item.file).stat().st_size for item in details.images)
     path = images / reference.id / reference.file
     size = path.stat().st_size if path.is_file() else len(image)
-    if used + size > MAX_TOTAL_IMAGE_BYTES:
+    if (size > settings.whole_upper_bound("new_item.max_image_bytes")
+            or used + size > settings.whole_upper_bound("new_item.max_total_image_bytes")):
         return details
     if not path.is_file():
         with tempfile.TemporaryDirectory(prefix=".screenshot-", dir=images.parent) as temporary:
@@ -2769,7 +2820,7 @@ def save_bug_page_state(saved: NativeSubmissionDestination, item_key: str, reque
             assert isinstance(report, investigation.Investigation)
             details = report.submission
             assert isinstance(details, ReviewSubmission)
-            added = details.page_state is None
+            added = isinstance(details.page_state, NoBugPageState)
             if added:
                 if request is None or request.page_state is None:
                     return False
@@ -2781,11 +2832,12 @@ def save_bug_page_state(saved: NativeSubmissionDestination, item_key: str, reque
                 details = replace(details, page=request.page, page_state=request.page_state, page_state_data=page_data)
                 _write_investigation_submission(located, details)
         state, data = details.page_state, details.bug_page_data
-        assert state is not None
+        assert isinstance(state, new_item_dialog.BugPageState)
         captured = PAGE_SCREENSHOT in details.images
         attached = False
         capture_error: OSError | ValueError | RuntimeError | None = None
-        if state.include_screenshot and not captured and len(details.images) < MAX_IMAGES:
+        if (state.include_screenshot and not captured
+                and len(details.images) < conf.read("review_links").whole_upper_bound("new_item.max_images")):
             try:
                 attached = screenshot(details.page, state)
             except (OSError, ValueError, RuntimeError) as error:
@@ -2814,7 +2866,7 @@ def record_deferred_bug_screenshot(target: new_item_dialog.ScopedSubmissionKey,
     if target.kind != SubmissionKind.BUG:
         return
     with scoped_submission(target) as located:
-        if located.details.page_state is None:
+        if isinstance(located.details.page_state, NoBugPageState):
             return
         saved = located.destination
     item_key = f"investigation/{saved.owner}/{saved.id}"

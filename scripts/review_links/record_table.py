@@ -138,7 +138,7 @@ def words_box(element_id: str, placeholder: str, *, value: str = '') -> str:
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
     initial = f' value="{html.escape(value, quote=True)}"' if value else ''
-    return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
+    return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words data-reload-safe'
             + f' autocomplete="off" aria-label="{words}" placeholder="{words}"{initial}>'
             + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 
@@ -306,7 +306,7 @@ font:inherit;font-variant-numeric:tabular-nums;margin:0;min-height:24px}
 .list-panel a,.list-counts a{color:var(--accent)}.list-panel ol.list-log{list-style:none;padding:0;font-size:13px}
 .list-log-panel{contain:size;display:flex;flex-direction:column;min-width:0;min-height:0}
 .list-log-panel h3{flex:none}
-.list-log-scroll{min-height:0;overflow-y:auto}
+.list-log-scroll{min-height:0;overflow-y:auto;scrollbar-color:var(--ink-3) transparent}
 .list-log-scroll .list-log{margin-bottom:0}
 .list-log li{display:grid;grid-template-columns:130px 1fr;gap:12px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .list-log time,.list-log small{color:var(--ink-3)}.list-log small{display:inline;font-size:inherit}

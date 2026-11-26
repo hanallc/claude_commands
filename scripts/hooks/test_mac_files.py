@@ -17,6 +17,7 @@ from unittest import mock
 from scripts.agents import remote
 from scripts.hooks import compaction_marker, conversation_pause, mac_files
 from scripts.lib import unit_runs
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import escalate, review_hold
 
 
@@ -26,7 +27,7 @@ class MacFilesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = (self.root / "production.conf").write_text("mac_run_host=fixture@mac\n", encoding="utf-8")
+        _ = write_config_fixture(self.root / "production.conf", "mac_run_host=fixture@mac\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)})))
         _ = self.enterContext(mock.patch.object(sys, "platform", "linux"))
         _ = self.enterContext(mock.patch.object(remote, "local_machine", return_value="natedev"))

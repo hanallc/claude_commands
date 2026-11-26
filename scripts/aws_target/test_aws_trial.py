@@ -38,7 +38,7 @@ from scripts.build_queue.admission_wire import CloudGroup, Owner
 from scripts.agents import remote
 from scripts.lib import origin_deletion
 from scripts.lib.git_test_support import fixture_git_environment
-from scripts.lint.memory_test_support import config_environment
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production import gate, staff
 from scripts.production.staff_test_support import fixture_member
 from scripts.lib.process_group import send_process_group
@@ -51,10 +51,9 @@ def write_guest_config(root: Path, *, slow_test_s: float = 1.0) -> None:
     override_fixture_settings(root / 'cloud_gate.conf',
         'packages=git python3 cargo rustc rustup cargo-nextest uv curl openssh rsync gnupg ripgrep jq '
         + 'gcc pkg-config tmux taplo zsh bash gh sqlite chromium nodejs util-linux bubblewrap\n')
-    _ = (root / 'test_times.conf').write_text(
-        f'# range: 0..\nslow_test_s={slow_test_s}\n'
-        + '# whole: 1..\ngate_failure_log_kib=64\n'
-        + '# whole: 1..\ntop_runs=5\n')
+    _ = write_config_fixture(root / 'test_times.conf',
+        f'slow_test_s={slow_test_s}\ngate_failure_log_kib=64\ntop_runs=5\n'
+        + 'module_cost.max_output_replay_bytes=1048576\n')
 
 
 @final

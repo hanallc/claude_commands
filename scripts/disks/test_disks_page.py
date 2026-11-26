@@ -25,6 +25,7 @@ from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
 from scripts.lib.process_group import run_process_group
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import page_frame, test_page_frame
 
 GIB = 1 << 30
@@ -64,21 +65,27 @@ class DisksPageTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
-        _ = (configuration / "statusline.conf").write_text("role.unit-director=#ffaf02\nrole.showrunner=#a379fd\n")
+        _ = write_config_fixture(configuration / "disks.conf", "cache_seconds=600\n")
+        _ = write_config_fixture(configuration / "statusline.conf", "role.unit-director=#ffaf02\nrole.showrunner=#a379fd\n")
         staff_file = configuration / "staff.json"
         _ = staff_file.write_text('{"schema": 1, "rows": []}')
         # Staff reads the machine list.
         _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "CONF_DIR": str(configuration), "STAFF_FILE": str(staff_file)})))
+            "CONF_DIR": str(configuration), "STAFF_FILE": str(staff_file),
+            "USER_ZONE": "America/New_York",
+        })))
 
     def test_session_tooltip_keeps_held_folder_names_plain(self) -> None:
         runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("builds"))
         names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
         page = self.page_html()
-        self.assertIn('"roleLabels": {"showrunner"', page)
+        staff_data_prefix = "<script>window.staffNames={\n ..."
+        staff_data_start = page.index(staff_data_prefix) + len(staff_data_prefix)
+        staff_data = cast(dict[str, object], json.JSONDecoder().raw_decode(page, staff_data_start)[0])
+        role_labels = cast(dict[str, dict[str, object]], staff_data["roleLabels"])
+        self.assertIn("opening", role_labels["showrunner"])
         session_tip = page[page.index("const SESSION_TIP_FOLDER_LIMIT"):page.index("function fitSessionTip(")]
         setup = "globalThis.window=globalThis;" + staff_names.script(names.registry(), names.role_labels())[8:-9] + session_tip
         session_body = str(self.run_page("(()=>{" + setup

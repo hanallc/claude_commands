@@ -28,8 +28,8 @@ agents_exec_main() {
     local prompt_file="$4"
     local output_file="$5"
     local log_file="$6"
-    local script_dir prompt family_args_line claude_code workers_home extraction_code
-    local -a family_args extra_args command
+    local script_dir prompt family_args_line worker_window claude_code workers_home extraction_code
+    local -a family_args window_args extra_args command
 
     if [[ ! -f "$prompt_file" ]]; then
         printf 'Prompt not found: %s\n' "$prompt_file" > "$log_file"
@@ -106,6 +106,8 @@ agents_exec_main() {
             [[ "${AGENT_EXEC_DRY_RUN:-}" == 1 ]] || : > "$log_file"
             family_args_line="$(agents_claude_args)"
             read -r -a family_args <<< "$family_args_line"
+            worker_window="$("$PY" "$script_dir/../lib/models_registry.py" worker-window)" || return 1
+            read -r -a window_args <<< "$worker_window"
             # Every Claude print launch sets CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1.
             # An is_error result or errors array gives ERROR: <reason> and exit 1.
             # The output holds the final answer. The log holds the complete event stream.
@@ -117,7 +119,7 @@ agents_exec_main() {
             fi
             command+=(--settings '{"sandbox":{"enabled":false}}')
             command+=(--verbose --output-format stream-json)
-            command+=("${family_args[@]}")
+            command+=("${family_args[@]}" "${window_args[@]}")
             if [[ -n "${AGENT_EXEC_EXTRA_ARGS:-}" ]]; then
                 command+=("${extra_args[@]}")
             fi

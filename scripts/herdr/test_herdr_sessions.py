@@ -16,6 +16,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from scripts.lib import autocompact, models_registry
 from scripts.lib.script_envelope import script_prompt
 
 from datetime import datetime, timezone
@@ -33,6 +34,7 @@ from scripts.production import showrunners
 from scripts.accounts import accounts
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.test_models_registry import write_registry
 from scripts.production import staff, fake_unit_host
 from scripts.message import sessions as runtime_sessions
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
@@ -807,6 +809,7 @@ class StandaloneLaunchTests(unittest.TestCase):
             "HERDR_PROC": str(self.proc), "FAKE_HERDR_LOG": str(self.log),
             "FAKE_HERDR_RESPONSES": str(self.responses_path),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "MODELS_CONFIG_FILE": str(write_registry(self.root / "models.conf")),
         }, clear=True))
         _ = self.enterContext(fake_unit_host.private_process_registry())
         _ = self.enterContext(patch.object(herdr.Herdr, "run_in_pane"))
@@ -1049,6 +1052,98 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertIn(f"CLAUDE_CONFIG_DIR={directory}", workspace)
         self.assertIn(f"CLAUDE_CODE_REMOTE_MEMORY_DIR={self.root / 'home/.claude'}", workspace)
         self.assertIn("HERDR_AGENT_PANE=1", workspace)
+
+    def test_resume_uses_the_registered_window_unless_the_caller_supplies_one(self) -> None:
+        identity = fixture_runtime_id("registered-producer")
+        _ = fixture_member("producer", name="producer", runtime_id=identity)
+        registry = write_registry(self.root / "models.conf", {"compact_windows": {"producer": "300000"}})
+        for explicit, expected in (((), ["--autocompact", "300000"]),
+                                   (("--autocompact", "auto"), ["--autocompact", "auto"]),
+                                   (("--autocompact=200000",), ["--autocompact=200000"])):
+            with self.subTest(explicit=explicit), patch.dict(os.environ, {"MODELS_CONFIG_FILE": str(registry)}):
+                self.destination()
+                self.log.unlink(missing_ok=True)
+                self.assertEqual(self.call("resume", "producer", "--session-id", identity,
+                                           "--cwd", str(self.root), "--", *explicit), (0, ""))
+                start, = self.agent_starts()
+                self.assertEqual(start[start.index("--") + 1:],
+                                 [*expected, "--resume", identity, "-n", "producer"])
+
+    def test_resume_keeps_the_model_when_the_unit_window_is_unavailable(self) -> None:
+        unit = unit_membership("sdlc", "resume-window")
+        registry = Path(os.environ["MODELS_CONFIG_FILE"])
+        for readable in (True, False):
+            with self.subTest(readable=readable):
+                self.destination()
+                self.log.unlink(missing_ok=True)
+                if not readable:
+                    registry.unlink()
+                    registry.mkdir()
+                code, errors = self.call("resume", "resume-window", "--session-id", unit.current_session,
+                                         "--cwd", str(self.root), "--", "--model", "native-model")
+                self.assertEqual(code, 0, errors)
+                start, = self.agent_starts()
+                self.assertEqual(start[start.index("--") + 1:],
+                    ["--model", "native-model", "--resume", unit.current_session, "-n", "resume-window"])
+                if readable:
+                    self.assertEqual(errors, "")
+                else:
+                    anomaly, = errors.splitlines()
+                    self.assertTrue(anomaly.startswith("anomaly: cannot read the model registry:"))
+                    self.assertIn(str(registry), anomaly)
+
+    def test_resume_keeps_the_saved_unit_window_when_the_registry_is_unreadable(self) -> None:
+        unit = unit_membership("sdlc", "resume-window")
+        registry = Path(os.environ["MODELS_CONFIG_FILE"])
+        registry.unlink()
+        registry.mkdir()
+        autocompact.record(unit.current_session, "300000")
+        self.destination()
+
+        code, errors = self.call("resume", "resume-window", "--session-id", unit.current_session,
+                                 "--cwd", str(self.root), "--", "--model", "native-model")
+        self.assertEqual(code, 0, errors)
+        anomaly, = errors.splitlines()
+        self.assertTrue(anomaly.startswith("anomaly: cannot read the model registry:"))
+        self.assertIn(str(registry), anomaly)
+        start, = self.agent_starts()
+        self.assertEqual(start[start.index("--") + 1:],
+            ["--model", "native-model", "--autocompact", "300000", "--resume",
+             unit.current_session, "-n", "resume-window"])
+
+    def test_resume_uses_the_same_snapshot_for_the_window_and_model(self) -> None:
+        unit = unit_membership("sdlc", "resume-window")
+        caller_registry = write_registry(Path(os.environ["MODELS_CONFIG_FILE"]), {
+            "claude.families": {"test-alias": "caller-model"}, "compact_windows": {"unit": "200000"},
+        })
+        target_registry = write_registry(self.root / "target-models.conf", {
+            "claude.families": {"test-alias": "original-model"}, "compact_windows": {"unit": "300000"},
+        })
+        read = models_registry.registry_text
+
+        def load_target(folder: Path, base_env: dict[str, str]) -> herdr.nix_env.Loaded:
+            self.assertEqual(folder, self.root)
+            self.assertEqual(base_env["MODELS_CONFIG_FILE"], str(caller_registry))
+            return herdr.nix_env.Loaded({**base_env, "MODELS_CONFIG_FILE": str(target_registry)}, self.root / ".envrc")
+
+        def change_registry(path: Path | None = None) -> str:
+            snapshot = read(path)
+            _ = write_registry(target_registry, {"claude.families": {"test-alias": "changed-model"},
+                                                 "compact_windows": {"unit": "100000"}}, update=True)
+            return snapshot
+
+        self.destination()
+        with (patch.object(herdr.nix_env, "ensure", side_effect=load_target) as load,
+              patch.object(models_registry, "registry_text", side_effect=change_registry) as registry_read):
+            self.assertEqual(self.call("resume", "resume-window", "--session-id", unit.current_session,
+                                       "--cwd", str(self.root), "--", "--model=test-alias"), (0, ""))
+        load.assert_called_once()
+        registry_read.assert_called_once_with(target_registry)
+        start, = self.agent_starts()
+        self.assertEqual(start[start.index("--") + 1:],
+            ["--model=original-model", "--autocompact", "300000", "--resume",
+             unit.current_session, "-n", "resume-window"])
+        self.assertFalse(any("MODELS_LAUNCH_CONFIGURATION" in argument for argument in start))
 
     def test_resume_without_prompt_or_attach_leaves_user_input_untouched(self) -> None:
         self.destination()

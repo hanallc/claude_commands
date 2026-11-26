@@ -1,15 +1,18 @@
-"""The readings log and the weighted pace for account usage."""
+"""The readings log and the recent rate for account usage."""
 
 import json
 import math
+import os
 import tempfile
 import unittest
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 
-from scripts.whoami.run_out import HALF_LIFE, MAX_GAP, MIN_SPAN, Reading, read_readings, weighted_rate
+from scripts.lib import conf
+from scripts.whoami.run_out import Reading, read_readings
 from scripts.whoami import run_out
 
 START = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
@@ -18,13 +21,9 @@ START = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 STEP = 600
 
 
-def climb(used: list[float], *, start: datetime = START) -> list[Reading]:
+def climb(used: Sequence[float], *, start: datetime = START) -> list[Reading]:
     """One reading every ten minutes."""
     return [Reading(start + timedelta(seconds=STEP * index), percent) for index, percent in enumerate(used)]
-
-
-def step(steps: float) -> float:
-    return START.timestamp() + STEP * steps
 
 
 class RunOutTests(unittest.TestCase):
@@ -119,72 +118,70 @@ class RunOutTests(unittest.TestCase):
         self.assertEqual(result.used, 30)
         self.assertEqual(path.read_bytes(), original)
 
-    def test_a_rise_twelve_hours_old_counts_half(self) -> None:
-        self.assertEqual(HALF_LIFE, timedelta(hours=12))
-        # Two hours at 1 point a step, then the same two hours 12 h later at 3 a step; the drop between them is a refill.
-        old = climb([float(index) for index in range(13)])
-        new = climb([5.0 + 3 * index for index in range(13)], start=START + HALF_LIFE)
-        self.assertAlmostEqual(weighted_rate(old + new, new[-1].at.timestamp()) or 0, (0.5 * 1 + 3) / (1.5 * STEP))
+    def test_hourly_usage_rate_uses_configured_window_and_latest_refill(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = folder / "accounts.conf"
+        cases = (
+            (60, [2, 20, 22, 24, 26, 28, 30, 32, 90], run_out.UsageRate(12)),
+            (30, [2, 20, 22, 24, 26, 28, 30, 32, 90], run_out.UsageRate(12)),
+            (30, [2, 20, 22, 24, 26, 27, 28, 29, 90], run_out.UsageRate(6)),
+            (60, [2, 20, 22, 24, 26, 27, 28, 29, 90], run_out.UsageRate(9)),
+            (60, [30, 2, 6, 10, 14, 18, 22, 26], run_out.UsageRate(24)),
+            (60, [30, 55, 60, 80, 90, 2, 6, 10], run_out.NoUsageRate()),
+            (55, [2, 20, 22, 24, 26, 28, 30, 32, 90], run_out.UsageRate(12)),
+        )
+        with patch.dict(os.environ, {"CONF_DIR": str(folder)}):
+            for minutes, usage, expected in cases:
+                with self.subTest(minutes=minutes, usage=usage):
+                    _ = config.write_text(f"# whole: 1..\nrate.lookback_minutes={minutes}\n")
+                    now = START + timedelta(minutes=70)
+                    self.assertEqual(run_out.hourly_usage_rate(climb(usage), now), expected)
 
-    def test_quiet_recent_stretch_lengthens_time_left(self) -> None:
-        rise = [5.0 * index for index in range(9)]
-        busy_then_quiet = climb(rise + [40.0] * 8)
-        quiet_then_busy = climb([0.0] * 8 + rise)
-        plain = 40 / (16 * STEP)
-        quiet = weighted_rate(busy_then_quiet, step(16)) or 0
-        busy = weighted_rate(quiet_then_busy, step(16)) or 0
-        self.assertLess(quiet, plain)
-        self.assertGreater(busy, plain)
-        self.assertGreater(60 / quiet, 60 / busy)
-        # Each further quiet stretch lowers the pace, so the run-out moves later.
-        paces = [weighted_rate(busy_then_quiet[:index + 1], step(index)) or 0 for index in range(8, 17)]
-        self.assertEqual(paces, sorted(paces, reverse=True))
-        self.assertEqual(len(set(paces)), len(paces))
+    def test_hourly_usage_rate_requires_a_rise_inside_the_window(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = folder / "accounts.conf"
+        _ = config.write_text("# whole: 1..\nrate.lookback_minutes=60\n")
+        settings = conf.read(config)
+        now = START + timedelta(minutes=70)
+        for readings in ([], climb([40], start=now), climb([20, 40]), climb([40] * 8),
+                         climb([40, 20], start=now - timedelta(minutes=10))):
+            with self.subTest(readings=readings):
+                self.assertEqual(run_out.hourly_usage_rate(readings, now, account_config=settings), run_out.NoUsageRate())
 
-    def test_refill_starts_a_new_stretch_and_the_one_before_still_counts(self) -> None:
-        # An hour at 2 points a step, a refill, then an hour at 1 a step; each old rise is 7 steps older than its new one.
-        readings = climb([50, 52, 54, 56, 58, 60, 62, 0, 1, 2, 3, 4, 5, 6])
-        weight = math.pow(0.5, 7 * STEP / HALF_LIFE.total_seconds())
-        self.assertAlmostEqual(weighted_rate(readings, step(13)) or 0, (2 * weight + 1) / ((weight + 1) * STEP))
+    def test_hourly_usage_rate_requires_a_full_observed_window(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = folder / "accounts.conf"
+        _ = config.write_text("# whole: 1..\nrate.lookback_minutes=60\n")
+        settings = conf.read(config)
+        end = START + timedelta(hours=1)
+        cases = (
+            ("short", [Reading(end - timedelta(minutes=5), 39), Reading(end, 40)], run_out.NoUsageRate()),
+            ("exact gap limit", [Reading(end - timedelta(minutes=age), 40 - age / 5)
+                                 for age in (60, 45, 30, 15, 0)], run_out.UsageRate(12)),
+            ("long gap", [Reading(end - timedelta(minutes=age), 40 - age / 5)
+                          for age in (60, 44, 30, 15, 0)], run_out.NoUsageRate()),
+            ("time at full", climb([88, 90, 92, 94, 96, 100, 100]), run_out.NoUsageRate()),
+        )
+        for case, readings, expected in cases:
+            with self.subTest(case=case):
+                self.assertEqual(run_out.hourly_usage_rate(readings, end, account_config=settings), expected)
 
-    def test_an_account_waiting_its_turn_is_not_quiet_use(self) -> None:
-        # A refill, eight steps untouched while another account is in use, then an hour at 2 points a step.
-        waited = climb([60, 0, 0, 0, 0, 0, 0, 0, 0, 2, 4, 6, 8, 10, 12, 14])
-        self.assertAlmostEqual(weighted_rate(waited, step(15)) or 0, 2 / STEP)
-        # Once the account has risen, a flat stretch is quiet use and still counts.
-        paused = climb([0, 2, 4, 6, 8, 10, 12, 12, 12, 14])
-        self.assertLess(weighted_rate(paused, step(9)) or 0, 2 / STEP)
-
-    def test_time_at_full_is_skipped(self) -> None:
-        readings = climb([88, 90, 92, 94, 96, 98, 100, 100, 100, 100, 0, 2, 4, 6, 8, 10, 12])
-        self.assertAlmostEqual(weighted_rate(readings, step(16)) or 0, 2 / STEP)
-
-    def test_time_logged_out_is_not_quiet_time(self) -> None:
-        before = climb([float(index) for index in range(8)])
-        after = climb([7.0 + index for index in range(8)], start=START + timedelta(days=2))
-        self.assertAlmostEqual(weighted_rate(before + after, after[-1].at.timestamp()) or 0, 1 / STEP)
-        # A reading `MAX_GAP` after the last still counts as quiet time; one second later it does not.
-        last = before[-1].at
-        counted = weighted_rate(before + [Reading(last + MAX_GAP, 7)], (last + MAX_GAP).timestamp()) or 0
-        skipped = weighted_rate(before + [Reading(last + MAX_GAP + timedelta(seconds=1), 7)], (last + MAX_GAP).timestamp() + 1) or 0
-        self.assertLess(counted, 1 / STEP)
-        self.assertAlmostEqual(skipped, 1 / STEP)
-
-    def test_readings_after_end_are_ignored(self) -> None:
-        self.assertAlmostEqual(weighted_rate(climb([0, 1, 2, 3, 4, 5, 6, 7, 50]), step(7)) or 0, 1 / STEP)
-
-    def test_no_pace_until_the_readings_cover_an_hour(self) -> None:
-        self.assertEqual(MIN_SPAN, timedelta(hours=1))
-        self.assertIsNone(weighted_rate([], step(0)))
-        self.assertIsNone(weighted_rate(climb([40]), step(0)))
-        self.assertIsNone(weighted_rate(climb([90, 20]), step(1)))
-        self.assertIsNone(weighted_rate(climb([100.0] * 9), step(8)))
-        # Six ten-minute steps weigh a little under an hour; the seventh carries it over.
-        self.assertIsNone(weighted_rate(climb([0, 3, 6, 9, 12, 15, 18]), step(6)))
-        self.assertAlmostEqual(weighted_rate(climb([0, 3, 6, 9, 12, 15, 18, 21]), step(7)) or 0, 3 / STEP)
-        # An account that has not moved for an hour since the log began is waiting its turn: no use, so a pace of 0.
-        self.assertEqual(weighted_rate(climb([40.0] * 8), step(7)), 0)
-        self.assertIsNone(weighted_rate(climb([40.0] * 6), step(5)))
+    def test_hourly_usage_rate_uses_only_the_observed_part_of_the_window(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        config = folder / "accounts.conf"
+        _ = config.write_text("# whole: 1..\nrate.lookback_minutes=60\n")
+        settings = conf.read(config)
+        now = START + timedelta(minutes=70)
+        readings = climb([30, 40, 40, 40, 40, 40, 40])
+        self.assertEqual(run_out.hourly_usage_rate(readings, now, account_config=settings), run_out.NoUsageRate())
+        readings = climb([28, 30, 32, 34, 36, 38, 40])
+        for age in (timedelta(microseconds=1), timedelta(minutes=15)):
+            with self.subTest(age=age):
+                rate = run_out.hourly_usage_rate(readings, readings[-1].at + age, account_config=settings)
+                assert isinstance(rate, run_out.UsageRate)
+                self.assertAlmostEqual(rate.points_per_hour, 12)
+        self.assertEqual(run_out.hourly_usage_rate(readings, readings[-1].at + timedelta(minutes=16),
+                                                  account_config=settings), run_out.NoUsageRate())
 
 
 if __name__ == "__main__":

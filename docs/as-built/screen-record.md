@@ -2,7 +2,15 @@
 
 ## What it is
 
-`/screen_record` records one existing X11 window on Linux to a short MP4 clip, so an agent can capture what an app does on screen (Hana's startup animation was the first use) and check or send the result without anyone watching it live. The window is chosen by a substring of its title. Guardrails keep a recording from running long: the duration is required, capped at 60 s with no override, bounded again by an outer `timeout`, and the file is capped at 500 MB. A cleanup policy keeps clips from filling the disk: clips live in one directory, and every run first deletes clips older than 7 days, then the oldest until the directory is under 2 GiB. The recorder only records. Launching the app before and shutting it down after stay with the caller.
+`/screen_record` records one X11 window on Linux to a short MP4 clip.
+Select the window by a substring of its title.
+Specify a duration of at most 60 s.
+An outer `timeout` stops a recording that runs too long.
+`config/screen_record.conf` sets the file cap and the directory limit.
+The shipped limits are 500 MB per clip and 2 GiB for the directory.
+Before recording, the command deletes clips older than 7 days.
+It then deletes the oldest clips until the directory is below the configured limit.
+The caller launches and shuts down the app.
 
 ## How it works
 
@@ -11,8 +19,9 @@
 | File | Role |
 | --- | --- |
 | `commands/screen_record.md` | The `/screen_record` skill: arguments, the caller's launch and shutdown duties, the Hana recipe, how to check a clip, cleanup duties. |
-| `scripts/screen_record/screen_record.py` | The recorder: refusals, tool and display checks, prune, window lookup, recording under `timeout`, outcomes. Python 3.13 standard library only. |
+| `scripts/screen_record/screen_record.py` | Checks prerequisites, prunes clips, finds the window, and records it under `timeout`. |
 | `scripts/screen_record/test_screen_record.py` | `unittest` cases that run the script as a subprocess with `xprop`, `timeout` and `ffmpeg` stubs alone on `PATH` and a temporary `HOME`. |
+| `config/screen_record.conf` | Sets the file cap and the directory limit. |
 | `~/.cache/screen-record/` | The clip directory, outside the repository (mode 0700). |
 
 ### Command line
@@ -35,23 +44,25 @@ main()
   refuse (exit 2) on: not Linux, --seconds missing / not 1–60, empty --window, bad --name
   missing xprop / timeout / ffmpeg (named together)      → exit 1
   DISPLAY unset                                          → exit 1
+  read both size limits                                  → exit 1 if unusable
   directory = $SCREEN_RECORD_DIR (when non-empty) or ~/.cache/screen-record; mkdir 0700
-  prune(directory)
+  prune(directory, max_directory_bytes)
   find_window(substring) → FoundWindow(window_id, title)  or WindowLookupFailure → exit 1
   clip_path(directory, name) → reserved path
-  record(window_id, title, seconds, display, path)       → exit 0, 1 or 3
+  record(window_id, title, seconds, display, path, max_bytes=max_bytes) → exit 0, 1 or 3
 ```
 
 Every external tool runs from an argument list, never through a shell. Stdout carries one line, the clip's absolute path, and only when a clip is kept. Everything else goes to stderr, prefixed `screen_record:`.
 
 ### Prune
 
-`prune(directory)` runs before the window lookup:
+`prune()` runs before the window lookup.
 
 1. Collect the regular `*.mp4` files directly in the directory. Symlinks, subdirectories and other names are neither counted nor deleted.
 2. Delete each one whose mtime is more than 7 days old (`MAX_AGE_SECONDS = 604_800`).
-3. Sort the rest oldest first (mtime, then name) and delete until the total is under 2 GiB (`DIRECTORY_LIMIT = 2_147_483_648`).
-4. When anything went, print `pruned <n> clips (<MB> MB): <a> older than 7 days, <b> to bring the directory under 2 GiB`.
+3. Sort the remaining clips by mtime, then by name.
+4. Delete the oldest clips until the total falls below `retention.max_directory_bytes`.
+5. If the command deletes clips, report the count, reclaimed space, and configured limit.
 
 A file that cannot be inspected or deleted is reported on stderr and skipped. The run goes on.
 
@@ -83,7 +94,7 @@ No match at the limit reports the titles seen.
 timeout --kill-after=5 <seconds + 15> \
   ffmpeg -hide_banner -loglevel error -nostdin -y \
     -f x11grab -framerate 60 -window_id <decimal id> -i $DISPLAY \
-    -t <seconds> -fs 500000000 \
+    -t <seconds> -fs <recording.max_bytes> \
     -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 \
     -c:v libx264 -preset veryfast -tune zerolatency -crf 18 -pix_fmt yuv420p <path>
 ```
@@ -92,9 +103,10 @@ timeout --kill-after=5 <seconds + 15> \
 
 | Exit | Cause | Clip | Stderr |
 | --- | --- | --- | --- |
-| 0 | ffmpeg exited 0, clip under 500 MB | kept, path printed | `recorded <s> s of '<title>' (<KB> KB)` |
+| 0 | ffmpeg exited 0 and the clip is below the configured cap | kept, path printed | `recorded <s> s of '<title>' (<KB> KB)` |
 | 3 | `timeout` returned 124 or 137, or was killed by SIGKILL (−9) | deleted, stdout empty | `stopped by the outer timeout at <d> s (<s> s + 15 s): ffmpeg did not stop at -t; partial clip deleted` |
-| 3 | ffmpeg exited 0, clip at or over 500,000,000 bytes | kept, path printed | `stopped at the 500 MB file cap (ffmpeg -fs); the clip is shorter than <s> s` |
+| 3 | ffmpeg exited 0 and the clip reached the configured cap | kept, path printed | The file cap and the requested duration. |
+| 1 | A size limit is unusable | none reserved | The config diagnostic names the key. |
 | 1 | any other nonzero exit, unreadable clip, `OSError` | deleted | `ffmpeg exited <rc>; partial clip deleted`, or `could not record: <error>` |
 | 2 | refused before anything ran | none | one line naming the limit, values shown with `repr` |
 
@@ -111,11 +123,15 @@ Every failure deletes only the path this run reserved.
 
 ### Disk: the prune and the disk-floor job
 
-The clip directory is on `/`, the same filesystem the disk-floor job (`/etc/nixos/modules/linux/disk-floor.nix`) holds at 300 GiB free. That job runs `scripts/lint/sweep.py --floor-only` every 2 minutes and frees only cargo target directories, then sends a phone alert when `/` is under 150 GiB. It never touches `~/.cache/screen-record/`. The prune is that directory's only bound: under 2 GiB when a run starts, plus the one clip that run writes, at most a little over 500 MB. Clips can therefore take at most about 2.5 GB of the room the floor protects, and when `/` drops under the floor the sweep deletes build caches, never clips.
+The clip directory shares `/` with the disk-floor job (`/etc/nixos/modules/linux/disk-floor.nix`).
+The job runs `scripts/lint/sweep.py --floor-only` every 2 minutes with a 300 GiB floor.
+It clears cargo target directories and sends a phone alert below 150 GiB free.
+The recorder prunes its own clips.
+With the shipped limits, the directory starts below 2 GiB and grows by one clip of about 500 MB or less.
 
 ## Invariants
 
-- No flag, environment variable or setting raises the 60 s ceiling, the 15 s timeout margin or the 500 MB file cap. A refusal or a stop names the limit it reached.
+- The 60 s ceiling and the 15 s timeout margin are fixed. `recording.max_bytes` sets the file cap.
 - A refusal (exit 2) has no side effects: no directory created, nothing pruned, no tool run.
 - Stdout holds only the kept clip's path, on one line; callers capture it with `clip=$(…)`.
 - A failure deletes only the path its own run reserved, never another clip.
@@ -130,14 +146,14 @@ The clip directory is on `/`, the same filesystem the disk-floor job (`/etc/nixo
 
 - **Wayland.** ffmpeg has no PipeWire input, so a native Wayland window cannot be recorded. Launch the app with `env -u WAYLAND_DISPLAY` so it opens under Xwayland (`DISPLAY=:0` on natedev). An ffplay test window also needs `SDL_VIDEODRIVER=x11`, or SDL opens a native Wayland window that is absent from Xwayland's client list.
 - **Clip size.** 7 s of a 1280×720 window at 60 fps came to 330 KB, recorded at real speed. A busy window costs far more, but a 60 s clip rarely reaches the 500 MB cap.
-- **The file cap.** ffmpeg exits 0 when `-fs` stops it, and the file ends slightly over the cap. The script tells a capped clip from a full one by its size alone (`>= MAX_BYTES`).
+- **The file cap.** ffmpeg exits 0 when `-fs` stops it. The recorder marks a clip as capped when its size reaches `recording.max_bytes`.
 - **The outer timeout's kill path.** `timeout` returns 124 when ffmpeg stops on the TERM. If ffmpeg ignores the TERM for 5 s, `--kill-after` sends SIGKILL to `timeout`'s whole process group, `timeout` itself included, so Python reads a return code of −9, not 137. `screen_record.py` treats −9 like 124 and 137: exit 3, clip deleted. A test drives the real `timeout` against a stub ffmpeg that ignores TERM and checks the run matches the 137 case.
 - **Odd window sizes.** libx264 refuses yuv420p at an odd width or height (`width not divisible by 2 (401x301)`, ffmpeg exit 187). The crop trims one column or row: 401×301 records as 400×300.
 - **Overrun after `-t`.** `-t` ends the capture on time, but x264's default lookahead and frame threads hold dozens of frames, and ffmpeg encodes all of them before it exits. On a 3840×2012 window at load average 196, default veryfast had written 0 of 53 frames at the `-t` cutoff and exited 1.56 s later; with `-tune zerolatency` it had written 103 of 112 and exited 0.26 s later. Starved to half a core (`systemd-run --user --scope --collect -p CPUQuota=50%`), the old command hit the outer timeout on a 10 s clip (exit 3 at 31 s); with zerolatency it finished in 12.9 s. FFmpeg 8.1's default fps mode adds no duplicate frames here (`dup=0`), so `-fps_mode` changes nothing.
 - **Prune timing.** The prune runs only when a recording run gets past its refusals and its tool and `DISPLAY` checks. Nothing expires clips between runs, so the 7-day limit takes effect at the next run, and the caller's `rm` is what keeps the directory empty.
 - **Lookup time.** A failed lookup takes the full 10 s; the no-match test waits it by design. A substring that matches more than one title fails at once; pass a longer one.
 - **Window id.** `xprop` reports hex ids; ffmpeg gets the decimal form.
-- **Non-clip files.** Files that are not `*.mp4` are not counted toward 2 GiB and never pruned, which is why stills go to the caller's scratchpad.
+- **Non-clip files.** The directory limit and pruning apply only to regular `*.mp4` files. Keep stills in the caller's scratchpad.
 
 ## Why
 
