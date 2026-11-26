@@ -211,8 +211,10 @@ class FolderMoveBackend:
         self.publish_process_state()
 
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
-                    timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *,
+                    publication: herdr.LaunchPublicationTiming = herdr.LaunchPublicationTiming.ON_START,
+                    ) -> herdr.PromptSubmissionNotRequired:
+        _ = publication
         self.fixture.assertFalse(self.live, "a live session must not start again")
         self.fixture.assertEqual((name, pane, kind), (self.fixture.owner.name, "w1:p1", self.kind))
         self.fixture.assertIn(self.fixture.owner.current_session, agent_arguments)
