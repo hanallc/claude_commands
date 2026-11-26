@@ -1318,10 +1318,12 @@ if(example.filterOn){
         bands = studio.split('<div class="list-top-bands">', 1)[1].split('<div data-record-filters>', 1)[0]
         dwight = bands.split(f'<section class="list-top-band" data-top-band="staff:{DWIGHT.id}" aria-label="Top priority">',
                              1)[1].split('</section>', 1)[0]
-        self.assertIn(f'<b>#{status.number} {status.title}</b>', dwight)
+        top_link = html.escape(list_page.item_link(MORTY.id, status.number))
+        self.assertIn(f'<a class="list-top-link" data-record-jump href="{top_link}">#{status.number} {status.title}</a>',
+                      dwight)
         self.assertIn("Read the result and check the page.", dwight)
         self.assertIn('<span class="list-state accent">Working</span><small>ETA ', dwight)
-        self.assertNotIn(MORTY.id, bands)
+        self.assertNotIn(f'data-top-band="staff:{MORTY.id}"', bands)
         self.assertIn('<section class="list-top-band" data-top-band="none" aria-label="Top priority">', bands)
         self.assertIn('<b>No top priority item</b><div class="list-top-next">Open an item and click "Make top priority".',
                       bands)
@@ -1397,6 +1399,65 @@ if(example.filterOn){
         steps = steps.replace('STUDIO_PATH', json.dumps(studio_page.PAGE_PATH))
         steps = steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
         self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_studio_top_priority_link_opens_the_item(self) -> None:
+        item = self.add("Check the top item", number=264)
+        _ = self.add("Check the other item", owner=OTHER.id, number=265)
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(item.number))
+        page = self.root / "studio.html"
+        _ = page.write_bytes(list_page.render(self.root / "reviews", include_counts=False))
+        browser = self.chrome()
+        session = browser.session
+        _ = browser.command("Emulation.setEmulatedMedia",
+                            {"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}, session)
+        browser.navigate(page.as_uri())
+
+        def evaluate(expression: str) -> object:
+            response = browser.command("Runtime.evaluate",
+                                       {"expression": expression, "awaitPromise": True, "returnByValue": True}, session)
+            self.assertNotIn("exceptionDetails", response, response)
+            return cast(dict[str, object], response["result"]).get("value")
+
+        link = "document.querySelector('.list-top-link')"
+        row = f"document.querySelector('[data-number=\"{item.number}\"]')"
+        opened = f"recordIsOpen({row}) && !{row}.hidden"
+        tab = f'[data-filter-row="producer"] [data-filter-value="staff:{MORTY.id}"]'
+        _ = evaluate(f"document.querySelector({json.dumps(tab)}).click()")
+        _ = evaluate(f"""(() => {{
+ window.addEventListener('click',event=>{{
+  window.followed=event.defaultPrevented;
+  event.preventDefault();
+ }},{{once:true}});
+ {link}.dispatchEvent(new MouseEvent('click',{{bubbles:true,cancelable:true,ctrlKey:true}}));
+}})()""")
+        self.assertIs(evaluate("window.followed"), False)
+        self.assertIs(evaluate(opened), False)
+        _ = evaluate(f"{link}.click()")
+        self.assertIs(evaluate(opened), True)
+        back = "new Promise(resolve=>{addEventListener('popstate',resolve,{once:true});history.back();})"
+        _ = evaluate(back)
+        self.assertIs(evaluate(opened), False)
+        _ = evaluate("document.getElementById('list-search').focus()")
+        for key, code in (("Tab", 9), ("Enter", 13)):
+            if key == "Enter":
+                self.assertIs(evaluate(f"document.activeElement==={link}"), True)
+            fields = {"key": key, "code": key, "windowsVirtualKeyCode": code}
+            _ = browser.command("Input.dispatchKeyEvent", {**fields, "type": "rawKeyDown"}, session)
+            _ = browser.command("Input.dispatchKeyEvent", {**fields, "type": "keyUp"}, session)
+        self.assertIs(evaluate(opened), True)
+        _ = evaluate(back)
+        owner = f'[data-filter-row="owner"] [data-filter-value="staff:{OTHER.id}"]'
+        _ = evaluate(f"document.querySelector({json.dumps(owner)}).click()")
+        self.assertIs(evaluate(f"{row}.hidden"), True)
+        _ = evaluate(f"{link}.click()")
+        self.assertIs(evaluate(opened), True)
+        self.assertEqual(evaluate("document.getElementById('filter-owner-all').getAttribute('aria-pressed')"), "true")
+        self.assertEqual(evaluate("new URLSearchParams(location.hash.slice(1)).get('item')"), f"{MORTY.id}/{item.id}")
+        place = cast(str, evaluate("location.href"))
+        browser.navigate("about:blank")
+        browser.navigate(place)
+        self.assertIs(evaluate(opened), True)
 
     def browser_row_expansion(self, steps: str) -> None:
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
