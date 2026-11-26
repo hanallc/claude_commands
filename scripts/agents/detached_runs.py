@@ -2460,12 +2460,12 @@ def _unconfirmed_result_received(record: RunRecord, membership: staff.StaffSnaps
         if isinstance(member, RunOwnerUnavailable):
             return False
     marker = f"Detached run: {record['run_id']}"
-    with contextlib.suppress(OSError, ValueError):
+    with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
         if _result_received(member, membership, marker):
             return True
     if member.kind == "worker" and delivery.startswith(UNCONFIRMED_RESULT_PUSH):
         holder = membership.parent_of(member)
-        with contextlib.suppress(OSError, ValueError):
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
             return holder is not None and _result_received(holder, membership, marker)
     return False
 
@@ -2601,7 +2601,9 @@ def _deliver(record: RunRecord, result: CommandResult, *,
 
     def save_deferral(detail: str) -> str:
         failed = saved.startswith((FAILED_RESULT_PUSH, FAILED_WORKER_SUBMISSION))
-        return _save_delivery(path, saved if failed and saved != LEGACY_WORKER_READINESS_FAILURE else detail)
+        if failed and detail != WORKER_READINESS_PENDING and saved != LEGACY_WORKER_READINESS_FAILURE:
+            return _save_delivery(path, saved)
+        return _save_delivery(path, detail)
 
     with _delivery_lock(path), contextlib.ExitStack() as locks:
         with record_lock(path):
@@ -2683,10 +2685,12 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             read_coverage = cast(Callable[[staff.StaffRow, dict[str, object], RunRecord],
                 ResultDoneCoverage | ResultTranscriptUnknown],
                 import_module("scripts.production.worker").result_done_coverage)
-            coverage = read_coverage(selected, passed, record)
-            if not isinstance(coverage, str):
-                raise _WorkerPassDeliveryBlocked(
-                    DEFERRED_WORKER_RESULT + f"worker transcript is unavailable: {coverage.reason}")
+            try:
+                coverage = read_coverage(selected, passed, record)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                raise _WorkerPassDeliveryBlocked(WORKER_READINESS_PENDING) from error
+            if isinstance(coverage, ResultTranscriptUnknown):
+                raise _WorkerPassDeliveryBlocked(WORKER_READINESS_PENDING)
             if coverage == ResultDoneCoverage.COVERED:
                 raise _WorkerPassDeliveryBlocked(COVERED_BY_DONE)
             if isinstance(stage, UnknownResultStage):
@@ -2755,7 +2759,6 @@ def _deliver(record: RunRecord, result: CommandResult, *,
         request = send.WorkerResultSubmission(worker_only=self_stop or pane_wait == CompletionPaneWait.READY_NOW,
                                               before_input=before_input,
                                               before_holder=before_holder)
-        reason = ""
         try:
             ownership, passed = read_pass(worker, membership)
             require_owned_pass(ownership)
@@ -2768,13 +2771,12 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                 try:
                     if _result_received(worker, membership, marker):
                         return _save_delivery(path, f"already delivered: {record['run_id']}")
-                except (OSError, ValueError) as error:
-                    reason = f"worker transcript is unavailable: {error}"
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    return save_deferral(WORKER_READINESS_PENDING)
             target, reply_instruction = check_pass(worker, ownership, passed, assignment)
             if unconfirmed:
                 return saved
-            if target is WorkerResultTarget.DIRECTOR:
-                reason = target.value
+            reason = target.value if target is WorkerResultTarget.DIRECTOR else ""
             if target is WorkerResultTarget.PARKED and not isinstance(resume_parked, ParkedWorkerDelivery):
                 if not resume_parked():
                     return save_deferral(DEFERRED_WORKER_RESULT + "the parked worker could not resume")
@@ -2816,7 +2818,7 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                 return _save_delivery(path, status)
             return save_deferral(status)
         if isinstance(delivery, send.WorkerResultNotReady):
-            return _save_delivery(path, WORKER_READINESS_PENDING)
+            return save_deferral(WORKER_READINESS_PENDING)
         if isinstance(delivery, send.WorkerResultNotSubmitted):
             return save_deferral(FAILED_WORKER_SUBMISSION + delivery.detail)
         if isinstance(delivery, send.WorkerResultUnconfirmed):

@@ -3708,7 +3708,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["status"], "completed")
         self.assertEqual(self.inputs, [])
 
-    def test_linked_result_defers_when_the_pass_read_fails(self) -> None:
+    def test_linked_result_defers_when_pass_evidence_reads_fail(self) -> None:
         row = self.fixture.worker("impl", family="codex")
         self.fixture.world.add(row, "w1:p1", family="codex")
         dispatch, _ = self.begin_pane_pass(row)
@@ -3724,6 +3724,12 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(delivery, "deferred: worker pass is unavailable: private pass read failure")
         self.assertEqual(saved.get("delivery"), delivery)
         self.assertNotIn("delivered_at", saved)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.notices, [])
+
+        with patch.object(worker, "result_done_coverage", side_effect=OSError("saved DONE read failed")):
+            delivery = detached_runs.deliver(record, detached_runs.CompletedCommand(0))
+        self.assertEqual(delivery, detached_runs.WORKER_READINESS_PENDING)
         self.assertEqual(self.inputs, [])
         self.assertEqual(self.notices, [])
 
@@ -7552,16 +7558,22 @@ class PaneRunDeliveryTests(unittest.TestCase):
         path = Path(record["log"]).with_suffix(".json")
         attempts = 0
         read_readiness = self.fixture.world.readiness
+        read_pane_row = self.fixture.world.pane_row
 
         def readiness(target: str) -> herdr.WorkerReadiness:
             if attempts == 2:
                 raise OSError("fixture readiness is unavailable")
             return read_readiness(target)
 
+        def pane_row(target: str) -> herdr.PaneIdentity | herdr.NoPane:
+            if attempts == 3:
+                raise OSError("fixture prompt target is unavailable")
+            return read_pane_row(target)
+
         def before_retry(_seconds: float) -> None:
             nonlocal attempts
             attempts += 1
-            self.assertLessEqual(attempts, 3)
+            self.assertLessEqual(attempts, 4)
             self.assertEqual(self.notices, [])
             self.assertEqual(self.inputs, [])
             saved = worker_lifecycle.read_json_object(path)
@@ -7575,10 +7587,62 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         with (patch.object(turn_end, "run_finished", return_value=detached_runs.CompletionReplay.RETRY),
               patch.object(self.fixture.world, "readiness", new=readiness),
+              patch.object(self.fixture.world, "pane_row", new=pane_row),
               patch.object(time, "sleep", side_effect=before_retry)):
             self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
         self.assertEqual(self.notices, [])
-        self.assertEqual(attempts, 3)
+        self.assertEqual(attempts, 4)
+        self.assertEqual(len(self.inputs), 1)
+        self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
+
+    def test_supervisor_retry_keeps_result_pending_when_a_transcript_read_fails(self) -> None:
+        row = self.fixture.worker(family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        self.fixture.world.locations[pane]["agent_status"] = "working"
+        record = self.record(row)
+        path = Path(record["log"]).with_suffix(".json")
+        attempts = 0
+        reads_failed: list[int] = []
+        read_transcript = worker_admission.transcript_records
+        boundaries = worker_admission.TranscriptRecordBoundary
+
+        def transcript_records(source: Path, *, offset: int = 0,
+                               boundary: worker_admission.TranscriptRecordBoundary = boundaries.ALL_RECORDS,
+                               ) -> Generator[dict[str, object] | worker_admission.TornTranscriptRecord]:
+            if attempts == 1 and boundary is boundaries.ALL_RECORDS:
+                reads_failed.append(attempts)
+                raise OSError("fixture receipt read failed")
+            if attempts == 2 and boundary is boundaries.COMPLETE_LINES_WITH_TAIL:
+                reads_failed.append(attempts)
+                raise subprocess.CalledProcessError(1, "fixture transcript decoder")
+            if attempts == 3 and boundary is boundaries.ALL_RECORDS:
+                reads_failed.append(attempts)
+                yield worker_admission.TornTranscriptRecord()
+                return
+            yield from read_transcript(source, offset=offset, boundary=boundary)
+
+        def before_retry(_seconds: float) -> None:
+            nonlocal attempts
+            attempts += 1
+            self.assertLessEqual(attempts, 4)
+            self.assertEqual(self.notices, [])
+            self.assertEqual(self.inputs, [])
+            saved = worker_lifecycle.read_json_object(path)
+            expected = detached_runs.BUSY_WORKER_RESULT if attempts == 1 else detached_runs.WORKER_READINESS_PENDING
+            self.assertEqual(saved.get("delivery"), expected)
+            self.assertIs(saved.get("completion_pending"), True)
+            self.assertNotIn("push_retries", saved)
+            self.assertNotIn("delivered_at", saved)
+            self.fixture.world.locations[pane]["agent_status"] = "idle"
+
+        with (patch.object(turn_end, "run_finished", return_value=detached_runs.CompletionReplay.RETRY),
+              patch.object(worker_admission, "transcript_records", new=transcript_records),
+              patch.object(time, "sleep", side_effect=before_retry)):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(self.notices, [])
+        self.assertEqual(reads_failed, [1, 2, 3])
+        self.assertEqual(attempts, 4)
         self.assertEqual(len(self.inputs), 1)
         self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
 
@@ -7818,19 +7882,25 @@ class PaneRunDeliveryTests(unittest.TestCase):
         row = self.fixture.worker()
         self.assert_holder_result(self.record(row), "worker pane is closed")
 
-    def test_unknown_process_result_reaches_its_holder_with_one_anomaly(self) -> None:
+    def test_unknown_process_keeps_the_result_pending_with_one_anomaly(self) -> None:
         row = self.fixture.worker()
         self.fixture.world.add(row, "w1:p1")
         self.fixture.world.unknown["w1:p1"] = "private process read failed"
         with contextlib.redirect_stderr(io.StringIO()) as errors:
-            self.assert_holder_result(self.record(row), "private process read failed")
+            self.assertEqual(detached_runs.deliver(self.record(row), detached_runs.CompletedCommand(1)),
+                             detached_runs.WORKER_READINESS_PENDING)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.notices, [])
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
 
-    def test_duplicate_native_identity_result_reaches_its_holder(self) -> None:
+    def test_duplicate_native_identity_keeps_the_result_pending(self) -> None:
         row = self.fixture.worker()
         self.fixture.world.add(row, "w1:p1")
         self.fixture.world.add(row, "w2:p2", tab="w2:t2", workspace="w2")
-        self.assert_holder_result(self.record(row), "duplicate native identities")
+        self.assertEqual(detached_runs.deliver(self.record(row), detached_runs.CompletedCommand(1)),
+                         detached_runs.WORKER_READINESS_PENDING)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.notices, [])
 
     def test_blocked_worker_result_reaches_its_holder(self) -> None:
         row = self.fixture.worker()
@@ -7936,12 +8006,21 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(saved["delivery"], f"sent: worker {row.name} at {pane}")
         self.assertIs(saved["completion_pending"], False)
 
-    def test_unreadable_transcript_result_reaches_its_holder_without_input(self) -> None:
+    def test_unreadable_transcript_keeps_the_result_pending_without_input(self) -> None:
         row = self.fixture.worker(family="codex")
         self.fixture.world.add(row, "w1:p1", family="codex")
         source = worker_admission.transcript_source(row, staff.CodexBackend(self.fixture.root / "codex"))
+        transcript = source.read_text()
         source.unlink()
-        self.assert_holder_result(self.record(row), "worker transcript is unavailable")
+        record = self.record(row)
+        self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(1)),
+                         detached_runs.WORKER_READINESS_PENDING)
+        self.assertEqual(self.inputs, [])
+        self.assertEqual(self.notices, [])
+
+        write_text_atomic(source, transcript)
+        self.fixture.world.remove_pane("w1:p1")
+        self.assert_holder_result(record, "worker pane is closed")
 
     def test_self_stop_result_waits_for_the_worker_transcript(self) -> None:
         row = self.fixture.worker(family="codex")
@@ -7957,7 +8036,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         self.assertEqual(detached_runs.main(["deliver", str(path)]), 0)
         saved = worker_lifecycle.read_json_object(path)
-        self.assertIn("deferred: worker transcript is unavailable", str(saved.get("delivery")))
+        self.assertEqual(saved.get("delivery"), detached_runs.WORKER_READINESS_PENDING)
         self.assertNotIn("delivered_at", saved)
         self.assertEqual(self.notices, [])
         self.assertEqual(self.inputs, [])

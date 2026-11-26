@@ -5509,14 +5509,20 @@ class WorkerResultProbe:
         if isinstance(backend, staff.BackendUnavailable):
             raise ValueError("worker transcript backend is unavailable")
         source = worker_admission.transcript_source(worker, backend)
+        incomplete = False
         for entry in worker_admission.transcript_entries(source, set()):
-            if not isinstance(entry, str) or not entry.startswith("user:\n"):
+            if isinstance(entry, worker_admission.TornTranscriptRecord):
+                incomplete = True
+                continue
+            if not entry.startswith("user:\n"):
                 continue
             body = entry.removeprefix("user:\n")
             if body.lstrip().startswith(SCRIPT_ENVELOPE_START) and not body.rstrip().endswith(SCRIPT_ENVELOPE_END):
                 continue
             if self.marker in body.splitlines():
                 return True
+        if incomplete:
+            raise ValueError("worker transcript has incomplete records")
         return False
 
 
@@ -5567,12 +5573,12 @@ def _result_transcript_cursors(source: Path, stream: str
 
 
 def _result_submission_boundary(worker: staff.StaffRow, membership: staff.StaffSnapshot
-                                ) -> worker_panes.TranscriptCursor | NoResultTranscript:
+                                ) -> worker_panes.TranscriptCursor:
     from scripts.herdr import worker_panes
 
     source = _result_transcript_source(worker, membership)
     if isinstance(source, NoResultTranscript):
-        return source
+        raise ValueError(source.value)
     stream = worker_panes.transcript_stream(worker, source)
     boundary = worker_panes.TranscriptCursor(stream, 0, hashlib.sha256().hexdigest())
     for _, boundary in _result_transcript_cursors(source, stream):
@@ -5668,7 +5674,7 @@ class OrdinaryWorkerMessage(Enum):
 
 
 class _WorkerResultReadinessFailure(herdr_types.HerdrFailure):
-    """The current pane does not have proof of readiness."""
+    """The checks could not prove that the worker can receive the result."""
 
 
 def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot, text: str, *,
@@ -5699,6 +5705,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                 return WorkerResultNotReady("retry", str(error))
             raise
         if isinstance(state, worker_panes.OpenWorker):
+            checking_target = False
             attempting_input = False
             boundary: worker_panes.TranscriptCursor | NoResultTranscript = NoResultTranscript.UNRECORDED
             ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
@@ -5714,15 +5721,16 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     raise _WorkerResultReadinessFailure("worker is not ready for input")
 
             def require_idle() -> None:
-                nonlocal attempting_input, boundary
+                nonlocal checking_target, attempting_input, boundary
+                checking_target = False
                 check_readiness()
                 assert isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission))
                 _ = receipt.before_input()
                 if isinstance(receipt, WorkerResultSubmission):
                     try:
                         boundary = _result_submission_boundary(worker, membership)
-                    except (OSError, ValueError) as error:
-                        raise herdr_types.HerdrFailure(f"worker transcript is unavailable: {error}") from error
+                    except (OSError, ValueError, subprocess.SubprocessError) as error:
+                        raise _WorkerResultReadinessFailure(f"worker transcript is unavailable: {error}") from error
                     check_readiness()
                 attempting_input = True
 
@@ -5753,13 +5761,15 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                         current = _current_staff_session(selection, ExpectedStaffSession(worker.current_session))
                         if isinstance(current, RecipientLookupFailed):
                             return Result("failed", current.reason)
+                    checking_target = True
                     prompt_client.prompt(state.pane, review_text or text, target=str(worker.current_session),
                                          proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=on_submission)
                     if isinstance(receipt, OrdinaryWorkerMessage):
                         return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
                 except (herdr_types.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                     reason = str(error)
-                    if isinstance(receipt, WorkerResultSubmission) and isinstance(error, _WorkerResultReadinessFailure):
+                    if isinstance(receipt, WorkerResultSubmission) and (
+                            checking_target or isinstance(error, _WorkerResultReadinessFailure)):
                         return WorkerResultNotReady("retry", reason)
                     if isinstance(receipt, OrdinaryWorkerMessage):
                         if submission.may_have_submitted:
@@ -5777,7 +5787,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                             return _confirm_worker_result(worker, state.pane, state.terminal, review_text or text, boundary)
                         if receipt.received(worker, membership):
                             return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
-                    except (OSError, ValueError, staff.StaffUnreadable) as error:
+                    except (OSError, ValueError, subprocess.SubprocessError) as error:
                         reason = f"worker transcript is unavailable: {error}"
                     return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
