@@ -2390,17 +2390,20 @@ def accept_sent(key: str, to: str, at: datetime, *, delivered: bool = True) -> N
 
 
 def _settle_codex_pane_claim(key: str, recipient: StableRecipient, attempt: PendingDelivery, *, confirmed: bool) -> bool:
-    """Save proof for the current claim or restore a missing claim as pending."""
+    """Save the confirmation or restore the claim if it is missing."""
     with key_states(require_readable=True) as states:
         state = states.setdefault(key, {"last": {}})
         address = recipient.value
         pending = state.get("pending", {})
         started = attempt["started"]
         if pending.get(address) != attempt or state["last"].get(address) != started:
-            if address not in state["last"] and address not in pending:
-                state["last"][address] = started
-                state.setdefault("pending", {})[address] = attempt
-            return False
+            if address in state["last"] or address in pending:
+                return False
+            state["last"][address] = started
+            pending[address] = attempt
+            state["pending"] = pending
+            if not attempt.get("once_per_key"):
+                return False
         if confirmed:
             del pending[address]
             if not pending:
@@ -6224,8 +6227,12 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
                 _ = rca.open_case(refusal_report(options), defer_owner=True)
         elif isinstance(route, CodexPaneRecipient):
+            named_staff = (isinstance(member, staff.StaffRow)
+                           and not options.to.startswith((CODEX_PREFIX, SESSION_PREFIX)))
+            logical_recipient = (stable.value if named_staff or isinstance(options.recipient_identity, LogicalRecipientIdentity)
+                                 else "")
             result = deliver_codex(message, route, options.timeout, selection=options.selection,
-                                   review_recipient=(stable.value if isinstance(options.recipient_identity, LogicalRecipientIdentity) else ""),
+                                   review_recipient=logical_recipient,
                                    pane_repeat=window, pane_aliases=pane_aliases)
         elif isinstance(route, CodexSessionRecipient):
             result = deliver_codex(message, route, options.timeout, selection=options.selection,

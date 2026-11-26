@@ -9094,6 +9094,26 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual((after_expiry.outcome, after_acceptance.outcome), ("sent", "skipped"))
         self.assertEqual(prompt.call_count, 2)
 
+    def test_codex_pane_staff_retry_stays_pending_after_the_thread_changes(self) -> None:
+        row, observed = self.codex_agent()
+        options = send.parse(["--here", "--to", row.name, "--from", "fixture", "--text", "Read the report.",
+                              "--key", "report", "--repeat-minutes", "5"])
+        started = send.now()
+        with (mock.patch.object(roster, "roster", return_value=observed) as observe,
+              mock.patch("scripts.message.send._prompt_pane", side_effect=[OSError("The pane lost confirmation."), None]) as prompt,
+              mock.patch.object(send, "now", return_value=started) as clock):
+            first = send.send(options)
+            new_thread = staff.native_id(fixture_runtime_id("pane-agent-new-thread"))
+            _ = staff.update_current_session(row.current_session, new_thread)
+            entry, = observed.entries
+            observe.return_value = roster.Roster([
+                replace(entry, thread=roster.CodexThread(new_thread), reach=roster.Messageable(f"codex:{new_thread}")),
+            ], [])
+            clock.return_value = started + timedelta(minutes=1)
+            retry = send.send(options)
+        self.assertEqual((first.outcome, retry.outcome), ("pending", "pending"))
+        prompt.assert_called_once()
+
     def test_codex_pane_releases_a_claim_when_its_folder_sync_fails_before_input(self) -> None:
         row, observed = self.codex_agent()
         options = send.parse(["--here", "--to", row.name, "--from", "fixture", "--text", "Read the report.",
@@ -9134,6 +9154,24 @@ class PaneWorkerMessageTests(unittest.TestCase):
             first = send.send(options)
             retry = send.send(options)
         self.assertEqual((first.outcome, retry.outcome), ("pending", "pending"))
+        submit.assert_called_once()
+
+    def test_codex_pane_once_per_key_keeps_confirmation_when_the_key_file_disappears(self) -> None:
+        row, observed = self.codex_agent()
+        options = send.parse(["--here", "--to", row.name, "--from", "fixture", "--text", "Read the report.",
+                              "--key", "report", "--once-per-key"])
+
+        def prompt(_place: HerdrPlace, _text: str, *, target: str, timeout: float) -> None:
+            self.assertEqual((target, timeout), (row.current_session, options.timeout))
+            (self.state / "keys.json").unlink()
+
+        with (mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch("scripts.message.send._prompt_pane", side_effect=prompt) as submit):
+            first = send.send(options)
+            retry = send.send(options)
+        self.assertEqual(first.outcome, "sent")
+        self.assertEqual(retry, send.Result("skipped", send.ONCE_ACCEPTED))
+        self.assertEqual(send.pending_deliveries(send.read_key_states()["report"]), {})
         submit.assert_called_once()
 
     def test_keyed_codex_pane_confirms_one_copy_on_the_first_send(self) -> None:
