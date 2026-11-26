@@ -208,6 +208,7 @@ PlacementEvidenceKeys = dict[tuple[str, placement.PlacementDestination], placeme
 class RetryAfterAvailability:
     """The target needs an available reading taken after the decline."""
     declined_at: float
+    reason: str
 
 
 PLACEMENT_REASON_TEXT = {
@@ -2189,6 +2190,7 @@ class AdmissionServer:
         self.mac_linux_state: MacLinuxStateReady | MacLinuxStateUnavailable = MacLinuxStateUnavailable(
             "The Mac Linux state root setup has not run.")
         self.manual_guest_settlement: set[str] = set()
+        self.mac_linux_read_deadlines: dict[tuple[str, placement.PlacementDestination], float] = {}
         self.execution_evidence: dict[str, execution_identity.ExecutionEvidence] = {}
         self.prerequisites: dict[str, placement.LocalExecutionPrerequisite] = {}
         self.placement_eligibility: dict[str, tuple[placement.CandidateEligibility, ...]] = {}
@@ -4664,7 +4666,7 @@ class AdmissionServer:
         return self.host_evidence(key)
 
     def _request_mac_linux_evidence(self, request: wire.PlacementRequest,
-                                    key: placement.HostEvidenceKey) -> placement.FreshHostEvidence:
+                                    key: placement.HostEvidenceKey) -> placement.HostEvidence:
         now = self.clock.now()
         if any(_holds_consumed_guest_slot(saved) for saved in self.assignments.values()):
             return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion("busy"))
@@ -4673,20 +4675,17 @@ class AdmissionServer:
             return placement.FreshHostEvidence(key, now, "", backoff)
         self.host_requests[key] = request
         current = self.host_evidence(key)
-        if (isinstance(current, placement.FreshHostEvidence) and current.observed_at > backoff.failed_at
-                and (isinstance(current.eligibility, placement.AllowedHost)
-                     or current.eligibility == placement.TemporaryExclusion("blocked"))):
-            if isinstance(current.eligibility, placement.AllowedHost) and any(
-                    is_mac_linux_guest(self.assignments[attempt].assignment.destination)
-                    for episode, attempt in self.current_assignments.items() if episode != request.episode):
-                return replace(current, eligibility=placement.TemporaryExclusion("busy"))
-            return current
+        if isinstance(current, placement.FreshHostEvidence):
+            if current.observed_at > backoff.failed_at:
+                if isinstance(current.eligibility, placement.AllowedHost) and any(
+                        is_mac_linux_guest(self.assignments[attempt].assignment.destination)
+                        for episode, attempt in self.current_assignments.items() if episode != request.episode):
+                    return replace(current, eligibility=placement.TemporaryExclusion("busy"))
+                return current
+            current = placement.StaleHostEvidence(key, current.observed_at, "mac_linux_reading_required")
         if isinstance(self.last_usable_configuration, records.MemoryConfig):
             _ = self._host_evidence_reader(key, self.last_usable_configuration.waiting_pass_seconds)
-        reason = (MAC_LINUX_NO_ANSWER if isinstance(current, placement.FreshHostEvidence)
-                  and current.eligibility == placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER)
-                  else "mac_linux_reading_required")
-        return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion(reason))
+        return current
 
     def _placement_evidence_key(self, request: wire.PlacementRequest,
                                 destination: placement.PlacementDestination, keys: PlacementEvidenceKeys | None = None
@@ -5088,7 +5087,8 @@ class AdmissionServer:
         if not isinstance(block, mac_test.NoMacBlock):
             return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion("blocked"))
         try:
-            _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry))
+            _ = mac_linux.read_guest_main(mac_linux.read_settings(backoff.registry),
+                                        wait_limit_seconds=mac_linux.GUEST_REF_TIMEOUT_SECONDS)
         except (mac_linux.GuestUnavailable, OSError, ValueError, subprocess.SubprocessError):
             return placement.FreshHostEvidence(key, started_at, "", placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER))
         return placement.FreshHostEvidence(key, started_at, "", placement.AllowedHost())
@@ -5519,7 +5519,7 @@ done
                 and (destination.provider == "scaler" or is_mac_linux_guest(destination))
                 and isinstance(report, placement.TerminalAttemptReport)
                 and isinstance(report.outcome, placement.PrelaunchRefused)):
-            return RetryAfterAvailability(report.received_at)
+            return RetryAfterAvailability(report.received_at, report.outcome.reason)
         if (isinstance(retry, placement.DoNotRetry) and retry.reason in placement.SETTINGS_REFUSAL_REASONS
                 and saved.state == placement.ClosedAssignment(retry.reason)):
             generation = (saved.refusal_settings if isinstance(saved.refusal_settings, records.RefusalSettings)
@@ -5565,6 +5565,9 @@ done
                     if isinstance(self.last_usable_configuration, records.MemoryConfig):
                         _ = self._host_evidence_reader(evidence.key, self.last_usable_configuration.waiting_pass_seconds)
                     permitted = placement.EvidenceNeeded("provider availability predates the decline")
+                if (is_mac_linux_guest(destination) and isinstance(retry, RetryAfterAvailability)
+                        and retry.reason == MAC_LINUX_NO_ANSWER and isinstance(permitted, placement.EvidenceNeeded)):
+                    permitted = placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER)
                 if (destination.provider == "scaler" and isinstance(permitted, placement.AllowedHost)
                         and self._cloud_slots_full()):
                     permitted = placement.TemporaryExclusion("cloud slots full")
@@ -5586,6 +5589,17 @@ done
                         permitted = placement.TemporaryExclusion("busy")
                     elif evidence.observed_at < max((item[1] for item in retained), default=float("-inf")):
                         permitted = placement.EvidenceNeeded("provider evidence predates the retained claim report")
+            if is_mac_linux_guest(destination):
+                pair = (request.episode, destination)
+                if isinstance(permitted, placement.EvidenceNeeded):
+                    from scripts.build_targets.mac_linux import GUEST_REF_TIMEOUT_SECONDS
+
+                    now = self.clock.monotonic()
+                    deadline = self.mac_linux_read_deadlines.setdefault(pair, now + GUEST_REF_TIMEOUT_SECONDS)
+                    if now >= deadline:
+                        permitted = placement.TemporaryExclusion(MAC_LINUX_NO_ANSWER)
+                else:
+                    _ = self.mac_linux_read_deadlines.pop(pair, None)
             result.append(placement.CandidateEligibility(destination, permitted))
         return tuple(result), local_holder
 
@@ -5674,6 +5688,9 @@ done
                                     and (pair[1].provider != "local" or pair[0] in self.waiters
                                          or pair[0] not in self.current_assignments)}
         needed = set(self.placement_host_keys.values()) | set(self.settlement_host_keys.values())
+        for pair in tuple(self.mac_linux_read_deadlines):
+            if pair[0] not in active:
+                del self.mac_linux_read_deadlines[pair]
         for key in set(self.host_readers) - needed:
             reader = self.host_readers.pop(key)
             reader.worker.remove(key)
@@ -6116,6 +6133,10 @@ done
                 if (initial_readiness_unchecked and destination.provider == "local"
                         and isinstance(inputs.build_space, records.NoBuildSpaceHold)
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
+                    break
+                if is_mac_linux_guest(destination) and isinstance(candidate.eligibility, placement.EvidenceNeeded):
+                    # Keep later candidates from taking the run before the guest answers.
+                    removed.add(owner)
                     break
                 shared_at = shared_free_at.get((request.episode, destination))
                 if shared_at is None and not isinstance(candidate.eligibility, placement.AllowedHost):

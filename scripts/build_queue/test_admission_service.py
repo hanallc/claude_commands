@@ -486,6 +486,107 @@ class PlacementStatusTests(unittest.TestCase):
                 self.assertEqual(repeated.eligibility[0].eligibility,
                                  placement.EvidenceNeeded("provider evidence expired"))
 
+    def test_placement_waits_for_the_preferred_mac_linux_reading(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture, placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            _ = mac_linux_fixture(fixture)
+            guest = mac_linux_candidate()
+            local = local_candidate(fixture)
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(guest, local)))
+
+            waiting, = fixture.connect(request).replies()
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertEqual(waiting.eligibility, (
+                placement.CandidateEligibility(guest.destination, placement.EvidenceNeeded("not read")),
+                placement.CandidateEligibility(local.destination, placement.AllowedHost()),
+            ))
+            self.assertNotIn(request.episode, fixture.server.reservations)
+
+            _ = publish_candidate(fixture, request)
+            self.run_placement_timer(fixture)
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.Assignment), granted
+            self.assertEqual(granted.assignment.destination, guest.destination)
+
+    def test_placement_uses_natedev_for_a_busy_or_unreachable_mac_linux_reading(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture, placement_request, publish_candidate,
+        )
+
+        for reason in ("busy", placement.MAC_LINUX_NO_ANSWER):
+            with self.subTest(reason=reason), PlacementFixture() as fixture:
+                _ = mac_linux_fixture(fixture)
+                guest = mac_linux_candidate()
+                local = local_candidate(fixture)
+                request = placement_request(fixture)
+                request = replace(request, constraints=replace(request.constraints, candidates=(guest, local)))
+                exclusion = placement.TemporaryExclusion(reason)
+                _ = publish_candidate(fixture, request, exclusion)
+
+                granted, = fixture.connect(request).replies()
+                assert isinstance(granted, wire.LocalPlacementGranted), granted
+                self.assertEqual(granted.assignment.destination, local.destination)
+                self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
+                                 placement.CandidateEligibility(guest.destination, exclusion))
+
+    def test_placement_uses_natedev_at_the_mac_linux_reading_deadline(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture, placement_request,
+        )
+        from scripts.build_targets.mac_linux import GUEST_REF_TIMEOUT_SECONDS
+
+        with PlacementFixture() as fixture:
+            _ = mac_linux_fixture(fixture)
+            guest = mac_linux_candidate()
+            local = local_candidate(fixture)
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(guest, local)))
+
+            waiting, = fixture.connect(request).replies()
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            fixture.clock.advance(GUEST_REF_TIMEOUT_SECONDS - 1)
+            _ = fixture.run_pass()
+            still_waiting, = fixture.connect(request).replies()
+            self.assertIsInstance(still_waiting, wire.PlacementWait)
+
+            fixture.clock.advance(1)
+            _ = fixture.run_pass()
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            self.assertEqual(granted.assignment.destination, local.destination)
+            self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
+                             placement.CandidateEligibility(
+                                 guest.destination, placement.TemporaryExclusion(placement.MAC_LINUX_NO_ANSWER)))
+
+    def test_mac_linux_placement_probe_shares_one_deadline_across_connect_retries(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, mac_linux_candidate, mac_linux_fixture, placement_request,
+        )
+        from scripts.build_targets import mac_linux
+
+        with PlacementFixture() as fixture:
+            _ = mac_linux_fixture(fixture)
+            guest = mac_linux_candidate()
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(guest,)))
+            key = fixture.server.host_evidence_key(request, guest.destination)
+            fixture.server.host_requests[key] = request
+            failed = subprocess.CompletedProcess(("ssh",), mac_linux.INNER_CONNECT_STATUS, "",
+                mac_linux.INNER_CONNECT_MARKER + "\nssh: connect to host fixture port 22: Connection refused\n")
+            expired = subprocess.TimeoutExpired(("ssh",), 5)
+            with (mock.patch.object(mac_linux, "run_guest_ssh", side_effect=(failed, expired)) as ssh,
+                  mock.patch.object(mac_linux, "monotonic", side_effect=(0, 0, 24, 25)),
+                  mock.patch.object(mac_linux, "sleep") as retry_delay):
+                reading = fixture.server.read_provider_evidence(key)
+            assert isinstance(reading, placement.FreshHostEvidence), reading
+            self.assertEqual(reading.eligibility, placement.TemporaryExclusion(placement.MAC_LINUX_NO_ANSWER))
+            self.assertEqual([call.args[1] for call in ssh.call_args_list], [30, 5])
+            retry_delay.assert_called_once_with(mac_linux.CONNECT_RETRY_SECONDS)
+
     def test_placement_poll_sees_a_provider_settings_edit_after_the_timer_pass(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, mac_linux_candidate, mac_linux_fixture, placement_request,
@@ -531,8 +632,7 @@ class PlacementStatusTests(unittest.TestCase):
                 self.run_placement_timer(fixture)
                 repeated, = fixture.connect(request).replies()
                 assert isinstance(repeated, wire.PlacementWait)
-                self.assertEqual(repeated.eligibility[0].eligibility,
-                                 placement.TemporaryExclusion("mac_linux_reading_required"))
+                self.assertEqual(repeated.eligibility[0].eligibility, placement.EvidenceNeeded("not read"))
 
     def test_placement_poll_sees_an_expired_attempt_retry_after_the_timer_pass(self) -> None:
         from scripts.build_queue.test_placement import (
