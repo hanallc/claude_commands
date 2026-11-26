@@ -308,6 +308,7 @@ The standard list starts with the count and size of the folders it would remove.
 For example, it starts with `1 folder, 2.00 MiB, would be removed`.
 A second line gives a count when some folders stay.
 Each row shows the machine, the place, the size, and what happens to it.
+When a program uses a folder, the result can read `stays: the program cargo (pid 42) works in this folder`.
 The list uses GiB for all sizes when the first total is at least 0.01 GiB.
 It uses MiB for all sizes when the total is smaller.
 For example, a result can read `would remove: no program use found; last changed 3 days ago`.
@@ -319,7 +320,8 @@ These lists have no apply command.
 On natedev it also reads the Mac list over SSH.
 If the Mac does not answer, the list gives the cause when known and says it has no folders of the Mac.
 The Mac slot folder is list-only. Bob handles its removal by hand.
-`/build/sccache` is a shared tool cache from the system configuration. The cleanup lists it and keeps it.
+`/build/sccache` is a shared tool cache from the system configuration.
+Its result says `stays: shared tool cache; this tool never removes it`.
 
 The command lists each direct entry under `roots.gate`.
 The list shows `t-` and `targeted-test-` rows first.

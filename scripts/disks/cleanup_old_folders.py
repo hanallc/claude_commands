@@ -252,6 +252,15 @@ SshRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 REMOTE_COMMAND = "~/.claude/scripts/lib/py ~/.claude/scripts/disks/cleanup_old_folders.py --host-list"
 MAC_UNREACHABLE = "mac unreachable"
 PROC_ROOT = "/proc"
+# Keep PWD evidence distinct from the working directory in the sort order.
+PWD_USE = "uses it in PWD"
+PROGRAM_USE_ACTIONS = {
+    tmp_sweep.WORKS_IN: "works in this folder",
+    tmp_sweep.ROOTS_IN: "has its root in this folder",
+    tmp_sweep.MAPS_FILE: "maps a file in this folder",
+    tmp_sweep.HOLDS_FILE: "holds a file open in this folder",
+    tmp_sweep.WRITES_FILE: "holds a file open for writing in this folder",
+}
 DIGEST = re.compile(r"[0-9a-f]{64}")
 CONFIG_SECTION = re.compile(r'\[([a-zA-Z0-9-]+)(?:\.([a-zA-Z0-9.-]+)|[ \t]+"((?:[^"\\]|\\.)*)")?\]')
 CONFIG_KEY = re.compile(r"[a-zA-Z][a-zA-Z0-9-]*")
@@ -1621,7 +1630,7 @@ def collect(machine: Machine, settings: conf.ConfigRead, bounds: CleanupBounds) 
         return expansions[pattern]
 
     for key, decision in (("dead", RemovalAssessment.PENDING),
-                          ("list_only", removal_guard.Kept(f"kept: {reason}, list only"))):
+                          ("list_only", removal_guard.Kept(f"kept: {reason}; this tool never removes it"))):
         configured = settings.value(f"cleanup.{key}.{machine.value}", lambda value: patterns(value, bounds.home),
                                     recover_invalid=False, host_override=conf.HostOverride.IGNORED)
         for pattern in configured:
@@ -1712,11 +1721,20 @@ class CleanupProcessReview:
     pwd_failure: removal_guard.Kept | NoUseFound = NoUseFound.CLEAR
     unreadable_processes: tuple[tuple[int, str], ...] = ()
     gate_paths: GatePathUse = GatePathUse.CLEAR
+    program_names: tuple[tuple[int, str], ...] = ()
 
     def all_uses(self) -> Iterator[tuple[str, int, str]]:
         yield from self.paths
         for path, pid in self.pwd_users:
-            yield str(path), pid, "uses it in PWD"
+            yield str(path), pid, PWD_USE
+
+    def use_reason(self, pid: int, action: str) -> str:
+        if action == PWD_USE:
+            action = tmp_sweep.WORKS_IN
+        name = next((name for number, name in self.program_names if number == pid), None)
+        if name is None:
+            name = process_name(pid)
+        return f"the program {removal_guard.single_line(name)} (pid {pid}) {PROGRAM_USE_ACTIONS.get(action, action)}"
 
 
 class ProcessCheckRequest(TypedDict):
@@ -1736,6 +1754,7 @@ class ProcessCheckResult(TypedDict):
     pwd_failure: str
     unreadable: tuple[tuple[int, str], ...]
     gate_paths: str
+    program_names: tuple[tuple[int, str], ...]
 
 
 class WorkerReview(TypedDict):
@@ -1774,7 +1793,7 @@ def message_rows(raw: object, columns: tuple[type[str] | type[int], ...]) -> Ite
         yield fields
 
 
-def unreadable_records(raw: object) -> tuple[tuple[int, str], ...]:
+def process_name_records(raw: object) -> tuple[tuple[int, str], ...]:
     return tuple((cast(int, pid), cast(str, name)) for pid, name in message_rows(raw, (int, str)))
 
 
@@ -1815,8 +1834,9 @@ class WorkerChannel:
             tuple((Path(cast(str, path)), cast(int, pid))
                   for path, pid in message_rows(fields.get("pwd_users"), (str, int))),
             removal_guard.Kept(pwd_failure) if pwd_failure else NoUseFound.CLEAR,
-            unreadable_records(fields.get("unreadable")),
+            process_name_records(fields.get("unreadable")),
             GatePathUse(gate_paths),
+            program_names=process_name_records(fields.get("program_names")),
         )
 
 
@@ -2096,12 +2116,15 @@ def answer_process_check(channel: WorkerChannel, request: dict[str, object]) -> 
         worker_fds=tmp_sweep.WorkerRemovalDescriptors(pid, frozenset(cast(list[int], fds))),
         gate_root=Path(gate) if gate else GateRootNotSelected.NOT_SELECTED,
     )
+    # Read names in the process table that supplied the paths.
+    pids = {number for _, number, _ in uses.all_uses()}
     result: ProcessCheckResult = {
         "kind": "process-result", "paths": uses.paths, "pwd_users": tuple((str(path), pid) for path, pid in uses.pwd_users),
         "path_failure": uses.path_failure.reason if isinstance(uses.path_failure, removal_guard.Kept) else "",
         "pwd_failure": uses.pwd_failure.reason if isinstance(uses.pwd_failure, removal_guard.Kept) else "",
         "unreadable": uses.unreadable_processes,
         "gate_paths": uses.gate_paths.value,
+        "program_names": tuple((number, process_name(number)) for number in sorted(pids)),
     }
     channel.send(result)
 
@@ -2120,7 +2143,7 @@ def find_process_use(path: Path, uses: CleanupProcessReview, *, sidecars: tuple[
     sidecar_names = frozenset(map(str, sidecars))
     for name, pid, action in sorted(uses.all_uses()):
         if name in sidecar_names or any(name == folder or name.startswith(folder + "/") for folder in folders):
-            return removal_guard.Kept(f"pid {pid} {action}")
+            return removal_guard.Kept(uses.use_reason(pid, action))
     return NoUseFound.CLEAR
 
 
@@ -2145,7 +2168,7 @@ def check_worktree_link(checked: CheckedCleanup, uses: CleanupProcessReview,
         pids = [pid for path, pid in uses.pwd_users if path.is_relative_to(checked.path)]
         if pids:
             pid = min(pids)
-            return removal_guard.Kept(f"pid {pid} {removal_guard.single_line(process_name(pid))} uses the link in PWD")
+            return removal_guard.Kept(uses.use_reason(pid, PWD_USE))
         if isinstance(membership, removal_guard.Kept):
             return membership
         for row in membership.all_rows:
@@ -2168,7 +2191,7 @@ def review_worktree_folder(checked: CheckedCleanup, uses: CleanupProcessReview,
     path = checked.path
     for name, pid, action in sorted(uses.all_uses(), key=lambda use: (use[2] != tmp_sweep.WORKS_IN, use)):
         if Path(name).is_relative_to(path):
-            reason = f"pid {pid} {action}"
+            reason = uses.use_reason(pid, action)
             if isinstance(membership, staff.StaffSnapshot):
                 row = membership.by_worktree(Machine.NATEDEV.value, Path(name))
                 reason += f"; staff row {removal_guard.single_line(row.name)}" if row is not None else "; no staff row found"
@@ -3606,7 +3629,7 @@ def run_masked_cleanup(command: Sequence[str], args: Arguments, run_ssh: SshRunn
         channel = WorkerChannel(cast(TextIO, child.stdout), cast(TextIO, child.stdin))
         report = receive_worker_report(channel, "review")
         local = HostList(Machine.NATEDEV, decode_cleanup_rows(report.get("rows"), Machine.NATEDEV),
-                         unreadable_records(report.get("unreadable")))
+                         process_name_records(report.get("unreadable")))
         if args.go is None:
             finish_worker(child, channel)
 

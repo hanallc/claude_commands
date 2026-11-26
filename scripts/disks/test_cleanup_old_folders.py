@@ -151,7 +151,7 @@ with patch.object(cleanup, "local_machine", return_value=cleanup.Machine.NATEDEV
         fields = cleanup.WorkerChannel(channel, io.StringIO()).receive()
         received = cleanup.HostList(
             cleanup.Machine.NATEDEV, cleanup.decode_cleanup_rows(fields["rows"], cleanup.Machine.NATEDEV),
-            cleanup.unreadable_records(fields["unreadable"]),
+            cleanup.process_name_records(fields["unreadable"]),
         )
         self.assertEqual(received, review)
 
@@ -493,7 +493,8 @@ assert not loaded, sorted(loaded)
         path = self.candidate()
         self.write_settings("~/old")
         for uses, reason in (
-            (tmp_sweep.ProcessUsesKnown([(str(path / "payload"), 42, "holds a file")]), "pid 42 holds a file"),
+            (tmp_sweep.ProcessUsesKnown([(str(path / "payload"), 42, tmp_sweep.HOLDS_FILE)]),
+             "the program <command unavailable> (pid 42) holds a file open in this folder"),
             (tmp_sweep.ProcessUsesIncomplete(), "open file scan is incomplete"),
         ):
             with (self.subTest(reason=reason),
@@ -505,6 +506,24 @@ assert not loaded, sorted(loaded)
             self.assertTrue((path / "payload").is_file())
             scan.assert_called_once_with((str(path),), require_complete=True, same_user_only=True)
 
+    def test_program_use_reason_names_the_action(self) -> None:
+        path = self.candidate()
+        self.write_settings("~/old")
+        proc, pid = self.proc_fixture()
+        _ = (pid / "comm").write_text("cargo\n")
+        for action, description in (
+            (tmp_sweep.ROOTS_IN, "has its root in this folder"),
+            (tmp_sweep.MAPS_FILE, "maps a file in this folder"),
+            (tmp_sweep.WRITES_FILE, "holds a file open for writing in this folder"),
+        ):
+            uses = cleanup_old_folders.CleanupProcessReview(paths=((str(path), 42, action),))
+            with (self.subTest(action=action),
+                  mock.patch.object(cleanup_old_folders, "process_uses", return_value=uses),
+                  mock.patch.object(cleanup_old_folders, "PROC_ROOT", str(proc))):
+                status, output, errors = self.command("--host-list")
+                self.assertEqual((status, errors), (0, ""))
+                self.assertIn(f"stays: the program cargo (pid 42) {description}\n", output)
+
     def proc_fixture(self) -> tuple[Path, Path]:
         proc = self.home / "proc"
         pid = proc / "42"
@@ -515,6 +534,7 @@ assert not loaded, sorted(loaded)
         _ = (pid / "status").write_text(f"Uid: {uid} {uid} {uid} {uid}\nState: S\nThreads: 1\n")
         (pid / "fd").mkdir()
         (pid / "environ").touch()
+        _ = (pid / "comm").write_text("fixture-process\n")
         return proc, pid
 
     def test_list_names_the_user_and_skips_other_users_processes(self) -> None:
@@ -808,8 +828,9 @@ assert not loaded, sorted(loaded)
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
         self.assertRegex(output, rf"{str(free)!r}\t{LIST_SIZE}\twould remove")
-        self.assertRegex(output, rf"{str(cwd)!r}\t{LIST_SIZE}\tstays: pid 44 works in it")
-        self.assertRegex(output, rf"{str(open_file)!r}\t{LIST_SIZE}\tstays: pid 44 holds a file open in it")
+        self.assertRegex(output, rf"{str(cwd)!r}\t{LIST_SIZE}\tstays: the program reader \(pid 44\) works in this folder")
+        self.assertRegex(output, rf"{str(open_file)!r}\t{LIST_SIZE}\tstays: "
+                         + r"the program reader \(pid 44\) holds a file open in this folder")
 
     def test_pwd_denials_keep_folders_and_links_and_name_each_process_once(self) -> None:
         free = self.candidate()
@@ -864,8 +885,9 @@ assert not loaded, sorted(loaded)
         self.assertEqual((status, errors), (0, ""))
         for path in (free, unused_link):
             self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\twould remove")
-        self.assertRegex(output, rf"{str(used_link)!r}\t{LIST_SIZE}\tstays: pid 43 .* uses the link in PWD")
-        self.assertRegex(output, rf"{str(held)!r}\t{LIST_SIZE}\tstays: pid 44 uses it in PWD")
+        for path, pid in ((used_link, 43), (held, 44)):
+            self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\tstays: "
+                             + rf"the program <command unavailable> \(pid {pid}\) works in this folder")
 
     def test_linux_preview_and_apply_use_the_proc_table(self) -> None:
         path = self.candidate()
@@ -878,7 +900,7 @@ assert not loaded, sorted(loaded)
               mock.patch.object(tmp_sweep, "lsof_paths", return_value=tmp_sweep.ProcessUsesIncomplete()) as lsof):
             status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
-            self.assertIn("pid 42 works in", output)
+            self.assertIn("the program fixture-process (pid 42) works in this folder", output)
             cwd.unlink()
             preview = self.approval("--host-list")
             status, output, errors = self.command("--host-list", "--go", preview)
@@ -1234,7 +1256,8 @@ assert not loaded, sorted(loaded)
         (recovery / ".git/run.json").touch()
         mode = cleanup.CleanupMode.MOVE_GATE_GIT
         for evidence, expected in (
-            (cleanup.CleanupProcessReview(paths=((str(used), 42, tmp_sweep.WORKS_IN),)), "pid 42 works in it"),
+            (cleanup.CleanupProcessReview(paths=((str(used), 42, tmp_sweep.WORKS_IN),)),
+             "the program <command unavailable> (pid 42) works in this folder"),
             (cleanup.CleanupProcessReview(path_failure=removal_guard.Kept("open file scan is incomplete")),
              "open file scan is incomplete"),
         ):
@@ -1448,7 +1471,7 @@ assert not loaded, sorted(loaded)
         self.assertEqual(output.count(f"\t{str(self.gate)!r}\t"), 1)
         self.assertRegex(output, rf"{str(self.gate)!r}\tunknown\t.*permission denied")
         self.assertRegex(output, rf"{str(other)!r}\t{LIST_SIZE}\twould remove")
-        self.assertRegex(output, rf"{str(cache)!r}\t{LIST_SIZE}\tstays: shared tool cache, list only")
+        self.assertRegex(output, rf"{str(cache)!r}\t{LIST_SIZE}\tstays: shared tool cache; this tool never removes it")
 
     def test_gate_newest_time_includes_the_lock_and_lease(self) -> None:
         path = self.candidate("t-stamps", home=self.gate)
@@ -1517,8 +1540,9 @@ assert not loaded, sorted(loaded)
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
         row = next(line for line in output.splitlines() if line.startswith(f"natedev\t{str(gate)!r}\t"))
-        self.assertRegex(row, rf"\t{LIST_SIZE}\tstays: pid 42 holds a file open")
-        self.assertEqual(row.count("pid 42 holds a file open"), 1)
+        self.assertRegex(row, rf"\t{LIST_SIZE}\tstays: "
+                         + r"the program fixture-process \(pid 42\) holds a file open in this folder")
+        self.assertEqual(row.count("the program fixture-process (pid 42) holds a file open in this folder"), 1)
 
     def test_gate_list_shows_age_size_and_why_folders_stay(self) -> None:
         large = self.candidate("t-large", home=self.gate)
@@ -1585,11 +1609,11 @@ assert not loaded, sorted(loaded)
                 if changed:
                     _ = (path / "new").write_text("keep the new file")
                     return tmp_sweep.ProcessUsesKnown([])
-                return tmp_sweep.ProcessUsesKnown([(str(path / "payload"), 42, "holds a file")])
+                return tmp_sweep.ProcessUsesKnown([(str(path / "payload"), 42, tmp_sweep.HOLDS_FILE)])
             return tmp_sweep.ProcessUsesKnown([])
 
         for changed, reason in (
-            (False, "pid 42 holds a file"),
+            (False, "the program <command unavailable> (pid 42) holds a file open in this folder"),
             (True, "identity or contents changed since the list was checked"),
         ):
             with self.subTest(changed=changed), mock.patch.object(tmp_sweep, "lsof_paths", side_effect=opened):
@@ -1615,14 +1639,14 @@ assert not loaded, sorted(loaded)
                 status, output, errors = self.command()
                 self.assertEqual((status, errors), (0, ""))
                 self.assertIn(f"{str(path)!r}", output)
-                self.assertIn(f"\tstays: {reason}, list only\n", output)
+                self.assertIn(f"\tstays: {reason}; this tool never removes it\n", output)
                 self.assertNotIn("would remove", output)
                 self.assertEqual(self.command("--host-list", "--go", self.json_digest())[0], 0)
                 self.assertTrue((path / "payload").is_file())
                 with mock.patch.object(cleanup_old_folders, "platform_mounts", return_value=lambda: (Path("/"), path)):
                     status, output, errors = self.command("--host-list")
                     self.assertEqual((status, errors), (0, ""))
-                    self.assertIn(f"{str(path)!r}\tunknown\tstays: {reason}, list only; ", output)
+                    self.assertIn(f"{str(path)!r}\tunknown\tstays: {reason}; this tool never removes it; ", output)
                     self.assertIn(removal_guard.RefusalReason.MOUNT.value, output)
 
     def test_list_only_cache_preserves_the_scan_error(self) -> None:
@@ -1632,7 +1656,7 @@ assert not loaded, sorted(loaded)
         with mock.patch.object(cleanup_old_folders, "inspect_cleanup_tree", side_effect=failure):
             status, output, errors = self.command("--host-list")
         self.assertEqual((status, errors), (0, ""))
-        self.assertIn(f"{str(cache)!r}\tunknown\tstays: shared tool cache, list only; {failure}\n", output)
+        self.assertIn(f"{str(cache)!r}\tunknown\tstays: shared tool cache; this tool never removes it; {failure}\n", output)
 
     def test_only_known_repositories_have_protected_model_folders(self) -> None:
         fixture = self.build / "p-fixture"
@@ -2079,7 +2103,7 @@ assert not loaded, sorted(loaded)
                         return tmp_sweep.ProcessUsesKnown([])
                     with lock.open("r+") as contender, self.assertRaises(BlockingIOError):
                         fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    return tmp_sweep.ProcessUsesKnown([(str(payload), 42, "holds a file")])
+                    return tmp_sweep.ProcessUsesKnown([(str(payload), 42, tmp_sweep.HOLDS_FILE)])
 
                 def start_use(directory: Path | str | int) -> list[str]:
                     nonlocal active
@@ -2100,7 +2124,7 @@ assert not loaded, sorted(loaded)
                       mock.patch.object(removal_guard, "remove_cleanup", side_effect=during_preflight)):
                     status, output, errors = self.command("--host-list", "--go", approval)
                 self.assertEqual((status, errors), (1, ""), output)
-                self.assertIn("pid 42 holds a file", output)
+                self.assertIn("the program <command unavailable> (pid 42) holds a file open in this folder", output)
                 self.assertEqual(payload.read_text(), "keep this file")
 
     def test_partial_cleanup_records_deleted_entries_and_keeps_the_git_marker(self) -> None:
@@ -2159,11 +2183,11 @@ assert not loaded, sorted(loaded)
         _ = (path / "work").write_text("keep active work\n")
         approval = self.approval("--host-list")
         clear = tmp_sweep.ProcessUsesKnown([])
-        active = tmp_sweep.ProcessUsesKnown([(str(path / "work"), 42, "holds a file")])
+        active = tmp_sweep.ProcessUsesKnown([(str(path / "work"), 42, tmp_sweep.HOLDS_FILE)])
         with mock.patch.object(tmp_sweep, "lsof_paths", side_effect=(clear, clear, active)):
             status, output, errors = self.command("--host-list", "--go", approval)
         self.assertEqual((status, errors), (1, ""))
-        self.assertIn("pid 42 holds a file", output)
+        self.assertIn("the program <command unavailable> (pid 42) holds a file open in this folder", output)
         self.assertTrue(self.git(source, "for-each-ref", "refs/rescue"))
         self.assertEqual((path / "work").read_text(), "keep active work\n")
 
@@ -2185,7 +2209,7 @@ assert not loaded, sorted(loaded)
             approval = self.approval("--host-list")
             status, output, errors = self.command("--host-list", "--go", approval)
         self.assertEqual((status, errors), (1, ""), output)
-        self.assertIn("pid 42 holds a file open in it", output)
+        self.assertIn("the program fixture-process (pid 42) holds a file open in this folder", output)
         self.assertTrue((registration / "index").is_file())
         self.assertTrue((path / "work").is_file())
 
@@ -2337,12 +2361,13 @@ assert not loaded, sorted(loaded)
         for extra in (wrapper / "notes.txt", target / "target/notes.txt", profile / "target/debug/notes.txt", notes):
             _ = extra.write_text("keep my notes")
         self.write_settings("~/rust/.saved-target-*")
-        uses = tmp_sweep.ProcessUsesKnown([(str(busy / "target/debug/tool"), 42, "holds a file")])
+        uses = tmp_sweep.ProcessUsesKnown([(str(busy / "target/debug/tool"), 42, tmp_sweep.HOLDS_FILE)])
         with mock.patch.object(tmp_sweep, "lsof_paths", return_value=uses):
             status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
             self.assertRegex(output, rf"{str(clean)!r}\t{LIST_SIZE}\twould remove")
-            self.assertRegex(output, rf"{str(busy)!r}\t{LIST_SIZE}\tstays: pid 42 holds a file")
+            self.assertRegex(output, rf"{str(busy)!r}\t{LIST_SIZE}\tstays: "
+                             + r"the program <command unavailable> \(pid 42\) holds a file open in this folder")
             for path in (wrapper, target, profile, doc, wrong_type, wrong_doc, doc_profile, unknown_directory):
                 self.assertRegex(output, rf"{str(path)!r}\t{LIST_SIZE}\t.*not verified as Cargo output")
             approval = self.list_digest(output)
@@ -2443,7 +2468,7 @@ assert not loaded, sorted(loaded)
             for name in ("dead", "free"):
                 self.assertRegex(output, rf"{str(links[name])!r}\t{LIST_SIZE}\twould remove")
             self.assertRegex(output, rf"{str(links['in-pwd'])!r}\t{LIST_SIZE}\t"
-                             + "stays: pid 42 fixture-shell uses the link in PWD")
+                             + r"stays: the program fixture-shell \(pid 42\) works in this folder")
             self.assertIn("staff row fixture worker", output)
             approval = self.list_digest(output)
             status, output, errors = self.command("--host-list", "--go", approval)
@@ -2466,7 +2491,7 @@ assert not loaded, sorted(loaded)
         with mock.patch.object(cleanup_old_folders, "process_uses", side_effect=(clear, clear, active)):
             status, output, errors = self.command("--host-list", "--go", approval)
         self.assertEqual((status, errors), (1, ""), output)
-        self.assertIn("pid 42 uses it in PWD", output)
+        self.assertIn("the program <command unavailable> (pid 42) works in this folder", output)
         self.assertTrue(path.is_symlink())
 
     def test_link_does_not_probe_its_protected_target(self) -> None:
@@ -2615,7 +2640,7 @@ assert not loaded, sorted(loaded)
               mock.patch.object(staff, "snapshot", return_value=self.staff_at(busy))):
             status, output, errors = self.command("--host-list")
             self.assertEqual((status, errors), (0, ""))
-            self.assertIn("pid 42 works in it; staff row fixture worker", output)
+            self.assertIn("the program fixture-process (pid 42) works in this folder; staff row fixture worker", output)
             self.assertRegex(output, rf"{str(repo)!r}\tunknown\tstays: list only: no setting names it; review only,"
                                      + r" dirty: 1, unpushed: 1, branch: 'fixture-branch'")
             self.assertNotIn(str(model), output)
@@ -2686,7 +2711,8 @@ assert not loaded, sorted(loaded)
                     status, output, errors = self.command("--host-list", "--go", approval)
                 descriptor.unlink()
                 self.assertEqual((status, errors), (1, ""), output)
-                self.assertIn("open file scan is incomplete" if incomplete else "pid 42 holds a file", output)
+                self.assertIn("open file scan is incomplete" if incomplete else
+                              "the program fixture-process (pid 42) holds a file open in this folder", output)
                 self.assertIn(f"deleted {str(path)!r}", output)
                 self.assertFalse(path.exists())
                 self.assertEqual(lease.read_text(), record)
