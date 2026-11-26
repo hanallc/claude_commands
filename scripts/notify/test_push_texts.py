@@ -11,15 +11,18 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Iterator
+from contextlib import redirect_stdout
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest import mock
+from urllib.parse import parse_qs
 
-from scripts.notify import gpu_xid
-from scripts.notify import push_texts
+from scripts.lib import conf
 from scripts.message import session_send
+from scripts.notify import gpu_xid, pushover, push_texts, silence
 from scripts.notify.push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
 from scripts.notify.user_action import ActionRequired, NO_SESSION_LINE, SessionLine
 from scripts.production import nightly_schedule
@@ -187,16 +190,88 @@ class PushTextTests(unittest.TestCase):
         self.assertTrue(entries, "push_catalog.ENTRIES must include script and nixos pushes")
         self.assertEqual(missing_approvals(entries, push_texts.REVIEWED_FILE), [])
 
+    def test_aws_snapshot_examples_show_the_approved_title_action_and_body(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "aws.snapshot_failed")
+        action = "Action: Do the step under For you on the console."
+        cases = {
+            "permission": (
+                "AWS refused a price read",
+                "AWS refused the us-east-2 price read, because our AWS setup does not allow it yet. "
+                + "The step adds the permission. After 2 hours without the read, "
+                + "test runs on AWS can pick a region that costs more.",
+            ),
+            "regional_permissions": (
+                "AWS refused 2 reads",
+                "AWS refused the price read in us-east-2, because our AWS setup does not allow it yet. "
+                + "AWS refused the Standard quota read in us-west-2, because our AWS setup does not allow it yet. "
+                + "The step adds the permission. After 2 hours without the reads, "
+                + "test runs on AWS can pick a region that costs more.",
+            ),
+        }
+        self.assertEqual({example.name for example in entry.examples}, set(cases))
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                title, body = cases[example.name]
+                push = push_texts.render_entry(entry, example.values)
+                self.assertEqual(push.posted_title, title)
+                self.assertEqual(push.message, f"{action}\n{body}")
+                self.assertEqual(push.phone_message, f"{action}\n\n{body}")
+
+    def test_aws_snapshot_phone_message_keeps_every_region_and_the_consequence(self) -> None:
+        config = Path(__file__).resolve().parents[2] / "config/cloud_gate.conf"
+        regions = conf.read(config).words("spot_candidate_regions")
+        failures = json.dumps([{"region": region, "read": "price"} for region in regions])
+        push = push_texts.render("aws.snapshot_failed", failures=failures)
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with (mock.patch.object(pushover, "read_keys", return_value={"user": "user", "token": "token"}),
+              mock.patch.object(pushover, "log"), redirect_stdout(StringIO())):
+            self.assertEqual(pushover.post_message(push.sender, "0", push.posted_title, push.message,
+                                                   Path("unused-test-keys"), post, "", text_id=push.id,
+                                                   action_end=push.action_end), 0)
+        post.assert_called_once()
+        request = parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        self.assertEqual(request["title"], [f"AWS refused {len(regions)} reads"])
+        message, = request["message"]
+        self.assertEqual(message, push.phone_message + "\n\nSent by: buildlog · Template: aws.snapshot_failed")
+        for region in regions:
+            self.assertIn(region, message)
+        self.assertTrue(message.endswith(
+            "After 2 hours without the reads, test runs on AWS can pick a region that costs more."
+            + "\n\nSent by: buildlog · Template: aws.snapshot_failed"))
+
+    def test_phone_preview_matches_delivery_for_a_long_body_with_leading_newlines(self) -> None:
+        sender = "test-sender"
+        text_id = "test.long_note"
+        entry = PushText(text_id, sender, "note", "Long note", push_texts.NoActionNeeded(),
+                         "\r\n" * 40 + "B" * 1100, (PushExample("typical", {}),), purpose="Test.")
+        push = push_texts.render_entry(entry, {})
+        post = mock.Mock(return_value=(200, b'{"status":1}'))
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.object(push_texts, "approval_date", return_value="2026-11-25"),
+              mock.patch.object(pushover, "read_keys", return_value={"user": "user", "token": "token"}),
+              mock.patch.object(pushover, "log"),
+              mock.patch.object(silence, "on_mac", return_value=False),
+              mock.patch.object(silence, "keep_here", return_value=silence.NotSilent()),
+              redirect_stdout(StringIO())):
+            self.assertEqual(pushover.send(["--text-id", text_id], Path("unused-test-keys"), post), 0)
+        post.assert_called_once()
+        request = parse_qs(cast(bytes, post.call_args.args[1]).decode())
+        header = "No action needed."
+        body_length = pushover.MESSAGE_MAX - len(header) - 1 - 80
+        self.assertEqual(push.phone_message, header + "\n\n" + "B" * body_length)
+        self.assertEqual(request["message"], [push.phone_message
+                                             + f"\n\nSent by: {sender} · Template: {text_id}"])
+
     def test_every_catalog_example_fits_the_phone_title_and_body_limits(self) -> None:
         for entry in push_texts.catalog():
             for example in entry.examples:
                 with self.subTest(id=entry.id, example=example.name):
                     push = push_texts.render_entry(entry, example.values)
-                    text = push.message
+                    length = push.phone_message_length
                     if entry.id == "decision.choices":
-                        self.assertLess(len(text), 1024)
+                        self.assertLess(length, 1024)
                     else:
-                        self.assertLess(len(text), 500)
+                        self.assertLess(length, 500)
                     # A one-line text posts no title; its line is the message.
                     self.assertLess(len(push.posted_title), 45)
 
@@ -400,8 +475,8 @@ class PushTextTests(unittest.TestCase):
         entry = replace(self.entry(), session=SessionTemplate("{version}"))
         push = push_texts.render_entry(entry, {"version": "1.2"})
         self.assertEqual(push_texts.shown(entry),
-                         "test  Test.\n\nTemplate:\nTitle: Choose {version}\nSession: {version}\nAction: Reply upgrade or wait.\n"
-                         + "The check passed on {version}.\n\nExample (typical):\nTitle: Choose 1.2\n" + push.message)
+                         "test  Test.\n\nTemplate:\nTitle: Choose {version}\nSession: {version}\nAction: Reply upgrade or wait.\n\n"
+                         + "The check passed on {version}.\n\nExample (typical):\nTitle: Choose 1.2\n" + push.phone_message)
 
     def test_session_template_renders_before_action_and_body(self) -> None:
         entry = replace(self.entry(), session=SessionTemplate("{version}"))

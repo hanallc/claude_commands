@@ -1183,6 +1183,8 @@ It renders the registered `aws.snapshot_failed` text and sends it through `push_
 The message key comes from the streak's start time.
 The notice names each region and read that AWS refused. The saved failure keeps the AWS error code.
 `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, and `not authorized` permit a notice.
+The notice directs the user to the AWS read fix under **For you** on the console.
+The notice says that after two hours without the reads, test runs on AWS can pick a region that costs more.
 The first permission refusal files the **Allow AWS price reads** action with `deploy.py up --approve-resources` on natedev.
 The card reason says, "After 2 hours without the read, test runs on AWS can pick a region that costs more."
 The card shows **Completion: Automatic** and also has a **Done** button.

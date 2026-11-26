@@ -5465,9 +5465,26 @@ with mock.patch.object(sweep, "free_bytes", return_value=130 * sweep.GIB), mock.
         ):
             for offset in (-1, 0, 1):
                 with self.subTest(state=state, offset=offset), redirect_stderr(io.StringIO()):
-                    _ = write_config_fixture(conf.path("lint"), f"sweep_push_text_limit={len(rendered.message) + offset}\n")
+                    _ = write_config_fixture(conf.path("lint"), f"sweep_push_text_limit={rendered.phone_message_length + offset}\n")
                     push = sweep.fit_disk_floor_push(140 * GIB, 150 * GIB, selected, lint_settings=conf.read("lint"))
                     self.assertEqual(push, rendered if offset == 1 else fallback)
+
+    def test_disk_floor_push_falls_back_when_the_separator_reaches_500_characters(self) -> None:
+        _ = self.base()
+        free, floor = 140 * GIB, 150 * GIB
+        label = "/private/output"
+        choice = sweep.FolderChoice(label, 180 * GIB, sweep.FolderChoiceKind.OTHER)
+        short = sweep.disk_floor_push(free, floor, sweep.AvailableFolderChoices((choice,)))
+        label += "x" * (499 - len(short.message))
+        choices = sweep.AvailableFolderChoices((replace(choice, label=label),))
+        full = sweep.disk_floor_push(free, floor, choices)
+        self.assertEqual(len(full.message), 499)
+        self.assertEqual(full.phone_message_length, 500)
+        _ = write_config_fixture(conf.path("lint"), "sweep_push_text_limit=500\n")
+
+        fallback = sweep.disk_floor_push(free, floor, sweep.UNAVAILABLE_FOLDER_CHOICES)
+        self.assertLess(fallback.phone_message_length, 500)
+        self.assertEqual(sweep.fit_disk_floor_push(free, floor, choices, lint_settings=conf.read("lint")), fallback)
 
     def test_protected_recommendation_names_its_folder_among_several_choices(self) -> None:
         with self.crossing_delivery({}) as delivery:
