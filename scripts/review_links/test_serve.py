@@ -11,6 +11,7 @@ import errno
 import fcntl
 import base64
 import hashlib
+import html
 import importlib.util
 import io
 import ipaddress
@@ -7136,7 +7137,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertNotIn(top, cast(dict[str, str], json.loads(state.body))["detail_html"])
                     page = self.request(studio_page.PAGE_PATH).body.decode()
                     self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority"', page)
-                    self.assertIn(f'<b>#{item.number} {item.title}</b>', page)
+                    link = html.escape(list_page.item_link(morty.id, item.number))
+                    self.assertIn(f'<a class="list-top-link" data-record-jump href="{link}">'
+                                  + f'#{item.number} {item.title}</a>', page)
 
     def test_studio_pictures_are_guarded_named_files_under_the_avatar_root(self) -> None:
         avatars = self.root.parent.resolve() / "studio-avatars"
@@ -7646,6 +7649,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                          sorted([unit.id, morty.id]))
         self.assertEqual(record["sent"], {unit.id: True, morty.id: True})
         message = cast(str, delivery.call_args.args[2])
+        self.assertTrue(message.startswith(f"Studio: nate pressed Go for item {item.number}."))
         self.assertIn("What: Merge needsme to main.", message)
         self.assertIn(f"{go_ledger.CHECK_COMMAND} {go_id}", message)
         saved = the_list.load(morty.id, item.id)
@@ -7916,8 +7920,10 @@ class ReviewLinksServerTests(unittest.TestCase):
         unit = replace(unit, parent=staff.ReportsTo(runner.id))
         _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty, unit, runner))))
         _ = the_list.update(morty.id, item.id, {"owner": unit.id}, source="morty")
+        retried_messages: list[str] = []
         def unit_offline(recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
             if recipient == unit.id:
+                retried_messages.append(_message)
                 raise OSError("The session is offline.")
         code, _reply, delivery = self.post_go(body, send_error=unit_offline)
         self.assertEqual(code, 200)
@@ -7931,6 +7937,9 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual((record["sent"], record["reported"]), ({unit.id: False, morty.id: True}, {unit.id: True, morty.id: False}))
         self.assertEqual(go_ledger.unsent(self.root), (go_id,))
         closed = the_list.load(morty.id, item.id).asks[0]
+        legacy = {name: value for name, value in record.items() if name != "origin"}
+        _ = entry.write_text(json.dumps(legacy))
+        retried_messages.clear()
         not_delivered = lambda: [change.what for change in the_list.load(morty.id, item.id).log
                                  if isinstance(change.what, the_list.GoNotDelivered)]
         self.assertEqual(not_delivered(), [the_list.GoNotDelivered(closed, unit.id)])
@@ -7940,6 +7949,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                                    client="192.0.2.9", page="page", moment=the_list.now())
         self.assertEqual(go_ledger.unsent(self.root), tuple(sorted((go_id, waiting["go_id"]))))
         self.assertEqual(self.restart_and_recover_goes(unit_offline), [unit.id] * 3, "no new alert to the showrunner")
+        original = cast(str, delivery.call_args_list[0].args[2])
+        self.assertEqual(retried_messages, [original.replace("Studio:", "List page:", 1)] * 3)
         self.assertEqual(not_delivered(), [the_list.GoNotDelivered(closed, unit.id)])
         self.assertEqual(go_ledger.unsent(self.root), (go_id,), "no ask holds the waiting go id, so the start removed it")
         self.assertTrue(the_list.load(morty.id, item.id).asks[1].is_open)
@@ -8129,7 +8140,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(saved.log[:-1], parked.log)
                 self.assertEqual(saved.log[-1].what,
                                  the_list.UnparkNoChangeReceipt(
-                                     the_list.PageRequest(request, "unpark", "List page: nate unparked item 1."),
+                                     the_list.PageRequest(request, "unpark", "Studio: nate unparked item 1."),
                                      the_list.UnparkNoChangeReason.EXPIRED))
                 reparked = the_list.park(morty.id, item.id, new_time, source="morty")
                 delivered.clear()
