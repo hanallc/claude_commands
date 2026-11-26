@@ -271,16 +271,21 @@ Images uses the page notice if the image is deleted and the list cannot refresh.
 The shared frame freezes the title, the action area, and the status line at the top of the page.
 Review also freezes Search.
 Search sits to the right of the status above 800 px and below the status at smaller widths.
+The Studio also freezes the Producer picture tabs, Search, the Owner and Show chips, and the Unread only switch.
+The Top priority card scrolls with the table.
 The frozen top has an opaque page background.
 The content scrolls under it.
 At widths of 640 px or less, only the title stays in view.
 The action area and status line scroll with the content at these widths.
 Review Search also scrolls with the content at these widths.
+The Studio filters scroll with the content at these widths.
+The Studio table header sticks directly below the frozen top at all widths.
 The action area holds the owner name and the New item button.
 The script puts the actions beside the title when they fit on one line.
 When they do not fit, the actions stay above the title.
 The frame measures the frozen top when its size changes.
 It uses this height as the page scroll padding for anchor jumps and focused rows.
+The Studio adds the table header height to the scroll padding.
 A page can add action buttons between the owner name and New item.
 `page_frame.page_action_button(action, icon, label, dialog_id)` makes one button, and pages pass it through `actions`.
 `owner_control()` and `with_owner()` take `actions`. The names `new-item` and `owner` are reserved.

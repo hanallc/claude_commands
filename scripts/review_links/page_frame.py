@@ -134,7 +134,8 @@ HEADING_STYLE = ('.page-heading{box-sizing:border-box;display:flex;align-items:c
 # Modal dialogs and the image zoom use the browser top layer.
 PAGE_TOP_STYLE = """
 :root{scroll-padding-top:var(--page-top-height,0px)}
-main:has(>.page-top>.page-status,>.page-top>.page-heading>h1):not(.page-wide){max-width:1124px}
+main:has(>.page-top>.page-status,>.page-top>.page-heading>h1,>div>.page-top>[data-page-top-controls]):not(.page-wide){
+max-width:1124px}
 .page-top{position:sticky;top:0;z-index:4;display:flow-root;flex:0 0 100%;min-width:0;
 margin-block:-8px 12px;padding-block:8px;background:var(--bg,Canvas)}
 .page-top>.page-status{position:relative;top:auto;z-index:auto;padding-block:0;margin:0}
@@ -377,8 +378,8 @@ def icon_svg(name: str) -> str:
     return source[source.index("<svg"):].replace("<svg", '<svg aria-hidden="true" focusable="false"', 1)
 
 
-def title(text: str, page: str, *, status_companion: str = "") -> str:
-    """Build the title and refresh status with an optional control."""
+def title(text: str, page: str, *, status_companion: str = "", frozen_controls: str = "") -> str:
+    """Build the title, refresh status and optional frozen controls."""
     settings = conf.read_or_repository("console")
     status_page = "list" if page == "studio" else page
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
@@ -390,6 +391,7 @@ def title(text: str, page: str, *, status_companion: str = "") -> str:
                         ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),
                         ('Failed', 'triangle-alert'), ('Paused', 'circle-pause')))
     heading = f'<h1 class="page-title">{html.escape(text)}</h1>'
+    controls = f'<div data-page-top-controls>{frozen_controls}</div>' if frozen_controls else ''
     return (PAGE_TOP + heading
             + '<p class="page-status" data-page-status data-state="Reading" role="status" aria-live="off" '
             + f'data-status-options="{html.escape(json.dumps(options), quote=True)}" data-page-facts>'
@@ -397,7 +399,7 @@ def title(text: str, page: str, *, status_companion: str = "") -> str:
             + '<span data-status-age hidden></span><span data-status-trip hidden></span>'
             + '<span data-status-render hidden></span><span data-status-reason hidden></span>'
             + '<span class="page-status-announcement" aria-live="polite" data-status-announcement></span></p>'
-            + status_companion + '</div>'
+            + status_companion + controls + '</div>'
             + PAGE_TOP_SCRIPT + HEADING_MEASURE)
 
 

@@ -83,6 +83,12 @@ def tabs(chips: Iterable[record_table.Chip], selected: str) -> str:
 
 
 STYLE = '''<style>
+:root{scroll-padding-top:calc(var(--page-top-height,0px) + var(--studio-table-heading-height,0px))}
+[data-page-top-controls]{display:flow-root;margin-top:20px}
+[data-list]>.list-table{overflow:clip}
+[data-list]>.list-table thead{position:sticky;top:var(--page-top-height,0px);z-index:3;background:var(--card)}
+@media(max-width:960px){[data-list]>.list-table thead{background:var(--bg)}}
+@media(max-width:640px){[data-page-top-controls]{margin-top:0}}
 .studio-tab-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-bottom:12px}
 .studio-tab-row>.record-filter-words{margin-block:0}
 .studio-tab-row>.record-filter-words input{display:block}
