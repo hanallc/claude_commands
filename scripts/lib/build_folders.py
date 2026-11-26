@@ -750,18 +750,27 @@ def _shared_claims(folders: set[Path], root: Path) -> Generator[tuple[int, ...]]
 
 
 @contextmanager
-def build_folder_creation(path: Path, *, publish_lease: bool = False) -> Generator[tuple[int, ...]]:
-    """Take shared claim locks before creating a build folder or any parent."""
+def build_folder_creation(path: Path, *, publish_lease: bool = False,
+                          reserve_repository: bool = False) -> Generator[tuple[int, ...]]:
+    """Hold claim locks before creation. Reserve a repository during a mirror transfer."""
     root = build_root().resolve()
     locations = _claim_locations(path, root)
     folders = {folder for location in locations for folder in (location, *location.parents)
                if folder.is_relative_to(root) and folder != root}
-    with _shared_claims(folders, root) as claims, ExitStack() as locks:
+    with ExitStack() as locks:
+        reserved: tuple[int, ...] = ()
+        repository = path.resolve()
+        if reserve_repository and repository.parent == root:
+            descriptor = locks.enter_context(build_folder_claim_lock(repository, root, exclusive=True))
+            assert descriptor is not None
+            reserved = (descriptor,)
+            folders.remove(repository)
+        claims = locks.enter_context(_shared_claims(folders, root))
         if publish_lease:
             for location in sorted(locations):
                 if location.parent == root and is_temporary_build_folder(location, require_lease=False):
                     _ = locks.enter_context(_parent_lease_lock(location, root, publish=True, create=True))
-        yield claims
+        yield (*claims, *reserved)
 
 
 def parse_form(path: Path) -> ParsedFolder:
@@ -1175,6 +1184,71 @@ def folder_lease_fields(path: Path) -> dict[str, object]:
     """Read lease fields for a status display."""
     with build_folder_lock.folder_parent(path, build_root(), create=False) as directory:
         return _read_folder_lease(path, directory)
+
+
+def _is_configured_fixed_build_folder(path: Path, root: Path) -> bool:
+    if path.parent.parent == root:
+        with suppress(InvalidFolderForm):
+            return isinstance(build_folder_form(path.name), FixedRepositoryBuildFolders)
+    return False
+
+
+def _has_fixed_build_lease(path: Path, parent: int) -> bool:
+    try:
+        fields = _read_folder_lease(path, parent, allow_empty=True)
+    except FileNotFoundError:
+        return False
+    except ValueError as error:
+        raise ValueError(f"{lease_path(path)}: invalid build folder lease: {error}") from error
+    repository = fields.get("repository")
+    return fields.get("machine") == path.name and (
+        repository == path.parent.name
+        or (_HIDDEN_REMOVAL.fullmatch(path.parent.name) is not None and isinstance(repository, str)))
+
+
+def is_fixed_build_folder(path: Path) -> bool:
+    """Check whether the path names a fixed repository build folder."""
+    folder = path.resolve()
+    if _is_configured_fixed_build_folder(folder, build_root().resolve()):
+        return True
+    try:
+        with build_folder_lock.folder_parent(folder, folder.parent, create=False) as parent:
+            return _has_fixed_build_lease(folder, parent)
+    except FileNotFoundError:
+        return False
+
+
+class FixedBuildFolderRemovalRefused(PermissionError):
+    """The removal tree contains a fixed repository build folder."""
+
+    def __init__(self, folder: Path) -> None:
+        super().__init__(f"{folder}: cannot remove a fixed build folder")
+
+
+def require_no_fixed_build_folders(path: Path, *, include_root: bool = True) -> None:
+    """Refuse removal of a fixed folder or its ancestor."""
+    if include_root and is_fixed_build_folder(path):
+        raise FixedBuildFolderRemovalRefused(path)
+
+    def unreadable(error: OSError) -> None:
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    root = build_root().resolve()
+    with suppress(FileNotFoundError), ExitStack() as opened:
+        folders = cast(Generator[tuple[str, list[str], list[str], int]], os.fwalk(path.resolve(), onerror=unreadable))
+        _ = opened.callback(folders.close)
+        for directory, children, files, parent in folders:
+            folder = Path(directory)
+            for name in children:
+                child = folder / name
+                if folder.parent != root and lease_path(child).name not in files:
+                    continue
+                with suppress(FileNotFoundError):
+                    if not stat.S_ISDIR(os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode):
+                        continue
+                    if _is_configured_fixed_build_folder(child, root) or _has_fixed_build_lease(child, parent):
+                        raise FixedBuildFolderRemovalRefused(child)
 
 
 def gate_folder_lease_fields(path: Path, root: Path) -> dict[str, object]:
@@ -2329,6 +2403,8 @@ class CheckedRemovalTree:
     info: os.stat_result
 
     def remove(self, *, repair_access: bool = False, metadata_last: Collection[str] = ()) -> None:
+        if _HIDDEN_REMOVAL.fullmatch(self.path.name) is None:
+            require_no_fixed_build_folders(self.path)
         _delete_renamed_folder(self.path, self.parent, self.info,
                                repair_access=repair_access, metadata_last=metadata_last)
 
@@ -2412,7 +2488,7 @@ def _remove_folder(path: Path, directory: int, allocated: os.stat_result, *,
                     return False
                 refusal = _hold_child_leases(
                     hidden, directory, leases, wait=False, held=held, repair_access=repair_access,
-                    review_root=review_root)
+                    review_root=review_root, original_path=path)
             except (OSError, ValueError):
                 return False
             if isinstance(refusal, RefusedRemovalLease):
@@ -2729,9 +2805,13 @@ def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool 
                        probe_fds: list[int] | None = None, held: set[tuple[int, int]] | None = None,
                        repair_access: bool = False, check_owners: bool = False,
                        review_root: Path | None = None,
-                       inspect: Callable[[Path, set[str], set[str]], None] | None = None) -> RefusedRemovalLease | None:
+                       inspect: Callable[[Path, set[str], set[str]], None] | None = None,
+                       original_path: Path | None = None) -> RefusedRemovalLease | None:
     """Hold child leases through the open parent. Skip inodes already held."""
     scan_root = path
+    build = build_root().resolve()
+    source = original_path if original_path is not None else path
+    layout_root = source.parent.resolve() / source.name
 
     def visit(path: Path, parent: int) -> RefusedRemovalLease | None:
         try:
@@ -2740,6 +2820,9 @@ def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool 
             return None
         if not stat.S_ISDIR(expected.st_mode):
             return None
+        original = layout_root / path.relative_to(scan_root)
+        if _is_configured_fixed_build_folder(original, build):
+            raise FixedBuildFolderRemovalRefused(original)
         with ExitStack() as opened:
             try:
                 directory = _open_removal_directory(path, parent, expected, opened, repair_access=repair_access)
@@ -2772,6 +2855,10 @@ def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool 
                         raise TemporaryFolderReview(EXTERNAL_LINK_REASON)
             if inspect is not None:
                 inspect(path, children, entries)
+            for name in folders:
+                child = path / name
+                if lease_path(child).name in entries and _has_fixed_build_lease(child, directory):
+                    raise FixedBuildFolderRemovalRefused(original / name)
             for name in entries:
                 stem = name.removesuffix(".lock")
                 if not stem or stem == name:
@@ -2809,6 +2896,8 @@ def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool 
                     return refusal
         return None
 
+    if _has_fixed_build_lease(source, parent):
+        raise FixedBuildFolderRemovalRefused(layout_root)
     return visit(path, parent)
 
 
@@ -3072,6 +3161,9 @@ def _remove_build_folder(path: Path, *, temporary: bool = True, dir_fd: int | No
                 return _FolderRemoval.LOCK_CHANGED
             if lease.created:
                 _ = parents.callback(_unlink_transient_lock, lease)
+            if (_is_configured_fixed_build_folder(path.parent.resolve() / path.name, build_root().resolve())
+                    or _has_fixed_build_lease(path, directory)):
+                return _FolderRemoval.PROTECTED
             try:
                 allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
             except FileNotFoundError:
@@ -3239,17 +3331,17 @@ def recover_staged_folder(source: Path, name: str, device: int, inode: int, *, d
         return False
     path = source.with_name(name)
     if dir_fd is not None:
-        return _recover_staged_folder(path, dir_fd, wait=False, identity=(device, inode))
+        return _recover_staged_folder(path, dir_fd, wait=False, identity=(device, inode), source=source)
     with ExitStack() as parents:
         try:
             directory = parents.enter_context(build_folder_lock.folder_parent(path, source.parent, create=False))
         except FileNotFoundError:
             return False
-        return _recover_staged_folder(path, directory, wait=False, identity=(device, inode))
+        return _recover_staged_folder(path, directory, wait=False, identity=(device, inode), source=source)
 
 
 def _recover_staged_folder(path: Path, directory: int, *, wait: bool,
-                           identity: tuple[int, int] | None = None) -> bool:
+                           identity: tuple[int, int] | None = None, source: Path | None = None) -> bool:
     """Hold the staging lock through deletion of the matching folder."""
     with ExitStack() as leases:
         original: os.stat_result | None = None
@@ -3278,7 +3370,13 @@ def _recover_staged_folder(path: Path, directory: int, *, wait: bool,
                     _publish_lease(path, directory, _staging_identity(original))
                 elif recorded != _staging_identity(original):
                     return False
-                refusal = _hold_child_leases(path, directory, leases, wait=wait, repair_access=True)
+                if source is None:
+                    for name in os.listdir(directory):
+                        if name.endswith(".lease.json") and _has_fixed_build_lease(
+                                path.with_name(name.removesuffix(".lease.json")), directory):
+                            return False
+                refusal = _hold_child_leases(path, directory, leases, wait=wait, repair_access=True,
+                                             original_path=source)
                 if isinstance(refusal, RefusedRemovalLease):
                     return False
         except (OSError, ValueError):

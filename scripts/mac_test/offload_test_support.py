@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 import json
 import os
+import re
 import select
 import shlex
 import signal
@@ -803,18 +804,34 @@ raise SystemExit(offload.main())
     def leftover_events(self) -> list[CommandEvent]:
         return [event for event in self.events_for("ssh") if "select_leftovers()" in event["args"][-1]]
 
-    def fixed_selector_patterns(self) -> tuple[str, str]:
+    def fixed_selector_patterns(self, remote: str = "") -> tuple[str, str]:
         path = (self.stub_directory / "fixed-checkout").read_text().strip()
         self.assertTrue(Path(path).is_absolute())
         home = Path(self.environment["HOME"]).resolve()
         self.assertEqual(path, str(home / "build.fixture" / "hana" / "mac"))
-        parent = str(home.parent).removeprefix("/").replace(".", "[.]").replace(" ", "[ ]")
-        mirror = f"[/]{parent}/home/build[.]fixture/hana/mac"
-        return f"{mirror}([/'\"[:space:]]|$)", f"^n{mirror}(/|$)"
+        expected = re.escape(path)
+        if not remote:
+            remote = self.leftover_events()[-1]["args"][-1]
+        assignments = {match[1]: match[2] for match in
+                       re.finditer(r"^mirror_(command|cwd)_pattern=(.+)$", remote, re.MULTILINE)}
+        command, = shlex.split(assignments["command"])
+        cwd, = shlex.split(assignments["cwd"])
+        self.assertIn("build[.]fixture", command)
+
+        def normalize(pattern: str) -> str:
+            # Python also escapes a hyphen outside brackets.
+            return re.sub(r"\[(.)\]|-", lambda match: re.escape(match[1] or match[0]), pattern)
+
+        ending = "([/'\"[:space:]]|$)"
+        self.assertTrue(command.startswith("[/]") and command.endswith(ending), command)
+        self.assertEqual(normalize(command.removesuffix(ending)), expected)
+        self.assertTrue(cwd.startswith("^n[/]") and cwd.endswith("(/|$)"), cwd)
+        self.assertEqual(normalize(cwd.removeprefix("^n").removesuffix("(/|$)")), expected)
+        return command, cwd
 
     def assert_leftover_selectors(self, remote: str) -> None:
         if (self.stub_directory / "fixed-checkout").exists() and "recover_fixed_offload_folder" not in remote:
-            command, cwd = self.fixed_selector_patterns()
+            command, cwd = self.fixed_selector_patterns(remote)
         else:
             command, cwd = HANA_COMMAND_PATTERN, HANA_CWD_PATTERN
         self.assertIn(f"mirror_command_pattern={shlex.quote(command)}\n", remote)

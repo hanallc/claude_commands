@@ -30,7 +30,7 @@ from scripts.copies import copies
 from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
-from scripts.lib import build_folders, conf, file_lock, scratch
+from scripts.lib import build_folder_lock, build_folders, conf, file_lock, scratch
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import floor_claims, mac_gate
@@ -135,6 +135,79 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertEqual(record.read_bytes(), before)
         self.assertEqual(output.read_text(), "Cargo output\n")
         self.assertFalse(floor_claims.removal_authority_path(folder).exists())
+
+    def test_mirror_remove_refuses_a_tree_with_fixed_build_folders(self) -> None:
+        builds = build_folders.build_root()
+        layouts = ((builds, "hana"), (builds / "archived" / "old-build", "other"))
+        for index, (root, repository) in enumerate(layouts):
+            with mock.patch.object(build_folders, "build_root", return_value=root):
+                with build_folders.fixed_repository_build_folder(repository, machine="mac", unit="alpha") as folder:
+                    output = build_folders.fixed_cargo_folder(folder) / "compiled"
+                    output.parent.mkdir(exist_ok=True)
+                    _ = output.write_text("Cargo output\n")
+            tree = builds / ("hana" if root == builds else "archived")
+            mirror = self.remote(path=str(tree))
+            copies.mark_mirror(tree, mirror.owner, mirror.repository.name, mirror.session)
+            record = tree / floor_claims.MIRROR_RECORD
+            before = record.read_bytes()
+            authority = floor_claims.removal_authority_path(tree)
+            remove = mirror_arguments(mirror, "mirror-remove")
+            receive = mirror_arguments(mirror, "mirror-receive")
+            with (self.subTest(folder=folder),
+                  mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+                  mock.patch.object(build_folders.CheckedRemovalTree, "remove",
+                                    side_effect=AssertionError("The fixed build folder reached removal"))):
+                with self.assertRaisesRegex(copies.CopyError, "fixed build folder"):
+                    _ = copies.mirror_remove(remove)
+                self.assertFalse(authority.exists())
+                self.assertFalse(build_folders.remove_build_folder(tree, wait=False))
+                with self.assertRaisesRegex(copies.CopyError, "fixed build folder"):
+                    _ = copies.mirror_run(receive)
+                self.assertEqual(record.read_bytes(), before)
+                self.assertEqual(output.read_text(), "Cargo output\n")
+
+                stage = tree.with_name(f".removing-123-{index:016x}")
+                _ = tree.rename(stage)
+                info = stage.stat()
+                with stage.with_suffix(".lock").open("wb") as lock:
+                    build_folder_lock.mark_lock(lock.fileno())
+                write_text_atomic(build_folders.lease_path(stage), json.dumps({
+                    "device": info.st_dev, "inode": info.st_ino,
+                }))
+                pending = floor_claims.read_mirror_record(stage / floor_claims.MIRROR_RECORD)
+                pending.update(build_folders.StagedRemoval(stage.name, info.st_dev, info.st_ino).fields())
+                write_text_atomic(authority, json.dumps(pending))
+                with self.assertRaisesRegex(copies.CopyError, "staged mirror could not be removed"):
+                    _ = copies.mirror_remove(remove)
+                self.assertEqual((stage / output.relative_to(tree)).read_text(), "Cargo output\n")
+                self.assertTrue(authority.is_file())
+
+    def test_mirror_receive_refreshes_a_fixed_folder_with_pending_removal(self) -> None:
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            cargo = build_folders.fixed_cargo_folder(folder)
+            cargo.mkdir(exist_ok=True)
+            output = cargo / "compiled"
+            _ = output.write_text("Cargo output\n")
+            keep = build_folders.copy_keep_file(folder)
+            _ = keep.write_text("The transfer holds this checkout.\n")
+            mirror = replace(self.remote(path=str(folder)), repository=copies.SelectedRepository("hana"))
+            copies.mark_mirror(folder, mirror.owner, mirror.repository.name, mirror.session)
+            record = folder / floor_claims.MIRROR_RECORD
+            authority = floor_claims.removal_authority_path(folder)
+            _ = authority.write_bytes(record.read_bytes())
+            received = folder / "received"
+            args = mirror_arguments(replace(mirror, session="new-session"), "mirror-receive")
+            args.command = [sys.executable, "-c", "import sys; from pathlib import Path; Path(sys.argv[1]).touch()",
+                            str(received)]
+            with (mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+                  mock.patch.object(build_folders.CheckedRemovalTree, "remove",
+                                    side_effect=AssertionError("The fixed build folder reached removal"))):
+                self.assertEqual(copies.mirror_run(args), 0)
+            self.assertTrue(received.is_file())
+            self.assertFalse(authority.exists())
+            self.assertEqual(json.loads(record.read_bytes())["session"], "new-session")
+            self.assertEqual(output.read_text(), "Cargo output\n")
+            self.assertEqual(keep.read_text(), "The transfer holds this checkout.\n")
 
     def test_deferred_removal_reports_missing_ssh_and_keeps_the_request(self) -> None:
         mirror = self.remote()

@@ -2644,7 +2644,8 @@ def local_mirror_lease(tree: Path, session: str, *, create: bool = True,
         yield
         return
     parent_lock = floor_claims.mirror_parent_lock_path(tree)
-    with build_folders.build_folder_creation(tree) as claims, ExitStack() as leases:
+    with (build_folders.build_folder_creation(tree, reserve_repository=not create_tree) as claims,
+          ExitStack() as leases):
         parent_lock.parent.mkdir(parents=True, exist_ok=True)
         lease_files: list[TextIO] = []
         check = "mirror lease"
@@ -2820,33 +2821,19 @@ def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.ClaimSnapshot]:
         yield claims
 
 
-def is_fixed_build_folder(tree: Path) -> bool:
-    """Identify a fixed folder from its form or a lease under a former build root."""
-    folder = tree.resolve()
-    if folder.parent.parent == build_folders.build_root().resolve():
-        with suppress(build_folders.InvalidFolderForm):
-            if isinstance(build_folders.build_folder_form(folder.name), build_folders.FixedRepositoryBuildFolders):
-                return True
-    lease = build_folders.lease_path(folder)
+def check_mirror_removal(tree: Path, *, include_root: bool = True) -> None:
     try:
-        record = cast(object, json.loads(read_regular_metadata(lease)))
-    except FileNotFoundError:
-        return False
-    except ValueError as error:
-        raise CopyError(f"{lease}: invalid build folder lease: {error}") from error
-    if not isinstance(record, dict):
-        raise CopyError(f"{lease}: invalid build folder lease")
-    fields = cast(dict[str, object], record)
-    return fields.get("machine") == folder.name and fields.get("repository") == folder.parent.name
+        build_folders.require_no_fixed_build_folders(tree, include_root=include_root)
+    except (build_folders.FixedBuildFolderRemovalRefused, ValueError) as error:
+        raise CopyError(str(error)) from error
 
 
 def mirror_remove(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
-    if is_fixed_build_folder(tree):
-        raise CopyError(f"{tree}: mirror-remove cannot remove a fixed build folder")
     authority = floor_claims.removal_authority_path(tree)
     with local_mirror_lease(tree, args.session, create=False):
         with mirror_metadata_locks(tree) as claims:
+            check_mirror_removal(tree)
             if (not tree.exists() and not authority.exists() and not scratch.removal_mark(tree).exists()
                     and not scratch.cargo_removal_mark(tree).exists()):
                 return 0
@@ -2880,15 +2867,19 @@ def mirror_remove(args: CopyArguments) -> int:
                             != (str(tree.resolve()), args.owner, args.repository, args.session, args.session)):
                         raise CopyError(f"{tree}: clone registration changed")
                     task_record = tree / copy_record.RECORD
-                write_text_atomic(authority, json.dumps(raw) + "\n")
                 # A task clone or a temporary gate goes as one task folder; an editable copy keeps its folder rules.
                 if task_record is not None and copy_record.copy_folder(tree) != tree.resolve():
-                    scratch.remove_marked(task_record.parent)
+                    task_folder = task_record.parent
+                    if task_folder != tree.resolve():
+                        check_mirror_removal(task_folder)
+                    write_text_atomic(authority, json.dumps(raw) + "\n")
+                    scratch.remove_marked(task_folder)
                     # A task clone is its task folder, so its lock files sit in the scratch root.
-                    if task_record.parent == tree.resolve():
+                    if task_folder == tree.resolve():
                         for lock in (floor_claims.mirror_lock_path(tree), floor_claims.record_lock_path(tree)):
                             lock.unlink(missing_ok=True)
                 else:
+                    write_text_atomic(authority, json.dumps(raw) + "\n")
                     _remove_mirror_tree(tree, raw)
             if scratch.removal_mark(tree).exists() or scratch.cargo_removal_mark(tree).exists():
                 scratch.remove_marked(tree)
@@ -3261,27 +3252,42 @@ def receive_metadata(tree: Path, args: CopyArguments) -> None:
     """Finish pending removal and publish all metadata before deleting its authority."""
     authority = floor_claims.removal_authority_path(tree)
     record = tree / floor_claims.MIRROR_RECORD
+    try:
+        fixed = build_folders.is_fixed_build_folder(tree)
+    except ValueError as error:
+        raise CopyError(str(error)) from error
+    # The receiver can delete files in the destination during a transfer.
+    check_mirror_removal(tree, include_root=False)
     previous = floor_claims.read_mirror_record(record) if record.exists() else {}
+    keep_authority = False
     if authority.exists():
         pending = floor_claims.read_mirror_record(authority)
-        recover_mirror_stage(tree, pending)
-        # A different record identifies a complete replacement. Keep its content.
-        if tree.exists() and (not record.exists() or previous == pending):
-            clear_mirror_content(tree, pending)
-        if not previous:
+        if fixed:
+            # Preserve the stage record if an earlier command moved the checkout.
+            keep_authority = "removal_stage" in pending
+        else:
+            recover_mirror_stage(tree, pending)
+            # A different record identifies a complete replacement. Keep its content.
+            if tree.exists() and (not record.exists() or previous == pending):
+                clear_mirror_content(tree, pending)
+        if not previous and not fixed:
             previous = pending
     tree.mkdir(exist_ok=True)
     mark_mirror(tree, cast(str, previous.get("owner", args.owner)),
                 cast(str, previous.get("repo", args.repository)), args.session,
                 last_use=time.time(), process_group=os.getpgrp())
-    authority.unlink(missing_ok=True)
+    if not keep_authority:
+        authority.unlink(missing_ok=True)
 
 
 def mirror_run(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
-    with local_mirror_lease(tree, args.session, create_tree=args.action != "mirror-receive"):
+    receiving = args.action == "mirror-receive"
+    if receiving and build_folders.build_root().resolve().is_relative_to(tree.resolve()):
+        raise CopyError(f"{tree}: mirror-receive cannot replace the build root")
+    with local_mirror_lease(tree, args.session, create_tree=not receiving):
         with mirror_metadata_locks(tree):
-            if args.action == "mirror-receive":
+            if receiving:
                 receive_metadata(tree, args)
             else:
                 mark_mirror(tree, args.owner, args.repository, args.session,
