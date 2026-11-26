@@ -1067,14 +1067,15 @@ class QuestionOwnerUnavailable:
     document: Path
 
 
-def question_folder(document: Path | staff.StaffRow, identities: QuestionStaff, *,
+def question_folder(document: Path | staff.StaffRow, identities: QuestionStaff | staff.StaffSnapshot, *,
                     lines: list[str] | None = None) -> QuestionFolder | QuestionOwnerUnavailable:
     """Select the production's question folder from its document and staff context."""
     if isinstance(document, staff.StaffRow):
         if document.kind != "producer":
             raise RegistrationFailure("questions", f"{document.id}: expected a producer")
         return QuestionFolder(record_store.default_question_folder(document.id), document.id)
-    owner = identities.record.by_doc(local_machine(), document)
+    members = identities.record if isinstance(identities, QuestionStaff) else identities
+    owner = members.by_doc(local_machine(), document)
     if owner is None or owner.kind != "showrunner":
         return QuestionOwnerUnavailable(document)
     assert isinstance(owner.doc, (staff.LiveDoc, staff.WrappedDoc))
@@ -2029,6 +2030,7 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
             raise RegistrationFailure("ask", "the request key is empty")
         saved = keyed_question(production, identities, outgoing.request_key)
         if saved is not None:
+            _file_list_exchange(saved, identities.record)
             return saved
     asker = identities.asker(production, unit)
     for option, title in (("--text", text), ("--ask", parts["ask"])):

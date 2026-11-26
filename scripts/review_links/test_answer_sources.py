@@ -8,18 +8,23 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
 from scripts.console_text import check as console_text
+from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.production import investigation, record_store, staff, the_list, update_registration
+from scripts.production import (
+    change_review, change_routing, delivery_state, investigation, list_exchange, record_store, staff, the_list,
+    unrouted_alert, update_registration,
+)
 from scripts.production.issues import Issue
 from scripts.review_links import (
-    answer_sources, change_page, image_store, images, new_item_dialog, question_record, review_items, review_page,
+    answer_sources, change_page, image_store, images, new_item_dialog, question_path, question_record, review_items, review_page, staff_names,
 )
 from scripts.review_links.review_events import ReviewLog, encode, rows
 
@@ -225,6 +230,7 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertIn(f"{key} -> {KEEPER.id}/L1", applied)
         item, = the_list.records(KEEPER.id)
         self.assertEqual(item.owner, ASKER.id)
+        self.assertIs(type(item.filed_exchanges[0]), list_exchange.FiledExchange)
         self.assertEqual({exchange.source_key for exchange in item.filed_exchanges}, {key})
         self.assertEqual({exchange.exchange_id for exchange in item.filed_exchanges},
                          {"initial", "followup:1", "followup:2"})
@@ -277,7 +283,8 @@ class AnswerSourceTests(unittest.TestCase):
         proposal = review_items.ReviewItem("proposal/fixture", "owner/P1", review_items.ReviewType.PROPOSAL,
             OWNER.id, OWNER.id, "Move the filter", review_items.ReviewState.OPEN,
             review_items.ReviewTimes(START, SECOND_REPLY), log, ("approve", "decline"), review_items.ProposalSource(issue))
-        answer_sources.file_saved_review(proposal, MEMBERS)
+        with patch.object(review_items, "read_current", return_value=proposal):
+            answer_sources.file_saved_review(proposal, MEMBERS)
         current, = answer_sources.apply_review_handoffs([proposal], user_zone())
         self.assertFalse(review_items.on_list(current))
         self.assertFalse(current.unread_answer)
@@ -285,6 +292,149 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertTrue(current.for_you(SECOND_REPLY))
         item, = the_list.records(KEEPER.id)
         self.assertEqual(item.filed_exchanges[0].source_key, proposal.key)
+
+    def test_dry_migration_does_not_alert_for_an_unrouted_change(self) -> None:
+        folder = self.root / "changes"
+        folder.mkdir()
+        listing = folder / "change-review - fixture.md"
+        listing.touch()
+        row = {"#": "C1", "Producer": "missing", "Change": "Check the route"}
+        record = replace(MEMBERS, production=True)
+        snapshot = change_review.ReviewListSnapshot("", [row], [], [])
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        with (patch.object(staff, "snapshot", return_value=record),
+              patch.object(change_review, "review_snapshot", return_value=snapshot),
+              patch.object(change_routing, "waits_for_user", return_value=True),
+              patch.object(unrouted_alert, "notify") as alert,
+              patch("scripts.production.session_staff.member_sources") as live_members):
+            self.assertEqual(self.migrate(apply=False)[0], 0)
+            alert.assert_not_called()
+            live_members.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+
+    def test_failed_list_directory_sync_keeps_the_answer_in_review(self) -> None:
+        key = self.native("during-sync", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",
+            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin("request-1234567890")),
+            "followups": [{"followup": "Which plan?", "reply": "Use plan A."}],
+        })
+        row = the_list.folder(KEEPER.id) / "L1.md"
+        seen: list[str] = []
+        original = atomic_file.sync_folder
+
+        def sync(folder: Path) -> None:
+            if folder == row.parent and row.exists() and not seen:
+                self.assertTrue(the_list.load(KEEPER.id, "L1").filed_exchanges)
+                seen.extend(item.key for item in review_items.read(self.review, members=MEMBERS, show="open"))
+                raise OSError("List directory sync failed after replacement.")
+            original(folder)
+
+        with patch.object(atomic_file, "sync_folder", sync):
+            self.assertEqual(self.migrate(apply=True)[0], 1)
+        self.assertEqual(seen, [key])
+        self.assertFalse(row.exists())
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertTrue(row.exists())
+        self.assertEqual(review_items.read(self.review, members=MEMBERS, show="open"), [])
+
+    def test_stale_inventory_cannot_file_a_withdrawn_question(self) -> None:
+        for file_open_first in (False, True):
+            with self.subTest(file_open_first=file_open_first):
+                key = self.native("withdraw-" + str(file_open_first),
+                                  {"since": FILED, "text": "Choose a plan", "question": "Which plan?"})
+                before = answer_sources.read_exchanges(self.review, members=MEMBERS)
+                if file_open_first:
+                    self.assertEqual(self.migrate(apply=True)[0], 0)
+                path = record_store.default_question_folder(OWNER.id) / key.rsplit("/", 1)[-1]
+                _ = path.write_text(path.read_text().replace("status: open", "status: closed"))
+                if file_open_first:
+                    current, = update_registration.selected_question_records([path], (), None)
+                    answer_sources.file_saved_question(current, MEMBERS)
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(answer_sources.migrate(before, MEMBERS, apply=True), 0)
+                filed = [exchange for item in the_list.records(KEEPER.id) for exchange in item.filed_exchanges
+                         if exchange.source_key == key]
+                self.assertEqual([exchange.answer for exchange in filed],
+                    [answer_sources.QuestionWithoutAnswer.CLOSED] if file_open_first else [])
+
+    def test_reservation_recovers_after_counter_advances(self) -> None:
+        _ = self.native("interrupted", {"since": FILED, "text": "Choose a plan", "question": "Which plan?"})
+        with patch.object(the_list, "_save_exchange_reservation", side_effect=OSError("Reservation write failed.")):
+            self.assertEqual(self.migrate(apply=True)[0], 1)
+        self.assertEqual((the_list.folder(KEEPER.id) / ".next-number").read_text(), "2\n")
+        other = the_list.add(KEEPER.id, "Another item", owner=OWNER.id, source="test", changes={})
+        self.assertEqual(other.id, "L2")
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual({item.id for item in the_list.records(KEEPER.id)}, {"L1", "L2"})
+
+    def test_keyed_staff_ask_retry_files_the_existing_question(self) -> None:
+        key = self.native("keyed", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",
+                                    "request_key": "the-same-request"})
+        path = record_store.default_question_folder(OWNER.id) / key.rsplit("/", 1)[-1]
+        saved, = update_registration.selected_question_records([path], (), None)
+        scope = update_registration.ProducerQuestions(OWNER)
+        parts = update_registration.QuestionParts(ask="Which plan?", context="", items=[], recommend="", choices=[])
+        with patch.object(update_registration, "keyed_question", return_value=saved):
+            result = update_registration.ask(scope, saved.item["text"], parts, "", update_registration.Ranking(),
+                identities=update_registration.QuestionStaff.for_record(MEMBERS),
+                outgoing=update_registration.KeyedStaffQuestion("the-same-request"))
+        self.assertEqual(result, saved)
+        item, = the_list.records(KEEPER.id)
+        self.assertEqual(item.filed_exchanges[0].source_key, key)
+
+    def change_with_log(self, log: tuple[ReviewLog, ...],
+                        question: delivery_state.OpenQuestion | delivery_state.AnsweredQuestion) -> review_items.ReviewItem:
+        path = self.root / "changes" / "change-review - fixture.md"
+        assignment = change_routing.ChangeAssignment(change_routing.ShowrunnerOwnChange(ASKER.id, ASKER.name),
+                                                    path.with_name("production.md"))
+        slots = delivery_state.DeliverySlots(delivery_state.NoDelivery(), delivery_state.NoDelivery(), question)
+        source = review_items.ChangeSource(path, {"Review log": encode(log)}, assignment, slots)
+        return review_items.ReviewItem("fixture/C1", "C1", review_items.ReviewType.CHANGE, ASKER.id, ASKER.id,
+            "Check the result", review_items.ReviewState.OPEN, review_items.ReviewTimes(START, SECOND_REPLY),
+            log, ("works", "not works"), source, answer_time=SECOND_REPLY)
+
+    def test_reply_uses_its_exchange_id_and_saved_author_after_owner_changes(self) -> None:
+        first_id = "first"
+        log = (ReviewLog(START, "nate", "question: Which plan?", first_id),
+               ReviewLog(SECOND_ASK, "nate", "question: How long?", "second"),
+               ReviewLog(SECOND_REPLY, OWNER.name, "Answer: Use plan A.", question_path.answer_log_id(first_id)))
+        item = self.change_with_log(log, delivery_state.OpenQuestion("second", "How long?", delivery_state.NoDelivery()))
+        _ = (self.root / "config" / "producer_map.conf").write_text(f"{OWNER.id}={OWNER.id}\n")
+        with patch.object(review_items, "read_current", return_value=item):
+            answer_sources.file_saved_review(item, MEMBERS)
+        row, = the_list.records(KEEPER.id)
+        exchange, = row.filed_exchanges
+        self.assertEqual((exchange.exchange_id, exchange.question, row.owner, row.producer),
+                         ("question:first", "Which plan?", OWNER.id, OWNER.id))
+
+    def test_legacy_change_reply_uses_the_saved_slot_question(self) -> None:
+        log = (ReviewLog(START, "nate", "question: An older question?"),
+               ReviewLog(SECOND_REPLY, OWNER.id, "Answer: The east side."))
+        item = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
+        with patch.object(review_items, "read", return_value=[item]):
+            exchange, = answer_sources.read_exchanges(self.review, members=MEMBERS).exchanges
+        self.assertEqual((exchange.exchange_id, exchange.question, exchange.answerer),
+                         ("question:saved", "Which side?", OWNER.id))
+
+    def test_filed_answer_keeps_an_unread_feedback_reply_with_the_same_text(self) -> None:
+        log = (ReviewLog(START, "nate", "question: Which plan?", "first"),
+               ReviewLog(FIRST_REPLY, OWNER.id, "Answer: Yes.", question_path.answer_log_id("first")),
+               ReviewLog(SECOND_ASK, "nate", "feedback: Check the result.", "feedback"),
+               ReviewLog(SECOND_REPLY, OWNER.id, "Answer: Yes.", question_path.answer_log_id("feedback")))
+        item = self.change_with_log(log, review_items.CompletedFeedback("feedback", "Check the result.", "Yes."))
+        with patch.object(review_items, "read_current", return_value=item):
+            answer_sources.file_saved_review(item, MEMBERS)
+        current, = answer_sources.apply_review_handoffs([item], user_zone())
+        handoff = current.exchange_handoff
+        assert isinstance(handoff, review_items.FiledReviewExchange)
+        self.assertEqual(handoff.answer_events, frozenset({1}))
+        self.assertEqual(handoff.exchange_ids, frozenset({"question:first"}))
+        self.assertTrue(review_page.can_acknowledge_answer(current))
+        names = staff_names.StaffNames(MEMBERS)
+        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("test"), MEMBERS, 4, {}, user_zone(), names)
+        markup = review_page.details(current, inputs)
+        self.assertIn("Answer filed on the List", markup)
+        self.assertIn("Yes.", markup)
+        self.assertIn('value="read">Mark read', markup)
 
     def test_new_investigation_answer_files_when_the_source_saves(self) -> None:
         with patch.object(console_text, "require"):

@@ -57,7 +57,7 @@ class ExchangeAnswer:
 
 
 @dataclass(frozen=True)
-class FiledExchange:
+class Exchange:
     source: Source
     source_key: str
     exchange_id: str
@@ -67,6 +67,16 @@ class FiledExchange:
     asker: StaffId | Nate
     answerer: StaffId | Nate | RecordedAnswerer
     answer: ExchangeAnswer | QuestionWithoutAnswer
+
+
+@dataclass(frozen=True)
+class FiledExchange(Exchange):
+    """An exchange stored on a List item."""
+
+    @classmethod
+    def from_exchange(cls, value: Exchange) -> FiledExchange:
+        return cls(value.source, value.source_key, value.exchange_id, value.direction, value.question,
+                   value.asked_at, value.asker, value.answerer, value.answer)
 
 
 def _time_text(time: datetime | TimeNotRecorded) -> str:

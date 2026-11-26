@@ -6129,6 +6129,59 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(self.request(card_url).status, 404)
             send.assert_called_once()
 
+    def test_answers_a_filed_open_staff_question_from_studio(self) -> None:
+        from scripts.review_links import answer_sources
+
+        case = self.review_fixture()
+        key = case.question()
+        members = staff.snapshot()
+        source = review_page.build_snapshot(case.root).records[key].source
+        assert isinstance(source, review_items.QuestionSource)
+        answer_sources.file_saved_question(source.record, members)
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            snapshot = cache.get()
+            self.assertNotIn(key, {entry["key"] for entry in snapshot.entries})
+            self.assertEqual(self.request(review_page.card_url(key)).status, 303)
+            card = self.request(review_page.card_url(key, studio_question=True))
+            self.assertEqual(card.status, 200, card.body)
+            self.assertIn(b'value="answer"', card.body)
+            revision = re.search(rb'name="revision" value="([^"]+)"', card.body)
+            self.assertIsNotNone(revision)
+            assert revision is not None
+            body = case.body(key, "answer", "Use the wide layout.") + "&" + urlencode({"revision": revision[1].decode()})
+            status, answer = self.post(review_page.PAGE_PATH, body)
+            self.assertEqual(status, 200, answer)
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        item, = the_list.records(keeper.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual(exchange.source_key, key)
+        self.assertIsInstance(exchange.answer, answer_sources.ExchangeAnswer)
+        assert isinstance(exchange.answer, answer_sources.ExchangeAnswer)
+        self.assertIn("Use the wide layout.", exchange.answer.text)
+
+    def test_legacy_change_reply_retry_files_the_saved_answer(self) -> None:
+        case = self.review_fixture(changes=1)
+        page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, ("C1",), "")
+        question = case.status.ask(page, "C1", "Which layout?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        arguments = ["answer-question", "--production", "page-owner", "--list", str(page.review_list),
+                     "--row", "C1", "--question", question.question_id, "--text", "Use the wide layout."]
+        keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+        assert keeper is not None
+        with patch.object(the_list, "_save", side_effect=OSError("The List write failed.")):
+            self.assertEqual(change_page.main(arguments), 0)
+        self.assertEqual(the_list.records(keeper.id), [])
+        self.assertEqual(change_page.main(arguments), 0)
+        item, = the_list.records(keeper.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual(exchange.exchange_id, "question:" + question.question_id)
+        self.assertEqual(exchange.question, "Which layout?")
+        self.assertEqual(exchange.answerer, item.owner)
+
     def test_filed_review_answer_redirects_to_the_saved_studio_item(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")

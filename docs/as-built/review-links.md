@@ -2241,10 +2241,13 @@ Closed staff questions without a saved answer stay outside the migration.
 
 New questions and answers use the same writer after the source saves.
 The writer saves the source key and exchange ID on the List item.
+The writer rereads the source under its filing lock.
+The List allocator records the destination before it advances the counter.
 A retry uses the recorded destination.
-Review hands off the question or answer after the List item contains the exchange.
-Review keeps a separate decision available.
+Review checks a save receipt before it hands off each exchange.
+Review keeps separate decisions and unread replies that remain in Review.
 Old links to a filed Review answer open its Studio item.
+Use **Answer question** on a Studio item to answer an open staff question.
 
 ### Images page
 
