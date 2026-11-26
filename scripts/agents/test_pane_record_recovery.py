@@ -143,7 +143,7 @@ class FakeClient(herdr.Herdr):
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
                     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int, *,
                     publication: herdr.LaunchPublicationTiming = herdr.LaunchPublicationTiming.ON_START,
-                    ) -> herdr.PromptSubmitOutcome | herdr.PromptSubmissionNotRequired:
+                    ) -> herdr.PromptSubmissionNotRequired:
         _ = (kind, opening, timeout_ms, publication)
         if not any(row["pane_id"] == pane for row in self.rows):
             self.rows.append({"pane_id": pane, "label": name, "workspace_id": "w1",
