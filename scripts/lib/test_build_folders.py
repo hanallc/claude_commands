@@ -25,6 +25,8 @@ from unittest import mock
 from contextlib import AbstractContextManager, chdir, nullcontext, redirect_stdout
 
 from scripts.lib import build_folder_lock, build_folders as folders, conf, copy_record, git_files, scratch, unit_runs, process_group
+from scripts.lib.boot_identity import boot_identity
+from scripts.lib.process_start import Started, process_start
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, FixtureConfigValues, config_environment, write_config_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
@@ -1368,6 +1370,52 @@ os.execv(os.environ['EDITABLE_REAL_GIT'], [os.environ['EDITABLE_REAL_GIT'], *arg
         self.assertEqual(lease.read_text(), before)
         self.assertEqual(json.loads(lease.read_text())["pid"], os.getpid())
         self.assertEqual(folders.build_folder_state(path), "held")
+
+    def test_gate_suite_lease_records_the_owner_and_directory_identity(self) -> None:
+        samestat = os.path.samestat
+        checked: list[Path] = []
+
+        def check_order(created: os.stat_result, current: os.stat_result) -> bool:
+            if stat.S_ISDIR(current.st_mode):
+                for entry in self.root.glob("g-*"):
+                    if samestat(current, entry.stat()):
+                        read_owner.assert_any_call(os.getpid())
+                        checked.append(entry)
+            return samestat(created, current)
+
+        with (mock.patch("scripts.lib.process_start.process_start", wraps=process_start) as read_owner,
+              mock.patch.object(os.path, "samestat", side_effect=check_order)):
+            request = folders.GateSuiteFolder("g-", folders.ExplicitBuildParent(self.root))
+            with folders.temporary_build_folder(request) as path:
+                self.assertIn(path, checked)
+                status = path.stat()
+                start = process_start(os.getpid())
+                assert isinstance(start, Started)
+                lease = folders.lease_path(path)
+                fields = cast(dict[str, object], json.loads(lease.read_text()))
+                self.assertEqual(fields["pid"], os.getpid())
+                self.assertEqual(fields["process_start"], start.start)
+                if sys.platform == "darwin":
+                    self.assertNotIn("boot_id", fields)
+                else:
+                    self.assertEqual(fields["boot_id"], boot_identity())
+                self.assertEqual(fields["device"], status.st_dev)
+                self.assertEqual(fields["inode"], status.st_ino)
+        self.assertFalse(path.exists())
+        self.assertFalse(lease.exists())
+
+    def test_legacy_lease_keeps_its_pid_based_owner_state(self) -> None:
+        request = folders.UniqueBuildFolder("old-gate-", folders.ExplicitBuildParent(self.root))
+        path = folders.create_build_folder(request)
+        _release_folder(path)
+        fields = cast(dict[str, object], json.loads(folders.lease_path(path).read_text()))
+        self.assertTrue({"process_start", "boot_id", "device", "inode"}.isdisjoint(fields))
+        with folders.folder_removal_lease(path, wait=False) as lease:
+            assert isinstance(lease, folders.HeldFolderRemovalLease)
+            self.assertIs(lease.owner_state(), folders.LeaseOwnerState.ACTIVE)
+            with mock.patch.object(os, "kill", side_effect=ProcessLookupError) as kill:
+                self.assertIs(lease.owner_state(), folders.LeaseOwnerState.ENDED)
+                kill.assert_called_once_with(os.getpid(), 0)
 
     def test_tool_lock_files_do_not_keep_a_temporary_folder(self) -> None:
         with folders.temporary_build_folder(folders.UniqueBuildFolder("rust-project-")) as path:

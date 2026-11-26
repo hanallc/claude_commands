@@ -848,7 +848,7 @@ def _listed_session(
         return {"pid": pid, "name": name, "reason": "account unreadable"}
     session_id = _string(record.get("sessionId"))
     member = membership.by_current_session(session_id)
-    kind: staff.Kind | Literal["top-level"] = member.kind if member is not None else (
+    kind: staff.Kind | Literal["top-level"] = member.kind if member is not None and member.kind != "session" else (
         "worker" if record.get("kind") == "bg" else "top-level")
     name = member.name if member is not None else ""
     owner = member

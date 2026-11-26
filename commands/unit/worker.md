@@ -53,14 +53,14 @@ The pass and any held role stay active.
 The launcher returns at once. End the director turn after any assigned synchronous review.
 When compaction is due, the launcher prints `<worker>: compaction runs detached; the prompt follows`.
 The child survives a signal to the caller's process group.
-It requires a compaction record within `WORKER_COMPACT_SECONDS`, then sends the prompt and confirms its transcript receipt.
+It requires a compaction record within `worker_compact_seconds`, then sends the prompt and confirms its transcript receipt.
 A detached failure ends the pass with `error` and sends the director a completion notice.
 Assignments with no compaction due keep their attached delivery path.
 The turn hook saves the result, completes the pass, and sends the director its reply path.
 The hook closes the completed pane and keeps its native conversation.
 A live run retains the same pass without another prompt.
 Other codes: `1` check failure, `2` refusal, `4` Codex question, `6` busy, `7` retained, `8` uncertain.
-An attached Codex delivery requires its transcript prompt within `WORKER_SETTLE_SECONDS`; otherwise it returns `8`.
+An attached Codex delivery requires its transcript prompt within `worker_settle_seconds`; otherwise it returns `8`.
 A Claude delivery returns before its transcript must contain the prompt.
 A failed delivery command returns an error.
 The transcript prevents replay and proves completion.
