@@ -40,7 +40,6 @@ type ListLink = investigation.ListDestination | LegacyListLink
 class Exchange(list_exchange.Exchange):
     list_links: tuple[ListLink, ...]
     reply_event: ReviewLog | None = field(default=None, compare=False)
-    mirrored_slot_exchange_id: str = field(default="", compare=False)
 
 
 type ReloadExchanges = Callable[[], Iterable[Exchange]]
@@ -196,26 +195,45 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
              if prompt.identity.startswith("question:")}
     slot = source.slots.question if isinstance(source, review_items.ChangeSource) else delivery_state.NoQuestion()
     slot_prompt: _LoggedQuestion | None = None
+    slot_question_id = ""
+    slot_position = -1
+    if (isinstance(slot, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion))
+            and not isinstance(slot, (review_items.OpenFeedback, review_items.CompletedFeedback))):
+        slot_question_id = slot.question_id
+        slot_position = next((index for index in prompts if log[index].feedback_request_id == slot_question_id),
+                             len(log))
     legacy_slot = False
+    slot_answered_at: question_path.AnswerTime = question_path.NO_ANSWER_TIME
+    slot_author: staff.StaffId | RecordedAnswerer = RecordedAnswerer("Answerer not recorded")
+    last_answer_position = -1
     if (isinstance(source, review_items.ChangeSource) and isinstance(slot, delivery_state.AnsweredQuestion)
             and not isinstance(slot, review_items.CompletedFeedback)):
         original = named.get(slot.question_id)
         slot_prompt = original or _LoggedQuestion("question:" + slot.question_id, slot.text, item.times.filed)
-        legacy_slot = original is None and not source.answered_by and not isinstance(source.answered_at, datetime)
         named[slot.question_id] = slot_prompt
-    last_answer_position = -1
-    if legacy_slot:
-        last_answer_position = max((index for index, event in enumerate(log)
-                                    if event.who != Nate.USER and event.words.startswith("Answer: ")), default=-1)
+        slot_answered_at = source.answered_at
+        reference = source.answered_by or (source.validators[0] if source.validators else "")
+        if reference:
+            slot_author = _answerer(reference, members)
+        legacy_slot = original is None
+        if legacy_slot and not isinstance(slot_answered_at, datetime):
+            last_answer_position = max((index for index, event in enumerate(log)
+                                        if event.who != Nate.USER and event.words.startswith("Answer: ")), default=-1)
+    tagged_answers = {event.feedback_request_id.removeprefix("answer:") for event in log
+                      if event.feedback_request_id and event.who != Nate.USER
+                      and event.words.startswith("Answer: ") and event.words.removeprefix("Answer: ").strip()}
     seen: set[str] = set()
     logged_legacy_slot = False
     for index, event in enumerate(log):
         label, _, words = event.words.partition(": ")
         if index in prompts:
-            pending = None if event.feedback_request_id else prompts[index]
+            tag = event.feedback_request_id
+            # Only an older question can use an untagged reply after the slot changes.
+            historical = index < slot_position and tag != slot_question_id and tag not in tagged_answers
+            pending = prompts[index] if not tag or historical else None
             continue
-        if event.who == Nate.USER and label.lower() in ("answer", "approve", "decline", "feedback",
-                                                        "feedback sent", "marked read", "read"):
+        if (pending is not None and not pending.identity.startswith("question:") and event.who == Nate.USER
+                and label.lower() in ("answer", "approve", "decline", "feedback", "feedback sent", "marked read", "read")):
             pending = None
         if label != "Answer" or event.who == Nate.USER or not words.strip():
             continue
@@ -226,26 +244,27 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
         if prompt is None or prompt.identity in seen:
             continue
         seen.add(prompt.identity)
+        author = _answerer(event.who, members)
         mirrored_slot_exchange_id = ""
-        # A complete legacy log exchange keeps its ID when an old slot repeats its text.
-        if (index == last_answer_position and isinstance(slot, delivery_state.AnsweredQuestion)
-                and prompt.identity.startswith("log:") and prompt.text == slot.text and words == slot.answer):
+        if (legacy_slot and not logged_legacy_slot and isinstance(source, review_items.ChangeSource)
+                and isinstance(slot, delivery_state.AnsweredQuestion) and prompt.identity.startswith("log:")
+                and prompt.text == slot.text and words == slot.answer
+                and (not source.answered_by or author == slot_author)
+                and (event.time == slot_answered_at if isinstance(slot_answered_at, datetime)
+                     else index == last_answer_position)):
             logged_legacy_slot = True
             mirrored_slot_exchange_id = "question:" + slot.question_id
         state = _read_state(event.time, read_times, acknowledged=item.state is review_items.ReviewState.DONE)
         yield Exchange(Source.SCOPED_REPLY, key, prompt.identity, Direction.ANSWER_TO_NATE, prompt.text,
-                       prompt.time, Nate.USER, _answerer(event.who, members),
-                       ExchangeAnswer(words, event.time, state), links, event, mirrored_slot_exchange_id)
-    if (slot_prompt is not None and isinstance(source, review_items.ChangeSource)
-            and isinstance(slot, delivery_state.AnsweredQuestion) and slot_prompt.identity not in seen
-            and not logged_legacy_slot):
-        reference = source.answered_by or (source.validators[0] if source.validators else "")
-        answered_at = source.answered_at if isinstance(source.answered_at, datetime) else TimeNotRecorded.ABSENT
+                       prompt.time, Nate.USER, author, ExchangeAnswer(words, event.time, state), links, event,
+                       mirrored_slot_exchange_id=mirrored_slot_exchange_id)
+    if (slot_prompt is not None and isinstance(slot, delivery_state.AnsweredQuestion)
+            and slot_prompt.identity not in seen and not logged_legacy_slot):
+        answered_at = slot_answered_at if isinstance(slot_answered_at, datetime) else TimeNotRecorded.ABSENT
         answer = ExchangeAnswer(slot.answer, answered_at, _read_state(answered_at, read_times,
                                 acknowledged=item.state is review_items.ReviewState.DONE))
-        author = _answerer(reference, members) if reference else RecordedAnswerer("Answerer not recorded")
         yield Exchange(Source.SCOPED_REPLY, key, slot_prompt.identity, Direction.ANSWER_TO_NATE, slot_prompt.text,
-                       slot_prompt.time, Nate.USER, author, answer, links)
+                       slot_prompt.time, Nate.USER, slot_author, answer, links)
 
 
 _REVIEW_SOURCE_KINDS = (*review_items.QUESTION_TYPES, *review_items.INVESTIGATION_TYPES,

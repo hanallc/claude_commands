@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import cast
@@ -69,6 +69,7 @@ class Exchange:
     asker: StaffId | Nate
     answerer: StaffId | Nate | RecordedAnswerer
     answer: ExchangeAnswer | QuestionWithoutAnswer
+    mirrored_slot_exchange_id: str = field(default="", compare=False, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -89,29 +90,39 @@ def retain_legacy_ids[Entry: Exchange](exchanges: tuple[Entry, ...], saved: Iter
     """Keep the filed ID when one anonymous log exchange matches one old slot exchange."""
     current_ids = {(exchange.source_key, exchange.exchange_id) for exchange in exchanges}
     saved_ids: set[tuple[str, str]] = set()
+    old_ids: set[tuple[str, str]] = set()
     old_slots: dict[FiledExchange, list[str]] = defaultdict(list)
     for exchange in saved:
         key = exchange.source_key, exchange.exchange_id
         saved_ids.add(key)
         if (exchange.source is Source.SCOPED_REPLY and exchange.exchange_id.startswith("question:")
                 and key not in current_ids and isinstance(exchange.answer, ExchangeAnswer)):
+            old_ids.add(key)
             old_slots[_legacy_content(exchange, exchange.answer)].append(exchange.exchange_id)
-    if not old_slots:
+    if not old_ids:
         return exchanges
+    identified = list(exchanges)
+    claimed: set[tuple[str, str]] = set()
     log_entries: dict[FiledExchange, list[int]] = defaultdict(list)
     for index, exchange in enumerate(exchanges):
-        if (exchange.source is Source.SCOPED_REPLY and exchange.exchange_id.startswith("log:")
-                and (exchange.source_key, exchange.exchange_id) not in saved_ids
-                and isinstance(exchange.answer, ExchangeAnswer)):
-            content = _legacy_content(exchange, exchange.answer)
-            if content in old_slots:
-                log_entries[content].append(index)
-    identified = list(exchanges)
+        if (exchange.source is not Source.SCOPED_REPLY or not exchange.exchange_id.startswith("log:")
+                or not isinstance(exchange.answer, ExchangeAnswer)):
+            continue
+        content = _legacy_content(exchange, exchange.answer)
+        log_entries[content].append(index)
+        alias = exchange.source_key, exchange.mirrored_slot_exchange_id
+        if alias in old_ids and alias not in claimed and (exchange.source_key, exchange.exchange_id) not in saved_ids:
+            identified[index] = replace(exchange, exchange_id=alias[1])
+            claimed.add(alias)
     for content, positions in log_entries.items():
-        identities = old_slots[content]
-        if len(positions) == len(identities) == 1:
+        identities = old_slots.get(content)
+        if identities is not None and len(positions) == len(identities) == 1:
             index = positions[0]
-            identified[index] = replace(exchanges[index], exchange_id=identities[0])
+            current = exchanges[index]
+            key = current.source_key, current.exchange_id
+            previous = current.source_key, identities[0]
+            if identified[index] is current and previous not in claimed and key not in saved_ids:
+                identified[index] = replace(current, exchange_id=previous[1])
     return tuple(identified)
 
 
