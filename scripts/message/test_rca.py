@@ -1,4 +1,4 @@
-"""rca.py cases, owner messages and pushes, with a temp state dir and a stub send.py."""
+"""Test rca.py cases, owner messages and alert retirement with isolated state."""
 from __future__ import annotations
 
 import io
@@ -25,7 +25,6 @@ from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.process_test_support import OwnedTestProcesses
 from scripts.notify import push_texts  # noqa: E402
 from scripts.message import rca  # noqa: E402
-from scripts.notify import review  # noqa: E402
 from scripts.message import send  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import session_staff  # noqa: E402
@@ -33,7 +32,6 @@ from scripts.production import showrunners, staff, fake_showrunner  # noqa: E402
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner, fixture_member  # noqa: E402
 from scripts.production.test_showrunners import stalled_session_reader  # noqa: E402
 from scripts.notify import silence  # noqa: E402
-from scripts.notify.user_action import NoActionRequired  # noqa: E402
 
 OPENED = datetime(2026, 10, 23, 13, 30, tzinfo=timezone.utc)
 SHOWRUNNER = "uds:/tmp/cargo-liner-show.sock"
@@ -46,8 +44,7 @@ if os.environ.get('RCA_TEST_BARRIER_SOCKET'):
         assert client.recv(16) == b'delivered'
 with open(os.environ['RCA_TEST_LOG'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\\n')
-print(os.environ.get('RCA_TEST_OUTPUT', 'SENT: to the user'))
-raise SystemExit(int(os.environ.get('RCA_TEST_EXIT', '0')))
+print('SENT: to the user')
 """
 # The stub of subprocess.Popen keeps the real one: subprocess.run calls Popen too.
 REAL_POPEN = subprocess.Popen
@@ -60,22 +57,13 @@ ALERTED = HANDLER._replace(waits="The cargo-handler release waits for it", sourc
                            key="stall-watch:prompt:cargo-liner:handler")
 CAUSE = "a helper ran a build command that needs your permission"
 FIX = "helpers use the build command that is always allowed"
-# The reviewer's refusal of a fixed text: what failed, a question, and its own rewrite.
-REWRITE = review.Draft("cargo-liner", "0", "cargo-liner: fixed why handler hit a check", NoActionRequired(),
-                       "In the handler session, the session asked you to allow a build.\n"
-                       + "Why: a helper ran a build that needs your permission.\nNow: helpers use the allowed build.", False)
-REFUSED = review.Failed(REWRITE, ["plain-words"], failures=(review.RuleFailure("plain-words", "verify.sh"),),
-                        questions=("What does the fix change for the user?",))
 
 
 def flags(argv: list[str]) -> dict[str, str]:
-    """Each flag of a send.py call and its value; the --value pairs go under their own keys."""
+    """Return the flags and values of a send.py call."""
     found: dict[str, str] = {}
     for flag, value in zip(argv, argv[1:]):
-        if flag == "--value":
-            key, _, item = value.partition("=")
-            found["value:" + key] = item
-        elif flag.startswith("--"):
+        if flag.startswith("--"):
             found[flag] = value
     return found
 
@@ -99,9 +87,6 @@ class RcaTests(unittest.TestCase):
     root: Path = Path()
     log: Path = Path()
     owner_processes: list[bool] = []
-    # What the fake push review gives, by the draft it reads; None approves the draft.
-    verdict: review.ReviewOutcome | None = None
-    reviewed: list[review.Draft] = []
 
     @override
     def setUp(self) -> None:
@@ -115,17 +100,14 @@ class RcaTests(unittest.TestCase):
         # A fixed clock: a case id carries the day, so a call with no time of its own opens 261023-<n> on any day.
         _ = self.enterContext(mock.patch.object(rca, "now", return_value=OPENED))
         (self.root / "sessions").mkdir()
-        removed = ("CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
-        environment = {key: value for key, value in os.environ.items() if key not in removed and not key.startswith("SHOWRUNNER_")}
+        environment = {key: value for key, value in os.environ.items()
+                       if key != "CLAUDE_CODE_SESSION_ID" and not key.startswith("SHOWRUNNER_")}
         self.enterContext(mock.patch.dict(os.environ, environment | {
             "RCA_TEST_LOG": str(self.log), "USER_ZONE": "America/Puerto_Rico",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "NOTIFY_STATE_DIR": str(self.root / "notify")},
             clear=True))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = (self.root / "staff.json").write_text(json.dumps({"schema": 2, "rows": []}))
-        # No test runs the real push review (claude -p).
-        self.verdict, self.reviewed = None, []
-        _ = self.enterContext(mock.patch.object(review, "review", side_effect=self.review))
         timers = self.root / "notifiers"
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", timers))
         document = self.root / "cargo-production.md"
@@ -151,11 +133,6 @@ class RcaTests(unittest.TestCase):
                            start_new_session=start_new_session, env=self.owned.environment())
         self.owned.track(child, group=start_new_session)
         return child
-
-    def review(self, draft: review.Draft, revision: bool, *, limit: float = 0) -> review.ReviewOutcome:
-        del revision, limit
-        self.reviewed.append(draft)
-        return self.verdict or review.Approved(draft)
 
     def live_session(self, name: str, session_id: str) -> None:
         """A session record for this test's process, with a bound socket, so the record counts as live."""
@@ -374,9 +351,6 @@ subprocess.run([sys.executable, '-c',
         self.assertEqual((code, out), (0, "rca: opened 261023-1\n"))
         self.assertIn("the owner message did not start, a reminder follows: no python", err)
 
-    def values(self, argv: list[str]) -> dict[str, str]:
-        return {key.removeprefix("value:"): value for key, value in flags(argv).items() if key.startswith("value:")}
-
     def test_the_kind_of_action_is_named_by_the_first_word_of_each_command(self) -> None:
         for commands, action in ((("cargo build -p cargo-handler",), "a shell command"),
                                  (("write phases/34h/state.json (34h phase record)",), "a file change"),
@@ -388,185 +362,109 @@ subprocess.run([sys.executable, '-c',
             with self.subTest(commands=commands):
                 self.assertEqual(rca.action_of(commands), action)
 
-    def test_auto_mode_owner_message_and_story_describe_a_refused_command_without_a_session_stop(self) -> None:
+    def test_auto_mode_owner_message_describes_a_refused_command_without_a_session_stop(self) -> None:
         case_id = rca.open_case(HANDLER._replace(kind="auto_mode", commands=("write progress.json",)), OPENED).split()[-1]
         case = self.case(case_id)
         delivered = flags(self.sends()[0])["--text"]
         self.assertIn("handler on natedev had a command refused by auto mode.", delivered)
         self.assertIn("Find why this happened and fix the source.", delivered)
-        for text in (delivered, rca.owner_message(case, reminder=True), *rca.story(case).values()):
+        for text in (delivered, rca.owner_message(case, reminder=True)):
             with self.subTest(text=text):
                 self.assertNotIn("stopped", text)
-        self.assertEqual(rca.story(case)["stop"], "auto mode refused a file change")
 
-    def test_start_sends_the_started_push_in_plain_words_with_the_case_key(self) -> None:
-        stopped = OPENED - timedelta(minutes=2)
-        for report, stop, waits in (
-                (ALERTED._replace(stopped=stopped.isoformat()), "the session asked you to allow a shell command",
-                 " The cargo-handler release waits for it."),
-                (HANDLER._replace(kind="auto_mode", commands=("write a.json", "edit b.py")),
-                 "auto mode refused 2 file changes", "")):
-            with self.subTest(stop=stop):
-                self.log.unlink(missing_ok=True)
+    def test_start_records_the_owner_without_sending_a_push(self) -> None:
+        for report in (ALERTED, HANDLER._replace(kind="auto_mode", commands=("write a.json", "edit b.py"))):
+            with self.subTest(kind=report.kind):
                 case_id = rca.open_case(report, OPENED).split()[-1]
-                code, out, _ = self.quiet(["start", case_id, "--owner", "builds"])
-                self.assertEqual((code, out), (0, "SENT: to the user\n"))
-                sent = flags(self.sends()[-1])
-                self.assertEqual((sent["--to"], sent["--text-id"], sent["--from"], sent["--key"]),
-                                 ("user", "permission.rca_started", "cargo-liner", "rca-" + case_id))
-                time = silence.shown(stopped if report.stopped else OPENED)
-                self.assertTrue(time.endswith(("09:28 AST", "09:30 AST")))
-                self.assertEqual(self.values(self.sends()[-1]), {"sender": "cargo-liner", "session": "handler",
-                                                                  "time": time, "stop": stop, "waits_line": waits})
-                rendered = push_texts.render("permission.rca_started", **self.values(self.sends()[-1]))
-                self.assertEqual(rendered.title, "cargo-liner: finding why handler hit a check")
-                self.assertEqual(rendered.body, f"At {time} in the handler session, {stop}.{waits} A session"
-                                 + " now finds the cause and fixes it, so this does not happen again."
-                                 + " A second push comes when the fix is in.")
-                # The owner, who the user does not need, stays in the case.
-                self.assertEqual((self.case(case_id)["status"], self.case(case_id)["owner"]), ("started", "builds"))
-                self.assertNotIn("builds", rendered.body)
+                sends = self.sends()
+                self.assertEqual(self.quiet(["start", case_id, "--owner", "builds"]), (0, "", ""))
+                case = self.case(case_id)
+                self.assertEqual((case["status"], case["owner"]), ("started", "builds"))
+                self.assertEqual(self.sends(), sends)
 
-    def test_fixed_closes_the_case_and_its_push_has_one_period_each(self) -> None:
-        _ = rca.open_case(HANDLER._replace(production="", waits="The cargo-handler release waits for it"), OPENED)
-        code, _, _ = self.quiet(["fixed", "261023-1", "--cause", CAUSE + ".",
-                                 "--fix", "helpers use the build\ncommand that is always allowed.",
-                                 "--commit", "5e2b9c41d07a"])
-        self.assertEqual(code, 0)
-        # The case had no alert key: no retire runs, only the owner message and the push.
-        [_, fixed_push] = self.sends()
-        sent = flags(fixed_push)
-        self.assertEqual((sent["--text-id"], sent["--from"], sent["--key"]), ("permission.rca_fixed", "messaging", "rca-261023-1"))
-        rendered = push_texts.render("permission.rca_fixed", **self.values(fixed_push))
-        self.assertEqual(rendered.title, "messaging: fixed why handler hit a check")
-        # The waits sentence is in the present tense: the fixed push leaves it out.
-        self.assertEqual(rendered.body, f"At {silence.shown(OPENED)} in the handler session, the session asked you to"
-                         + f" allow a shell command.\nWhy: {CAUSE}.\nNow: {FIX}.")
-        # The push review read the whole fixed text once and approved it.
-        self.assertEqual([(draft.title, draft.body) for draft in self.reviewed], [(rendered.title, rendered.body)])
+    def test_fixed_records_the_fix_without_sending_a_push(self) -> None:
+        _ = rca.open_case(HANDLER, OPENED)
+        sends = self.sends()
+        self.assertEqual(self.quiet(["fixed", "261023-1", "--cause", CAUSE + ".",
+                                     "--fix", "helpers use the build\ncommand that is always allowed.",
+                                     "--commit", "5e2b9c41d07a"]), (0, "", ""))
         case = self.case("261023-1")
-        self.assertEqual((case["status"], case["commit"], case["refusals"]), ("fixed", "5e2b9c41d07a", 0))
-        # A fixed case takes no start; an unknown case is refused.
+        self.assertEqual((case["status"], case["commit"], case["cause"], case["fix"]),
+                         ("fixed", "5e2b9c41d07a", CAUSE, FIX))
+        self.assertEqual(self.sends(), sends)
         self.assertEqual(self.quiet(["start", "261023-1", "--owner", "builds"])[0], 2)
-        code, _, err = self.quiet(["start", "261023-9", "--owner", "builds"])
-        self.assertEqual(code, 2)
-        self.assertIn("no case 261023-9 on this machine", err)
+        for action, arguments in (
+                ("start", ["--owner", "builds"]),
+                ("fixed", ["--cause", CAUSE, "--fix", FIX, "--commit", "abc"])):
+            with self.subTest(action=action):
+                code, _, err = self.quiet([action, "261023-9", *arguments])
+                self.assertEqual(code, 2)
+                self.assertIn("no case 261023-9 on this machine", err)
 
-    def test_fixed_retires_the_alert_of_the_case_before_its_push(self) -> None:
+    def test_fixed_only_retires_the_case_alert(self) -> None:
         _ = rca.open_case(ALERTED, OPENED)
         code, out, _ = self.quiet(["fixed", "261023-1", "--cause", CAUSE, "--fix", FIX, "--commit", "abc"])
-        self.assertEqual((code, out), (0, "SENT: to the user\nSENT: to the user\n"))
-        [_, retire, fixed_push] = self.sends()
+        self.assertEqual((code, out), (0, "SENT: to the user\n"))
+        [_, retire] = self.sends()
         self.assertEqual(retire, ["retire", "--to", "user", "--from", "stall-watch",
                                   "--key", "stall-watch:prompt:cargo-liner:handler"])
-        self.assertEqual(flags(fixed_push)["--text-id"], "permission.rca_fixed")
 
-    def test_the_first_refusal_of_the_fixed_text_sends_nothing_and_exits_1(self) -> None:
+    def test_fixed_reports_retirement_failure_and_retries_the_saved_alert(self) -> None:
         _ = rca.open_case(ALERTED, OPENED)
-        self.verdict = REFUSED
-        code, out, _ = self.quiet(["fixed", "261023-1", "--cause", "verify.sh ran cargo build", "--fix", FIX,
-                                   "--commit", "abc"])
-        self.assertEqual(code, 1)
-        for part in ("rca: not sent: the push review refused this text:", "failed: plain-words: verify.sh",
-                     "question: What does the fix change for the user?", "The reviewer's rewrite:", REWRITE.body,
-                     "Write --cause and --fix again"):
-            self.assertIn(part, out)
-        # Nothing went out: no retire and no push, only the owner message of the open.
-        self.assertEqual(len(self.sends()), 1)
-        case = self.case("261023-1")
-        self.assertEqual((case["status"], case["refusals"], case["cause"]), ("open", 1, ""))
-
-    def test_a_second_refusal_sends_the_reviewers_rewrite_or_else_the_callers_text(self) -> None:
-        for rewrite in (True, False):
-            with self.subTest(rewrite=rewrite):
-                self.verdict = REFUSED
-                case_id = rca.open_case(ALERTED, OPENED).split()[-1]
-                self.assertEqual(self.quiet(["fixed", case_id, "--cause", CAUSE, "--fix", FIX, "--commit", "abc"])[0], 1)
-                if not rewrite:
-                    # The reviewer gave no rewrite: its best version is the caller's own text.
-                    self.verdict = review.Failed(self.reviewed[-1], ["plain-words"])
-                code, _, _ = self.quiet(["fixed", case_id, "--cause", CAUSE, "--fix", FIX, "--commit", "abc"])
-                self.assertEqual(code, 0)
-                retire, pushed = self.sends()[-2:]
-                self.assertEqual(retire[0], "retire")
-                values = self.values(pushed)
-                if rewrite:
-                    self.assertEqual(flags(pushed)["--text-id"], "permission.rca_fixed_rewritten")
-                    self.assertEqual(values, {"sender": "cargo-liner", "title": REWRITE.title, "body": REWRITE.body})
-                else:
-                    self.assertEqual(flags(pushed)["--text-id"], "permission.rca_fixed")
-                    self.assertEqual((values["cause"], values["fix"]), (CAUSE, FIX))
-                self.assertEqual(flags(pushed)["--key"], "rca-" + case_id)
-                case = self.case(case_id)
-                self.assertEqual((case["status"], case["refusals"]), ("fixed", 2))
+        arguments = ["fixed", "261023-1", "--cause", CAUSE, "--fix", FIX, "--commit", "abc"]
+        retire = ["retire", "--to", "user", "--from", ALERTED.source, "--key", ALERTED.key]
+        with mock.patch.object(rca, "send", side_effect=[(False, "Cancellation timed out."), (True, "Cancelled.")]) as send_call:
+            code, out, err = self.quiet(arguments)
+            self.assertEqual((code, out), (1, ""))
+            self.assertIn("Cancellation timed out.", err)
+            self.assertIn("The alert can still repeat.", err)
+            self.assertIn("Run fixed again to retry retirement.", err)
+            send_call.assert_called_once_with(retire)
+            case = self.case("261023-1")
+            self.assertEqual((case["status"], case["cause"], case["fix"], case["commit"]), ("fixed", CAUSE, FIX, "abc"))
+            self.assertEqual(self.quiet(arguments), (0, "Cancelled.\n", ""))
+            self.assertEqual(send_call.call_args_list, [mock.call(retire), mock.call(retire)])
 
     def test_a_case_saved_before_the_new_fields_still_loads(self) -> None:
         _ = rca.open_case(HANDLER, OPENED)
         path = rca.case_path("261023-1")
         old = cast(dict[str, object], json.loads(path.read_text()))
-        for field in ("stopped", "waits", "alert_source", "alert_key", "refusals"):
+        for field in ("stopped", "waits", "alert_source", "alert_key"):
             del old[field]
         _ = path.write_text(json.dumps(old))
         case = self.case("261023-1")
-        self.assertEqual((case["stopped"], case["waits"], case["alert_source"], case["alert_key"], case["refusals"]),
-                         (OPENED.isoformat(), "", "", "", 0))
+        self.assertEqual((case["stopped"], case["waits"], case["alert_source"], case["alert_key"]),
+                         (OPENED.isoformat(), "", "", ""))
+        sends = self.sends()
         self.assertEqual(self.quiet(["start", "261023-1", "--owner", "builds"])[0], 0)
         self.assertEqual(self.quiet(["fixed", "261023-1", "--cause", CAUSE, "--fix", FIX, "--commit", "abc"])[0], 0)
-        self.assertNotEqual(self.sends()[-2][0], "retire")
+        self.assertEqual(self.sends(), sends)
 
-    def test_a_fixed_case_under_silence_leaves_only_its_fixed_push_for_silence_end(self) -> None:
-        """The alert and the started push are kept under silence; at its end only the fixed push goes, once."""
+    def test_fixed_removes_the_alert_kept_under_silence(self) -> None:
         with redirect_stdout(io.StringIO()):
             self.assertEqual(silence.on(None, lambda _argv: 0), 0)
-        sender = "cargo-liner"
-
-        def kept(argv: list[str]) -> silence.KeptPush:
-            given = flags(argv)
-            values = self.values(argv)
-            rendered = push_texts.render(given["--text-id"], **values)
-            return {"source": given["--from"], "priority": "0", "title": rendered.title, "message": rendered.body,
-                    "detail": "", "key": given.get("--key", ""), "text_id": given["--text-id"]}
-
-        def deliver(argv: list[str]) -> tuple[bool, str]:
-            """send.py as rca.py runs it: a retire runs the real one; a push is kept, as pushover.py keeps it."""
-            if argv[0] == "retire":
-                output = io.StringIO()
-                with (mock.patch.object(send, "STATE", self.root / "message"),
-                      mock.patch.object(send, "run", return_value=(0, "pushover: nothing to cancel\n", "")),
-                      redirect_stdout(output)):
-                    return send.main(argv) == 0, output.getvalue().strip()
-            return isinstance(silence.keep_here(kept(argv)), silence.Kept), "KEPT"
-
         alert = push_texts.render("stall_watch.permission_prompt", unit="handler", machine="natedev", since="09:28 AST",
                                   request="run cargo build -p cargo-handler")
-        alert_argv = push_texts.user_send_argv(alert, sender="stall-watch", key=ALERTED.key)[2:]
-        self.assertIsInstance(silence.keep_here(kept(alert_argv)), silence.Kept)
+        kept: silence.KeptPush = {"source": ALERTED.source, "priority": "0", "title": alert.title, "message": alert.body,
+                                  "detail": "", "key": ALERTED.key, "text_id": alert.id}
+        self.assertIsInstance(silence.keep_here(kept), silence.Kept)
         _ = rca.open_case(ALERTED, OPENED)
-        with mock.patch.object(rca, "send", side_effect=deliver):
-            self.assertEqual(self.quiet(["start", "261023-1", "--owner", "builds"])[0], 0)
-            self.assertEqual(len(silence.read_kept()), 2)
+        self.assertEqual(self.quiet(["start", "261023-1", "--owner", "builds"])[0], 0)
+        self.assertEqual(silence.read_kept(), [kept])
+
+        def deliver(argv: list[str]) -> tuple[bool, str]:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = send.main(argv)
+            return code == 0, output.getvalue().strip()
+
+        with (mock.patch.object(rca, "send", side_effect=deliver),
+              mock.patch.object(send, "STATE", self.root / "message"),
+              mock.patch.object(send, "run", return_value=(0, "pushover: nothing to cancel\n", ""))):
             code, out, _ = self.quiet(["fixed", "261023-1", "--cause", CAUSE, "--fix", FIX, "--commit", "abc"])
         self.assertEqual(code, 0)
         self.assertIn("dropped 1 kept push\n", out)
-        delivered: list[silence.KeptPush] = []
-
-        def post(push: silence.KeptPush) -> int:
-            delivered.append(push)
-            return 0
-
-        claimed = silence.claim()
-        assert claimed is not None
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(silence.release(*claimed, lambda _argv: 0, post, "silence off"), 0)
-        self.assertEqual([(push["source"], push["key"], push["title"]) for push in delivered],
-                         [(sender, "rca-261023-1", "cargo-liner: fixed why handler hit a check")])
-        self.assertTrue(delivered[0]["message"].endswith(f"Now: {FIX}."))
-
-    def test_a_failed_push_exits_1_and_keeps_the_new_status(self) -> None:
-        _ = rca.open_case(HANDLER, OPENED)
-        with mock.patch.dict(os.environ, {"RCA_TEST_EXIT": "4", "RCA_TEST_OUTPUT": "HELD: not sent"}):
-            self.assertEqual(self.quiet(["start", "261023-1", "--owner", "builds"])[:2], (1, "HELD: not sent\n"))
-        self.assertEqual(self.case("261023-1")["status"], "started")
+        self.assertEqual(silence.read_kept(), [])
 
     def test_pending_owner_notices_and_reminders_share_one_concurrent_delivery_budget(self) -> None:
         for number in range(4):

@@ -26,6 +26,13 @@ The same episode can receive a Mac assignment after disk evidence recovers.
 The live step record keeps diagnostic disk evidence.
 Standalone fixed local callers retain their existing local admission path.
 
+The queue checks waiters in order for each remote place.
+For Mac places only, a lower step's newer free reading clears a higher step's busy result for the same destination.
+The higher step can take the place in that pass.
+The queue keeps each step's other eligibility results.
+A step that needs evidence can hold the place for one waiting pass interval plus the probe time limit.
+The remote claim checks the place again before the step starts.
+
 ## Mac Linux gate type checks
 
 A gate that runs in the Mac Linux guest runs its requested type checks and tests in the same numbered copy.
@@ -635,12 +642,12 @@ The runner refuses `PATH`, `HOME`, `MACOSX_DEPLOYMENT_TARGET`, `RUSTFLAGS` and `
 It also refuses prefixes `BUILDLOG_`, `LINT_`, `CARGO_`, `RUSTC`, `NEXTEST_`, `DYLD_`, `MAC_TEST_` and `VERIFY_` there.
 The fetch folder must be git-ignored and relative to the mirror root. Empty, `.` and `..` path parts are refused.
 One trailing slash is removed. Tests must write to that root-relative folder, even when nextest runs them inside a package folder.
-Each test uses the terminal values from `VERIFY_TEST_FIXED_ENV` in `config/direct.conf`.
+Each test uses the terminal values from `verify_test_fixed_env` in `config/direct.conf`.
 The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
 The rule includes local tests and the test step of `final`.
 Test keys hold configured fixed values, instead of the caller's terminal values.
 
-`result_environment.py` reads `VERIFY_RESULT_ENV_NAMES`, `VERIFY_RESULT_ENV_PREFIXES`, and `VERIFY_TEST_FIXED_ENV` from `config/direct.conf` at use.
+`result_environment.py` reads `verify_result_env_names`, `verify_result_env_prefixes`, and `verify_test_fixed_env` from `config/direct.conf` at use.
 The selected name defaults include `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, `LANG`, and the configured `LC_` categories.
 `LC_TERMINAL` and `LC_TERMINAL_VERSION` are excluded.
 The prefix defaults are `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, and `TRACE_`.
@@ -694,6 +701,8 @@ The saved script name identifies the callback.
 The current callback invokes the installed Mac gate script to stop the attempt.
 It checks the saved checkout path even if the attempt folder is absent.
 For older inline checkouts without a journal, it checks for test processes before removal.
+Cleanup checks the disk device and mount before it makes one detach attempt per gate image.
+A failed detach reports the error and keeps the gate folder.
 Custom callbacks use their saved path.
 The queue removes its run record and receipt after the callback confirms cleanup.
 
@@ -910,9 +919,29 @@ Existing waits keep their place on natedev until then.
 ### Disk floor recovery
 
 `ensure_mac_disk_floor` returns `MacDiskReady`, `SweepShort`, or `SweepFailed`.
-Below the required floor, it runs one shared floor sweep and reads free space again.
+Below the required floor, it runs one shared floor sweep.
+It reads free space again after a successful sweep.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
 A direct caller that finds a running sweep waits for its result.
+The sweep uses a dedicated SSH terminal. The terminal sends `SIGHUP` when the SSH connection closes.
+Natedev uses the full `floor_sweep_timeout_s` for SSH.
+Natedev reserves the smaller of half that timeout and the sum of its `connect_timeout_s` and `probe_timeout_s`.
+It sends the resulting deadline as a Unix time when it starts SSH.
+The Mac supervisor uses the time that remains at startup. It skips the sweep if the deadline has passed.
+This deadline relies on the two clocks agreeing. The reserve estimates time for SSH setup and the reply.
+Slow setup, clock differences, or a transport failure can prevent natedev from receiving the result in time.
+On disconnect or timeout, the supervisor stops the sweep process group and waits for the sweep process to exit.
+The supervisor sends a cleanup record after the worker exits. It also sends one if the deadline passed before startup.
+If `SIGKILL` ends the worker, the supervisor exits with status 137 and sends no record.
+Natedev reports an unsuccessful sweep without that record as unconfirmed cleanup.
+Natedev also reports unconfirmed cleanup if SSH times out, loses the connection, or leaves no result.
+An SSH retry waits for `floor.lock` within its deadline before it reads mirror leases and claims.
+A standalone sweep skips an occupied floor lock and returns status 0.
+The sweep publishes a complete review file with an atomic rename.
+A later publication removes temporary files from writers that have exited.
+Both scans report a temporary file removal error and continue with publication, including when the list path stays the same.
+If the rename succeeds and the directory sync fails, a later publication by the same list keeps that path. A new SSH attempt starts a new list with a new path.
+Floor rows require manual review. The removal command refuses those rows.
 The evidence worker reads disk space and saved mirror processes in one SSH command per Mac probe cycle.
 The same command reports setup for each required mirror.
 Each step requires a successful setup result for its mirror.
@@ -923,7 +952,7 @@ The worker checks repository policy, session, and claim scope for each key.
 The worker reports pending disk recovery while a separate thread runs the sweep.
 The Mac stays excluded during recovery even when a probe reports enough free space.
 When the sweep ends, the worker probes all subscribed Mac keys again.
-The sweep holds no admission or claim lock during removal.
+The sweep holds no admission or claim lock while it lists output.
 `floor_claims.serve()` reads claims and mirror leases under `state.lock`.
 It builds the reply under the lock and prints after the lock closes.
 It exits without reading stdin.
@@ -932,16 +961,19 @@ A lost SSH session cannot retain the state lock while the sweep runs.
 An unavailable or unreadable claim reply protects all output.
 
 `mirror_sweep_leases()` reports acquired leases separately from busy mirrors.
-The sweep keeps busy mirrors and holds acquired leases through removal.
-For output outside those leases, it reads claims again immediately before each removal group.
+Discovery still walks all three configured roots.
+The alert still measures folders under those roots when a disk alert is due.
+Mirror leases and the claim snapshot protect busy mirrors during candidate selection.
+The sweep holds acquired leases while it lists output.
+For output outside those leases, it reads claims again before it adds each group to the list.
 A new claim or an unreadable reply keeps that output.
 Cargo locks, scratch busy locks, and process checks retain their existing roles.
 
-| Path class | Protection during removal |
+| Path class | Protection during listing or removal |
 | --- | --- |
-| Mirror build units, orphan files, and whole targets | The sweep holds the Mac-side mirror lease. |
-| Registered mirror clones outside the mirror root | The sweep holds their registered Mac-side mirror leases. |
-| Marked gate caches and other output outside acquired leases | The sweep reads claims again before each removal group and retains existing output locks. |
+| Mirror build units, orphan files, and whole targets | The sweep holds the Mac-side mirror lease while it lists output. |
+| Registered mirror clones outside the mirror root | The sweep holds their registered Mac-side mirror leases while it lists output. |
+| Marked gate caches and other output outside acquired leases | The sweep reads claims again before listing each group and holds existing output locks. |
 | `mirror-remove` payload, metadata, and removal authority | `local_mirror_lease` covers the operation; the record lock serializes metadata changes. |
 | A registered task clone's parent folder | An outside mirror lease survives parent removal and blocks concurrent `mirror-use`. No parent busy lock applies. |
 | `mirror-receive` cleanup of interrupted removal | The mirror lease and record lock cover the old payload and metadata. |
@@ -1017,7 +1049,7 @@ Unknown remote memory remains unknown and creates no local memory charge.
 One `mirror_busy_backoff_s` key in `mac_test.conf` serves both Mac and AWS targets.
 Each target stores `mirror-busy-<repository>.until` beside its unreachable backoff record.
 A mirror busy refusal during copy writes this time.
-A busy mirror lease also writes this time.
+If the mirror lease is busy, the caller also writes this time.
 A `mirror-use` busy refusal after copy becomes `BusyMacDecline`, without a lost run.
 A successful copy removes the repository's refusal time.
 `free-now` reads this local record without SSH or a lock.

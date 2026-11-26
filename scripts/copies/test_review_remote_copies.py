@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import fcntl
 import io
@@ -23,15 +23,15 @@ import unittest
 from unittest import mock
 
 from scripts.build_hold.owning_session import NoOwningSession
-from scripts.build_queue import admission_client, admission_protocol as wire, execution_identity, placement
+from scripts.build_queue import admission_client, admission_wire as wire, execution_identity, placement
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.copies.copies_test_support import mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
-from scripts.lint import sweep
+from scripts.lint import sweep, tmp_sweep
 from scripts.lib import build_folders, conf, scratch
 from scripts.lib import process_start as process_identity
 from scripts.lib.atomic_file import write_text_atomic
@@ -86,7 +86,7 @@ class RemoteEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(local_remote_transport(self.root))
-        private = private_slot_config(self.root)
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.enterContext(warm_claim_servers())
@@ -110,10 +110,13 @@ class RemoteEntryTests(unittest.TestCase):
             self.assertIn(floor_claims.HeldMirror(identity, other.session), claims.mirrors)
             self.assertTrue(claims.holds(other.path, self.mirror.parent))
             self.assertFalse(claims.holds(other.path, self.mirror.parent, exemption=identity))
-            copies.remove_trees("alpha")
-            self.assertFalse(self.mirror.exists())
+            owned = floor_claims.HeldMirror(floor_claims.MirrorIdentity(mine.host, mine.path), mine.session)
+            sibling = floor_claims.HeldMirror(identity, other.session)
+            removal_claims = floor_claims.ClaimSnapshot(frozenset(), (owned, sibling))
+            diagnostic = self.remove_idle_mirrors("alpha", claims=removal_claims)
+            self.assertFalse(self.mirror.exists(), diagnostic)
             with self.assertRaisesRegex(copies.CopyError, "other.*holder-session"):
-                copies.remove_trees("beta")
+                _ = self.remove_idle_mirrors("beta", claims=removal_claims)
         self.assertEqual(copies.owned_remote_mirrors("beta"), [other])
         self.assertTrue(Path(other.path).exists())
 
@@ -253,8 +256,8 @@ class RemoteEntryTests(unittest.TestCase):
         copies.register_remote(mirror)
         self.assertEqual(copies.mirror_run(args), 0)
         self.assertEqual((actual / "repository/payload").read_text(), "copied")
-        copies.remove_trees("alpha")
-        self.assertFalse((actual / "repository").exists())
+        diagnostic = self.remove_idle_mirrors("alpha")
+        self.assertFalse((actual / "repository").exists(), diagnostic)
         self.assertTrue(link.is_symlink())
 
     def test_standing_checkout_offload_records_and_removes_the_gate_owner(self) -> None:
@@ -284,9 +287,9 @@ class RemoteEntryTests(unittest.TestCase):
                 self.assertTrue(copies.remote_record_path(mirror).exists())
                 with self.assertRaisesRegex(copies.CopyError, "another owner"):
                     _ = copies.mirror_remove(mirror_arguments(replace(mirror, owner="other"), "mirror-remove"))
-                copies.remove_trees("alpha")
-                self.assertFalse(self.mirror.exists())
-                self.assertFalse(copies.remote_record_path(mirror).exists())
+                diagnostic = self.remove_idle_mirrors("alpha")
+                self.assertFalse(self.mirror.exists(), diagnostic)
+                self.assertFalse(copies.remote_record_path(mirror).exists(), diagnostic)
 
     def test_empty_owner_removes_no_remote_mirrors(self) -> None:
         mirror = self.mirror_record()
@@ -310,6 +313,31 @@ class RemoteEntryTests(unittest.TestCase):
         self.assertEqual(copies.owned_remote_mirrors(owner), [])
         self.assertTrue(Path(other.path).exists())
         self.assertEqual(copies.owned_remote_mirrors("beta-unit"), [other])
+
+    def remove_idle_mirrors(self, owner: str, *, claims: floor_claims.ClaimSnapshot | None = None) -> str:
+        """Run mirror removal with private claims and real file locks."""
+        snapshot = floor_claims.ClaimSnapshot(frozenset()) if claims is None else claims
+        processes = copies.MirrorProcessScan(tmp_sweep.ProcessUsesKnown([]), frozenset())
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def remove_over_ssh(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            request, separator, _ = arguments[-1].partition("; copies_status=")
+            if arguments[0] != "ssh" or not separator:
+                return run(arguments, **options)
+            command = shlex.split(request)[2:]
+            self.assertEqual(command[0], "mirror-remove")
+            with (mock.patch.object(floor_claims, "read_claims", return_value=snapshot),
+                  mock.patch.object(copies, "scan_mirror_processes", return_value=processes),
+                  redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()) as stderr):
+                status = copies.main(command)
+            return subprocess.CompletedProcess(arguments, status, stdout.getvalue() + f"\nrc={status}\n",
+                                               stderr.getvalue())
+
+        diagnostic = io.StringIO()
+        with (mock.patch.object(subprocess, "run", side_effect=remove_over_ssh),
+              redirect_stdout(diagnostic), redirect_stderr(diagnostic)):
+            copies.remove_trees(owner)
+        return diagnostic.getvalue()
 
     def remove_trees_through_cli(self, owner: str) -> None:
         """Run the remote removal in a child with warm imports."""
@@ -469,9 +497,9 @@ assert json.loads((tree / '.copy-record.json').read_text())['owner'] == 'beta'
 """, str(tree)]
                 copies.register_remote(replacement)
                 self.assertEqual(copies.mirror_run(use), 0)
-                copies.remove_trees("beta")
-                self.assertFalse(tree.exists())
-                self.assertFalse(authority.exists())
+                diagnostic = self.remove_idle_mirrors("beta")
+                self.assertFalse(tree.exists(), diagnostic)
+                self.assertFalse(authority.exists(), diagnostic)
 
     def test_receive_keeps_complete_replacement_with_stale_removal_authority(self) -> None:
         for moment in ("payload", "record"):
@@ -500,8 +528,8 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 use.command = receive.command
                 copies.register_remote(replacement)
                 self.assertEqual(copies.mirror_run(use), 0)
-                copies.remove_trees("beta")
-                self.assertFalse(tree.exists())
+                diagnostic = self.remove_idle_mirrors("beta")
+                self.assertFalse(tree.exists(), diagnostic)
 
     def test_failed_admission_after_recovery_keeps_the_received_owner(self) -> None:
         for moment in ("payload", "record"):
@@ -531,7 +559,8 @@ assert Path(sys.argv[1]).read_text() == 'complete replacement'
                 self.assertEqual(copies.owned_remote_mirrors("alpha"), [original])
                 self.assertEqual(copies.owned_remote_mirrors("new-owner"), [])
                 copies.register_remote(replace(original, owner=expected_owner))
-                copies.remove_trees(expected_owner)
+                diagnostic = self.remove_idle_mirrors(expected_owner)
+                self.assertFalse(tree.exists(), diagnostic)
 
     def interrupt_receive_recovery(self, original: copies.RemoteMirror, moment: str, stage: str) -> None:
         tree = Path(original.path)
@@ -695,12 +724,16 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertGreater(runner, 0)
             self.assertGreater(child, 0)
             owner.terminate()
-            _ = owner.wait(timeout=5)
+            try:
+                _ = owner.wait(timeout=TEST_HANG_GUARD_SECS)
+            except subprocess.TimeoutExpired:
+                self.fail(f"owner {owner.pid} did not exit after SIGTERM")
             for pid in (runner, shell):
                 descriptor = os.pidfd_open(pid)
                 try:
                     os.kill(pid, signal.SIGKILL)
-                    self.assertTrue(select.select([descriptor], [], [], 5)[0])
+                    self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
+                                    f"process {pid} did not exit after SIGKILL")
                 finally:
                     os.close(descriptor)
             with self.assertRaisesRegex(copies.CopyError, "holder-session"):
@@ -708,7 +741,10 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertTrue((self.mirror / ".copy-record.json").exists())
         finally:
             send_process_group(owner.pid, signal.SIGKILL)
-            _ = owner.communicate(timeout=5)
+            try:
+                _ = owner.communicate(timeout=TEST_HANG_GUARD_SECS)
+            except subprocess.TimeoutExpired:
+                self.fail(f"owner {owner.pid} did not close its output and exit after SIGKILL")
 
     def test_workspace_repairs_a_stale_lock_and_a_damaged_index(self) -> None:
         for damaged in (False, True):
@@ -736,7 +772,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
         _ = write_config_fixture(settings, "offload=on\n", template="mac_test")
         target = target_config.SshTarget("linux", "linux", settings)
         config = eligibility.OffloadConfig(True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
-                                      1, 1, 1, "1", {})
+                                      1, 1, 1, "1", {"mirror_busy_backoff_s": "120"})
         request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
                                         target="linux", owner="new-owner", holder_session="new-session")
         controller = offload.ProcessController()
@@ -853,6 +889,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             consume.assert_called_once()
             self.assertFalse(legacy.exists())
         self.assertIsInstance(result, offload.PassedOnTarget)
+        self.assertEqual(controller.attempt_evidence.slot, 2)
         self.assertEqual(copies.owned_remote_mirrors("first-owner"), [first])
         self.assertEqual([record.path for record in copies.owned_remote_mirrors("new-owner")], [second.path])
         self.assertEqual(json.loads((Path(first.path) / ".copy-record.json").read_text())["owner"], "first-owner")
@@ -924,7 +961,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
             self.assertTrue(arguments)
             self.assertIn("policy", keywords)
             entered.set()
-            self.assertTrue(cancel.wait(timeout=10))
+            self.assertTrue(cancel.wait(TEST_HANG_GUARD_SECS), "the sweep did not receive cancellation")
             raise InterruptedError("cancelled sweep")
 
         with (mock.patch.object(floor_claims, "subprocess", subprocess),
@@ -932,7 +969,7 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
               ThreadPoolExecutor(max_workers=2) as executor):
             pending = executor.submit(sweep.main, ["--floor-only", "--host", "mac"])
             try:
-                self.assertTrue(entered.wait(timeout=10))
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS), "the sweep did not enter the floor check")
                 with self.assertRaisesRegex(copies.CopyError, "busy"):
                     copies.remove_trees("alpha")
                 with self.admission() as (controller, config, request):
@@ -945,16 +982,23 @@ with (mock.patch.object(linux_runner, 'prepare_shell', return_value=linux_runner
 
                     with mock.patch.object(controller, "complete_claim", side_effect=claim):
                         admission = executor.submit(offload.run_offload, controller, config, request, 0)
-                        self.assertTrue(attempted.wait(timeout=5))
+                        self.assertTrue(attempted.wait(TEST_HANG_GUARD_SECS),
+                                        "admission did not reach the claim attempt")
                         self.assertFalse(admission.done())
                         cancel.set()
-                        result = admission.result(timeout=15)
+                        try:
+                            result = admission.result(timeout=TEST_HANG_GUARD_SECS)
+                        except TimeoutError:
+                            self.fail("admission did not finish after the sweep was cancelled")
                 self.assertIsInstance(result, offload.PassedOnTarget)
                 self.assertTrue(Path(mirror.path).exists())
             finally:
                 cancel.set()
             with self.assertRaisesRegex(InterruptedError, "cancelled sweep"):
-                _ = pending.result(timeout=10)
+                try:
+                    _ = pending.result(timeout=TEST_HANG_GUARD_SECS)
+                except TimeoutError:
+                    self.fail("the sweep did not exit after cancellation")
         copies.remove_trees("alpha")
         self.assertFalse(Path(mirror.path).exists())
 

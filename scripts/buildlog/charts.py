@@ -186,9 +186,9 @@ def page_data(days: int, n: int = 3) -> PageData | IndexUnavailable:
     """Read the recent costs from one index snapshot."""
 
     settings = conf.read("buildlog")
-    recent_days = settings.whole("TOP_COST_RECENT_DAYS")
+    recent_days = settings.whole("top_cost_recent_days")
     if recent_days > days:
-        raise conf.Unusable(f"TOP_COST_RECENT_DAYS={recent_days} exceeds the page days ({days})")
+        raise conf.Unusable(f"top_cost_recent_days={recent_days} exceeds the page days ({days})")
     zone = user_zone()
     end = datetime.now(zone)
     start = end - timedelta(days=days)

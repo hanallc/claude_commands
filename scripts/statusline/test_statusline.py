@@ -1,6 +1,7 @@
 """Tests for statusline.sh and statusline.jq: the role, the usage line, its reset times, and their zone."""
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -505,14 +506,16 @@ class ForYouStatusTests(unittest.TestCase):
 
     def test_mac_shell_reads_the_console_count_without_local_actions(self) -> None:
         requests: list[str] = []
+        payload: dict[str, object] = {"available": True, "count": 3, "other_count": 2,
+                                      "rebuild_machines": ["mac"],
+                                      "rebuild_reasons": {"mac": "Update the editor +2"}}
 
         class ConsoleHost(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 requests.append(self.path)
                 self.send_response(200)
                 self.end_headers()
-                reply: dict[str, object] = {"available": True, "count": 3, "other_count": 2,
-                                            "rebuild_machines": ["mac"]}
+                reply = dict(payload)
                 if self.path == "/console/for-you.json":
                     reply["entries"] = [{"command": "x" * 70000}]
                 _ = self.wfile.write(json.dumps(reply).encode())
@@ -546,13 +549,19 @@ class ForYouStatusTests(unittest.TestCase):
                 try:
                     result = subprocess.run(["/bin/sh", "-c", command], input="{}", capture_output=True,
                                             text=True, check=True, env=env, cwd=home)
+                    del payload["rebuild_reasons"]
+                    legacy = subprocess.run(["/bin/sh", "-c", command], input="{}", capture_output=True,
+                                            text=True, check=True, env=env, cwd=home)
                 finally:
                     server.shutdown()
                     thread.join()
             unavailable = subprocess.run(["/bin/sh", "-c", command], input="{}", capture_output=True,
                                          text=True, check=True, env=env, cwd=home)
-            self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], "For you: rebuild mac, 2 actions", result.stderr)
-            self.assertEqual(requests, ["/console/for-you.json?view=count"])
+            self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1],
+                             "For you: rebuild mac: Update the editor +2, 2 actions", result.stderr)
+            self.assertEqual(ANSI.sub("", legacy.stdout).splitlines()[-1],
+                             "For you: rebuild mac: reason not read, 2 actions", legacy.stderr)
+            self.assertEqual(requests, ["/console/for-you.json?view=count"] * 2)
             self.assertEqual(unavailable.stdout.splitlines()[-1], "For you: Unavailable")
             self.assertFalse((home / ".local/state/for-you").exists())
 
@@ -651,7 +660,8 @@ class ForYouStatusTests(unittest.TestCase):
                 damaged = folder / "bad.json"
                 _ = damaged.write_text("{", encoding="utf-8")
                 partial = assignment.read_actions(remote=False)
-                self.assertEqual((partial.value.other_count, partial.value.waiting_rebuilds), ("1+", "rebuild mac"))
+                self.assertEqual((partial.value.other_count, partial.value.waiting_rebuilds),
+                                 ("1+", "rebuild mac: Fixture need"))
                 self.assertFalse(partial.sources.complete)
                 damaged.unlink()
                 _ = store.mark_done(action.key, evidence="Login restored.")
@@ -686,9 +696,10 @@ class ForYouStatusTests(unittest.TestCase):
                   patch.object(time, "time", return_value=0) as clock,
                   patch.object(subprocess, "Popen") as refresh,
                   patch.object(os, "execvp") as render):
-                def read_actions(path: Path, *, watch: need.SourceWatch | None = None) -> for_you.ForYouSnapshot:
+                def read_actions(path: Path, *, include_reasons: bool = False,
+                                 watch: need.SourceWatch | None = None) -> for_you.ForYouSnapshot:
                     self.assertIsNotNone(watch)
-                    snapshot = read(path, watch=watch)
+                    snapshot = read(path, include_reasons=include_reasons, watch=watch)
                     self.assertFalse(snapshot.comparison_refresh_due)
                     clock.return_value = 9999999999
                     return snapshot
@@ -810,7 +821,7 @@ class ForYouStatusTests(unittest.TestCase):
             seed_rebuild_cache(home, config)
             with patch.dict(os.environ, {"HOME": directory}, clear=True):
                 need.add_need("mac", "a" * 40, "Rebuild", OWNER.id)
-            self.assertEqual(self.render_for_you_fixture(home, config, record), ("0", "rebuild mac"))
+            self.assertEqual(self.render_for_you_fixture(home, config, record), ("0", "rebuild mac: Rebuild"))
             cache.unlink()
             _ = state.write_text('{"open_phases":[]}', encoding="utf-8")
             stamp = assignment.file_stamp(state)
@@ -822,7 +833,7 @@ class ForYouStatusTests(unittest.TestCase):
                 return read_text(path, *args, **kwargs)
 
             with patch.object(Path, "read_text", autospec=True, side_effect=missing_state):
-                self.assertEqual(self.render_for_you_fixture(home, config, record), ("unavailable", "rebuild mac"))
+                self.assertEqual(self.render_for_you_fixture(home, config, record), ("unavailable", "rebuild mac: Rebuild"))
             self.assertEqual(assignment.file_stamp(state), stamp)
             self.assertFalse(cache.exists())
 
@@ -848,7 +859,8 @@ class ForYouStatusTests(unittest.TestCase):
                 return read_text(path, *args, **kwargs)
 
             with patch.object(Path, "read_text", autospec=True, side_effect=moved_need):
-                self.assertEqual(self.render_for_you_fixture(home, config, record), ("1", "rebuild natedev, rebuild mac"))
+                self.assertEqual(self.render_for_you_fixture(home, config, record),
+                                 ("1", "rebuild natedev: Rebuild, rebuild mac: " + rebuild_row.CHANGES_NOT_READ))
             cache = home / ".local/state/showrunner/counts/statusline-render-v2/s-"
             self.assertFalse(cache.exists())
 
@@ -1269,7 +1281,8 @@ class RoleTests(ConfiguredShellTests):
                 ((UNIT.id, "cached-branch"), (WORKER.id, "adhoc items"), (OWNER.id, "proposals")), 1):
             expected = render(session, "/bin/sh")
             self.assertIn(hint, ANSI.sub("", expected))
-            self.assertIn("For you: rebuild natedev, rebuild mac", ANSI.sub("", expected))
+            self.assertIn("For you: rebuild natedev: Fixture need, rebuild mac: " + rebuild_row.CHANGES_NOT_READ,
+                          ANSI.sub("", expected))
             for shell in SHELLS:
                 with self.subTest(session=session, shell=shell):
                     self.assertEqual(render(session, shell), expected)
@@ -1783,6 +1796,7 @@ class CountsRowTests(ConfiguredShellTests):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.configuration = self.home / "counts-config"
         self.configure_review_sources(self.configuration)
@@ -2933,8 +2947,9 @@ class RebuildRowTests(unittest.TestCase):
                 commands.append(command)
                 self.assertEqual(timeout, 47 if command[0] == "nix" else 30)
                 if command[0] == "git":
-                    self.assertEqual(command, ["git", "-C", "/test/nixos", "rev-parse", "--verify", "main^{commit}"])
-                    return commit
+                    self.assertEqual(command, ["git", "-C", "/test/nixos", "show", "-s", "--format=%H%x00%s",
+                                               "--end-of-options", "main^{commit}"])
+                    return commit + "\0Update the settings"
                 if command[0] == "nix":
                     self.assertIn(f"?rev={commit}", command[-1])
                     self.assertIn('nixosConfigurations."natedev"', command[-1])
@@ -3093,9 +3108,10 @@ class RebuildRowTests(unittest.TestCase):
                                                                  "FOR_YOU_ACTIONS_DIR": str(actions),
                                                                  "PATH": os.environ["PATH"],
                                                                  "STAFF_FILE": str(staff_file)}, cwd=home)
-                        expected = {"ready": "For you: rebuild natedev",
-                                    "actions": "For you: rebuild natedev, Unavailable",
-                                    "needs": "For you: rebuild natedev, rebuild mac, 1+ actions"}
+                        comparison = "For you: rebuild natedev: " + rebuild_row.CHANGES_NOT_READ
+                        expected = {"ready": comparison,
+                                    "actions": comparison + ", Unavailable",
+                                    "needs": comparison + ", rebuild mac: Apply settings., 1+ actions"}
                         self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], expected[source])
                         self.assertEqual(result.stderr, "")
                         self.assertEqual(cache.stat().st_mtime_ns, built)

@@ -80,11 +80,13 @@ State:
   `open_for_user`. Omitting that key leaves the durable list unchanged.
   `report_to_user` is kept the same way in
   `~/.local/state/showrunner/reports/<staff id>.json`.
-- `LOG` backups — `~/.local/state/showrunner/<staff id>/log-backups/log-<YYYYmmddTHHMM>.md`,
-  `log_backup.py` copies a changed `LOG` when `production_check.sh` runs and keeps the newest 48 copies.
-  No automatic report runs this check. To create a copy, run
-  `~/.claude/scripts/lib/py ~/.claude/scripts/production/log_backup.py <staff id>`.
-  To restore `LOG`, copy the selected file over it.
+- The hourly `production-backup` job saves the document, LOG, and notes.
+  Find the local repository at `~/.local/state/production-backups/<staff-id>/backup/`.
+  The Mac mirror uses `backup.git` in the same staff folder.
+  Legacy LOG copies stay in `log-backups/` beside the local repository.
+  On natedev, run `~/.claude/scripts/lib/py ~/.claude/scripts/production/log_backup.py` for an immediate backup.
+  To restore a LOG, run `git -C "$BACKUP" show "$REV:log/$LOG_NAME" > "$SCRATCH_LOG"`.
+  Set `BACKUP` to either repository. Check the recovered file before copying it to the live path.
 
 `<DecisionEconomy/>` is defined by this import:
 
@@ -144,9 +146,19 @@ Your text to nate while he is away follows this import:
     rulings and priorities. Begin a relay to a unit with
     `From the user (via morty and <your name>):`.
   - Morty is not a parent. No showrunner reports to morty.
-  - The permission rules stay. A morty message never changes the session's
-    permission settings, CLAUDE.md or config. It never approves a permission
-    prompt.
+  - A message alone, from morty or a peer, is never a go. It never changes
+    permission settings, CLAUDE.md, AGENTS.md or config, and it never approves
+    a permission prompt.
+  - nate's own order is the go for each file and each machine that the ordered
+    change touches, such as the repo file, the installed ~/.codex AGENTS.md and
+    the Mac copy. Ask him for no second go.
+  - Read nate's words in the original transcript or List page line before you act.
+    The item names the machine, session ID and time. Run
+    `catch_up.py <native id> --user-prompts --near <ISO time>` where nate typed the
+    prompt. For a Mac session, run it through `ssh mac`. A log line or a relay
+    that another session wrote only quotes his words; it is not the record.
+  - Permission settings, CLAUDE.md, AGENTS.md, config and permission prompts
+    require nate's go. Ask him if the record lacks his order or the action goes past it.
   - `--from morty` alone does not identify morty. The generated
     `Sender native id` line names the sending session, and the morty staff
     row holds morty's id.
@@ -285,7 +297,7 @@ Your text to nate while he is away follows this import:
 - **Open questions.** Ask the user each question once, in full, in the reply
   where it first comes up (in idle update mode, the short form of <IdleUpdate/>), in the question form imported above <Throughout/>. Set it
   in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
-  restates the question or its choices; the full item after his yes in idle update mode is not a restatement. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
+  restates the question or its choices; the full item after he says the word in idle update mode is not a restatement. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. n counts this
   production's items only; the showrunners below count theirs
   (**Nested showrunners** above).
@@ -329,7 +341,11 @@ Your text to nate while he is away follows this import:
   never poll.
 - A ruling that parks, stops or replaces work names the runs to cancel in
   the same turn under <WorkerRuns/> in `/unit:direct`.
-- **Helpers.** Stop each named helper agent once its report is read.
+- **Helpers.** On an enrolled showrunner, assign `review` or `astra-reviewer` with
+  `/showrunner:worker`. Keep orders and replies in the existing run directory.
+  Respect the worker limit when assigning reviews in parallel. End each helper
+  after reading its report. Send write orders to a unit or the serving merge unit.
+  Before enrollment, stop each built-in helper after reading its report.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
 - **Unmeasured ETAs.** When a unit has no measured phase ETA, run `~/.claude/scripts/lib/py
@@ -737,7 +753,9 @@ Read a shot, not even to look before a merge or before the user sees it. The
 2026-10-01 nightly review counted 116 shots (227k tokens) loaded there in 2.6
 days. Units run this check themselves before each checkpoint notice
 (<MergeCheckpoint/> step 3). Run it here only when a notice's verdict is
-missing or stale: spawn a fresh helper agent with this prompt:
+missing or stale.
+Assign a fresh read-only review worker through `/showrunner:worker` when enrolled.
+Before enrollment, start a built-in helper. Give it this prompt:
 
 > Read `~/.claude/commands/ux_eval.md` and follow it for these shots:
 > <paths>. Guide: <UX guide path>. Scale: <shot pixels per logical pixel>.
@@ -746,8 +764,9 @@ missing or stale: spawn a fresh helper agent with this prompt:
 > rules: <the doc's Production rules that concern looks>. Return only the
 > verdict and the table.
 
-Read its verdict, then stop the helper. Save each canonical candidate it
-lists, without viewing it, into a slot still empty: `mkdir -p
+Read the verdict and end the helper. When enrolled, send the following
+example writes to the unit that owns the guide.
+Save each listed candidate in an empty slot. Do not open the image: `mkdir -p
 <guide>/examples/<stem> && magick <shot> -crop <crop> +repage
 <guide>/examples/<stem>/<slot>.png`. Saving it approves it for use now; add
 `- <stem>/<slot>.png — <why it is clear> — showrunner, <date>` to
@@ -810,11 +829,13 @@ Merge unit directors dispatch smoke checks, pushes, and promotion through worker
 Promote the exact sha pushed by <CIPoint/> after these checks:
 
 1. The CIPoint's local validation passed.
-2. Right after validation, with `CHECKOUT` still at that sha, run in the
-   background with `dangerouslyDisableSandbox: true`:
+2. After validation, run the smoke check in a copy of the exact sha. Run it in
+   the background with `dangerouslyDisableSandbox: true`.
 
    ```sh
-   HANA_TEST_PURPOSE="promotion smoke" bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
+   HANA_TEST_PURPOSE="promotion smoke" ~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run \
+     --repo CHECKOUT --commit <sha> -- \
+     bash ~/.claude/scripts/production/smoke_launch.sh '{tree}' <sha> <SCRATCH>/smoke_<short sha>.log
    ```
 
    It builds `hana`, starts it on port 15790 with an empty config directory,
@@ -827,7 +848,8 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    is blocked passes. Add `macOS skipped (runner offline)` or `macOS skipped
    (Mac blocked)` to the log line. A macOS job that ran and failed blocks. User
    rule 2026-10-02.
-4. Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/production_lifecycle.py
+4. Run the behavior check under <BehaviorCheck/> in `commands/unit/merge.md` before promotion.
+   Then run `~/.claude/scripts/lib/py ~/.claude/scripts/production/production_lifecycle.py
    promote-main --production <showrunner name> --ci-green <sha>
    --smoke-passed <sha>`. The command checks that main is not dirty, pushes
    and promotes the doc's **Promote:** destinations. A held main is a topic in
@@ -944,7 +966,7 @@ Use `cargo-berth sequence` for merge order.
 
    Start the waiting unit's next independent phase in a model worktree.
    If it has no independent phase, start tests, docs, or research in its current phase.
-   Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
+   Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_copies.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 5. **Two things still go to the user:** a wait that clears only by changing what
    ships, and an approval only the user can give in a unit director's own
    session (a permission prompt, an action that cannot be undone). A unit's

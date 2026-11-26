@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.buildlog.store import host_name
+from scripts.lib import conf
 from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 @dataclass(frozen=True)
-class SlotTestConfiguration:
+class CopyTestConfiguration:
     settings: Path
     machine: str
     environment: Mapping[str, str]
@@ -23,16 +24,17 @@ def write_private_build_roots(settings: Path, root: Path, machine: str) -> None:
         _ = write_config_fixture(settings)
     lines = [line for line in settings.read_text().splitlines() if not line.startswith("roots.build")]
     lines.append(f"roots.build={root / 'build'}")
-    for host in sorted({"natedev", machine}):
+    for host in sorted({"natedev", conf.host_key_name(machine)}):
         lines.append(f"roots.build.{host}={root / 'build'}")
     _ = settings.write_text("\n".join(lines) + "\n")
 
 
-def private_slot_config(root: Path) -> SlotTestConfiguration:
+def private_copy_config(root: Path) -> CopyTestConfiguration:
     """Give direct calls and child commands private roots without a caller session."""
     environment = config_environment(root / "config")
     settings = Path(environment["CONF_DIR"]) / "build_folders.conf"
     machine = host_name()
+    host = conf.host_key_name(machine)
     fixed = f"""# whole: 1..
 names.suffix_length=8
 # whole: 1..64
@@ -65,8 +67,8 @@ locks.probe_retry_seconds=0.005
 # whole: 1..
 folders.unused_days=2"""
     fixed_lines = fixed.splitlines()
-    if machine != "natedev":
-        fixed_lines.append(f"roots.build.{machine}={root / 'build'}")
+    if host != "natedev":
+        fixed_lines.append(f"roots.build.{host}={root / 'build'}")
     keys = {line.partition("=")[0] for line in fixed_lines if "=" in line}
     replaced_prefixes = tuple(f"{key}." for key in keys)
     lines = [line for line in settings.read_text().splitlines()
@@ -85,4 +87,4 @@ folders.unused_days=2"""
         "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
         "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
     })
-    return SlotTestConfiguration(settings, machine, environment)
+    return CopyTestConfiguration(settings, machine, environment)

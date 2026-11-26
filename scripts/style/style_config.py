@@ -150,7 +150,8 @@ def read_config(doc: Path) -> StyleRepositoryConfig:
         lines = doc.read_text(encoding="utf-8").splitlines()
         assignments = _assignments(lines)
         receiving_branch = production_doc.production_field(lines, "Merge branch")
-        checkout = Path(production_doc.production_field(lines, "Showrunner checkout")).expanduser().resolve()
+        checkout = (production_doc.read_new_production(doc, doc.stem).checkout if staff.declares_merge_checkout(lines)
+                    else Path(production_doc.production_field(lines, "Showrunner checkout")).expanduser().resolve())
         if production_doc.optional_field(lines, "Kind") == production_doc.FieldPresent("style"):
             branch_point = production_doc.production_field(lines, "Branch point").removeprefix("refs/heads/")
             route = StyleShowrunnerRoute(receiving_branch, branch_point, doc, checkout)
@@ -159,6 +160,17 @@ def read_config(doc: Path) -> StyleRepositoryConfig:
         return StyleRepositoryConfig(assignments, route)
     except (OSError, UnicodeError, production_doc.Refusal) as error:
         raise StyleConfigError(f"{doc}: {error}") from error
+
+
+def proposals_folder(doc: Path) -> Path:
+    """Resolve the proposals folder from the live document."""
+    lines = doc.read_text(encoding="utf-8").splitlines()
+    folder = Path(production_doc.production_field(lines, "Proposals")).expanduser()
+    if folder.is_absolute():
+        return folder
+    root = (Path(production_doc.production_field(lines, "Repository")).expanduser()
+            if staff.declares_merge_checkout(lines) else doc.parent.parent)
+    return root / folder
 
 
 def config_for_unit(unit: str | staff.StaffRow, record: staff.StaffSnapshot) -> StyleRepositoryConfig:

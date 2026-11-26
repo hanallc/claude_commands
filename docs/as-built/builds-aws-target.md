@@ -1183,7 +1183,16 @@ It renders the registered `aws.snapshot_failed` text and sends it through `push_
 The message key comes from the streak's start time.
 The notice names each region and read that AWS refused. The saved failure keeps the AWS error code.
 `AccessDenied`, `AccessDeniedException`, `UnauthorizedOperation`, and `not authorized` permit a notice.
-The fixed action requests `deploy.py up --workload merge-gates --approve-resources` on natedev.
+The first permission refusal files the **Allow AWS price reads** action with `deploy.py up --approve-resources` on natedev.
+The card reason says, "After 2 hours without the read, test runs on AWS can pick a region that costs more."
+The card shows **Completion: Automatic** and also has a **Done** button.
+The streak saves the action key before it files the action.
+A new streak withdraws any open action from the previous streak before it files an action for the current regions.
+It records successful action creation separately from the notice claim.
+A later permission refusal retries a failed action creation, even after the notice goes out.
+Completing the action leaves the creation record in the streak.
+A clean read saves the snapshot and ends the streak before it withdraws the open action.
+A withdrawal failure sets status 1. The next clean read or permission refusal retries the withdrawal.
 That command updates permissions but does not replace scaler credentials.
 Credential errors, timeouts, network errors, and throttling send no phone notice.
 `deploy.py apply --approve-resources` replaces the scaler key and checks its identity.
@@ -1196,7 +1205,7 @@ The snapshot saves the notice claim before it calls the message process.
 The claim prevents another send for that streak after a crash.
 A crash before delivery can suppress that streak's notice.
 A normal delivery failure clears the claim for the next snapshot attempt with the same key.
-Success in every candidate region ends the streak and drops any unsent notice because no user action remains.
+A completed streak drops any unsent notice.
 A later failure starts a new streak and permits a new notice.
 `snapshot_notification_timeout_s=120` bounds message review and delivery in seconds.
 Each failure logs the region, the failed read, the error class, and a redacted reason on one line.
@@ -1758,7 +1767,7 @@ The bootstrap downloads the payload inside the main checkout.
 The bootstrap extracts the runtime under `~/rust/hana/.git/hana-payload`.
 Systemd mounts that path as a bounded filesystem for each command.
 The runner stages the verified bundle in the main checkout's Git directory.
-`build_slots.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
+`build_copies.take_copy` takes the assigned number under `~/build/hana/aws-hana`.
 The maker rescues source edits before reset and retains Cargo output within the configured size limit.
 The copy's `rust-toolchain.toml` digest must equal the manifest before execution.
 The shell cache lives at `~/build/hana/main/shells`.

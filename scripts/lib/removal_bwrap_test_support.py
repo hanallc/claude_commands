@@ -11,7 +11,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import sysconfig
 
 from scripts.lib import conf
 
@@ -22,35 +21,37 @@ CONFIG_ROOT_KEYS = frozenset(("sweep_floor_roots", "sweep_ci_targets", "folder_s
 ROOT_CONFIGS = ("build_folders.conf", "lint.conf", "mac_test.conf", "scratch.conf")
 
 
+def run_mac_fixture_command(command: list[str], *, timeout: int, cwd: Path | None = None,
+                            env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, text=True,
+                              capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        stdout = (error.stdout or b"").decode(errors="replace")
+        stderr = (error.stderr or b"").decode(errors="replace")
+        raise AssertionError(
+            f"timed out after {timeout} s: {shlex.join(command)}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ) from error
+
+
 def is_declared_root(key: str) -> bool:
     return key.startswith("roots.") or key.partition(".")[0] in CONFIG_ROOT_KEYS
 
 
-def mac_profile(private: Path, checkout: Path) -> str:
-    """Permit fixture data and the code and runtime that the proof runs."""
+def mac_profile(fixture: Path) -> str:
+    """Protect the test root and limit writes to the fixture and /dev/null."""
     def subpath(path: Path) -> str:
         return f"(subpath {json.dumps(str(path), ensure_ascii=False)})"
 
-    interpreter = Path(sys.executable).resolve()
-    libraries = {Path(sysconfig.get_path(name)).resolve() for name in ("stdlib", "platstdlib")}
-    python_library = (Path(sys.base_prefix) / "Python").resolve()
-    runtime = tuple(Path(path) for path in (
-        "/bin", "/usr/bin", "/usr/lib", "/System/Library", "/usr/share/zoneinfo", "/private/var/db/timezone",
-    ))
-    readable = (private, checkout, *sorted(libraries), *runtime)
-    readable_files = (interpreter, python_library, Path("/dev/null"))
-    parents = {parent for path in (*readable, *readable_files) for parent in path.parents}
-    directories = " ".join(map(subpath, readable))
-    def literals(paths: tuple[Path, ...] | list[Path]) -> str:
-        return " ".join(f"(literal {json.dumps(str(path), ensure_ascii=False)})" for path in paths)
-
-    cache = f"dataclass-code-{os.getuid()}"
+    fixture_path = subpath(fixture)
     return (
-        "(version 1)\n(allow default)\n(deny network*)\n(deny file-read*)\n(deny file-write*)\n"
-        f"(allow file-read* {directories} {literals(readable_files)})\n"
-        f"(allow file-read-metadata {literals(sorted(parents))})\n"
-        f"(deny file-read* (subpath \"/var/tmp/{cache}\") (subpath \"/private/var/tmp/{cache}\"))\n"
-        f"(allow file-write* {subpath(private)} (literal \"/dev/null\"))\n"
+        "(version 1)\n"
+        "(allow default)\n"
+        "(deny network*)\n"
+        "(deny file-write*)\n"
+        f'(allow file-write* {fixture_path} (literal "/dev/null"))\n'
+        f"(deny file-read-data {subpath(fixture.parent)})\n"
+        f"(allow file-read-data {fixture_path})\n"
     )
 
 
@@ -165,7 +166,7 @@ printf '1 0 launchd\n%s 1 %s\n' "$PPID" "$REMOVAL_PROOF_CALLER_ARGS"
             path = fixture_bin / name
             _ = path.write_text(script)
             path.chmod(0o700)
-        _ = (self.fixture / "removal.sb").write_text(mac_profile(self.fixture, self.checkout))
+        _ = (self.fixture / "removal.sb").write_text(mac_profile(self.fixture))
 
     def private_root(self, word: str) -> Path:
         if word.startswith("~/"):
@@ -206,8 +207,8 @@ printf '1 0 launchd\n%s 1 %s\n' "$PPID" "$REMOVAL_PROOF_CALLER_ARGS"
             profile = self.fixture / "removal.sb"
             env["PATH"] = f"{self.fixture / 'bin'}:{env['PATH']}"
             env["REMOVAL_PROOF_CALLER_ARGS"] = " ".join(arguments)
-            return subprocess.run([str(MAC_BACKEND), "-f", str(profile), *arguments], cwd=self.fixture,
-                                  env=env, text=True, capture_output=True, timeout=90, check=False)
+            return run_mac_fixture_command([str(MAC_BACKEND), "-f", str(profile), *arguments],
+                                           cwd=self.fixture, env=env, timeout=90)
         if sys.platform != "linux":
             raise AssertionError(f"removal proof has no sandbox backend for {sys.platform}")
         bubblewrap = shutil.which("bwrap")
