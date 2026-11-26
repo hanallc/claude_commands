@@ -18,6 +18,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Literal, Protocol, cast, final, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
@@ -60,6 +61,38 @@ class ProducerScopedUpdate(Protocol):
 
 
 scoped_update = cast(ProducerScopedUpdate, getattr(the_list, "_update"))
+
+
+class PreviousLogEntry(Protocol):
+    @property
+    def what(self) -> object: ...
+
+
+class PreviousListItem(Protocol):
+    @property
+    def title(self) -> str: ...
+
+    @property
+    def latest_status(self) -> str: ...
+
+    @property
+    def next_step(self) -> str: ...
+
+    @property
+    def log(self) -> tuple[PreviousLogEntry, ...]: ...
+
+    @property
+    def latest_status_time(self) -> object: ...
+
+    @property
+    def unread_since(self) -> object: ...
+
+
+class PreviousListReader(Protocol):
+    def load(self, keeper: staff.StaffId, identity: str) -> PreviousListItem: ...
+
+    def update(self, keeper: staff.StaffId, identity: str, changes: dict[str, str], *,
+               source: str) -> PreviousListItem: ...
 
 
 @final
@@ -177,6 +210,236 @@ class TheListTests(unittest.TestCase):
                     self.assertEqual(saved.eta, the_list.EtaStatus.WAITING_FOR_NATE if keeps_delivery
                                      else the_list.EtaStatus.NO_TIME_YET)
                     self.assertEqual(saved.log[-1].what, words)
+
+    def test_tag_normalizes_one_line_and_refuses_invalid_text(self) -> None:
+        self.assertEqual(the_list.Tag(" Review  Flow \t").text, "review flow")
+        self.assertEqual(the_list.Tag("Review\tFlow"), the_list.Tag("review flow"))
+        for text in ("", "  \t", "review,flow", "review\nflow", "review\r", "review\u2028flow"):
+            with self.subTest(text=text), self.assertRaises(the_list.ListError):
+                _ = the_list.Tag(text)
+
+    def test_tag_refuses_the_reserved_empty_list_text(self) -> None:
+        for text in ("none", "None", "  NONE  "):
+            with self.subTest(text=text), self.assertRaisesRegex(
+                    the_list.ListError, "'none' is reserved for an empty tag list"):
+                _ = the_list.Tag(text)
+        self.assertEqual(the_list.Tag("Review none").text, "review none")
+
+    def test_tag_changes_keep_order_and_log_once_for_each_write(self) -> None:
+        item = self.add()
+        flow, build = the_list.Tag("Review flow"), the_list.Tag("build")
+        change = the_list.add_tag(MORTY.id, item.id, flow, source="morty")
+        self.assertEqual(change.log, (*item.log, the_list.ItemChange(
+            START, the_list.TagsChanged((flow,)), "morty")))
+        change = the_list.add_tag(MORTY.id, item.id, build, source="morty")
+        self.assertEqual(change.tags, (flow, build))
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertIn(("tags: " + json.dumps(json.dumps(["review flow", "build"])) + "\n").encode(), before[0])
+        self.assertEqual(the_list.add_tag(MORTY.id, item.id, the_list.Tag("Review  Flow "), source="morty"), change)
+        self.assertEqual(the_list.remove_tag(MORTY.id, item.id, the_list.Tag("missing"), source="morty"), change)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+        removed = the_list.remove_tag(MORTY.id, item.id, flow, source="morty")
+        self.assertEqual(removed.tags, (build,))
+        self.assertEqual(removed.log, (*change.log, the_list.ItemChange(
+            START, the_list.TagsChanged((build,)), "morty")))
+        restored = the_list.add_tag(MORTY.id, item.id, flow, source="morty")
+        saved = the_list.load(MORTY.id, item.id)
+        self.assertEqual(saved, restored)
+        self.assertEqual(saved.tags, (build, flow))
+        self.assertEqual(list(the_list.log_field_changes(saved, include_tags=True))[-1], {"tags": (build, flow)})
+        self.assertEqual(list(the_list.log_field_changes(saved))[-1], {})
+
+    def previous_list_reader(self) -> PreviousListReader:
+        revision = "9f48ce4ef2:scripts/production/the_list.py"
+        old_source = subprocess.check_output(
+            ["git", "show", revision], cwd=Path(__file__).resolve().parents[2], text=True)
+        module = ModuleType("scripts.production.previous_the_list")
+        module.__file__ = str(Path(the_list.__file__).with_name("previous_the_list.py"))
+        self.enterContext(patch.dict(sys.modules, {module.__name__: module}))
+        exec(compile(old_source, revision, "exec"), module.__dict__)
+        _ = self.enterContext(patch.object(module, "now", return_value=START))
+        return cast(PreviousListReader, cast(object, module))
+
+    def test_previous_reader_accepts_tag_add_and_last_removal(self) -> None:
+        previous = self.previous_list_reader()
+        item = self.add(changes={"latest_status": "The page is ready."})
+        original = previous.load(MORTY.id, item.id)
+        tag = the_list.Tag('Review "flow"')
+        added = the_list.add_tag(MORTY.id, item.id, tag, source="morty")
+        with self.subTest(operation="add"):
+            saved = previous.load(MORTY.id, item.id)
+            self.assertEqual((saved.title, saved.latest_status), (original.title, original.latest_status))
+            self.assertEqual(saved.log[:-1], original.log)
+            self.assertEqual(len(saved.log), len(added.log))
+            self.assertEqual(saved.log[-1].what, 'Tags: review "flow"')
+
+        with self.subTest(operation="rewrite with the previous writer"):
+            saved = previous.update(MORTY.id, item.id, {"next_step": "Run checks."}, source="morty")
+            path = the_list.folder(MORTY.id) / f"{item.id}.md"
+            self.assertNotIn(b"\ntags:", path.read_bytes())
+            replayed = the_list.load(MORTY.id, item.id)
+            self.assertEqual(replayed.tags, (tag,))
+            self.assertEqual(replayed.log[:-1], added.log)
+            self.assertEqual(replayed.next_step, saved.next_step)
+
+        removed = the_list.remove_tag(MORTY.id, item.id, tag, source="morty")
+        with self.subTest(operation="remove last"):
+            saved = previous.load(MORTY.id, item.id)
+            self.assertEqual((saved.title, saved.latest_status), (original.title, original.latest_status))
+            self.assertEqual(saved.log[:len(original.log)], original.log)
+            self.assertEqual(len(saved.log), len(removed.log))
+            self.assertEqual(saved.log[-1].what, "Tags: none")
+
+        current = the_list.load(MORTY.id, item.id)
+        self.assertEqual(current, removed)
+        self.assertEqual(current.tags, ())
+        self.assertEqual(list(the_list.log_field_changes(current, include_tags=True))[-3:],
+                         [{"tags": (tag,)}, {"next_step": "Run checks."}, {"tags": ()}])
+
+    def test_tag_edits_leave_unread_and_mark_read_target_unchanged(self) -> None:
+        item = self.add()
+        target = the_list.unread_update(item)
+        assert isinstance(target, the_list.UnreadUpdate)
+        tag = the_list.Tag("build")
+        with patch.object(the_list, "now", return_value=START + timedelta(minutes=1)):
+            added = the_list.add_tag(MORTY.id, item.id, tag, source="morty")
+            with self.subTest(operation="add to unread item"):
+                self.assertEqual(added.unread_since, item.unread_since)
+                self.assertEqual(the_list.unread_update(the_list.load(MORTY.id, item.id)), target)
+            removed = the_list.remove_tag(MORTY.id, item.id, tag, source="morty")
+            with self.subTest(operation="remove from unread item"):
+                self.assertEqual(removed.unread_since, item.unread_since)
+                self.assertEqual(the_list.unread_update(removed), target)
+        read = the_list.mark_read(MORTY.id, item.id, source=the_list.PAGE_SOURCE, update=target)
+        self.assertIs(read.unread_since, the_list.NoTimestamp.UNSET)
+        previous = self.previous_list_reader()
+        updated = the_list.update(MORTY.id, item.id, {"tags": (tag,), "title": read.title}, source="morty")
+        self.assertIs(the_list.unread_update(updated), the_list.NoUnreadUpdate.ABSENT)
+        self.assertEqual(previous.load(MORTY.id, item.id).unread_since, "")
+        self.assertIs(the_list.unread_update(the_list.remove_tag(MORTY.id, item.id, tag, source="morty")),
+                      the_list.NoUnreadUpdate.ABSENT)
+
+    def test_previous_reader_keeps_added_fields_and_status_time_with_tags(self) -> None:
+        previous = self.previous_list_reader()
+        original = self.add(changes={"latest_status": "The page is ready."})
+        tag = the_list.Tag("review flow")
+        tagged = self.add(changes={"latest_status": original.latest_status, "tags": (tag,)})
+        original_saved = previous.load(MORTY.id, original.id)
+        tagged_saved = previous.load(MORTY.id, tagged.id)
+        with self.subTest(operation="add"):
+            self.assertEqual(tagged_saved.log[0], original_saved.log[0])
+            self.assertEqual(tagged_saved.latest_status_time, START)
+            self.assertEqual(tagged_saved.log[1].what, "Tags: review flow")
+
+        moment = START + timedelta(minutes=1)
+        with patch.object(the_list, "now", return_value=moment):
+            updated = the_list.update(MORTY.id, tagged.id, {
+                "latest_status": "The check passed.", "tags": (tag, the_list.Tag("build"))}, source="morty")
+        with self.subTest(operation="update"):
+            saved = previous.load(MORTY.id, tagged.id)
+            self.assertEqual(saved.latest_status, "The check passed.")
+            self.assertEqual(saved.latest_status_time, moment)
+            self.assertEqual(saved.log[-1].what, "Tags: review flow, build")
+            self.assertEqual(len(saved.log), len(tagged_saved.log) + 2)
+        self.assertEqual(the_list.load(MORTY.id, tagged.id), updated)
+        self.assertEqual(list(the_list.log_field_changes(updated, include_tags=True))[-2:],
+                         [{"latest_status": "The check passed."}, {"tags": (tag, the_list.Tag("build"))}])
+
+    def test_unrelated_and_invalid_tag_notes_stay_plain(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        before = path.read_text().rstrip("\n") + "\n"
+        for note in ("List tags: review later", "Tags: see later,", "Tags: build, build",
+                     "Tags: "):
+            with self.subTest(note=note):
+                row = {"time": START.isoformat(), "source": "morty", "note": note}
+                _ = path.write_text(before + "- " + json.dumps(row) + "\n")
+                current = the_list.load(MORTY.id, item.id)
+                self.assertEqual(current.log[-1].what, note)
+                self.assertEqual(current.tags, ())
+
+        note = "Tags: see later"
+        _ = path.write_text(before + f"- 2026-11-16 18:00:00+00:00 {note} — morty\n")
+        current = the_list.load(MORTY.id, item.id)
+        self.assertEqual(current.log[-1].what, note)
+        self.assertEqual(current.tags, ())
+        _ = the_list.update(MORTY.id, item.id, {"next_step": "Review the page."}, source="morty")
+        reread = the_list.load(MORTY.id, item.id)
+        self.assertEqual(reread.log[-2].what, note)
+        self.assertEqual(reread.tags, ())
+
+    def test_duplicate_tags_are_refused_in_edits_and_headers(self) -> None:
+        item = self.add()
+        tags = (the_list.Tag("build"), the_list.Tag("BUILD"))
+        with self.assertRaises(the_list.ListError):
+            _ = the_list.update(MORTY.id, item.id, {"tags": tags}, source="morty")
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        duplicates = json.dumps(json.dumps(["build", "BUILD"]))
+        _ = path.write_text(path.read_text().replace('tags: "[]"', f"tags: {duplicates}"))
+        with self.assertRaises(the_list.ListError):
+            _ = the_list.load(MORTY.id, item.id)
+
+    def test_old_record_without_tags_reads_without_a_write(self) -> None:
+        item = self.add()
+        path = the_list.folder(MORTY.id) / f"{item.id}.md"
+        _ = path.write_text(path.read_text().replace('tags: "[]"\n', ""))
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertNotIn(b"\ntags:", before[0])
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
+        self.assertEqual(the_list.load(MORTY.id, item.id).tags, ())
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_tags_count_open_items_and_list_requires_every_tag(self) -> None:
+        flow, build, archive = the_list.Tag("review flow"), the_list.Tag("build"), the_list.Tag("archive")
+        both = self.add("Both tags", changes={"tags": (flow, build), "producer": OTHER.id})
+        one = self.add("One tag", changes={"tags": (flow,), "producer": BOB.id})
+        _ = self.add("No tags")
+        closed = self.add("Closed item", changes={"tags": (flow, build)})
+        _ = the_list.close(MORTY.id, closed.id, "Delivered.", source="morty")
+        self.assertEqual(self.command("tag", "--id", closed.id, "--add", "Archive", "--source", "morty"), (0, "", ""))
+        items = the_list.records(MORTY.id, include_closed=True)
+        closed = next(item for item in items if item.id == closed.id)
+        self.assertEqual(closed.tags, (flow, build, archive))
+        self.assertEqual(closed.unread_since, the_list.NoTimestamp.UNSET)
+        self.assertEqual(the_list.tag_counts(items), {flow: 2, build: 1})
+        self.assertEqual(the_list.select_by_tags(items, (flow, build, flow)), [both, closed])
+        self.assertEqual(the_list.select_by_tags(items, ()), items)
+        self.assertEqual(self.command("tags"), (0, "build\t1\nreview flow\t2\n", ""))
+        code, output, error = self.command("list", "--tag", "Review  Flow ", "--tag", "Build")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn(both.title, output)
+        for title in (one.title, "No tags", closed.title):
+            self.assertNotIn(title, output)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": BOB.current_session}):
+            self.assertEqual(self.command("tags"), (0, "review flow\t1\n", ""))
+            code, output, error = self.command("list", "--tag", "Review Flow", "--tag", "Build")
+            self.assertEqual((code, error), (0, ""))
+            self.assertNotIn(both.title, output)
+
+    def test_producer_tags_only_its_own_items_under_the_write_lock(self) -> None:
+        own = self.add(changes={"producer": OTHER.id})
+        other = self.add(changes={"producer": BOB.id, "tags": (the_list.Tag("build"),)})
+        path = the_list.folder(MORTY.id) / f"{other.id}.md"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("tag", "--id", own.id, "--add", " Build "), (0, "", ""))
+            tagged = the_list.load(MORTY.id, own.id)
+            self.assertEqual(tagged.tags, (the_list.Tag("build"),))
+            self.assertEqual(tagged.log[-1].source, OTHER.name)
+            self.assertEqual(self.command("tag", "--id", own.id, "--remove", "BUILD", "--source", "morty"), (0, "", ""))
+            for option in ("--add", "--remove"):
+                with self.subTest(option=option):
+                    self.assertEqual(self.command("tag", "--id", other.id, option, "build"), (1, "", (
+                        f"the_list: {other.id} is assigned to another producer. "
+                        + "A producer can change only its own items.\n")))
+        saved = the_list.load(MORTY.id, own.id)
+        self.assertEqual(saved.tags, ())
+        self.assertEqual(saved.log[-1].source, OTHER.name)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.command("tag", "--id", other.id, "--remove", "build", "--source", "morty"), (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, other.id).tags, ())
 
     def test_log_field_changes_replays_linked_delivery(self) -> None:
         item = self.add(changes={"state": the_list.ItemState.WORKING})
@@ -1729,7 +1992,8 @@ the_list.fire_scheduled(timedelta(minutes=2))
                     + f"Its showrunner is show.\nRun `{launcher} list --all --latest-status` to read it. "
                     + f"Run `{launcher} update --id L{number}` to update it. "
                     + "Use any of `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, "
-                    + "`--eta`, `--state`, `--next-check`, `--evidence`, `--add-evidence`."))
+                    + "`--eta`, `--state`, `--next-check`, `--owner`, `--related-to`, `--blocked-by`, "
+                    + "`--evidence`, `--add-evidence`."))
                 self.assertEqual(showrunner, (RUNNER.id, f"dwight is the producer of item {number}: Build plan. "
                     + "Send design questions on this item to dwight."))
         self.assertEqual(len(self.notices), 4)
@@ -1956,7 +2220,8 @@ the_list.fire_scheduled(timedelta(minutes=2))
             for option, value in (("--eta", "Paused"), ("--state", "Working"), ("--next-check", START.isoformat()),
                                   ("--title", "New title"), ("--done-when", "The plan is public."),
                                   ("--unit", "unit-board"), ("--evidence", "An updated result."),
-                                  ("--add-evidence", "An additional result.")):
+                                  ("--add-evidence", "An additional result."), ("--owner", RUNNER.id),
+                                  ("--blocked-by", "L2:ready"), ("--related-to", "L2")):
                 with self.subTest(option=option):
                     self.assertEqual(self.command("update", "--id", item.id, option, value), (1, "", (
                         f"the_list: {item.id} is assigned to another producer. "
@@ -1973,6 +2238,29 @@ the_list.fire_scheduled(timedelta(minutes=2))
                              (1, "", f"the_list: {identity} is assigned to another producer. "
                               + "A producer can change only its own items.\n"))
         self.assertEqual(the_list.load(MORTY.id, identity), saved)
+
+    def test_producer_updates_owner_and_links_without_writing_the_target(self) -> None:
+        own = self.add(changes={"producer": OTHER.id, "owner": the_list.UnassignedOwner.NATE})
+        target = self.add(changes={"producer": BOB.id})
+        target_path = the_list.folder(MORTY.id) / f"{target.id}.md"
+        before = target_path.read_bytes(), target_path.stat().st_mtime_ns
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("update", "--id", own.id, "--owner", RUNNER.id,
+                                          "--related-to", target.id, "--blocked-by", f"{target.id}:ready"), (0, "", ""))
+            saved = the_list.load(MORTY.id, own.id)
+            self.assertEqual(saved.log[-1].what, the_list.FieldChange("Updated", {
+                "owner": RUNNER.id, "related_to": (target.number,),
+                "blocked_by": (the_list.ItemDependency(target.number, "ready"),),
+            }))
+            self.assertEqual((saved.owner, saved.producer), (RUNNER.id, OTHER.id))
+            self.assertEqual(saved.related_to, (target.number,))
+            self.assertEqual(saved.blocked_by, (the_list.ItemDependency(target.number, "ready"),))
+            self.assertEqual(saved.log[-1].source, OTHER.name)
+            result, output, error = self.command("update", "--id", target.id, "--related-to", own.id)
+            self.assertEqual((result, output), (1, ""))
+            self.assertIn("A producer can change only its own items.", error)
+        self.assertEqual((target_path.read_bytes(), target_path.stat().st_mtime_ns), before)
+        self.assertEqual(self.notices, [])
 
     def test_producer_updates_and_appends_its_evidence(self) -> None:
         cases = (
@@ -2002,19 +2290,25 @@ the_list.fire_scheduled(timedelta(minutes=2))
 
     def test_producer_cannot_update_other_fields(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
-        fields = (("--owner", RUNNER.id), ("--owner", "invalid owner"),
-                  ("--producer", BOB.id), ("--producer", "invalid producer"), ("--requested-by", "nate"),
-                  ("--blocked-by",), ("--related-to",))
+        fields = (("--producer", BOB.id), ("--producer", "invalid producer"), ("--requested-by", "nate"))
         with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
             for field, *values in fields:
                 with self.subTest(field=field):
                     result, output, error = self.command("update", "--id", item.id, "--eta", "Paused", field, *values)
                     self.assertEqual((result, output), (1, ""))
                     self.assertIn("producers can update only --title, --done-when, --unit, --latest-status, "
-                                  + "--next-step, --eta, --state, --next-check, --evidence, --add-evidence.", error)
+                                  + "--next-step, --eta, --state, --next-check, --owner, --related-to, --blocked-by, "
+                                  + "--evidence, --add-evidence.", error)
                     self.assertIn(f"Refused options: {field}", error)
                     self.assertEqual(the_list.load(MORTY.id, item.id), item)
         self.assertEqual(self.notices, [])
+
+    def test_producer_update_rejects_an_invalid_owner(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": OTHER.current_session}):
+            self.assertEqual(self.command("update", "--id", item.id, "--owner", OWNER.id),
+                             (1, "", "the_list: owner must name a showrunner staff id\n"))
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
     def test_producer_scoped_update_cannot_reassign_an_item(self) -> None:
         item = self.add(changes={"producer": OTHER.id})
@@ -3550,8 +3844,9 @@ the_list.fire_scheduled(timedelta(minutes=2))
             with self.subTest(options=options):
                 self.assertEqual(self.command("update", "--id", item.id, "--keeper", BOB.id, *options,
                                               "--source", "morty"), refusal)
-        # A producer never changes these fields, so it gets the field refusal.
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": BOB.current_session}):
+            self.assertEqual(self.command("update", "--id", item.id, "--keeper", BOB.id, "--owner", RUNNER.id),
+                             refusal)
             status, output, errors = self.command("update", "--id", item.id, "--keeper", BOB.id, "--producer", "dwight")
         self.assertEqual((status, output), (1, ""))
         self.assertIn("producers can update only", errors)
@@ -3568,11 +3863,8 @@ the_list.fire_scheduled(timedelta(minutes=2))
             updated = the_list.load(MORTY.id, item.id)
             self.assertEqual(updated.next_step, "Check it.")
             self.assertEqual(updated.unit, "example")
-            status, output, errors = self.command("update", "--id", item.id, "--owner", RUNNER.id)
-        self.assertEqual((status, output), (1, ""))
-        self.assertIn("producers can update only", errors)
-        self.assertIn("Refused options: --owner", errors)
-        self.assertEqual(the_list.load(MORTY.id, item.id), updated)
+            self.assertEqual(self.command("update", "--id", item.id, "--owner", "nate"), (0, "", ""))
+        self.assertEqual(the_list.load(MORTY.id, item.id).owner, the_list.UnassignedOwner.NATE)
         self.assertEqual(the_list.load(BOB.id, item.id), item)
 
     def test_page_mark_read_notice_for_mortys_item_skips_the_producers_legacy_copy(self) -> None:
