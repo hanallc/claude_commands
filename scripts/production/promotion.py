@@ -20,6 +20,9 @@ from scripts.production import checkpoint_gate, production_doc, staff, unit_look
 from scripts.production.production_names import CARGO_LINER_PRODUCTION
 
 
+CI_WORKFLOW_DIRECTORY = ".github/workflows"
+
+
 @dataclass(frozen=True)
 class CollectedCi:
     document: Path
@@ -45,6 +48,12 @@ type PromotionApproval = CollectedCi | LifecycleCi | LifecycleNoCi | FastTrackIn
 
 
 @dataclass(frozen=True)
+class MainInstallation:
+    checkout: Path
+    advance: Callable[[], None]
+
+
+@dataclass(frozen=True)
 class ApprovedPromotion:
     """The exact commit that this operation permits at each destination."""
 
@@ -53,11 +62,12 @@ class ApprovedPromotion:
     def install(self, checkout: Path, expected_head: str) -> None:
         waiting_rows.move_to(checkout, self.sha, fast_forward=True, expected_head=expected_head)
 
-    def land(self, checkout: Path) -> land_main.Landed:
-        if git(checkout, "rev-parse", "HEAD") == self.sha:
-            return land_main.land(checkout, self.sha)
+    def land(self, checkout: Path, *, installation: MainInstallation | None = None) -> land_main.Landed:
+        advance = installation.advance if installation else None
+        if (installation and installation.checkout == checkout) or git(checkout, "rev-parse", "HEAD") == self.sha:
+            return land_main.land(checkout, self.sha, install_checkout=advance)
         with land_main.exact_hook_checkout(checkout, self.sha) as exact:
-            return land_main.land(exact, self.sha, retry_source=checkout)
+            return land_main.land(exact, self.sha, retry_source=checkout, install_checkout=advance)
 
 
 @dataclass(frozen=True)
@@ -74,6 +84,16 @@ def git(checkout: Path, *arguments: str) -> str:
         raise checkpoint_gate.Stop("promote", "failed", result.stderr.strip() or f"git {arguments[0]} failed",
                                    "inspect Git and retry promotion")
     return result.stdout.strip()
+
+
+def ci_workflow_paths(source: Path, tip: str) -> list[str]:
+    listing = git(source, "ls-tree", "--full-tree", "-z", tip, "--", f"{CI_WORKFLOW_DIRECTORY}/")
+    workflows: list[str] = []
+    for entry in listing.split("\0"):
+        metadata, _, path = entry.partition("\t")
+        if path.endswith((".yml", ".yaml")) and metadata.split()[1] == "blob":
+            workflows.append(path)
+    return workflows
 
 
 def require_approval(source: Path, branch: str, tip: str, approval: PromotionApproval) -> None:
@@ -105,7 +125,8 @@ def require_approval(source: Path, branch: str, tip: str, approval: PromotionApp
             raise checkpoint_gate.Stop("promote", "held", f"collect cargo-liner CI on the integration tip before promoting {tip}",
                                        "collect CI and retry promotion")
     elif isinstance(approval, CollectedCi):
-        checkpoint_gate.require_promotion_ci(owner, tip, "standard")
+        if ci_workflow_paths(source, tip):
+            checkpoint_gate.require_promotion_ci(owner, tip, "standard")
     elif isinstance(approval, LifecycleCi):
         if not re.fullmatch(r"[0-9a-f]{7,64}", approval.verdict):
             raise checkpoint_gate.Stop("promote", "held", "CI verdict must identify a commit by SHA",

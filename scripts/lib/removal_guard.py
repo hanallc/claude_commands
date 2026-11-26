@@ -405,6 +405,23 @@ class CopyDestination:
     directory: int
 
 
+@dataclass(frozen=True)
+class CheckedGitFile:
+    path: Path
+    device: int
+    inode: int
+    mode: int
+    size: int
+    modified_ns: int
+
+    @classmethod
+    def from_stat(cls, path: Path, info: os.stat_result) -> CheckedGitFile:
+        return cls(path, info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+
+
+NO_CHECKED_GIT_FILES: frozenset[CheckedGitFile] = frozenset()
+
+
 @dataclass(frozen=True, init=False)
 class ProvedCopyCleanup:
     """Approve removal of the source entries that match a verified copy."""
@@ -414,9 +431,11 @@ class ProvedCopyCleanup:
     published_path: Path
     destination: CopyDestination
     destination_stamps: Mapping[Path, tuple[int, ...]]
+    checked_git_files: frozenset[CheckedGitFile]
 
     def __init__(self, checked: CheckedCopySource, source: int, destination: CopyDestination,
-                 entries: Mapping[Path, ApprovedCleanupEntry]) -> None:
+                 entries: Mapping[Path, ApprovedCleanupEntry], *,
+                 checked_git_files: frozenset[CheckedGitFile] = NO_CHECKED_GIT_FILES) -> None:
         reader = _copy_tree_reader()
         if (not destination.path.is_absolute() or ".." in destination.path.parts
                 or destination.path.is_relative_to(checked.path) or checked.path.is_relative_to(destination.path)
@@ -449,6 +468,7 @@ class ProvedCopyCleanup:
         object.__setattr__(self, "entries", MappingProxyType(dict(entries)))
         object.__setattr__(self, "published_path", checked.published_copy_path)
         object.__setattr__(self, "destination", destination)
+        object.__setattr__(self, "checked_git_files", checked_git_files)
         object.__setattr__(self, "destination_stamps", MappingProxyType({
             path: _stamp(info) for path, info in copied_ids.items()
         }))
@@ -492,11 +512,13 @@ def remove(checked: CheckedEntry, *, account: Callable[[str, os.stat_result], No
 
 
 def remove_proved_copy(checked: CheckedCleanupPath, proof: ProvedCopyCleanup, approved_target: Path, *,
-                       before_delete: Callable[[], None]) -> None:
+                       before_delete: Callable[[], None], after_copy_check: Callable[[], None]) -> None:
     """Remove only the checked source after verifying its approved copy."""
     _remove(checked, proof, None, mode=RemovalPass.CHECK)
     proof.require_unchanged_destination(approved_target)
     before_delete()
+    proof.require_unchanged_destination(approved_target)
+    after_copy_check()
     _delete_cleanup_entries(checked, proof, ())
 
 
@@ -557,12 +579,15 @@ def _remove(checked: CheckedEntry | CheckedCleanupPath, approval: ApprovedCleanu
 
     def visit(parent: int, name: str, path: Path, before: os.stat_result) -> None:
         key = identity(before)
+        if (isinstance(approval, ProvedCopyCleanup) and path.name.casefold() == ".git"
+                and not stat.S_ISDIR(before.st_mode)):
+            if (not stat.S_ISREG(before.st_mode)
+                    or CheckedGitFile.from_stat(path, before) not in approval.checked_git_files):
+                raise ChangedEntry("holds Git work")
         if not isinstance(approval, BuildRemoval):
             expected = approval.entries.get(path)
             if expected is None or not _matches_cleanup_stamp(expected.stamp, before, unlinked.get(key, 0)):
                 raise ChangedEntry(f"entry changed before removal: {path}")
-        if copied and path.name.casefold() == ".git" and not stat.S_ISDIR(before.st_mode):
-            raise ChangedEntry("holds Git work")
         if key[0] != checked.info.st_dev:
             raise Refused(RefusalReason.MOUNT, str(path))
         if stat.S_ISDIR(before.st_mode):

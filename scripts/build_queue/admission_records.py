@@ -1011,6 +1011,12 @@ def keep_aside_parts(run: RunMemory, share_percent: int) -> KeepAsideParts:
     return KeepAsideParts(0, 0, run.held, run.need)
 
 
+def growth_loan_bytes(runs: Iterable[RunMemory], share_percent: int) -> int:
+    """Return the growth bytes that the room does not keep aside."""
+    parts = (keep_aside_parts(run, share_percent) for run in runs)
+    return sum(part.growth - part.growth_kept for part in parts)
+
+
 @dataclass(frozen=True)
 class CapUnavailable:
     """These runs prevent calculation of the memory cap."""
