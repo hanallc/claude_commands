@@ -60,6 +60,10 @@ class ScheduleSelectionChanged(ListError):
     """The saved schedule or selected run changed before the write."""
 
 
+class ConflictingExchangeReplies(ListError):
+    """The source has no exchange without a reply conflict."""
+
+
 class SavedReadFailed(OSError):
     """The save is on disk, but the item could not be read again."""
 
@@ -2501,9 +2505,13 @@ def _reserve_exchange_number(store: record_store.NumberedRecords, reservation: P
         return ExchangeDestination(destination, True)
 
 
+_NO_UNRESOLVED_REPLIES: frozenset[str] = frozenset()
+
+
 def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.Exchange, ...], title: str, *,
                    linked: investigation.ListDestination | NextNumber,
-                   owner: staff.StaffId, members: staff.StaffSnapshot) -> investigation.ListDestination:
+                   owner: staff.StaffId, members: staff.StaffSnapshot,
+                   unresolved_reply_ids: frozenset[str] = _NO_UNRESOLVED_REPLIES) -> investigation.ListDestination:
     """Save one source and publish its receipt after the List row is durable."""
     key, reservation = source.key, source.reservation
     if not exchanges or any(exchange.source_key != key for exchange in exchanges):
@@ -2525,6 +2533,10 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
             _save_exchange_reservation(reservation, linked, "linked")
             reserved = ExchangeDestination(linked, False)
     if isinstance(reserved, NextNumber):
+        proposed = combine_exchange_history(_read_pending_exchanges(reservation), filed)
+        conflicts = list_exchange.conflicting_reply_ids(proposed, members) | unresolved_reply_ids
+        if all(exchange.exchange_id in conflicts for exchange in proposed):
+            raise ConflictingExchangeReplies("The exchanges claim the same reply.")
         route = report_route(owner, members)
         reserved = _reserve_exchange_number(_store(route.keeper), reservation)
     destination = reserved.destination
@@ -2542,17 +2554,31 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
         pending_path = reservation.with_suffix(".pending")
         pending = _read_pending_exchanges(reservation)
         candidate = combine_exchange_history(combine_exchange_history(history, pending), filed)
-        if candidate != history and candidate != pending:
-            write_text_atomic(pending_path, list_exchange.encode(candidate), new_file_mode=0o600)
+        conflicts = list_exchange.conflicting_reply_ids(candidate, members) | unresolved_reply_ids
+        candidate = tuple(exchange for exchange in candidate if exchange.exchange_id not in conflicts)
+        if not candidate:
+            raise ConflictingExchangeReplies("The exchanges claim the same reply.")
+        disputed_pending = tuple(exchange for exchange in pending if exchange.exchange_id in conflicts)
+        staged = (*candidate, *disputed_pending)
+        safe_history = tuple(exchange for exchange in history if exchange.exchange_id not in conflicts)
+        if candidate != safe_history and staged != pending:
+            write_text_atomic(pending_path, list_exchange.encode(staged), new_file_mode=0o600)
+            pending = staged
         if item is None:
             item = _save_new_exchanges(store, destination.number, title, owner, report_route(owner, members), candidate)
         else:
             item = _save_linked_exchanges(store, item, candidate)
         saved = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
-        if frozenset(saved) != confirmed_exchanges(key, destination, saved):
-            receipt = "".join(_exchange_receipt_line(destination, exchange) + "\n" for exchange in saved)
+        confirmed = confirmed_exchanges(key, destination, saved)
+        receipted = tuple(exchange for exchange in saved if exchange.exchange_id not in conflicts or exchange in confirmed)
+        if frozenset(receipted) != confirmed:
+            receipt = "".join(_exchange_receipt_line(destination, exchange) + "\n" for exchange in receipted)
             write_text_atomic(reservation.with_suffix(".saved"), receipt, new_file_mode=0o600)
-        pending_path.unlink(missing_ok=True)
+        if disputed_pending:
+            if disputed_pending != pending:
+                write_text_atomic(pending_path, list_exchange.encode(disputed_pending), new_file_mode=0o600)
+        else:
+            pending_path.unlink(missing_ok=True)
     return destination
 
 

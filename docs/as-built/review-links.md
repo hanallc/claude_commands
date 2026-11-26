@@ -2377,16 +2377,18 @@ A unique request interval can supply reply metadata when saved tags and other st
 A submitted Question can use its original question for the first owner reply.
 A closed staff Question can recover one log pair from its saved reason.
 A legacy Bug can use its original question when one owner reply matches the saved answer before a later request.
-A different earlier Bug reply requires a later verified question and reply that match the saved answer.
-Change history files verified earlier pairs and checks the current slot separately.
+A different earlier Investigation reply requires a later verified question and reply that match the saved answer.
+One verifier selects the log replies and the current slot answer for filing and Review.
 One verifier reads the source owner, terminal events, slot state, saved pairs, tags, and reply digests.
 It reports verified ownership, conflicting evidence, or missing evidence.
 Approval, decline, or supersession ends the request for every type of reply proof.
 Feedback or a replacement question also ends the initial submitted Question request.
 Each submitted Question and Investigation reply must match its owner.
 An open slot cannot supply proof of an answer.
-A bound reply or an authoritative slot answer reserves its author ID, time, and words.
-Distinct stable request IDs can establish separate replies with the same author, time, and words.
+A reply identity uses its resolved author ID, time, and words.
+The writer checks the complete source, including saved and pending rows, before it saves an exchange.
+When multiple exchanges claim one reply identity, the writer leaves those exchanges unresolved.
+When the slot author is unknown, the slot answer and matching anonymous replies stay unresolved.
 If an Investigation restores its original answer to the log, Review uses the verified log position and keeps the saved binding.
 A conflicting or unverified log reply stays in Review.
 The native question and answer can still file when the log association remains unresolved.
@@ -2395,6 +2397,7 @@ New anonymous log exchanges use a digest of the prompt, its time, and the reply 
 Verified Feedback replies remain in Review outside the unresolved question count.
 The preview reports each unresolved source key and its reply count.
 Review keeps an Investigation or native Question visible while an outgoing question waits or a reply remains unresolved.
+Review hides a card only after a confirmed List receipt covers every reply and the current answer.
 A later slot change leaves the filed reply binding and answer text intact.
 A filed question can receive an answer or close after withdrawal.
 The writer also updates read state and verified question metadata.

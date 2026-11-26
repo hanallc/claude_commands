@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import cast
 
-from scripts.production.staff import StaffId
+from scripts.production.staff import StaffId, StaffSnapshot
 
 
 class Source(StrEnum):
@@ -125,6 +127,36 @@ class Exchange:
     answerer: StaffId | Nate | RecordedAnswerer
     answer: ExchangeAnswer | QuestionWithoutAnswer
     binding: ExchangeBinding | UnboundExchange = field(default=UnboundExchange.LEGACY, kw_only=True)
+
+
+def resolved_answerer(reference: str, members: StaffSnapshot) -> StaffId | RecordedAnswerer:
+    member = members.by_member_reference(reference)
+    if member is None:
+        matches = [row for row in (*members.rows, *members.retired_producers)
+                   if reference in (row.id, row.name)]
+        member = matches[0] if len(matches) == 1 else None
+    return member.id if member is not None else RecordedAnswerer(reference)
+
+
+@dataclass(frozen=True)
+class ReplyIdentity:
+    author: StaffId | Nate | RecordedAnswerer
+    time: datetime
+    words: str
+
+
+def conflicting_reply_ids(exchanges: Iterable[Exchange], members: StaffSnapshot) -> frozenset[str]:
+    """Find exchanges that claim the same reply within one source."""
+    claims: dict[ReplyIdentity, set[str]] = defaultdict(set)
+    for exchange in exchanges:
+        answer = exchange.answer
+        if isinstance(answer, ExchangeAnswer) and isinstance(answer.time, datetime):
+            author = exchange.answerer
+            if not isinstance(author, Nate):
+                author = resolved_answerer(author.name if isinstance(author, RecordedAnswerer) else author, members)
+            identity = ReplyIdentity(author, answer.time, answer.text.rstrip())
+            claims[identity].add(exchange.exchange_id)
+    return frozenset(exchange_id for ids in claims.values() if len(ids) > 1 for exchange_id in ids)
 
 
 @dataclass(frozen=True)
