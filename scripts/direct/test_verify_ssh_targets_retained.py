@@ -113,6 +113,8 @@ class VerifySshRetainedTests(VerifySshTargetsFixture):
         _ = self.admission.run_pass()
         with self.admission.loop_turn():
             server = self.admission.server
+            # The owner pidfd is ready after communicate() reaps verify.
+            server.run_once(0)
             self.assertEqual(server.verify_run_slots, {})
             key = execution_identity.attempt_key(identity.episode, identity.attempt)
             saved = server.assignments[key]
