@@ -3802,6 +3802,31 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
                 self.assertEqual(progress.next_step_html(link_urls=True),
                                  list_page.item_text_html(source, paragraphs=True, link_urls=True))
 
+    def test_next_step_finds_command_labels_and_paragraphs_outside_fences(self) -> None:
+        example = "```text\nExample\n\nRun this command:\n\nprintf x\n```"
+        command = "printf x\n\nprintf y"
+        label = "Run this command:\n\n"
+        for source in (example, example.removesuffix("\n```"),
+                       label + "```sh\nprintf x\n```\n```sh\nprintf y\n```",
+                       label + "```sh\n```\n\n```sh\nprintf x\n```"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                self.assertEqual(progress.next_step_html(),
+                                 list_page.item_text_html(source, paragraphs=True, link_urls=False))
+        for source in (f"{label}```sh\n{command}\n```", f"{example}\n\n{label}~~~sh\n{command}\n~~~"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                block = '<div class="list-command">' + page_frame.copy_code_block(command) + '</div>'
+                self.assertTrue(progress.next_step_html().endswith(block))
+
+    def test_next_step_normalizes_carriage_returns_in_a_command(self) -> None:
+        label = "Run this command:"
+        for source in (label + "\r\n\r\nprintf x\rprintf y", label + "\r\r```sh\r\nprintf x\rprintf y\n```"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                block = '<div class="list-command">' + page_frame.copy_code_block("printf x\nprintf y") + '</div>'
+                self.assertEqual(progress.next_step_html(), f'<p>{label}</p>' + block)
+
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_studio_copies_the_next_step_command_once_after_refresh(self) -> None:
         root = self.root / "reviews"
@@ -3836,19 +3861,26 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
  oldCopy.click();await flush();
  check(copied.length===2 && copied.every(text=>text===ORIGINAL_COMMAND),
   'Each click copies the exact original command once.');
+ const focusField=FOCUS_DETAIL ? detail : summary;
+ const focusedCopy=copy(focusField());
+ focusedCopy.focus();
  refreshMarkup=FRESH_PAGE;
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await flush();
  const newCopy=copy(detail());
  check(pageReads===1 && recordIsOpen(row) && newCopy!==oldCopy,'The refresh replaces the open command block.');
+ const renewedCopy=copy(focusField());
+ check(renewedCopy!==focusedCopy && document.activeElement===renewedCopy,
+  'The replacement copy button has focus in the same field.');
  newCopy.click();await flush();
  check(copied.length===3 && copied[2]===UPDATED_COMMAND,'A click after the refresh copies the new command once.');
 '''
         steps = (steps.replace("ORIGINAL_COMMAND", json.dumps(command)).replace("UPDATED_COMMAND", json.dumps(updated))
                  .replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/")))
-        for width in (1440, 390):
-            with self.subTest(width=width):
-                self.browser_action_sequence(steps.replace("VIEWPORT_WIDTH", str(width)), markup=initial,
+        for width, focus_detail in ((1440, False), (390, True)):
+            with self.subTest(width=width, focus_detail=focus_detail):
+                probe = steps.replace("VIEWPORT_WIDTH", str(width)).replace("FOCUS_DETAIL", json.dumps(focus_detail))
+                self.browser_action_sequence(probe, markup=initial,
                                              add_item=False, reduced_motion=True, window_size=(width, 900))
 
     def test_bad_records_leave_valid_rows_and_nav_news(self) -> None:

@@ -938,6 +938,13 @@ def report_state_time(item: the_list.ListItem, today: datetime) -> str:
     return ""
 
 
+NEXT_STEP_COMMAND_LABEL = "Run this command:"
+NEXT_STEP_FENCE = re.compile(
+    r"(?m)^[ \t]*(?P<marker>(?P<char>`|~)(?P=char){2,})[^\n]*\n"
+    + r"(?:(?P<body>[\s\S]*?)^[ \t]*(?P=marker)(?P=char)*[ \t]*(?=\n|$)|[\s\S]*\Z)"
+)
+
+
 class ListProgress(NamedTuple):
     latest_status: str
     status_time: the_list.Timestamp
@@ -950,15 +957,30 @@ class ListProgress(NamedTuple):
             return '<p>' + self.repair_producer_html + ' repairs it again</p>'
         if not self.show_next_step:
             return ""
-        text = self.next_step or "Not recorded"
-        paragraphs = change_browser.BLANK_LINE.split(text)
-        label = "Run this command:"
-        if len(paragraphs) >= 2 and paragraphs[-2] == label and label not in paragraphs[:-2]:
-            command = paragraphs[-1]
+        text = (self.next_step or "Not recorded").replace("\r\n", "\n").replace("\r", "\n")
+        label = NEXT_STEP_COMMAND_LABEL
+        if label not in text:
+            return item_text_html(text, paragraphs=True, link_urls=link_urls)
+        fences = list(NEXT_STEP_FENCE.finditer(text))
+        paragraphs: list[str] = []
+        start = 0
+        for blank in change_browser.BLANK_LINE.finditer(text):
+            if any(fence.start() <= blank.start() < fence.end() for fence in fences):
+                continue
+            paragraphs.append(text[start:blank.start()])
+            start = blank.end()
+        if paragraphs and paragraphs[-1] == label and label not in paragraphs[:-1]:
+            command = text[start:]
+            fence = next((fence for fence in fences if fence.start() >= start), None)
+            if fence is not None:
+                body = fence["body"]
+                command = (body.removesuffix("\n") if body is not None and fence.span() == (start, len(text))
+                           else "")
+            elif (block := page_frame.CODE_BLOCK.fullmatch(command)) and block[2] is not None:
+                command = block[2]
             if command.strip():
-                prose = item_text_html(text.removesuffix(command), paragraphs=True, link_urls=link_urls)
-                block = page_frame.CODE_BLOCK.fullmatch(command)
-                code = page_frame.code_block_html(block) if block else page_frame.copy_code_block(command)
+                prose = item_text_html(text[:start], paragraphs=True, link_urls=link_urls)
+                code = page_frame.copy_code_block(command)
                 return prose + '<div class="list-command">' + code + '</div>'
         return item_text_html(text, paragraphs=True, link_urls=link_urls)
 
@@ -3980,7 +4002,9 @@ function applyListSnapshot(fresh){
  const direction=field?.selectionDirection;
  const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
  const action=field?.matches('button[name="action"]') ? field.value : '';
- const focusedRow=action || field?.matches('.list-toggle') ? field.closest('[data-list-item]')?.dataset.key : '';
+ const copyCommand=field?.matches('.list-command [data-copy-code]');
+ const focusedRow=action || copyCommand || field?.matches('.list-toggle') ? recordFromDetail(field) : null;
+ const copyInDetail=copyCommand && recordDetails(focusedRow)?.contains(field);
  recordDetails(tableView.openItem)?.querySelector('[data-feedback-form]')?.retainDraft?.();
  tableView.holdLog();
  const footer=content.querySelector('[data-list-counts-url]'),nextFooter=fresh.querySelector('[data-list-counts-url]');
@@ -4008,8 +4032,11 @@ function applyListSnapshot(fresh){
    field.setSelectionRange(start,end,direction);}
  if(reviewLink && !field?.isConnected) restoreReviewLink(reviewLink);
  if(focusedRow && !field?.isConnected){
-  const row=[...content.querySelectorAll('[data-list-item]')].find(item=>item.dataset.key===focusedRow && !item.hidden);
-  const button=action && recordDetails(row)?.querySelector('button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
+  const match=rowIn(content,focusedRow.dataset.key);
+  const row=match && !match.hidden ? match : null;
+  const scope=copyInDetail ? recordDetails(row) : row?.querySelector('[data-label="Next step"]');
+  const button=copyCommand ? scope?.querySelector('.list-command [data-copy-code]') :
+   action && recordDetails(row)?.querySelector('button[name="action"][value="'+CSS.escape(action)+'"]:enabled');
   (button || row?.querySelector('.list-toggle') || content.querySelector('#list-search')).focus({preventScroll:true});
  }
  void loadListCounts();
