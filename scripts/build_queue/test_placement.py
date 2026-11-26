@@ -1425,7 +1425,9 @@ class PlacementTests(unittest.TestCase):
                 persist.assert_called_once()
 
     def test_scaler_execution_report_persists_one_transition(self) -> None:
-        self.check_execution_report_persist_count(guest=False)
+        # Let the report handler settle the journal without a concurrent probe.
+        with mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            self.check_execution_report_persist_count(guest=False)
 
     def test_mac_linux_execution_report_persists_one_transition(self) -> None:
         self.check_execution_report_persist_count(guest=True)
@@ -4892,7 +4894,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
         with PlacementFixture() as fixture:
             settings, request, destination = self.target_settings_fixture(fixture)
-            host = socket.gethostname().split(".", 1)[0]
+            host = conf.local_host_key_name()
             good = settings.read_text() + f"\n# range: 1..\nshell_timeout_s=10\n# range: 1..\nshell_timeout_s.{host}=31\n"
             broken = "\n".join("floor_sweep_timeout_s=broken" if line.startswith("floor_sweep_timeout_s=") else line
                                for line in good.splitlines()) + "\n"

@@ -9,7 +9,7 @@ import re
 import secrets
 import shlex
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from importlib import import_module
@@ -287,13 +287,11 @@ def section(change: WaitingChange, feedback_rows: int, members: staff.StaffSnaps
             labels: dict[str, str | None] = {action: handoff for action in change_page.CHANGE_HANDOFFS}
             labels.update(verdict_toast_labels(page.owner, members))
             form = form.replace('<form method="post"', '<form method="post" ' + send_route_attributes(labels), 1)
-        text = change_page.answer_status(row.get("Verdict", ""), change.slots)
-        saved = f'<p>{html.escape(text)}</p>' if text else ""
         content = f'''<h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 {change_page.review_html(row.get(change_review.CHECK, ''))}
-{anomaly}{question}{saved}<p role="status" data-save-state></p>{form}
-{change_page.change_details(row, shown)}'''
+{anomaly}{question}<p role="status" data-save-state hidden></p>{form}
+{change_page.change_details(row, shown, validating=change.slots.validation_requested)}'''
     return f'<section {attributes}>' + change_page.change_content(row, content) + '</section>'
 
 
@@ -533,7 +531,7 @@ def question_section(question: WaitingQuestion, browser: ReviewBrowser, feedback
     return f'''<section hidden data-type="questions" data-key="{key}" data-tab="{html.escape(question.tab)}" data-pending="true">
 <h1>{html.escape(title)}</h1>
 {body}{shown_choices}
-<p role="status" data-save-state></p>{form}{question_details(question, names)}</section>'''
+<p role="status" data-save-state hidden></p>{form}{question_details(question, names)}</section>'''
 
 
 @dataclass(frozen=True)
@@ -545,7 +543,7 @@ class Rebuild:
     text: str
 
 
-def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[rebuild_row.Change, ...]],
+def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: Mapping[str, rebuild_row.CachedChanges],
                  record: staff.StaffSnapshot, completed: tuple[need.CompletedNeedRecord, ...] = (),
                  damaged: Iterable[str] = ()) -> str:
     """Show waiting machines and completed requests."""
@@ -558,19 +556,20 @@ def rebuild_list(answer: rebuild_row.RebuildAnswer, changes: dict[str, tuple[reb
     blocks: list[str] = []
     for machine_name, name in zip(answer.machines, names):
         records = next((machine.records for machine in answer.needs if machine.newest["machine"] == machine_name), ())
-        filed = {item["nixos_commit"] for item in records}
         items = [Rebuild(item["created_at"], who(item["requested_by"] or item["concerns"]),
                          item["reason"].strip() or need.NO_REASON)
                  for item in records]
-        commits = [Rebuild(change.at, who(change.session), change.reason)
-                   for change in changes.get(machine_name, ()) if change.commit not in filed]
+        comparison = rebuild_row.matched_changes(answer, machine_name, changes.get(machine_name))
+        display = rebuild_row.changes_for_display(answer, machine_name, comparison, records)
         staff_names_by_reference = staff_names.StaffNames(record)
         listed = owner_groups(items, staff_names_by_reference)
-        if commits:
+        if display.commits:
+            more = f'<p>{display.more}</p>' if display.more else ''
+            groups = [Rebuild(change.at, who(change.session), change.reason) for change in display.commits]
             listed += '<section class="rebuild-commits"><h3>Commits</h3>' + owner_groups(
-                commits, staff_names_by_reference, heading="h4") + '</section>'
-        if not listed:
-            listed = '<p>The change list is not available yet.</p>'
+                groups, staff_names_by_reference, heading="h4") + more + '</section>'
+        elif display.fallback:
+            listed += f'<p>{html.escape(display.fallback)}</p>'
         blocks.append(f'<article data-machine="{html.escape(machine_name)}"><h2>Rebuild {html.escape(name)}</h2>{listed}</article>')
     label = f"Rebuild {' and '.join(names)}" if names else ""
     if not blocks:
@@ -612,6 +611,7 @@ def owner_groups(items: list[Rebuild],
 # Machines sit side by side when the frame is wide; under each owner, a time is a column beside its reasons.
 REBUILD_STYLE = """<style>main{max-width:1124px}
 [data-rebuilds]{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:32px 48px;align-items:start}
+[data-rebuilds] article{overflow-wrap:anywhere}
 [data-rebuilds] h2{margin:8px 0 0}[data-rebuilds] h3{font-size:17px;line-height:1.3;margin:24px 0 8px}
 [data-rebuilds] h4{font-size:15px;line-height:1.3;margin:16px 0 8px}
 [data-rebuilds] dl{display:grid;grid-template-columns:max-content minmax(0,1fr);column-gap:16px;row-gap:4px;margin:0;font-size:15px}
@@ -629,7 +629,7 @@ def render_rebuilds() -> bytes:
     config = conf.path("statusline")
     damaged: list[str] = []
     completed = need.read_completed_needs(damaged)
-    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_changes(config), staff.snapshot(),
+    rebuilds = rebuild_list(rebuild_row.read(config), rebuild_row.read_recorded_changes(config), staff.snapshot(),
                             completed, damaged)
     return change_page.document(REBUILD_STYLE + '<h1 class="page-title">Rebuilds needed</h1>' + rebuilds, "Rebuilds needed")
 
@@ -967,7 +967,8 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
     return change_page.MessageDelivery(page, page.rows[0], (recipient,), message, attempt, (question.owner,)), answer
 
 
-SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + page_frame.HELD_SEND_SCRIPT + r'''
+SCRIPT = (page_frame.REFRESH_SCRIPT + page_frame.MOTION_SCRIPT + page_frame.ACTION_STATUS_SCRIPT
+          + page_frame.HELD_SEND_SCRIPT) + r'''
 let content=document.querySelector('[data-review-content]');
 const motion=createCardMotion(()=>content);
 let rows,viewOrders,runnerOptions,showrunners,runnerMenu,next,empty,saveNotice;
@@ -1033,7 +1034,7 @@ function show(){
  shownHash=location.hash;
  // The console records this place in its own URL, so a reload or a shared link opens it again.
  if(parent!==window) parent.postMessage('console-place',location.origin); }
-function clearNotice(){saveNotice.hidden=true;saveNotice.textContent='';}
+function clearNotice(){showActionFailure(saveNotice);}
 function go(key){navigation++;clearNotice();location.hash=new URLSearchParams({showrunner:tab,row:key || ''});show();}
 function advance(row){
  const ordered=viewRows(), at=ordered.indexOf(row), candidates=waiting();
@@ -1045,43 +1046,55 @@ async function save(row,form,outcome){
  clearNotice();form.dataset.saving='true'; const state=row.querySelector('[data-save-state]'), position=navigation;
  const data=new URLSearchParams(new FormData(form));
  data.set('row',row.dataset.key);data.set('outcome',outcome);data.delete('choice');
+ const skip=kind==='questions' && outcome==='skip';
+ if(skip) data.set('feedback','');
  form.querySelectorAll('button[name=outcome]').forEach(b=>b.setAttribute('aria-pressed',String(b.value===outcome)));
- state.textContent='Saving'; row.dataset.saveState='saving';
- const moveOn=notice=>{
+ showActionFailure(state);
+ const moveOn=()=>{
   row.dataset.pending='false';
-  if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position){advance(row);saveNotice.textContent=notice;saveNotice.hidden=false;}
+  if(current===row && (tab==='' || tab===row.dataset.tab) && navigation===position) advance(row);
   else show();
   motion.settled().then(()=>{if(row.dataset.pending==='false') form.hidden=true;});
  };
- // Works and Does not work show the next change at once; a failed save puts the change back.
- const early=kind!=='questions' && (outcome==='works' || outcome==='not works');
- if(early) moveOn('Saving review.');
+ const early=skip || kind!=='questions' && (outcome==='works' || outcome==='not works');
+ if(early) moveOn();
  try{
-  // A Skip only moves the item, so it needs no Undo.
   const options={method:'POST',body:data,headers:{Accept:'application/json'}};
-  const response=await (outcome==='skip' ? fetch(form.action,options)
-                                      : heldFetch(form.action,options,sendActionReceiver(form,data)));
+  const response=await heldFetch(form.action,options,skip ? null : sendActionReceiver(form,data));
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
-  state.textContent=reply.answer ? 'Saved: '+reply.answer :
-   outcome==='question' ? ''' + json.dumps(page_frame.QUESTION_WAITING.format(owner_role="showrunner")) + r''' :
-   outcome==='feedback' ? 'The showrunner will act on this' :
-   outcome==='followup' ? 'Follow-up sent to the asker' : outcome==='skip' ? 'Moved to the end of the list' : 'The showrunner will validate this';
-  row.dataset.saveState='saved';
   saved=true;
-  if(!early) moveOn(kind!=='questions' ? 'Review saved.' : outcome==='followup' ? 'Follow-up sent.' : outcome==='skip' ? 'Skipped.' : 'Answer saved.');
-  else if(!saveNotice.hidden && saveNotice.textContent==='Saving review.') saveNotice.textContent='Review saved.';
+  if(skip){
+   const stillNext=navigation===position+1;
+   rows=rows.filter(card=>card!==row);rows.push(row);
+   row.dataset.pending='true';form.hidden=false;
+   if(!current && stillNext) go(row.dataset.key);
+   else show();
+   if(stillNext) showActionFailure(saveNotice,'Skipped.');
+  }else if(!early) moveOn();
  }catch(error){
   const undone=error instanceof SendUndone;
   const reason=error instanceof SyntaxError ? 'The answer could not be saved. Try again.' : error.message;
-  row.dataset.saveState=undone ? '' : 'failed'; state.textContent=undone ? reason : 'Not saved: '+reason;
+  showActionFailure(state,undone ? reason : 'Not saved: '+reason);
   if(early){
-   row.dataset.pending='true';form.hidden=false;show();
+   row.dataset.pending='true';form.hidden=false;
+   if(skip && undone){
+    form.querySelectorAll('button[name=outcome]').forEach(button=>button.removeAttribute('aria-pressed'));
+    if(navigation===position+1){
+     go(row.dataset.key);
+     showActionFailure(saveNotice,'Undone.');
+     return;
+    }
+   }
+   show();
+  }
+  if(current!==row){
    const open=document.createElement('button');open.type='button';open.textContent='Open it';
    open.addEventListener('click',()=>go(row.dataset.key));
-   saveNotice.replaceChildren((undone ? 'Undone: ' : 'Not saved: ')+row.dataset.shown+'. '+(undone ? '' : reason+' ')
-    +'It is back in the list. ',open);
-   saveNotice.hidden=false;
+   const label=row.dataset.shown || row.querySelector('h1')?.textContent || row.dataset.key;
+   const message=undone ? 'Undone: '+label+'. It is back in the list.' : 'Not saved: '+label+'. '+reason;
+   showActionFailure(saveNotice,message);
+   saveNotice.append(' ',open);
   }
  }finally{
   form.dataset.saving='false';activeSaves--;
@@ -1112,13 +1125,21 @@ function applyHeldPage(){
   .filter(row=>row.dataset.pending==='true');
  const keep=candidates.find(row=>row.dataset.key===current?.dataset.key);
  const chosen=keep || following.map(key=>candidates.find(row=>row.dataset.key===key)).find(Boolean) || candidates[0];
- const notice=saveNotice.hidden ? '' : saveNotice.textContent;
+ const notice=saveNotice.hidden ? null : saveNotice;
+ const failures=new Map(rows.flatMap(row=>{
+  const status=row.querySelector('[data-save-state]');
+  return status?.textContent ? [[row.dataset.key,status.textContent]] : [];
+ }));
  motion.finish();
  shownPage=fresh.outerHTML;content.replaceWith(fresh);content=fresh;bindPage();
+ for(const row of rows){
+  const status=row.querySelector('[data-save-state]');
+  if(status && failures.has(row.dataset.key)) showActionFailure(status,failures.get(row.dataset.key));
+ }
  content.querySelectorAll('details').forEach(detail=>detail.open=opened.has(detailKey(detail)));
  history.replaceState(null,'','#'+new URLSearchParams({showrunner:tab,row:chosen?.dataset.key || ''}));
  show();
- if(notice){saveNotice.textContent=notice;saveNotice.hidden=false;}
+ if(notice){saveNotice.replaceWith(notice);saveNotice=notice;}
  if(controlId) content.querySelector('#'+controlId)?.focus({preventScroll:true});
  const field=rows.find(row=>row.dataset.key===fieldRow)?.querySelector('[name="'+fieldName+'"]');
  if(field && !field.closest('section').hidden){field.focus({preventScroll:true});field.setSelectionRange(...selection);}

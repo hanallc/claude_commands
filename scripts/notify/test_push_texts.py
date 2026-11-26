@@ -172,6 +172,16 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual(push.body, "")
                 self.assertEqual(push.message, "Action: Wake the Mac or check its network.")
 
+    def test_hana_screenshot_lock_catalog_has_the_unlock_action(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "hana_shot.mac_locked")
+        example, = entry.examples
+        self.assertEqual(example.name, "typical")
+        push = push_texts.render_entry(entry, example.values)
+        self.assertEqual(push.need, "blocked")
+        self.assertEqual(push.title, "Hana screenshot waits for the Mac")
+        self.assertEqual(push.action, ActionRequired("Unlock the Mac."))
+        self.assertEqual(push.body, "The screenshot starts when the Mac is ready. This alert stops on its own.")
+
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
         self.assertTrue(entries, "push_catalog.ENTRIES must include script and nixos pushes")
@@ -313,22 +323,42 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(result.stderr, f"gpu_xid: unknown Xid code: {shown}\n")
 
-    def test_failed_restart_catalog_examples_show_the_count_and_one_command(self) -> None:
+    def test_failed_restart_catalog_examples_name_one_session_and_give_one_resume_command(self) -> None:
         entries = {entry.id: entry for entry in push_texts.catalog()}
         self.assertNotIn("shutdown.move_untrusted", entries)
         entry = entries["shutdown.restart_failed"]
-        self.assertEqual({example.name for example in entry.examples}, {"typical", "one_long_name"})
+        expected = {
+            "typical": ("trunk did not start on claude4", "trunk --to claude4"),
+            "one_long_name": ("account-migration… did not start on claude3", "account-migration-verification --to claude3"),
+            "unnamed": ("A session did not start on codex2", "019b3a40-4250-7000-8000-000000000103 --to codex2"),
+        }
+        self.assertEqual({example.name for example in entry.examples}, expected.keys())
         for example in entry.examples:
             with self.subTest(example=example.name):
                 push = push_texts.render_entry(entry, example.values)
-                stopped = push.values["stopped"]
-                self.assertRegex(stopped, r"^(?:1 session|[1-9][0-9]* sessions)")
-                self.assertIn(stopped, push.message)
-                self.assertIn("Coding work stays stopped until the restart succeeds.", push.body)
-                self.assertEqual(cast(ActionRequired, push.action).text.count("/agents restart"), 1)
-                self.assertIn("natedev", cast(ActionRequired, push.action).text)
-                self.assertLess(len(push.message), 500)
-        self.assertEqual(entry.examples[0].values["stopped"], "5 sessions")
+                title, arguments = expected[example.name]
+                self.assertEqual(push.title, title)
+                self.assertLessEqual(len(push.title), 44)
+                self.assertEqual(push.message, f"Action: In the natedev session, run: /agents resume {arguments}")
+                self.assertEqual(push.body, "")
+                self.assertEqual(push.values, example.values)
+
+        push = push_texts.render_entry(entry, entry.examples[0].values | {"session": "migration review"})
+        self.assertEqual(push.title, "migration review did not start on claude4")
+        self.assertEqual(push.action, ActionRequired("In the natedev session, run: /agents resume 'migration review' --to claude4"))
+
+    def test_failed_restart_keeps_the_full_account_and_session_in_the_command(self) -> None:
+        account = "claude123456789012345678901234"
+        identity = "019b3a40-4250-7000-8000-000000000103"
+        push = push_texts.render("shutdown.restart_failed", session="", identity=identity, account=account)
+        self.assertEqual(push.title, "A session did not start on claude1234567890…")
+        self.assertLessEqual(len(push.title), 44)
+        self.assertEqual(push.action, ActionRequired(f"In the natedev session, run: /agents resume {identity} --to {account}"))
+        push = push_texts.render("shutdown.restart_failed", session="account-migration--verification",
+                                 identity=identity, account="claude3")
+        self.assertEqual(push.title, "account-migration… did not start on claude3")
+        push = push_texts.render("shutdown.restart_failed", session="--help", identity=identity, account="claude 4")
+        self.assertEqual(push.action, ActionRequired("In the natedev session, run: /agents resume --to 'claude 4' -- --help"))
 
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:
         for entry in push_texts.catalog():

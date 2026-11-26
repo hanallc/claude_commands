@@ -381,14 +381,14 @@ def run(*, dry_run: bool = False) -> int:
         return 2
     terminal = sys.stdout
     settings = conf.read_or_repository("shutdown")
-    folder = settings.value("REBOOT_LOG_FOLDER", str, default="reboot")
+    folder = settings.value("reboot_log_folder", str, default="reboot")
     if folder in ("", ".", "..") or Path(folder).name != folder:
-        raise ValueError("REBOOT_LOG_FOLDER must be one folder name")
+        raise ValueError("reboot_log_folder must be one folder name")
     state = herdr.reboot_state_directory()
     directory = state.with_name(folder)
-    interval = settings.number("REBOOT_SPINNER_SECONDS")
+    interval = settings.number("reboot_spinner_seconds")
     if not math.isfinite(interval) or interval <= 0:
-        raise ValueError("REBOOT_SPINNER_SECONDS must be finite and greater than zero")
+        raise ValueError("reboot_spinner_seconds must be finite and greater than zero")
     directory.mkdir(parents=True, exist_ok=True)
     zone = user_zone()
     path = directory / f"{datetime.now(zone):%Y%m%dT%H%M%S}-{uuid4().hex}.log"

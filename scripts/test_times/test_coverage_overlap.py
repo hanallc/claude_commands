@@ -219,7 +219,7 @@ class CoverageOverlapTests(unittest.TestCase):
             _ = (root / "scripts/__init__.py").write_text("")
             sources = {
                 "scripts/fixture/product.py": PRODUCT,
-                "config/test_times.conf": "COVERAGE_LEAF_PROGRAMS=git\n",
+                "config/test_times.conf": "coverage_leaf_programs=git\n",
                 **sources,
             }
             for relative, source in sources.items():

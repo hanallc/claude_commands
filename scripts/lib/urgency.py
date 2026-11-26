@@ -56,6 +56,7 @@ Item = TypeVar("Item")
 
 # The /next word that adds every production below the showrunner's own.
 ALL_BELOW = "all-below"
+CHANGE_QUEUE_PREFIX = "change-"
 
 
 def scope_queue(name: str, below: bool) -> str:
@@ -340,11 +341,13 @@ def queue_order(entries: Iterable[Entry[Item]], queue: str) -> list[Entry[Item]]
 
 
 def _pin_first(queue: str, ranked: Sequence[Entry[Item]], source: str = "") -> None:
-    """Pin the first item and forget a moved item that left the queue; write only on a change."""
+    """Pin the first item. Keep move times for change rows that can reopen."""
     state = read_queue_state(queue)
-    present = {entry.key for entry in ranked}
-    kept = {key: when for key, when in state.ended.items() if key in present}
-    if ranked[0].key != state.current or source != state.source or kept != dict(state.ended):
+    kept = state.ended
+    if kept and not queue.startswith(CHANGE_QUEUE_PREFIX):
+        present = {entry.key for entry in ranked}
+        kept = {key: when for key, when in kept.items() if key in present}
+    if ranked[0].key != state.current or source != state.source or kept != state.ended:
         _write_state(queue, QueueState(ranked[0].key, source, kept))
 
 

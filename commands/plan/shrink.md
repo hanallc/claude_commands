@@ -245,7 +245,9 @@ for the current `As-built` block.
 
 Otherwise skip this step when no `todo` phase remains; the floor is empty.
 
-Dispatch ONE `Explore` (or `general-purpose`) subagent. Its prompt must include:
+Assign one read-only worker through `/showrunner:worker` when enrolled.
+Keep its order and reply in the existing run directory. Before enrollment, use one built-in helper.
+Give it these instructions:
 
 - The absolute plan-doc path and the line ranges of the **`todo` phases** and
   `## Delegation Context` (from `<Locate/>`'s heading map). Directive: read those
@@ -274,7 +276,9 @@ Capture it as ${FLOOR}. It is small; it goes into every later prompt.
 **Goal:** one replacement block per `done` phase, produced without the archive
 text ever entering the orchestrator's context.
 
-In closeout mode, dispatch one `general-purpose` subagent for the single target.
+When enrolled, send each replacement write to the unit that owns the plan.
+Use the unit for assembly and the final plan edit.
+In closeout mode, assign one helper for the single target.
 It reads only that phase span plus
 `phase_review_retrospective_<id>.md` and `phase_review_outcomes_<id>.md`; it must
 not read another phase. The artifacts provide shipped behavior, deviations,
@@ -282,9 +286,8 @@ files, gotchas, rejected choices, and already-applied forward edits. Produce one
 replacement under `<KeepDrop/>` with no review, finding, pass, or approval prose.
 
 In standalone mode, group the `done` phases into **chunks** of at most 6 phases or ~1,000 original
-lines, whichever comes first. Dispatch one `general-purpose` subagent per chunk,
-**in parallel** — each writes only its own scratch files and never touches the
-plan doc, so there is no write race.
+lines, whichever comes first. Assign one helper per chunk within the worker limit.
+Give each helper its own output files. Let assembly install the replacements.
 
 Each prompt must include:
 
@@ -461,8 +464,8 @@ heading, and no Work Order, Retrospective, or Phase Review heading in that span.
 Compare the backup outside that span byte-for-byte. This completes verification;
 do not dispatch another subagent.
 
-**Standalone content check:** dispatch ONE `general-purpose` subagent with ${FLOOR}, the
-plan path, and the new spans of the shrunk phases. Its job: confirm every
+**Standalone content check.** Use the read-only route in <IndexLiveDependencies/>.
+Supply ${FLOOR}, the plan path, and the new spans of the shrunk phases. Its job: confirm every
 floor item survives in the phase that owns it, verbatim for signatures and type
 names. Return `missing` — floor item, owning phase, one line — and nothing else.
 
