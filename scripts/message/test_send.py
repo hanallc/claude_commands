@@ -44,6 +44,7 @@ from scripts.lib.test_models_registry import write_registry
 from scripts.herdr import herdr_types
 from scripts.herdr.place import HerdrPlace
 from scripts.lib.signal_test_support import install_signal_pid_guard
+from scripts.lib import atomic_file
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
@@ -9071,6 +9072,69 @@ class PaneWorkerMessageTests(unittest.TestCase):
                 retry = send.deliver_codex(message, route, 1, selection=send.RosterLookup(address))
         self.assertEqual(len(copies), 1)
         self.assertEqual([first.outcome, retry.outcome], ["pending", "pending"])
+
+    def test_codex_pane_addresses_share_one_claim_until_the_repeat_window_ends(self) -> None:
+        row, observed = self.codex_agent()
+        options = send.parse(["--here", "--to", row.name, "--from", "fixture", "--text", "Read the report.",
+                              "--key", "report", "--repeat-minutes", "5", "--timeout", "600"])
+        native = options._replace(selection=send.RosterLookup(f"session:{row.current_session}"))
+        started = send.now()
+        with (mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch("scripts.message.send._prompt_pane", side_effect=[OSError("The pane lost confirmation."), None]) as prompt,
+              mock.patch.object(send, "now", return_value=started) as clock):
+            first = send.send(options)
+            clock.return_value = started + timedelta(minutes=1)
+            retry = send.send(native)
+            self.assertEqual((first.outcome, retry.outcome), ("pending", "pending"))
+            prompt.assert_called_once()
+
+            clock.return_value = started + timedelta(minutes=5)
+            after_expiry = send.send(native._replace(repeat_minutes=30))
+            after_acceptance = send.send(options)
+        self.assertEqual((after_expiry.outcome, after_acceptance.outcome), ("sent", "skipped"))
+        self.assertEqual(prompt.call_count, 2)
+
+    def test_codex_pane_releases_a_claim_when_its_folder_sync_fails_before_input(self) -> None:
+        row, observed = self.codex_agent()
+        options = send.parse(["--here", "--to", row.name, "--from", "fixture", "--text", "Read the report.",
+                              "--key", "report", "--repeat-minutes", "5"])
+        keys = self.state / "keys.json"
+        sync_folder = atomic_file.sync_folder
+        claim_sync_failed = False
+
+        def sync(folder: Path) -> None:
+            nonlocal claim_sync_failed
+            if not claim_sync_failed and folder == self.state and keys.is_file():
+                claim_sync_failed = True
+                raise OSError("The key folder sync failed.")
+            sync_folder(folder)
+
+        with (mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch.object(atomic_file, "sync_folder", side_effect=sync),
+              mock.patch("scripts.message.send._prompt_pane") as prompt):
+            first = send.send(options)
+            self.assertTrue(claim_sync_failed)
+            prompt.assert_not_called()
+            retry = send.send(options)
+        self.assertEqual((first.outcome, retry.outcome), ("failed", "sent"))
+        prompt.assert_called_once()
+
+    def test_codex_pane_stays_pending_when_the_key_file_disappears_after_input(self) -> None:
+        row, observed = self.codex_agent()
+        options = send.parse(["--here", "--to", row.name, "--from", "fixture", "--text", "Read the report.",
+                              "--key", "report", "--repeat-minutes", "5"])
+
+        def prompt(_place: HerdrPlace, _text: str, *, target: str, timeout: float) -> None:
+            self.assertEqual(target, row.current_session)
+            self.assertEqual(timeout, options.timeout)
+            (self.state / "keys.json").unlink()
+
+        with (mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch("scripts.message.send._prompt_pane", side_effect=prompt) as submit):
+            first = send.send(options)
+            retry = send.send(options)
+        self.assertEqual((first.outcome, retry.outcome), ("pending", "pending"))
+        submit.assert_called_once()
 
     def test_keyed_codex_pane_confirms_one_copy_on_the_first_send(self) -> None:
         row, observed = self.codex_agent()
