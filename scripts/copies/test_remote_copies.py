@@ -209,6 +209,105 @@ class RemoteCopiesTests(unittest.TestCase):
             self.assertEqual(output.read_text(), "Cargo output\n")
             self.assertEqual(keep.read_text(), "The transfer holds this checkout.\n")
 
+    def test_mirror_receive_refuses_a_staged_fixed_checkout(self) -> None:
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            output = folder / "compiled"
+            _ = output.write_text("Cargo output\n")
+        mirror = self.remote(path=str(folder.parent))
+        copies.mark_mirror(folder.parent, mirror.owner, mirror.repository.name, mirror.session)
+        stage = folder.with_name(".removing-123-0123456789abcdef")
+        _ = folder.rename(stage)
+        info = stage.stat()
+        write_text_atomic(build_folders.lease_path(stage), json.dumps({"device": info.st_dev, "inode": info.st_ino}))
+        lease = build_folders.lease_path(folder)
+        before = lease.read_bytes()
+        with (mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+              mock.patch.object(build_folders.CheckedRemovalTree, "remove",
+                                side_effect=AssertionError("The fixed checkout reached deletion"))):
+            with self.assertRaisesRegex(copies.CopyError, "fixed build folder"):
+                _ = copies.mirror_run(mirror_arguments(mirror, "mirror-receive"))
+            self.assertFalse(build_folders.remove_build_folder(folder.parent, wait=False))
+        self.assertEqual((stage / output.name).read_text(), "Cargo output\n")
+        self.assertEqual(lease.read_bytes(), before)
+
+    def test_mirror_remove_refuses_a_former_fixed_checkout_with_an_empty_lease(self) -> None:
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            mirror = self.remote(path=str(folder))
+            copies.mark_mirror(folder, mirror.owner, mirror.repository.name, mirror.session)
+        for lease in (b"", b"\xff"):
+            _ = build_folders.lease_path(folder).write_bytes(lease)
+            with (self.subTest(lease=lease),
+                  mock.patch.object(build_folders, "build_root", return_value=self.root / "new-build"),
+                  mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+                  mock.patch.object(build_folders.CheckedRemovalTree, "remove",
+                                    side_effect=AssertionError("The fixed checkout reached deletion")),
+                  self.assertRaisesRegex(copies.CopyError, "invalid build folder lease")):
+                _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
+            self.assertTrue(folder.is_dir())
+
+    def test_mac_fetch_setup_refuses_a_symlink_in_the_path(self) -> None:
+        from scripts.mac_test import eligibility, nextest_log, offload
+        from scripts.build_targets import target_config
+
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            with build_folders.fixed_repository_build_folder("other", machine="mac", unit="alpha") as other:
+                protected = other / "output"
+                protected.mkdir()
+                (folder / "linked").symlink_to(other, target_is_directory=True)
+                (folder / "linked-output").symlink_to(protected, target_is_directory=True)
+        home = Path(os.environ["HOME"])
+        launcher = home / ".claude/scripts/lib/py"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.symlink_to(sys.executable)
+        stub = self.root / "bin"
+        stub.mkdir()
+        unchecked = self.root / "unchecked-rm"
+        rm = stub / "rm"
+        _ = rm.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(str(unchecked))}\n")
+        rm.chmod(0o755)
+        checkout = Path(copies.__file__).resolve().parents[2]
+        self.enterContext(mock.patch.dict(os.environ, {"PATH": f"{stub}:{os.environ['PATH']}",
+                                                     "PYTHONPATH": str(checkout)}))
+        config = eligibility.OffloadConfig(
+            True, eligibility.SshConnectionSettings("host", 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
+            1, 1, 1, "1", {"abandoned_session_minutes": "60"})
+        _ = self.enterContext(mock.patch.object(eligibility, "configured_ssh_target",
+                              return_value=target_config.SshTarget("mac", "macos", self.root / "settings")))
+        _ = self.enterContext(mock.patch.object(offload, "remote_mirror", return_value=str(folder)))
+        _ = self.enterContext(mock.patch.object(offload, "removal_script", return_value="true"))
+        _ = self.enterContext(mock.patch.object(nextest_log, "capture_function",
+                                               return_value="run_nextest_logged() { echo mac_exit=0; }"))
+        _ = self.enterContext(mock.patch.object(floor_claims, "read_claims",
+                                               return_value=floor_claims.ClaimSnapshot(frozenset())))
+        request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
+                                         owner="alpha", holder_session="holder-session")
+        mirror = self.remote(path=str(folder))
+        diagnostic = self.root / "fetch-result"
+        for fetch in ("linked/output", "linked-output"):
+            with self.subTest(fetch=fetch):
+                command = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder(fetch)),
+                                                      eligibility.KnownRepository("hana"))
+                args = mirror_arguments(mirror, "mirror-use")
+                args.command = ["sh", "-c", "{ " + command + "; } >" + shlex.quote(str(diagnostic)) + " 2>&1"]
+                _ = copies.mirror_run(args)
+                self.assertIn("symbolic link", diagnostic.read_text())
+                self.assertNotIn("mac_exit=0", diagnostic.read_text())
+                self.assertFalse(unchecked.exists())
+                self.assertTrue(protected.is_dir())
+        output = folder / "local/output"
+        output.mkdir(parents=True)
+        _ = (output / "stale").write_text("stale output\n")
+        command = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("local/output")),
+                                              eligibility.KnownRepository("hana"))
+        unleased = subprocess.run(["sh", "-c", command], capture_output=True, check=False, text=True)
+        self.assertIn("fetch cleanup requires the mirror lease", unleased.stderr)
+        self.assertTrue(output.is_dir())
+        args = mirror_arguments(mirror, "mirror-use")
+        args.command = ["sh", "-c", "{ " + command + "; } >" + shlex.quote(str(diagnostic)) + " 2>&1"]
+        self.assertEqual(copies.mirror_run(args), 0)
+        self.assertIn("mac_exit=0", diagnostic.read_text())
+        self.assertFalse(output.exists())
+
     def test_deferred_removal_reports_missing_ssh_and_keeps_the_request(self) -> None:
         mirror = self.remote()
         copies.record_remote_holder(mirror)

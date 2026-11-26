@@ -2797,9 +2797,24 @@ def remote_test_command(
         cleanup_command = remote_cleanup_command(config, request, repository)
     abandoned_sessions = ""
     if not custom_target:
-        abandoned_sessions = removal_script(target, config.abandoned_session_minutes) + " && "
+        program = ("import sys; from pathlib import Path; "
+                   "from scripts.lib.build_folders import require_no_fixed_build_folders; "
+                   "require_no_fixed_build_folders(Path(sys.argv[1]))")
+        guard = f'"$HOME/.claude/scripts/lib/py" -c {shlex.quote(program)} {target}'
+        prune = removal_script(target, config.abandoned_session_minutes)
+        abandoned_sessions = f"{{ {guard} >/dev/null 2>&1 && {prune} || :; }} && "
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
-    remove_folder = f"rm -rf -- {shlex.quote(request.fetch.value)} && " if isinstance(request.fetch, FetchFolder) else ""
+    remove_folder = ""
+    if isinstance(request.fetch, FetchFolder):
+        program = "\n".join((
+            "import sys",
+            "from scripts.copies.copies import CopyError, clear_mirror_fetch_folder",
+            "try:",
+            "    clear_mirror_fetch_folder(sys.argv[1])",
+            "except (CopyError, OSError, ValueError) as error:",
+            '    sys.exit(f"mac_test: {error}")',
+        ))
+        remove_folder = f'"$HOME/.claude/scripts/lib/py" -c {shlex.join([program, request.fetch.value])} && '
     environment = "".join(f"{name}={shlex.quote(value)} " for name, value in request.environment)
     run_id = f"BUILDLOG_RUN={shlex.quote(request.run_id)} " if request.run_id else ""
     clear_environment = clear_environment + " && " if clear_environment else ""
@@ -2904,6 +2919,7 @@ def fetch_folder(
         for entry in fetched.iterdir():
             if entry.lstat().st_mtime < oldest:
                 if entry.is_dir() and not entry.is_symlink():
+                    build_folders.require_no_fixed_build_folders(entry)
                     shutil.rmtree(entry)
                 else:
                     entry.unlink()
@@ -2945,11 +2961,15 @@ def fetch_folder(
             return FetchFailed("the fetched destination already exists")
         os.replace(partial, destination)
         return Fetched(destination / folder.value, kib)
-    except OSError as error:
+    except (OSError, ValueError) as error:
         return FetchFailed(str(error))
     finally:
         if owns_partial and partial.exists():
-            shutil.rmtree(partial)
+            try:
+                build_folders.require_no_fixed_build_folders(partial)
+                shutil.rmtree(partial)
+            except (OSError, ValueError) as error:
+                print(f"mac_test: kept {partial}: {error}", file=sys.stderr)
 
 
 def return_fix(

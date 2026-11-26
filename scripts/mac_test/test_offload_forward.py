@@ -84,11 +84,19 @@ class OffloadForwardTests(OffloadCommandFixture):
     def test_default_remote_command_is_byte_equal_and_fetch_alone_keeps_artifacts(self) -> None:
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         config = eligibility.read_config(self.config_path)
-        expected = (
-            'cd .local/state/mac-test/test-mirror/hana && { find "$HOME"/.local/state/mac-test/test-mirror/hana/target -maxdepth 5 -type d '
+        guarded_setup = (
+            'cd .local/state/mac-test/test-mirror/hana && { "$HOME/.claude/scripts/lib/py" -c '
+            + shlex.quote('import sys; from pathlib import Path; '
+                          + 'from scripts.lib.build_folders import require_no_fixed_build_folders; '
+                          + 'require_no_fixed_build_folders(Path(sys.argv[1]))')
+            + ' "$HOME"/.local/state/mac-test/test-mirror/hana/target >/dev/null 2>&1 && '
+            + '{ find "$HOME"/.local/state/mac-test/test-mirror/hana/target -maxdepth 5 -type d '
             + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
             + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
-            + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } && "
+            + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } || :; } && "
+        )
+        expected = (
+            guarded_setup
             + nextest_log.capture_function(nextest_log.output_limits(config.settings)) + " && "
             + 'PATH="$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH" '
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
@@ -123,11 +131,23 @@ class OffloadForwardTests(OffloadCommandFixture):
         )
         self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)
-        self.assertTrue(fetch.startswith("cd .local/state/mac-test/test-mirror/hana && { find "))
-        self.assertIn(" || :; } && rm -rf -- target/shots && run_nextest_logged() ", fetch)
+        guarded_fetch = (
+            '"$HOME/.claude/scripts/lib/py" -c '
+            + shlex.quote(
+                "import sys\n"
+                + "from scripts.copies.copies import CopyError, clear_mirror_fetch_folder\n"
+                + "try:\n"
+                + "    clear_mirror_fetch_folder(sys.argv[1])\n"
+                + "except (CopyError, OSError, ValueError) as error:\n"
+                + '    sys.exit(f"mac_test: {error}")'
+            )
+            + " target/shots && "
+        )
+        self.assertTrue(fetch.startswith(guarded_setup + guarded_fetch + "run_nextest_logged() "))
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
         self.assertNotIn("rm -rf -- target/shots", expected)
+        self.assertNotIn("clear_mirror_fetch_folder", expected)
 
     def test_nextest_setup_failure_declines_without_fetching(self) -> None:
         self.configure_fetch(run_status_line="mac_nextest_setup=failed")

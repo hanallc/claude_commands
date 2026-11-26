@@ -14,6 +14,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
+import errno
 import json
 import fcntl
 import hashlib
@@ -2828,6 +2829,46 @@ def check_mirror_removal(tree: Path, *, include_root: bool = True) -> None:
         raise CopyError(str(error)) from error
 
 
+def clear_mirror_fetch_folder(relative: str) -> None:
+    """Clear the requested path in the checkout held by mirror-use."""
+    parts = relative.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise CopyError(f"{relative}: expected a relative fetch path")
+    tree = Path.cwd()
+    lease = floor_claims.mirror_lock_path(tree)
+    try:
+        identity = lease.lstat()
+    except FileNotFoundError:
+        raise CopyError(f"{tree}: fetch cleanup requires the mirror lease") from None
+    for descriptor in floor_claims.inherited_mirror_descriptors():
+        if os.path.samestat(os.fstat(descriptor), identity):
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+    else:
+        raise CopyError(f"{tree}: fetch cleanup requires the mirror lease")
+
+    path = tree.joinpath(*parts)
+    with ExitStack() as held:
+        try:
+            parent = held.enter_context(build_folder_lock.open_folder_parent(path, tree, create=False))
+            info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise CopyError(f"{path}: a fetch parent is a symbolic link or is not a directory") from error
+            raise
+        if stat.S_ISLNK(info.st_mode):
+            raise CopyError(f"{path}: the fetch path is a symbolic link")
+        if not build_folder_lock.parent_current(path, parent):
+            raise CopyError(f"{path}: the fetch parent changed")
+        if not stat.S_ISDIR(info.st_mode):
+            os.unlink(path.name, dir_fd=parent)
+        elif not build_folders.remove_build_folder(path, dir_fd=parent, expected=info, temporary=False,
+                                                  wait=False, transient_lock=True):
+            raise CopyError(f"{path}: guarded fetch cleanup refused")
+
+
 def mirror_remove(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
     authority = floor_claims.removal_authority_path(tree)
@@ -3165,7 +3206,12 @@ def publish_files(tree: Path, paths: Sequence[str], before: Sequence[Publication
         repository = repository_name(tree)
         with ExitStack() as cleanup:
             publication = scratch.new(word="gate-binary", throwaway=True)
-            _ = cleanup.callback(shutil.rmtree, publication)
+
+            def discard_publication() -> None:
+                check_mirror_removal(publication)
+                shutil.rmtree(publication)
+
+            _ = cleanup.callback(discard_publication)
             for source in sources:
                 destination = publication / source.name
                 temporary = publication / f".{source.name}.tmp"
@@ -3257,7 +3303,7 @@ def receive_metadata(tree: Path, args: CopyArguments) -> None:
     except ValueError as error:
         raise CopyError(str(error)) from error
     # The receiver can delete files in the destination during a transfer.
-    check_mirror_removal(tree, include_root=False)
+    check_mirror_removal(tree, include_root=not fixed)
     previous = floor_claims.read_mirror_record(record) if record.exists() else {}
     keep_authority = False
     if authority.exists():

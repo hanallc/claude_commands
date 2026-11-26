@@ -64,6 +64,7 @@ The main checkouts stay at `~/rust/<repo>` and `~/.claude`. The repo word is the
 
 The Hana guest stores its shell cache under `<build root>/hana/main/shells`.
 Each numbered copy uses its own real `target` directory.
+Each `r*` test run folder lives in `test-runs` in the checkout's build output, for example `/build/claude/main/test-runs` for `~/.claude` on natedev; a checkout without a model output uses `$TMPDIR/test-runs` (see `merge-gate-and-test-speed.md`).
 
 The unit word names the unit. Use a unit word for only one active unit. A new unit can reuse a retired unit's word. The folder rules reserve `main` and `ci`.
 

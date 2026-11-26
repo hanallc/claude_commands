@@ -779,8 +779,14 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         '  exit 75',
         'fi',
     ])
-    abandoned_sessions = (removal_script(shlex.quote(str(target)), int(values['abandoned_session_minutes'])) + '\n'
-                          if target == (mirror / 'target').resolve() else '')
+    abandoned_sessions = ''
+    if target == (mirror / 'target').resolve():
+        try:
+            build_folders.require_no_fixed_build_folders(target)
+        except (OSError, ValueError):
+            pass
+        else:
+            abandoned_sessions = removal_script(shlex.quote(str(target)), int(values['abandoned_session_minutes'])) + '\n'
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
     with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
             ".linux-step-", build_folders.ExplicitBuildParent(mirror))) as step_directory:
