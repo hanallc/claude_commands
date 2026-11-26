@@ -20,7 +20,10 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 
 from scripts.message.process_test_support import OwnedTestProcesses
+from scripts.lib import conf_reads
+from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.message import send
 from scripts.message import repeat_guard as guard
@@ -114,8 +117,8 @@ class RepeatGuardTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state")}))
         config = install_notice_test_config(self.home)
-        limits_path = self.limits_file(FIXTURE_LIMITS, name="default-limits.conf")
-        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config), "SEND_REPEAT_CONFIG": str(limits_path)}))
+        _ = self.limits_file(FIXTURE_LIMITS)
+        self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config)}))
         limits = guard.configuration()
         if isinstance(limits, guard.GuardUnavailable):
             raise AssertionError(limits.reason)
@@ -183,8 +186,7 @@ class RepeatGuardTests(unittest.TestCase):
             return child
 
         errors = io.StringIO()
-        with (patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state"),
-                                      "SEND_REPEAT_CONFIG": os.environ["SEND_REPEAT_CONFIG"]}, clear=True),
+        with (patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state")}, clear=True),
               patch.object(guard, "Popen", slow_start), redirect_stderr(errors)):
             held = [guard.check(self.root, self.attempt(at=index)).held for index in range(3)]
         self.assertEqual(held, [False, False, True])
@@ -263,7 +265,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         loaded = site / "worker-loaded-sitecustomize"
         _ = (site / "sitecustomize.py").write_text(
             f"with open({str(loaded)!r}, 'w') as marker: marker.write('loaded')\n")
-        with patch.dict(os.environ, {"PYTHONPATH": str(site), "SEND_REPEAT_CONFIG": str(self.limits_file(self.limits))}):
+        with patch.dict(os.environ, {"PYTHONPATH": str(site), "CONF_DIR": str(self.limits_file(self.limits).parent)}):
             held = [guard.check(self.root, self.attempt(at=at)).held for at in range(3)]
             guard.transport_result("watchdog", "session:morty", "stopped", "delivered")
         self.assertEqual(held, [False, False, True])
@@ -362,7 +364,7 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
 
     def test_receiver_rate_policy_is_read_at_use_and_the_old_key_is_rejected(self) -> None:
         config = self.limits_file(replace(self.limits, receiver_rate_count=2))
-        with patch.dict(os.environ, {"SEND_REPEAT_CONFIG": str(config)}):
+        with patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
             self.assertFalse(self.persist(self.attempt("first result", at=0)).held)
             _ = self.limits_file(replace(self.limits, receiver_rate_count=3))
             self.assertFalse(self.persist(self.attempt("second result", at=1)).held)
@@ -550,26 +552,45 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
         self.assertEqual(state.holds, [10])
 
     def test_missing_or_invalid_config_fails_open_and_prints_one_error(self) -> None:
-        for contents in (None, "repeat_count=bad\n"):
-            path = self.home / ("missing.conf" if contents is None else "bad.conf")
+        for name, contents in (("missing", None), ("bad", "repeat_count=bad\n")):
+            folder = self.home / name
+            folder.mkdir()
             if contents is not None:
-                _ = path.write_text(contents)
+                _ = write_config_fixture(folder / "send_repeat_guard.conf", contents)
             errors = io.StringIO()
-            with patch.dict(os.environ, {"SEND_REPEAT_CONFIG": str(path)}), redirect_stderr(errors):
+            with patch.dict(os.environ, {"CONF_DIR": str(folder)}), redirect_stderr(errors):
                 for index in range(5):
                     self.assertFalse(guard.check(self.root, self.attempt(at=index)).held)
             self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertFalse(self.root.exists())
 
-    def limits_file(self, limits: guard.Limits, *, name: str = "limits.conf") -> Path:
-        path = self.home / name
+    def test_bad_live_limit_recovers_the_committed_limit(self) -> None:
+        path = self.limits_file(replace(self.limits, repeat_count=4))
+        folder = path.parent
+        git_environment = fixture_git_environment(folder)
+        _ = subprocess.run(["git", "-C", str(folder), "init", "-q"], env=git_environment, check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = commit_repository(folder, "Set repeat limit", path.name, env=git_environment)
+        _ = write_config_fixture(path, "repeat_count=2\nignored_row=bad\n")
+        with path.open("a", encoding="utf-8") as stream:
+            _ = stream.write("repeat_count=9\n")
+        reads = folder / "reads"
+        errors = io.StringIO()
+        with conf_reads.record_reads(reads), redirect_stderr(errors):
+            self.assertEqual([self.persist(self.attempt(at=index)).held for index in range(4)],
+                             [False, False, False, True])
+        self.assertIn("repeat_count='2'", errors.getvalue())
+        self.assertIn("send_repeat_guard", reads.read_text().splitlines())
+
+    def limits_file(self, limits: guard.Limits) -> Path:
+        path = self.home / ".claude/config/send_repeat_guard.conf"
         values = cast(dict[str, int], asdict(limits))
-        _ = path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+        _ = write_config_fixture(path, "".join(f"{key}={value}\n" for key, value in values.items()))
         return path
 
     def test_config_is_read_at_use_and_unfinished_notices_outlive_counters(self) -> None:
         config = self.limits_file(replace(self.limits, repeat_count=4))
-        with patch.dict(os.environ, {"SEND_REPEAT_CONFIG": str(config)}):
+        with patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
             self.assertEqual([self.persist(self.attempt(at=index)).held for index in range(4)],
                              [False, False, False, True])
             delivered: list[tuple[guard.SenderState, guard.Notice, guard.Limits]] = []
@@ -595,7 +616,8 @@ print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
             with self.assertRaises(BlockingIOError):
                 with guard.sender_record(self.root, "watchdog"):
                     self.fail("capacity reload selected a different lock")
-            with patch.dict(os.environ, {"SEND_REPEAT_CONFIG": str(self.limits_file(replace(self.limits, max_senders=7)))}):
+            config = self.limits_file(replace(self.limits, max_senders=7))
+            with patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
                 with patch.object(guard, "GUARD_IO_CEILING_SECONDS", 0.25):
                     self.assertFalse(guard.check(self.root, self.attempt()).held)
                     self.assertLess(time.monotonic() - start, guard.GUARD_IO_CEILING_SECONDS * DEADLINE_CEILING_FACTOR)
@@ -821,34 +843,31 @@ os.kill(os.getpid(), signal.SIGSTOP)
             self.assertEqual([self.apply(text).held for text in texts], [False, False, False])
 
     def test_import_and_protected_calls_do_not_read_config_and_fifo_config_is_bounded(self) -> None:
-        fifo = self.home / "policy"
+        folder = self.home / "fifo-config"
+        folder.mkdir()
+        fifo = folder / "send_repeat_guard.conf"
         os.mkfifo(fifo)
         workers = self.home / "fifo-workers"
         self.owned.markers.append(workers)
         program = """import sys
 from pathlib import Path
-original = Path.read_text
-def read(path, *args, **kwargs):
-    return original(Path(sys.argv[1]) if path.name == "send_repeat_guard.conf" else path, *args, **kwargs)
-Path.read_text = read
 from scripts.message import repeat_guard as g
-g.CONFIG=Path(sys.argv[1])
 launch = g.Popen
 def tracked(*args, **kwargs):
     child = launch(*args, **kwargs)
-    with Path(sys.argv[3]).open('a') as marker: marker.write(str(child.pid) + '\\n')
+    with Path(sys.argv[2]).open('a') as marker: marker.write(str(child.pid) + '\\n')
     return child
 g.Popen = tracked
 g.GUARD_IO_CEILING_SECONDS = 0.25
-assert not g.check(Path(sys.argv[2]), g.Attempt('user','session:a','same','fixture',0)).held
+assert not g.check(Path(sys.argv[1]), g.Attempt('user','session:a','same','fixture',0)).held
 print('ready', flush=True)
 sys.stdin.readline()
-assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','fixture',0)).held
+assert not g.check(Path(sys.argv[1]), g.Attempt('watchdog','session:a','same','fixture',0)).held
 """
-        command = [sys.executable, "-c", program, str(fifo), str(self.root), str(workers)]
+        command = [sys.executable, "-c", program, str(self.root), str(workers)]
         with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, start_new_session=True,
-                env=self.owned.environment({**os.environ, "SEND_REPEAT_CONFIG": str(fifo),
+                env=self.owned.environment({**os.environ, "CONF_DIR": str(folder),
                      "PYTHONPATH": str(Path(guard.__file__).parent)})) as process:
             self.owned.track(process, group=True)
             try:
@@ -897,7 +916,7 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
         if not path.exists():
             _ = path.write_text(NOTICE_FIXTURE)
         child = subprocess.Popen([sys.executable, str(path), "supervise", mode, str(self.root), str(self.home / "accepted")],
-            env=self.owned.environment({**os.environ, "SEND_REPEAT_CONFIG": str(self.limits_file(self.limits))}),
+            env=self.owned.environment({**os.environ, "CONF_DIR": str(self.limits_file(self.limits).parent)}),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         self.owned.track(child, group=True)
         try:

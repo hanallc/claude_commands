@@ -40,7 +40,7 @@ from datetime import datetime, timezone, tzinfo
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Iterator
 from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
 
@@ -366,6 +366,11 @@ class LoginEndUnknown:
     """The reading has no login end date."""
 
 
+@dataclass(frozen=True)
+class NoFableQuota:
+    """The usage response has no readable Fable window."""
+
+
 def usage_store_warning_line(warning: UsageStoreWarning) -> str:
     if isinstance(warning, UsageClaimFailed):
         return f"usage store: could not claim the read; {warning.reason}; read without a hold"
@@ -380,6 +385,7 @@ class Report:
     email: str | None = None
     plan: str | None = None
     quotas: list[Quota] = field(default_factory=list)
+    weekly_fable: Quota | NoFableQuota = field(default_factory=NoFableQuota, kw_only=True)
     problem: str | None = None
     quota_problem: str | None = None
     limit_reset_count: int | None = None
@@ -763,19 +769,47 @@ def claude_credentials(config_dir: Path | None = None) -> ClaudeCredentials:
     raise ClaudeCredentialsUnavailable("usage credentials unavailable")
 
 
+FABLE_WEEKLY_QUOTA_LABEL = "Weekly fable"
+
+
+def _claude_weekly_windows(usage: dict[str, object]) -> Iterator[tuple[str, dict[str, object]]]:
+    weekly = usage.get("seven_day")
+    if isinstance(weekly, dict):
+        yield "Weekly", cast(dict[str, object], weekly)
+    for name, value in usage.items():
+        if name.startswith("seven_day_") and isinstance(value, dict) and "utilization" in value:
+            label = "Weekly " + name.removeprefix("seven_day_").replace("_", " ")
+            yield label, cast(dict[str, object], value)
+
+
 def claude_usage_quotas(usage: dict[str, object]) -> list[Quota]:
     """The weekly windows in a Claude usage payload, main window first."""
     quotas: list[Quota] = []
-    weekly = usage.get("seven_day")
-    if isinstance(weekly, dict):
-        window = cast(UsageWindow, cast(object, weekly))
-        quotas.append(Quota("Weekly", window.get("utilization"), parse_reset(window.get("resets_at"))))
-    for name, value in usage.items():
-        if name.startswith("seven_day_") and isinstance(value, dict) and "utilization" in value:
-            window = cast(UsageWindow, cast(object, value))
-            label = "Weekly " + name.removeprefix("seven_day_").replace("_", " ")
-            quotas.append(Quota(label, window.get("utilization"), parse_reset(window.get("resets_at"))))
+    for label, fields in _claude_weekly_windows(usage):
+        window = cast(UsageWindow, cast(object, fields))
+        quotas.append(Quota(label, window.get("utilization"), parse_reset(window.get("resets_at"))))
     return quotas
+
+
+def _claude_fable_fields(usage: dict[str, object]) -> dict[str, object]:
+    limits = usage.get("limits")
+    scoped = cast(dict[str, object], limits).get("weekly_scoped") if isinstance(limits, dict) else None
+    return cast(dict[str, object], scoped) if isinstance(scoped, dict) else {}
+
+
+def claude_fable_weekly(usage: dict[str, object]) -> Quota | NoFableQuota:
+    """Decode the scoped Fable window in the usage response."""
+    fields = _claude_fable_fields(usage)
+    reset = fields.get("resets_at")
+    try:
+        resets_at = _checked_claude_usage_reset(None if reset == "" else reset)
+    except (OSError, OverflowError, ValueError):
+        return NoFableQuota()
+    used = fields.get("percent")
+    if (isinstance(used, bool) or not isinstance(used, (int, float)) or not 0 <= used <= 100
+            or not isinstance(fields.get("is_active"), bool)):
+        return NoFableQuota()
+    return Quota(FABLE_WEEKLY_QUOTA_LABEL, used, resets_at)
 
 
 def claude_five_hour(usage: dict[str, object]) -> Quota | None:
@@ -786,9 +820,44 @@ def claude_five_hour(usage: dict[str, object]) -> Quota | None:
     return Quota("5-hour", window.get("utilization"), parse_reset(window.get("resets_at")))
 
 
-def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = False) -> Report:
+def _checked_claude_usage_reset(value: object) -> datetime | None:
+    if value is None:
+        return None
+    reset = parse_reset(value)
+    if reset is None or reset.tzinfo is None:
+        raise ValueError("invalid usage reset")
+    return reset
+
+
+def _claude_usage_payload(decoded: object) -> dict[str, object]:
+    if not isinstance(decoded, dict):
+        raise ValueError("invalid usage response")
+    usage = cast(dict[str, object], decoded)
+    for name in ("five_hour", "seven_day"):
+        value = usage.get(name)
+        if value is not None and not isinstance(value, dict):
+            raise ValueError("invalid usage window")
+    windows = [fields for _, fields in _claude_weekly_windows(usage)]
+    five_hour = usage.get("five_hour")
+    if isinstance(five_hour, dict):
+        windows.append(cast(dict[str, object], five_hour))
+    for fields in (*windows, _claude_fable_fields(usage)):
+        _ = _checked_claude_usage_reset(fields.get("resets_at"))
+    for fields in windows:
+        used = fields.get("utilization")
+        if used is not None and (isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used)):
+            raise ValueError("invalid usage percent")
+    return usage
+
+
+def claude_live(config_dir: Path | NumberedAccount | None = None, *, use_disk_identity: bool = False) -> Report:
+    """Read usage. Check a supplied numbered account before claiming a read."""
     store = cast(UsageReadStore, cast(object, import_module("scripts.whoami.usage_store")))
 
+    selection = config_dir
+    if isinstance(config_dir, NumberedAccount):
+        config_dir = config_dir.home
+        use_disk_identity = True
     report = Report("Claude", source=ClaudeDirectorySource(
         claude_config_dir() if config_dir is None else config_dir,
     ))
@@ -816,11 +885,13 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         report.problem = "Account unavailable (claude auth status failed)"
         return report
-    if not account.get("loggedIn"):
+    signed_in_login = account.get("email")
+    if (not account.get("loggedIn") or isinstance(selection, NumberedAccount)
+            and (not isinstance(signed_in_login, str) or signed_in_login.casefold() != selection.login.casefold())):
         report.usage_read_outcome = UsageReadOutcome.CREDENTIALS_UNAVAILABLE
         report.problem = "Login credentials unavailable in this session"
         return report
-    report.email = account.get("email")
+    report.email = signed_in_login
     report.plan = account.get("subscriptionType") or account.get("authMethod")
     if account.get("authMethod") != "claude.ai":
         report.quota_problem = "Weekly quota: unavailable for this authentication method"
@@ -867,9 +938,13 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
         opened = cast(http.client.HTTPResponse, urllib.request.urlopen(
             request, timeout=conf.read("accounts").whole("claude_usage_timeout_seconds")))
         with opened as response:
-            usage = cast(dict[str, object], json.loads(response.read()))
-        report.quotas = claude_usage_quotas(usage)
-        report.five_hour = claude_five_hour(usage)
+            usage = _claude_usage_payload(cast(object, json.loads(response.read())))
+        quotas = claude_usage_quotas(usage)
+        five_hour = claude_five_hour(usage)
+        weekly_fable = claude_fable_weekly(usage)
+        report.quotas = quotas
+        report.five_hour = five_hour
+        report.weekly_fable = weekly_fable
         if any(quota.label == "Weekly" and quota.remaining_percent is not None for quota in report.quotas):
             report.usage_read_outcome = UsageReadOutcome.OK
         if not any(quota.label == "Weekly" for quota in report.quotas):
@@ -881,7 +956,7 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
         report.usage_read_outcome = (UsageReadOutcome.REFUSED_401 if error.code == 401 else
                                      UsageReadOutcome.RATE_LIMITED_429 if error.code == 429 else UsageReadOutcome.ERROR)
         report.quota_problem = f"Weekly quota: unavailable (HTTP {error.code}; try Claude /usage)"
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+    except (OSError, OverflowError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         report.quota_problem = "Weekly quota: unavailable (could not read live usage; try Claude /usage)"
     finally:
         if report.email and isinstance(claim, UsageReadClaim):

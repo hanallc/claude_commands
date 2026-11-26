@@ -7,12 +7,13 @@ import subprocess
 import tempfile
 import unittest
 from io import BytesIO
+from pathlib import Path
 from typing import cast
 from unittest import mock
 
 
 from scripts.style.git_process import (GitBlob, GitExitAnswers, GitReadFailed, MalformedBlobReply, MissingBlob,
-                         TruncatedBlobReply, parse_status_z, read_batch_blob, run_git)
+                         TruncatedBlobReply, blob_contents, parse_status_z, read_batch_blob, run_git)
 
 
 class GitProcessTests(unittest.TestCase):
@@ -74,6 +75,24 @@ class GitProcessTests(unittest.TestCase):
         replies = BytesIO(b"HEAD:path with spaces missing\nabc blob 1\nx\n")
         self.assertIsInstance(read_batch_blob(replies), MissingBlob)
         self.assertEqual(read_batch_blob(replies), GitBlob("abc", b"x"))
+
+    def test_blob_contents_reports_missing_and_reads_the_next_blob_without_a_temp_file(self) -> None:
+        command = ("git", "-C", "/repo", "cat-file", "--batch")
+        content = b"line\n\0\xff"
+        output = b"absent missing\nabc blob 7\n" + content + b"\n"
+        result = subprocess.CompletedProcess(command, 0, output, b"")
+        with (mock.patch.object(subprocess, "run", return_value=result),
+              mock.patch.object(tempfile, "TemporaryFile", side_effect=AssertionError("Unexpected temporary file"))):
+            replies = list(blob_contents(Path("/repo"), {"missing.py": "absent", "next.py": "abc"},
+                                         report_missing=True))
+        self.assertEqual(replies, [("missing.py", MissingBlob()), ("next.py", content)])
+
+    def test_blob_contents_rejects_missing_objects_by_default(self) -> None:
+        command = ("git", "-C", "/repo", "cat-file", "--batch")
+        result = subprocess.CompletedProcess(command, 0, b"absent missing\n", b"")
+        with mock.patch.object(subprocess, "run", return_value=result):
+            with self.assertRaises(GitReadFailed):
+                _ = list(blob_contents(Path("/repo"), {"missing.py": "absent"}))
 
     def test_malformed_blob_headers(self) -> None:
         for header in (b"", b"abc\n", b"abc tree 3\nxyz\n", b"abc blob -1\n", b"abc blob size\n"):

@@ -125,10 +125,10 @@ class StatusBoardTests(unittest.TestCase):
                         self.assertIsInstance(result.first_next_moves, accounts.NextMovesUnavailable)
                         self.assertIn("Upcoming moves: unavailable", result.upcoming_moves[0])
                     elif content == "[]":
-                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveTargets())
+                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveEntries())
                         self.assertEqual(result.upcoming_moves, ("Upcoming moves: none",))
                     else:
-                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveTargets({"units": "claude2", "workers": "codex2"}))
+                        self.assertEqual(result.first_next_moves, accounts.FirstNextMoveEntries({"units": first, "workers": workers}))
                         self.assertEqual(result.upcoming_moves, ("Upcoming moves:", *expected.splitlines()))
             with (patch.object(accounts, "_read_status", return_value=fixture()),
                   patch.object(role_map, "is_role_map_host", return_value=False),
@@ -427,7 +427,25 @@ class StatusBoardTests(unittest.TestCase):
             {"text": model.model, "tone": "default", "kind": "bold", "color": value, "color_key": key},
         ])
 
-    def test_model_rows_share_the_account_total_with_current_and_older_peer_counts(self) -> None:
+    def test_unrepresentable_peer_timestamp_keeps_the_local_board_counts(self) -> None:
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        cache = home / "peer.json"
+        _ = cache.write_text(json.dumps({"machine": "mac", "at": "9999-12-31T23:59:59+00:00",
+            "accounts": {}}))
+        local = row("claude1", ("units",), (counts(1, 2, 0, 0),), 60, None, None)
+        zone = ZoneInfo("Asia/Tokyo")
+        read_counts = cast(Callable[..., accounts.MachineRoleCounts], getattr(accounts, "_machine_role_counts"))
+        with (patch.object(remote, "other_machine", return_value="mac"),
+              patch.object(accounts, "_session_counts_cache", return_value=cache),
+              patch.object(accounts, "_start_session_counts_fetch", return_value=False)):
+            reading = read_counts((local,), NOW, zone=zone)
+
+        self.assertEqual(reading.problems, ("mac unavailable: counts are natedev only",))
+        self.assertEqual(reading.peer_count_notes, ())
+        board = accounts.status_board(accounts.StatusReading(reading.rows, reading.problems, (), zone, NOW))
+        self.assertEqual(text(board["rows"][-1]["cells"]["total"]), "3")
+
+    def test_model_rows_share_the_local_account_total_with_current_and_older_peer_counts(self) -> None:
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         local_model = accounts.ObservedSessionModel("claude-opus-5-5", "high")
         reading = accounts.StatusReading((replace(
@@ -455,13 +473,9 @@ class StatusBoardTests(unittest.TestCase):
                     table = accounts.models_board(both, {"model.claude-opus-5-5": "#e08a5c"})
                     self.assertEqual([[text(line["cells"][key]) for key in
                                        ("model", "effort", *accounts.MODEL_COUNT_COLUMNS)] for line in table.rows],
-                                     ([["claude-fable-5-1", "high", "1", "0", "0", "0", "1"],
-                                       ["claude-opus-5-5", "low", "0", "1", "0", "0", "1"],
-                                       ["", "high", "0", "0", "1", "0", "1"],
-                                       ["unknown", "-", "0", "0", "1", "0", "1"]]
-                                      if current else [["claude-opus-5-5", "high", "0", "0", "1", "0", "1"],
-                                                       ["unknown", "-", "1", "1", "1", "0", "3"]])
-                                     + [["total", "", "1", "1", "2", "0", "4"]])
+                                     [["claude-opus-5-5", "high", "0", "0", "1", "0", "1"],
+                                      ["unknown", "-", "0", "0", "1", "0", "1"],
+                                      ["total", "", "0", "0", "2", "0", "2"]])
                     self.assertEqual(text(table.rows[-1]["cells"]["total"]),
                                      text(accounts.status_board(both)["rows"][-1]["cells"]["total"]))
 

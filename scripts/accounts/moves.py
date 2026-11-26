@@ -12,15 +12,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from importlib import import_module
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from uuid import uuid4
 from typing import TYPE_CHECKING, Literal, NotRequired, ReadOnly, TypedDict, Protocol, cast, override, assert_never
 
 from scripts.accounts import role_map, worker_names
 from scripts.agents.stop_results import MoveHandedOff, StopFailed
-from scripts.lib import process_start
+from scripts.lib import file_lock, process_start
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import staff
 
 if TYPE_CHECKING:
     from scripts.whoami.account import ResolvedHistoryLabel, HistoricalAccountUnresolved
@@ -191,6 +193,102 @@ class MoveMember:
 
 
 @dataclass(frozen=True)
+class HandMoveSession:
+    name: str
+
+
+class MoveInitiator(Enum):
+    AUTOMATIC = "automatic"
+    CONSOLE = "console page"
+    HAND = "terminal"
+
+
+GROUP_MOVE_BUSY_REASON = "Another move is in progress. Try again when it ends."
+
+
+@dataclass(frozen=True)
+class MoveQueued:
+    """The move has not started this member."""
+
+
+@dataclass(frozen=True)
+class MoveDestinationUnselected:
+    """The move has no recorded destination."""
+
+
+MoveDestination = str | MoveDestinationUnselected
+
+
+@dataclass(frozen=True)
+class MemberMoving:
+    started: datetime
+    target: MoveDestination = field(default_factory=MoveDestinationUnselected)
+
+
+@dataclass(frozen=True)
+class MemberMoved:
+    ended: datetime
+    elapsed: timedelta
+    recovered_holder: str = ""
+    target: MoveDestination = field(default_factory=MoveDestinationUnselected)
+
+
+@dataclass(frozen=True)
+class MemberAlreadyOnTarget:
+    ended: datetime
+    elapsed: timedelta
+    target: str
+
+
+class MoveFailureKind(Enum):
+    MOVE_IN_PROGRESS = "move in progress"
+    NO_SAVED_SESSION = "no saved session"
+    OTHER = "other"
+
+
+@dataclass(frozen=True)
+class MemberMoveFailed:
+    ended: datetime
+    elapsed: timedelta
+    reason: str
+    target: MoveDestination = field(default_factory=MoveDestinationUnselected)
+    stopped: bool = False
+    failure_kind: MoveFailureKind = MoveFailureKind.OTHER
+
+
+MoveMemberState = MoveQueued | MemberMoving | MemberMoved | MemberAlreadyOnTarget | MemberMoveFailed
+
+
+class MoveMemberKind(Enum):
+    NATIVE = "native"
+    STAFF = "staff"
+    REQUEST = "request"
+
+
+@dataclass(frozen=True)
+class MoveMemberProgress:
+    member: MoveMember
+    state: MoveMemberState
+    kind: MoveMemberKind = MoveMemberKind.NATIVE
+
+
+@dataclass(frozen=True)
+class MoveProgress:
+    batch_id: str
+    group: str
+    target: MoveDestination
+    reason: str
+    initiator: HandMoveSession | MoveInitiator
+    started: datetime
+    members: tuple[MoveMemberProgress, ...]
+    cause: MoveCause = "by hand"
+
+    @property
+    def active(self) -> bool:
+        return any(isinstance(row.state, (MoveQueued, MemberMoving)) for row in self.members)
+
+
+@dataclass(frozen=True)
 class MoveBatchResult:
     target: str | FollowGroupAccount
     pending: tuple[MoveMember, ...]
@@ -206,6 +304,250 @@ class ClaimOwner:
 
     pid: int
     start: str
+
+
+@dataclass(frozen=True)
+class MoveNotEnded:
+    """The writer has not marked the end of the batch."""
+
+
+@dataclass(frozen=True)
+class TrackedMove:
+    progress: MoveProgress
+    owner: ClaimOwner
+    updated: datetime
+    ended: datetime | MoveNotEnded = field(default_factory=MoveNotEnded)
+
+
+def _progress_path(batch_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", batch_id):
+        raise ValueError("invalid move batch id")
+    return store_file().parent / "move-progress" / f"{batch_id}.json"
+
+
+EARLIER_MOVE_LIMIT = 3
+
+
+def move_destination(target: object) -> MoveDestination:
+    return target if isinstance(target, str) and _numbered_target(target) else MoveDestinationUnselected()
+
+
+def move_display_reason(cause: MoveCause, why: str) -> str:
+    """Use only the safe parts of a recorded cause in the console."""
+    if cause == "by hand":
+        return ""
+    quota = re.fullmatch(r"(?:claude|codex)[1-9][0-9]* at ([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)%(?: Fable)?", why)
+    if quota and 0 <= float(quota[1]) <= 100:
+        return quota[0]
+    if cause == "refusal":
+        refusal = re.match(r"^((?:claude|codex)[1-9][0-9]*) refused: (weekly_fable|five_hour|weekly|unknown|five-hour|Fable weekly) limit\b", why)
+        if refusal:
+            window = {"weekly_fable": "Fable weekly", "five_hour": "five-hour"}.get(refusal[2], refusal[2])
+            return f"{refusal[1]} refused: {window} limit"
+        return "quota refusal"
+    return "credits off" if cause == "credits off" else "scheduled quota limit"
+
+
+def move_failure_reason(reason: str) -> str:
+    """Keep one line and remove email addresses from the diagnostic."""
+    return re.sub(r"[\w.!#$%&'*+/=?^_`{|}~-]+@[\w-]+(?:\.[\w-]+)*", "[account identity]", " ".join(reason.splitlines()))
+
+
+def _progress_reason(reason: object, origin: HandMoveSession | MoveInitiator) -> str:
+    if origin is not MoveInitiator.AUTOMATIC:
+        return ""
+    detail = reason if isinstance(reason, str) else ""
+    if detail == "credits off":
+        return detail
+    cause = "refusal" if detail in ("refusal", "quota refusal") or " refused: " in detail else "auto"
+    return move_display_reason(cause, detail)
+
+
+def _progress_time(value: object) -> datetime:
+    if isinstance(value, str):
+        at = datetime.fromisoformat(value)
+        if at.tzinfo is not None:
+            return at
+    raise ValueError("move progress time needs a zone")
+
+
+def _read_failure_kind(fields: dict[str, object], reason: str) -> MoveFailureKind:
+    if "failure_kind" in fields:
+        try:
+            return MoveFailureKind(fields["failure_kind"])
+        except ValueError:
+            return MoveFailureKind.OTHER
+    if reason == "Another move is in progress.":
+        return MoveFailureKind.MOVE_IN_PROGRESS
+    if reason == "No saved session was found.":
+        return MoveFailureKind.NO_SAVED_SESSION
+    return MoveFailureKind.OTHER
+
+
+def _is_native_session_id(value: str) -> bool:
+    try:
+        _ = staff.native_id(value)
+    except staff.StaffRefused:
+        return False
+    return True
+
+
+def _progress_member(value: object, target: MoveDestination) -> MoveMemberProgress:
+    if not isinstance(value, dict):
+        raise ValueError("invalid member progress")
+    fields = cast(dict[str, object], value)
+    reference, name = fields.get("reference"), fields.get("name")
+    if not isinstance(reference, str) or not reference or not isinstance(name, str) or not name:
+        raise ValueError("invalid move member")
+    member = MoveMember(reference, "unnamed session" if name == reference and _is_native_session_id(name) else name)
+    kind = MoveMemberKind(fields.get("kind", MoveMemberKind.NATIVE.value))
+    state = fields.get("state")
+    destination = move_destination(fields["target"]) if "target" in fields else target
+    if state == "queued":
+        return MoveMemberProgress(member, MoveQueued(), kind)
+    if state == "moving":
+        return MoveMemberProgress(member, MemberMoving(_progress_time(fields.get("started")), destination), kind)
+    elapsed = fields.get("elapsed")
+    if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool) or not 0 <= elapsed < timedelta.max.total_seconds():
+        raise ValueError("invalid move duration")
+    ended, duration = _progress_time(fields.get("ended")), timedelta(seconds=elapsed)
+    if state == "moved" and isinstance(holder := fields.get("recovered_holder", ""), str):
+        return MoveMemberProgress(member, MemberMoved(ended, duration, "task" if holder == "operation" else holder,
+                                                       destination), kind)
+    if state == "already on target" and isinstance(destination, str):
+        return MoveMemberProgress(member, MemberAlreadyOnTarget(ended, duration, destination), kind)
+    if state == "failed" and isinstance(reason := fields.get("reason"), str):
+        return MoveMemberProgress(member, MemberMoveFailed(ended, duration, move_failure_reason(reason), destination,
+                                                            stopped=fields.get("stopped") is True,
+                                                            failure_kind=_read_failure_kind(fields, reason)), kind)
+    raise ValueError("invalid move member state")
+
+
+def _encode_member(row: MoveMemberProgress) -> dict[str, object]:
+    fields: dict[str, object] = {"reference": row.member.reference, "name": row.member.name, "kind": row.kind.value}
+    state = row.state
+    if isinstance(state, MoveQueued):
+        return fields | {"state": "queued"}
+    fields["target"] = state.target if isinstance(state.target, str) else None
+    if isinstance(state, MemberMoving):
+        return fields | {"state": "moving", "started": state.started.isoformat()}
+    fields |= {"ended": state.ended.isoformat(), "elapsed": state.elapsed.total_seconds()}
+    if isinstance(state, MemberMoved):
+        return fields | {"state": "moved", "recovered_holder": state.recovered_holder}
+    if isinstance(state, MemberAlreadyOnTarget):
+        return fields | {"state": "already on target"}
+    return fields | {"state": "failed", "reason": move_failure_reason(state.reason),
+                     "stopped": state.stopped, "failure_kind": state.failure_kind.value}
+
+
+def _numbered_target(target: str) -> bool:
+    return re.fullmatch(r"(?:claude|codex)[1-9][0-9]*", target) is not None
+
+
+def read_tracked_move(batch_id: str) -> TrackedMove:
+    value = cast(object, json.loads(_progress_path(batch_id).read_text(encoding="utf-8")))
+    if not isinstance(value, dict):
+        raise ValueError("invalid move progress")
+    fields = cast(dict[str, object], value)
+    group, target = fields.get("group"), move_destination(fields.get("target"))
+    pid, start = fields.get("pid"), fields.get("start")
+    members, initiator, session = fields.get("members"), fields.get("initiator"), fields.get("session")
+    if (not isinstance(group, str) or not group or not isinstance(pid, int) or isinstance(pid, bool)
+            or pid <= 0 or not isinstance(start, str) or not isinstance(members, list) or not members):
+        raise ValueError("invalid move progress fields")
+    if initiator == "session" and isinstance(session, str) and session:
+        origin: HandMoveSession | MoveInitiator = HandMoveSession("unnamed" if _is_native_session_id(session) else session)
+    elif initiator in tuple(source.value for source in MoveInitiator):
+        origin = MoveInitiator(initiator)
+    else:
+        raise ValueError("invalid move initiator")
+    reason = _progress_reason(fields.get("reason", fields.get("cause")), origin)
+    rows = tuple(_progress_member(row, target) for row in cast(list[object], members))
+    if len({row.member.reference for row in rows}) != len(rows):
+        raise ValueError("duplicate move member")
+    raw_cause = fields.get("cause")
+    cause: MoveCause = (raw_cause if raw_cause in ("by hand", "auto", "refusal", "credits off")
+                       else "auto" if origin is MoveInitiator.AUTOMATIC else "by hand")
+    progress = MoveProgress(batch_id, group, target, reason, origin, _progress_time(fields.get("started")), rows, cause)
+    updated = _progress_time(fields.get("updated"))
+    ended = fields.get("ended", updated.isoformat() if not progress.active else None)
+    return TrackedMove(progress, ClaimOwner(pid, start), updated,
+                       _progress_time(ended) if ended is not None else MoveNotEnded())
+
+
+def write_move_progress(record: TrackedMove) -> None:
+    progress, owner = record.progress, record.owner
+    origin = progress.initiator
+    path = _progress_path(progress.batch_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = {"group": progress.group, "target": progress.target if isinstance(progress.target, str) else None,
+              "reason": _progress_reason(progress.reason, origin), "cause": progress.cause,
+              "initiator": "session" if isinstance(origin, HandMoveSession) else origin.value,
+              "session": origin.name if isinstance(origin, HandMoveSession) else "",
+              "started": progress.started.isoformat(), "updated": record.updated.isoformat(),
+              "ended": record.ended.isoformat() if isinstance(record.ended, datetime) else None,
+              "pid": owner.pid, "start": owner.start, "members": [_encode_member(row) for row in progress.members]}
+    write_text_atomic(path, json.dumps(fields), new_file_mode=0o600)
+
+
+def finish_move_progress(record: TrackedMove) -> None:
+    """Save the end mark before pruning only ended files."""
+    write_move_progress(replace(record, ended=record.updated))
+    completed: list[tuple[datetime, Path]] = []
+    for path in _progress_path(record.progress.batch_id).parent.glob("*.json"):
+        try:
+            ending = read_tracked_move(path.stem).ended
+        except (OSError, ValueError, RecursionError):
+            continue
+        if isinstance(ending, datetime):
+            completed.append((ending, path))
+    completed.sort(reverse=True)
+    for _, path in completed[EARLIER_MOVE_LIMIT:]:
+        path.unlink(missing_ok=True)
+
+
+def refusal_failure_kind(reason: str) -> MoveFailureKind:
+    """Give the failure kind of a refused move from its reason."""
+    return MoveFailureKind.MOVE_IN_PROGRESS if reason == GROUP_MOVE_BUSY_REASON else MoveFailureKind.OTHER
+
+
+def record_console_group_refusal(group: role_map.ClaudeGroup, target: str, reason: str) -> None:
+    """Record a refused request with no members to retry."""
+    now = datetime.now(timezone.utc)
+    destination = move_destination(target)
+    member = MoveMemberProgress(MoveMember(group, group),
+                                MemberMoveFailed(now, timedelta(), reason, destination,
+                                                 failure_kind=refusal_failure_kind(reason)),
+                                MoveMemberKind.REQUEST)
+    progress = MoveProgress(uuid4().hex, group, destination, "", MoveInitiator.CONSOLE, now, (member,))
+    finish_move_progress(TrackedMove(progress, own_claim_owner(), now))
+
+
+def visible_move_progress(record: TrackedMove) -> MoveProgress:
+    progress = record.progress
+    if not progress.active or _claim_owner_is_live(record.owner):
+        return progress
+    members: list[MoveMemberProgress] = []
+    for row in progress.members:
+        if isinstance(row.state, (MoveQueued, MemberMoving)):
+            began = row.state.started if isinstance(row.state, MemberMoving) else progress.started
+            state = MemberMoveFailed(record.updated, max(timedelta(), record.updated - began),
+                                     "The move ended before it recorded a result.",
+                                     row.state.target if isinstance(row.state, MemberMoving) else progress.target)
+            row = replace(row, state=state)
+        members.append(row)
+    return replace(progress, members=tuple(members))
+
+
+def read_move_progress() -> tuple[MoveProgress, ...]:
+    directory = store_file().parent / "move-progress"
+    records: list[MoveProgress] = []
+    for path in directory.glob("*.json"):
+        try:
+            records.append(visible_move_progress(read_tracked_move(path.stem)))
+        except (OSError, ValueError):
+            continue
+    return tuple(sorted(records, key=lambda move: (move.started, move.batch_id), reverse=True))
 
 
 @dataclass(frozen=True)
@@ -244,6 +586,27 @@ def claim_lock() -> Generator[None]:
         os.close(descriptor)
 
 
+@contextmanager
+def group_move_lock(group: role_map.ClaudeGroup) -> Generator[file_lock.LockResult]:
+    """Keep the group selection stable while a move requests its members."""
+    path = store_file().parent / f"move-{group}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = file_lock.take_exclusive(path)
+    if lock is file_lock.LockResult.BUSY:
+        yield file_lock.LockResult.BUSY
+        return
+    try:
+        active = tuple(move for move in read_move_progress() if move.group == group and move.active)
+        console_busy = any(move.initiator is MoveInitiator.CONSOLE for move in active)
+        active_ids = {move.batch_id for move in active}
+        hand_busy = not console_busy and bool(active_ids) and any(
+            saved.request.request_id in active_ids and saved.request.target == f"group:{group}"
+            and claim_is_live(saved.request) for saved in pending_move_requests())
+        yield file_lock.LockResult.BUSY if console_busy or hand_busy else file_lock.LockResult.ACQUIRED
+    finally:
+        lock.release()
+
+
 def own_claim_owner() -> ClaimOwner:
     """Read the own process start, with one more read after a failure; no start is recorded after two failures."""
     for _ in range(2):
@@ -257,9 +620,82 @@ def claim_is_live(request: LatestMoveRequest) -> bool:
     """A user claim is live while its process lives or cannot be read; a claim with no start, while its pid exists."""
     if request.owner is None:
         return False
-    state = process_start.process_start(request.owner.pid)
+    return _claim_owner_is_live(request.owner)
+
+
+def _claim_owner_is_live(owner: ClaimOwner) -> bool:
+    state = process_start.process_start(owner.pid)
     return (isinstance(state, process_start.Unreadable)
-            or isinstance(state, process_start.Started) and request.owner.start in ("", state.start))
+            or isinstance(state, process_start.Started) and owner.start in ("", state.start))
+
+
+def _hand_queue_path(identity: str) -> Path:
+    path = latest_request_path(identity)
+    return path.parent.with_name("hand-move-queues") / path.name
+
+
+def _hand_queue(identity: str) -> dict[str, ClaimOwner]:
+    try:
+        raw = cast(object, json.loads(_hand_queue_path(identity).read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("invalid hand move queue")
+    queued: dict[str, ClaimOwner] = {}
+    for request, owner in cast(dict[str, object], raw).items():
+        match owner:
+            case [int(pid), str(start)] if type(pid) is int and pid > 1:
+                queued[request] = ClaimOwner(pid, start)
+            case _:
+                raise ValueError("invalid hand move queue owner")
+    return queued
+
+
+def _save_hand_queue(identity: str, queued: dict[str, ClaimOwner]) -> None:
+    path = _hand_queue_path(identity)
+    if queued:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(path, json.dumps({request: (owner.pid, owner.start) for request, owner in queued.items()}),
+                          new_file_mode=0o600)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def queue_hand_move(identity: str, request_id: str, owner: ClaimOwner) -> None:
+    """Register a hand move in arrival order under the claim lock."""
+    with claim_lock():
+        queued = _hand_queue(identity)
+        if request_id not in queued:
+            queued[request_id] = owner
+            _save_hand_queue(identity, queued)
+
+
+def move_holds_session(identity: str) -> bool:
+    """Read live claims and hand moves without changing the queue."""
+    claim = read_latest_request(identity)
+    return ((isinstance(claim, LatestMoveRequest) and claim_is_live(claim))
+            or hand_move_ahead(identity, "") is not None)
+
+
+def hand_move_ahead(identity: str, request_id: str) -> ClaimOwner | None:
+    """Read the oldest live hand move before this request. The caller holds the claim lock."""
+    for queued_id, owner in _hand_queue(identity).items():
+        if queued_id == request_id:
+            break
+        if _claim_owner_is_live(owner):
+            return owner
+    return None
+
+
+def hand_move_is_queued(identity: str, request_id: str) -> bool:
+    return request_id in _hand_queue(identity)
+
+
+def end_hand_move(identity: str, request_id: str) -> None:
+    with claim_lock():
+        queued = _hand_queue(identity)
+        if queued.pop(request_id, None) is not None:
+            _save_hand_queue(identity, {key: owner for key, owner in queued.items() if _claim_owner_is_live(owner)})
 
 
 def write_latest_request(native_session: str, request: LatestMoveRequest, *, name: str = "") -> None:
@@ -267,9 +703,9 @@ def write_latest_request(native_session: str, request: LatestMoveRequest, *, nam
 
     A move writes its request while it holds the session locks.
     One exception: a user command writes its claim without the row lock while another operation holds the row.
-    The holder reads the request again before its stop and drops the row when the claim replaced its own.
+    An automatic holder reads the request again before its stop and drops the row if a hand move took its claim.
     An automatic move never takes a row while a live user claim is current.
-    A user command stops its wait for a row when its claim is missing or replaced, because a newer move ran.
+    Concurrent hand moves use the queue to preserve the order of their claims.
     """
     path = latest_request_path(native_session)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,12 +764,16 @@ MOVE_COMMAND = "~/.claude/scripts/lib/py ~/.claude/scripts/agents/stop_resume.py
 RETRY_COMMAND = f"{MOVE_COMMAND} retry"
 
 
-def batch_move_command(reference: str, destination: str | FollowGroupAccount, *, user_command: bool = False) -> str:
+def batch_move_arguments(reference: str, destination: str | FollowGroupAccount, *, user_command: bool = False) -> list[str]:
     options = (["--group", destination.group] if isinstance(destination, FollowGroupAccount)
                else ["--target", destination])
     if user_command:
         options.append("--user-command")
-    return f"{MOVE_COMMAND} batch {shlex.join([*options, '--', reference])}"
+    return ["batch", *options, "--", reference]
+
+
+def batch_move_command(reference: str, destination: str | FollowGroupAccount, *, user_command: bool = False) -> str:
+    return f"{MOVE_COMMAND} {shlex.join(batch_move_arguments(reference, destination, user_command=user_command))}"
 
 
 def remove_latest_request(native_session: str, request_id: str) -> None:
@@ -356,8 +796,12 @@ def set_claim_owner(native_session: str, request_id: str, owner: ClaimOwner | No
     """
     with claim_lock():
         saved = _read_move_request(latest_request_path(native_session))
+        queued = _hand_queue(native_session)
+        if owner is not None and request_id in queued and queued[request_id] != owner:
+            queued[request_id] = owner
+            _save_hand_queue(native_session, queued)
         if not isinstance(saved, PendingMoveRequest) or saved.request.request_id != request_id:
-            return False
+            return owner is not None and request_id in queued
         if saved.request.owner != owner:
             write_latest_request(native_session, replace(saved.request, owner=owner), name=saved.member.name)
         return True

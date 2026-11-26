@@ -53,7 +53,7 @@ from pathlib import Path
 from scripts.lib.transcripts import open_transcript, transcript_paths, uncompressed_path
 from typing import Protocol, TypedDict, cast
 
-from scripts.lib import models_registry  # noqa: E402
+from scripts.lib import conf, models_registry  # noqa: E402
 
 from scripts.whoami.note_file import InvalidReset, KnownReset, NoResetKnown, reset_time
 
@@ -71,7 +71,6 @@ SCAN_DAYS = 3                 # rollout directories a tick re-reads: a thread ca
 K_PRIOR = 2.3                 # fit over Sep 22 - Oct 1, 2026, before the pacer measured its own
 MIN_TIER_SHARE = 0.1          # each tier needs this share of the tokens for the fit to stand
 PURE_MODEL = 0.95             # an hour enters the fit when the dominant model ran this share of it
-MAX_STEP = 3.0                # a larger rise between readings is a switch of account, not spend
 RESET_DROP = 5.0              # a larger fall within one window is a limit reset
 
 # Relative token costs, in proportion to API prices: a cached input token is a
@@ -266,10 +265,13 @@ def ingest(state: State, files: Iterator[Path]) -> None:
                 read_line(state, entry, raw, readings)
             except (ValueError, KeyError, TypeError):
                 continue  # a line codex wrote in a shape this does not know
+    if not readings:
+        return
+    max_step_percent = conf.read("codex_pacer").number("sampling.max_step_percent")
     readings.sort()
     for at, used, window in readings:
         high = state["windows"].get(window)
-        if high is not None and high < used <= high + MAX_STEP:
+        if high is not None and high < used <= high + max_step_percent:
             bucket(state, at)["spent"] += used - high
         if high is None or used > high or used < high - RESET_DROP:
             state["windows"][window] = used
@@ -554,7 +556,10 @@ def main() -> None:
     args = parser.parse_args()
     command = cast(str, args.command)
     if command == "backfill":
-        state = backfill(cast(int, args.days), cast(datetime | None, args.fast_from), cast(datetime | None, args.fast_until))
+        try:
+            state = backfill(cast(int, args.days), cast(datetime | None, args.fast_from), cast(datetime | None, args.fast_until))
+        except conf.Unusable as error:
+            sys.exit(f"codex_pacer: {error}")
         print(f"rebuilt {len(state['buckets'])} hours from {len(state['files'])} recent rollouts")
         return
     try:

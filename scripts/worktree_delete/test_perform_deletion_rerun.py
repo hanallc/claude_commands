@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from scripts.agents import remote as staff_remote
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
 from scripts.production.test_production_doc import enrolled_document
@@ -274,6 +275,7 @@ class ProtectedDeletionTests(unittest.TestCase):
         config = self.root / "machines"
         config.mkdir()
         _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/machines.conf", config / "machines.conf")
+        _ = write_config_fixture(config / "user_zone.conf")
         binaries = self.root / "bin"
         binaries.mkdir()
         self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(config),

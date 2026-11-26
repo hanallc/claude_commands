@@ -16,6 +16,7 @@ from typing import cast, override
 
 
 from scripts.lib.process_group import send_process_group
+from scripts.lint.memory_test_support import write_config_fixture
 SCRIPT = Path(__file__).with_name("screen_record.py")
 REAL_TIMEOUT = shutil.which("timeout")
 STUB_BODY = r'''
@@ -84,6 +85,7 @@ elif name == "timeout":
 class ScreenRecordTests(unittest.TestCase):
     root: Path = Path()
     clips: Path = Path()
+    config: Path = Path()
     stubs: Path = Path()
     settings: dict[str, object] = {}
     environment: dict[str, str] = {}
@@ -93,6 +95,9 @@ class ScreenRecordTests(unittest.TestCase):
         self.assertIsNotNone(REAL_TIMEOUT)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.clips = self.root / "clips"
+        self.config = self.root / "config/screen_record.conf"
+        _ = write_config_fixture(self.config, "# whole: 1..\nrecording.max_bytes=500000000\n"
+                                 + "# whole: 1..\nretention.max_directory_bytes=2147483648\n")
         self.stubs = self.root / "stubs"
         self.stubs.mkdir()
         for name in ("xprop", "xwininfo", "timeout", "ffmpeg"):
@@ -106,6 +111,7 @@ class ScreenRecordTests(unittest.TestCase):
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
+            "CONF_DIR": str(self.config.parent),
             "SCREEN_RECORD_DIR": str(self.clips),
             "SCREEN_RECORD_TEST_ROOT": str(self.root),
             "DISPLAY": ":99",
@@ -438,12 +444,32 @@ xwininfo: Window id: 0x50d (the root window) (has no name)
         self.assertEqual(list(self.clips.glob("*.mp4")), [])
 
     def test_file_cap_keeps_clip_and_reports_limit(self) -> None:
-        self.settings["file_size"] = 500_000_001
-        result = self.run_script("--window", "debug", "--seconds", "2")
-        self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertEqual(len(result.stdout.splitlines()), 1)
-        self.assertEqual(Path(result.stdout.strip()).stat().st_size, 500_000_001)
-        self.assertIn("500 MB file cap", result.stderr)
+        for cap, label in ((500_000_000, "500 MB"), (2_000_000, "2 MB")):
+            with self.subTest(cap=cap):
+                _ = write_config_fixture(self.config, f"recording.max_bytes={cap}\n")
+                self.settings["file_size"] = cap + 1
+                result = self.run_script("--window", "debug", "--seconds", "2")
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertEqual(len(result.stdout.splitlines()), 1)
+                self.assertEqual(Path(result.stdout.strip()).stat().st_size, cap + 1)
+                self.assertIn(f"{label} file cap", result.stderr)
+                ffmpeg = self.calls_for("ffmpeg")[-1]
+                self.assertEqual(ffmpeg[ffmpeg.index("-fs") + 1], str(cap))
+
+    def test_unusable_size_limit_preserves_existing_clips_and_refuses_to_record(self) -> None:
+        old = self.make_clip("old.mp4", 100, 8)
+        for key in ("recording.max_bytes", "retention.max_directory_bytes"):
+            with self.subTest(key=key):
+                _ = write_config_fixture(self.config, f"{key}=0\n")
+                result = self.run_script("--window", "debug", "--seconds", "2")
+                _ = write_config_fixture(self.config, "recording.max_bytes=500000000\n"
+                                         + "retention.max_directory_bytes=2147483648\n")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(key, result.stderr)
+                self.assertIn("no usable committed value", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(list(self.clips.glob("*.mp4")), [old])
+                self.assertEqual(self.calls_for("ffmpeg"), [])
 
     def test_outer_timeout_deletes_partial_clip(self) -> None:
         self.settings.update({"hang": True, "short": True})
@@ -479,15 +505,17 @@ xwininfo: Window id: 0x50d (the root window) (has no name)
         self.assertIn("1 older than 7 days", result.stderr)
 
     def test_prunes_oldest_clips_until_under_two_gib(self) -> None:
-        clips = [self.make_clip(f"age-{age}.mp4", 700 * 1024 * 1024, age) for age in (4, 3, 2, 1)]
-        result = self.run_script("--window", "debug", "--seconds", "2")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(clips[0].exists())
-        self.assertFalse(clips[1].exists())
-        self.assertTrue(clips[2].exists())
-        self.assertTrue(clips[3].exists())
-        self.assertTrue(Path(result.stdout.strip()).exists())
-        self.assertIn("0 older than 7 days, 2 to bring the directory under 2 GiB", result.stderr)
+        for gib, removed in ((2, 2), (1, 3)):
+            with self.subTest(gib=gib):
+                self.clips = self.root / f"clips-{gib}"
+                self.environment["SCREEN_RECORD_DIR"] = str(self.clips)
+                _ = write_config_fixture(self.config, f"retention.max_directory_bytes={gib * 1024**3}\n")
+                clips = [self.make_clip(f"age-{age}.mp4", 700 * 1024 * 1024, age) for age in (4, 3, 2, 1)]
+                result = self.run_script("--window", "debug", "--seconds", "2")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual([clip.exists() for clip in clips], [False] * removed + [True] * (4 - removed))
+                self.assertTrue(Path(result.stdout.strip()).exists())
+                self.assertIn(f"0 older than 7 days, {removed} to bring the directory under {gib} GiB", result.stderr)
 
     def test_age_prune_precedes_size_prune(self) -> None:
         old = self.make_clip("old.mp4", 1536 * 1024 * 1024, 8)

@@ -78,9 +78,6 @@ class MeasuredDiskSnapshot(TypedDict):
     outside_build_cache_totals: list[OutsideBuildCacheTotal]
 
 
-MIN_OUTSIDE_DIRECTORY_BYTES = 1 << 30
-
-
 FOLDERS: list[tuple[str, str]] = [
     ("~/rust", "~/rust"),
     ("~/.local/state", "~/.local/state"),
@@ -189,6 +186,7 @@ def previous_outside_measurement(snapshot: DiskSnapshot | None) -> PreviousOutsi
 def outside_directories(
     folders: list[tuple[str, str]], previous: PreviousOutsideMeasurement,
 ) -> tuple[str | None, list[OutsideBuildCacheDirectory], list[OutsideBuildCacheTotal]]:
+    min_bytes = conf.read("buildlog").whole("disk.min_outside_directory_bytes")
     earlier = previous.measured_at if isinstance(previous, EarlierOutsideMeasurement) else None
     old_sizes = previous.directory_bytes if isinstance(previous, EarlierOutsideMeasurement) else {}
     old_child_sizes = previous.child_directory_bytes if isinstance(previous, EarlierOutsideMeasurement) else {}
@@ -215,7 +213,7 @@ def outside_directories(
             "child_bytes": children_by_parent.get(path, {}),
         }
         for path, size in sorted(sizes.items())
-        if depths[path] in (1, 2) and size >= MIN_OUTSIDE_DIRECTORY_BYTES
+        if depths[path] in (1, 2) and size >= min_bytes
     ]
     for row in rows:
         children = row.get("child_bytes", {})

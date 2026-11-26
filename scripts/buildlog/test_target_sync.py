@@ -21,7 +21,7 @@ from scripts.buildlog import store
 from scripts.buildlog import sync
 from scripts.buildlog import vault_pull
 from scripts.buildlog.test_index import point_root_at
-from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE
+from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE, write_config_fixture
 
 
 class TargetSyncTests(unittest.TestCase):
@@ -39,6 +39,7 @@ class TargetSyncTests(unittest.TestCase):
         self.commands = []
         self.unavailable = set()
         self.failed_pushes = set()
+        _ = write_config_fixture(temporary / "user_zone.conf")
         for name in ("mac", "spare"):
             _ = (temporary / f"{name}.conf").write_text(f"host=fake-{name}\nci_repo=\n")
         _ = self.registry.write_text(

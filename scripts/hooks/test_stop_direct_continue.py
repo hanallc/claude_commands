@@ -22,6 +22,7 @@ from scripts.production import staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 HOOK = Path(__file__).with_name("stop-direct-continue.py")
@@ -143,6 +144,8 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
         }), encoding="utf-8")
         config = root / "models.conf"
         _ = write_registry(config, {'claude.context': {'default': '200k'}}, replace_sections=('claude.context',))
+        _ = write_config_fixture(root / "context_usage.conf", "transcript.tail_bytes=524288\n")
+        _ = write_config_fixture(root / "stall_watch.conf")
         from scripts.lib.atomic_file import write_text_atomic
 
         row = staff.StaffRow(staff.StaffId(SESSION), "showrunner", "director", staff.StaffRoot(),
@@ -155,7 +158,7 @@ def director_stop_fixture() -> Generator[DirectorStopFixture]:
             "UNIT_HISTORY_DIR": str(history.parent), "UNIT_SYNC_WRITES": "0",
             "SCRATCH_ROOT": str(root / "scratch"),
             "CLAUDE_PROBE_SESSION": "0", "MODELS_CONFIG_FILE": str(config),
-            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k", "STAFF_FILE": str(root / "staff.json"),
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200k", "STAFF_FILE": str(root / "staff.json"), "CONF_DIR": str(root),
         }
         fixture = DirectorStopFixture(root, run, root / "staff.json", root / "transcript.jsonl", environment)
         fixture.write_usage(160_000)

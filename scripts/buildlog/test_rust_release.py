@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -21,6 +22,7 @@ from scripts.buildlog import rust_release
 from scripts.lib import build_folders, cargo_output, scratch
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.build_copies_test_support import private_copy_config
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush, render, user_send_argv
 from scripts.notify.user_action import ActionRequired
@@ -100,9 +102,9 @@ class RustReleaseTests(unittest.TestCase):
         self.root = Path(temporary) / "buildlog"
         self.scratch = Path(temporary) / "scratch"
         self.scratch.mkdir()
-        self.config = Path(temporary) / "lint.conf"
-        _ = self.config.write_text("sweep_free_floor_gib = 500\n")
-        _ = self.enterContext(mock.patch.object(rust_release, "LINT_CONFIG", self.config))
+        self.config = Path(private.environment["CONF_DIR"]) / "lint.conf"
+        _ = write_config_fixture(self.config, "# range: 0..\nsweep_free_floor_gib=500\n"
+                                 + "sweep_free_floor_gib.natedev=500\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TMPDIR": str(self.scratch)})))
         point_root_at(self, self.root)
         self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.scratch)}))
@@ -278,11 +280,9 @@ class RustReleaseTests(unittest.TestCase):
                 self.assertEqual(push.body, "")
 
     def test_release_send_wait_includes_the_configured_review_limit(self) -> None:
-        config = self.scratch / "notify.conf"
-        _ = config.write_text("review_timeout_seconds=90\n")
+        _ = write_config_fixture(self.config.with_name("notify.conf"), "review_timeout_seconds=90\n")
         done = subprocess.CompletedProcess(["send.py"], 0, "SENT: to the user", "")
-        with (mock.patch.object(review, "NOTIFY_CONFIG", config),
-              mock.patch.object(subprocess, "run", return_value=done) as run):
+        with mock.patch.object(subprocess, "run", return_value=done) as run:
             self.assertTrue(rust_release.send_release_text(render("rust.passed", version="1.100.0", pin="1.99.0")))
             self.assertEqual(run.call_args.kwargs["timeout"], send_budget.user_seconds(review.user_send_seconds()))
 
@@ -352,6 +352,15 @@ class RustReleaseTests(unittest.TestCase):
         assert state is not None
         assert state["trial"]["status"] == "waiting"
         self.assertEqual("513 GiB free, needs 550", state["trial"]["reason"])
+
+    def test_host_floor_applies_only_to_its_host(self) -> None:
+        config = self.scratch / "host-config"
+        _ = write_config_fixture(config / "lint.conf", "# range: 0..\nsweep_free_floor_gib.fixture=500\n")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config)}):
+            for host, reason in (("fixture.example", "49 GiB free, needs 550"),
+                                 ("another-host", "49 GiB free, needs 50")):
+                with self.subTest(host=host), mock.patch.object(socket, "gethostname", return_value=host):
+                    self.assertEqual(rust_release.waiting_reason(lambda: False, lambda: False, lambda: 49), reason)
 
     def test_before_quiet_hours_waits_and_sends_no_text(self) -> None:
         texts: list[tuple[str, str]] = []
