@@ -817,19 +817,30 @@ If a named local document cannot be read, Send reports the reason and leaves the
 Send checks native ID allocation and reads the folder registry before it saves a request binding or an image.
 The page owner dialog lists the evidence under **Sent with your words**.
 The server starts a screenshot when the dialog opens with **Include a screenshot** selected.
-The screenshot shows the page as the user sees it, with the window under New item open.
-`window.pageCapturePlace()` adds `console-window=NAME` to the address for the top open window.
-NAME is the `data-window-place` value or the `href` of the control that opened the window.
-When the page loads, the frame removes the parameter from the address and clicks that control again.
-A link that the frame clicks again does not move the page.
-A Review or List row that is open keeps its own place in the address (`item=`).
+The browser copies the live document before it opens New item.
+The copy keeps open rows, open windows, loaded text, form values, canvas pixels, scroll positions, and the focus ring.
+The copy omits page scripts and the New item window.
+The server renders the copy in Firefox at the same viewport size and theme.
+The console address supplies the base for relative asset paths.
+The server restores scroll positions and focus after layout.
+The browser compresses the copy with gzip.
+The screenshot uses a maximum of 5 MiB of compressed data and 32 MiB of decompressed HTML.
+If the snapshot exceeds either limit, Send uses page data and visible text.
+The draft keeps one copy of the snapshot while editing or sending.
+Closing the draft or confirming a filing releases the browser snapshot and its page context.
+If a filing leaves edits in the dialog, the next draft captures fresh page data and a fresh snapshot.
+Closing the draft aborts the preview upload and polling. The browser asks the server to discard the unfiled capture by key.
+Expiry removes an unfiled capture if the discard request reaches the server before it reserves the key.
+A retry after closing uses the saved capture key and viewport.
 The dialog keeps **Send** available while it takes the screenshot.
 Send uses page data if the preview is still pending.
 Send saves the capture intent with the native item and links the List draft to it.
 The capture key belongs to the browser draft, even when The List saves a different request ID.
-The server recreates a missing capture lookup from the native item after a restart.
+The private capture store retains the snapshot until Firefox finishes or the capture expires.
+After a restart, it resumes a pending snapshot from that store.
+If the screenshot is already attached, the server can restore a missing lookup from the native item.
 The item retains its page data if the screenshot is unavailable.
-An invalid capture object, address, or viewport makes the screenshot unavailable.
+An invalid snapshot, source address, or viewport makes the screenshot unavailable.
 An address for a different page also makes the screenshot unavailable.
 Send rejects an invalid capture key or a key that belongs to another draft or item.
 The server attaches the screenshot when the capture finishes, even if you leave the page.
@@ -1366,10 +1377,17 @@ The command sends the assignee ID so the server can find the producer and unit.
 For a List window Send, the server uses the recipient's producer.
 Send reads the producer map from disk without Git recovery.
 If the server cannot read a usable map or find a producer, it files the Review item and sends the notice.
-The same path applies if the producer retires before the List write.
+The same path applies if the producer retires, or if the readable staff record has no row for the producer.
 The server logs the reason it skipped the List row.
-The command saves its draft ID and recipient before the POST.
-While the result is uncertain, a retry sends the saved ID and recipient before any routing checks for a new filing.
+The window keeps the dialog open and names the saved Review item if it could not file a List row.
+The command reports the same result.
+The command saves its draft ID, recipient ID, and assignee ID before the POST.
+A retry of the same command uses those saved IDs even if the assignee name changes.
+The saved assignee ID can recover a draft after removal of the staff row.
+A legacy draft matches the same request by the typed reference, normalized reference, or resolved staff ID.
+The command refuses a matching legacy draft if its filename cannot prove the assignee ID.
+The command ignores other legacy drafts.
+The server resolves the assignee by ID if the first request did not file.
 The command clears the draft after success or a confirmed refusal before filing.
 The result names the type and assignee.
 It includes the List number if the server filed a row.
@@ -1508,6 +1526,7 @@ Old records without the reviews field load with no links.
 Each List record stores a `producer`: the fixed staff ID of a staff row with the producer role.
 `the_list.py add` and `update` take `--producer <name or staff id>`.
 The option refuses a name or ID that does not resolve to exactly one current producer row.
+New assignments, batch creation, and reopen require a current producer staff row.
 Morty's adds without `--producer` assign the item to morty.
 Another producer's adds without `--producer` assign the item to the caller.
 That producer can name only itself in `--producer`.
@@ -2691,6 +2710,8 @@ The user receives no delivery alert.
 At startup, the server delivers pending records with the same retry and alert rules.
 New item saves a first-message marker before it writes the native record.
 For a List Send, the server saves the List route before it writes the native record.
+The route stores the unit ID. The List write reads the current unit name from the staff record.
+Pending routes with only a unit name retain the name saved with the route.
 The server holds the recipient locks while it reserves a List number and saves the linked row.
 It releases the recipient locks before it takes the delivery lock.
 Recovery reuses the reserved number if the process stops during the List write or before the notice claim.

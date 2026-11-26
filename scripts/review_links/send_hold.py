@@ -12,16 +12,17 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import re
 import secrets
 import sys
 import threading
 import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -40,6 +41,8 @@ RESULT_WAIT_SECONDS = 25.0
 # A handler that runs longer than this gives the "may have left" result.
 REPLAY_TIMEOUT_SECONDS = 300.0
 MAY_HAVE_LEFT = "The send may have left. Check before you send again."
+STALE_NEW_ITEM_TOKEN = "The New item token expired. Try Send again."
+_JSON_WHITESPACE = re.compile(r"[ \t\r\n]*")
 
 Replay = Callable[[str, Mapping[str, str], bytes], "HeldResponse"]
 
@@ -50,6 +53,7 @@ class PendingFile(TypedDict):
     headers: dict[str, str]
     body: str
     due: float
+    new_item_authorized: NotRequired[Literal[True]]
 
 
 class ReleasedFile(TypedDict):
@@ -70,7 +74,13 @@ class ClosingFile(TypedDict):
     closed_at: float
 
 
-HoldFile = PendingFile | ReleasedFile | UndoneFile | ClosingFile
+class AwaitingNewItemTokenFile(TypedDict):
+    state: Literal["awaiting-new-item-token"]
+    request: PendingFile
+    refused_at: float
+
+
+HoldFile = PendingFile | ReleasedFile | UndoneFile | ClosingFile | AwaitingNewItemTokenFile
 
 
 class BadFile(Enum):
@@ -79,9 +89,10 @@ class BadFile(Enum):
 
 
 class HoldHeader(Enum):
-    """The X-Send-Hold answer header: the send waits for Undo, or its result is not ready."""
+    """The X-Send-Hold header reports the hold state to the browser."""
     HELD = "held"
     PENDING = "pending"
+    RETRY = "retry"
 
 
 class HeldFields(TypedDict):
@@ -93,6 +104,85 @@ class HoldsStopped(Exception):
     """The server restarts, so it takes no new hold."""
 
 
+class NoNewItemAuthorization(Enum):
+    ABSENT = "absent"
+
+
+@dataclass(frozen=True)
+class AuthorizedNewItem:
+    """A New item request with the current form token."""
+
+    token: str = field(repr=False)
+    request: dict[str, object] = field(repr=False)
+
+
+def _json_object(body: bytes) -> dict[str, object] | None:
+    try:
+        fields = cast(object, json.loads(body))
+    except (ValueError, RecursionError):
+        return None
+    return cast(dict[str, object], fields) if isinstance(fields, dict) else None
+
+
+def _new_item_request(fields: dict[str, object]) -> dict[str, object]:
+    """Use the request fields that remain after the dialog releases its screenshot."""
+    request = {key: value for key, value in fields.items() if key != "token"}
+    capture = request.get("defer_capture")
+    if isinstance(capture, dict):
+        request["defer_capture"] = {key: value for key, value in cast(dict[str, object], capture).items()
+                                    if key != "document_gzip"}
+    return request
+
+
+def authorize_new_item(body: bytes, valid_token: Callable[[object], bool]) -> AuthorizedNewItem | NoNewItemAuthorization:
+    """Verify the form token before the server saves a New item hold."""
+    fields = _json_object(body)
+    if fields is not None:
+        token = fields.get("token")
+        if (isinstance(token, str) and isinstance(fields.get("request_id"), str)
+                and "page_capture" not in fields and "discard_capture" not in fields and valid_token(token)):
+            return AuthorizedNewItem(token, _new_item_request(fields))
+    return NoNewItemAuthorization.ABSENT
+
+
+def _skip_json_whitespace(source: str, offset: int) -> int:
+    gap = _JSON_WHITESPACE.match(source, offset)
+    assert gap is not None
+    return gap.end()
+
+
+def _renew_new_item_token(body: bytes, token: str) -> bytes:
+    """Replace the top-level token and preserve the rest of the original JSON."""
+    decoder = json.JSONDecoder()
+    try:
+        source = body.decode("utf-8")
+        offset = _skip_json_whitespace(source, 0)
+        if source[offset] != "{":
+            return body
+        offset = _skip_json_whitespace(source, offset + 1)
+        start, end = 0, 0
+        while source[offset] != "}":
+            key, key_end = cast(tuple[object, int], decoder.raw_decode(source, offset))
+            colon = _skip_json_whitespace(source, key_end)
+            if source[colon] != ":":
+                return body
+            value_start = _skip_json_whitespace(source, colon + 1)
+            value, value_end = cast(tuple[object, int], decoder.raw_decode(source, value_start))
+            if key == "token":
+                start, end = (value_start, value_end) if isinstance(value, str) else (0, 0)
+            offset = _skip_json_whitespace(source, value_end)
+            if source[offset] != ",":
+                break
+            offset = _skip_json_whitespace(source, offset + 1)
+        if start and source[offset] == "}" and _skip_json_whitespace(source, offset + 1) == len(source):
+            replacement = json.dumps(token)
+            if source[start:end] != replacement:
+                return (source[:start] + replacement + source[end:]).encode("utf-8")
+    except (IndexError, ValueError, RecursionError):
+        pass
+    return body
+
+
 @dataclass(frozen=True)
 class HeldResponse:
     status: int
@@ -100,10 +190,19 @@ class HeldResponse:
     body: bytes
 
 
+@dataclass(frozen=True)
+class NewItemReplay:
+    """The New item endpoint and the current token for an authorized replay."""
+
+    path: str
+    token: Callable[[], str]
+
+
 class HoldState(Enum):
     PENDING = "pending"
     UNDONE = "undone"
     MISSING = "missing"
+    AWAITING_NEW_ITEM_TOKEN = "awaiting-new-item-token"
 
 
 class UndoResult(Enum):
@@ -137,9 +236,10 @@ class Holds:
     that the next server releases.
     """
 
-    def __init__(self, folder: Path, replay: Replay) -> None:
+    def __init__(self, folder: Path, replay: Replay, *, new_item: NewItemReplay | None = None) -> None:
         self._folder: Path = folder
         self._replay: Replay = replay
+        self._new_item: NewItemReplay | None = new_item
         self._lock: threading.Condition = threading.Condition()
         self._timers: dict[str, threading.Timer] = {}
         self._releasing: set[str] = set()
@@ -160,7 +260,7 @@ class Holds:
         """Read one hold file, or name it on stderr when it is not a hold."""
         try:
             saved = cast(HoldFile, json.loads(path.read_text(encoding="utf-8")))
-            if saved["state"] in ("pending", "released", "undone", "closing"):
+            if saved["state"] in ("pending", "released", "undone", "closing", "awaiting-new-item-token"):
                 return saved
         except (OSError, ValueError, KeyError, TypeError) as error:
             print(f"review-links send hold {path.name}: {error}", file=sys.stderr)
@@ -197,7 +297,8 @@ class Holds:
         return self._saved(path) if path.exists() else BadFile.UNREADABLE
 
     def hold(self, path: str, headers: Mapping[str, str], body: bytes, seconds: float, *,
-             request_id: str = "") -> HeldFields:
+             request_id: str = "", authorization: AuthorizedNewItem | NoNewItemAuthorization =
+             NoNewItemAuthorization.ABSENT) -> HeldFields:
         """Save a send or return its existing hold with the remaining Undo time."""
         hold_id = request_id or new_hold_id()
         if not valid_hold_id(hold_id):
@@ -206,11 +307,15 @@ class Holds:
             "state": "pending", "path": path, "body": base64.b64encode(body).decode("ascii"),
             "headers": {name: value for name, value in headers.items() if name.lower() in REPLAY_HEADERS},
             "due": time.time() + seconds + RELEASE_GRACE_SECONDS}
+        if isinstance(authorization, AuthorizedNewItem):
+            saved["new_item_authorized"] = True
         with self._lock:
             if hold_id in self._releasing or hold_id in self._failed:
                 return {"hold": hold_id, "seconds": 0}
             timer = self._timers.get(hold_id)
             existing = self._existing(hold_id)
+            if existing is not BadFile.UNREADABLE and isinstance(authorization, AuthorizedNewItem):
+                self._retry_new_item_hold(hold_id, path, existing, authorization)
             if timer is not None:
                 remaining = (max(0.0, existing["due"] - RELEASE_GRACE_SECONDS - time.time())
                              if existing is not BadFile.UNREADABLE and existing["state"] == "pending"
@@ -224,6 +329,35 @@ class Holds:
             self._write(hold_id, saved)
             self._schedule(hold_id, saved["due"])
         return {"hold": hold_id, "seconds": seconds}
+
+    def _retry_new_item_hold(self, hold_id: str, path: str, saved: HoldFile,
+                             authorization: AuthorizedNewItem) -> None:
+        match saved["state"]:
+            case "pending":
+                request = saved
+            case "awaiting-new-item-token":
+                request = saved["request"]
+            case _:
+                return
+        if request["path"] != path:
+            return
+        body = base64.b64decode(request["body"])
+        fields = _json_object(body)
+        if fields is None or not isinstance(fields.get("token"), str):
+            return
+        if saved["state"] == "pending" and request.get("new_item_authorized") and fields["token"] == authorization.token:
+            return
+        if _new_item_request(fields) != authorization.request:
+            return
+        refreshed = _renew_new_item_token(body, authorization.token)
+        pending: PendingFile = {**request, "body": base64.b64encode(refreshed).decode("ascii"),
+                                "new_item_authorized": True}
+        if saved["state"] == "awaiting-new-item-token":
+            pending["due"] = time.time()
+            self._write(hold_id, pending)
+            self._schedule(hold_id, pending["due"])
+        elif pending != request:
+            self._write(hold_id, pending)
 
     def _schedule(self, hold_id: str, due: float) -> None:
         timer = threading.Timer(max(0.0, due - time.time()), self._release, (hold_id,))
@@ -290,9 +424,13 @@ class Holds:
                 self._lock.notify_all()
 
     def _send(self, hold_id: str) -> None:
+        new_item = self._new_item
         try:
             saved = cast(PendingFile, json.loads(self._file(hold_id).read_text(encoding="utf-8")))
             body = base64.b64decode(saved["body"])
+            # The hold keeps the authorization if the server restarts before the Retry arrives.
+            if new_item is not None and saved["path"] == new_item.path and saved.get("new_item_authorized"):
+                body = _renew_new_item_token(body, new_item.token())
             # A server that stops during the replay finds this result, and never sends the request again.
             self._write(hold_id, released_file(failed(MAY_HAVE_LEFT)))
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -309,12 +447,20 @@ class Holds:
             response = failed(MAY_HAVE_LEFT)
         except (OSError, http.client.HTTPException, ValueError) as error:
             response = failed(f"The held send failed: {error}")
+        result: HoldFile
+        refusal = (_json_object(response.body)
+                   if new_item is not None and saved["path"] == new_item.path and response.status == 403 else None)
+        if refusal is not None and refusal.get("code") == "stale_token":
+            result = {"state": "awaiting-new-item-token", "request": saved, "refused_at": time.time()}
+        else:
+            result = released_file(response)
         try:
-            self._write(hold_id, released_file(response))
+            self._write(hold_id, result)
         except OSError as error:
             print(f"review-links send hold {hold_id}: {error}", file=sys.stderr)
             with self._lock:
-                self._failed[hold_id] = response
+                self._failed[hold_id] = (failed("Could not keep the held Send for Retry.")
+                                         if result["state"] == "awaiting-new-item-token" else response)
 
     def result(self, hold_id: str, *, wait: float = RESULT_WAIT_SECONDS) -> HeldResponse | HoldState:
         """Return the response of a released send, waiting a short time for a pending one.
@@ -344,6 +490,8 @@ class Holds:
                 return HoldState.UNDONE
             case "closing":
                 return HoldState.MISSING
+            case "awaiting-new-item-token":
+                return HoldState.AWAITING_NEW_ITEM_TOKEN
             case "released":
                 return HeldResponse(saved["status"], saved["content_type"], base64.b64decode(saved["body"]))
 
@@ -383,7 +531,8 @@ class Holds:
                 path.unlink(missing_ok=True)
             elif saved["state"] == "undone" and saved["undone_at"] < oldest:
                 path.unlink(missing_ok=True)
-            elif saved["state"] == "closing" and saved["closed_at"] < oldest:
+            elif ((saved["state"] == "closing" and saved["closed_at"] < oldest)
+                  or (saved["state"] == "awaiting-new-item-token" and saved["refused_at"] < oldest)):
                 with self._lock:
                     current = self._existing(path.stem)
                     if current == saved:

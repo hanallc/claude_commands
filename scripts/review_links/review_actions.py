@@ -306,12 +306,13 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
     key = review_items.submission_review_key(saved)
     evidence = REVIEW_PATH + "?show=all#" + urlencode({"show": "open", "jump": key})
     words = saved.words
+    unit = the_list.ReviewListUnit(route["unit_id"]) if "unit_id" in route else route["unit"]
     try:
         _ = the_list.add_review_item(route["keeper"], review_submissions.submission_title(words), owner=route["owner"],
-                                     producer=route["producer"], unit=route["unit"], words=words, evidence=evidence,
+                                     producer=route["producer"], unit=unit, words=words, evidence=evidence,
                                      review_key=key, source=route["source"],
                                      reservation=review_submissions.list_filing_reservation(saved))
-    except the_list.RetiredListProducer as error:
+    except the_list.UnavailableListProducer as error:
         review_submissions.skip_list_filing(saved, str(error))
 
 

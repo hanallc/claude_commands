@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
@@ -1187,12 +1187,39 @@ def _stage_initial_delivery(folder: Path, address: SubmissionAddress,
         atomic_file.sync_folder(folder)
 
 
-class ListFilingRoute(TypedDict):
+class ListFilingFields(TypedDict):
     keeper: staff.StaffId
     owner: staff.StaffId
     producer: staff.StaffId
-    unit: str
     source: str
+
+
+class ListFilingWithFixedUnit(ListFilingFields):
+    unit_kind: Literal["fixed-id"]
+    unit: Literal[""]
+    unit_id: staff.StaffId
+
+
+class LegacyListUnitName(str):
+    """The nonempty unit name from a legacy List filing plan."""
+
+    def __new__(cls, name: str) -> LegacyListUnitName:
+        if not name:
+            raise ValueError("A legacy List unit name must not be empty.")
+        return super().__new__(cls, name)
+
+
+class ListFilingWithLegacyUnit(ListFilingFields):
+    unit_kind: Literal["legacy-name"]
+    unit: LegacyListUnitName
+
+
+class ListFilingWithoutUnit(ListFilingFields):
+    unit_kind: Literal["no-unit"]
+    unit: Literal[""]
+
+
+type ListFilingRoute = ListFilingWithFixedUnit | ListFilingWithLegacyUnit | ListFilingWithoutUnit
 
 
 @dataclass(frozen=True)
@@ -1253,9 +1280,10 @@ def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipi
     producer = _list_filing_producer(member, members)
     if isinstance(producer, ListFilingUnavailable):
         return producer
-    unit = member.name if member.kind == "unit" else ""
-    return ListFilingRoute(keeper=keeper.id, owner=recipient.id, producer=producer.id,
-                           unit=unit, source=source)
+    fields = ListFilingFields(keeper=keeper.id, owner=recipient.id, producer=producer.id, source=source)
+    if member.kind == "unit":
+        return ListFilingWithFixedUnit(**fields, unit_kind="fixed-id", unit="", unit_id=member.id)
+    return ListFilingWithoutUnit(**fields, unit_kind="no-unit", unit="")
 
 
 def assigned_member(assignment: new_item_dialog.Assignment, recipient: staff.StaffRow,
@@ -1276,8 +1304,10 @@ def _plan_producer_filing(member: staff.StaffRow, recipient: staff.StaffRow, req
         return ListFilingUnavailable("The List has no active producer.")
     source = ("nate via /new_item" if isinstance(request.notice, new_item_dialog.SubmissionNotice)
               and request.notice.from_command else "nate via New item")
-    return ListFilingRoute(keeper=keeper.id, owner=member.id, producer=recipient.id,
-                           unit=member.name if member.kind == "unit" else "", source=source)
+    fields = ListFilingFields(keeper=keeper.id, owner=member.id, producer=recipient.id, source=source)
+    if member.kind == "unit":
+        return ListFilingWithFixedUnit(**fields, unit_kind="fixed-id", unit="", unit_id=member.id)
+    return ListFilingWithoutUnit(**fields, unit_kind="no-unit", unit="")
 
 
 @dataclass(frozen=True)
@@ -1306,8 +1336,16 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
     if not (isinstance(keeper, str) and isinstance(owner, str) and isinstance(producer, str)
             and isinstance(unit, str) and isinstance(source, str)):
         raise OSError(f"Invalid List route for request {saved.request_id}.")
-    return ListFilingRoute(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner), producer=staff.StaffId(producer),
-                           unit=unit, source=source)
+    route = ListFilingFields(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner),
+                             producer=staff.StaffId(producer), source=source)
+    if "unit_id" in values:
+        unit_id = values["unit_id"]
+        if unit or not isinstance(unit_id, str) or not unit_id:
+            raise OSError(f"Invalid List unit reference for request {saved.request_id}.")
+        return ListFilingWithFixedUnit(**route, unit_kind="fixed-id", unit="", unit_id=staff.StaffId(unit_id))
+    if unit:
+        return ListFilingWithLegacyUnit(**route, unit_kind="legacy-name", unit=LegacyListUnitName(unit))
+    return ListFilingWithoutUnit(**route, unit_kind="no-unit", unit="")
 
 
 def list_filing_reservation(saved: SavedSubmission) -> Path:
@@ -2534,7 +2572,8 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                     _write_draft_index(folder, ClaimedDraft(saved))
                 _write_location(pending_file, saved)
                 if isinstance(route, dict):
-                    _write_request_file(folder / "list-filing.json", route)
+                    fields = {key: value for key, value in route.items() if key != "unit_kind"}
+                    _write_request_file(folder / "list-filing.json", fields)
                 elif isinstance(route, ListFilingUnavailable):
                     _write_request_file(folder / "list-filing.json", {"unavailable": route.reason})
                 if isinstance(list_preview, RequestedListPreview) and isinstance(screenshot, new_item_dialog.PageScreenshot):

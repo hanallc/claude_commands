@@ -58,8 +58,11 @@ class SavedReadFailed(OSError):
     """The save is on disk, but the item could not be read again."""
 
 
-class RetiredListProducer(ListError):
-    """A retired producer cannot take an open List item."""
+class UnavailableListProducer(ListError):
+    """The producer cannot take a new List assignment."""
+
+
+_NO_CURRENT_PRODUCER_ROW = "The producer has no current producer staff row."
 
 
 class ItemState(StrEnum):
@@ -1968,18 +1971,13 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
         raise store.invalid(identity, error) from None
 
 
-def _require_active_open_producers(items: Sequence[ListItem]) -> None:
-    producers = dict.fromkeys(item.producer for item in items if item.state != ItemState.CLOSED)
-    if not producers:
-        return
-    try:
-        record = staff.authority_snapshot()
-    except staff.StaffAbsent:
-        return
-    for identity in producers:
+def _require_active_producers(producers: Iterable[staff.StaffId], record: staff.StaffSnapshot) -> None:
+    for identity in dict.fromkeys(producers):
         producer = record.by_id(identity)
-        if producer is not None and isinstance(producer.retirement, staff.RetiredProducer):
-            raise RetiredListProducer(f"{producer.name}: retired producer. Choose an active producer.")
+        if producer is None or producer.kind != "producer":
+            raise UnavailableListProducer(f"{identity}: {_NO_CURRENT_PRODUCER_ROW}")
+        if isinstance(producer.retirement, staff.RetiredProducer):
+            raise UnavailableListProducer(f"{producer.name}: retired producer. Choose an active producer.")
 
 
 def _stored_log_line(entry: ItemChange) -> str:
@@ -2163,7 +2161,8 @@ def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
                 raise ListError(f"{item.id}: the item already exists")
             _check_links(item.number, {"blocked_by": item.blocked_by, "related_to": item.related_to},
                          require_related=require_related, read_dependency=read)
-        _require_active_open_producers(items)
+        if items:
+            _require_active_producers((item.producer for item in items), staff.authority_snapshot())
         if pending:
             store.reserve_number(max(pending))
         for item in items:
@@ -2231,7 +2230,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
         _check_series_limit(item.schedule)
         _check_links(item.number, changes, require_related=require_related,
                      read_dependency=lambda number: read_reference(number, scope=assigned_to))
-        _require_active_open_producers((item,))
+        _require_active_producers((item.producer,), staff.authority_snapshot())
         store.reserve_number(chosen)
         if before_save is not None:
             before_save(chosen)
@@ -2276,8 +2275,15 @@ def reserved_review_number(path: Path) -> int | NextNumber:
     return int(value)
 
 
+@dataclass(frozen=True)
+class ReviewListUnit:
+    """Read the current unit name from its fixed staff ID when the row saves."""
+
+    id: staff.StaffId
+
+
 def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, producer: staff.StaffId,
-                    unit: str, words: str, evidence: str, review_key: str, source: str, reservation: Path) -> int:
+                    unit: str | ReviewListUnit, words: str, evidence: str, review_key: str, source: str, reservation: Path) -> int:
     """Reserve a number for this Review filing and publish its linked row under the List lock."""
     store = _store(keeper)
     number = reserved_review_number(reservation)
@@ -2290,10 +2296,14 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
             sync_folder(store.folder())
             return number
         chosen = store.next_number() if isinstance(number, NextNumber) else number
+        members = staff.authority_snapshot()
+        _require_active_producers((producer,), members)
+        if isinstance(unit, ReviewListUnit):
+            row = members.by_id(unit.id)
+            unit = row.name if row is not None and row.kind == "unit" else ""
         item = _new_item(chosen, title, owner, keeper, source,
                          {"producer": producer, "unit": unit, "latest_status": words, "evidence": evidence},
                          reviews=(review_key,))
-        _require_active_open_producers((item,))
         if isinstance(number, NextNumber):
             store.reserve_number(chosen)
             write_text_atomic(reservation, f"{chosen}\n", new_file_mode=0o600)
@@ -2384,8 +2394,8 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             return UnchangedEdit(item)
         changed = replace(changed, log=(*changed.log, *entries))
         _validate(changed)
-        if item.state == ItemState.CLOSED or changed.producer != item.producer:
-            _require_active_open_producers((changed,))
+        if changed.producer != item.producer or item.state == ItemState.CLOSED and changed.state != ItemState.CLOSED:
+            _require_active_producers((changed.producer,), staff.authority_snapshot())
         if isinstance(request, PageRequest):
             changed = _save_page_request(store, keeper, changed, request)
         else:
@@ -4220,7 +4230,7 @@ def notify_producer_assignment(item: ListItem, previous_producer: staff.StaffId,
         try:
             if recipient is None:
                 if role == "producer":
-                    raise ListError("The producer has no current producer staff row.")
+                    raise ListError(_NO_CURRENT_PRODUCER_ROW)
                 if isinstance(reference, UnassignedOwner):
                     raise ListError("the item has no assigned showrunner")
                 raise ListError("the owner has no current showrunner staff row")
