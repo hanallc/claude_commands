@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, NoReturn, cast, override
 from unittest import mock
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 
@@ -916,13 +917,15 @@ class NewItemServerTests(unittest.TestCase):
             review_actions.recover_interrupted_list_reports()
             change_page.recover_review_messages(restarted)
             send.assert_called_once()
-            self.assertIn("Evidence on the List", cast(str, send.call_args.args[2]))
-            self.assertIn("/console/list.html#", cast(str, send.call_args.args[2]))
             native = investigation.load(successor, saved.id)
             destination = native.list_destination
             assert isinstance(destination, investigation.ListDestination)
             self.assertEqual(destination.keeper, keeper.id)
             self.assertEqual([item.number for item in the_list.records(keeper.id)], [destination.number])
+            sent = cast(str, send.call_args.args[2])
+            item_key = quote(f"{keeper.id}/L{destination.number}", safe="")
+            self.assertIn("Evidence on the List", sent)
+            self.assertIn(f"http://console/console/studio.html#item={item_key}", sent.splitlines())
             review_actions.recover_submission_deliveries(status, review_page.PAGE_PATH)
             send.assert_called_once()
 
