@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -364,6 +365,16 @@ for folder in masks:
                     + f"{scope} --go {approval}",
                 ])
 
+        with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refused:
+            _ = cleanup_old_folders.main(("--host-list", "--go"), run_ssh=self.unreachable)
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn("argument --go: expected one argument", errors.getvalue())
+        self.assertEqual((self.home / "old/payload").read_text(), "old content\n")
+        approval = self.approval("--host-list")
+        status, output, error = self.command("--host-list", "--go", approval)
+        self.assertEqual((status, error), (0, ""))
+        self.assertIn(f"removed {str(self.home / 'old')!r}", output)
+
     def test_kept_rows_and_json_have_no_apply_command(self) -> None:
         self.write_settings("~/missing")
         status, output, errors = self.command("--host-list")
@@ -605,8 +616,7 @@ assert not loaded, sorted(loaded)
               mock.patch.object(cleanup, "protected_mounts", return_value=(self.build / "cargo",)) as masks,
               mock.patch.object(shutil, "which", side_effect=fixture_executable),
               mock.patch.object(subprocess, "Popen", return_value=worker) as spawn,
-              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
-                  ("ssh",), 255, "", "fixture unreachable\n")) as ssh,
+              mock.patch.object(subprocess, "run", side_effect=AssertionError("sudo move started SSH")) as ssh,
               mock.patch.object(outgoing, "close"), redirect_stdout(io.StringIO()) as output):
             self.assertEqual(cleanup.run_cli(()), 0)
         checked = cleanup.message_object(cast(object, json.loads(outgoing.getvalue())))
@@ -624,12 +634,7 @@ assert not loaded, sorted(loaded)
         masks.assert_called_once_with(Path(account.pw_dir), self.build)
         environment = cast(dict[str, str], spawn.call_args.kwargs["env"])
         self.assertEqual(environment["HOME"], account.pw_dir)
-        ssh_command = cast(tuple[str, ...], ssh.call_args.args[0])
-        self.assertEqual(ssh_command[:8], command[:8])
-        self.assertEqual(ssh_command[8:11], (sys.executable, "-IB", "-c"))
-        self.assertEqual(ssh_command[-5:], (
-            "ssh", "-o", "BatchMode=yes", "mac", cleanup.REMOTE_COMMAND + " --json"))
-        self.assertEqual(ssh.call_args.kwargs["env"], environment)
+        ssh.assert_not_called()
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
     def test_sudo_list_ends_with_the_apply_command(self) -> None:
@@ -649,13 +654,13 @@ assert not loaded, sorted(loaded)
               mock.patch.object(subprocess, "Popen", return_value=worker),
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(cleanup.run_cli((), run_ssh=self.unreachable), 0)
-        approval = self.list_digest(output.getvalue())
         self.assertIn("would move to disk", output.getvalue())
-        self.assertEqual(output.getvalue().splitlines()[-3:], [
+        self.assertNotIn("Digest:", output.getvalue())
+        self.assertNotIn("mac\t", output.getvalue())
+        self.assertEqual(output.getvalue().splitlines()[-2:], [
             "1 folder, 0.00 GiB, would move from memory to disk.",
-            "To move these folders, run:",
-            'sudo "$(command -v python3)" -IB "$HOME/.claude/scripts/disks/cleanup_old_folders.py"'
-            + f" --go {approval}",
+            'To move these folders, run: sudo "$(command -v python3)" -IB '
+            + '"$HOME/.claude/scripts/disks/cleanup_old_folders.py" --go',
         ])
 
     def test_move_count_line_counts_only_the_moving_folders(self) -> None:
@@ -667,13 +672,245 @@ assert not loaded, sorted(loaded)
                 cleanup.Row(Path("/dev/shm/t-d"), 7 * gib, cleanup.WouldRemove("d")))
         local = cleanup.HostList(cleanup.Machine.NATEDEV, rows)
         with redirect_stdout(io.StringIO()) as output:
-            cleanup.show_apply_command(local, local, "f" * 64, mode=cleanup.CleanupMode.MOVE_GATE_GIT,
-                                       host_list=False)
-        self.assertEqual(output.getvalue().splitlines()[0],
-                         "3 folders, 2.00 GiB (size unknown for 1), would move from memory to disk.")
+            self.assertEqual(cleanup.finish_gate_move(
+                cleanup.parse_arguments(()), local, self.unexpected_move, self.unexpected_confirmation), 0)
+        self.assertIn("3 folders, 2.00 GiB (size unknown for 1), would move from memory to disk.",
+                      output.getvalue().splitlines())
         with redirect_stdout(io.StringIO()) as output:
-            cleanup.show_apply_command(local, local, "f" * 64, mode=cleanup.CleanupMode.STANDARD, host_list=False)
+            cleanup.show_apply_command(local, local, "f" * 64, host_list=False)
         self.assertNotIn("would move from memory to disk", output.getvalue())
+
+    def unexpected_move(self, _rows: tuple[cleanup_old_folders.Row, ...]) -> cleanup_old_folders.GateMoveResult:
+        self.fail("the list started a move")
+
+    def unexpected_confirmation(self, _prompt: str) -> str:
+        self.fail("the list asked for confirmation")
+
+    def sudo_move_command(self, answer: str, *, tty_present: bool = True, is_terminal: bool = True,
+                          before_answer: Callable[[], None] | None = None,
+                          reviewed_sizes: dict[Path, int] | None = None) -> tuple[int, str, str, str, str]:
+        cleanup = cleanup_old_folders
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        local, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        if reviewed_sizes is not None:
+            local = replace(local, rows=tuple(replace(row, size=reviewed_sizes[row.path])
+                                              if row.path in reviewed_sizes else row for row in local.rows))
+        incoming = io.StringIO(json.dumps(cleanup.worker_review(local)) + "\n")
+        outgoing = io.StringIO()
+        uid, gid = os.geteuid(), os.getegid()
+        user = cleanup.SudoCleanupUser(uid, gid, "fixture", self.home, "/fixture/setpriv")
+        child = mock.MagicMock(stdout=incoming, stdin=outgoing)
+        child.configure_mock(**{"wait.return_value": 0})
+        worker = mock.MagicMock()
+        worker.configure_mock(**{"__enter__.return_value": child})
+        keyboard, display = io.StringIO(answer), io.StringIO()
+        requests: list[str] = []
+        write = outgoing.write
+        popen = subprocess.Popen
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        def apply_request(message: str) -> int:
+            self.assertEqual(json.loads(message), {"kind": "apply"})
+            requests.append(message)
+            reports = io.StringIO()
+            with (mock.patch.object(os, "geteuid", return_value=uid),
+                  mock.patch.object(cleanup, "review_local", return_value=(local, bounds)),
+                  mock.patch.object(cleanup, "process_uses", return_value=cleanup.CleanupProcessReview()),
+                  mock.patch.object(cleanup, "check_protected_masks"),
+                  mock.patch.object(subprocess, "Popen", popen)):
+                self.assertEqual(cleanup.serve_masked_cleanup(
+                    cleanup.WorkerChannel(io.StringIO(message), reports), self.build, frozenset(), mode=mode), 0)
+            position = incoming.tell()
+            _ = incoming.write(reports.getvalue().partition("\n")[2])
+            _ = incoming.seek(position)
+            return write(message)
+
+        def open_terminal(path: str, mode: str = "r", **_options: str) -> io.StringIO:
+            self.assertEqual(path, "/dev/tty")
+            if not tty_present:
+                raise OSError(errno.ENXIO, "no controlling terminal")
+            return keyboard if mode == "r" else display
+
+        read = keyboard.readline
+
+        def type_answer() -> str:
+            self.assertEqual(outgoing.getvalue(), "")
+            self.assertIn("Machine\tPlace\tBytes\tResult", stdout.getvalue())
+            if before_answer is not None:
+                before_answer()
+            return read()
+
+        with (mock.patch.dict(os.environ, {"SUDO_UID": str(uid), "SUDO_GID": str(gid)}),
+              mock.patch.object(os, "geteuid", return_value=0),
+              mock.patch.object(cleanup, "sudo_cleanup_user", return_value=user),
+              mock.patch.object(cleanup, "protected_mounts", return_value=()),
+              mock.patch.object(cleanup, "masked_cleanup_command", return_value=("bwrap",)),
+              mock.patch.object(subprocess, "Popen", return_value=worker),
+              mock.patch.object(outgoing, "write", side_effect=apply_request),
+              mock.patch.object(display, "close", return_value=None),
+              mock.patch.object(keyboard, "isatty", return_value=is_terminal),
+              mock.patch.object(display, "isatty", return_value=is_terminal),
+              mock.patch.object(keyboard, "readline", side_effect=type_answer),
+              mock.patch.object(cleanup, "open", side_effect=open_terminal, create=True),
+              mock.patch.object(sys, "stdin", io.StringIO("yes\n")),
+              mock.patch.object(cleanup, "remote_list", side_effect=AssertionError("sudo move started SSH")),
+              redirect_stdout(stdout), redirect_stderr(stderr)):
+            status = cleanup.run_cli(("--go",))
+        return status, stdout.getvalue(), stderr.getvalue(), "".join(requests), display.getvalue()
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_moves_after_one_typed_yes(self) -> None:
+        path = self.gate_checkout_to_move()
+        status, output, errors, request, prompt = self.sudo_move_command("yes\n")
+        self.assertEqual((status, errors), (0, ""), output)
+        self.assertEqual(prompt, "Type yes to move this 1 folder (0.00 GiB) from memory to disk: ")
+        self.assertEqual(request, '{"kind": "apply"}\n')
+        self.assertEqual(output.splitlines()[-1], "Moved 1 folder, 0.0 GiB.")
+        self.assertFalse(path.exists())
+        target = self.build / "claude/resources/shm-moved" / path.name
+        self.assertEqual((target / "payload").read_text(), "old content\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_declines_every_answer_except_yes(self) -> None:
+        path = self.gate_checkout_to_move()
+        for answer in ("no\n", "\n", "", "yes \n", "YES\n"):
+            with self.subTest(answer=answer):
+                status, output, errors, request, prompt = self.sudo_move_command(answer)
+                self.assertEqual((status, errors, request), (0, "", ""))
+                self.assertTrue(prompt.endswith("from memory to disk: "))
+                self.assertEqual(output.splitlines()[-1], "Nothing moved.")
+                self.assertEqual((path / "payload").read_text(), "old content\n")
+                self.assertFalse((self.build / "claude/resources/shm-moved").exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_requires_a_terminal(self) -> None:
+        path = self.gate_checkout_to_move()
+        for tty_present, is_terminal in ((False, True), (True, False)):
+            with self.subTest(tty_present=tty_present):
+                status, output, errors, request, prompt = self.sudo_move_command(
+                    "yes\n", tty_present=tty_present, is_terminal=is_terminal)
+                self.assertEqual((status, request, prompt), (1, "", ""))
+                self.assertIn("would move to disk", output)
+                self.assertEqual(errors,
+                                 "cleanup_old_folders refused: --go needs a terminal for the typed yes. Nothing moved.\n")
+                self.assertEqual((path / "payload").read_text(), "old content\n")
+                self.assertFalse((self.build / "claude/resources/shm-moved").exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_skips_the_prompt_when_there_are_no_moves(self) -> None:
+        self.write_settings("~/missing")
+        status, output, errors, request, prompt = self.sudo_move_command("yes\n", tty_present=False)
+        self.assertEqual((status, errors, request, prompt), (0, "", "", ""))
+        self.assertIn("would move to disk: 0", output)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_counts_a_folder_that_changes_after_review(self) -> None:
+        changed = self.gate_checkout_to_move("t-changed")
+        unchanged = self.gate_checkout_to_move("t-unchanged")
+        new_file = changed / "new-file"
+
+        def change_folder() -> None:
+            _ = new_file.write_text("added after review\n")
+
+        gib = 1 << 30
+        status, output, errors, request, prompt = self.sudo_move_command(
+            "yes\n", before_answer=change_folder, reviewed_sizes={changed: 5 * gib, unchanged: 7 * gib // 4})
+        self.assertEqual((status, errors, request), (0, "", '{"kind": "apply"}\n'), output)
+        self.assertEqual(prompt, "Type yes to move these 2 folders (6.75 GiB) from memory to disk: ")
+        self.assertIn("identity or contents changed since the list was checked", output)
+        self.assertEqual(output.splitlines()[-1], "Moved 1 folder, 1.8 GiB. 1 folder changed and stayed.")
+        target = self.build / "claude/resources/shm-moved"
+        self.assertEqual(new_file.read_text(), "added after review\n")
+        self.assertFalse((target / changed.name).exists())
+        self.assertFalse(unchanged.exists())
+        self.assertEqual((target / unchanged.name / "payload").read_text(), "old content\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_counts_a_copy_failure_before_publication_as_stayed(self) -> None:
+        path = self.gate_checkout_to_move()
+        with mock.patch.object(cleanup_old_folders, "copy_gate_tree", side_effect=OSError(errno.EIO, "copy failed")):
+            status, output, errors, request, _prompt = self.sudo_move_command("yes\n")
+        self.assertEqual((status, errors, request), (0, "", '{"kind": "apply"}\n'))
+        self.assertIn("copy failed", output)
+        self.assertEqual(output.splitlines()[-1], "Moved 0 folders, 0.0 GiB. 1 folder changed and stayed.")
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertFalse((self.build / "claude/resources/shm-moved" / path.name).exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_refuses_a_digest_before_starting_the_worker(self) -> None:
+        cleanup = cleanup_old_folders
+        user = cleanup.SudoCleanupUser(1000, 1000, "fixture", self.home, "/fixture/setpriv")
+        with (mock.patch.object(os, "geteuid", return_value=0),
+              mock.patch.object(cleanup, "sudo_cleanup_user", return_value=user),
+              mock.patch.object(cleanup, "protected_mounts", side_effect=AssertionError("read mounts before refusal")),
+              mock.patch.object(subprocess, "Popen", side_effect=AssertionError("started a worker")),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(cleanup.run_cli(("--go", "a" * 64)), 1)
+        self.assertEqual(errors.getvalue(),
+                         "cleanup_old_folders refused: the move takes no digest; run --go and type yes\n")
+
+    def test_sudo_move_refuses_a_repeated_go_flag(self) -> None:
+        cleanup = cleanup_old_folders
+        with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refused:
+            _ = cleanup.parse_arguments(("--go=x", "--go"), mode=cleanup.CleanupMode.MOVE_GATE_GIT)
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn("argument --go: may only be used once", errors.getvalue())
+
+    def test_standard_cleanup_refuses_a_repeated_go_flag(self) -> None:
+        with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit) as refused:
+            _ = cleanup_old_folders.parse_arguments(("--go", "--go", "a" * 64))
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn("argument --go: expected one argument", errors.getvalue())
+
+    def test_standard_cleanup_uses_the_last_go_digest(self) -> None:
+        first, last = "a" * 64, "b" * 64
+        args = cleanup_old_folders.parse_arguments(("--go", first, "--go", last))
+        self.assertEqual(args.go, last)
+
+    def test_parent_refuses_duplicate_moved_paths_fields(self) -> None:
+        cleanup = cleanup_old_folders
+        line = ('{"kind":"applied","status":0,"moved_paths":["/t-one"],'
+                + '"moved_paths":["/t-two"],"stayed":1}\n')
+        channel = cleanup.WorkerChannel(io.StringIO(line), io.StringIO())
+        with self.assertRaisesRegex(ValueError, "invalid cleanup message: duplicate key"):
+            _ = cleanup.receive_worker_report(channel, "applied")
+
+    def test_sudo_move_result_refuses_unreviewed_or_duplicate_paths_and_worker_sizes(self) -> None:
+        cleanup = cleanup_old_folders
+        gib = 1 << 30
+        small, large = self.gate / "t-small", self.gate / "t-large"
+        moves = (cleanup.Row(small, 2 * gib, cleanup.WouldMove(self.build / small.name, "a")),
+                 cleanup.Row(large, 5 * gib, cleanup.WouldMove(self.build / large.name, "b")))
+        forged: dict[str, object] = {"kind": "applied", "status": 0, "moved": 1, "moved_bytes": 4 * gib, "stayed": 1}
+        with self.assertRaisesRegex(ValueError, "invalid cleanup move result"):
+            _ = cleanup.decode_gate_move_result(forged, moves)
+
+        for paths, stayed in (([str(small), str(small)], 0), ([str(self.gate / "t-other")], 1),
+                              ([2], 1), (str(small), 1)):
+            with self.subTest(paths=paths), self.assertRaises(ValueError):
+                _ = cleanup.decode_gate_move_result(
+                    {"kind": "applied", "status": 0, "moved_paths": paths, "stayed": stayed}, moves)
+
+    def test_worker_refuses_duplicate_keys_in_the_apply_message(self) -> None:
+        cleanup = cleanup_old_folders
+        review = cleanup.HostList(cleanup.Machine.NATEDEV, ())
+        bounds = cleanup.CleanupBounds(self.home, self.build, frozenset(), self.gate)
+        uid, gid = os.geteuid(), os.getegid()
+        for mode in cleanup.CleanupMode:
+            with (self.subTest(mode=mode),
+                  mock.patch.dict(os.environ, {"SUDO_UID": str(uid), "SUDO_GID": str(gid)}),
+                  mock.patch.object(cleanup, "review_local", return_value=(review, bounds)),
+                  mock.patch.object(cleanup, "check_protected_masks"),
+                  mock.patch.object(cleanup, "apply", side_effect=AssertionError("applied duplicate approval")) as remove,
+                  mock.patch.object(cleanup, "apply_gate_moves",
+                                    side_effect=AssertionError("applied duplicate approval")) as move):
+                outgoing = io.StringIO()
+                channel = cleanup.WorkerChannel(io.StringIO('{"kind":"cancel","kind":"apply"}\n'), outgoing)
+                with self.assertRaisesRegex(ValueError, "invalid cleanup message: duplicate key"):
+                    _ = cleanup.serve_masked_cleanup(channel, self.build, frozenset(), mode=mode)
+                self.assertEqual(outgoing.getvalue().splitlines(), [json.dumps(cleanup.worker_review(review))])
+                remove.assert_not_called()
+                move.assert_not_called()
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
     def test_the_worker_applies_only_with_the_invoking_user_ids(self) -> None:
@@ -1019,7 +1256,7 @@ assert not loaded, sorted(loaded)
 
         with (mock.patch.object(cleanup, "copy_gate_tree", side_effect=change_link),
               redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
         self.assertIn("copy differs from the checked source: alias", output.getvalue())
         self.assertEqual(os.readlink(link), "old-target")
         self.assertFalse(row.outcome.target.exists())
@@ -1278,7 +1515,7 @@ assert not loaded, sorted(loaded)
 
         with (mock.patch.object(cleanup, "copy_gate_tree", side_effect=create_registration),
               redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
         self.assertIn(f"a Git checkout here belongs to a repository outside this folder: {registration}",
                       output.getvalue())
         self.assertEqual(marker.read_text(), text)
@@ -1361,7 +1598,7 @@ assert not loaded, sorted(loaded)
             wrong_parent, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
             self.assertEqual(next(row.outcome for row in wrong_parent.rows if row.path == path),
                              removal_guard.Kept("the move target parent belongs to another user"))
-            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1)
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0)
         self.assertIn("the move target parent belongs to another user", output.getvalue())
         self.assertEqual((path / "payload").read_text(), "old content\n")
         self.assertEqual(list(target.parent.iterdir()), [])
@@ -1509,7 +1746,7 @@ assert not loaded, sorted(loaded)
               redirect_stdout(io.StringIO()) as output):
             review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
             with mock.patch.object(session_move, "rename_exclusive", side_effect=refuse_lock):
-                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
             self.assertIn("fixture cannot publish lock", output.getvalue())
             self.assertEqual(target_present, [True])
             for source in (path, lock, source_lease):
@@ -1540,7 +1777,7 @@ assert not loaded, sorted(loaded)
 
         with redirect_stdout(io.StringIO()) as output:
             with mock.patch.object(os, "fsync", side_effect=fail_after_rename):
-                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
             self.assertIn("fixture cannot sync the published folder", output.getvalue())
             self.assertEqual((path / "payload").read_text(), "old content\n")
             self.assertFalse(target.exists())
@@ -1615,7 +1852,7 @@ assert not loaded, sorted(loaded)
 
         with (mock.patch.object(cleanup, "copy_gate_tree", side_effect=corrupt),
               redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1)
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0)
         self.assertIn("copy differs", output.getvalue())
         self.assertEqual((path / "payload").read_text(), "old content\n")
         self.assertFalse(target.exists())
@@ -1654,7 +1891,7 @@ assert not loaded, sorted(loaded)
         decoded = cleanup.decode_cleanup_rows(cast(object, json.loads(json.dumps(worker_record["rows"]))), review.machine)
         self.assertEqual(decoded, review.rows)
         with redirect_stdout(io.StringIO()) as output:
-            cleanup.show(review, cleanup.LocalListOnly.REQUESTED, record["digest"])
+            cleanup.show(review, cleanup.LocalListOnly.REQUESTED, mode=mode)
         self.assertIn(f"would move to disk at {str(target)!r}", output.getvalue())
         self.assertRegex(output.getvalue(), r"would move to disk: 1 \([0-9.]+ GiB\)")
         self.assertTrue(path.is_dir())
@@ -1671,7 +1908,7 @@ assert not loaded, sorted(loaded)
         target.mkdir(parents=True)
         _ = (target / "existing").write_text("keep this\n")
         with redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1)
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0)
         self.assertIn("move target already exists", output.getvalue())
         self.assertEqual((target / "existing").read_text(), "keep this\n")
         self.assertEqual((path / "payload").read_text(), "old content\n")
@@ -1713,8 +1950,7 @@ assert not loaded, sorted(loaded)
         metadata.mkdir(parents=True)
         head = metadata / "HEAD"
         _ = head.write_text("ref: refs/heads/main\n")
-        mode = cleanup.CleanupMode.MOVE_GATE_GIT
-        moves, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        target = self.build / "claude/resources/shm-moved" / path.name
         verify = cleanup.verify_gate_copy
 
         def change_source_after_verification(
@@ -1725,19 +1961,117 @@ assert not loaded, sorted(loaded)
                 ) -> cleanup_old_folders.VerifiedGateCopy:
             verified = verify(checked, source, destination, target_parent, entries, sidecars, target_path=target_path,
                               checked_git_files=checked_git_files)
-            info = head.stat()
-            _ = head.write_text("ref: refs/heads/next\n")
-            os.utime(head, ns=(info.st_atime_ns, info.st_mtime_ns))
+            if target_path == target:
+                self.assertTrue(target.is_dir())
+                info = head.stat()
+                _ = head.write_text("ref: refs/heads/next\n")
+                os.utime(head, ns=(info.st_atime_ns, info.st_mtime_ns))
             return verified
 
-        with (mock.patch.object(cleanup, "verify_gate_copy", side_effect=change_source_after_verification),
-              redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(cleanup.apply(moves, bounds, mode=mode), 1, output.getvalue())
-        self.assertIn("entry changed before removal", output.getvalue())
+        with mock.patch.object(cleanup, "verify_gate_copy", side_effect=change_source_after_verification):
+            status, output, errors, _request, _prompt = self.sudo_move_command("yes\n")
+        self.assertIn("entry changed before removal", output)
+        self.assertEqual((status, errors), (0, ""), output)
+        self.assertEqual(output.splitlines()[-1], "Moved 0 folders, 0.0 GiB. 1 folder changed and stayed.")
         self.assertEqual(head.read_text(), "ref: refs/heads/next\n")
         self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertFalse(target.exists())
+        staged, = target.parent.glob("*/" + target.name)
+        self.assertEqual((staged / head.relative_to(path)).read_text(), "ref: refs/heads/main\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_counts_a_source_edited_during_staging_as_stayed(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
         target = self.build / "claude/resources/shm-moved" / path.name
-        self.assertEqual((target / head.relative_to(path)).read_text(), "ref: refs/heads/main\n")
+        copy_tree = cleanup.copy_gate_tree
+
+        def edit_after_copy(source: int, destination: int) -> None:
+            copy_tree(source, destination)
+            self.assertFalse(target.exists())
+            _ = (path / "payload").write_text("changed during staging\n")
+
+        with mock.patch.object(cleanup, "copy_gate_tree", side_effect=edit_after_copy):
+            status, output, errors, _request, _prompt = self.sudo_move_command("yes\n")
+        self.assertIn("entry changed before removal", output)
+        self.assertEqual((status, errors), (0, ""), output)
+        self.assertEqual(output.splitlines()[-1], "Moved 0 folders, 0.0 GiB. 1 folder changed and stayed.")
+        self.assertEqual((path / "payload").read_text(), "changed during staging\n")
+        self.assertFalse(target.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_counts_a_source_made_unreadable_after_publication_as_stayed(self) -> None:
+        path = self.gate_checkout_to_move()
+        payload = path / "payload"
+        target = self.build / "claude/resources/shm-moved" / path.name
+        original = path.stat()
+        read_entry = session_move.read_entry
+
+        def revoke_read(parent: int, relative: Path, info: os.stat_result,
+                        kind: session_move.HashedEntry, mount: int) -> session_move.TreeEntry:
+            if relative == Path("payload") and target.is_dir() and os.path.samestat(os.fstat(parent), original):
+                payload.chmod(0)
+            return read_entry(parent, relative, info, kind, mount)
+
+        with mock.patch.object(session_move, "read_entry", side_effect=revoke_read):
+            status, output, errors, _request, _prompt = self.sudo_move_command("yes\n")
+        self.assertIn("Permission denied", output)
+        self.assertEqual((status, errors), (0, ""), output)
+        self.assertEqual(output.splitlines()[-1], "Moved 0 folders, 0.0 GiB. 1 folder changed and stayed.")
+        self.assertEqual(payload.stat().st_mode & 0o777, 0)
+        self.assertFalse(target.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_counts_a_source_sidecar_changed_after_publication_as_stayed(self) -> None:
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        lock = path.with_name(path.name + ".lock")
+        lock.touch()
+        lease = build_folders.lease_path(path)
+        _ = lease.write_text('{"pid": 42, "process_start": "123"}')
+        changed = '{"pid": 43, "process_start": "456"}'
+        remove = removal_guard.remove_proved_copy
+
+        def change_lease(checked: removal_guard.CheckedCleanupPath, proof: removal_guard.ProvedCopyCleanup,
+                         approved_target: Path, *, before_delete: Callable[[], None],
+                         after_copy_check: Callable[[], None]) -> None:
+            self.assertTrue(target.is_dir())
+            _ = lease.write_text(changed)
+            remove(checked, proof, approved_target, before_delete=before_delete, after_copy_check=after_copy_check)
+
+        with (mock.patch.object(process_start, "process_start", return_value=process_start.Gone()),
+              mock.patch.object(removal_guard, "remove_proved_copy", side_effect=change_lease)):
+            status, output, errors, _request, _prompt = self.sudo_move_command("yes\n")
+        self.assertIn("worktree sidecars changed", output)
+        self.assertEqual((status, errors), (0, ""), output)
+        self.assertEqual(output.splitlines()[-1], "Moved 0 folders, 0.0 GiB. 1 folder changed and stayed.")
+        self.assertEqual(lease.read_text(), changed)
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertFalse(target.exists())
+        self.assertFalse(build_folders.lease_path(target).exists())
+        self.assertFalse(target.with_name(lock.name).exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_sudo_go_counts_the_move_when_sidecar_cleanup_fails(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        source_lock = path.with_name(path.name + ".lock")
+        source_lock.touch()
+        target = self.build / "claude/resources/shm-moved" / path.name
+
+        def fail_sidecar_removal(*_args: object, **_kwargs: object) -> None:
+            self.assertFalse(path.exists())
+            self.assertEqual((target / "payload").read_text(), "old content\n")
+            raise OSError(errno.EIO, "cannot remove the source sidecar")
+
+        with mock.patch.object(cleanup, "remove_reviewed_entries", side_effect=fail_sidecar_removal):
+            status, output, errors, _request, _prompt = self.sudo_move_command(
+                "yes\n", reviewed_sizes={path: 2 << 30})
+        self.assertEqual((status, errors), (1, ""), output)
+        self.assertIn("cannot remove the source sidecar", output)
+        self.assertEqual(output.splitlines()[-1], "Moved 1 folder, 2.0 GiB.")
+        self.assertTrue(source_lock.is_file())
+        self.assertTrue(target.with_name(target.name + ".lock").is_file())
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
     def test_gate_move_keeps_a_source_opened_during_the_removal_walk(self) -> None:
@@ -1764,10 +2098,12 @@ assert not loaded, sorted(loaded)
             self.assertIsInstance(next(row.outcome for row in review.rows if row.path == path), cleanup.WouldMove)
             with (mock.patch.object(removal_guard, "mount_id", side_effect=open_during_walk),
                   redirect_stdout(io.StringIO()) as output):
-                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
         self.assertIn("pid 42 holds a file open", output.getvalue())
         self.assertEqual(payload.read_text(), "old content\n")
-        self.assertEqual((target / payload.name).read_text(), "old content\n")
+        self.assertFalse(target.exists())
+        staged, = target.parent.glob("*/" + target.name)
+        self.assertEqual((staged / payload.name).read_text(), "old content\n")
 
     def test_gate_listing_does_not_start_git(self) -> None:
         source, checkout = self.git_fixture()
@@ -2053,7 +2389,7 @@ assert not loaded, sorted(loaded)
             self.assertTrue(require_complete)
             self.assertTrue(same_user_only)
             if ignored_self_fds:
-                with lock.open("r+") as contender, self.assertRaises(BlockingIOError):
+                with lock.open("r+ ") as contender, self.assertRaises(BlockingIOError):
                     fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 if changed:
                     _ = (path / "new").write_text("keep the new file")
@@ -2071,7 +2407,7 @@ assert not loaded, sorted(loaded)
             self.assertIn(reason, output)
             self.assertTrue((path / "payload").is_file())
         self.assertEqual((path / "new").read_text(), "keep the new file")
-        with lock.open("r+") as holder:
+        with lock.open("r+ ") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertIn("a folder lock is held", self.command("--host-list")[1])
 
@@ -2550,7 +2886,7 @@ assert not loaded, sorted(loaded)
                 def opened(*_args: object, **_options: object) -> tmp_sweep.ProcessUsesKnown:
                     if not active:
                         return tmp_sweep.ProcessUsesKnown([])
-                    with lock.open("r+") as contender, self.assertRaises(BlockingIOError):
+                    with lock.open("r+ ") as contender, self.assertRaises(BlockingIOError):
                         fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     return tmp_sweep.ProcessUsesKnown([(str(payload), 42, "holds a file")])
 
@@ -3273,7 +3609,7 @@ assert not loaded, sorted(loaded)
                 if sidecar.path == lease:
                     checks += 1
                     if checks == 2:
-                        with lock.open("r+") as contender:
+                        with lock.open("r+ ") as contender:
                             with self.assertRaises(BlockingIOError):
                                 fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         _ = next_lock.replace(lock)
