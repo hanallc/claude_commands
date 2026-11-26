@@ -50,7 +50,7 @@ from scripts.review_links import list_page, staff_names, test_change_page
 from scripts.review_links import efficiency_reviews, new_item_dialog, reply_tokens, review_actions, review_events, review_later, review_submissions
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.test_record_table import save_notice_failures
-from scripts.statusline import counts_row
+from scripts.statusline import counts_row, rebuild_row
 
 
 def unpack_index(payload: str) -> list[review_page.ReviewIndexEntry]:
@@ -5483,6 +5483,113 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
         saved = review_submissions.submit(request)
         self.assertTrue(review_submissions.answer(saved.key, 'Use the wide layout.', saved.reply_token))
         return f'question/{owner}/{saved.path.name}'
+
+    def test_question_count_keeps_only_the_question_for_nate(self) -> None:
+        owner = self.ready_submission_recipient()
+        key = self.question()
+        _ = self.file_response(owner.id)
+        members = staff.snapshot()
+        identities = update_registration.QuestionStaff.for_record(members)
+        self.assertIn(key, {item.key for item in review_items.read_open(self.root)})
+        self.assertEqual(counts_row.question_counts(owner, user_zone(), identities, None), (1, ''))
+        with patch.object(rebuild_row, 'read', return_value=Mock(machines=())):
+            chips = list_page.counts_strip(members, staff_names.StaffNames(members))
+        self.assertIn('<b>1</b> question', chips)
+        self.assertNotIn('<b>2</b> questions', chips)
+
+    def test_response_to_nate_stays_on_review_without_a_footer_count(self) -> None:
+        producer = fixture_member('producer', name='bob')
+        key = self.file_response(producer.id)
+        members = staff.snapshot()
+        identities = update_registration.QuestionStaff.for_record(members)
+        item = review_page.build_snapshot(self.root).records[key]
+        self.assertIs(item.type, review_items.ReviewType.RESPONSE)
+        self.assertIs(item.state, review_items.ReviewState.OPEN)
+        self.assertIn('read', item.actions)
+        self.assertEqual(counts_row.question_counts(producer, user_zone(), identities, None), (0, ''))
+        instance = self.fixture.temporary / ('showrunner-' + producer.id)
+        self.assertEqual(counts_row.row(instance, [], identities=identities, require_complete=True), ('', ''))
+
+    def test_followup_on_an_existing_question_counts_for_the_showrunner(self) -> None:
+        owner = self.ready_submission_recipient()
+        key = self.fixture.file_user_question(asker=self.fixture.unit)
+        delivery, result = review_page.submit(self.root, self.body(key, 'question', 'Does the wide layout fit?'), self.status)
+        self.assertEqual(result, 'question sent')
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertEqual(delivery.recipients, (owner.id,))
+        pending = review_page.build_snapshot(self.root).records[key]
+        self.assertIs(pending.state, review_items.ReviewState.WAITING)
+        self.assertEqual(pending.question_answer_due, review_items.StaffAnswerDue(owner.id))
+        self.assert_question_footer_counts_for_owner(owner)
+
+    def ask_question_from_unit(self, owner: staff.StaffRow, words: str) -> None:
+        key = self.fixture.file_user_question(asker=self.fixture.unit)
+        snapshot = review_page.build_snapshot(self.root)
+        delivery, result = review_page.submit(self.root, self.card_body(snapshot, key, 'question', words),
+                                              self.status, snapshot=snapshot)
+        self.assertEqual(result, 'question sent')
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertEqual(delivery.recipients, (owner.id,))
+
+    def assert_question_footer_counts_for_owner(self, owner: staff.StaffRow) -> None:
+        identities = update_registration.QuestionStaff.read()
+        instance = self.fixture.temporary / ('showrunner-' + owner.id)
+        owner_counts, _ = counts_row.row(instance, [], identities=identities, require_complete=True)
+        unit_counts, _ = counts_row.row(instance, [], identities=identities, source=self.fixture.unit.id,
+                                        require_complete=True)
+        self.assertRegex(owner_counts, r'\b1 question(?:, |$)')
+        self.assertNotRegex(unit_counts, r'\b\d+ questions?\b')
+
+    def test_multiline_ask_question_counts_for_its_delivery_recipient(self) -> None:
+        owner = self.ready_submission_recipient()
+        self.ask_question_from_unit(owner, 'Does the wide layout fit?\nCan we keep both columns?')
+        self.assert_question_footer_counts_for_owner(owner)
+
+    def test_ask_question_counts_for_its_delivery_recipient_after_zone_change(self) -> None:
+        owner = self.ready_submission_recipient()
+        with patch.dict(os.environ, {'USER_ZONE': 'UTC'}):
+            self.ask_question_from_unit(owner, 'Does the wide layout fit?')
+        with patch.dict(os.environ, {'USER_ZONE': 'Asia/Tokyo'}):
+            self.assert_question_footer_counts_for_owner(owner)
+
+    def test_legacy_followup_counts_for_its_delivery_recipient(self) -> None:
+        owner = self.ready_submission_recipient()
+        unit = self.fixture.unit
+        key = self.fixture.file_user_question(asker=unit)
+        path, forms, _ = self.fixture.browser('questions')
+        browser = change_browser.page_at(self.root, path + '?type=questions')
+        fields = self.fixture.browser_fields(forms, key, 'followup', 'Does the wide layout fit?')
+        delivery, _ = change_browser.submit(browser, urlencode(fields), self.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        self.assertEqual(delivery.recipients, (unit.id,))
+
+        identities = update_registration.QuestionStaff.read()
+        instance = self.fixture.temporary / ('showrunner-' + owner.id)
+        unit_counts, _ = counts_row.row(instance, [], identities=identities, source=unit.id, require_complete=True)
+        self.assertRegex(unit_counts, r'\b1 question(?:, |$)')
+        owner_counts, _ = counts_row.row(instance, [], identities=identities, require_complete=True)
+        self.assertNotRegex(owner_counts, r'\b\d+ questions?\b')
+        pending = review_page.build_snapshot(self.root).records[key]
+        self.assertIs(pending.state, review_items.ReviewState.WAITING)
+        self.assertEqual(pending.question_answer_due, review_items.StaffAnswerDue(delivery.recipients[0]))
+        assert isinstance(pending.source, review_items.QuestionSource)
+        fields = pending.source.record.item
+        assert 'followup' in fields
+        self.assertEqual(fields['followup'].get('recipient'), delivery.recipients[0])
+
+    def test_old_followup_without_a_recipient_uses_the_legacy_relay(self) -> None:
+        _ = self.ready_submission_recipient()
+        unit = self.fixture.unit
+        key = self.fixture.file_user_question(asker=unit)
+        item = review_page.build_snapshot(self.root).records[key]
+        assert isinstance(item.source, review_items.QuestionSource)
+        record = item.source.record
+        record.item['followup'] = update_registration.PendingFollowup(
+            text='Does the wide layout fit?', sent='2026-11-12T12:01')
+        update_registration.write_question_record(record)
+
+        pending = review_page.build_snapshot(self.root).records[key]
+        self.assertEqual(pending.question_answer_due, review_items.StaffAnswerDue(unit.id))
 
     def test_sent_question_feedback_recovers_when_the_saved_mark_write_fails(self) -> None:
         key = self.file_sent_question()
