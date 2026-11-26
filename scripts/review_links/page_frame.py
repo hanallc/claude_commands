@@ -542,13 +542,13 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
 }
 '''
 
-CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\n|$)"
+CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n((?:(?![ \t]*```[ \t]*$)[^\n]*\n)*)[ \t]*```[ \t]*$"
                         + r"|^[ \t]*`([^`\n]+)`[ \t]*(?=\n|$)")
 
 
 def code_block_html(block: re.Match[str]) -> str:
     """Build a code block with the shared copy button."""
-    text = block[1] if block[1] is not None else block[2]
+    text = block[1].removesuffix("\n") if block[1] is not None else block[2]
     return copy_code_block(text)
 
 

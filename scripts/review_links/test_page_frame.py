@@ -29,6 +29,18 @@ PAGE_OWNER = staff.StaffRow(staff.StaffId("owner"), "showrunner", "Page owner", 
                             current_session=staff.StaffId("session-owner"))
 
 
+class CodeBlockTests(unittest.TestCase):
+    def test_fenced_code_ends_at_its_first_closing_line(self) -> None:
+        empty = "```sh\n```"
+        code = "  printf x\n\n"
+        fenced = f"```sh\n{code}\n```"
+        adjacent = empty + "\n" + fenced
+
+        self.assertIsNone(page_frame.CODE_BLOCK.fullmatch(adjacent))
+        self.assertEqual(page_frame.render_code_blocks(adjacent, self.fail),
+                         page_frame.copy_code_block("") + page_frame.copy_code_block(code))
+
+
 class PageStatusTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
