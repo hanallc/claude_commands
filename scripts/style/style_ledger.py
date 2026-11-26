@@ -35,7 +35,7 @@ from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
 from scripts.production.issues import Issue, frontmatter
-from scripts.lib import build_folders
+from scripts.lib import build_folders, conf
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.git_blob import git_blob_id
 from scripts.production import staff, session_staff
@@ -202,13 +202,13 @@ class ChangedBeforeLock(LedgerError):
     """Rows a writer read before its write lock changed before it took the lock."""
 
 
-# How many times a writer reads, then takes the write lock, before rows that keep changing refuse.
-LOCK_ATTEMPTS = 3
-
-
 def retry_on_change[T](attempt: Callable[[], T]) -> T:
     """Run attempt again while the rows it read change before its write lock; the last change refuses."""
-    for _ in range(LOCK_ATTEMPTS - 1):
+    try:
+        attempts = conf.read("style_ledger").whole("write.lock_attempts")
+    except conf.Unusable as error:
+        raise LedgerError(str(error)) from error
+    for _ in range(attempts - 1):
         try:
             return attempt()
         except ChangedBeforeLock:

@@ -23,7 +23,11 @@ A known recovery or reset closes it silently.
 
 Natedev sends both Claude quota pushes.
 The quota check forecasts when each in-use Claude account will run out of weekly usage.
-It divides the weekly percentage left by the recent rate and adds that duration to the reading's time.
+It divides the weekly percentage left by the hourly usage rate and adds that duration to the current time.
+The rate measures the rise and elapsed time from the window start to the latest reading.
+The setting `rate.lookback_minutes` defaults to 60 minutes.
+The latest reading must be at most 15 minutes old.
+The observed span must reach the window start without a refill, a gap over 15 minutes, or an interval that starts at 100%.
 The forecast needs a positive rate, a recent reading, and a known future reset.
 The quota check sends `quota.claude_expiry` when the forecast is before the reset and fewer than `claude_expiry.alert_hours` away.
 Scheduled moves suppress the push when they cover every group on that account.
@@ -42,6 +46,19 @@ The next weekly window has its own repeat interval.
 The expiry template requires current approval before sending.
 
 Claude sends no weekly session alert, 30-minute repeat, showrunner relay, `Quota restored:` notice or instruction to start no new work. `/quota_ack` and its acknowledgement state are removed. `/quota_refresh` still refreshes readings when the user reports a reset; routing restoration is recorded in the moves journal without a session notice. A scheduled move consumes its entry when its group selection is recorded, keeps the usual safe shutdown/showrunner notices, and sends no phone alert.
+
+## Claude login reminders
+
+The notes timer checks stored Claude login end dates on natedev and the Mac.
+`login_sitting_interval_days` sets the interval between sittings.
+Each sitting selects the account with the earliest unreported end.
+The push names that account and its unreported ends.
+An accepted push marks those dates as reported.
+Renewal replaces the old end with a later end in date order.
+The timer records when it first sees the later end.
+Only the safety reminder can name several accounts.
+It covers unreported login ends within three days.
+Both reminders respect notification silence. Silence retains each batch under its own key.
 
 ## Token notices
 
@@ -78,6 +95,8 @@ Workers entries have no hold in minutes.
 A move to Claude holds until the source account's weekly reset, even if Codex has room earlier.
 Entries run once in log order and leave the log after a recorded move.
 A refused move keeps its entry.
+The workers queue uses the Codex target report from the current pass.
+It treats a weekly reset at or before the check time as an unavailable reading.
 
 Above 0% and at or below 2%, Codex can send one phone reminder per episode.
 The first pending workers entry suppresses this reminder, even when it targets the current account.
@@ -156,7 +175,14 @@ The request includes the retained terminal.
 Failures, waits, wait completion, no room, and renewed room have separate entries.
 Readers skip malformed lines, including during duplicate confirmation checks.
 Requests omit an unknown `reset`; waits carry a known reset.
-Refusal state stays in `refusals.json`.
+Refusal state stays in `refusals.json`, with one all-model record and one record for each model family for each account.
+The watcher records “Fable limit” as `weekly_fable`, even when the provider reports a generic weekly rate type.
+A Fable account pick or automatic group destination requires room in both weekly windows.
+The existing Claude usage response supplies the Fable window in `limits.weekly_scoped`.
+The usage store saves it beside the all-model weekly and five-hour readings.
+The picker skips the account when that window is unavailable or expired.
+The watcher claims a fresh read for an automatic Fable move if either weekly window has reset.
+Later groups can use that reading if it is fresh and the required windows are current at their decision time.
 A usage store failure writes a log line without preventing alerts.
 Advice reads the saved store.
 
@@ -193,7 +219,9 @@ The notice `quota.codex_workers_stay` is one line: `<account> is empty; we're in
 `<units>` is the Claude account of the units group in the role map.
 When the role map cannot be read or has no units account, the line says `the units account`.
 With credits off and a workers entry queued, the line is `<account> is empty; workers wait for their queued move`.
-When the switch to Claude fails, the notice is `quota.codex_refused`.
+A failed switch to Claude can send `quota.codex_refused`.
+The picker must find no Codex account that can take work before the sender attempts this push.
+The existing Claude hold and retry rules still apply.
 An episode saved with the older values (`reset`, `reason`, `fallback`) renders with only its account and outcome.
 Old outcome words change to the new ones: “work moves to Claude” becomes the self-actualize line, “workers wait for their next entry” becomes “workers wait for their queued move”, and “work could not move” sends `quota.codex_refused`.
 The fallback remains until that refill or the selected account recovers.

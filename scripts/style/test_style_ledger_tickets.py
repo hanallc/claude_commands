@@ -28,6 +28,7 @@ from scripts.style import style_reader
 from scripts.style import style_plan
 from scripts.style import mechanical_classes
 from scripts.lib import berth_board
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.style import coverage_report
 from scripts.style import style_proposals
 from scripts.style import unit_files
@@ -1832,10 +1833,27 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.assertEqual({judgment.commit for judgment in ledger.latest_ticket_judgments("1")}, {checkpoint})
 
     def test_checkpoint_refuses_after_its_judgments_change_on_every_attempt(self) -> None:
-        ledger, checkpoint, load = self.judge_while_loading_rules(style_ledger.LOCK_ATTEMPTS)
-        with self.assertRaisesRegex(style_ledger.ChangedBeforeLock, "1: the ticket changed while it became checkpointed; rerun"):
+        ledger, checkpoint, load = self.judge_while_loading_rules(5)
+        configuration = self.root / "config/style_ledger.conf"
+        with mock.patch.dict(os.environ, config_environment(configuration.parent)):
+            for limit in (3, 2):
+                with self.subTest(limit=limit):
+                    _ = write_config_fixture(configuration, f"# whole: 1..\nwrite.lock_attempts={limit}\n")
+                    load.reset_mock()
+                    with self.assertRaisesRegex(style_ledger.ChangedBeforeLock,
+                                                "1: the ticket changed while it became checkpointed; rerun"):
+                        ledger.ticket_checkpoint("1", checkpoint)
+                    self.assertEqual(load.call_count, limit)
+                    self.assertEqual(ledger.ticket_open(ticket_owner_id("names"))[0]["state"], "assigned")
+
+    def test_checkpoint_refuses_when_the_write_attempt_limit_is_unusable(self) -> None:
+        ledger, checkpoint, load = self.judge_while_loading_rules(0)
+        configuration = self.root / "config/style_ledger.conf"
+        _ = write_config_fixture(configuration, "# whole: 1..\nwrite.lock_attempts=0\n")
+        with (mock.patch.dict(os.environ, config_environment(configuration.parent)),
+              self.assertRaisesRegex(style_ledger.LedgerError, r"write\.lock_attempts.*no usable committed value")):
             ledger.ticket_checkpoint("1", checkpoint)
-        self.assertEqual(load.call_count, style_ledger.LOCK_ATTEMPTS)
+        load.assert_not_called()
         self.assertEqual(ledger.ticket_open(ticket_owner_id("names"))[0]["state"], "assigned")
 
     def test_checkpoint_keeps_verdicts_stale_and_reissues_when_an_outside_commit_changed_the_path(self) -> None:
@@ -3565,7 +3583,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         with mock.patch.object(rules, "load_rules", side_effect=catalog_then_edit) as load:
             with self.assertRaisesRegex(style_ledger.ChangedBeforeLock, second + ": rule changed while pinning; rerun"):
                 ledger.ticket_add("1001", ticket_owner_id("read"), "read", "names", "crates/alpha", list(self.sources[:2]), [first, second])
-        self.assertEqual(load.call_count, style_ledger.LOCK_ATTEMPTS)
+        self.assertEqual(load.call_count, 3)
         self.assertEqual(ledger.queued_tickets(ticket_owner_id("read")), ())
         with closing(sqlite3.connect(ledger.database)) as connection:
             texts = cast(list[tuple[str]], connection.execute("SELECT blob FROM rule_texts").fetchall())

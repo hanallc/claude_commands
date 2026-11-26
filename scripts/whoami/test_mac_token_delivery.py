@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import push_reference, push_texts, pushover, review, silence
 from scripts.whoami.token_expiry import ALERT_IDS, LEGACY_MAC_EXPIRY_ID
 
@@ -28,7 +29,11 @@ class MacTokenDeliveryTests(unittest.TestCase):
         self.approvals = root / "approvals.json"
         self.keys = root / "fixture-keys"
         _ = self.keys.write_text("PUSHOVER_USER=fixture\nPUSHOVER_TOKEN=fixture\n", encoding="utf-8")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(root / "state")})))
+        _ = write_config_fixture(root / "notify.conf", "pushover.max_source_chars=80\n")
+        _ = write_config_fixture(root / "user_zone.conf")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(root), "NOTIFY_STATE_DIR": str(root / "state"),
+        })))
         _ = self.enterContext(patch.object(push_texts, "REVIEWED_FILE", self.approvals))
         _ = self.enterContext(patch.object(pushover, "LOG_FILE", root / "pushes.jsonl"))
         _ = self.enterContext(patch.object(silence, "on_mac", return_value=False))

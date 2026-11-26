@@ -600,6 +600,7 @@ class ProducerCommandsTests(unittest.TestCase):
         return identity
 
     def test_stop_selects_the_producer_process_with_duplicate_or_unreported_panes(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"USER_ZONE": "UTC"})))
         with self.subTest(selection="registry-references"):
             case = self.world()
             identity = case.entry["session_id"]

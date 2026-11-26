@@ -19,6 +19,7 @@ from typing import override
 
 from scripts.lib import live_settings, main_sync, waiting_rows
 from scripts.lib.git_test_support import fixture_git_environment
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import session_send
 from scripts.agents import remote
 from scripts.production import staff
@@ -49,6 +50,7 @@ class MainSyncTests(unittest.TestCase):
         config = self.root / "config"
         config.mkdir()
         _ = (config / "send.conf").write_text("# range: 0.001..\nmain_sync_repeat_minutes=17\n")
+        _ = write_config_fixture(config / "user_zone.conf")
         binaries = self.root / "bin"
         binaries.mkdir()
         _ = (binaries / "git").symlink_to(shutil.which("git") or "/usr/bin/git")

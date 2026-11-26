@@ -1,9 +1,10 @@
-"""A unit director's own Claude auto-compact window, kept per session across relaunches.
+"""Claude's auto-compact window: the one validator, and the per-session record of a unit director.
 
-`add_unit.py --resume <id> --autocompact <tokens>` records it (for a unit that already has a staff row it
-only records, launching nothing); every later `add_unit.py --resume <id>`,
-which agents restarts, account moves and renames all run, passes `--autocompact <tokens>` to Claude.
-`--autocompact auto` removes the record, so the session falls back to the saved setting.
+`add_unit.py --resume <id> --autocompact <tokens>` records the window of a unit session.
+For a unit that already has a staff row, it only records and launches nothing.
+Every later Claude launch of that session passes the record as `--autocompact <tokens>`,
+and the record wins over the `unit` key in `[compact_windows]` of `config/models.conf`.
+`--autocompact auto` removes the record, so the session uses the role window or settings.json.
 """
 from __future__ import annotations
 
@@ -42,9 +43,10 @@ def checked(value: str) -> str:
         raise BadAutocompact(f"--autocompact takes auto or a token count such as 200k, not {value!r}")
     unit = match.group(2).lower()
     scale = {"": 1, "k": 1_000, "m": 1_000_000}[unit]
-    if not LOWEST <= int(match.group(1)) * scale <= HIGHEST:
+    digits = match.group(1)
+    if len(digits) > len(str(HIGHEST)) or not LOWEST <= int(digits) * scale <= HIGHEST:
         raise BadAutocompact(f"--autocompact {value} is outside 100k to 1M")
-    return match.group(1) + {"": "", "k": "k", "m": "M"}[unit]
+    return digits + {"": "", "k": "k", "m": "M"}[unit]
 
 
 def recorded(session_id: str) -> str:

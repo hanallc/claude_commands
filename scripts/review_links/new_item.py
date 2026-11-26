@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable, Generator
@@ -32,6 +33,7 @@ from scripts.review_links import change_page, for_you, list_draft, new_item_dial
 SOURCE = "nate via /new_item"
 OPTIONS_TARGET = f"{review_page.NEW_ITEM_PATH}?page=list"
 FORM = "/new_item <type> <assignee> <description> [extra, such as a time]"
+RESEND_FORM = "new_item.py resend-reply <item-id>"
 MAY_BE_FILED = "The item may be filed. Check the List before a retry."
 
 
@@ -291,6 +293,7 @@ def usage() -> str:
         f"Types: {', '.join((*ItemType, new_item_dialog.SCHEDULED_KIND))}",
         "Assignee: a producer, a showrunner or a unit",
         "/new_item scheduled natedev Set the time zone back to Eastern time. Start Fri Nov 27 13:00.",
+        f"Resend a reply command: {RESEND_FORM}",
     ))
 
 
@@ -652,7 +655,8 @@ def refuse_scheduled_draft_reuse(request_id: str) -> None:
     review_submissions.refuse_scheduled_draft_reuse(request_id, load_list_draft=_load_list_draft)
 
 
-def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_submissions.ListItemDestination:
+def submit_scheduled(request: new_item_dialog.ScheduledSubmission, *,
+                     live_words_limit: int) -> review_submissions.ListItemDestination:
     """File a browser Schedule and recover its receipt and notices on Retry."""
     fields: list[object] = [request.page, request.recipient_id, request.words]
     if request.producer_route:
@@ -661,6 +665,7 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
 
     @contextmanager
     def prepare() -> Generator[tuple[review_submissions.ListDraftClaim, review_submissions.ListDraftWriter]]:
+        words = new_item_dialog.read_words(request.words, "Your words", live_words_limit)
         with investigation.recipient_locks(request.recipient_id):
             members = staff.snapshot()
             recipient = review_submissions.selected_recipient(request.recipient_id, members)
@@ -668,7 +673,7 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission) -> review_sub
                 raise new_item_dialog.SubmissionError("Pick a producer.")
             producer = recipient if request.producer_route else None
             owner = review_submissions.assigned_member(request.assignment, recipient, members)
-            filing = prepare_scheduled(owner, request.words, members, producer=producer)
+            filing = prepare_scheduled(owner, words, members, producer=producer)
             notices, warning = _assignment_notices(filing.title, filing.producer, filing.keeper, owner, members)
             claim = review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback, notices, warning)
             draft = review_submissions.NewItemDraft(request.request_id, claim)
@@ -712,21 +717,61 @@ class Arguments(argparse.Namespace):
     preview: bool = False
 
 
+class ResendArguments(argparse.Namespace):
+    item: str = ""
+
+
+def resend_reply(arguments: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="new_item.py resend-reply",
+                                     description="Send the reply command of a waiting item to its current owner.",
+                                     epilog="The command refuses closed items and unknown IDs.")
+    _ = parser.add_argument("item", help="the native item ID or full submission key")
+    args = parser.parse_args(arguments, namespace=ResendArguments())
+    try:
+        identity = change_page.resend_submission_reply(args.item)
+    except (OSError, ValueError, RuntimeError) as error:
+        print("new_item: " + " ".join(str(error).splitlines()), file=sys.stderr)
+        return Outcome.REFUSED
+    print(f"Accepted the reply command for delivery to the owner of {identity}.")
+    return Outcome.FILED
+
+
+def forward_filing(arguments: list[str], session: str, ssh_program: str) -> int:
+    """Carry the Mac hook identity to the natedev filing process."""
+    environment = shlex.join(["env", "CODEX_THREAD_ID=", f"CLAUDE_CODE_SESSION_ID={session}"])
+    command = ('"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/new_item.py" '
+               + shlex.join(arguments))
+    limit = main_publish.CommandTimeLimit(conf.read_or_repository("live_settings").whole("natedev_forward_seconds"))
+    result = main_publish.ssh(f"{environment} {command}", ssh_program=ssh_program, host="natedev", time_limit=limit)
+    if isinstance(result, str):
+        print(f"new_item: natedev: {result}", file=sys.stderr)
+        return Outcome.FAILED
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
+
+
 def main(arguments: list[str] | None = None) -> int:
     argv = sys.argv[1:] if arguments is None else arguments
     if not argv:
         print(usage())
         return Outcome.USAGE
+    session = staff.caller_identity()
     if platform.system() == "Darwin":
-        # The Mac uses the natedev staff snapshot and console address.
-        return main_publish.forward("review_links/new_item.py", [*argv, "--session", staff.caller_identity()],
-                                    label="new_item", ssh_program=os.environ.get("ZONE_SSH") or "ssh")
-    parser = argparse.ArgumentParser(prog="new_item.py", description=__doc__)
+        ssh_program = os.environ.get("ZONE_SSH") or "ssh"
+        if argv[0] == "resend-reply":
+            return main_publish.forward("review_links/new_item.py", argv, label="new_item", ssh_program=ssh_program)
+        return forward_filing(argv, session, ssh_program)
+    if argv[0] == "resend-reply":
+        return resend_reply(argv[1:])
+    parser = argparse.ArgumentParser(prog="new_item.py", description=__doc__, epilog=(
+        "The item owner receives the reply command through Review delivery. "
+        f"To send it again, run {RESEND_FORM}."))
     _ = parser.add_argument("item_type", type=str.lower, choices=(*ItemType, new_item_dialog.SCHEDULED_KIND))
     _ = parser.add_argument("assignee")
     _ = parser.add_argument("description")
     _ = parser.add_argument("extra", nargs="?", default="")
-    _ = parser.add_argument("--session", default=staff.caller_identity(), help=argparse.SUPPRESS)
+    _ = parser.add_argument("--session", default=session, help=argparse.SUPPRESS)
     _ = parser.add_argument("--preview", action="store_true", help="read a Scheduled start and repeat without saving")
     args = parser.parse_args(argv, namespace=Arguments())
     if not args.description.strip():
@@ -754,9 +799,7 @@ def main(arguments: list[str] | None = None) -> int:
         if isinstance(member, producer_map.UnknownMember):
             print(unknown_name(member, members))
             return Outcome.UNKNOWN_NAME
-        caller = members.by_current_session(args.session) if args.session else None
-        to = unit_of(member, members) + (", this session" if caller is not None and caller.id == member.id else "")
-        result = f"{item_type.value.capitalize()} → {to}."
+        producer = ""
         words = words_text(item_type, args.description, args.extra)
         try:
             address = console_address()
@@ -786,7 +829,7 @@ def main(arguments: list[str] | None = None) -> int:
                     print(f"new_item: {recipient.reason}", file=sys.stderr)
                     return Outcome.REFUSED
                 draft = save_pending_draft(path, recipient.id)
-                result += producer_line(member, mapped)
+                producer = producer_line(member, mapped)
             else:
                 options = read_options(address)
             reply = post_item(address, options, item_type, draft, words, member.id)
@@ -805,6 +848,19 @@ def main(arguments: list[str] | None = None) -> int:
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
         return Outcome.FAILED
+    owner = reply.fields.get("reply_owner")
+    reply_owner = staff.StaffId(owner) if isinstance(owner, str) and owner else draft.recipient
+    caller = members.by_current_session(session) if session else None
+    session_label = ", this session" if caller is not None and caller.id == reply_owner else ""
+    assignee = unit_of(member, members)
+    delivery = ""
+    if reply_owner == member.id:
+        assignee += session_label
+    elif session_label or reply_owner != draft.recipient:
+        recipient_row = members.by_id(reply_owner)
+        recipient_name = recipient_row.name if recipient_row is not None else next(
+            (row.name for row in options.recipients if row.id == reply_owner), reply_owner)
+        delivery = f" Reply command goes to {recipient_name}{session_label}."
     number = reply.fields.get("list_number")
     if type(number) is int and number > 0:
         filed = f"List item {number}."
@@ -812,7 +868,7 @@ def main(arguments: list[str] | None = None) -> int:
         review_id = reply.fields.get("id")
         shown = review_id if isinstance(review_id, str) and review_id else "a Review item"
         filed = f"Filed as {shown}. The console server returned no List number."
-    print(f"{result} {filed}")
+    print(f"{item_type.value.capitalize()} → {assignee}.{producer} {filed}{delivery}")
     return Outcome.FILED
 
 

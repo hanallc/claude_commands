@@ -15,6 +15,7 @@ import zlib
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from contextlib import AbstractContextManager
 from typing import BinaryIO, ClassVar, NotRequired, TypedDict, cast, override
 from unittest import mock
 
@@ -29,11 +30,17 @@ from scripts.shot_report.transcripts import (
     AvailableTimingSource, ExactAttemptCountFromOrderedCaptures, PersistentScanCache, scan_calls,
 )
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 def setUpModule() -> None:
     """Pin fixture dates so the user's zone setting does not change test windows."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Vancouver"}))
+    config = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())) / "config"
+    _ = write_config_fixture(config / "shot_report.conf", "# whole: 1..\ntranscripts.parallel_scan_bytes=1000000000\n")
+    _ = config_environment(config)
+    _ = unittest.enterModuleContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+        "CONF_DIR": str(config), "USER_ZONE": "America/Vancouver",
+    })))
 
 
 class EpisodeRecord(TypedDict):
@@ -675,9 +682,9 @@ class ShotReportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
             configuration = state_dir / "user_zone.conf"
-            _ = configuration.write_text("zone=Asia/Kolkata\n", encoding="utf-8")
+            _ = write_config_fixture(configuration, "zone=Asia/Kolkata\n")
             environment = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
-            environment["USER_ZONE_CONF"] = str(configuration)
+            environment["CONF_DIR"] = str(configuration.parent)
             result = subprocess.run([
                 str(HERE.parent / "lib/py"), str(COMMAND), "report", "--state-dir", str(state_dir),
                 "--since", "2026-01-10", "--until", "2026-01-11",

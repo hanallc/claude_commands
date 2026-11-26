@@ -245,6 +245,82 @@ class SharedUsageReadTests(unittest.TestCase):
             self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
         self.assertEqual(request.call_args.kwargs["timeout"], 23)
 
+    def test_malformed_usage_response_records_a_failed_read(self) -> None:
+        with patch.object(urllib.request, "urlopen", side_effect=self.response):
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+        observed = self.now.isoformat(timespec="seconds")
+        for payload in (b"[]", b"null", b'{"seven_day":[]}', b'{"seven_day":{"utilization":"25"}}',
+                        b'{"seven_day":{"utilization":50},"five_hour":{"resets_at":1e100}}'):
+            with self.subTest(payload=payload):
+                self.now += timedelta(minutes=2)
+                with patch.object(urllib.request, "urlopen", return_value=io.BytesIO(payload)):
+                    report = self.read()
+                self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.ERROR)
+                self.assertEqual(report.quotas, [])
+                stored, = usage_store.load().values()
+                self.assertEqual(stored.get("attempt_outcome"), agent_accounts.UsageReadOutcome.ERROR)
+                assert "weekly" in stored
+                self.assertEqual((stored["weekly"]["at"], stored["weekly"]["left"]), (observed, 75))
+
+    def test_usage_read_ignores_optional_weekly_fields_that_are_not_windows(self) -> None:
+        payload = (b'{"seven_day":{"utilization":25,"resets_at":"2026-10-25T12:00:00Z"},'
+                   b'"seven_day_metadata":42,"seven_day_other_metadata":{"resets_at":"garbled"},'
+                   b'"seven_day_opus":{"utilization":50,"resets_at":null}}')
+        with patch.object(urllib.request, "urlopen", return_value=io.BytesIO(payload)):
+            report = self.read()
+        self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+        self.assertEqual([quota.label for quota in report.quotas], ["Weekly", "Weekly opus"])
+        self.assertEqual(report.weekly_remaining, 75)
+
+    def test_usage_read_preserves_saved_resets_when_a_window_has_an_invalid_reset(self) -> None:
+        good_reset = "2026-10-25T12:00:00+00:00"
+        weekly: dict[str, object] = {"utilization": 25, "resets_at": good_reset}
+        fable: dict[str, object] = {"percent": 35, "resets_at": good_reset, "is_active": True}
+        good = {"seven_day": weekly, "limits": {"weekly_scoped": fable}}
+        with patch.object(urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(good).encode())):
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+        before, = usage_store.load().values()
+        self.assertIn("weekly_fable", before)
+        for invalid in (
+            {**good, "seven_day": {**weekly, "resets_at": "garbled"}},
+            {**good, "seven_day": {**weekly, "resets_at": "2026-10-26T12:00:00"}},
+            {**good, "seven_day_opus": {**weekly, "resets_at": ""}},
+            {**good, "five_hour": {**weekly, "resets_at": False}},
+            {**good, "limits": {"weekly_scoped": {**fable, "resets_at": "garbled"}}},
+            {**good, "limits": {"weekly_scoped": {**fable, "percent": None, "resets_at": "garbled"}}},
+        ):
+            with self.subTest(response=invalid):
+                self.now += timedelta(minutes=2)
+                with patch.object(urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(invalid).encode())):
+                    report = self.read()
+                self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.ERROR)
+                self.assertEqual(report.quotas, [])
+                stored, = usage_store.load().values()
+                self.assertEqual(stored.get("attempt_outcome"), agent_accounts.UsageReadOutcome.ERROR)
+                self.assertEqual(stored.get("weekly"), before.get("weekly"))
+                self.assertEqual(stored.get("weekly_fable"), before.get("weekly_fable"))
+
+    def test_checked_usage_account_rejects_a_changed_sign_in_before_claiming_a_read(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        expected = agent_accounts.NumberedAccount("claude2", folder, "shared@example.invalid")
+        identity_file = folder / ".claude.json"
+        _ = identity_file.write_text(json.dumps({"oauthAccount": {"emailAddress": "other@example.invalid"}}))
+        with (patch.object(agent_accounts, "claude_credentials", return_value={
+                  "claudeAiOauth": {"accessToken": "fixture", "subscriptionType": "max"}}),
+              patch.object(agent_accounts, "command_json", side_effect=AssertionError("unexpected CLI call")),
+              patch.object(urllib.request, "urlopen", side_effect=self.response) as read):
+            rejected = agent_accounts.claude_live(expected)
+            self.assertEqual(rejected.usage_read_outcome, agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE)
+            self.assertIsNone(rejected.email)
+            self.assertEqual(usage_store.load(), {})
+            read.assert_not_called()
+            _ = identity_file.write_text(json.dumps({"oauthAccount": {"emailAddress": expected.login.upper()}}))
+            accepted = agent_accounts.claude_live(expected)
+        read.assert_called_once()
+        self.assertEqual(accepted.usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+        self.assertEqual(accepted.source, agent_accounts.ClaudeDirectorySource(folder))
+
     def test_signed_out_cli_exit_preserves_the_last_good_reading(self) -> None:
         folder = self.home / ".claude2"
         login = "shared@example.invalid"
