@@ -1639,6 +1639,10 @@ Parked items also match the word `Parked`.
 The address retains the owner, producer, status chip, unread switch, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
+In the Studio, write `Run this command:` in its own Next step paragraph.
+Leave a blank line and put one command in the final paragraph.
+The row and the open item show the command in a code block with a copy button.
+The button copies the exact command text. A long command scrolls inside its block.
 HTTP and HTTPS links in the open row's item text and log open in a new tab.
 Whitespace, angle brackets, double quotes, and the start of the next URL scheme end a link.
 Only HTTP and HTTPS URLs become links.

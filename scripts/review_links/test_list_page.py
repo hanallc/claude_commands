@@ -3785,6 +3785,72 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         self.assertIn('<ul><li>One</li><li>Two</li></ul>', details)
         self.assertIn('<ol><li>First</li><li>Second</li></ol>', details)
 
+    def test_next_step_renders_one_labeled_command(self) -> None:
+        command = "  printf '%s\\n' '<tag> & value'  "
+        for source in (command, f"`{command}`", f"```sh\n{command}\n```"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, f"Check the result.\n\nRun this command:\n\n{source}", "", True)
+                markup = progress.next_step_html(link_urls=True)
+                self.assertTrue(markup.startswith('<p>Check the result.</p><p>Run this command:</p>'))
+                self.assertIn('<pre><code>' + html.escape(command) + '</code></pre>', markup)
+                self.assertIn(page_frame.COPY_BUTTON, markup)
+        for source in ("Check the result.\n\nOpen https://example.org/preview.", "Run this command:",
+                       "Run this command:\n\n ", "Run this command:\n\nprintf x\n\nRead the result.",
+                       "Run this command:\n\nprintf x\n\nRun this command:\n\nprintf y"):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                self.assertEqual(progress.next_step_html(link_urls=True),
+                                 list_page.item_text_html(source, paragraphs=True, link_urls=True))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_browser_studio_copies_the_next_step_command_once_after_refresh(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Check the command", number=1)
+        command = "printf '%s\\n' '<tag> & \"value\"' '" + "x" * 180 + "'"
+        updated = command.replace("<tag>", "<new tag>")
+
+        def page(words: str) -> str:
+            _ = the_list.update(MORTY.id, item.id, {"next_step": "Run this command:\n\n" + words}, source="morty")
+            return list_page.render(root, include_counts=False).decode()
+
+        initial, fresh = page(command), page(updated)
+        steps = r'''
+ const copied=[];
+ Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async text=>{copied.push(text);}}});
+ const summary=()=>row.querySelector('[data-label="Next step"]');
+ const detail=()=>recordDetails(row).querySelector('.list-field-next_step');
+ const copy=field=>field.querySelector('[data-copy-code]');
+ const oldCopy=copy(detail());
+ const code=detail().querySelector('pre code');
+ check(innerWidth===VIEWPORT_WIDTH && document.documentElement.scrollWidth<=innerWidth,
+  'The Studio fits the requested viewport.');
+ code.scrollLeft=code.scrollWidth;
+ check(code.scrollLeft>0,'The long command scrolls inside its block.');
+ check(code.getBoundingClientRect().right<=oldCopy.getBoundingClientRect().left,
+  'The scroll area leaves room for the copy button.');
+ oldCopy.focus();
+ check(oldCopy.matches(':focus-visible') && getComputedStyle(oldCopy).opacity==='1',
+  'Keyboard focus shows the copy button.');
+ copy(summary()).click();await flush();
+ check(recordIsOpen(row),'A click on the summary copy button keeps the item open.');
+ oldCopy.click();await flush();
+ check(copied.length===2 && copied.every(text=>text===ORIGINAL_COMMAND),
+  'Each click copies the exact original command once.');
+ refreshMarkup=FRESH_PAGE;
+ dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+ await flush();
+ const newCopy=copy(detail());
+ check(pageReads===1 && recordIsOpen(row) && newCopy!==oldCopy,'The refresh replaces the open command block.');
+ newCopy.click();await flush();
+ check(copied.length===3 && copied[2]===UPDATED_COMMAND,'A click after the refresh copies the new command once.');
+'''
+        steps = (steps.replace("ORIGINAL_COMMAND", json.dumps(command)).replace("UPDATED_COMMAND", json.dumps(updated))
+                 .replace("FRESH_PAGE", json.dumps(fresh).replace("</", "<\\/")))
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                self.browser_action_sequence(steps.replace("VIEWPORT_WIDTH", str(width)), markup=initial,
+                                             add_item=False, reduced_motion=True, window_size=(width, 900))
+
     def test_bad_records_leave_valid_rows_and_nav_news(self) -> None:
         good = self.add("Valid item")
         bad = self.add("Invalid item")
