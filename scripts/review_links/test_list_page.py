@@ -4509,7 +4509,7 @@ window.fetch=(url,options)=>{
                 self.assertIn('<h3>How to try</h3>', page[:page.index('</main>')])
                 self.assertIn(instructions, page[:page.index('</main>')])
                 self.assertIn('value="works">Works</button>', page)
-                self.assertIn('value="not works" disabled>Not fixed</button>', page)
+                self.assertIn('value="not works">Not fixed</button>', page)
                 self.assertEqual(repaired.state_entered, NOW + timedelta(minutes=2))
                 stale = self.fields(repaired, "works")
                 with self.assertRaisesRegex(question_record.AnswerRefused, "List token"):
@@ -9009,18 +9009,18 @@ window.fetch=async(_url,options)=>{
   }
  };
  const words=form.elements.words;
- const text='The last choice is missing.';
+ const text=undoOutcome==='missing' ? '' : undoOutcome===null ? '\u0085\u001c\t\u2028\u3000' : 'The last choice is missing.';
  const reject=form.querySelector('[value="not works"]');
  const toast=()=>document.querySelector('[data-send-undo]:has(button)');
  show('needs-me');
  check(row.getClientRects().length && recordIsOpen(row),'Needs me contains the open Repaired item.');
  check(recordDetails(row).textContent.includes('Open the menu and count all six choices.'),'The panel shows how to try it.');
- check(reject.disabled,'Not fixed needs words.');
- for(const blank of ['\u0085','\u001c\t\u2028','\u00a0\n\u3000']){
-  words.value=blank;words.dispatchEvent(new Event('input'));
-  check(reject.disabled,'Not fixed rejects words with only server whitespace.');
-  form.requestSubmit(reject);
-  check(!requests.length,'A blank draft sends no request.');
+ check(!reject.disabled,'Not fixed accepts an empty box.');
+ for(const action of ['tell','question']){
+  const button=form.querySelector('[value="'+action+'"]');
+  check(button.disabled,action+' requires words.');
+  form.requestSubmit(button);
+  check(!requests.length,action+' sends no empty request.');
  }
  words.value=text;words.dispatchEvent(new Event('input'));
  const store=Storage.prototype.setItem;
@@ -9031,6 +9031,8 @@ window.fetch=async(_url,options)=>{
   'A storage failure shows before any request leaves.');
  submit('not works');
  await until(toast,'The Undo toast did not show.');
+ check(requests[0].get('words')===(undoOutcome==='undone' ? text : ''),
+  'Not fixed sends words or an empty value.');
  check(toast().textContent.includes('Sent to sdlc and dwight.'),'The toast names the owner and producer.');
  check(!row.getClientRects().length,'The held repair report is hidden.');
  toast().querySelector('button').click();

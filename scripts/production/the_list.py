@@ -2569,7 +2569,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             item = _read_item(store, identity, fields, body)
         request = page_action
         if isinstance(page_action, PageItemNotice):
-            if not page_action.words.strip():
+            if page_action.action is not ReportVerdict.NOT_FIXED and not page_action.words.strip():
                 raise ListError("an item notice needs words")
             request = PageRequest(page_action.request, page_action.action, page_action.words, page_action.form_words,
                                   page_action.parked_until)
@@ -2654,8 +2654,8 @@ def check_report(keeper: staff.StaffId, identity: str, verdict: ReportVerdict, w
     """Save nate's verdict and the pending Not fixed message in one List write."""
     if verdict is ReportVerdict.NOT_FIXED:
         words = words.strip(REPORT_WORD_WHITESPACE)
-        if not words or len(words) > 10000:
-            raise RepairCheckRefused(request, "Enter your words for the owner and the producer.")
+        if len(words) > 10000:
+            raise RepairCheckRefused(request, "Use at most 10,000 characters for Not fixed.")
     state = ItemState.DELIVERED if verdict is ReportVerdict.WORKS else ItemState.WORKING
 
     def check(item: ListItem, _: datetime) -> ListItem:
@@ -3939,7 +3939,8 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
     state, alerted_to, target = fields.get("state"), fields.get("alerted_to", ""), fields.get("read_update", "")
     if state not in ("pending", "sent", "alerted") or not isinstance(alerted_to, str) or not isinstance(target, str):
         raise ListError("invalid List feedback log")
-    if action not in ("tell", "remove", "park", "unpark", "read", "not works") or not words.strip():
+    if (action not in ("tell", "remove", "park", "unpark", "read", "not works")
+            or (action != "not works" and not words.strip())):
         raise ListError("invalid List feedback action")
     recipient = _field_text(fields.get("recipient", ""), "feedback recipient")
     additional = _field_text(fields.get("additional_recipient", ""), "additional feedback recipient")

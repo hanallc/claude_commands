@@ -924,7 +924,8 @@ def item_progress(item: the_list.ListItem, names: staff_names.StaffNames, schedu
             event = entry.what
             if isinstance(event, the_list.PageFeedback) and event.action is the_list.ReportVerdict.NOT_FIXED:
                 if use_repair_status:
-                    latest_status, status_time = "Not fixed: " + event.words, entry.time
+                    latest_status = "Not fixed: " + event.words if event.words else "Not fixed"
+                    status_time = entry.time
                 if use_repair_step:
                     producer = owner_name(names.members, item.producer)
                     next_step = producer + " repairs it again"
@@ -1765,8 +1766,10 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         tries = settings.whole("delivery_tries")
         heading = {the_list.ReportVerdict.NOT_FIXED: "Not fixed",
                    "tell": "nate's words"}.get(feedback.action)
-        message = (f"List page: {heading} for item {item.number}\n{feedback.words}"
-                   if heading is not None else feedback.words)
+        message = feedback.words
+        if heading is not None:
+            words_line = "\n" + feedback.words if feedback.words else ""
+            message = f"List page: {heading} for item {item.number}" + words_line
         source = the_list.folder(delivery.keeper) / f"{item.id}.md"
         key = change_page.review_delivery_key(source, item.id, feedback.request)
         recipients = feedback.recipient_ids(delivery.keeper)
@@ -3409,8 +3412,7 @@ function bindFeedbackForm(form){
    const canReject=Boolean(notFixed && (repaired || retryRepair));
    if(repairActions) repairActions.hidden=!canReject;
    if(works) works.hidden=!repaired || Boolean(retryRepair);
-   if(notFixed) notFixed.disabled=!canReject || Boolean(form.dataset.sending) || repairRequests.sending(key) ||
-    (!retryRepair && !normalizeRepairWords(words.value));
+   if(notFixed) notFixed.disabled=!canReject || Boolean(form.dataset.sending) || repairRequests.sending(key);
    if(!tell) return;
    const name=matching('tell')?.recipientName ?? signed.recipientName;
    const wordsLabel=canReject ? 'Your words about this repair' : 'Your words for '+name+' about this item';
@@ -3485,10 +3487,9 @@ function bindFeedbackForm(form){
    const saveAction=changesParking || action==='read' || action==='remove' || action==='works';
    const heldSave=saveAction && Number(content.dataset.undoSeconds)>0;
    const asksQuestion=action==='question';
-   const retryRepair=rejectsRepair && Boolean(repairRequests.get(key));
    if(rejectsRepair && repairRequests.sending(key)) return;
    const submittedWords=rejectsRepair ? normalizeRepairWords(words.value) : words.value.trim();
-   if(usesWords && !retryRepair && !submittedWords) return;
+   if((action==='tell' || asksQuestion) && !submittedWords) return;
    if(parkForDelivery && scheduleEditor?.words()){
     scheduleEditor.showError('Clear the instruction to park until delivery.');return;
    }

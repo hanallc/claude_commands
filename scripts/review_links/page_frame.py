@@ -716,8 +716,7 @@ def verdict_button(item_type: VerdictItemType, action: VerdictAction, *,
     label = "Works" if action is VerdictAction.WORKS else NEGATIVE_VERDICT_LABELS[item_type]
     pressed = 'aria-pressed="true" ' if selected else ""
     style = ' class="primary"' if primary else ""
-    disabled = ' disabled' if item_type is VerdictItemType.LIST_REPAIR and action is VerdictAction.NOT_FIXED else ""
-    return f'<button {pressed}name="{item_type}" value="{action}"{style}{disabled}>{label}</button>'
+    return f'<button {pressed}name="{item_type}" value="{action}"{style}>{label}</button>'
 
 
 def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
