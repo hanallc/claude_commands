@@ -4667,20 +4667,24 @@ class AdmissionServer:
 
     def _request_mac_linux_evidence(self, request: wire.PlacementRequest,
                                     key: placement.HostEvidenceKey) -> placement.HostEvidence:
+        from scripts.mac_test import mac_test
+
         now = self.clock.now()
-        if any(_holds_consumed_guest_slot(saved) for saved in self.assignments.values()):
+        if (any(_holds_consumed_guest_slot(saved) for saved in self.assignments.values())
+                or any(is_mac_linux_guest(self.assignments[attempt].assignment.destination)
+                       for episode, attempt in self.current_assignments.items() if episode != request.episode)):
             return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion("busy"))
         backoff = mac_linux_backoff(now)
         if isinstance(backoff, placement.TemporaryExclusion):
             return placement.FreshHostEvidence(key, now, "", backoff)
+        block = mac_test.blocking_claim_block(mac_test.state_paths(), key.session)
+        if not isinstance(block, mac_test.NoMacBlock):
+            return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion("blocked"))
         self.host_requests[key] = request
         current = self.host_evidence(key)
         if isinstance(current, placement.FreshHostEvidence):
-            if current.observed_at > backoff.failed_at:
-                if isinstance(current.eligibility, placement.AllowedHost) and any(
-                        is_mac_linux_guest(self.assignments[attempt].assignment.destination)
-                        for episode, attempt in self.current_assignments.items() if episode != request.episode):
-                    return replace(current, eligibility=placement.TemporaryExclusion("busy"))
+            if (current.observed_at > backoff.failed_at
+                    and current.eligibility != placement.TemporaryExclusion("mac_linux_backoff")):
                 return current
             current = placement.StaleHostEvidence(key, current.observed_at, "mac_linux_reading_required")
         if isinstance(self.last_usable_configuration, records.MemoryConfig):

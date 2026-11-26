@@ -562,6 +562,100 @@ class PlacementStatusTests(unittest.TestCase):
                              placement.CandidateEligibility(
                                  guest.destination, placement.TemporaryExclusion(placement.MAC_LINUX_NO_ANSWER)))
 
+    def test_placement_uses_natedev_before_reading_an_assigned_guest(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, assignment_for, local_candidate, mac_linux_candidate, mac_linux_fixture,
+            placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            _ = mac_linux_fixture(fixture)
+            guest = mac_linux_candidate()
+            local = local_candidate(fixture)
+            holder = placement_request(fixture, session=OwningSession("guest-holder"))
+            holder = replace(holder, constraints=replace(holder.constraints, candidates=(guest,)))
+            _ = publish_candidate(fixture, holder)
+            assignment = assignment_for(fixture, holder)
+            self.assertEqual(assignment.destination, guest.destination)
+            saved = fixture.server.assignments[fixture.server.current_assignments[holder.episode]]
+            self.assertNotIsInstance(saved.permission, placement.PermissionConsumed)
+
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(guest, local)))
+            key = fixture.server.host_evidence_key(request, guest.destination)
+            self.assertIsInstance(fixture.server.host_evidence(key), placement.HostEvidenceUnavailable)
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            self.assertEqual(granted.assignment.destination, local.destination)
+            self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
+                             placement.CandidateEligibility(guest.destination, placement.TemporaryExclusion("busy")))
+            self.assertNotIn(key, fixture.server.host_readers)
+
+    def test_placement_waits_after_a_cached_guest_backoff_expires(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture, placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture:
+            backoff = mac_linux_fixture(fixture)
+            now = fixture.clock.now()
+            _ = backoff.write_text(str(now + 1))
+            os.utime(backoff, (now - 1, now - 1))
+            guest = mac_linux_candidate()
+            local = local_candidate(fixture)
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(guest, local)))
+            key = fixture.server.host_evidence_key(request, guest.destination)
+            fixture.server.host_requests[key] = request
+            reading = fixture.server.read_provider_evidence(key)
+            assert isinstance(reading, placement.FreshHostEvidence), reading
+            self.assertEqual(reading.eligibility, placement.TemporaryExclusion("mac_linux_backoff"))
+            self.assertEqual(reading.observed_at, now)
+            fixture.server.publish_host_evidence(reading)
+
+            fixture.clock.advance(2)
+            waiting, = fixture.connect(request).replies()
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertEqual(waiting.eligibility, (
+                placement.CandidateEligibility(guest.destination, placement.EvidenceNeeded("mac_linux_reading_required")),
+                placement.CandidateEligibility(local.destination, placement.AllowedHost()),
+            ))
+            _ = publish_candidate(fixture, request)
+            self.run_placement_timer(fixture)
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.Assignment), granted
+            self.assertEqual(granted.assignment.destination, guest.destination)
+
+    def test_placement_uses_natedev_before_reading_a_blocked_guest(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture, placement_request,
+        )
+        from scripts.mac_test import mac_test
+
+        with PlacementFixture() as fixture:
+            _ = mac_linux_fixture(fixture)
+            paths = mac_test.state_paths()
+            self.assertTrue(paths.block.is_relative_to(fixture.root))
+            paths.block.parent.mkdir(parents=True, exist_ok=True)
+            since = datetime.fromtimestamp(fixture.clock.now(), UTC)
+            mac_test.write_block(paths.block, mac_test.ActiveMacBlock(
+                "fixture", "private hold", since, since + timedelta(hours=1),
+                mac_test.RecordedSession("guest-block-holder", "fixture"), mac_test.NO_SHOWRUNNER,
+                "off_before", mac_test.FREE_MESSAGE_NOT_NEEDED))
+            guest = mac_linux_candidate()
+            local = local_candidate(fixture)
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(guest, local)))
+            key = fixture.server.host_evidence_key(request, guest.destination)
+            self.assertIsInstance(fixture.server.host_evidence(key), placement.HostEvidenceUnavailable)
+
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            self.assertEqual(granted.assignment.destination, local.destination)
+            self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
+                             placement.CandidateEligibility(guest.destination, placement.TemporaryExclusion("blocked")))
+            self.assertNotIn(key, fixture.server.host_readers)
+
     def test_mac_linux_placement_probe_shares_one_deadline_across_connect_retries(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, mac_linux_candidate, mac_linux_fixture, placement_request,
