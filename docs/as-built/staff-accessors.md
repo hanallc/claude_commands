@@ -265,6 +265,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/nightly_review/candidates.py` | read | snapshot, caller_identity, by_current_session |
 | `scripts/nightly_review/nightly_review.py` | read | active, snapshot |
 | `scripts/nix_env/heal.py` | read | initial_snapshot |
+| `scripts/notify/pushover.py` | read | snapshot |
 | `scripts/production/add_showrunner.py` | write | by_id, cli_result, initial_snapshot, native_id, operation, update_current_session, set_home |
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
