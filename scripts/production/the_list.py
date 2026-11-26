@@ -31,6 +31,7 @@ from pathlib import Path
 from tempfile import TemporaryFile
 from time import monotonic
 from typing import IO, Literal, TypedDict, cast
+from unicodedata import category
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.agents import remote
@@ -142,6 +143,36 @@ Eta = datetime | date | EtaRange | EtaStatus | EtaDescription
 class ItemDependency:
     number: int
     condition: str
+
+
+_EMPTY_TAG_LIST_TEXT = "none"
+
+
+def tag_character_error(text: str) -> str:
+    for character in text:
+        kind = category(character)
+        if kind == "Cc":
+            return "a tag cannot contain a control character"
+        if kind == "Cs":
+            return "a tag cannot contain a lone surrogate"
+    return ""
+
+
+@dataclass(frozen=True)
+class Tag:
+    text: str
+
+    def __post_init__(self) -> None:
+        _line(self.text, "tag")
+        error = tag_character_error(self.text)
+        if error:
+            raise ListError(error)
+        if "," in self.text:
+            raise ListError("a tag cannot contain a comma")
+        normalized = " ".join(self.text.lower().split())
+        if normalized == _EMPTY_TAG_LIST_TEXT:
+            raise ListError("'none' is reserved for an empty tag list")
+        object.__setattr__(self, "text", normalized)
 
 
 @dataclass(frozen=True)
@@ -275,6 +306,7 @@ PAGE_SOURCE = "nate via List"
 _IMAGE_ANSWER_SOURCE = "nate via Images"
 _LEGACY_RECEIPT = "List request receipt: "
 _LEGACY_FEEDBACK = "Feedback to morty: "
+_TAG_CHANGE_NOTE = "Tags: "
 feedback_claims: set[tuple[Path, str]] = set()
 feedback_claims_lock = threading.Lock()
 
@@ -631,6 +663,7 @@ class ListItem:
     run_deliveries: tuple[RunDelivery, ...] = ()
     new_item_draft_id: list_draft.ListDraftOrigin = list_draft.NoNewItemDraft.ABSENT
     asks: tuple[Ask, ...] = ()
+    tags: tuple[Tag, ...] = ()
 
     def __post_init__(self) -> None:
         if self.state != ItemState.CLOSED or not isinstance(self.unread_since, datetime):
@@ -686,7 +719,7 @@ class ProducerListRead:
     incomplete: bool
 
 
-class ItemChanges(TypedDict, total=False):
+class ItemFieldChanges(TypedDict, total=False):
     title: str
     owner: ItemOwner
     producer: staff.StaffId
@@ -704,7 +737,11 @@ class ItemChanges(TypedDict, total=False):
     schedule: Schedule
 
 
-class LogFields(ItemChanges, total=False):
+class ItemChanges(ItemFieldChanges, total=False):
+    tags: tuple[Tag, ...]
+
+
+class LogFields(ItemFieldChanges, total=False):
     parked_until: Parking
     closing_words: str
 
@@ -713,6 +750,11 @@ class LogFields(ItemChanges, total=False):
 class FieldChange:
     action: Literal["Added", "Updated", "Parked", "Closed"]
     fields: LogFields
+
+
+@dataclass(frozen=True)
+class TagsChanged:
+    tags: tuple[Tag, ...]
 
 
 @dataclass(frozen=True)
@@ -809,7 +851,7 @@ class GoNotDelivered:
 
 
 PageActivity = PageFeedback | PageRequest | QuestionRequestReceipt | UnparkNoChangeReceipt
-ListEvent = (FieldChange | QuestionAnswered | QuestionClosed | MarkedRead | Reopened | Unparked
+ListEvent = (FieldChange | TagsChanged | QuestionAnswered | QuestionClosed | MarkedRead | Reopened | Unparked
              | ReviewLinksChanged | EvidenceCopyRemoved | AskOpened | AskWithdrawn | GoGiven | GoNotDelivered | PageActivity)
 LogContent = str | ListEvent
 
@@ -1433,6 +1475,7 @@ def _validate(item: ListItem) -> None:
         raise ListError("only a Closed item can have closing words")
     _validate_dependencies(item.blocked_by, item.number)
     _validate_related(item.related_to, item.number)
+    _validate_tags(item.tags)
     _validate_review_keys(item.reviews)
     _validate_asks(item.asks)
     for name, value in (("next_step", item.next_step), ("latest_status", item.latest_status),
@@ -1502,6 +1545,19 @@ def _review_keys(value: object) -> tuple[str, ...]:
     if any(not isinstance(entry, str) for entry in entries):
         raise ListError("reviews must be a list of keys")
     return tuple(cast(list[str], entries))
+
+
+def _validate_tags(tags: tuple[Tag, ...]) -> None:
+    if len(tags) != len(set(tags)):
+        raise ListError("an item cannot have duplicate tags")
+
+
+def _read_tags(value: object) -> tuple[Tag, ...]:
+    if not isinstance(value, list):
+        raise ListError("tags must be a list")
+    tags = tuple(Tag(_field_text(entry, "tag")) for entry in cast(list[object], value))
+    _validate_tags(tags)
+    return tags
 
 
 def _log_fields(fields: LogFields) -> dict[str, object]:
@@ -1700,6 +1756,9 @@ def _log_content(content: LogContent) -> dict[str, object]:
         return {"action": content.action, "fields": _log_fields(content.fields), "request": _request_id(content.request)}
     if isinstance(content, FieldChange):
         return {"action": content.action, "fields": _log_fields(content.fields)}
+    if isinstance(content, TagsChanged):
+        tags = ", ".join(tag.text for tag in content.tags) or _EMPTY_TAG_LIST_TEXT
+        return {"note": _TAG_CHANGE_NOTE + tags}
     if isinstance(content, QuestionAnswered):
         return {"action": "Answered", "question_id": _question_id(content.question_id)}
     if isinstance(content, QuestionClosed):
@@ -1748,9 +1807,9 @@ def _read_field_change(action: Literal["Added", "Updated", "Parked", "Closed"], 
     match action:
         case "Added":
             valid = {"title", "owner", "producer", "state", "eta", "next_step", "latest_status"} <= fields.keys()
-            valid = valid and fields.keys() <= ItemChanges.__annotations__.keys()
+            valid = valid and fields.keys() <= ItemFieldChanges.__annotations__.keys()
         case "Updated":
-            allowed = ItemChanges.__annotations__.keys() | ({"parked_until"} if "schedule" in fields else set[str]())
+            allowed = ItemFieldChanges.__annotations__.keys() | ({"parked_until"} if "schedule" in fields else set[str]())
             valid = bool(fields) and fields.keys() <= allowed
         case "Parked":
             valid = fields.keys() in ({"parked_until"}, {"parked_until", "schedule", "state"})
@@ -1761,6 +1820,17 @@ def _read_field_change(action: Literal["Added", "Updated", "Parked", "Closed"], 
     return FieldChange(action, fields)
 
 
+def _read_tag_note(note: str) -> TagsChanged | str:
+    text = note.removeprefix(_TAG_CHANGE_NOTE)
+    if text == _EMPTY_TAG_LIST_TEXT:
+        return TagsChanged(())
+    try:
+        tags = _read_tags(text.split(", "))
+    except ListError:
+        return note
+    return TagsChanged(tags) if text == ", ".join(tag.text for tag in tags) else note
+
+
 def _read_log_line(line: str, number: int, read_schedule: Callable[[object], Schedule]) -> ItemChange:
     if line.startswith("- {"):
         fields = _json_fields(cast(object, json.loads(line[2:])))
@@ -1769,6 +1839,8 @@ def _read_log_line(line: str, number: int, read_schedule: Callable[[object], Sch
             raise ListError("invalid log time or source")
         content: LogContent
         match fields:
+            case {"note": str(note)} if len(fields) == 1 and note.startswith(_TAG_CHANGE_NOTE):
+                content = _read_tag_note(note)
             case {"note": str(note)} if len(fields) == 1:
                 content = _read_legacy_note(note, source, number, read_schedule)
             case {"note": str(note), "image_answer": {"key": str(key), "producer": str(producer)}} if len(fields) == 2:
@@ -1867,6 +1939,12 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
             return _read_schedule(raw, lambda: schedule.run_allowance if isinstance(schedule, ScheduledSeries) else legacy_allowance())
 
         changes = tuple(_read_log_line(line.removesuffix("\r"), number, read_log_schedule) for line in log_lines)
+        if "tags" in fields:
+            tags = _read_tags(cast(object, json.loads(fields["tags"])))
+        else:
+            # An older writer can omit the header field and preserve the log.
+            tags = next((event.tags for change in reversed(changes)
+                         if isinstance(event := change.what, TagsChanged)), ())
         item = ListItem(number, fields["title"],
                         UnassignedOwner(fields["owner"]) if fields["owner"] in UnassignedOwner else staff.StaffId(fields["owner"]),
                         staff.StaffId(fields.get("producer", store.owner)),
@@ -1880,7 +1958,8 @@ def _read_item(store: record_store.NumberedRecords, identity: str, fields: dict[
                         _review_keys(cast(object, json.loads(fields.get("reviews", "[]")))),
                         delivery_state.read_list_questions(fields.get("questions", "[]")), schedule,
                         _read_run_deliveries(fields), list_draft.read_list_draft(fields),
-                        _read_asks(fields.get("asks", "[]")))
+                        _read_asks(fields.get("asks", "[]")),
+                        tags=tags)
         if item.id != identity or not changes:
             raise ListError("the item number must match its path and the log must not be empty")
         _validate(item)
@@ -1904,6 +1983,9 @@ def _require_active_open_producers(items: Sequence[ListItem]) -> None:
 
 
 def _stored_log_line(entry: ItemChange) -> str:
+    if not isinstance(entry, _ImageAnswerChange) and isinstance(entry.what, str) and entry.what.startswith(_TAG_CHANGE_NOTE):
+        # Keep legacy notes distinct from tag changes.
+        return f"- {entry.time.isoformat(' ')} {entry.what} — {entry.source}"
     fields = _log_content(entry.what)
     if isinstance(entry, _ImageAnswerChange):
         fields["image_answer"] = {"key": entry.key, "producer": entry.producer}
@@ -1926,6 +2008,7 @@ def _save(store: record_store.NumberedRecords, item: ListItem, *, previous_produ
               "parked_until": question_path.write_later(later_value(item.parked_until)),
               "blocked_by": json.dumps([(entry.number, entry.condition) for entry in item.blocked_by], ensure_ascii=False),
               "related_to": json.dumps(item.related_to), "reviews": json.dumps(item.reviews),
+              "tags": json.dumps([tag.text for tag in item.tags], ensure_ascii=False),
               "requested_by": item.requested_by.value,
               "opened": _time_text(item.opened), "updated": _time_text(item.updated),
               "closed": _time_text(item.closed), "closing_words": item.closing_words}
@@ -1963,6 +2046,22 @@ def records(keeper: staff.StaffId, *, include_closed: bool = False,
             sources: list[Path] | None = None) -> list[ListItem]:
     items = _store(keeper).records(lambda identity: load(keeper, identity), sources=sources)
     return sorted((item for item in items if include_closed or item.state != ItemState.CLOSED), key=lambda item: item.number)
+
+
+def tag_counts(items: Iterable[ListItem]) -> dict[Tag, int]:
+    """Count the open items for each tag."""
+    counts: dict[Tag, int] = {}
+    for item in items:
+        if item.state != ItemState.CLOSED:
+            for tag in item.tags:
+                counts[tag] = counts.get(tag, 0) + 1
+    return counts
+
+
+def select_by_tags(items: Iterable[ListItem], tags: Iterable[Tag]) -> list[ListItem]:
+    """Keep items that have every requested tag."""
+    required = frozenset(tags)
+    return [item for item in items if required.issubset(item.tags)]
 
 
 def _producer_records(keeper: staff.StaffId, producer: staff.StaffId, *, include_closed: bool) -> ProducerListRead:
@@ -2152,10 +2251,14 @@ def _new_item(number: int, title: str, owner: ItemOwner, keeper: staff.StaffId, 
                     new_item_draft_id=new_item_draft_id, **defaults)
     if changes:
         item = replace(item, **changes)
+    fields = changes.copy()
+    _ = fields.pop("tags", ())
     initial: LogFields = {"title": item.title, "owner": item.owner, "producer": item.producer,
                           "state": item.state, "eta": item.eta, "next_step": item.next_step,
-                          "latest_status": item.latest_status, "requested_by": item.requested_by, **changes}
+                          "latest_status": item.latest_status, "requested_by": item.requested_by, **fields}
     log = (ItemChange(moment, FieldChange("Added", initial), source),)
+    if item.tags:
+        log += (ItemChange(moment, TagsChanged(item.tags), source),)
     if reviews:
         log += (ItemChange(moment, ReviewLinksChanged("Linked reviews", reviews), source),)
     item = replace(item, log=log)
@@ -2234,7 +2337,12 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
         entries: list[ItemChange] = []
         schedule_changed = _schedule_fields(item.schedule) != _schedule_fields(changed.schedule)
         if changed != item or schedule_changed:
-            event = what(changed) if callable(what) else what
+            tags_changed = changed.tags != item.tags
+            tags_only = tags_changed and not schedule_changed and replace(changed, tags=item.tags) == item
+            if tags_only:
+                event = TagsChanged(changed.tags)
+            else:
+                event = what(changed) if callable(what) else what
             if isinstance(event, FieldChange) and schedule_changed:
                 log_fields: LogFields = {**event.fields, "schedule": changed.schedule}
                 if event.action != "Closed" and item.state != changed.state:
@@ -2243,10 +2351,15 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
                     log_fields["parked_until"] = changed.parked_until
                 event = replace(event, fields=log_fields)
             entries.append(ItemChange(moment, event, source))
+            if tags_changed and not tags_only:
+                entries.append(ItemChange(moment, TagsChanged(changed.tags), source))
             if follow is not None:
                 entries.extend(follow(item, changed, moment))
-            stays_unread = unread(changed) if callable(unread) else unread
-            changed = replace(changed, updated=moment, unread_since=moment if stays_unread else NoTimestamp.UNSET)
+            unread_since = item.unread_since
+            if not tags_only:
+                mark_unread = unread(changed) if callable(unread) else unread
+                unread_since = moment if mark_unread else NoTimestamp.UNSET
+            changed = replace(changed, updated=moment, unread_since=unread_since)
             if (isinstance(event, FieldChange) and event.action == "Updated"
                     and event.fields.get("state") == ItemState.DELIVERED
                     and changed.parked_until is ParkUntilDelivered.DELIVERED):
@@ -2980,7 +3093,7 @@ def update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, source
 
 _LAUNCHER = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py"
 _PRODUCER_UPDATE_FIELDS = ("title", "done_when", "unit", "latest_status", "next_step", "eta", "state", "next_check",
-                           "evidence", "add_evidence")
+                           "owner", "related_to", "blocked_by", "evidence", "add_evidence")
 _PRODUCER_SCHEDULE_FIELDS = ("start", "do", "repeat", "scope")
 _PRODUCER_UPDATE_OPTIONS = tuple("--" + field.replace("_", "-") for field in _PRODUCER_UPDATE_FIELDS)
 PRODUCER_SCHEDULE_UPDATE_OPTIONS = (*_PRODUCER_UPDATE_OPTIONS, *("--" + field for field in _PRODUCER_SCHEDULE_FIELDS))
@@ -2999,7 +3112,7 @@ def _append_evidence(evidence: str, line: str) -> str:
     return evidence + separator + line
 
 
-def log_field_changes(item: ListItem) -> Generator[dict[str, object]]:
+def log_field_changes(item: ListItem, *, include_tags: bool = False) -> Generator[dict[str, object]]:
     """Replay the saved fields and yield the fields to show for each log entry."""
     previous: dict[str, object] = {}
     for entry in item.log:
@@ -3031,6 +3144,8 @@ def log_field_changes(item: ListItem) -> Generator[dict[str, object]]:
             previous["parked_until"] = NoTimestamp.UNSET
             if isinstance(event, UnparkedForDelivery):
                 previous["state"] = ItemState.DELIVERED
+        elif include_tags and isinstance(event, TagsChanged):
+            shown = {"tags": event.tags}
         yield shown
 
 
@@ -3091,7 +3206,9 @@ def _update(keeper: staff.StaffId, identity: str, changes: ItemChanges, *, sourc
         return changed
 
     def event(changed: ListItem) -> FieldChange:
-        fields: LogFields = {**changes}
+        field_changes = changes.copy()
+        _ = field_changes.pop("tags", ())
+        fields: LogFields = {**field_changes}
         if "state" in fields:
             fields["state"] = changed.state
         if add_evidence:
@@ -3142,6 +3259,27 @@ def unlink(keeper: staff.StaffId, identity: str, reviews: Sequence[str], *, sour
         _open(item)
         return replace(item, reviews=tuple(review for review in item.reviews if review not in chosen))
     return _change(keeper, identity, edit, ReviewLinksChanged("Unlinked reviews", chosen), source).item
+
+
+def _change_tags(keeper: staff.StaffId, identity: str, tag: Tag, *, remove: bool, source: str,
+                 assigned_to: staff.StaffId | AllItems) -> ListItem:
+    def edit(item: ListItem, _: datetime) -> ListItem:
+        if remove:
+            return replace(item, tags=tuple(saved for saved in item.tags if saved != tag))
+        return item if tag in item.tags else replace(item, tags=(*item.tags, tag))
+
+    return _change(keeper, identity, edit, lambda item: TagsChanged(item.tags), source,
+                   assigned_to=assigned_to).item
+
+
+def add_tag(keeper: staff.StaffId, identity: str, tag: Tag, *, source: str,
+            assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
+    return _change_tags(keeper, identity, tag, remove=False, source=source, assigned_to=assigned_to)
+
+
+def remove_tag(keeper: staff.StaffId, identity: str, tag: Tag, *, source: str,
+               assigned_to: staff.StaffId | AllItems = AllItems.INCLUDED) -> ListItem:
+    return _change_tags(keeper, identity, tag, remove=True, source=source, assigned_to=assigned_to)
 
 
 def park(keeper: staff.StaffId, identity: str, until: Parking, *, source: str,
@@ -3270,8 +3408,9 @@ def unread_update(item: ListItem) -> UnreadUpdate | NoUnreadUpdate:
     """Keep an update identity stable when page feedback adds log entries."""
     if not isinstance(item.unread_since, datetime):
         return NoUnreadUpdate.ABSENT
-    changes = [(index, entry.time.isoformat(), _unread_log_content(entry.what), entry.source) for index, entry in enumerate(item.log)
-               if not (_own_page_entry(entry) or _is_tell_move(item.log, index))]
+    log = tuple(entry for entry in item.log if not isinstance(entry.what, TagsChanged))
+    changes = [(index, entry.time.isoformat(), _unread_log_content(entry.what), entry.source) for index, entry in enumerate(log)
+               if not (_own_page_entry(entry) or _is_tell_move(log, index))]
     text = json.dumps((item.unread_since.isoformat(), changes), ensure_ascii=False)
     return UnreadUpdate(hashlib.sha256(text.encode()).hexdigest())
 
@@ -3298,7 +3437,8 @@ def _unread_changes(item: ListItem, *, include_park_receipts: bool = False) -> G
                 or isinstance(content, FieldChange) and content.action == "Closed"):
             return
         park_receipt = include_park_receipts and isinstance(content, PageRequest) and content.action == "park"
-        if park_receipt or not (_own_page_entry(change) or _is_tell_move(item.log, index)):
+        if park_receipt or not (isinstance(content, TagsChanged) or _own_page_entry(change)
+                                or _is_tell_move(item.log, index)):
             yield change
         if isinstance(content, Reopened) or content == "Reopened":
             return
@@ -4227,6 +4367,13 @@ def main(argv: list[str] | None = None) -> int:
     _ = withdrawal.add_argument("--reason", required=True, help="why the ask is no longer needed")
     top = commands.add_parser("top-priority", help="make an open item the top priority item of its producer")
     _ = top.add_argument("--id", required=True, help="the List item ID, such as L1")
+    tag = commands.add_parser("tag", help="add or remove a tag")
+    _ = tag.add_argument("--id", required=True)
+    _ = tag.add_argument("--source")
+    tag_action = tag.add_mutually_exclusive_group(required=True)
+    _ = tag_action.add_argument("--add")
+    _ = tag_action.add_argument("--remove")
+    _ = commands.add_parser("tags", help="list tags and open item counts")
     for name in ("add", "update", "park", "unpark", "close", "reopen", "mark-read", "clean-evidence", "link", "unlink", "list"):
         command = commands.add_parser(name)
         if name != "list":
@@ -4267,6 +4414,7 @@ def main(argv: list[str] | None = None) -> int:
             _ = command.add_argument("--all", action="store_true")
             _ = command.add_argument("--include-parked", action="store_true")
             _ = command.add_argument("--latest-status", action="store_true", help="show the latest status column")
+            _ = command.add_argument("--tag", action="append", default=[], help="require this tag on each result")
     args = parser.parse_args(argv)
     name = cast(str, args.command)
     if name in ("link", "unlink") and not cast(list[ReviewByShownId | ReviewByKey], args.reviews):
@@ -4327,8 +4475,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         # Only morty updates every field of every item, in each keeper's folder.
         assigned_to = AllItems.INCLUDED if caller.id == morty else caller.id
-        if name == "list":
-            include_closed = cast(bool, args.all)
+        if name in ("list", "tags"):
+            include_closed = name == "list" and cast(bool, args.all)
             if assigned_to is AllItems.INCLUDED:
                 items = records(keeper, include_closed=include_closed)
                 incomplete = False
@@ -4336,25 +4484,46 @@ def main(argv: list[str] | None = None) -> int:
                 read = _producer_records(keeper, assigned_to, include_closed=include_closed)
                 items = read.items
                 incomplete = read.incomplete
-            print(_format_table(items, record, include_parked=include_closed or cast(bool, args.include_parked),
-                                show_latest_status=cast(bool, args.latest_status)))
+            if name == "tags":
+                counts = tag_counts(items)
+                for saved_tag in sorted(counts, key=lambda entry: entry.text):
+                    print(f"{saved_tag.text}\t{counts[saved_tag]}")
+            else:
+                tags = [Tag(text) for text in cast(list[str], args.tag)]
+                if tags:
+                    items = select_by_tags(items, tags)
+                print(_format_table(items, record, include_parked=include_closed or cast(bool, args.include_parked),
+                                    show_latest_status=cast(bool, args.latest_status)))
             if incomplete:
                 raise ListError("The List results are incomplete. Could not read every record.")
+            return 0
+        if name == "tag":
+            if assigned_to is AllItems.INCLUDED:
+                if source is None:
+                    parser.error("tag requires --source for morty")
+            else:
+                if isinstance(caller.retirement, staff.RetiredProducer):
+                    raise ListError(f"{caller.name}: retired producer. Choose an active producer.")
+                source = caller.name
+            addition = cast(str | None, args.add)
+            change_tag = add_tag if addition is not None else remove_tag
+            value = Tag(addition if addition is not None else cast(str, args.remove))
+            _ = change_tag(keeper, cast(str, args.id), value, source=source, assigned_to=assigned_to)
             return 0
         schedule_scope = cast(ScheduleScope, getattr(args, "scope", ScheduleScope.UNSPECIFIED))
         if name == "update":
             identity = _cli_item_id(cast(str, args.id))
             keeper = _record_keeper(morty, caller.id, identity, cast(staff.StaffId | None, args.keeper),
                                     policy=_KeeperRouting.UPDATE)
-            reassigns = cast(str | None, args.producer) is not None or cast(str | None, args.owner) is not None
-            # A producer gets the field refusal below, because it never changes these fields.
-            if assigned_to is AllItems.INCLUDED and keeper != morty and reassigns:
-                raise ListError("move the item to morty's List before you change its producer or owner")
             if assigned_to is not AllItems.INCLUDED:
                 options = cast(dict[str, object], vars(args))
                 _check_producer_update_fields(key for key, value in options.items()
                                               if value is not None and key not in {"command", "id", "keeper", "source"}
                                               and value is not ScheduleScope.UNSPECIFIED)
+            reassigns = cast(str | None, args.producer) is not None or cast(str | None, args.owner) is not None
+            if keeper != morty and reassigns:
+                raise ListError("move the item to morty's List before you change its producer or owner")
+            if assigned_to is not AllItems.INCLUDED:
                 _ = _update(keeper, identity, _cli_changes(args, record, add_evidence), source=source or "",
                             add_evidence=add_evidence or "", assigned_to=caller,
                             schedule_edits=_cli_schedule_edits(args), schedule_scope=schedule_scope, say_schedule=True)

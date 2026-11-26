@@ -1385,7 +1385,7 @@ The page uses the order from the latest server response.
 A column button sorts all matching items by its values.
 A second click reverses that order.
 
-By default, the List starts with All selected in the Owner, Producer, and Show rows.
+By default, the List starts with All selected in the Owner, Producer, Tag, and Show rows.
 Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
 If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
@@ -1399,6 +1399,35 @@ The List restores these words on reload.
 The List ignores form text that the browser restores without an input event.
 The chip order is All, Needs me, Producer answering, Working, Blocked, Parked, and Scheduled.
 The List excludes Closed records from rows, filters, and counts.
+
+Tags appear as chips under each item title.
+The Tag row counts open items that match the words and the other filters.
+The server applies the `tag` query before the first paint.
+The server and browser ignore query tags that contain control characters or lone surrogates.
+Select a chip in the Tag row or under a title to filter the items.
+Each item must have every selected tag.
+Type the first letters of a tag to find it in the suggestions.
+Select All in the Tag row to clear the tag selection.
+
+Opening an item creates its Tags section from a shared template.
+The editor reuses signed List action data when the item has it.
+Otherwise, it requests signed data for the keeper and item when the item opens.
+The Tags section appears before Links.
+Type a tag and press Enter, or select a suggestion.
+The suggestions show matching tags first and offer Create for a new tag.
+The field keeps focus after a save.
+The field shows the tag validation error for invalid text.
+Tags cannot contain Unicode control characters (`Cc`) or lone surrogates (`Cs`).
+Select × to remove a tag, or press Backspace in the empty field to remove the last tag.
+The editor offers Undo only for a removal that the server confirms.
+If another session already removed the tag, the editor shows the current tags.
+Select Undo before the notice fades to add the tag again.
+The same signed List action path uses `the_list.add_tag` and `the_list.remove_tag` to save the record header.
+The List sends tag edits for one item in order and shows the pending count.
+Backspace uses the tag order after the pending edits.
+If a save fails, the List reads the item's current tags.
+The editor shows a save error only for the latest edit.
+
 Parked includes items with an active park, no unread answer, and no open Go request.
 Needs me includes each item with an unread answer or an open Go request.
 It also includes each unparked item with an unread delivery release.
