@@ -318,6 +318,7 @@ class FiledReviewExchange:
     exchange_ids: frozenset[str]
     open_staff_question: bool
     filed_slot_id: str = ""
+    filed_investigation_answer: bool = False
 
 
 @dataclass(frozen=True)

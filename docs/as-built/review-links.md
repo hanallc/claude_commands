@@ -2368,10 +2368,13 @@ Closed staff questions without a saved answer stay outside the migration.
 
 New questions and answers use the same writer after the source saves.
 The writer keeps the source key, exchange ID, and question and reply origins.
-A reply origin is a reply tag, a verified log position, or an answer saved only in its slot.
-The writer uses legacy slot evidence at first filing.
+A reply uses a tag, a verified log event, a slot answer, or a native record answer.
+An unanswered exchange records that it has no answer.
+A slot question uses its source key and question ID.
+An anonymous log question needs independent evidence to share that ID.
+A native Question keeps its saved pairs even when a reply cannot claim a log event.
 The preview reports each unresolved source key and its reply count.
-Review keeps unresolved replies visible.
+Review keeps an Investigation or native Question visible while an outgoing question waits or a reply remains unresolved.
 A later slot change leaves the filed reply binding and answer text intact.
 A filed question can receive an answer or close after withdrawal.
 The writer also updates read state and verified question metadata.
@@ -2379,6 +2382,9 @@ The writer rereads the source under its filing lock.
 The List allocator records the destination before it advances the counter.
 The writer saves pending exchanges before it writes the List item.
 A retry uses the recorded destination and pending exchanges.
+Old bindings keep their encoded form for receipt checks.
+Migration rewrites verified bindings in place and issues receipts after the new List data is durable.
+An unverified Investigation binding remains visible in Review and requires a separate repair.
 Review checks a save receipt before it hands off each exchange.
 The handoff hides only the recorded reply event.
 Review keeps separate decisions and unread replies that remain in Review.

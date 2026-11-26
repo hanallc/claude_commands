@@ -2351,13 +2351,12 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
         return chosen
 
 
-def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.Exchange, ...]) -> ListItem:
+def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
     saved = {(exchange.source_key, exchange.exchange_id): exchange for exchange in item.filed_exchanges}
     for exchange in exchanges:
         key = (exchange.source_key, exchange.exchange_id)
         previous = saved.get(key)
-        saved[key] = (previous.updated(exchange) if previous is not None
-                      else list_exchange.FiledExchange.from_exchange(exchange))
+        saved[key] = previous.updated(exchange) if previous is not None else exchange
     return replace(item, filed_exchanges=tuple(saved.values()))
 
 
@@ -2558,7 +2557,7 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
 
 
 def _save_linked_exchanges(store: record_store.NumberedRecords, item: ListItem,
-                           exchanges: tuple[list_exchange.Exchange, ...]) -> ListItem:
+                           exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
     changed = _with_filed_exchanges(item, exchanges)
     if changed != item:
         with record_store.keep_file_on_error(store.path(item.id)):
