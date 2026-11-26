@@ -1580,6 +1580,7 @@ class AccountsTests(unittest.TestCase):
         from scripts.herdr.test_worker_panes import PaneWorld
         from scripts.production import fake_unit_host
         from scripts.production.staff_test_support import unit_membership
+        from scripts.review_links import accounts_page
 
         _, target = self.workers_fixture()
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1601,11 +1602,22 @@ class AccountsTests(unittest.TestCase):
             _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
             _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "shutdown.conf", "start_seconds=20\n")
             reading = accounts.read_status(detail=True)
-        table = accounts.render_status_table(reading)
-        self.assertIn(f"herdr {world.session}:{pane}: pane is starting", reading.notes)
-        self.assertIn(f"worker {row.name}: starting", reading.detail_lines)
+            table = accounts.render_status_table(reading)
+            stored = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
+            markup = accounts_page.board(stored)
+            document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(stored)))
+        state = f"{row.name}: starting"
+        self.assertIn(f"worker {state}", reading.detail_lines)
         self.assertIn("busy 1, idle 0", table)
-        self.assertNotIn("read warning: herdr", table)
+        self.assertIn(f">workers</span><br>{state}</td>", markup)
+        self.assertEqual(document.get("starting_workers"),
+                         [{"session": row.current_session, "name": row.name, "state": "starting"}])
+        for problem in (*reading.notes, *stored.notes, *document["problems"]):
+            self.assertNotIn("pane is starting", problem)
+            self.assertNotIn(state, problem)
+            self.assertNotIn(f"{world.session}:{pane}", problem)
+        self.assertNotIn("pane is starting", markup)
+        self.assertEqual(markup.count(state), 1)
 
     def test_peer_counts_age_failure_and_recovery_use_only_the_local_counts(self) -> None:
         row = SharedStatusDocumentTests().row()

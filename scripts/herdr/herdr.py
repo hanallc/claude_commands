@@ -1782,27 +1782,22 @@ class PaneObservations:
 
 
 _pane_observations: ContextVar[PaneObservations | None] = ContextVar("pane_observations", default=None)
-_starting_notes: ContextVar[list[str] | None] = ContextVar("starting_pane_notes", default=None)
+_quiet_starting_panes: ContextVar[bool] = ContextVar("quiet_starting_panes", default=False)
 
 
 @contextmanager
-def starting_pane_notes() -> Generator[list[str]]:
-    """Give a status report the starting notices for its normal output."""
-    notes: list[str] = []
-    token = _starting_notes.set(notes)
+def quiet_starting_panes() -> Generator[None]:
+    """Suppress startup notices while Accounts reads worker states."""
+    token = _quiet_starting_panes.set(True)
     try:
-        yield notes
+        yield
     finally:
-        _starting_notes.reset(token)
+        _quiet_starting_panes.reset(token)
 
 
 def _report_starting_pane(place: str) -> None:
-    note = f"herdr {place}: {PANE_STARTING}"
-    notes = _starting_notes.get()
-    if notes is None:
-        print(note, file=sys.stderr)
-    else:
-        notes.append(note)
+    if not _quiet_starting_panes.get():
+        print(f"herdr {place}: {PANE_STARTING}", file=sys.stderr)
 
 
 _reported_target_retentions: ContextVar[set[tuple[HerdrPlace | NotInHerdr, str | AgentProcessIdentity, str]]] = (
@@ -3853,44 +3848,8 @@ type CheckedPane[Owner] = ProvedMatch[Owner] | ProvedOtherOwner | ObservedEmpty 
 
 
 def _foreground_processes(info: dict[str, object]) -> list[dict[str, object]]:
-    rows = [json_object(value, "native foreground process")
+    return [json_object(value, "native foreground process")
             for value in json_items(info.get("foreground_processes"), "native foreground processes")]
-    if _platform() != "linux" or len(rows) < 2:
-        return rows
-    processes: list[dict[str, object]] = []
-    groups: dict[int, int] = {}
-    leaders: set[int] = set()
-    for row in rows:
-        pid = row.get("pid")
-        group = _linux_thread_group(pid) if type(pid) is int and pid > 0 else None
-        if group is None:
-            processes.append(row)
-            continue
-        position = groups.get(group)
-        if position is None:
-            groups[group] = len(processes)
-            processes.append(row if pid == group else {**row, "pid": group})
-        elif pid == group:
-            if group in leaders:
-                processes.append(row)
-            else:
-                processes[position] = row
-        if pid == group:
-            leaders.add(group)
-    return processes
-
-
-def _linux_thread_group(pid: int) -> int | None:
-    """Read the thread group from the kernel's status for this PID."""
-    try:
-        with (proc_root() / str(pid) / "status").open() as status:
-            for line in status:
-                if line.startswith("Tgid:"):
-                    group = int(line.removeprefix("Tgid:"))
-                    return group if group > 0 else None
-    except (OSError, ValueError):
-        pass
-    return None
 
 
 def _foreground_pid(process: dict[str, object]) -> int:
