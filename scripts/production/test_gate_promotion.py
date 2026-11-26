@@ -333,6 +333,40 @@ sys.meta_path.insert(0, NoRepositoryModules())
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), tip)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD^2"), self.checkpoint)
 
+    def test_a_legacy_gate_retries_a_merge_with_a_local_production_doc_commit(self) -> None:
+        _ = self.git(self.main, "switch", "--detach", "main")
+        _ = self.git(self.checkout, "switch", "main")
+        self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `main`\n")
+        self.write(self.checkout / "production-note.md", "Retire alpha.\n")
+        local = self.commit(self.checkout, "production(fixture): retire alpha")
+        hook = self.origin / "hooks/pre-receive"
+        self.write(hook, '#!/bin/sh\necho "fixture push refusal" >&2\nexit 1\n')
+        hook.chmod(0o755)
+        options = ("--merge-branch", "main", "--main-repo", str(self.checkout))
+
+        stopped = self.run_gate(*options)
+
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("fixture push refusal", stopped.stderr)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, local, self.checkpoint])
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        hook.unlink()
+
+        with mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check:
+            retried = self.run_gate(*options)
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        check.assert_called_once_with(behavior_check.GitRange(self.checkout, self.base, self.checkpoint))
+        self.assertIn(f"Local doc commit goes out with this merge: {local[:12]}", retried.stdout)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), merged)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+        published = self.run_gate(*options)
+        self.assertEqual(published.returncode, 0, published.stdout + published.stderr)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), merged)
+
     def test_a_legacy_main_gate_refuses_a_checkpoint_without_behavior_review(self) -> None:
         _ = self.git(self.main, "switch", "--detach", "main")
         _ = self.git(self.checkout, "switch", "main")

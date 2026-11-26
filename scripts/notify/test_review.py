@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import select
 import shutil
 import subprocess
 from subprocess import run as run_fixture_zstd
@@ -17,11 +18,13 @@ import tempfile
 import time
 import unittest
 import urllib.parse
+from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from scripts.lib.transcript_test_support import compressed_copy
+from scripts.lib.file_lock import exclusive
 from typing import BinaryIO, Literal, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -59,6 +62,32 @@ class VerdictJSON(TypedDict):
 class ReviewerEnvelope(TypedDict):
     structured_output: VerdictJSON
     is_error: bool
+
+
+class QuestionReviewRequest(TypedDict):
+    draft: str
+    parts: dict[str, review.QuestionPart]
+
+
+class PartVerdictJSON(TypedDict):
+    number: int
+    questions: list[str]
+    failed_rules: list[review.RuleFailureRecord]
+
+
+def question_request(prompt: str) -> QuestionReviewRequest:
+    return cast(QuestionReviewRequest, json.loads(prompt.split("\n", 2)[2]))
+
+
+def question_batch(request: QuestionReviewRequest, *, questions: Sequence[str] = (),
+                   failures: Sequence[review.RuleFailureRecord] = (),
+                   parts: Sequence[PartVerdictJSON] = ()) -> review.StructuredCall:
+    local = {row["number"]: row for row in parts}
+    rows = [local.get(int(number), PartVerdictJSON(number=int(number), questions=[], failed_rules=[]))
+            for number in request["parts"]]
+    return review.StructuredCall("opus", review.StructuredAnswer({
+        "draft": {"questions": list(questions), "failed_rules": list(failures)}, "parts": rows,
+    }))
 
 
 class TranscriptMessage(TypedDict):
@@ -344,30 +373,25 @@ class LocalReviewTests(unittest.TestCase):
     def test_console_question_revision_keeps_passed_and_held_parts(self) -> None:
         title = "Retry the download?"
         point = "The download stopped."
-        recommend = "Recommended: Yes."
+        recommend = "Recommended: Yes. The download finishes in phase 3."
         choices = "Choices:\n- Yes, finish the download.\n- No, keep the partial file."
         question = "\n\n".join((title, point, recommend, choices))
         final_recommend = "Recommended: Yes. You get the full file."
         key = review.QuestionKey("demo", title, request_key="download")
         guide = FakeReviewer(verdict(self.draft))
-        failure = review.RuleFailure("console-standard-4", recommend)
-        requests: list[dict[str, object]] = []
+        failure = review.RuleFailure("console-standard-5", "phase 3")
+        requests: list[QuestionReviewRequest] = []
 
         def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
-            request = cast(dict[str, object], json.loads(prompt.split("\n", 2)[2]))
+            request = question_request(prompt)
             requests.append(request)
             if len(requests) == 2:
                 return review.StructuredCall("opus", review.ModelTimeout())
-            numbers = cast(list[int], request["review"])
-            parts = cast(dict[str, review.QuestionPart], request["parts"])
-            rows: list[dict[str, object]] = []
-            for number in numbers:
-                words = parts[str(number)]["text"]
-                problems = [{"rule": failure.rule, "quote": words}] if words == recommend else []
-                if len(requests) > 1 and parts[str(number)]["role"] == "choice":
-                    problems = [{"rule": "console-standard-10", "quote": words}]
-                rows.append({"number": number, "questions": [], "failed_rules": problems})
-            return review.StructuredCall("opus", review.StructuredAnswer({"parts": rows}))
+            return question_batch(request, parts=[
+                PartVerdictJSON(number=int(number), questions=[],
+                                failed_rules=[{"rule": failure.rule, "quote": failure.quote}])
+                for number, part in request["parts"].items() if part["text"] == recommend
+            ])
 
         with mock.patch.object(review, "structured_call", side_effect=judge):
             self.assertEqual(review.review_question(key, question, runner=guide, console_kind="question"),
@@ -383,9 +407,127 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.review_question(key, final, runner=guide, console_kind="question"),
                              review.QuestionAccepted(final))
 
-        self.assertEqual([request["review"] for request in requests], [[1, 2, 3, 4, 5], [1, 2], [1, 2], [3]])
-        revised_parts = cast(dict[str, review.QuestionPart], requests[1]["parts"])
-        self.assertIn("- No, keep the partial file.", [part["text"] for part in revised_parts.values()])
+        self.assertEqual([list(request["parts"]) for request in requests],
+                         [["1", "2", "3", "4", "5"], ["1", "2"], ["1", "2"], ["3"]])
+        self.assertIn("- No, keep the partial file.", requests[1]["draft"])
+
+    def test_console_question_checks_an_unchanged_recommendation_against_a_revised_fact(self) -> None:
+        title = "Retry the download?"
+        recommendation = "Recommended: Yes. You get the full file."
+        draft = f"{title}\n\n1. A partial file is on disk.\n\n{recommendation}"
+        revised = draft.replace("A partial file is on disk.", "You get the full file.")
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+        failure = review.RuleFailure("console-standard-2", "You get the full file.")
+        requests: list[QuestionReviewRequest] = []
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            request = question_request(prompt)
+            requests.append(request)
+            failures = [review.RuleFailureRecord(rule=failure.rule, quote=failure.quote)] if request["draft"] == revised else []
+            return question_batch(request, failures=failures)
+
+        with mock.patch.object(review, "structured_call", side_effect=judge):
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(draft))
+            self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
+                             review.QuestionReviewFailed(revised, (), (failure,)))
+            self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
+                             review.QuestionReviewFailed(revised, (), (failure,)))
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(draft))
+        self.assertEqual([list(request["parts"]) for request in requests], [["1", "2", "3"], ["2"], [], ["2"]])
+
+    def test_console_question_rechecks_clock_times_after_a_date_or_zone_change(self) -> None:
+        title = "Retry the download?"
+        clock_time = "12:00 EST"
+        draft = f"{title}\n\n1. The download stopped at {clock_time}.\n\nRecommended: Yes."
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+        zones = [
+            "User zone: EST (America/New_York). Today: 2026-11-26.",
+            "User zone: EST (America/New_York). Today: 2026-11-27.",
+            "User zone: PST (America/Los_Angeles). Today: 2026-11-27.",
+        ]
+        requests: list[tuple[str, list[str]]] = []
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            request = question_request(prompt)
+            context = prompt.split("\n", 1)[0]
+            requests.append((context, list(request["parts"])))
+            parts = [] if context == zones[0] else [
+                PartVerdictJSON(number=2, questions=[],
+                                failed_rules=[{"rule": "times-carry-zone", "quote": clock_time}])]
+            return question_batch(request, parts=parts)
+
+        with (mock.patch.object(review, "zone_line", side_effect=zones),
+              mock.patch.object(review, "structured_call", side_effect=judge)):
+            outcomes = [review.review_question(key, draft, runner=runner, console_kind="question") for _ in zones]
+
+        self.assertEqual(outcomes[0], review.QuestionAccepted(draft))
+        held = review.QuestionReviewFailed(draft, (), (review.RuleFailure("times-carry-zone", clock_time),))
+        self.assertEqual(outcomes[1:], [held, held])
+        self.assertEqual(requests, [(zone, ["1", "2", "3"]) for zone in zones])
+
+    def test_console_question_lock_wait_uses_the_review_deadline(self) -> None:
+        title = "Retry the download?"
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+        folder = review.state_path() / "question-verdicts"
+        folder.mkdir(parents=True)
+        digest = review.question_part_digest((key.name, "title", title))
+        for path in (folder / ".lock", folder / f"{digest}.lock"):
+            with (self.subTest(path=path.name), exclusive(path),
+                  mock.patch.object(review, "review_timeout_seconds", return_value=0.25),
+                  mock.patch.object(select, "select", wraps=select.select) as wait_for_lock,
+                  mock.patch.object(review, "structured_call") as judge):
+                result = review.review_question(key, title, runner=runner, console_kind="question")
+                self.assertEqual(result, review.QuestionReviewFailed(
+                    title, ("The question review could not acquire its cache lock in time.",)))
+                self.assertTrue(wait_for_lock.called)
+                judge.assert_not_called()
+
+    def test_console_question_expires_old_records_and_keeps_locked_drafts(self) -> None:
+        folder = review.state_path() / "question-verdicts"
+        folder.mkdir(parents=True)
+        stale = time.time() - review.QUESTION_VERDICT_MAX_AGE.total_seconds() - 1
+        expired, held, orphan_lock = (folder / (character * 64 + ".lock") for character in "abc")
+        files = [expired, expired.with_suffix(".json"), held, held.with_suffix(".json"), orphan_lock]
+        for path in files:
+            _ = path.write_text("{}")
+            os.utime(path, (stale, stale))
+        inode = held.stat().st_ino
+        title = "Retry the download?"
+        draft = replace(self.draft, body=title, title="", action=NoActionRequired())
+        runner = FakeReviewer(verdict(draft))
+        key = review.QuestionKey("demo", title)
+
+        with exclusive(held):
+            self.assertEqual(review.review_question(key, title, runner=runner, console_kind="question"),
+                             review.QuestionAccepted(title))
+            self.assertEqual(held.stat().st_ino, inode)
+            self.assertTrue(held.with_suffix(".json").exists())
+            for path in (expired, expired.with_suffix(".json"), orphan_lock):
+                self.assertFalse(path.exists(), str(path))
+        self.assertEqual(review.review_question(key, title, runner=runner, console_kind="question"),
+                         review.QuestionAccepted(title))
+        self.assertFalse(held.exists())
+        self.assertFalse(held.with_suffix(".json").exists())
+
+    def test_console_question_refuses_more_than_three_questions_across_verdicts(self) -> None:
+        title = "Retry the download?"
+        draft = f"{title}\n\n1. The download stopped.\n\nRecommended: Yes."
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(self.draft))
+        local = PartVerdictJSON(number=2, questions=["When did it stop?"], failed_rules=[])
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            return question_batch(question_request(prompt), parts=[local],
+                                  questions=["What failed?", "Why retry?", "What does No do?"])
+
+        with mock.patch.object(review, "structured_call", side_effect=judge):
+            self.assertEqual(review.review_question(key, draft, runner=runner, console_kind="question"),
+                             review.QuestionReviewFailed(draft, ("questions exceeds 3",)))
 
     def test_console_send_with_changed_text_accepts_the_original_draft(self) -> None:
         from scripts.console_text import check as console_text
