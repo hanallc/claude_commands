@@ -46,9 +46,12 @@ class Nate(StrEnum):
 
 @dataclass(frozen=True)
 class RecordedAnswerer:
-    """The List log records this name without a fixed staff ID."""
+    """The source has no staff ID for the answerer."""
 
     name: str
+
+
+UNRECORDED_ANSWERER = RecordedAnswerer("Answerer not recorded")
 
 
 @dataclass(frozen=True)
@@ -139,24 +142,33 @@ def resolved_answerer(reference: str, members: StaffSnapshot) -> StaffId | Recor
 
 
 @dataclass(frozen=True)
-class ReplyIdentity:
-    author: StaffId | Nate | RecordedAnswerer
+class DatedReply:
     time: datetime
     words: str
 
 
 def conflicting_reply_ids(exchanges: Iterable[Exchange], members: StaffSnapshot) -> frozenset[str]:
-    """Find exchanges that claim the same reply within one source."""
-    claims: dict[ReplyIdentity, set[str]] = defaultdict(set)
+    """Find competing replies. An unknown author matches any author."""
+    claims: dict[DatedReply, dict[StaffId | Nate | RecordedAnswerer, set[str]]] = defaultdict(dict)
     for exchange in exchanges:
         answer = exchange.answer
         if isinstance(answer, ExchangeAnswer) and isinstance(answer.time, datetime):
             author = exchange.answerer
-            if not isinstance(author, Nate):
+            if not isinstance(author, Nate) and author != UNRECORDED_ANSWERER:
                 author = resolved_answerer(author.name if isinstance(author, RecordedAnswerer) else author, members)
-            identity = ReplyIdentity(author, answer.time, answer.text.rstrip())
-            claims[identity].add(exchange.exchange_id)
-    return frozenset(exchange_id for ids in claims.values() if len(ids) > 1 for exchange_id in ids)
+            by_author = claims[DatedReply(answer.time, answer.text.rstrip())]
+            by_author.setdefault(author, set()).add(exchange.exchange_id)
+    conflicts: set[str] = set()
+    for by_author in claims.values():
+        if any(isinstance(author, RecordedAnswerer) for author in by_author):
+            ids = {exchange_id for group in by_author.values() for exchange_id in group}
+            if len(ids) > 1:
+                conflicts.update(ids)
+        else:
+            for ids in by_author.values():
+                if len(ids) > 1:
+                    conflicts.update(ids)
+    return frozenset(conflicts)
 
 
 @dataclass(frozen=True)

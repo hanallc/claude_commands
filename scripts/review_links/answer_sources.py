@@ -306,7 +306,14 @@ class OpenQuestionSlot:
 class AnsweredQuestionSlot:
     tag: str
     text: str
-    reply: ReplyEvidence
+    answer: str
+    time: datetime | TimeNotRecorded
+    author: staff.StaffId | RecordedAnswerer
+
+    @property
+    def reply(self) -> ReplyEvidence:
+        author = _AnswererEvidence.NOT_RECORDED if isinstance(self.author, RecordedAnswerer) else self.author
+        return ReplyEvidence(self.answer, self.time, author)
 
 
 class NoQuestionSlot(StrEnum):
@@ -317,6 +324,10 @@ class NoAcceptedSlotReply(StrEnum):
     ABSENT = "no accepted reply to the current slot"
 
 
+class NoChangeListOwner(StrEnum):
+    ABSENT = "no Change owner for List filing"
+
+
 @dataclass(frozen=True)
 class AcceptedExchanges:
     exchanges: tuple[Exchange, ...]
@@ -324,6 +335,7 @@ class AcceptedExchanges:
     log_positions: dict[str, int]
     current_slot_exchange: str | NoAcceptedSlotReply
     conflicting_ids: frozenset[str]
+    change_list_owner: staff.StaffId | NoChangeListOwner
 
     def __iter__(self) -> Iterator[Exchange]:
         return iter(self.exchanges)
@@ -365,6 +377,7 @@ class ExchangeVerifier:
         self.saved_tags: dict[str, set[str]] = defaultdict(set)
         self.saved_slots: dict[str, set[str]] = defaultdict(set)
         self.current_slot_exchange: str | NoAcceptedSlotReply = NoAcceptedSlotReply.ABSENT
+        self.unclaimed_slot_copies: set[int] = set()
         self.disputed: set[int] = set()
         self.bound: set[int] = set()
         self.tags: dict[str, list[int]] = defaultdict(list)
@@ -538,7 +551,7 @@ class ExchangeVerifier:
                     or not self._reply_agrees(position, slot.reply)):
                 return UnverifiedReply.CONFLICT
             if not tag and not tagged:
-                if not isinstance(slot.reply.time, datetime) and not isinstance(evidence.time, datetime):
+                if not isinstance(slot.time, datetime) and not isinstance(evidence.time, datetime):
                     return UnverifiedReply.MISSING
                 if sum(_same_prompt(prompt.text, slot.text) for prompt in self.prompts.values()) != 1:
                     return UnverifiedReply.MISSING
@@ -697,7 +710,7 @@ class ExchangeVerifier:
             return UnverifiedReply.MISSING
         tag = self.log[candidate.start].feedback_request_id
         slot = self.slot
-        time = slot.reply.time if isinstance(slot, AnsweredQuestionSlot) and tag == slot.tag else TimeNotRecorded.ABSENT
+        time = slot.time if isinstance(slot, AnsweredQuestionSlot) and tag == slot.tag else TimeNotRecorded.ABSENT
         proof = ReplyProof.TAG if self.tagged_replies.get(tag) else ReplyProof.TIME if isinstance(time, datetime) else ReplyProof.INTERVAL
         event = self.log[candidate.position]
         identity = _new_event_id(prompt, event)
@@ -1040,6 +1053,7 @@ class ExchangeVerifier:
                 feedback = _completed_feedback_reply(source, feedback_slot, log, self.prompts, self.members)
                 if feedback is not None:
                     possible.discard(feedback)
+            possible.update(self.unclaimed_slot_copies)
             count = len(possible - self.claimed.keys())
             if count or suspect is not None:
                 unresolved.append((key, count or 1))
@@ -1047,8 +1061,6 @@ class ExchangeVerifier:
 
     def _accept_slot(self, accepted: dict[str, Exchange], bound_slots: set[str], slot: AnsweredQuestionSlot,
                      key: str, links: tuple[ListLink, ...], read_times: tuple[datetime, ...], acknowledged: bool) -> None:
-        if isinstance(slot.reply.answerer, _AnswererEvidence):
-            return
         if slot.tag not in bound_slots:
             item = self.source
             assert isinstance(item, review_items.ReviewItem)
@@ -1062,7 +1074,7 @@ class ExchangeVerifier:
                 binding, time, author, text = reply.binding, event.time, self.authors[position], event.words[8:]
             else:
                 binding = ExchangeBinding(prompt.origin, ReplyWithoutEvent.SLOT)
-                time, author, text = slot.reply.time, slot.reply.answerer, slot.reply.text
+                time, author, text = slot.time, slot.author, slot.answer
             answer = ExchangeAnswer(text, time, _read_state(time, read_times, acknowledged=acknowledged))
             accepted[prompt.identity] = Exchange(Source.SCOPED_REPLY, key, prompt.identity, Direction.ANSWER_TO_NATE,
                                                  slot.text, prompt.time, Nate.USER, author, answer, links, binding=binding)
@@ -1070,12 +1082,20 @@ class ExchangeVerifier:
             binding, answer = exchange.binding, exchange.answer
             if (isinstance(binding, ExchangeBinding) and binding.slot_id == slot.tag
                     and exchange.question == slot.text and isinstance(answer, ExchangeAnswer)
-                    and answer.text == slot.reply.text
-                    and (not isinstance(slot.reply.time, datetime) or answer.time == slot.reply.time)
-                    and self._normalize_author(exchange.answerer) == slot.reply.answerer
+                    and answer.text == slot.answer
+                    and (not isinstance(slot.time, datetime) or answer.time == slot.time)
+                    and (isinstance(slot.author, RecordedAnswerer)
+                         or self._normalize_author(exchange.answerer) == slot.author)
                     and (binding.reply is ReplyWithoutEvent.SLOT or exchange.exchange_id in self.verified_handoff_ids)):
                 self.current_slot_exchange = exchange.exchange_id
                 self.verified_handoff_ids.add(exchange.exchange_id)
+                if isinstance(exchange.answerer, RecordedAnswerer) and isinstance(answer.time, datetime):
+                    self.unclaimed_slot_copies = {
+                        position for position in self.answers if position not in self.claimed
+                        and not self.log[position].feedback_request_id
+                        and self.log[position].time == answer.time
+                        and self.log[position].words[8:].rstrip() == answer.text.rstrip()
+                    }
                 return
 
     def resolve(self, key: str, links: tuple[ListLink, ...],
@@ -1086,18 +1106,8 @@ class ExchangeVerifier:
         candidates = tuple(self._native_exchanges(key, links, pending) if native
                            else self._scoped_exchanges(key, links, pending))
         conflicts = set(list_exchange.conflicting_reply_ids((*self.history, *candidates), self.members))
-        slot = self.slot
-        unknown_slot = False
-        if isinstance(slot, AnsweredQuestionSlot) and isinstance(slot.reply.answerer, _AnswererEvidence):
-            unknown_slot = True
-            for exchange in (*self.history, *candidates):
-                binding, answer = exchange.binding, exchange.answer
-                if isinstance(binding, ExchangeBinding) and binding.slot_id == slot.tag:
-                    conflicts.add(exchange.exchange_id)
-                elif ((binding is UnboundExchange.LEGACY or isinstance(binding.reply, LoggedReply))
-                      and isinstance(answer, ExchangeAnswer) and answer.text.rstrip() == slot.reply.text.rstrip()
-                      and (not isinstance(slot.reply.time, datetime) or answer.time == slot.reply.time)):
-                    conflicts.add(exchange.exchange_id)
+        if self.unclaimed_slot_copies:
+            conflicts.add(self.current_slot_exchange)
         positions = {identity: position for position, identity in self.claimed.items() if identity not in conflicts}
         if self.report is not None and (initial := positions.get("initial")) is not None:
             if (self.report.answer and self.log[initial].words != "Answer: " + self.report.answer
@@ -1106,15 +1116,22 @@ class ExchangeVerifier:
                 _ = positions.pop("initial")
         if unresolved is not None:
             count = sum(count for _, count in pending) + len(conflicts)
-            if unknown_slot:
-                count += 1
             if count:
                 unresolved.append((key, count))
         return AcceptedExchanges(tuple(value for value in candidates if value.exchange_id not in conflicts),
                                  frozenset(self.verified_handoff_ids - conflicts), positions,
                                  self.current_slot_exchange if self.current_slot_exchange not in conflicts
                                  else NoAcceptedSlotReply.ABSENT,
-                                 frozenset(conflicts))
+                                 frozenset(conflicts), self._change_list_owner())
+
+    def _change_list_owner(self) -> staff.StaffId | NoChangeListOwner:
+        item = self.source
+        if isinstance(item, review_items.ReviewItem) and isinstance(item.source, review_items.ChangeSource):
+            for reference in (item.source_unit, item.owner):
+                owner = _answerer(reference, self.members)
+                if not isinstance(owner, RecordedAnswerer):
+                    return owner
+        return NoChangeListOwner.ABSENT
 
     def _change_slot(self, source: review_items.ReviewSource | update_registration.QuestionRecord
                      ) -> OpenQuestionSlot | AnsweredQuestionSlot | NoQuestionSlot:
@@ -1128,14 +1145,13 @@ class ExchangeVerifier:
             return OpenQuestionSlot(slot.question_id, slot.text)
         time = source.answered_at if isinstance(source.answered_at, datetime) else TimeNotRecorded.ABSENT
         author = self._slot_author(source, slot, time)
-        return AnsweredQuestionSlot(slot.question_id, slot.text, ReplyEvidence(slot.answer, time, author))
+        return AnsweredQuestionSlot(slot.question_id, slot.text, slot.answer, time, author)
 
     def _slot_author(self, source: review_items.ChangeSource, slot: delivery_state.AnsweredQuestion,
-                     time: datetime | TimeNotRecorded) -> staff.StaffId | _AnswererEvidence:
+                     time: datetime | TimeNotRecorded) -> staff.StaffId | RecordedAnswerer:
         validators = {_answerer(reference, self.members) for reference in source.validators}
         if source.answered_by or len(validators) == 1:
-            author = _answerer(source.answered_by, self.members) if source.answered_by else next(iter(validators))
-            return _AnswererEvidence.NOT_RECORDED if isinstance(author, RecordedAnswerer) else author
+            return _answerer(source.answered_by, self.members) if source.answered_by else next(iter(validators))
         saved = self.filed.get(f"question:{slot.question_id}")
         if (saved is not None and saved.question == slot.text and isinstance(saved.answer, ExchangeAnswer)
                 and saved.answer.text == slot.answer and (not isinstance(time, datetime) or saved.answer.time == time)):
@@ -1152,8 +1168,7 @@ class ExchangeVerifier:
                     and event.words == "Answer: " + slot.answer
                     and (not isinstance(time, datetime) or event.time == time)):
                 return author
-        return _AnswererEvidence.NOT_RECORDED
-
+        return list_exchange.UNRECORDED_ANSWERER
 
     def review_handoff(self, item: review_items.ReviewItem, key: str, destination: investigation.ListDestination,
                        saved: frozenset[list_exchange.FiledExchange]
@@ -1177,11 +1192,21 @@ class ExchangeVerifier:
         filed_investigation_answer = bool(self.report is not None and self.report.answer and (
             (self.log[self.answers[-1]].words == "Answer: " + self.report.answer
              and offset + self.answers[-1] in events) if self.answers else "initial" in ids))
-        hides_card = (card_can_move and bool(verified) and item.state is not review_items.ReviewState.WAITING
+        hides_card = (bool(verified) and item.state is not review_items.ReviewState.WAITING
                       and all(offset + position in events for position in self.answers)
-                      and self._confirmed_native_content(verified, filed_investigation_answer))
+                      and (self._confirmed_native_content(verified, filed_investigation_answer) if card_can_move
+                           else self._single_change_slot_card(item, slot_id, accepted)))
         return review_items.FiledReviewExchange(destination, hides_card, events, ids, open_staff_question,
                                                 slot_id, filed_investigation_answer)
+
+    def _single_change_slot_card(self, item: review_items.ReviewItem, slot_id: str,
+                                 accepted: AcceptedExchanges) -> bool:
+        source, slot = item.source, self.slot
+        return (bool(slot_id) and isinstance(source, review_items.ChangeSource)
+                and item.state is review_items.ReviewState.OPEN
+                and isinstance(source.slots.verdict, delivery_state.NoDelivery)
+                and isinstance(slot, AnsweredQuestionSlot) and isinstance(slot.author, RecordedAnswerer)
+                and len(accepted.exchanges) == 1 and not accepted.conflicting_ids)
 
     def _confirmed_native_content(self, saved: tuple[list_exchange.FiledExchange, ...],
                                   filed_investigation_answer: bool) -> bool:
@@ -1228,7 +1253,7 @@ class ExchangeVerifier:
             filed_slot_id = slot.tag
             synthetic_tag = question_path.answer_log_id(slot.tag)
             positions.update(index for index, event in enumerate(item.log[:max(0, offset)])
-                             if event.feedback_request_id == synthetic_tag and event.words == "Answer: " + slot.reply.text)
+                             if event.feedback_request_id == synthetic_tag and event.words == "Answer: " + slot.answer)
         if offset >= 0:
             for row in confirmed:
                 position = accepted.log_positions.get(row.exchange_id)
@@ -1561,9 +1586,16 @@ def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadEx
         link = destinations[0] if destinations else the_list.NextNumber.AVAILABLE
         assert not isinstance(link, LegacyListLink)
         actor = first.asker if first.direction is Direction.QUESTION_TO_NATE else first.answerer
-        if not isinstance(link, investigation.ListDestination) and isinstance(actor, (Nate, RecordedAnswerer)):
+        if (not isinstance(link, investigation.ListDestination)
+                and isinstance(actor, RecordedAnswerer) and isinstance(current, AcceptedExchanges)
+                and first.exchange_id == current.current_slot_exchange):
+            owner = current.change_list_owner
+            if isinstance(owner, NoChangeListOwner):
+                owner = the_list.report_route(staff.StaffId(""), members).keeper
+        elif not isinstance(link, investigation.ListDestination) and isinstance(actor, (Nate, RecordedAnswerer)):
             raise the_list.ListError("The source has no staff ID for the List owner.")
-        owner = staff.StaffId(actor) if not isinstance(actor, RecordedAnswerer) else staff.StaffId("")
+        else:
+            owner = staff.StaffId(actor) if not isinstance(actor, RecordedAnswerer) else staff.StaffId("")
         if not first.question.strip():
             raise the_list.ListError("The source question has no text.")
         title = review_submissions.submission_title(first.question)
