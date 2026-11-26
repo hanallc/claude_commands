@@ -33,7 +33,7 @@ The flow:
 
 The URL form is `http://<host>:<port>/<id>/<file name>`, with the name percent-encoded.
 The `server_port` setting starts at 8765.
-For example, a rendered link is `http://100.103.14.30:8765/k3x9qa/herdr-issue-draft.html`.
+For example, a rendered link is `http://192.0.2.254:8765/k3x9qa/herdr-issue-draft.html`.
 The URL of a `.md` input names its rendered `<stem>.html`.
 The host comes from `tailscale ip -4`, parsed as IPv4.
 The `tailscale_timeout_seconds` setting starts at 10.
@@ -96,17 +96,22 @@ The open row keeps its place on the screen, the draft, focus, and text selection
 The New item dialog uses the console dialog frame.
 Select **Close**, press Esc, or select the backdrop to close the dialog.
 
-Staff names use the current role colors from the Accounts reader.
+Staff names and explicit role labels use the current role colors from the Accounts reader.
+The reader gets the colors from `statusline.conf` through `accounts.role_colors()` and `accounts.role_color()`.
 `staff_names.StaffNames` shares one staff snapshot and one color reading across each server render.
 It resolves fixed IDs, session IDs, and unambiguous staff names.
 The shared renderer escapes unknown names and free text without a role color.
+`StaffNames.role_label(role, text)` escapes the label and applies the configured color.
+Unit, unit director, merge director, and style director use the same unit color.
+Without a valid color, the label uses plain text.
+Button text, accessible names, filter keys, sort keys, and exports stay plain.
 The owner corner shows the active unit, showrunner, or producer set in `page.<page>.owner`.
 It uses the owner's staff color.
 If the configured owner is unavailable, the corner shows the default recipient.
 An item for a unit goes to its showrunner.
 Showrunner and producer owners receive their items directly.
 The page owner button names the default recipient and opens one shared dialog.
-The dialog offers Bug, Question, Feedback, Proposal, and Investigation.
+The dialog offers Bug, Question, Feedback, Proposal, Investigation, Enhancement, and Scheduled.
 The **To** row offers chips for all eligible producers and showrunners in the staff record.
 For a new draft, **To** selects the page owner or the showrunner who receives items for that unit.
 On an unavailable AWS Machines page owned by the AWS unit, **To** selects its showrunner, builds.
@@ -121,21 +126,43 @@ If the page has no default recipient, the button opens the dialog with no recipi
 Select a recipient to enable Send.
 Select any other chip to change the recipient.
 Proposal limits the row to recipients with a native proposal folder.
+The proposal writer checks the title and body before it creates the record.
+`/issue` passes a private draft to `proposal_issue.py number --draft-file`.
+Numbering checks the title and body before it takes the locks.
+It verifies the draft under the locks and publishes the new proposal with its number.
+Generated style decisions use their own filing path.
 When the selected recipient becomes unavailable, the dialog clears the selection and disables Send until you choose a recipient.
 Changing the type or reopening a kept draft preserves this empty selection.
 Feedback uses the native Investigation record.
+
+Select **Scheduled** to create a List item directly.
+Select the owner in **To**.
+Enter the instruction, a `Start` time, and an optional `Repeat` in the words box.
+The dialog shows an example for the start and repeat.
+The dialog hides page details and attachment controls for Scheduled.
+The saved confirmation shows the List number, start, repeat, and any assignment notice warning.
+If the dialog cannot confirm the save, **Retry** sends the original submitted fields.
+A retry of a filed Scheduled draft returns the same List number.
+
 The List colors Owner, Producer, supporting unit names, staff names in log sources, and showrunner names in the count strip.
-List delivery notices use role colors for the record keeper and the showrunner who received an alert.
+The Producer filter, table headers, and narrow card label use the producer color.
+The log colors Producer and Unit labels. The Go box colors the role phrase.
+The status colors Producer in Producer answering. The waiting note and Go box color staff names.
+List delivery notices and feedback log entries use role colors for the notice recipient.
+Delivery notices also color the showrunner who received an alert.
 They keep the notice words and time.
 Review colors Owner, Source, staff log names, and owner menu options.
+The Review action heading colors the word showrunner in Sends to showrunner.
+Review colors the staff names in Sends to, Question for, and Answer from headings.
 Proposal and efficiency cards show Assign next to Approve.
 The default shows the card owner's name and sends the approval to that owner.
 Assign lists current showrunners and unit directors by name in their role colors.
 Approve sends only to the selected assignee when you select a name.
-Images colors card owners and copies those colored names into the group links.
+Images colors card owners and their roles. The group links use the colored names.
+Legacy Changes and Questions color the Showrunner filter label. Changes also colors the feedback prefix.
 Legacy question pages color each source and its parent separately.
-Branch pages color unit names. Rebuilds colors recorded requesters.
-Builds shares the same rendered name spans in each current data reading.
+Branch pages color the Unit prefix and unit names. Rebuilds colors recorded requesters.
+Each Builds data reading shares the name spans and role colors with the page.
 Its tables, charts, target owners, queue priorities, and marked staff fields in tooltips use those spans.
 The tooltip renderer escapes other fields as plain text.
 The swap reader marks titles that name staff and keeps those markers in smaller-group members.
@@ -149,11 +176,18 @@ The reader marks each staff field before it joins the display text.
 The renderer colors marked staff parts and escapes paths, programs, and other context text.
 Old readings without marked parts stay plain.
 It renders each priority name before it joins the names.
-Empty target role labels use the recorded holder. Only the holder name can have a role color.
+Target availability and Builds tooltips color explicit staff role labels.
+When a target has no unit or showrunner, the page shows the recorded holder with a plain Holder label.
+The AWS costs table colors the Unit header and recorded staff names in the Unit column.
+The Unit group control uses the role color before selection.
+An open AWS day applies role and staff-name color changes on the next Builds data reading.
+The refresh keeps focus on the same control in the open day.
+The Builds page uses the saved staff ID to color the name in the bump mark and tooltip.
 Disks uses the same spans for slot holders, sessions, and shared tooltip fields.
+The slot tooltip colors the Showrunner label.
 Current Builds rows carry their name parts through `slotStep` to the Disks slot label.
-Its existing Builds refresh updates the name spans without a new timer.
-The AWS data and the console navigation show no staff name fields.
+Its Builds refresh updates the name spans and role colors without a new timer.
+The console navigation shows no staff name fields.
 The Units board emits Markdown through `unit_phases.py`; this checkout has no Units console route.
 
 Saved role colors apply after the next page render or Builds data reading.
@@ -171,7 +205,7 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Review and Placement disk POC.
+The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Studio, Review and Placement disk POC.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`, except the Placement disk POC page.
 That page is a standalone document with its own layout and styles, and it has no status line.
@@ -181,21 +215,36 @@ The title starts 32px from the top and left edges of that column.
 Each navigation page places `page_frame.title()` directly above its content.
 The title, status line and content use the same centered column on all console pages.
 Cards and form controls keep their page styles.
+Review and The List label the state filter **Show**.
+They share the chip markup and the chip control script in `record_table.py`.
+The List uses the shared facet count code in `record_table.py`.
+Review counts its chips in one pass over the table rows, because a Review chip click can also reset Show or Owner.
+They share the parking menu, date picker, and browser script.
+The timed park action saves to the item's store.
 Every page uses the shared background and text colors.
 The status line has the same background as the page.
 The frame reserves scrollbar space, so short and long pages keep the same column position.
-Each page has one action area at the top right: `<div class="page-heading-actions" data-page-actions>`.
-The area holds the owner name and the New item button, which is last.
-The heading row (`.page-heading`) holds the page title and follows the area.
-On a page without a title, the heading row is empty.
-Only the action area is sticky. The title scrolls with the page.
-The area sticks 8 px (`--page-actions-space`) below the top edge.
-Without the script, the area takes its height above the title, so the title never goes under the controls.
-A script at the end of the heading row measures the row before the browser reads the content after it.
-When the full title and the controls fit on one line, the script puts the controls beside the title.
-Then the area has no height (`data-page-actions-beside`), and the heading row keeps space for the controls.
-The script sets `--page-actions-height` and `--page-actions-reserve` from the size of the controls.
-The owner group in the area has one opaque page background with a 4 px edge, and content scrolls under it.
+A successful action updates the page without a confirmation line by default.
+List **Unpark** and Review **Done** show confirmation lines.
+An action that fails uses the shared action failure notice.
+Branches shows the remaining branches after deletion.
+The page uses the shared notice for deletion or delivery failures.
+The original address follows the latest saved list, including when report delivery fails.
+If the manifest update and next-list publication fail, the POST response still excludes the branches it deleted.
+Images uses the page notice if the image is deleted and the list cannot refresh.
+The shared frame freezes the title, the action area, and the status line at the top of the page.
+Review also freezes Search.
+Search sits to the right of the status above 800 px and below the status at smaller widths.
+The frozen top has an opaque page background.
+The content scrolls under it.
+At widths of 640 px or less, only the title stays in view.
+The action area and status line scroll with the content at these widths.
+Review Search also scrolls with the content at these widths.
+The action area holds the owner name and the New item button.
+The script puts the actions beside the title when they fit on one line.
+When they do not fit, the actions stay above the title.
+The frame measures the frozen top when its size changes.
+It uses this height as the page scroll padding for anchor jumps and focused rows.
 A page can add action buttons between the owner name and New item.
 `page_frame.page_action_button(action, icon, label, dialog_id)` makes one button, and pages pass it through `actions`.
 `owner_control()` and `with_owner()` take `actions`. The names `new-item` and `owner` are reserved.
@@ -203,18 +252,18 @@ A press on a page action button opens its dialog with `showModal()` and binds it
 `bindConsoleDialog` binds each dialog one time. A second call for the same dialog does nothing.
 When the dialog closes, focus goes back to the button that opened it, and the page does not scroll.
 A press on the copy of the button inside its own open dialog moves the focus to the first control of the dialog.
-A Late or Failed status line sticks directly below the stuck area, so the page order never changes.
-Nothing steps while the page scrolls: each part moves by at most the scroll distance.
-The status line never covers the owner name or button, and the area never covers the status line.
-Scrolling never changes the layout of the content, and at scroll zero the area stays in its normal place.
-The AWS region filter sticks directly below the action area and any sticky status line.
-The Images group index sticks 16 px below the action area and any sticky status line.
-The stacking order, from lowest to highest, is as follows:
-1. Page content, which includes a page's own sticky bars (z-index 3 or lower).
-2. The action area (z-index 4).
-3. Overlays: tooltips, menus, popovers and the Builds paused badge (z-index 5 to 10).
-4. The sticky Late or Failed status line (z-index 20).
-An item jump places the focused row below the action area and the status line.
+The AWS region filter sticks directly below the frozen top.
+The page gives targets below the filter a scroll margin equal to the filter height.
+The Images group index sticks 16 px below the frozen top.
+
+The stacking order is as follows, from lowest to highest.
+
+1. Page content and its sticky bars (z-index 3 or lower).
+2. The frozen top (z-index 4).
+3. Menus, tooltips, and the Builds paused badge (z-index 5 to 10).
+4. The Undo stack.
+5. Modal dialogs and the image zoom in the browser top layer.
+
 The window rule in `page_frame.py` keeps New item available while a page window is open.
 A page window is a `<dialog>` that a page opens with `showModal()`.
 These are the windows:
@@ -224,12 +273,14 @@ These are the windows:
 4. The Accounts color picker in `accounts_page.py`.
 A modal dialog makes the rest of the page inert, and a popover shown after it is also inert.
 Thus the frame adds a copy of the action area to each window when the window starts to open (`beforetoggle`).
-The copy is the last child of the window, at the same place as the area, and the window removes it when it closes.
+The copy is the last child of the window.
+It follows the position of the action area and stays in view when that area scrolls off the phone screen.
+The window removes the copy when it closes.
 The copy has the same labels as the area. It has no `id` attributes.
 The controls in the copy have no plate and no edge, so each part of the copy that shows is a control.
 The copy itself takes no clicks: a click beside its controls goes to the window, as a click on the backdrop does.
 A window meets the action area when a part of the window and the controls of the area overlap from left to right.
-While a window meets the area, the frame sets `--page-window-top` on it to the bottom of the action area.
+While a window meets the copy, the frame sets `--page-window-top` to the bottom of the copy.
 The frame measures each open window at these times:
 - when the window opens, and when another window closes,
 - when the view or the action area changes size,
@@ -258,7 +309,7 @@ Paused uses `circle-pause` and `--ink-3`.
 A hidden page or a replacement hold shows Paused before the other states.
 Otherwise, the state order is Failed, Late, a busy Paused state, Reading, Live.
 Late, Failed and Paused show a reason after the last data time instead of timings.
-Builds and Disks keep the shown data time when a later read or measure fails.
+Builds and Disks keep the shown data time when a later read fails.
 A first read shows only Reading until data arrives.
 A slow read retains the last data time and timings.
 The age increases each second without a request.
@@ -288,7 +339,13 @@ These routes clear the snapshot when the action ends.
 Accounts preferences, News polls, and Disks polls keep the snapshot.
 Builds revalidates `memory.json` at its feed interval.
 The server uses only `If-None-Match` to decide whether to return HTTP 304 for a static file.
-The server sends static JSON with gzip when the client accepts gzip.
+The server sends HTML responses, Review versions and Review indexes with gzip when the client accepts gzip.
+Static HTML, CSS, JavaScript, JSON, SVG and TXT files also support gzip.
+An explicit gzip quality takes precedence over the wildcard quality.
+Responses that support gzip include `Vary: Accept-Encoding`.
+Static files have different ETags for gzip and identity.
+HEAD returns the headers for the selected encoding with no body.
+Disks shows the drive cards and the session list.
 Disks reads `disks.json` at `page.poll_seconds` intervals and requests a new measure when needed.
 Disks shows Paused with the reason **Measuring…** while a measure runs and reads succeed.
 The loader result carries `busy:'Measuring…'` while the measure runs within `wait_seconds`.
@@ -303,7 +360,10 @@ The shared component uses that time for Late and keeps the size timestamp for th
 Other pages use their data timestamp for Late.
 A completed measure returns Disks to Live with the new size age.
 A measure that exceeds `wait_seconds` clears the measure state even when reads fail.
-The status shows Failed with **The measure did not finish.** or the read error.
+The action failure notice shows **The measure did not finish.**
+A refused measure shows its reason in the same notice.
+A successful measure request clears the notice.
+A failed data read uses the refresh status line.
 If a read remains pending past the age limit, the status shows Late with the retained data age.
 AWS reads its published page when shown; its hourly publisher sets the data time and render time.
 Images reads its rendered page when shown.
@@ -311,7 +371,7 @@ Review retains typed text across refresh and holds replacement during an active 
 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-Accounts, AWS, Builds, Disks, Images, List and Review put the title and status line in the same place.
+Accounts, AWS, Builds, Disks, Images, List, Studio and Review put the title and status line in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -486,6 +546,23 @@ Other pages use more icons from the same folder.
 That folder includes the versions, the sources, and the ISC license.
 The console shell inlines the icons and makes no CDN, font, script, or stylesheet request.
 
+### Builds memory tooltip
+
+Hover over a running local Hana nextest step with a program memory trace to see Compile and Test charts.
+The charts show program memory without file cache.
+Blue shows this run, and purple shows the latest whole run with the same build shape.
+Each chart has its own elapsed time axis and a dashed line for the phase reserve when known.
+The Compile chart scales this run to the past run's time axis and labels the scale.
+It shades the time when the past run compiled the final `hana` crate.
+The values show the latest sample, the past peak, and the past time above half its reserve.
+The Test chart shows **Not started** until tests start.
+The tooltip shows **No past run yet** when no whole run matches within the chart age limit.
+The `feed.past_run_max_age_days` setting in `config/memory_trace.conf` applies only to the chart.
+The trace worker keeps old trace files.
+On recovery, the worker saves an incomplete copy and keeps the original live trace.
+The open tooltip updates with each `memory.json` reading.
+Disks uses the shared step tooltip fields.
+
 ### Review page
 
 Select a Review row to show its detail and actions below the summary.
@@ -529,7 +606,7 @@ The log then keeps at least 8 rem of height.
 
 The For you Type chip follows All.
 It uses the same action reader as the console notifier.
-It defaults to Open and keeps the State, Owner, and Search controls.
+It defaults to Open and keeps the Show, Owner, and Search controls.
 All includes withdrawn actions and their reasons.
 The card shows the command, machine, working directory, requester, reason, waiting work, and completion method.
 Copy uses the shared code block. It leaves the action open.
@@ -624,15 +701,16 @@ When a Review action removes a card, the shared table keeps a copy of the row an
 The copy fades and collapses while the rows below slide up.
 `card_fade_out_ms` in `config/review_links.conf` sets the duration. Its initial value is 450 ms.
 The Review page can restore a pending card after the user scrolls one viewport.
-The redraw that restores this card waits for all row animations to end.
-When Later hides the last card for an owner, the Owner filter stays selected with a zero count.
+The page restores this card after all row animations end.
+When Later hides the last card for an owner, Review keeps the Owner filter selected and shows a zero count.
 A save can change the card's sort values. The copy keeps its previous values until the fade ends.
 If the request fails, the row slides back into view and the current card stays selected.
 `card_fade_in_ms` sets the duration of the return. Its initial value is 600 ms.
 Review and The List read both settings when they render.
 If the fade is still in progress, the return starts at the copy's current height and opacity.
 The animation updates when the user opens or closes a card during the transition.
-The status region above the table shows the most recent save failure when the row or its details are hidden.
+The status region above the table shows a failure only for the most recent submission.
+It shows that failure when the row or its details are hidden.
 It also confirms when a manual For you action completes.
 The next save attempt or reload clears this notice.
 Filter and sort changes apply at once.
@@ -652,10 +730,13 @@ An unknown owner returns to All and clears both owner and source-owner constrain
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The State row sets the Show filter below the Type row.
-All appears first, followed by Open, Waiting, Done, and Validating.
-The Validating chip is hidden when Responses or For you is selected.
-The Owner row follows the State row.
+The Show row offers All, Open, Waiting, Done, and Validating below the Type row.
+With Responses or For you selected, Show hides Validating.
+Old Waiting links open Waiting.
+Review expands legacy filter names in the query and fragment before it combines them.
+The query wins for names in LIST_QUERY_FIELDS that both sources supply.
+The fragment wins for other names, including sort and dir.
+The Owner row follows the Show row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Type and Show counts include an Owner reset if the click would return Owner to All.
 Type counts use Open when a click selects For you or switches from Validating to Responses.
@@ -674,7 +755,12 @@ The index contains summary values and shared staff labels.
 The server sends card bodies on demand.
 The server sends gzip when the browser accepts it with a positive quality.
 Each body response carries its snapshot version.
-If the versions differ, the browser refreshes the index before it displays the body.
+The browser displays an available body as soon as it arrives, even if its version differs from the index.
+The body supplies the row state before the browser enables its actions.
+A version difference starts the guarded page refresh.
+If the index changes during the request, the browser accepts only a body with the current index version.
+The refresh keeps the open form when its body has the same version as the new index.
+If the body request or index reports a missing item, the browser closes the card and shows the missing item notice.
 The Show chips replace the right count text.
 All includes active Review records and all For you actions.
 Done shows completed For you actions.
@@ -697,7 +783,7 @@ The active validation log shows **Asked <validator> to validate**, **Asked a que
 The question and answer sections show the full text.
 The question and answer preserve the active validation and its handoff time.
 The Validating and All chips count the change.
-The Validating chip is dim at zero.
+A chip with a zero count is dim.
 The next changed snapshot replaces the index.
 An unchanged version retains the index and checks expired Later times.
 The fresh index supplies the state and revision of each active item.
@@ -711,8 +797,7 @@ The row window moves other rows around the focused row when the user scrolls.
 Each focus change mounts the adjacent rows before the next Tab or Shift+Tab.
 A refresh restores focus to the same control by row key.
 The browser keeps each pending save by key while the form leaves the window.
-Review and The List use Show chips.
-The shared table tracks the selected Show chip.
+The shared table tracks the selected Show chip on both pages.
 The address and refresh retain the selected Show view.
 Review submissions retain the Type, Show and Owner chips and the search words.
 Standard Send, List Send and Review Send to the List owner use the same owner check.
@@ -776,12 +861,15 @@ Other types include the same page data when Send requests a pending screenshot o
 The Review card shows this evidence under **Page data**.
 A Bug also includes the page title, address, filters, and render time.
 The dialog shows Error lines and Script errors when the page has errors.
-Review reuses gzip bytes for an unchanged page shell with its current owner control.
+Review and Accounts reuse gzip bytes for an unchanged page with its current owner control.
 A Bug with a screenshot also includes the viewport.
-The dialog shows the saved item ID after Send on Review and the other pages outside The List.
-Select **Done** to close the confirmation.
-Review starts its refresh when Send succeeds.
-When the confirmation closes, Review opens the new item if it matches the current filters.
+**Send** closes the New item dialog at once.
+The user can work on the page while the fading **Undo** toast shows.
+**Undo** reopens the dialog with the same type, recipient, words, images and page capture.
+A failed send reopens the draft and shows the error.
+A retry after a lost response sends the original request again.
+If that retry confirms the original save, the dialog reopens with any edits made after the lost response.
+Review refreshes when Send succeeds and opens the new item if it matches the current filters.
 Review tells you when the current filters hide the new item.
 A save conflict shows its reason and preserves the current filters.
 The Type, Show and Owner chip rows wrap at phone width.
@@ -911,16 +999,17 @@ Investigations offer Mark read and Send feedback in that group.
 Proposals and efficiencies offer Approve, Decline and Send feedback in that group.
 A plan backlog proposal has no issue to hold an answer, so it offers only Later; the user answers it in chat.
 Cards with actions offer Ask question in the return group and **Later** in its own group.
-The menu lists four presets, then a divider and **Choose a time…**:
-1. **In 1 hour**: `later_soon_minutes` from now; the label follows the setting.
-2. **This evening**: `later_evening` today. The item shows only before `later_evening_until`.
-3. **Tomorrow morning**: `later_morning` tomorrow.
-4. **Next week**: `later_week_time` on the next `later_week_day`.
-Each preset shows its time on the right, such as `Tue 09:00`, in the user zone.
-The page computes the preset times each time the menu opens.
-A preset click hides the item at once.
-**Choose a time…** shows a calendar and a time field in the same menu.
-Review Later and List Park until share the date and time picker in `record_table.py`.
+The menu has three presets.
+
+1. **1 hour** adds `later_soon_minutes` to the current time. The label follows the setting.
+2. **Tomorrow** uses `later_morning` on the next day in the user zone.
+3. **Next week** uses the next `later_week_day` at `later_week_time` in the user zone.
+
+**Tomorrow** shows its time on the right.
+**Next week** shows its weekday and time, such as `Mon 09:00`.
+A preset click calculates the deadline and hides the item at once.
+**Pick a date…** shows a calendar and a time field in the same menu.
+Review Later and List Park share the date and time picker in `record_table.py`.
 The calendar keeps a valid future Later draft when it opens, including a draft restored after a refresh.
 Otherwise, it opens on tomorrow in the user zone, with `later_morning` as its time.
 The month header has previous and next buttons.
@@ -932,19 +1021,28 @@ A repeated wall time uses the earlier instant.
 The presets use the same conversion.
 **Save** is disabled unless that time is in the future.
 In the calendar, the arrow keys move one day or one week, including across months.
-Tab moves from the selected day to the time field and **Save**.
+Tab moves from the selected day to **Time** and **Save**.
 The **Time** field uses 24-hour `HH:MM` in every locale.
-It accepts `9:00`, `0900` and `09:00` and displays `09:00` when focus leaves the field or you press Enter.
-In the time field, Up and Down change the time by 15 minutes and wrap at midnight.
+It accepts `9:00`, `0900`, and `09:00`.
+It shows `09:00` when focus leaves the field.
+The suggestion list in **Time** starts at the next time step in the user zone.
+The default step is 15 minutes.
+The list shows future times for today and all times for a future date.
+Open the list with the arrow button or an Up or Down key.
+Use Up and Down to move through the suggestions.
+While the list is open, Escape closes it. Enter accepts the highlighted suggestion; with none highlighted, Enter closes the list.
+With the list closed, Enter saves the time and Escape closes the picker.
 An invalid time uses the error color and disables **Save**.
-Enter saves a valid future time. Escape closes the menu.
+Select **Save** to submit the chosen time.
+Escape closes the menu from a preset or the calendar.
 The hidden `later` field keeps the wall time for the draft.
 The page converts that time to UTC for the request.
-A preset resolves its time again at the click.
 The arrow keys, Home and End move between items, Enter picks one and Escape closes the menu.
-A click outside the menu closes it.
-The page refresh waits while a Later menu is open.
-The server stores a preset time, sent as UTC, in the user zone.
+A click outside the control or a move of focus outside the control closes the menu.
+The page refresh waits while the menu is open.
+The server stores the preset time in the user zone.
+List and Review refuse a new save if the deadline has passed.
+A List retry can still return the result of an earlier save.
 Waiting cards for questions, investigations, proposals and efficiencies retain their Open actions.
 Unowned questions retain only Later.
 Waiting cards for these types keep their state and counts until the user acts.
@@ -973,6 +1071,14 @@ A question from Open moves the item to Waiting.
 The owner’s answer returns that item to Open.
 The answer stays in the item log.
 Owners use `change_page.py answer-question --item <Review key> --question <id> --text "<answer>"` for all five types.
+The Console text check runs before the answer is saved.
+
+For native replies, the model reads the draft outside the delivery lock.
+For scoped replies, the model reads the draft outside the recipient and record locks.
+The writer checks the selected record again under the locks before it saves the reply.
+Questions and investigations use the check in their own writers.
+A failed draft leaves the question open and returns each rule and quote to the writer.
+The review log records the reason if the model is unavailable.
 Each new request supplies a question ID to identify the pending exchange.
 The existing question ID rule refuses a reply to a superseded exchange.
 `update_registration.py reply` and `investigation.py answer` apply this rule before they save a native answer.
@@ -1220,32 +1326,50 @@ The navigation label is List, and the page title is The List.
 The page uses the shared status line in `page_frame.py`.
 The page owner button opens the shared New item dialog.
 For a new draft, **To** selects the owner configured in `page.list.owner`.
-**Send** saves and delivers a Review item for the selected recipient.
-The List assigns numbers only when its own record writer creates an item.
+For a Review kind, **Send** files and delivers the Review item to the selected recipient.
+The List assigns numbers when its own record writer creates an item.
 The browser stores the recipient selection with the draft ID and restores both after a reload.
-The user can edit the draft before a retry.
-Each draft ID can file one Review item.
-A retry of a filed draft returns the original Review item ID.
+Retry uses the submitted fields when the browser saved them.
+Select **Edit a separate draft** to keep new edits while you confirm the earlier Send.
+If the browser stored only a draft ID and recipient, enter the original fields and select **Send**.
+Each Review draft ID can file one Review item and one linked List row.
+An exact retry returns the saved item ID.
+The dialog closes after the retry unless it holds a separate draft or shows an attachment warning.
+The reply includes the List number if the row exists.
+If a retry changes the saved draft, the window shows the saved item ID and preserves the new text.
 A retry can use a new screenshot if the first screenshot expires before filing.
+After filing, an exact retry uses the saved screenshot identity and digest even if the preview expires.
 After Send, the List refreshes with the current filters.
 Select a row to open it.
 If a row save is in progress, the List refreshes when that save ends.
 
 The `/new_item` command (`scripts/review_links/new_item.py`) sends the dialog request to the same New item endpoint.
-The server reply holds the Review item ID and key, and no List item.
-The command then makes one List item for the filed Review item. A Send from the dialog makes no List item.
-The command writes the item in morty's List folder, because only that folder allocates List numbers.
-The title is the first line that has words, at most 120 characters. Latest status holds the words.
-Evidence links to the Review item, and the item links to the Review key.
-Owner is the recipient. Producer is the producer of the assignee. A unit assignee also fills Unit.
-Each run sends a new request ID, so each run files a new Review item and a new List item.
-The result line names the type, the assignee and the List item number. It also names the producer of an assignee that is not a producer.
-If the List write fails after the server files the item, the command still exits 0.
-If the List item write fails, the line names the Review item ID, says that no List item exists, and gives the error.
-If only the Review link fails, the line says that List item N exists without its Review link, and gives the error.
+The server checks the producer against current staff under the List lock.
+If the producer is active, the server writes the row in morty's List folder before it sends the notice.
+The server reply contains the Review item ID and key.
+The title uses at most 120 characters from the first line with words.
+Latest status holds the words.
+Evidence links to the Review item.
+The server saves the row and its Review link in one write.
+Owner is the recipient.
+The command sends the assignee ID so the server can find the producer and unit.
+For a List window Send, the server uses the recipient's producer.
+Send reads the producer map from disk without Git recovery.
+If the server cannot read a usable map or find a producer, it files the Review item and sends the notice.
+The same path applies if the producer retires before the List write.
+The server logs the reason it skipped the List row.
+The command saves its draft ID and recipient before the POST.
+While the result is uncertain, a retry sends the saved ID and recipient before any routing checks for a new filing.
+The command clears the draft after success or a confirmed refusal before filing.
+The result names the type and assignee.
+It includes the List number if the server filed a row.
+For a new filing to a showrunner or unit, it also names the producer.
 
 The columns are #, Owner, Producer, Item, State, Next step, ETA, and Update.
 The Producer cell shows the name of the record's producer.
+A one-time Scheduled row shows its start below the state.
+A repeated row shows the rule and the next start, or **No next run**.
+For a pending run, Next step shows the instruction and ETA shows the start.
 On desktop, the ETA cell stays on one line and shows an ellipsis if the text is too long.
 Hover or focus on the ETA to see the full text.
 On a phone, the ETA wraps to show the full text in the row.
@@ -1261,28 +1385,39 @@ The page uses the order from the latest server response.
 A column button sorts all matching items by its values.
 A second click reverses that order.
 
-The List starts with All selected in the Owner, Producer, and Show rows.
+By default, the List starts with All selected in the Owner, Producer, and Show rows.
 Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
 If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
 The words box sits beside the Producer chips and wraps below them when space is limited.
-When the box contains text, it uses the same accent as a selected chip and shows the Clear filter button.
+When the box contains text, it uses the same accent as a selected chip.
+The box also shows the Clear filter button.
 Click Clear filter or press Escape in the box to remove the words.
 The other filters stay selected.
-The address stores the words as `q` and restores them on reload.
+The address stores the words as `q`.
+The List restores these words on reload.
 The List ignores form text that the browser restores without an input event.
-The chip order is All, Needs me, Morty answering, Working, Blocked, and Parked.
+The chip order is All, Needs me, Producer answering, Working, Blocked, Parked, and Scheduled.
 The List excludes Closed records from rows, filters, and counts.
-Parked includes non-Closed items with an active park and no unread answer.
-An unread delivery release belongs to Needs me even if the question remains open.
-Morty answering includes unparked items with an open question and no unread answer.
+Parked includes items with an active park, no unread answer, and no open Go request.
+Needs me includes each item with an unread answer or an open Go request.
+It also includes each unparked item with an unread delivery release.
+Producer answering includes other unparked items with an open question.
+The Producer selection limits which items the chip shows and counts.
+Producer answering uses the Show value `producer-answering`.
+Saved links with `waiting-answer` or `morty-answering` select Producer answering.
 Needs me also includes unparked items in Waiting for nate or Delivered with no open question.
 Working includes other unparked items in New or Working.
 Blocked includes other unparked items in Blocked or Paused.
+Scheduled includes items in the Scheduled state.
 All includes every open item, including parked items and Done items.
 The State cell shows the parking end time or delivery condition under the saved state.
 The Unread only switch shows and counts unread items.
 Each chip count reflects the words box and the filters in the other rows.
+The server applies the address query filters before the first paint. Python and the script share one filter rule and one list of address names.
+Each source first expands its legacy names (`showrunner` to `owner`, `show=unread` to Unread). Then, for each name the server reads (`LIST_QUERY_FIELDS`), the query wins when the query and the fragment both name it. A value that only the fragment names applies after load.
+For other names, such as sort and dir, the fragment value wins after load.
+Search folds case with a pinned Unicode 15.1 table in `search_fold.py`, the same in Python and the script.
 In All, each Owner and Producer chip counts matching parked items.
 The “need you” total uses the Needs me chip count.
 A zero-count chip stays visible and dimmed.
@@ -1297,6 +1432,10 @@ Back and Forward can open an item that the table filters hide.
 Select the row again to collapse it.
 Expanding or collapsing a row preserves the table filters and sort order.
 A linked Review card opens over the expanded row.
+An answer that supports **Undo** closes the card at once.
+**Undo** or a failed answer reopens the card with its draft and the result message.
+**Undo** focuses the feedback field.
+A successful answer refreshes the List.
 The List shows the item count above the table.
 
 A link under Links opens the target item in the console.
@@ -1304,7 +1443,7 @@ The table can change Show to All to reveal the target.
 A direct link with no filters opens a parked item in All.
 The table clears each filter that excludes the target and keeps each filter that matches it.
 The table scrolls to the target and highlights it briefly.
-The table leaves a gap below the sticky status banner when it shows.
+The table leaves a gap below the frozen top.
 A missing target shows “Item #N is not on the List”.
 A closed target shows “Item #N is closed”.
 The source row keeps its form and draft while it shows the target notice.
@@ -1330,12 +1469,33 @@ Old records without the reviews field load with no links.
 Each List record stores a `producer`: the fixed staff ID of a staff row with the producer role.
 `the_list.py add` and `update` take `--producer <name or staff id>`.
 The option refuses a name or ID that does not resolve to exactly one current producer row.
-Morty's CLI adds assign the item to morty by default.
-Other producers' CLI adds assign the item to the caller.
+Morty's adds without `--producer` assign the item to morty.
+Another producer's adds without `--producer` assign the item to the caller.
+That producer can name only itself in `--producer`.
 Old records without the field use their record keeper.
 The terminal list shows a Producer column after Owner.
 The CLI shows producers only their assigned items. Morty can see every item.
-See the `the_list.py` section of `showrunner-automation.md` for update permissions and assignment notices.
+Producers can park and close their assigned items. See `showrunner-automation.md` for CLI permissions and assignment notices.
+
+See the [List store](showrunner-automation.md#the-list-the_listpy) for the dispatcher, confirmation, and CLI rules.
+The `schedule` field uses `start` and `do` for the first start and instruction.
+The `repeat` and `run_allowance` fields hold the series rule and allowance.
+The `runs_before` field gives the run number offset.
+The `runs_used` field counts runs that have used the allowance.
+The `finished_runs` field names the runs that finished.
+The optional `following_runs` field names the run numbers kept by a scoped rule edit.
+The `exceptions` field stores changes and skips by run number.
+Active deliveries and confirmations use the `run_deliveries` field.
+The page and the dispatcher use `ScheduledSeries.next_run()` to select the pending run from saved progress.
+Herdr upkeep calls `the_list.fire_scheduled`.
+The dispatcher reads `scheduled_check` to decide when to load the full record.
+
+For a browser filing, `new_item_draft_id` holds the Scheduled draft ID and its filing claim.
+The claim includes the request fingerprint, keeper, filing readback, and assignment notices.
+`list_draft.py` defines the claim and parses the saved field.
+It also constructs the List store used by the writer and recovery.
+The draft index records the reserved List number before the writer saves the item.
+If a claim has no receipt, recovery validates the complete List record and checks the claim before it recreates the receipt.
 
 When List records have review links, the page reads review items once per render and indexes them by key.
 It stores no review states on the List record.
@@ -1415,7 +1575,7 @@ Closing an item clears its unread mark.
 An older address with `show=closed`, `show=done`, or `state=Closed` opens All.
 A link to a Closed item shows “Item #N is closed.”
 An older address with `show=unread` turns on Unread only.
-The search field matches the item number, owner name, title, or state words.
+The search field matches the item number, owner name, title, state words, or original request text.
 Numbers can include `L` or `#`.
 One match function ignores case for every field.
 Parked items also match the word `Parked`.
@@ -1430,7 +1590,7 @@ Each Details summary has a stable ID based on its item and log entry.
 Each log writer saves a typed event.
 The table and log use the same format for staff names, local ETAs, and field values.
 The table, log, and Park response show parking times in the user zone.
-At local midnight, the label shows the date.
+At local midnight, the Park notice shows only the date. The table, log, and Park response show the time `00:00`.
 The log uses plain field labels, such as Next step and Latest status.
 The List replays the log in record order to find the previous value of each field.
 Replay starts with the creation defaults for fields that Added omits, except the requester.
@@ -1457,10 +1617,13 @@ The Answer event includes the question ID.
 Link and Unlink events include the review keys.
 Evidence cleanup events name the copy that was removed.
 Request receipts stay in the record and are hidden from the log display.
-The dialog shows Remove, Park until, and a text box for Ask question and feedback when those actions are available.
-The text box names the record keeper in its placeholder and accessible name.
-The feedback button also names the record keeper.
-Ask question and the feedback button sit below the box beside the send status.
+The item dialog shows Remove, Park, and a text box for Ask question and `Tell <producer>` when available.
+The text box uses `Your words for <producer> about this item` as its placeholder and accessible name.
+The page reads the producer name from the staff snapshot.
+A producer without a staff row shows as its staff ID.
+The List New item button uses the configured page owner or its fallback.
+The owner corner shows that recipient.
+Ask question and Tell sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
 Clearing the box disables both buttons.
 Record text uses the shared review formatter for bold text, headings, lists, code spans, and links.
@@ -1472,52 +1635,61 @@ Bold content is nonempty and cannot start or end with whitespace or `/`.
 Delimiters between word characters or slashes stay literal, so `src/**/test/**/file.py` stays literal while `**read/write**` becomes bold.
 Mark read appears only when the item has an unread update.
 Mark read clears the dot and adds a log entry.
-Mark read on an unparked Waiting for nate item with no open question also sets the state to Working.
+Mark read on an unparked Waiting for nate item with no open question and no open ask also sets the state to Working.
+An open ask whose target has no staff row does not count here, because the page shows no box for it.
+A Go that leaves no ask with a box moves the item to Working by the same rule; see [Asks for nate's Go](#asks-for-nates-go).
 The same write logs the state change and saves a notice for the item's producer.
 The notice asks the producer to write the next step with `the_list.py update --source <producer> --next-step`.
+For an item in a legacy keeper folder, the command also has `--keeper <keeper>`. For morty's folder, it has no `--keeper`.
 The existing sender delivers it with its retry and alert rules.
 The page applies the Working state from the response, so the row leaves Needs me in place.
 Mark read on any other item sends no message.
 All actions use the record keeper and item ID from the signed form.
-Ask question and feedback can mark the update read after the action saves.
-The form signature includes the identity of the unread update that the row shows.
-A new question or feedback request can mark only that update read.
+Ask question and Tell use the same path to mark the update read after the action saves.
+The form signature includes the unread update identity and the feedback recipient's staff ID.
+A new Ask question or Tell request can mark only that update read.
 A repeated request cannot mark a newer update read.
-An exact feedback retry uses the read target saved with the feedback.
+An exact Tell retry uses the read target saved with the feedback.
 The store checks the update identity under its lock.
 This check preserves an update that arrives between the action save and the read write.
 An update identity includes its time and log history.
 Two updates with the same time keep separate identities.
-Questions and feedback add no read entry when the form shows no unread update.
+Ask question and Tell add no read entry when the form shows no unread update.
 The POST response includes the current unread state.
 The form keeps its signed update until a page refresh shows a new snapshot.
 The page clears the dot and Mark read button when that state is false.
 It restores both controls when the response reports a new unread update.
-Mark read, Park until, and Remove release the link to the item.
+Mark read, Park, and Remove release the link to the item.
 If the item stops matching the filters, it starts to fade as soon as the user submits the action.
 If the read write fails, the question or feedback remains saved and the sender can deliver it.
 The store keeps the unread update if the read write fails or a newer update exists.
-Feedback applies the current filters. A read item leaves the view when Unread only is on.
-Feedback with empty words changes no record.
+Tell shows `sent to <producer>` and reports whether the update remains unread.
+Tell applies the current filters. A read item leaves the view when Unread only is on.
+Tell with empty words changes no record.
 Ask question saves an open question in the item record under the List lock.
-List and Images share the code that saves and sends the question.
-After the server replies to the browser, it sends the record keeper the item number, title, question, and answer command.
-The List uses the keeper as the recipient even when another producer owns the work.
+List and Images share the code that saves and sends a question.
+Ask saves the current producer as the question recipient.
+If the producer is unavailable, Ask saves the record keeper as the recipient and records the unavailable producer.
+On the shared List, the record keeper is morty.
+At send time, the server finds the saved recipient’s current session.
+The server replies to the browser before it sends the item number, title, question, and answer command.
+Reassignment keeps the saved recipient. A question without a saved recipient belongs to the record keeper.
 Equal words select the open question. Different words create a new question.
-An exact request retry uses the same question ID, even after the record keeper answers it.
-The row moves to Morty answering when the question saves.
+An exact request retry uses the same question ID after an answer.
+The row moves to Producer answering when the question saves.
 The row shows a waiting note when each unanswered question has a live sender or confirmed acceptance.
 Acceptance includes a confirmed place in the transport queue.
 The List changes the search results, chip counts, and totals as soon as the browser receives the save result.
 The console updates its unread indicator on its own news refresh.
-The page shows “Question not delivered.” after a confirmed failure.
-List, Images, and Review use the same text.
-All attempts for one question use the same sender lock.
+The shared question renderer shows one “Question not delivered.” line for each confirmed failure.
+List, Images, and Review use this renderer.
+The saved attempt ID names the sender lock.
 List, Images, and Review question sends use the same retry loop.
 An unconfirmed send keeps its saved message ID for the next attempt.
 The server retries unresolved attempts during recovery.
 If the server cannot record a failure, it logs one line and keeps the attempt for recovery.
 The question reader checks the saved question words and answer command.
+An attempt saved before the `--keeper` flag also matches the same command without the flag.
 A List title edit preserves the delivery state.
 Recovery sends the prepared message with its original title.
 If Ask removes the focused row, focus moves to a nearby row with an available toggle or to Search.
@@ -1526,7 +1698,8 @@ After a successful Ask keeps the row visible, the row toggle receives lost focus
 Focus stays on the user's selection if they move it during the request, including to the parent console.
 On refresh, the List restores focus to an available action button with the same item key and action.
 Column sort buttons keep focus through refresh.
-A waiting row shows “The producer will answer.”
+A waiting row shows `<recipient> will answer.` for each saved recipient with an open question.
+If Ask chose the record keeper because the producer was unavailable, the row shows `<producer> is not live, so <keeper> will answer.`
 The panel shows each open question with its asked time and the linked review cards.
 An actively parked waiting row shows the parking condition and Unpark.
 A waiting row with an unread answer or delivery release shows Mark read.
@@ -1536,28 +1709,41 @@ The section does not change the results count.
 The List address preserves a linked item outside the filters when the console reloads.
 It counts in its current status chip.
 Close the linked item or change a filter to dismiss the section.
-An open question adds a Morty answering note below the saved state.
-The record keeper runs `the_list.py answer L<N> --question <id> --text "<answer>"` to save an answer.
-The command uses the caller's List folder.
-Only Morty can use `--keeper <staff-id>` to answer in another keeper's folder.
+An open question adds a Producer answering note below the saved state.
+The saved recipient, the record keeper, or morty can answer an open question.
+The message supplies the command `the_list.py answer L<N> --keeper <keeper> --question <id> --text "<answer>"`.
+Without `--keeper`, `answer` uses the caller's List folder if it holds the item. Otherwise, it uses morty's folder.
+`update` uses morty's folder by default.
+For a legacy item, use `the_list.py update --keeper <keeper> --id L<N> --next-step "<step>"`.
+A producer can name any keeper in `update`, but it updates only its own fields on items it produces.
+Each command refuses a `--keeper` that has no List folder.
+In a keeper folder other than morty's, `update` refuses `--producer` and `--owner`.
 The answer adds one record event and marks the item unread.
 Closing an item moves each open question to a “Question closed with item” log entry.
-The entry keeps the question ID, words, and time.
+The entry keeps the question ID, words, time, and saved recipient.
 The question no longer accepts answers or retries.
 Older Closed records stay in the store in their original format.
 Question delivery checks the current List record under the same lock that Close uses.
 List, Images, and Review use the same send loop.
-The loop checks the saved source before each attempt.
+The loop checks the saved source and recipient before each attempt.
+New List attempts save the keeper and the resolved item path.
+The sender checks that the keeper's item still resolves to that path.
+An older attempt can name the keeper only in its saved answer command.
+The sender checks that this keeper's item resolves to the saved path.
+For a command without `--keeper`, the sender can use the recipient, the source path, or Morty to locate the keeper.
+Recovery sends the original command.
 A close preserves the delivery result of a send already in progress.
 The sender checks the item again before it sends a failure alert.
 A read error during retry authorization preserves the confirmed failure and reports the read error separately.
 Recovery skips closed or answered questions.
 The server checks deferred questions again after the sender locks become free.
 A new Ask on a Closed item is refused.
-A retry of a saved Ask returns its saved result without sending again.
+An Ask with a saved request ID can resume its existing attempt.
+A replay after a confirmed failure returns the saved result without sending again.
+After a confirmed failure, Ask requires a new request ID to start a new attempt for the same question.
 An item with an active park stays in Parked while it waits for its first answer.
 A signed Unpark request from an earlier page can clear parking while the item waits for an answer.
-That request moves the item to Morty answering and shows its confirmation next to Show.
+That request moves the item to Producer answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
 Opening a row leaves its unread state and status chip unchanged.
@@ -1579,33 +1765,86 @@ A job holds the question's sender lock from claim through result publication.
 The sender publishes `sending` before it calls the transport.
 The transport can confirm `sent`, `queued`, or `failed`.
 A missing confirmation leaves the outcome `unknown`.
-Startup recovery verifies the saved question and claims work when the sender lock is free.
+Recovery takes the row lock, the saved attempt lock, and the lock named by the saved job ID without waiting.
+Recovery creates missing lock files.
+If a lock is busy, recovery queues the attempt for another pass.
+If a lock fails to open, recovery queues the attempt and logs one line.
+Recovery verifies the saved question and keeps all locks through the send and result write.
 If a sender stopped after it wrote the send marker, recovery reuses the same message ID.
 A closed item or a question that has an answer requires no send.
 The server clears that claim without a failure notice.
 If the server cannot start the send for another reason, it clears the claim and logs the error.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
-Remove sits at the left edge of the dialog above the four-line text box.
-Park and Remove close the dialog after the save.
+Remove sits at the left edge of the open row above the four-line text box.
+Park and Remove collapse the row after the save.
 The table applies the saved state before the next refresh.
-Park, Remove, Tell morty, Ask question, and Mark read show a message if the page cannot confirm the save.
-**Unpark** and **Park until** sit at the right edge of the row.
+Park, Remove, Tell, Ask question, and Mark read show a message if the page cannot confirm the save.
+
+#### Schedule controls
+
+Open **Park**, then choose **Pick a date…** to use the calendar and time picker on an ordinary row.
+Leave **At that time, do this** empty to park the item.
+Enter an instruction and choose a future start to schedule the item.
+The picker names the owner who receives the instruction and the producer who receives a copy.
+**Edit schedule** opens the picker for a Scheduled item.
+**Start now** moves the pending run to the current time.
+For a series, **Start now** applies to **This run**.
+**Unpark** on a Scheduled item removes the schedule for the selected scope.
+Clear the instruction to replace the schedule with a parking time or **Until delivered**.
+
+The **Repeat** menu appears when the picker has an instruction and a start.
+The menu offers **Does not repeat**, **Daily**, weekly, monthly, and annual presets, **Every weekday**, and **Custom…**.
+The date-based presets follow the selected start date.
+**Custom recurrence** sets an interval in days, weeks, months, or years.
+For a weekly rule, select the weekdays.
+For a monthly rule, select a calendar day or a weekday pattern.
+The rule can end on a date or after a count.
+**Never** uses the saved run allowance.
+Select **Done** to return the rule to the picker.
+Select **Save** in the picker to apply the rule.
+
+The scope dialog offers **This run**, **This and following runs**, and **All runs** when they apply.
+**This run** changes or skips the next run. A repeat rule change needs a broader scope.
+**This and following runs** is available after a run finishes and a pending run remains.
+An instruction-only edit with this scope preserves run dates, moved runs, and skipped runs.
+Park disables **This run** and explains that parking applies to the item.
+The dialog selects the first available scope.
+If a repeat edit omits a start, the List uses the selected run's displayed start, including a moved start.
+The writer checks the schedule and selected run under the write lock before it saves a scoped edit.
+This check applies when **All runs** uses the displayed run as the new start.
+If the schedule or run changed, the writer refuses the edit and keeps the saved schedule.
+
+A new rule uses the page's display time zone.
+A new CLI rule uses the selected run's time zone.
+A retained rule keeps the saved series time zone when the start changes.
+A retained Custom rule also keeps its saved text.
+The picker shows a validation message if the new start falls outside the retained rule.
+
+#### Ordinary parking and feedback
+
+**Unpark** and **Park** sit at the right edge of the row.
 The dialog shows a parked item's parking condition above the buttons.
 **Unpark** appears in the form when the item has active parking and its state is outside Closed.
-**Park until** opens the picker.
-**Until delivered** sits above the shared calendar and 24-hour time field.
-Click Until delivered to save this choice and move the item to Parked.
+**Park** opens the menu with **Until delivered** before the shared time presets.
+A click on **Until delivered** saves the choice and shows “Parked until delivered” in the row.
+A click on a timed preset saves the selected time.
+**Pick a date…** opens the shared calendar and 24-hour time field.
 The picker aligns with the right edge of the text box.
-The page refresh waits while the picker is open.
+The server publishes the earliest active parking deadline.
+The List refreshes at that deadline.
+If the Park menu or picker is open, the List refreshes when it closes.
 **Save** sends the chosen time in UTC.
 Park writes a date, a time, or `delivered` through `the_list.park` with the List page source.
 List and Review use the same Later code to read and write their saved values.
 The server reads a date as midnight in the user zone.
 The writer checks a new parking time against the current time under the List lock.
 The writer checks a Park retry against the parking condition in the receipt or the event with the same request ID.
-The picker can resend the original request and instant after the parking time passes.
-When the saved date has passed, the picker gives focus to an enabled day.
-The page keeps the words for Tell morty.
+After an unconfirmed Park save, the List retries once with the same request ID, token, and deadline.
+The List uses `frame_retry_seconds` for the retry delay and `page_request_timeout_seconds` for each request.
+A new preset click uses a fresh request ID and calculates the deadline at the time of the click.
+Reopening the picker keeps a draft that matches an unconfirmed request, even after its deadline.
+The calendar gives focus to an enabled day.
+The page keeps the words for Tell.
 **Unpark** clears parking through `the_list.unpark` and keeps the item state.
 It records one Unparked event and saves one notice for the record keeper.
 If the item has no active parking time, the writer saves only a hidden request receipt.
@@ -1616,52 +1855,60 @@ The page shows “Parking time already expired” for an expired time.
 It shows “No active parking time to clear” when the time is absent.
 Both results preserve the parking draft.
 A replay of a successful Unpark reports the original result and any newer active parking time.
-When Unpark clears parking and removes the row from Parked, the page shows “Item #N unparked.”
+If the row stays open after Unpark clears parking, it shows “Unparked”.
+If clearing parking removes the row from Parked, the page shows “Item #N unparked.”
 The page shows confirmations for hidden rows next to the Show filter.
 It keeps one confirmation per hidden row after overlapping Unpark requests.
 Focus moves from **Unpark** to the Parked filter and brings the filter and confirmation into view.
-If All is active when Unpark saves, the item dialog stays open.
+If All is active when Unpark saves, the row stays open.
 After Unpark, the item's saved state sets its status chip.
 After Park or Unpark saves, the List refreshes the server order even while the item waits for an answer.
 
-Morty can set this parking condition with `the_list.py park --id L<N> --until delivered --source morty`.
+The CLI commands `park`, `unpark`, `close`, and `reopen` use morty's folder.
+The item's producer can run `the_list.py park --id L<N> --until delivered --source "<nate's words>"`.
+Morty can use `--source morty` to set this condition.
 The List ends this park automatically when the producer sets the item state to Delivered.
 The same write clears the park, marks the item unread, and records an Unparked event.
 Linked changes supply review information on the List.
 The List shows historical Unparked events that name a linked change.
 The unread delivery release returns to Needs me with its review links.
-After Mark read, an open question returns the item to Morty answering.
-A dated park remains active until its time or an explicit Unpark.
+After Mark read, an open question returns the item to Producer answering.
+A dated park stays active until its time, Unpark, or Close.
 The shared item writer saves the action and its pending notice in one locked write.
-The notice tells its recipient which action Nate completed.
-The recipient is the item's producer for Mark read and the record keeper for each other action.
-The notice saves its recipient, so a later producer change does not move a saved Mark read notice.
+The notice tells its recipient which action nate completed.
+A Go next-step notice names the item's producer as its recipient.
 The existing sender delivers the notice with its retry and alert rules.
 A delivery failure does not reverse the completed item action.
-Tell sends the user's words and keeps the parking time.
+Tell saves the user's words in the log and sends them to the item's producer.
+Tell keeps the parking time.
 Tell moves a Waiting for nate or Delivered item to Working in the same write that saves the feedback.
 Remove hides the item at once and closes it when the save succeeds.
 Park moves an item to the parked group at once.
 The item stays visible in All if it matches the other filters.
-With Unread only on, the row leaves the view when the user presses Mark read, Ask question, or Tell morty.
+With Unread only on, the row leaves the view when the user presses Mark read, Ask question, or Tell.
 The row returns when the server reports an unread update and the row matches the current filters.
 The shared table fades and collapses the row and its open details when an action hides them.
 The request starts without waiting for the animation.
 The page disables all row buttons while the request runs.
 A second press sends no request.
 The page applies the saved state and parking status from the response.
-The page uses the saved parking condition to update the labels in the row and dialog.
+The page uses the saved parking condition to update the labels in the row summary and its open detail.
 A refusal restores the last confirmed item state, parking status, and unread state together.
 The unread state includes the Update sort key.
-If Mark read, Ask question, or Tell morty loses its response, the page restores the unread flag from before the request.
+If Mark read, Ask question, or Tell loses its response, the page restores the unread flag from before the request.
 The page opens the restored row and shows the reason there.
 The restored row slides back into view.
-After a Park refusal, the page returns focus to **Park until** only if the document body has focus and the control is visible and enabled.
+After a Park refusal, the page can return focus to **Park**.
+The document body must have focus.
+The button must be visible and enabled.
 Each row keeps its own inline failure notice.
 The List uses the same rules as Review for notices above the table.
-If Remove or Park loses its response, the page restores the confirmed row and reports that the save is unconfirmed.
+If Remove loses its response, the page restores the confirmed row and reports that the save is unconfirmed.
+If a Park retry fails, the List checks the original receipt and reads the current row.
+The List shows the shared failure line if the receipt cannot confirm Park.
+If the List cannot read the receipt, it restores the confirmed row.
 A new action uses a new request ID, even if the previous response did not arrive.
-The page keeps each unconfirmed request ID for an exact retry, even after another action.
+The page keeps unconfirmed request IDs for actions that support another manual submission.
 An HTTP 5xx response to Ask question leaves the request unconfirmed.
 The page discards each request ID when it receives a success or refusal for that request.
 A sent or alerted notice sends no second message.
@@ -1674,25 +1921,32 @@ A second run changes nothing.
 The page can mark an item read, close it, park it, unpark it, or append feedback and delivery states.
 The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
 The List record saves the request ID, action, and words with each change in one locked write.
-The same write saves a pending notice for actions that send one.
+The same write saves the pending notice and its recipient for actions that send a notice.
+For Tell, the recipient is the producer named when the page renders the form.
+For Remove, Park, and Unpark, the recipient is the record keeper.
+For a Mark read notice, the recipient is the item's producer when the notice saves.
 Under the lock, each action checks the request ID against the saved actions.
 A retry changes no item fields and saves no second notice.
 The writer refuses a saved ID with a different action or different words.
 After an unconfirmed directory sync, the writer checks the stored record under the same lock.
 If the record holds the request, the server reports that it saved the action.
 The List sender uses the shared `change_page` retry and alert helpers.
+The sender uses the saved recipient's current session on each attempt.
+For older feedback without a saved recipient, the sender uses the record keeper.
+If the recipient is missing or retired, the words stay saved and delivery follows the same alert path.
 A successful send appends the same request ID with the sent state.
 Exhausted tries alert the item owner's showrunner.
 The request becomes alerted only when at least one showrunner receives the alert.
 Failed alerts leave the request pending for repeated POSTs and startup recovery.
-An alerted request shows “not sent; <showrunner> told” until the record keeper writes the item again.
+An alerted request shows `not sent to <recipient>; <showrunner> told` until the next item update outside the List page.
 The server startup hook retries pending List requests separately from change and question recovery.
 A repeated POST retries a pending request without adding another pending log entry.
 Sent and alerted requests do not send again.
 A process claim prevents concurrent sends of one request without holding the List lock during delivery.
 Delivery is at least once; a crash after a send but before its saved result can cause another send.
-The Update cell shows “sent to <recipient>” with its time until the next log entry from another writer.
-The recipient is the record keeper, or the item's producer for a Mark read notice.
+The Update cell shows a notice only when delivery fails.
+The Log keeps the sent record.
+The log and retry use the original recipient after reassignment.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
 After a lost Park or Remove response, the List reads the current item before it restores the row.
@@ -1701,7 +1955,7 @@ Changed feedback uses the fresh signed request from the page.
 A successful send clears the saved request ID and only the text that the user sent.
 Each successful POST returns a fresh signed request ID for the next action.
 A retry retains its original request ID.
-It shows a save or send notice as soon as the user submits a form.
+The form disables its action controls while the request runs.
 An unread update shows a dot and marks the navigation entry as new.
 The navigation key includes the record ID and update time.
 The page uses `page_refresh_seconds` and the shared refresh helper.
@@ -1723,25 +1977,185 @@ Each count links to its existing page.
 The strip omits proposals and efficiencies.
 Closed items show no check text in the page or CLI.
 
+#### Asks for nate's Go
+
+An ask names one change that waits for nate's go or approval (List item 232).
+A producer opens it with `the_list.py ask` ([The List: `the_list.py`](showrunner-automation.md#the-list-the_listpy)).
+An open ask whose target has a staff row puts the item in Needs me, also during an active park.
+An open ask whose target has no staff row shows no box and does not hold the item.
+`the_list.answerable_asks` is the one rule for both: the page boxes, Needs me, Mark read and the Go use it.
+Mark read on an item with an open ask that shows a box clears the dot, keeps the state and sends no message.
+The open row shows one box for each open ask, above the item fields.
+The box has a warning border and a heading: “Needs your go” or “Needs your approval”.
+It shows What, Who needs it (the target's staff name and role) and Why.
+The role comes from the staff row, such as “a unit director of sdlc”, “the merge director of sdlc” or “the List producer”.
+The button is Go for a go ask and Approved for an approval ask. A config ask has the same button.
+Small muted text next to the button names the target: “Pressing Go sends your go to <agent>.”
+For an approval ask, it says “Pressing Approved sends your approval to <agent>.”
+The button has `aria-describedby` on that text. The keyboard and a screen reader use it like the other row buttons.
+A click sends a signed POST to `/console/list-go` with the item, the ask id and the page address.
+For each click, the server reads natedev's current Tailscale IPv4 and IPv6 addresses.
+It refuses a client address that matches either address, is loopback, or belongs to natedev.
+A successful socket bind to the client address proves that natedev owns it.
+The server returns 403 for these addresses or for an invalid client address.
+It returns 503 if a Tailscale read fails or the bind fails with an error other than `EADDRNOTAVAIL`.
+A refusal writes no ledger record.
+The row shows a refusal in its normal status place, as for the other row actions.
+An accepted click does these steps in this order:
+
+1. The server writes one ledger record in `go-ledger/<go id>.json` under its state folder.
+   The record has the go id (random), the ask, the item, the target, What, the time, the client address, the page address and `used: false`.
+   It also has `sent` and `reported` for each recipient, all false at first.
+   `sent` is true when the message reached the recipient. `reported` is true when nate saw that it did not.
+   The file lock `go-ledger/.lock` orders each ledger change across processes and threads.
+   The server holds it from this record to the end of the List save in step 2.
+2. The List closes the ask with the go id and logs “**Go** — nate: <what> → <agent>” (or **Approved**).
+   When no ask that shows a box stays open, the item leaves Needs me.
+   When the Go leaves no ask that shows a box on an unparked Waiting for nate item with no open question, the item becomes Working.
+   The same write logs the state change and saves a next-step notice for the item's producer, as Mark read does.
+   When the Go makes the item read, it also logs “Marked read” after the state change, as Mark read does.
+   A later unread walk stops there, so a later Go on the same item can make it read again.
+   The notice has the request id `<go id>-next-step`, so its delivery key differs from the key of the Go message.
+   An item in another state keeps its state.
+   The item becomes read only when it has no other unread change, such as an unread answer, an unread delivery or a newer update.
+   When the save cannot confirm folder durability, the List reads the item again.
+   If the ask holds this go id, the server keeps the record and continues.
+   When that read fails, the Go is on disk. The page shows “The Go is saved. It is sent at the next server start.”
+   If the save fails, the server reads the item again.
+   If an ask holds this go id, the server keeps the record, and the page shows “The Go is saved. It is sent at the next server start.”
+   If no ask holds this go id, the server removes the ledger record, and the page shows “The Go could not be saved. Try again.”
+   When that read also fails, the record stays and the page shows “The Go could not be saved. Try again.”
+   At each server start, the server reads the item of each kept record. It removes the record when no ask holds its go id, and keeps it when the read fails.
+3. The server answers the page. The page removes the box and applies the saved state, so a Working row leaves Needs me in place.
+4. The server sends the target and morty one message through the List Tell sender.
+   The message names What and carries only the go id and the check command.
+   When the Go set Working, the producer gets one message.
+   A producer that is a Go recipient gets the Go message with the next-step line at its end. The notice becomes sent with it.
+   Another producer gets the next-step notice alone, through the List Tell sender.
+   The server sets `sent` to true for each recipient that the message reached.
+   A failed send alerts the item's showrunners with the title “List Go needs attention”.
+   It also adds the log line “Go not delivered to <agent>”, so nate sees it.
+   The alert and the log line occur once for each recipient of a Go.
+
+At server start, the server sends each Go that has an unsent recipient again, through the same path.
+It sends only to the recipients that the message did not reach.
+It removes each record whose item shows no ask with its go id. When the item read fails, the record stays.
+It does this before the List Tell recovery, so a resend to the producer carries its next-step line in the same message.
+The List Tell recovery does not send a next-step notice whose Go record has its recipient unsent.
+Only the Go path sends that notice, with the Go, also when nate presses Go during the start recovery.
+When the producer is not a Go recipient, the List Tell recovery sends the notice alone.
+
+`go_check.py <go id>` asks the server with the caller's staff id from `staff.py`.
+The server answers `go ok` only when all of these are true:
+
+1. The record exists.
+2. The List item has a closed ask with this go id, the same target and the same What.
+3. The target is the caller.
+4. The record is not used.
+
+Then it marks the record used, under the ledger file lock, so a Go has one use at most.
+When that write cannot confirm folder durability, the mark is on disk, and the server answers `go ok`.
+A second use, another caller and an unknown id get one refusal line and exit 1.
+
+Risks:
+
+- The `caller` value is what the session says. A session that has a forwarded go id can name the target as the caller.
+  morty and the List record both hold the go id. This is in the class of a session that breaks the rules on purpose.
+- An agent on the Mac that breaks the rules can still post a Go. The refusal stops only a click from natedev.
+- The item log shows nate every Go.
+A Go sends immediately.
+
+### The Studio page
+
+`/console/studio.html` shows the List rows with one picture tab for each producer.
+The navigation label is Studio, with the Lucide `clapperboard` icon, and the page title is The Studio.
+Its `config/console.conf` block follows the List block.
+`studio_page.STUDIO_VIEW` is a `list_page.ListView`, so the page uses the List rows, filters, script and status line.
+`list_page.LIST_VIEW` keeps the List output unchanged.
+The Studio shows the Producer row as picture tabs above the filters.
+The Owner and Show rows and the words box stay below the tabs.
+`ListView.placement` puts the List Producer chips beside the words box and the Studio tabs above the filters.
+A render failure gives a 503 page with **The Studio page is not available.** and logs `review-links studio:`.
+
+The tabs are the List Producer filter: `record_table.chip_row('Producer', ...)` with `data-filter-row="producer"`.
+They use the same `staff:<id>` values and the same `#producer=<id>` fragment as the List.
+All is first. Then each active producer that is not retired follows in name order, also with a count of 0.
+A producer that has rows but no active staff row also gets a tab.
+Each tab shows a picture with the name and the item count on it. A click filters the rows to that producer.
+The counts change with the Owner, Show and words filters, as on the List.
+
+`studio_avatar_root` in `config/review_links.conf` names the picture folder.
+The All tab reads the folder `all`. A producer tab reads the folder named by its staff ID.
+A picture has three files: `NN-64.webp`, `NN-128.webp` and `NN-256.webp`.
+Each render lists each folder and picks one picture number at random for each tab. The page does not read `index.json`.
+The `<img>` uses the 128 file as `src` and all three files in `srcset`.
+A missing root, a missing folder, or a folder with no complete picture shows the initial of the name in a circle.
+A page refresh copies the `src` and `srcset` of each `img[data-keep-src]` into the new content.
+So a picture changes only when the page loads.
+
+`GET /console/studio/avatars/<folder>/<NN>-<size>.webp` serves one picture.
+The folder is `all` or a 36-character staff ID. The size is 64, 128 or 256.
+The request gets the Tailscale, host and origin checks of a Review attachment request, and a failure gets 403.
+Any other name, a link below the root, a missing file, or a file over 64 KB gets 404.
+A picture goes out as `image/webp` with `Cache-Control: max-age=86400`.
+
+On the Studio, `data-list-path` on `[data-list]` sets the path for row actions and item-state reads to `/console/studio.html`.
+The List uses `location.pathname` for these requests.
+`serve.LIST_VIEWS` maps each path to its view, so both paths use one POST handler with the same Tailscale, origin and form-token checks.
+The view sets the item panels in an action answer, so a Studio action keeps the Studio panel.
+A page refresh reads `location.pathname`, so the Studio refreshes as the Studio.
+Both pages use the shared HTML gzip response.
+See [Undo after Send](#undo-after-send) for the actions that use the send hold.
+
+Each producer has one top priority item: the `top_item` List number in its staff row.
+`ListView.top_priority` is `TopPriority.SHOWN` for the Studio and `TopPriority.HIDDEN` for the List, so the List does not change.
+`list_page.top_priority_mark` reads the mark at render time.
+An item is the top item when it is open, its producer is an active producer row, and that row names its number.
+A Closed or missing item reads as no top item, and the page writes nothing when an item closes.
+A flag before the title marks the top item in its row, also on the All tab.
+Each other open item of an active producer has the button **Make top priority** in its panel. An item of a retired or unknown producer shows neither the flag nor the button.
+`list_page.top_button` gives the button to both panel forms: beside Remove, or beside Mark read and Unpark when the item waits for an answer.
+The button posts the action `top`. `the_list.make_top_priority` names the item as the top item of its producer, so it takes the place of the old one.
+The List path refuses `top`. The refresh after the save moves the flag and the band.
+
+The band is above the filters on a producer tab and hidden on All.
+It shows the Top priority label with the flag, the item number and title in bold, the next step below, and the state and the short ETA on the right.
+A producer with no top item shows **No top priority item** and **Open an item and click "Make top priority".**
+The page renders one band for each top item and one band for no top item.
+A `:has()` rule for each band shows the band of the pressed Producer tab, so a tab click makes no request.
+`CONSOLE_DOCUMENTS` maps the Studio path to `list`, so New item and its screenshot use the List owner, `page.list.owner`.
+`page.studio.owner` sets the owner when the console shows the Studio as unavailable.
+The Studio uses the List status age limit and has no `status.studio` key.
+
 ### Images page
 
 `/console/images.html` shows registered images with their instructions, oldest first.
 A new image goes to the end, so the cards above it keep their places.
 The console lists it as **Images**, with the Lucide `image` icon.
-A showrunner or unit registers each image, or a before and after pair, with one command:
+A showrunner or unit uses one command to register an image or a pair.
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH | --before PATH --after PATH) --caption "TEXT" --owner STAFF_ID (--change ID | --phase ID)
+~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py register (--image PATH [--two-halves] | --before PATH --after PATH) --title "TITLE" [--look-for "POINT"]... --owner STAFF_ID (--change ID | --phase ID) [--list-item L<n>]
 ```
 
-- The caption is the change in the fewest plain words that stay accurate. It adds a second line, `Look for: <place>`, only when the change is hard to find.
+- The title says what the image shows. Give one `--look-for` for each point the user needs to check.
+- `max_chars.image_title` in `config/review_links.conf` sets the title limit. The default is 80 characters.
 - `scripts/review_links/reply_shot.py <markdown> <columns> <png>` renders a Markdown reply in the Claude Code terminal.
   It resumes a placeholder transcript in Xvfb and xterm, so no model call happens.
   It cuts the shot at the first blank band of `reply_shot_gap_rows` pixel rows, so the page shows readable text.
   `config/review_links.conf` sets the wait, the terminal rows and the band height.
 - The owner is the staff id that made the image. The command refuses an id that is not in the staff record.
-- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files and refuses an empty caption.
+- The command accepts `.png`, `.jpg`, `.jpeg`, `.gif` and `.webp` files.
+- Use one nonempty line for the title and one for each point.
+- Use `--two-halves` for a single file with two halves other than before and after.
+- The command runs the fast check and the model review before it copies the image.
+  The model receives the title, the look-for points, and the image layout.
+- Use `--list-item L<n>` to link the picture to a List item.
+  Registration searches the current and old List folders.
+  The picture record stores the List id and its keeper id.
 - It copies the image to `<review root>/images/<12-hex id>/image<suffix>` with a private `.review-link-image.json` record.
+  The record stores `title` and the `look_for` list. It also stores the full text in `caption` for older services.
+  The page uses the full `caption` as the title if the record has no `title`.
   A pair copies `before<suffix>` and `after<suffix>` to one folder with one record and one id.
   The record keeps the after image in `file` and the before image in `before`.
   It builds the folder under a private draft name, then renames it, so the page never shows a partial image.
@@ -1750,13 +2164,14 @@ A showrunner or unit registers each image, or a before and after pair, with one 
   `console.place_query` builds the query from the console's place key.
 - The server serves the copy, so the user never needs the source path.
 
-Each card shows, in this order:
+A card with an image shows these parts in order.
 
-1. The caption as the card title, in a larger font.
-2. The details, with aligned labels: `Owner:`, `For  :` and `Added:`.
-3. The image link. A pair shows its two images side by side, under **Before** and **After** labels.
-4. The **Feedback** field, with `feedback_rows` rows from `config/review_links.conf`.
-5. The answer buttons: **Approved** and **Send Feedback**.
+1. The full title in normal weight at the List title size. The title wraps when it exceeds the card width.
+2. The optional points as bullets in the secondary text color.
+3. The details with aligned labels for the owner, subject, and time.
+4. The image link. A pair shows both images under **Before** and **After** labels.
+5. The **Feedback** field. `feedback_rows` in `config/review_links.conf` sets its height.
+6. The **Approved**, **Send Feedback**, and **Ask question** buttons.
 
 A plain click on a single image or either pair image opens the shared image zoom.
 The zoom centers the full image over a dark backdrop within the page view.
@@ -1778,7 +2193,8 @@ The modal dialog takes focus and uses the image's alt text as its accessible nam
 **Owner** is `<name> (<kind>)`, or `Unknown session: <id>`. **For** is `Change <id>` or `Phase <id>`.
 **Added** is `MMM dd, yyyy, HH:MM` on the 24-hour clock in the user's zone (`config/user_zone.conf`).
 The Images page shows every waiting image, oldest first, with no age filter.
-A pair has one caption, one details block, one Feedback field and one set of answer buttons. The owner delete removes both images.
+A pair shares one title, bullet list, details block, Feedback field, and set of answer buttons.
+The owner can delete both images with one command.
 On a page 1108px or wider, a single card is 680px wide while the group panel is 300px or narrower, and a pair card is up to 1376px wide; both are centered in the images pane.
 When a pair card is narrower than 600px, its images stack, before on top.
 A page URL with `#image=<id>` opens at that card.
@@ -1803,21 +2219,62 @@ The server checks the token.
 **Approved** needs no text. **Send Feedback** refuses empty text with **Enter feedback first.** and keeps the card.
 Feedback always means that the image is not approved, so the page has no separate **Not Approved** button.
 A card loaded before that change can still post `not approved`; the server refuses it with **Not Approved was removed. Use Send Feedback.**
-Otherwise the card leaves the page at once, and the request runs in the background.
+The card leaves the page when the shared Undo toast appears.
+**Undo** restores the card and focuses the feedback field with the typed words.
+The server saves no answer for an undone send.
 The page skips its refresh while a send runs.
 An image leaves the page while each open question has a live sender or confirmed acceptance.
 The page also hides an image while the server recovers its verified delivery on startup.
-A failed or uncertain delivery returns the card with a delivery notice.
+A failed or unconfirmed delivery returns the card.
+Only a confirmed failure shows the shared question failure line.
 When the owner answers the last open question, the card returns and the console shows a new update.
-The server sends one message to the owner's staff id, resolved to its current session at each try.
-It uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
 The first line names the answer: `From the user (via the Images page): ` and then `your image is approved.` or `your image is not approved. The feedback follows.`
-A `Feedback:` line follows when the user wrote text.
-Then come the image link (a `Before:` and an `After:` link for a pair), the caption, the For line and the delete command for the owner to run after it acts.
-After a send, the record gets `feedback_at` and the page hides the image; the image file stays until the owner deletes it.
-A page loaded before the answer buttons can still post a delete, which removes the image folder under `images/.review-link-images.lock` and sends no message.
-When no try reaches the owner, the server answers 503 and writes nothing.
-The card goes back in its place with one line: **Not sent: <reason>**.
+The Images command checks replies to questions before it takes the image write lock.
+The writer checks that the question is still open.
+
+The server sends the answer to the owner's staff id.
+For a linked picture, the server saves the verdict and the user's words in the List log before it sends.
+The same List write sets Next step to `<producer name>: act on nate's answer to picture <id>`.
+It marks the item read and keeps open List questions.
+It closes open asks that name the picture id and keeps other asks open.
+An answer changes Waiting for nate to Working.
+Feedback changes Delivered to Working. Approval leaves Delivered for the producer to close.
+The answer clears a Waiting for nate ETA unless it approves a Delivered item.
+The server sends the answer to the item's saved producer and the picture owner.
+One staff id receives one message if it serves both roles.
+The server resolves each recipient to its current session at each try.
+The send uses `delivery_tries` and `delivery_pause_seconds` from `config/review_links.conf`.
+An answer message gives the verdict and any feedback.
+For a current picture it also gives the image links, the title, the look-for points, the subject, and the delete command.
+The question message also includes the title and the look-for points.
+For a removed picture it gives the picture id.
+The message includes the List id for a linked picture.
+
+A private answer record outside the picture folder saves the words, delivery key and confirmed recipients.
+A retry uses the saved delivery key and sends only to recipients that have no confirmation.
+The live picture gets `feedback_at` after all recipients confirm the send.
+The page then hides the card unless a new question answer needs review.
+Delete saves the picture reference, title, and look-for points before it removes the picture folder.
+The server deletes the folder under `images/.review-link-images.lock`.
+An open card can still send an answer after deletion.
+The page shows **This picture was removed; your words went to <owner name>.**
+If a save or delivery fails, the server answers 503 and names the step or recipient.
+On reload, each pending answer for a removed picture shows its saved title and look-for points.
+It also shows the saved words, **Not sent yet**, and a **Retry** button.
+Older records without a saved title show the picture id.
+The page also shows Retry if the picture folder remains after its record is removed.
+The retry card leaves the page when delivery is confirmed.
+The browser keeps editable drafts separate from saved answer attempts.
+Each edit saves the draft in the tab.
+Before each submit, the browser saves the draft and the action and round for an unchanged answer.
+A reload restores the drafts, including drafts for removed pictures.
+If draft storage fails, the page keeps the drafts in memory and blocks automatic reloads.
+While one request is active for a picture, its submit buttons are disabled.
+The buttons remain disabled until response handling and card removal finish.
+Other pictures can accept a request during this time.
+A confirmed send or Retry clears its matching draft if the draft has the same revision.
+A refresh keeps each Retry error with its saved attempt.
+The linked answer stays in the List log if delivery fails or the owner deletes the image.
 An agent deletes an image with this command:
 
 ```sh
@@ -1831,6 +2288,7 @@ It is the last navigation entry, with the label `Placement disk POC` and the `to
 The server reads the HTML file named by `placement_disk.file` in `config/console.conf` on each request.
 It does not copy the file, so an edit to the file shows after a page refresh.
 The server adds the page owner control at the first `<h1>` after `<main>`.
+The panel adds the frozen top height to its top padding when it scrolls a control into view.
 When the file is missing or unreadable, or the `~` path names an unknown user, the server returns 503 with `The Placement disk POC page is not available.`
 The page loads three.js from cdnjs. Served page documents send no Content-Security-Policy, so the load works in the console frame.
 
@@ -2003,7 +2461,7 @@ The message includes any feedback from the form.
 This answer writes no verdict and runs no feature-log command.
 The row leaves the view when the request saves.
 The review list retains the row until the showrunner saves a verdict.
-A direct link shows **The showrunner will validate this** without answer buttons.
+A direct link shows **With the showrunner for validation** in the card details.
 The delivery record preserves this state across page loads and server restarts.
 The page calls `next_item.move_to_end` to move the row to the end of the showrunner's own queue.
 The CLI keeps its current form and still moves the pinned item.
@@ -2038,8 +2496,7 @@ The message includes the feedback ID and the command to record the action.
 The recorded action returns the change to Open.
 
 Each answer uses a background `fetch` POST.
-The row shows **Saving…** during the save and **Saved: <result>** after success.
-The row then leaves the view without opening another card.
+After the save, the row leaves the view without opening another card.
 A failed save keeps the row and typed text and shows **Not saved: <reason>**.
 
 The fixed `console/` folder holds the all-list browser's private `.review-link-browser.json` and no HTML file.
@@ -2135,7 +2592,6 @@ An empty Producer cell belongs to the list's staff showrunner.
 Retries retain stored staff recipient ids.
 Older records without recipient ids compute the same recipients as a fresh verdict send.
 No agent polls for answers.
-A save shows **Saved: &lt;answer&gt;** from the review record.
 `DeliveryStatus` owns one private delivery record per review list and row under the configured review root.
 `scripts/production/delivery_state.py` owns its typed states and decoder.
 Both the page and waiting-count readers use this decoder.
@@ -2156,8 +2612,9 @@ The server reads the owner and its production document at use through `StaffRout
 `DeliveryIntent` models a pending send; it has no failed state.
 `ValidationRequested` keeps validation ownership and feedback after delivery or an alert.
 Only a showrunner answer returns an open question to the user.
-The page shows **Saved: <answer>**, **The showrunner will validate this**, or **The showrunner will answer this**.
-The page shows “Question not delivered.” after a confirmed delivery failure.
+The page shows the recorded verdict or the current state in the card.
+The shared question renderer shows “Question not delivered.” after a confirmed failure.
+The page has no Resend or Retry buttons.
 
 The server reads `config/review_links.conf` through `scripts/lib/conf.py` when delivery starts.
 Each page render reads `feedback_rows` once to set every feedback box's height.
@@ -2194,6 +2651,13 @@ The user receives no delivery alert.
 
 At startup, the server delivers pending records with the same retry and alert rules.
 New item saves a first-message marker before it writes the native record.
+For a List Send, the server saves the List route before it writes the native record.
+The server holds the recipient locks while it reserves a List number and saves the linked row.
+It releases the recipient locks before it takes the delivery lock.
+Recovery reuses the reserved number if the process stops during the List write or before the notice claim.
+If the producer retires before the row saves, recovery logs the reason, skips the row, and sends the notice.
+If the staff authority is temporarily unavailable, the server leaves the List write and notice pending.
+Recovery still clears the first-message markers for items that already have an answer.
 The delivery claim reads the native owner under the same lock as wrap.
 The server clears the marker after the claim saves.
 Startup recovers a marked message only when the native record exists.
@@ -2273,13 +2737,35 @@ It exits with status 0 when the folder disappears.
 The rest of this section describes the normal server and its initial config values.
 The server reads the current settings when it needs them.
 
-The shared check covers POST requests, New item token requests, Go token requests, and Review attachment requests.
+The shared check covers POST requests, New item token requests, Go token requests, Review attachment requests, and Studio picture requests.
 These requests require a single `Host` header for the server's bound address and port.
 The server also accepts the published host on the same port if its process receives the same `REVIEW_LINKS_HOST` override.
 On port 80, the server also accepts either host without a port.
 If the request supplies `Origin`, it must match the HTTP origin for that `Host`.
 A Go change (`POST /console/tune`) must supply `Origin` and the token.
 The server returns 403 when the host or origin check fails.
+
+The Builds Kill action uses `GET /console/build-kill` for current handles and stop results.
+`POST /console/build-kill` requires the matching Origin and request token.
+The server limits the form to `kill.request_bytes`, initially 4096 bytes.
+Both requests require the Tailscale login in `operator_login`.
+The default admits the user ID that owns the untagged local Tailscale node.
+The server checks the socket peer with Tailscale WhoIs.
+The Builds queue verifies the detached command and its saved run slice before it offers Kill.
+The first read of the detached run record determines acceptance.
+The server requires `completion_after_slice_cleanup` to offer or accept Kill.
+The supervisor sets that field when it publishes its process identity.
+A finished or missing record on that read gives **Run already ended**.
+The server saves accepted requests under `.review-link-build-kill` in its private state.
+The live supervisor finishes the run record.
+When the supervisor is gone, the server asks the normal reaper to check the selected record.
+The reaper finishes that record when the slice is empty and recovers its pending completion.
+The server saves **Stopped** when the record confirms the stop and the saved slice is empty.
+It then sends the keyed notice.
+A change in the detached record identity ends recovery with **Stop unconfirmed**.
+After restart, the server restores saved results and resumes pending actions.
+The server retries pending actions in its existing maintenance cycle.
+The Builds page reads these results at `page_refresh_seconds` intervals through its existing refresh cycle.
 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - The server repeats the address check after `tailscale_check_seconds`, which starts at 60 seconds.
@@ -2303,7 +2789,111 @@ The server returns 403 when the host or origin check fails.
 - `/console/` is rendered at each request, as [Hana console](#hana-console) states. Older console, browser and rebuild links get a 303 to the fixed address.
 - The server renders a published `changes.html` with a private manifest from the review record. A published console page, such as `memory_live.html`, gets HTTP 200 with no validator. For other regular files, it sends `ETag` and `Last-Modified` with HTTP 200 or 304. A matching `If-None-Match` gives HTTP 304. HTTP 200 also includes `Content-Type`, `Content-Length` and `X-Content-Type-Options: nosniff`.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
+- `POST /console/list-go` takes a List Go. It passes the same host and origin check as the other POST requests.
+  It writes the ledger record in `<state folder>/go-ledger/` before it closes the ask; see [Asks for nate's Go](#asks-for-nates-go).
+- `GET /console/go-check?id=<go id>&caller=<staff id>` answers `go_check.py` with JSON `ok` and `text`.
+  It gives 200 and marks the record used for the first check by the target, and 403 for each refusal.
 - Each request writes the standard access line to stderr.
+
+### Undo after Send
+
+The following actions wait so the user can undo them.
+
+1. Review items hold all answers, Later, and Validate.
+2. The List and the Studio hold Tell, Ask question, both Park choices, Unpark, Mark read, and Remove.
+3. Images holds Approved, Send Feedback, and Ask question.
+4. The New item dialog waits on each console page.
+5. The change browser holds each answer and the question Skip action.
+
+The browser marks the send with `X-Undo-Hold: 1` and sets `X-Undo-Request` to a new request ID.
+If the browser loses the response, a retry of the same action uses the same request ID.
+The browser allows POST retries for two minutes after the first POST. After two minutes, it shows a failure.
+The server uses this ID for the hold. A repeated POST returns the same hold and the remaining Undo time.
+The server saves the body, with the Content-Type, Origin, Host and Accept headers, in `<root>/.review-link-holds/<id>.json`.
+Only the owner can read the folder and its files. The server answers 202 with `X-Send-Hold: held`.
+The 202 body gives the hold ID and the remaining Undo time in `seconds`.
+If no time remains, the page reads the result without an Undo toast.
+Nothing is saved and nothing is sent before the time ends.
+When `undo_seconds` is zero, the server does not hold the send and handles it at once.
+
+The toast says `Sent to <name>.` and shows an **Undo** button and a bar.
+If the page has no receiver name, the toast says "Sending."
+For an action that saves without a message, the toast says "Saved."
+Later, Validate, Park, Unpark, Mark read, Remove, and Skip also use "Saved."
+The existing sender delivers any notice after the hold ends.
+The toast uses the recipient name shown when the user presses **Send**.
+For **Tell**, the toast uses the signed producer.
+If a draft can recover an earlier filing, the toast says "Sending."
+The toast appears at the bottom right of the top window.
+It sits 24 px from the bottom and right edges.
+At 560 px or less, the right gutter is 16 px.
+At 640 px or less, the stack is at most 280 px wide.
+Stacked toasts share the right edge. Long names wrap.
+The stack scrolls when it reaches the space reserved for the frozen header and a full card button.
+The stack keeps room for a full toast and its Undo button within the viewport.
+The page adds bottom scroll space and scroll padding from the top of the stack to the bottom of the page frame.
+A linked Review card reduces its height by the same amount.
+The card body scrolls when it has enough space between the header and footer.
+The full card scrolls when the body cannot fit between them.
+Closing a sending frame removes its toast.
+The page removes the scroll space from frames that close or when no toast is visible.
+The toast uses the console colors.
+The toast moves to the top open modal dialog, or to the page, so no dialog covers it or makes it inert.
+The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.
+Images, Review, and List hide the item while the Undo toast is available.
+**Undo** posts `/send-hold/<id>/undo`. The server replaces the saved request with an undone mark and answers 200.
+A repeated Undo, after a lost answer, also gets 200.
+The page then shows "Undone. Edit and send again." and keeps the draft.
+**Undo** restores the item. If the item is still open, **Undo** focuses its editable draft field.
+A failed send restores the item and its draft with the failure message.
+The New item dialog and the linked Review card reopen with the draft.
+You can open a new draft or another linked card while a send waits.
+The List keeps a separate recovery slot for each unresolved draft in the browser tab.
+If the server confirms a linked card save and its response is unreadable, the List shows the refresh error.
+A successful List refresh clears the error.
+A change browser answer goes back in the list with an **Open it** button.
+**Undo** restores the Review or List row in the current sort order.
+Undo after Unpark restores the row to Parked.
+Held Unpark hides a linked parked row during the hold. Undo restores the row and its link.
+Undo returns to a skipped question if the user stays at the next question.
+The page tracks the request from the first POST until the server confirms the result or Undo.
+The action POST uses `keepalive` for bodies of 64 KiB or less. Larger bodies use a regular POST.
+If the keepalive POST rejects before a response, the page retries once without `keepalive` and uses the same request ID.
+When the console page or the card frame closes, the page removes the toast and posts `/send-hold/<id>/send`.
+The server sends the request at once. If the release arrives first, the server records it until the POST arrives.
+A failed Undo leaves release on close active.
+
+One second after the time ends, the server sends the saved request to its own bound address.
+The normal handler then saves and sends, as for a send that does not wait.
+If delivery fails after a confirmed save, the toast shows the delivery failure. The action stays saved.
+An Undo after release gets 409.
+The toast waits for the result, then shows `Too late to undo. Sent to <name>.`, the save text, or the failure.
+The browser retries an Undo once if it loses the connection.
+A failed Undo says "Undo failed. The send can still leave."
+The toast still reads the result and shows any delivery failure.
+The page reads `GET /send-hold/<id>`, with the same Tailscale and origin checks as the New item options.
+The server answers 202 with `X-Send-Hold: pending` until the send ends.
+It then gives the saved response, so each page shows its normal result.
+A read that loses its connection tries again each second. After 30 failed reads, the page shows the error.
+A failed connection to itself gives a 503 result.
+Before the replay, the server writes a 503 result: "The send may have left. Check before you send again."
+A server that stops during a replay keeps that result, so it never sends the request two times.
+A handler that runs longer than 5 minutes gives the same result, because it can still finish.
+
+Each saved request is a file, so a server restart sends each request it finds when its time ends.
+A code change restarts the server only when no replay runs and no hold request waits for its answer.
+After that check, no replay starts, and a new held send gets 503: "The console is restarting. Send again."
+A hold file that the server cannot read gets a stderr line, and the sweep deletes it.
+The sweep also deletes undone marks after 10 minutes, and other files in the folder after 10 minutes.
+If the server cannot write before a replay, it deletes the saved request and keeps a failed result in memory.
+If the server cannot write the result after a replay, the page reads that result from memory.
+After a restart, that page reads "may have left".
+If the server cannot write the undone mark, the Undo answers 503 and the send still leaves.
+A page can read a result again until the sweep deletes it, 10 minutes after the send.
+A New item that waited through a restart gets the stale token answer. The List page shows it.
+Other pages load a new token and send again, with a new Undo time.
+The `.review-link-` prefix keeps the folder private: a GET of a saved request gets 404.
+An undo needs the console host and origin, as other POST requests do.
 
 ### Sweep
 
@@ -2434,12 +3024,14 @@ The scripts read `config/review_links.conf` through `scripts/lib/conf.py` when e
 `snapshot_allocation_tries` limits folder allocation attempts.
 `delivery_tries` and `delivery_pause_seconds` control message attempts.
 `feedback_rows` sets the textarea height from 1 to 20 rows and starts at 5.
+`undo_seconds` sets how long a send waits for Undo, from 0 to 60 seconds, and starts at 10. Zero turns Undo off. Each send reads it.
 `review_words_rows` sets the height of the Review page **Your words** box from 1 to 20 rows and starts at 4.
-The `later_*` keys set the Review page Later presets; each render reads them.
+The List and Review pages read the parking settings at each render.
 `later_soon_minutes` is 1 to 1440 minutes and starts at 60.
-`later_evening`, `later_evening_until`, `later_morning` and `later_week_time` are HH:MM times in the user zone.
-They start at 18:00, 17:00, 09:00 and 09:00.
-`later_week_day` is a weekday name and starts at Monday.
+`later_morning` is an HH:MM time from 00:00 to 23:59 in the user zone. It starts at 09:00.
+`later_week_day` is a full English weekday name with an initial capital. It starts at Monday.
+`later_week_time` uses the same format as `later_morning` and starts at 09:00.
+`park_time_step_minutes` is 1 to 60 minutes and starts at 15.
 `unrouted_alert_recipient` selects the alert recipient and the root showrunner for changes that nobody can take.
 This owner rule applies to routed changes when the list has no staff showrunner or its production document is gone.
 An unknown producer id or a broken parent chain keeps the change unrouted.
@@ -2460,6 +3052,8 @@ The page, the footer and `/next` use these same folder readers.
 
 `placement_disk.file` in `config/console.conf` names the Placement disk POC file; see [Placement disk POC page](#placement-disk-poc-page).
 A `~` at the start of the path expands to the home folder.
+`studio_avatar_root` in `config/review_links.conf` names the Studio picture folder; see [The Studio page](#the-studio-page).
+It must be an absolute path or start with `~`.
 
 
 Legacy Changes and Questions forms and the Images page share one motion helper.
@@ -2483,7 +3077,7 @@ The renderer removes blank lines at each text part's edges.
 Code blocks and paragraphs use the same 16px margin.
 Inline code keeps its current style.
 The button copies the code text without the button or its label.
-The button shows a check and the label “Copied” for two seconds after success.
+The button shows a check for two seconds after success. Its label stays the same.
 A second click starts the two seconds again.
 A failed copy keeps the copy icon and shows “Copy failed” for two seconds.
 The shared script uses the clipboard API when available.

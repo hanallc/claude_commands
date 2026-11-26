@@ -22,7 +22,7 @@ import threading
 import time
 import unicodedata
 from collections.abc import Callable, Generator, Iterable
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from functools import partial
@@ -31,9 +31,12 @@ from typing import IO, Literal, NotRequired, TypedDict, cast, overload
 from urllib.parse import parse_qs, urlsplit
 from weakref import WeakSet, WeakValueDictionary, finalize
 
+from scripts.console_text import check as console_text
+
 from scripts.agents import remote
 from scripts.lib import build_folders, process_start
 from scripts.lib.boot_identity import boot_identity
+from scripts.lib.file_lock import LockResult
 from scripts.message import send_result
 from scripts.production import change_review as change_review
 from scripts.production import investigation, proposal_issue, unit_lookup, record_store
@@ -41,7 +44,7 @@ from scripts.production.issues import Issue
 from scripts.production import update_registration
 from scripts.production import unrouted_alert, change_routing, delivery_state, next_item, showrunners, staff
 from scripts.production.delivery_state import (
-    NoQuestionSendOwner, NoQuestionSendReceipt, QuestionAttempt, QuestionAttemptMissing,
+    NoSavedListKeeper, NoQuestionSendOwner, NoQuestionSendReceipt, QuestionAttempt, QuestionAttemptMissing,
     QuestionSendOwner, QuestionSendReceipt, QuestionSendState, QuestionSource,
     AnsweredQuestion as AnsweredQuestion, DeliveryIntent as DeliveryIntent, DeliverySlots as DeliverySlots,
     NoDelivery as NoDelivery, NoQuestion as NoQuestion, OpenQuestion as OpenQuestion,
@@ -49,13 +52,11 @@ from scripts.production.delivery_state import (
 )
 from scripts.lib import atomic_file, conf, urgency
 from scripts.lib.user_zone import user_zone
-from scripts.production.production_doc import (
-    Refusal as Refusal, production_field, read_production,
-)
+from scripts.production.production_doc import Refusal as Refusal, production_field, read_production
 from scripts.feature_log import feature_log
 from scripts.review_links.question_path import AnswerTime, NO_ANSWER_TIME, answer_log_id
 from scripts.review_links import (console_theme, image_store, new_item_dialog, page_frame, question_record, review_events,
-                                  reply_tokens, review_link)
+                                  reply_tokens, review_link, staff_names)
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
 from scripts.review_links.review_items import (
     CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
@@ -381,6 +382,10 @@ class NoQuestionJob:
 
 NO_QUESTION_JOB = NoQuestionJob()
 
+_ANSWER_COMMAND_LINE = "\nAnswer with this command: "
+_LIST_ANSWER_PREFIX = "~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py answer "
+_LIST_ANSWER_SUFFIX = ' --question {question_id} --text "<answer>"'
+
 
 @dataclass(frozen=True)
 class SavedQuestionDelivery:
@@ -396,7 +401,10 @@ class SavedQuestionDelivery:
 
     @property
     def message_body(self) -> str:
-        return f"{self.source.words}\nAnswer with this command: {self.answer_command}"
+        return self._body(self.answer_command)
+
+    def _body(self, command: str) -> str:
+        return f"{self.source.words}{_ANSWER_COMMAND_LINE}{command}"
 
     @property
     def message(self) -> str:
@@ -407,7 +415,7 @@ class SavedQuestionDelivery:
         return ReviewPage(path, path.parent, (self.source.row,), "")
 
     def matches(self, record: QuestionAttempt) -> bool:
-        return (record.source == self.source and record.recipient_id == self.recipient
+        return (self.source.matches_attempt(record.source) and record.recipient_id == self.recipient
                 and self.matches_message(record.message))
 
     def matches_message(self, message: str) -> bool:
@@ -417,7 +425,10 @@ class SavedQuestionDelivery:
         if len(parts) != 3:
             return False
         heading, title, body = parts
-        return heading == self.heading and bool(title.strip()) and title.splitlines() == [title] and body == self.message_body
+        # Attempts saved before the keeper flag carry the List answer command without --keeper.
+        before_keeper = self._body(re.sub(r" --keeper \S+", "", self.answer_command, count=1))
+        return (heading == self.heading and bool(title.strip()) and title.splitlines() == [title]
+                and body in (self.message_body, before_keeper))
 
 
 @dataclass(frozen=True)
@@ -429,28 +440,31 @@ class QuestionDeliveryTarget:
     title: str
     answer_command: str
     alert_owner: staff.StaffId | None = None
+    initial_recipient: question_record.QuestionRecipient = question_record.DefaultQuestionRecipient.PAGE
+    keeper: staff.StaffId | NoSavedListKeeper = NoSavedListKeeper()
 
     def saved(self, question: question_record.Question) -> SavedQuestionDelivery:
         row = f"{self.row}/{question.question_id}"
-        source = QuestionSource(str(self.path.resolve()), self.item, question.question_id, question.words, row)
+        source = QuestionSource(str(self.path.resolve()), self.item, question.question_id, question.words, row, self.keeper)
         command = self.answer_command.format(item=shlex.quote(self.item), question_id=question.question_id)
         return SavedQuestionDelivery(source, self.recipient, self.title, command, self.alert_owner)
 
 
 def list_question_target(path: Path, item: str, number: int, title: str,
-                         recipient: staff.StaffId, *,
+                         recipient: staff.StaffId, *, keeper: staff.StaffId,
                          alert_owner: staff.StaffId | None = None) -> QuestionDeliveryTarget:
-    command = ('~/.claude/scripts/lib/py ~/.claude/scripts/production/the_list.py '
-               + 'answer {item} --question {question_id} --text "<answer>"')
-    return QuestionDeliveryTarget(path, item, recipient, f"List item {number}", title, command, alert_owner)
+    # The command names the record's folder, so a recipient never answers a same-number record in its own folder.
+    command = _LIST_ANSWER_PREFIX + f"{{item}} --keeper {shlex.quote(keeper)}" + _LIST_ANSWER_SUFFIX
+    return QuestionDeliveryTarget(path, item, recipient, f"List item {number}", title, command, alert_owner, keeper=keeper)
 
 
 def image_question_target(path: Path, image: image_store.ImageRecord) -> QuestionDeliveryTarget:
     command = ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/images.py answer '
                + '--id {item} --question {question_id} --text "<answer>"')
     owner = staff.StaffId(image["owner"])
+    summary = "\n".join((image["title"], *image_store.look_for_message_lines(image)))
     return QuestionDeliveryTarget(path, image["id"], owner, IMAGE_QUESTION_ROW_PREFIX + image["id"],
-                                  image["caption"], command, owner)
+                                  summary, command, owner)
 
 
 @dataclass(frozen=True)
@@ -489,8 +503,38 @@ def _boot_id() -> str:
     return boot_identity()
 
 
-def _question_lock_path(path: Path) -> Path:
-    return path.parent / ".review-link-question-jobs" / path.name
+def _question_lock_path(path: Path, name: str) -> Path:
+    return path.parent / ".review-link-question-jobs" / name
+
+
+type QuestionLockAcquisition = IO[str] | Literal[LockResult.BUSY]
+
+
+def _take_question_attempt_lock(path: Path) -> QuestionLockAcquisition:
+    path.parent.mkdir(exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException as error:
+        handle.close()
+        if isinstance(error, BlockingIOError):
+            return LockResult.BUSY
+        raise
+    return handle
+
+
+def _take_question_recovery_locks(locks: ExitStack, path: Path, record: QuestionAttempt) -> QuestionLockAcquisition:
+    """Take every sender lock and return the attempt lock for the claim."""
+    names = [path.name, record.attempt_id]
+    if isinstance(record.owner, QuestionSendOwner):
+        names.append(record.owner.job_id)
+    handles: dict[str, IO[str]] = {}
+    for name in dict.fromkeys(names):
+        handle = _take_question_attempt_lock(_question_lock_path(path, name))
+        if handle is LockResult.BUSY:
+            return handle
+        handles[name] = locks.enter_context(handle)
+    return handles[record.attempt_id]
 
 
 type QuestionLockState = Literal["held", "released", "unreadable"]
@@ -605,7 +649,7 @@ def _question_delivery_view(status: DeliveryStatus, saved: SavedQuestionDelivery
                             observe_job: Callable[[Path], QuestionJobObservation]) -> QuestionDeliveryView:
     page = saved.page()
     path = status.path(page, saved.source.row)
-    lock = observe_job(_question_lock_path(path))
+    lock = observe_job(_question_lock_path(path, path.name))
     record: QuestionAttempt | NoQuestionAttempt = NoQuestionAttempt()
     owner: QuestionSendOwner | NoQuestionSendOwner = NoQuestionSendOwner()
     try:
@@ -615,16 +659,18 @@ def _question_delivery_view(status: DeliveryStatus, saved: SavedQuestionDelivery
         except QuestionAttemptMissing:
             state = _legacy(status, page, saved, fields)
         else:
-            same_question = record.source == saved.source and record.recipient_id == saved.recipient
+            same_question = saved.source.matches_attempt(record.source) and record.recipient_id == saved.recipient
             failed = same_question and record.state is QuestionSendState.FAILED
             matches = saved.matches(record)
             state = record.state if failed or matches else QuestionSendState.UNKNOWN
             if failed and not matches:
                 return QuestionDeliveryFailed(record)
             owner = record.owner
-            if lock == "released" and isinstance(owner, QuestionSendOwner):
-                # Check the per-attempt lock from older records.
-                lock = observe_job(_question_lock_path(path).with_name(owner.job_id))
+            if lock in ("released", "unobserved"):
+                lock = observe_job(_question_lock_path(path, record.attempt_id))
+            if (lock in ("released", "unobserved") and isinstance(owner, QuestionSendOwner)
+                    and owner.job_id != record.attempt_id):
+                lock = observe_job(_question_lock_path(path, owner.job_id))
     except (FileNotFoundError, ValueError):
         state = QuestionSendState.UNKNOWN
     except OSError:
@@ -651,6 +697,8 @@ def _question_delivery_view(status: DeliveryStatus, saved: SavedQuestionDelivery
 def publish_question_attempt(path: Path, record: QuestionAttempt) -> None:
     data = {**asdict(record), "schema": 2, "message_id": record.message_id}
     _ = data.pop("resend_requests", None)
+    if isinstance(record.source.keeper, NoSavedListKeeper):
+        _ = cast(dict[str, object], data["source"]).pop("keeper")
     if isinstance(record.owner, NoQuestionSendOwner):
         data["owner"] = None
     if isinstance(record.receipt, NoQuestionSendReceipt):
@@ -691,27 +739,25 @@ def question_envelope(page: ReviewPage, record: QuestionAttempt,
                             record.attempt_id, (record.recipient_id,), job=job)
 
 
-def claim_question(status: DeliveryStatus, delivery: VerifiedQuestionAttempt) -> PageQuestionSend:
+def claim_question(status: DeliveryStatus, delivery: VerifiedQuestionAttempt,
+                   *, lock: IO[str] | None = None) -> PageQuestionSend:
     record = delivery.record
     page = delivery.saved.page()
     path = status.path(page, delivery.saved.source.row)
-    lock_path = _question_lock_path(path)
-    lock: IO[str] | None = None
+    lock_path = _question_lock_path(path, record.attempt_id)
     claimed = record
     try:
         start = process_start.process_start(os.getpid())
         boot_id = _boot_id()
         if not isinstance(start, process_start.Started) or not start.start.strip() or not boot_id.strip():
             raise OSError("Cannot read this question sender's process identity.")
-        owner = QuestionSendOwner(socket.gethostname(), boot_id, os.getpid(), start.start, secrets.token_hex(32))
-        lock_path.parent.mkdir(exist_ok=True)
-        lock = lock_path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock.close()
-            status.defer_question(path)
-            return question_envelope(page, record)
+        owner = QuestionSendOwner(socket.gethostname(), boot_id, os.getpid(), start.start, record.attempt_id)
+        if lock is None:
+            acquired = _take_question_attempt_lock(lock_path)
+            if acquired is LockResult.BUSY:
+                status.defer_question(path)
+                return question_envelope(page, record)
+            lock = acquired
         _local_question_jobs[lock_path.resolve()] = lock
         claimed = replace(record, revision=record.revision + 1, state=QuestionSendState.CLAIMED, owner=owner)
         advance_question_attempt(path, record, claimed)
@@ -776,11 +822,56 @@ def _send_result(delivery: VerifiedQuestionAttempt) -> QuestionAttempt:
 
 
 def _list_question_store(record: QuestionAttempt) -> record_store.NumberedRecords:
-    return record_store.NumberedRecords(record.recipient_id, "list", "L", "list item", ValueError)
+    source = record.source
+    path = Path(source.path)
+    keeper = source.keeper
+    if isinstance(keeper, NoSavedListKeeper):
+        keeper = _legacy_list_command_keeper(source, record.message.rpartition(_ANSWER_COMMAND_LINE)[2])
+    owner = record.recipient_id if isinstance(keeper, NoSavedListKeeper) else keeper
+    listing = record_store.NumberedRecords(owner, "list", "L", "list item", ValueError)
+    try:
+        if listing.path(source.item_id).resolve() == path:
+            return listing
+        if isinstance(keeper, NoSavedListKeeper):
+            return _legacy_list_question_store(listing, source)
+    except ValueError as error:
+        raise StaleQuestionAttempt("The List question source is unavailable.") from error
+    raise StaleQuestionAttempt("The List question source has moved.")
+
+
+def _legacy_list_command_keeper(source: QuestionSource, command: str) -> staff.StaffId | NoSavedListKeeper:
+    prefix = _LIST_ANSWER_PREFIX + shlex.quote(source.item_id)
+    suffix = _LIST_ANSWER_SUFFIX.format(question_id=source.question_id)
+    if not command.startswith(prefix) or not command.endswith(suffix):
+        raise ValueError("The saved List answer command does not match this question.")
+    option = command[len(prefix):-len(suffix)]
+    if not option:
+        return NoSavedListKeeper()
+    words = shlex.split(option)
+    if len(words) != 2 or option != " --keeper " + shlex.quote(words[1]):
+        raise ValueError("The saved List answer command has an invalid keeper.")
+    return staff.StaffId(words[1])
+
+
+def _legacy_list_question_store(listing: record_store.NumberedRecords,
+                                source: QuestionSource) -> record_store.NumberedRecords:
+    path = Path(source.path)
+    folder = path.parent
+    if folder.name == listing.collection and folder.parent.parent == record_store.state_root().resolve():
+        inferred = replace(listing, owner=staff.StaffId(folder.parent.name))
+        if inferred.path(source.item_id).resolve() == path:
+            return inferred
+    keepers = record_store.morty_ids(staff.snapshot())
+    if len(keepers) != 1:
+        raise ValueError("The List keeper is unavailable.")
+    morty = replace(listing, owner=keepers[0])
+    if morty.path(source.item_id).resolve() != path:
+        raise ValueError("The List question source has moved.")
+    return morty
 
 
 def _open_list_question(listing: record_store.NumberedRecords,
-                        record: QuestionAttempt) -> dict[str, str]:
+                        record: QuestionAttempt) -> tuple[dict[str, str], question_record.Question]:
     source = record.source
     path = listing.path(source.item_id)
     if path.resolve() != Path(source.path):
@@ -797,7 +888,11 @@ def _open_list_question(listing: record_store.NumberedRecords,
         raise ValueError("The List question source has a different item ID.")
     if fields["state"] == "Closed":
         raise ClosedQuestionSource("The List question source is Closed.")
-    return fields
+    questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
+    question = _verify_open_question(record, questions)
+    if question.recipient_id(listing.owner) != record.recipient_id:
+        raise StaleQuestionAttempt("The List question has a different recipient.")
+    return fields, question
 
 
 @contextmanager
@@ -815,9 +910,7 @@ def _lock_open_question_source(status: DeliveryStatus, record: QuestionAttempt) 
         return
     listing = _list_question_store(record)
     with listing.locked():
-        fields = _open_list_question(listing, record)
-        questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
-        _ = _verify_open_question(record, questions)
+        _ = _open_list_question(listing, record)
         yield
 
 
@@ -902,11 +995,11 @@ def run_question_delivery[Recipient, Result](
     return QuestionRun(results, None, attempts)
 
 
-def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) -> None:
+def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) -> DeliveryOutcome:
     """Publish the send marker before calling the transport."""
     job = delivery.job
     if isinstance(job, NoQuestionJob) or not job.start.acquire(blocking=False):
-        return
+        return DeliveryUnconfirmed()
     path = status.path(delivery.page, delivery.row)
     try:
         sending = replace(job.record, revision=job.record.revision + 1, state=QuestionSendState.SENDING)
@@ -937,7 +1030,7 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
                         _finish_unstarted_question(status, path, run.error, job.record, sending)
                 except (OSError, ValueError) as error:
                     _defer_question_error(status, path, delivery.row, error)
-            return
+            return DeliveryUnconfirmed()
         retry_error = run.error
         failed = result.state is QuestionSendState.FAILED and not unconfirmed
         if isinstance(retry_error, ClosedQuestionSource) and result.state not in (
@@ -949,11 +1042,11 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
             with status.locked():
                 advance_question_attempt(path, sending, result)
         except StaleQuestionAttempt:
-            return
+            return DeliveryUnconfirmed()
         except (OSError, ValueError) as error:
             _defer_question_error(status, path, delivery.row, error)
             if failed:
-                return
+                return DeliveryUnconfirmed()
             raise
         if result.state is QuestionSendState.UNKNOWN and result.earlier_unconfirmed:
             status.defer_question(path)
@@ -964,10 +1057,10 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
                 with _lock_open_question_source(status, result):
                     pass
             except ClosedQuestionSource:
-                return
+                return DeliveryUnconfirmed()
             except Exception as error:
                 print(f"review-links question alert {delivery.row}: " + " ".join(str(error).splitlines()), file=sys.stderr)
-                return
+                return DeliveryUnconfirmed()
             owner = verified.saved.alert_owner
             recipients: tuple[staff.StaffId, ...] = ()
             if owner is not None:
@@ -980,8 +1073,13 @@ def deliver_page_question(delivery: PageQuestionSend, status: DeliveryStatus) ->
                 _ = alert_delivery_failures([DeliveryFailure(result.recipient_id, result.error)], run.attempts,
                                             source=delivery.page.review_list, row=delivery.row,
                                             message=delivery.message, recipients=recipients, attempt=delivery.attempt)
+        if result.state in (QuestionSendState.SENT, QuestionSendState.QUEUED):
+            return DeliveryConfirmed()
+        if failed:
+            return FailedDelivery(delivery.attempt, delivery.page.review_list, delivery.row, result.error)
+        return DeliveryUnconfirmed()
     except StaleQuestionAttempt:
-        return
+        return DeliveryUnconfirmed()
     finally:
         _ = job.release()
         status.question_jobs.discard(job.lock)
@@ -1016,63 +1114,97 @@ def recover_page_question(status: DeliveryStatus, path: Path, record: QuestionAt
     page = ReviewPage(source_path, source_path.parent, (source.row,), "")
     if status.path(page, source.row) != path:
         return
-    lock = _question_lock_path(path)
-    locks = (lock, lock.with_name(record.owner.job_id)) if isinstance(record.owner, QuestionSendOwner) else (lock,)
-    if any(_question_lock_state(candidate) != "released" for candidate in locks):
-        status.defer_question(path)
-        return
+    with ExitStack() as locks:
+        try:
+            lock = _take_question_recovery_locks(locks, path, record)
+        except OSError as error:
+            _defer_question_error(status, path, source.row, error)
+            return
+        if lock is LockResult.BUSY:
+            status.defer_question(path)
+            return
+        try:
+            with status.locked():
+                record = _repair_question_job_id(path, record)
+            delivery = _claim_recovered_page_question(status, record, source_path, lock)
+        except StaleQuestionAttempt:
+            return
+        except Exception as error:
+            with status.locked():
+                _finish_unstarted_question(status, path, error, record)
+            return
+        deliver(delivery, status)
+
+
+def _decode_question_for_recovery(fields: dict[str, object]) -> QuestionAttempt:
+    """Use the saved attempt ID when the job ID is damaged."""
     try:
-        delivery = _claim_recovered_page_question(status, record, source_path)
-    except StaleQuestionAttempt:
-        return
-    except Exception as error:
-        with status.locked():
-            if any(_question_lock_state(candidate) != "released" for candidate in locks):
-                status.defer_question(path)
-                return
-            _finish_unstarted_question(status, path, error, record)
-        return
-    deliver(delivery, status)
+        return delivery_state.decode_question_attempt(fields)
+    except ValueError:
+        data = fields.get("question_attempt")
+        if not isinstance(data, dict):
+            raise
+        attempt = cast(dict[str, object], data)
+        owner = attempt.get("owner")
+        if not isinstance(owner, dict):
+            raise
+        return delivery_state.decode_question_attempt({"question_attempt": {
+            **attempt, "owner": {**cast(dict[str, object], owner), "job_id": attempt.get("attempt_id")}}})
+
+
+def _repair_question_job_id(path: Path, expected: QuestionAttempt) -> QuestionAttempt:
+    """Repair the current record while recovery holds the attempt lock."""
+    fields = delivery_state.read_fields(path)
+    try:
+        current = delivery_state.decode_question_attempt(fields)
+    except ValueError:
+        if _decode_question_for_recovery(fields) != expected:
+            raise StaleQuestionAttempt("This question delivery job is stale.") from None
+        unconfirmed = expected.earlier_unconfirmed or expected.state is QuestionSendState.SENDING
+        repaired = replace(expected, revision=expected.revision + 1, owner=NoQuestionSendOwner(),
+                           state=QuestionSendState.UNKNOWN if unconfirmed else QuestionSendState.READY,
+                           earlier_unconfirmed=unconfirmed, resend_requests=())
+        publish_question_attempt(path, repaired)
+        return repaired
+    if current != expected:
+        raise StaleQuestionAttempt("This question delivery job is stale.")
+    return current
 
 
 def _claim_recovered_page_question(status: DeliveryStatus, record: QuestionAttempt,
-                                   source_path: Path) -> MessageDelivery | NoMessageDelivery:
+                                   source_path: Path, lock: IO[str]) -> MessageDelivery | NoMessageDelivery:
     source = record.source
     if (source.row == f"{IMAGE_QUESTION_ROW_PREFIX}{source.item_id}/{source.question_id}"
             and source_path.name == image_store.RECORD):
         with status.locked():
             image = _read_image_question_source(status, record)
             questions = tuple(question_record.read(question) for question in image.get("questions", []))
-            target = image_question_target(source_path, image)
-            return _recover_saved_question(status, target, record, questions)
+            question = _verify_open_question(record, questions)
+            saved = image_question_target(source_path, image).saved(question)
+            return _recover_saved_question(status, saved, record, lock)
     elif source.row == f"List item {source.item_id.removeprefix('L')}/{source.question_id}":
         listing = _list_question_store(record)
         with listing.locked(), status.locked():
-            fields = _open_list_question(listing, record)
-            questions = delivery_state.read_list_questions(fields.get("questions", "[]"))
-            target = list_question_target(source_path, fields["id"], int(fields["number"]), fields["title"],
-                                          record.recipient_id, alert_owner=staff.StaffId(fields["owner"]))
-            return _recover_saved_question(status, target, record, questions)
+            fields, question = _open_list_question(listing, record)
+            number = int(fields["number"])
+            alert_owner = staff.StaffId(fields["owner"])
+            if isinstance(source.keeper, NoSavedListKeeper):
+                if source.row != f"List item {number}/{question.question_id}":
+                    raise ValueError("The saved List question has a different row.")
+                command = record.message.rpartition(_ANSWER_COMMAND_LINE)[2]
+                saved = SavedQuestionDelivery(source, record.recipient_id, fields["title"], command, alert_owner)
+            else:
+                target = list_question_target(source_path, fields["id"], number, fields["title"],
+                                              record.recipient_id, keeper=listing.owner, alert_owner=alert_owner)
+                saved = target.saved(question)
+            return _recover_saved_question(status, saved, record, lock)
     return NoMessageDelivery()
 
 
-def _recover_saved_question(status: DeliveryStatus, target: QuestionDeliveryTarget, record: QuestionAttempt,
-                            questions: tuple[question_record.Question, ...]) -> MessageDelivery | NoMessageDelivery:
-    question = _verify_open_question(record, questions)
-    saved = target.saved(question)
-    if not saved.matches(record):
-        raise ValueError("The saved question does not match this delivery.")
-    view = question_delivery_view(status, saved)
-    permitted = isinstance(view, QuestionSendPermitted) and view.state is not QuestionSendState.FAILED
-    interrupted = isinstance(view, QuestionDeliveryUnknown) and record.state in (
-        QuestionSendState.SENDING, QuestionSendState.UNKNOWN)
-    if isinstance(view, ResendBlocked) and view.attempt == record:
-        status.defer_question(status.path(saved.page(), record.source.row))
-    if not (permitted or interrupted) or view.attempt != record:
-        return NoMessageDelivery()
-    page = saved.page()
-    path = status.path(page, saved.source.row)
-    return ready_and_claim_question(status, path, record, saved)
+def _recover_saved_question(status: DeliveryStatus, saved: SavedQuestionDelivery,
+                            record: QuestionAttempt, lock: IO[str]) -> PageQuestionSend:
+    path = status.path(saved.page(), saved.source.row)
+    return claim_question(status, ready_question(path, record, saved), lock=lock)
 
 
 def stored_intent(intent: DeliveryIntent) -> StoredDeliveryIntent:
@@ -1573,13 +1705,15 @@ class DeliveryStatus:
         if not text.strip():
             raise question_record.AnswerRefused("enter an answer")
         text = text.strip()
+        if isinstance(self.question_for_reply(self.slots(page, row), question_id, text), AnsweredQuestion):
+            return NO_ANSWER_TIME
+        console_text.require(text, "reply", identity=f"{page.review_list}/{row}/{question_id}",
+                             refusal=question_record.AnswerRefused)
         with self.locked():
             slots = self.slots(page, row)
-            question = self.question_for_reply(page, row, question_id, text)
-            if isinstance(question, AnsweredQuestion) and question.answer == text:
+            question = self.question_for_reply(slots, question_id, text)
+            if isinstance(question, AnsweredQuestion):
                 return NO_ANSWER_TIME
-            if not isinstance(question, OpenQuestion):
-                raise question_record.AnswerRefused("this row has no open question")
             record = answer_row(page, row)
             if record.get("Verdict"):
                 raise question_record.AnswerRefused("this row already has a saved answer")
@@ -1596,11 +1730,11 @@ class DeliveryStatus:
                              answered_at=answered_at)
             return answered_at
 
-    def question_for_reply(self, page: ReviewPage, row: str, question_id: str, text: str) -> OpenQuestion | AnsweredQuestion:
-        """Apply the existing exchange identity rule to each Review type."""
-        question = self.slots(page, row).question
+    @staticmethod
+    def question_for_reply(slots: DeliverySlots, question_id: str, text: str) -> OpenQuestion | AnsweredQuestion:
+        """Check the exchange ID and answer against the saved delivery slots."""
         try:
-            return delivery_state.question_exchange_for_reply(question, question_id, text)
+            return delivery_state.question_exchange_for_reply(slots.question, question_id, text)
         except delivery_state.StaleQuestionExchange as error:
             raise question_record.AnswerRefused(str(error)) from error
 
@@ -1762,10 +1896,15 @@ class ChangeDetails:
                                                     ("commit", self.commit), ("kind", self.kind)) if value]
 
 
-def change_details(row: dict[str, str], key: str) -> str:
+def change_details(row: dict[str, str], key: str, *, validating: bool = False) -> str:
     """Show the change's facts as aligned lines, always open."""
+    details = ChangeDetails.read(row, key).lines()
+    if verdict := row.get("Verdict"):
+        details.append(("verdict", verdict))
+    elif validating:
+        details.append(("state", "With the showrunner for validation"))
     return ('<dl class="change-details">'
-            + "".join(f"<dt>{label}:</dt><dd>{html.escape(value)}</dd>" for label, value in ChangeDetails.read(row, key).lines())
+            + "".join(f"<dt>{label}:</dt><dd>{html.escape(value)}</dd>" for label, value in details)
             + "</dl>")
 
 
@@ -1780,7 +1919,8 @@ def source_name(members: staff.StaffSnapshot, owner: staff.StaffId) -> str:
 
 def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
     feedback_rows = conf.read("review_links").whole("feedback_rows")
-    return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice, feedback_rows))
+    return document(page_frame.action_failure("change-save-failure", "Not saved: " + notice.reason)
+                    + answer_form(page, notice, feedback_rows))
 
 
 LINK = re.compile(r"(https?://(?:[^\s<>\"'`]|`(?![^`\n]+`))*"
@@ -1918,13 +2058,23 @@ def review_question_failed(status: DeliveryStatus, page: ReviewPage, row: str,
     return re.fullmatch(r"C\d+", row) is not None
 
 
-def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion, *, failed: bool = False) -> str:
+def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion, *, failed: bool = False,
+                  names: staff_names.StaffNames | None = None) -> str:
     if isinstance(question, NoQuestion):
         return ""
     feedback = isinstance(question, (OpenFeedback, CompletedFeedback))
     content = ('<h2>Feedback</h2>' if feedback else '<h2>Question</h2>') + review_html(question.text)
     if isinstance(question, AnsweredQuestion):
-        content += review_html('Showrunner: ' + question.answer) if feedback else '<h2>Answer</h2>' + review_html(question.answer)
+        if feedback:
+            names = names if names is not None else staff_names.StaffNames(staff.StaffSnapshot(()))
+            label = 'Showrunner:'
+            answer = review_html(label + ' ' + question.answer)
+            prefix = '<p>' + label
+            if answer.startswith(prefix):
+                answer = '<p>' + names.role_label('showrunner', label) + answer[len(prefix):]
+            content += answer
+        else:
+            content += '<h2>Answer</h2>' + review_html(question.answer)
     elif not failed:
         content += '<p>The showrunner will act on this</p>' if feedback else '<p>The showrunner will answer this</p>'
     return content + question_failure_html(failed)
@@ -1979,12 +2129,6 @@ def answer_row(page: ReviewPage, row_id: str) -> dict[str, str]:
     return next(row for row in answer_rows(page) if row["#"] == row_id)
 
 
-def answer_status(verdict: str, slots: DeliverySlots) -> str:
-    if verdict:
-        return "Saved: " + verdict
-    return "The showrunner will validate this" if slots.validation_requested else ""
-
-
 def list_routing(snapshots: dict[Path, change_review.ReviewListSnapshot]) -> change_routing.StaffRouting:
     documents = change_routing.production_documents(dict(showrunners.timer_docs()),
         ((listing.stem.removeprefix(change_review.PREFIX), snapshot.text) for listing, snapshot in snapshots.items()))
@@ -1993,6 +2137,7 @@ def list_routing(snapshots: dict[Path, change_review.ReviewListSnapshot]) -> cha
 
 def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO_ANSWER_NOTICE) -> bytes:
     feedback_rows = conf.read("review_links").whole("feedback_rows")
+    names = staff_names.StaffNames(staff.StaffSnapshot(()))
     sections: list[str] = []
     saved = False
     for row in shown_rows(page):
@@ -2005,20 +2150,18 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
         warning = ""
         if notice.reason and notice.row == row["#"]:
             warning = "Not saved: " + notice.reason
-        alert = f'<p role="alert">{html.escape(warning)}</p>' if warning else ""
+        alert = page_frame.action_failure("change-save-failure", warning) if warning else ""
         form_notice = notice if notice.row == row["#"] else AnswerNotice(row["#"])
-        status_text = answer_status(verdict, slots)
-        answer = (f'<p role="status">{html.escape(status_text)}</p>' if status_text else
-                  "" if isinstance(question, OpenQuestion) else answer_form(page, form_notice, feedback_rows))
+        answer = answer_form(page, form_notice, feedback_rows) if slots.waits_for_user(bool(verdict)) else ""
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
 <h2>{proof_title}</h2>{review_html(row[change_review.CHECK])}
-{question_html(question, failed=failed)}{answer}
-{change_details(row, change_review.display_id(row, route_owner(page, row).tab))}'''
+{question_html(question, failed=failed, names=names)}{answer}
+{change_details(row, change_review.display_id(row, route_owner(page, row).tab), validating=slots.validation_requested)}'''
         sections.append(f'<section id="{row_id}" data-change-card>' + change_content(row, content) + '</section>')
     if notice.reason and not notice.row:
-        sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')
+        sections.insert(0, page_frame.action_failure("change-save-failure", "Not saved: " + notice.reason))
     queue = next_item.change_queue(page.production)
     moved = urgency.ended(queue.name)
     if saved or any(queue_key(page, row) in moved for row in page.rows):
@@ -2170,7 +2313,14 @@ def send_message(recipient: str, sender: str, message: str, *, key: str = "",
 def feature_review_id(page: ReviewPage, doc: Path, row_id: str) -> str:
     """Find the feature-log proposal for a Change row."""
     lines = doc.read_text(encoding="utf-8").splitlines()
-    repo = Path(production_field(lines, "Showrunner checkout")).expanduser()
+    try:
+        paths = change_review.enrolled_review_checkouts(doc, lines)
+    except Refusal as error:
+        raise RuntimeError(str(error)) from error
+    if isinstance(paths, change_review.EnrolledReviewCheckouts):
+        repo = paths.main
+    else:
+        repo = Path(production_field(lines, "Showrunner checkout")).expanduser()
     project = feature_log.project_of(str(repo))
     if project not in {name for name, spec in feature_log.PROJECTS.items() if spec.closes_by_change_review}:
         return ""
@@ -2648,7 +2798,7 @@ def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
 
 
 def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, intent: DeliveryIntent,
-                            question: OpenQuestion) -> None:
+                            question: OpenQuestion) -> DeliveryOutcome:
     """Use the same send loop for a question stored in Review delivery slots."""
     page, row = delivery.page, delivery.row
     started = False
@@ -2696,22 +2846,22 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
         if isinstance(error, StaleQuestionAttempt):
             if finished and intent.kind == "verdict":
                 status.send_pending_alerts(status.closeout_path(page, row))
-            return
+            return DeliveryUnconfirmed()
         failures = [result for result in run.results.values() if isinstance(result, DeliveryFailure)]
         if isinstance(error, ClosedQuestionSource):
             with status.locked():
                 slots = status.slots(page, row)
                 if intent in slots.intents() and review_open_question(page, slots, intent) == question:
                     status.finish_intent_locked(delivery, slots, intent)
-            return
+            return DeliveryUnconfirmed()
         if isinstance(error, reply_tokens.UnavailableReplyToken):
             _defer_question_error(status, status.path(page, row), row, error, delivery=delivery)
-            return
+            return DeliveryUnconfirmed()
         if QuestionSendState.UNKNOWN in run.results.values():
             status.defer_question(status.path(page, row), delivery)
             if error is not None:
                 print(f"review-links question {row}: " + " ".join(str(error).splitlines()), file=sys.stderr)
-            return
+            return DeliveryUnconfirmed()
         reason = " ".join(str(error).splitlines()) if error is not None else ""
         if error is not None and not failures:
             failures = [DeliveryFailure(MissingRecipient(), reason)]
@@ -2736,7 +2886,7 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
         with status.locked():
             slots = status.slots(page, row)
             if intent not in slots.intents() or review_open_question(page, slots, intent) != question:
-                return
+                return DeliveryUnconfirmed()
             if intent.kind == "question" and (isinstance(result, NoFailedDelivery) or relayed):
                 status.write_save_receipt(page, row, intent)
             status.record_result_locked(delivery, result, alerts, question_relayed=relayed,
@@ -2748,8 +2898,10 @@ def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, i
             status.send_pending_alerts(status.closeout_path(page, row))
         if error is not None:
             print(f"review-links question {row}: {reason}", file=sys.stderr)
+        return result if isinstance(result, FailedDelivery) else DeliveryConfirmed()
     except (OSError, ValueError) as failure:
         _defer_question_error(status, status.path(page, row), row, failure, delivery=delivery)
+        return DeliveryUnconfirmed()
     finally:
         status.release_recovery_claims((delivery.attempt,))
 
@@ -2764,8 +2916,7 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
     if isinstance(delivery, NoMessageDelivery):
         return DeliveryUnconfirmed()
     if isinstance(delivery, PageQuestionSend):
-        deliver_page_question(delivery, status)
-        return DeliveryUnconfirmed()
+        return deliver_page_question(delivery, status)
     tracked_review = False
     page = delivery.page
     confirm = isinstance(page, ReviewMessagePage) and bool(page.saved.get("submission_request"))
@@ -2799,8 +2950,7 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
                         return DeliveryUnconfirmed()
         status.request_attempts[delivery.attempt] = AttemptOwnership(status.path(page, delivery.row), "sending")
     if isinstance(question, OpenQuestion):
-        deliver_review_question(delivery, status, intent, question)
-        return DeliveryUnconfirmed()
+        return deliver_review_question(delivery, status, intent, question)
     try:
         outbound = outbound_review_message(delivery)
     except (OSError, ValueError) as error:
@@ -3024,7 +3174,8 @@ def recover_deferred_questions(status: DeliveryStatus) -> None:
     for path, delivery in status.take_deferred_questions().items():
         try:
             if delivery is None:
-                recover_page_question(status, path, read_question_attempt(path))
+                record = _decode_question_for_recovery(delivery_state.read_fields(path))
+                recover_page_question(status, path, record)
             else:
                 deliver(delivery, status)
         except FileNotFoundError:
@@ -3040,7 +3191,8 @@ def recover_review_messages(status: DeliveryStatus) -> None:
         try:
             fields = delivery_state.read_fields(path)
             if "question_attempt" in fields:
-                recover_page_question(status, path, delivery_state.decode_question_attempt(fields))
+                record = _decode_question_for_recovery(fields)
+                recover_page_question(status, path, record)
                 continue
             with status.locked():
                 if any(owner.row_file == path for owner in status.request_attempts.values()):
@@ -3200,31 +3352,41 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
             row = source.record.id
         else:
             path, row = efficiency_reviews.path(source.path), decision_store.efficiency_identity(item)
-        page = status.metadata_page(ReviewPage(path, path.parent, (row,), ''))
-        row = page.rows[0]
+        page = ReviewPage(path, path.parent, (row,), '')
+        text = words.strip()
+        slots = status.slots(page, row)
+        selected = slots.question
+        tracked = not isinstance(selected, NoQuestion) or bool(question_id)
+        if tracked and isinstance(status.question_for_reply(slots, question_id, text), AnsweredQuestion):
+            return False
+
+        save: Callable[[], bool | investigation.Investigation | None]
+        if isinstance(source, review_items.QuestionSource):
+            save = update_registration.prepare_reply_record(
+                source.record, words, who, identities=update_registration.QuestionStaff.read(), question_id=question_id)
+        elif isinstance(source, review_items.InvestigationSource):
+            save = investigation.prepare_answer(
+                source.record.owner, source.record.id, words, question_id=question_id)
+        else:
+            save = decision_store.prepare_answer(item, words, who)
+            console_text.require(words, "reply", identity=f"{path}/{row}/{question_id}",
+                                 refusal=question_record.AnswerRefused)
+
         with status.locked():
             slots = status.slots(page, row)
-            tracked = not isinstance(slots.question, NoQuestion) or bool(question_id)
-            if tracked:
-                question = status.question_for_reply(page, row, question_id, words.strip())
-                if isinstance(question, AnsweredQuestion):
-                    return False
-            if isinstance(source, review_items.QuestionSource):
-                identities = update_registration.QuestionStaff.read()
-                update_registration.reply_record(source.record,words,who,identities=identities,question_id=question_id)
-                changed = True
-            elif isinstance(source, review_items.InvestigationSource):
-                _ = investigation.answer(source.record.owner,source.record.id,words,question_id=question_id)
-                changed = True
-            else:
-                try:
-                    changed = decision_store.answer(item,words,who)
-                except decision_store.NoOpenQuestion as error:
-                    raise question_record.AnswerRefused(str(error)) from error
-            if tracked:
-                question = slots.question
-                assert isinstance(question, OpenQuestion)
-                status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id, question.text, words.strip())))
+            question = slots.question
+            if tracked and isinstance(status.question_for_reply(slots, question_id, text), AnsweredQuestion):
+                return False
+            if question != selected:
+                raise question_record.AnswerRefused("The current question changed.")
+            page = status.metadata_page(page)
+            try:
+                changed = save() is not False
+            except decision_store.NoOpenQuestion as error:
+                raise question_record.AnswerRefused(str(error)) from error
+            if isinstance(question, OpenQuestion):
+                status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id,
+                                                                                       question.text, text)))
             return changed
     if isinstance(source,review_items.ChangeSource):
         assert isinstance(source.assignment.production,Path)
@@ -3239,10 +3401,11 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
 
 
 def _forward_reply(machine: str, key: str, words: str, token: str) -> int:
+    from scripts.notify.review import review_timeout_seconds
     arguments = shlex.join(["answer-question", "--item=" + key, "--question=" + token, "--text=" + words])
     command = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" ' + arguments
     result = subprocess.run(["ssh", "-o", "BatchMode=yes", machine, command], stdin=subprocess.DEVNULL,
-                            capture_output=True, text=True, timeout=30, check=False)
+                            capture_output=True, text=True, timeout=30 + review_timeout_seconds(), check=False)
     if result.stdout:
         print(result.stdout, end="")
     if result.stderr:

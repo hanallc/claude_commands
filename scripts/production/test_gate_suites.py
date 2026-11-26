@@ -16,7 +16,7 @@ import select
 from types import SimpleNamespace
 from dataclasses import replace
 from pathlib import Path
-from typing import cast, final
+from typing import cast, final, override
 from collections.abc import Generator
 from unittest import mock
 from scripts.build_queue import admission_client as client, admission_protocol as wire, admission_records, placement
@@ -29,6 +29,7 @@ from scripts.production import affected_modules, checkpoint_gate, gate, targeted
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.copies import copies
 from scripts.lib import git_index, process_group
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.test_times import gate_record
 from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
 from scripts.production.gate_test_support import SUITE_MODULE, gate_suites, install_test_runner, wait_for_file
@@ -38,6 +39,12 @@ from scripts.production.test_gate_default_placement import placed
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    @override
+    def setUp(self) -> None:
+        environment = {**fixture_git_environment(self.fixture_root.parent), "GIT_CONFIG_SYSTEM": os.devnull}
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment, clear=True)))
+        super().setUp()
+
     @gate_suites("hooks")
     def test_finished_local_job_wins_when_polling_crosses_the_deadline(self) -> None:
         # The queue admission wait comes before the time limit starts.
@@ -160,7 +167,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
                     self.assertEqual(received[position:position + 1], [(f"session:{owner.current_session}", report)])
         self.assertEqual(len(received), 2)
 
-    def test_cpu_slot_wait_returns_to_the_runner_at_its_deadline(self) -> None:
+    def test_cpu_token_wait_returns_to_the_runner_at_its_deadline(self) -> None:
         reader, writer = os.pipe()
         self.addCleanup(os.close, reader)
         self.addCleanup(os.close, writer)
@@ -929,8 +936,10 @@ class MergeGateSuitesTests(GateSuitesFixture):
                         occupied.append(only_admitted(self.admission.server.handle_request(request)))
                 self.admission.allow_next_start()
                 os.environ["BUILDLOG_UNIT"] = "natemerge"
-                code = gate.main(["--affected", "--repo", str(checkout),
-                                  "--module", "lib/test_second.py"])
+                with (mock.patch.dict(os.environ, {"BUILDLOG_PREPARED_COPY": str(checkout)}),
+                      mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True)):
+                    code = gate.main(["--affected", "--repo", str(checkout),
+                                      "--module", "lib/test_second.py"])
                 self.assertEqual(code, 0, output.getvalue())
                 self.assertTrue(holder.exists())
                 self.assertEqual(events, ["admitted"])
@@ -1001,7 +1010,9 @@ class MergeGateSuitesTests(GateSuitesFixture):
             return finish(job, status)
 
         output = io.StringIO()
-        with (mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_UNIT": "natemerge", "TMPDIR": str(self.root)}),
+        with (mock.patch.dict(os.environ, {**self.environment, "BUILDLOG_UNIT": "natemerge", "TMPDIR": str(self.root),
+                                          "BUILDLOG_PREPARED_COPY": str(self.checkout)}),
+              mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True),
               mock.patch.object(client, "admit", wraps=client.admit) as admit,
               mock.patch.object(gate, "start_gate_job", side_effect=start_module),
               mock.patch.object(gate, "finish_gate_job", side_effect=finish_module),
@@ -1022,6 +1033,8 @@ class MergeGateSuitesTests(GateSuitesFixture):
         preamble = """
 from unittest.mock import patch
 from scripts.build_queue import admission_client
+from scripts.copies import copies
+patch.object(copies, "take_prepared_gate_handoff", return_value=True).start()
 patch.object(admission_client, "admit", side_effect=AssertionError("child requested admission")).start()
 patch.object(gate, "shared_cpu_pool", side_effect=AssertionError("child requested a CPU slot")).start()
 """
@@ -1038,6 +1051,7 @@ patch.object(gate, "shared_cpu_pool", side_effect=AssertionError("child requeste
                 reservations = admission.caller_reservations()
                 self.assertEqual(len(reservations), 1)
                 child = parent.child_environment(os.environ)
+                child["BUILDLOG_PREPARED_COPY"] = str(self.checkout)
                 for key, value in (("BUILDLOG_JOBSERVER_FIFO", str(self.root / "other-pool")),
                                    ("ADMISSION_SOCKET", str(admission.socket_dir / "other.sock"))):
                     with self.subTest(shared_resource_override=key):
@@ -1283,7 +1297,7 @@ class ChildImports(unittest.TestCase):
                         for path in caller_log.rglob("*")
                         if path.is_file() and path != caller_log / "keep"
                         for line in path.read_text().splitlines()]
-        self.assertEqual([record.get("kind") for record in gate_records], ["gate_run"])
+        self.assertEqual([record.get("kind") for record in gate_records], ["gate_folder_start", "gate_run"])
         self.assertEqual((caller_log / "keep").read_text(), "caller log")
         self.assertEqual(list((caller_log / "admission").glob("*.reservation")), [])
         self.assertEqual(list((caller_log / "admission").glob("*.waiting")), [])

@@ -1,6 +1,6 @@
 """Test first-step admission and handoff."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 import os
@@ -24,7 +24,7 @@ from scripts.build_queue.test_placement import (
 )
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.lib.build_steps import CLAIM_FAILURE_SUFFIX, GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, command_job
 from scripts.mac_test import claim_state
 from scripts.message.session_send_test_support import forbid_real_sender
@@ -373,13 +373,25 @@ class FirstStepTests(unittest.TestCase):
 
         with PlacementFixture() as fixture:
             source = gate_source(fixture, "claude_commands")
-            command = ("python3", str(source / "gate.py"), *MODULE_GATE_COMMAND[2:])
+            module = source / "scripts" / MODULE_GATE_COMMAND[-1]
+            module.parent.mkdir(parents=True)
+            module.touch()
+            command = ("python3", str(source / "gate.py"), *MODULE_GATE_COMMAND[2:], "--repo", str(source))
             parent = client.OuterReservation("parent", os.getpid())
 
-            def run(argv: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+            def run(argv: Sequence[str], **_options: object) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(tuple(argv), command)
                 report.assert_not_called()
                 return subprocess.CompletedProcess(argv, gate.main(argv[2:]))
+
+            def run_prepared(argv: Sequence[str], *, cwd: Path, descriptors: tuple[int, ...],
+                             environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(cwd, source)
+                self.assertEqual(descriptors, ())
+                self.assertEqual(environment["BUILDLOG_PREPARED_COPY"], str(source))
+                with (mock.patch.dict(os.environ, environment),
+                      mock.patch.object(copies, "take_prepared_gate_handoff", return_value=True)):
+                    return run(argv)
 
             with (mock.patch.object(gate_targets, "outer_reservation", return_value=parent),
                   mock.patch.object(gate, "outer_reservation", return_value=parent),
@@ -387,8 +399,12 @@ class FirstStepTests(unittest.TestCase):
                   mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
                   mock.patch.object(gate, "run_tests_only", return_value=17),
                   mock.patch.object(subprocess, "run", side_effect=run),
+                  mock.patch.object(copies, "run_prepared_gate", side_effect=run_prepared) as launch,
+                  mock.patch.object(first_step, "admitted_run",
+                                    side_effect=AssertionError("A nested gate requested admission.")),
                   mock.patch.object(first_step, "report_parent_gate_targets", return_value=nullcontext()) as report):
                 self.assertEqual(copies.main(["gate-step", "--repo", str(source), "--", *command]), 17)
+            launch.assert_called_once()
             report.assert_called_once_with(parent)
 
     def test_direct_nightly_default_excludes_aws_when_cloud_gates_are_enabled(self) -> None:
@@ -550,7 +566,7 @@ class FirstStepTests(unittest.TestCase):
                     acquire.assert_called_once_with(placed.request)
 
     def test_local_gate_keeps_its_reservation_and_assignment_through_the_handoff(self) -> None:
-        position = SlotQueuePosition("episode", 3)
+        position = CopyQueuePosition("episode", 3)
         assignment = placement.PlacementAssignment(position.episode, "attempt",
             placement.PlacementDestination("local", "natedev", "fixture-host", claim_state.WHOLE_MAC),
             execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("fixture-host", 1, "2"),
@@ -697,7 +713,7 @@ class FirstStepTests(unittest.TestCase):
             grant = wire.Assignment(assignment)
             path = fixture.root / "assignment.json"
             client.write_assignment(path, grant)
-            admitted = first_step.FirstStepAdmission(SlotQueuePosition(request.episode, request.since), grant, path)
+            admitted = first_step.FirstStepAdmission(CopyQueuePosition(request.episode, request.since), grant, path)
 
             admitted.handoff(fixture.root)
             self.assertEqual(os.environ["BUILDLOG_FIRST_STEP_ASSIGNMENT"], str(path))
@@ -728,7 +744,7 @@ class FirstStepTests(unittest.TestCase):
             assignment = assignment_for(fixture, request)
             other_owner = replace(assignment.owner, start_time=assignment.owner.start_time + "0")
             grant = wire.Assignment(replace(assignment, owner=other_owner))
-            admitted = first_step.FirstStepAdmission(SlotQueuePosition(request.episode, request.since),
+            admitted = first_step.FirstStepAdmission(CopyQueuePosition(request.episode, request.since),
                                                      grant, fixture.root / "assignment.json")
 
             with fixture.serving(), self.assertRaisesRegex(wire.AdmissionUnavailable,

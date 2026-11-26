@@ -17,7 +17,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable, Generator, Iterable, Mapping, MutableMapping
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from functools import cached_property
 from enum import Enum
@@ -40,12 +40,13 @@ from scripts.herdr import herdr, pane_launch, worker_panes
 from scripts.herdr.herdr import HerdrPlace
 from scripts.herdr.test_worker_panes import PaneWorld
 from scripts.lib import (
-    atomic_file, build_folder_lock, build_folders, build_slots, build_slots_test_support, conf, git_files, process_group, process_start,
+    atomic_file, build_folder_lock, build_folders, build_copies, build_copies_test_support, conf, git_files, process_group, process_start,
     socket_test_support, unit_runs,
 )
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.git_test_support import fixture_git_environment as shared_fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.unit_runs_test_support import bind_private_run_roots
 from scripts.lint.memory_test_support import write_config_fixture
@@ -53,9 +54,11 @@ from scripts.message import session_records, sessions, session_send
 from scripts.message.sessions import SessionRecord
 from scripts.production import (
     unit_lookup, unit_move, staff, staff_test_support, unit_config, add_unit, completion_receipt, worker,
-    rename_unit_test_support,
+    production_admission, production_doc, production_lifecycle, rename_unit_test_support, update_registration,
 )
-from scripts.production.production_doc import Production, read_production
+from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.add_showrunner_test_support import write_guard_proof
+from scripts.production.production_names import GUARD_READY_FILE, MERGE_CHECKOUT_FIELD
 from scripts.production.staff import StaffId
 from scripts.production.staff_test_support import (
     foreign_hostname,
@@ -78,8 +81,82 @@ from scripts.production.rename_test_support import (
 from scripts.production.rename_rerun_test_support import file_versions, final_files, saved_fixture
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_unit_test_support import FolderRenameFixture, FolderSessionFixture, UnitRenameFixture
+from scripts.usage import agents_log
 
 class AgentsUsageTests(unittest.TestCase):
+    def test_resume_forwards_a_mac_staff_row_through_ssh(self) -> None:
+        for kind in ("unit", "showrunner"):
+            with self.subTest(kind=kind):
+                self._check_mac_resume(kind)
+
+    def _check_mac_resume(self, kind: staff.Kind) -> None:
+        host = "Nates-MacBook-Pro-2023"
+        row = staff.StaffRow(StaffId("alpha-row"), kind, "alpha", staff.StaffRoot(),
+            current_session=StaffId("alpha-session"), worktree=staff.PresentWorktree(host, Path("/mac/alpha")),
+            unit_type=staff.UnitDetails("direct") if kind == "unit" else staff.NotUnit())
+        record = staff.StaffSnapshot((row,))
+
+        def row_operation(identity: str) -> nullcontext[None]:
+            self.assertEqual(identity, row.id)
+            self.assertTrue(shutdown.unit_machine_is_local(host))
+            return nullcontext()
+
+        def run_ssh(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "mac"])
+            command = shlex.split(argv[4].partition(";")[0])
+            self.assertEqual(command[-6:],
+                ["resume", "--here", "--why=retry after exit", "--to=claude 4", "--", row.id])
+            with (mock.patch.object(shutdown, "local_machine", return_value=host),
+                  mock.patch.object(shutdown, "other_machine", return_value="natedev")):
+                code, output, errors = self.invoke(command[2:])
+            self.assertEqual((code, errors), (0, ""))
+            return subprocess.CompletedProcess(argv, 0, output + f"rc={code}\n", "")
+
+        with (tempfile.TemporaryDirectory() as folder,
+              mock.patch.dict(os.environ, shutdown_fixture_configuration(Path(folder))),
+              mock.patch.object(shutdown, "local_machine", return_value="natedev"),
+              mock.patch.object(shutdown, "other_machine", return_value="mac"),
+              mock.patch.object(remote, "other_machine", return_value="mac"),
+              mock.patch.object(staff, "initial_snapshot", return_value=record),
+              mock.patch.object(staff, "row_operation", side_effect=row_operation) as operation,
+              mock.patch.object(herdr, "reboot_lock", return_value=nullcontext()),
+              mock.patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp(row.current_session, "pane", "claude4")) as resume,
+              mock.patch.object(subprocess, "run", side_effect=run_ssh) as ssh):
+            code, output, errors = self.invoke(["resume", row.name, "--to", "claude 4", "--why", "retry after exit"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertIn("Claude is up on claude4", output)
+        resume.assert_called_once_with(str(row.id), why="retry after exit", to="claude 4")
+        operation.assert_called_once_with(str(row.id))
+        ssh.assert_called_once()
+
+    def test_resume_refuses_unknown_or_unreachable_machines(self) -> None:
+        cases: tuple[tuple[str, list[str], str, int], ...] = (
+            ("", [], "the staff row has no machine", 0),
+            ("unlisted-host", [], "unknown machine 'unlisted-host'", 0),
+            ("mac", ["--here"], "session is on mac", 0),
+            ("mac", [], "cannot reach mac to resume the session", 1),
+        )
+        with (tempfile.TemporaryDirectory() as folder,
+              mock.patch.dict(os.environ, shutdown_fixture_configuration(Path(folder))),
+              mock.patch.object(shutdown, "local_machine", return_value="natedev"),
+              mock.patch.object(shutdown, "other_machine", return_value="mac"),
+              mock.patch.object(remote, "other_machine", return_value="mac"),
+              mock.patch.object(herdr, "reboot_lock", return_value=nullcontext()),
+              mock.patch.object(stop_resume, "resume") as resume):
+            for host, flags, message, calls in cases:
+                with self.subTest(host=host, flags=flags):
+                    location = staff.PresentWorktree(host, Path("/fixture/alpha")) if host else staff.WorktreeUnfilled()
+                    row = staff.StaffRow(StaffId("unit-row"), "unit", "alpha", staff.StaffRoot(),
+                        current_session=StaffId("alpha-session"), worktree=location, unit_type=staff.UnitDetails("direct"))
+                    with (mock.patch.object(staff, "initial_snapshot", return_value=staff.StaffSnapshot((row,))),
+                          mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                              ["ssh"], 255, "", "connection refused")) as ssh):
+                        code, output, errors = self.invoke(["resume", row.name, *flags])
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertIn(message, errors)
+                    self.assertEqual(ssh.call_count, calls)
+            resume.assert_not_called()
+
     def test_resume_dwight_admits_the_first_conversation_and_retains_the_live_conversation(self) -> None:
         with (mock.patch.object(test_stop_resume, "write_config_fixture", write_pinned_fixture_setting),
               mock.patch.object(test_stop_resume, "write_machine_config", shutdown_fixture_configuration),
@@ -139,10 +216,13 @@ class AgentsUsageTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(errors, "")
         self.assertEqual([line.split()[1] for line in output.splitlines()[1:]],
-                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "resume", "retire", "rename", "move",
+                         ["help", "status", "pause", "exit", "pause", "resume", "resume", "resume", "clone", "retire", "rename", "move",
                           "reboot", "restart", "stop", "remove-stray", "transfer", "add-producer", "set-model"])
         self.assertIn("resume NAME", output)
+        self.assertIn("pause NAME [--finish-step] [--keep-workers] --why TEXT", output)
+        self.assertIn("pause --production SHOWRUNNER [--except UNIT ...] [--finish-step] [--keep-workers] --why TEXT", output)
         self.assertIn("resume PRODUCER --resend-opening-prompt", output)
+        self.assertIn("clone NAME --as NEW", output)
         self.assertIn("transfer NAME [--model MODEL --effort EFFORT]", output)
         self.assertIn("add-producer NAME [--model MODEL] [--effort EFFORT] [--job TEXT]", output)
         self.assertIn("set-model ROLE MODEL [EFFORT]", output)
@@ -198,6 +278,27 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                     self.assertEqual((code, errors), (0, ""))
                     self.assertIn("agents select-model TARGET MODEL", output)
 
+    def test_subcommand_help_shows_its_usage_and_guidance(self) -> None:
+        cases = (
+            ("move", "usage: agents move [-h] [--dry-run] [--why WHY] SESSION_OR_GROUP ACCOUNT",
+             "Move Claude sessions to <claudeN>.", ("default",)),
+            ("set-model", "usage: agents set-model [-h] ROLE MODEL [EFFORT]",
+             "Example: agents set-model producers fable high", ()),
+        )
+        for command, usage, guidance, forbidden_text in cases:
+            with self.subTest(command=command):
+                result = subprocess.run(
+                    [sys.executable, str(Path(__file__).with_name("shutdown.py")), command, "--help"],
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                    env={**os.environ, "COLUMNS": "100"},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                lines = [line for line in result.stdout.splitlines() if line]
+                self.assertEqual(lines[:2], [usage, guidance])
+                for forbidden in forbidden_text:
+                    self.assertNotIn(forbidden, result.stdout)
+
     def test_unknown_command_prints_usage_and_exits_two(self) -> None:
         status, output, errors = self.invoke(["unknown-command"])
         self.assertEqual(status, 2)
@@ -218,47 +319,47 @@ STOP_SESSION = stop_resume.stop
 SHUTDOWN_FIXTURE_SETTINGS = {
     "staff": """\
 # range: 0.001..
-OPERATION_LOCK_SECONDS=30
+operation_lock_seconds=30
 # range: 0.001..
-REMOTE_SECONDS=20
-PRODUCER_WORKSPACE=producers
-PRODUCER_FOLDER_ROOT=~/rust/hanadocs
+remote_seconds=20
+producer_workspace=producers
+producer_folder_root=~/rust/hanadocs
 """,
     "shutdown": """\
 # whole: 1..300
-STOP_GRACE_SECONDS=2
+stop_grace_seconds=2
 # whole: 1..300
-KILL_GRACE_SECONDS=5
+kill_grace_seconds=5
 # whole: 1..300
-MOVE_STOP_MARGIN_SECONDS=3
+move_stop_margin_seconds=3
 # range: 5e-324..
-START_SECONDS=20
+start_seconds=20
 # range: 5e-324..
-OPENING_PROMPT_SECONDS=90
+opening_prompt_seconds=90
 # range: 5e-324..
-STAY_SECONDS=10
+stay_seconds=10
 # range: 0..300
-OWN_PANE_SHELL_SECONDS=30
+own_pane_shell_seconds=30
 # range: 0..3600
-RESUME_CHECK_SECONDS=180
+resume_check_seconds=180
 # range: 5e-324..300
-RESUME_CHECK_INTERVAL_SECONDS=5
+resume_check_interval_seconds=5
 """,
     "production": """\
 # range: 5e-324..
-RETIRE_POLL_SECONDS=0.2
+retire_poll_seconds=0.2
 # range: 5e-324..
-RETIRE_TERM_WAIT_SECONDS=10
+retire_term_wait_seconds=10
 # range: 5e-324..
-RETIRE_COMMAND_TIMEOUT_SECONDS=900
+retire_command_timeout_seconds=900
 # range: 5e-324..
-RENAME_LIVE_WAIT_SECONDS=180
+rename_live_wait_seconds=180
 # range: 5e-324..
-RENAME_RUN_STOP_WAIT_SECONDS=120
+rename_run_stop_wait_seconds=120
 # range: 5e-324..
-RENAME_POLL_SECONDS=1
+rename_poll_seconds=1
 # range: 5e-324..
-RENAME_COMMAND_TIMEOUT_SECONDS=900
+rename_command_timeout_seconds=900
 # whole: 1..
 unit_port_first=15720
 # whole: 1..
@@ -270,18 +371,18 @@ mac_run_port=15710
 """,
     "direct": """\
 # range: 0.1..0.9
-WORKER_SPLIT_RATIO=0.667
-WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.
+worker_split_ratio=0.667
+worker_first_turn_text=Reply with ready. Do not use tools.
 # range: 1..600
-WORKER_FIRST_TURN_SECONDS=120
+worker_first_turn_seconds=120
 # range: 1..1800
-WORKER_COMPACT_SECONDS=300
+worker_compact_seconds=300
 # range: 0.01..600
-WORKER_PUBLISH_LOCK_SECONDS=15
+worker_publish_lock_seconds=15
 # range: 1..600
-PANE_AGENT_START_SECONDS=90
+pane_agent_start_seconds=90
 # whole: 1..
-UNIT_COMPACT_ABOVE_TOKENS=200000
+unit_compact_above_tokens=200000
 """,
     "build_folders": """\
 # whole: 1..
@@ -394,9 +495,6 @@ names.test-all=test all
 names.test-modules=test named
 prose.gate=the gate
 prose.build=release build
-owned.default={unit} {step}
-owned.showrunner-default=showrunner {step}
-owned.ci-default=CI {step}
 """,
     "showrunners": """\
 # range: 0..100
@@ -427,7 +525,7 @@ def shutdown_fixture_configuration(root: Path) -> dict[str, str]:
 
 
 def retirement_copies_environment(root: Path) -> dict[str, str]:
-    private = build_slots_test_support.private_slot_config(root, repository="fixture", default_maximum=2)
+    private = build_copies_test_support.private_copy_config(root)
     return {**private.environment, "HOME": str(root), "SCRATCH_COPIES_ROOT": str(root / "copies")}
 
 
@@ -476,7 +574,7 @@ def setUpModule() -> None:
     unittest.addModuleCleanup(ShutdownStaffFixture.owner_server.close)
     unittest.enterModuleContext(mock.patch.dict(os.environ, environment, clear=True))
     _ = unittest.enterModuleContext(mock.patch.object(staff_test_support, "write_config_fixture", write_pinned_fixture_setting))
-    _ = unittest.enterModuleContext(mock.patch.object(build_slots_test_support, "config_environment", shutdown_fixture_configuration))
+    _ = unittest.enterModuleContext(mock.patch.object(build_copies_test_support, "config_environment", shutdown_fixture_configuration))
     _ = unittest.enterModuleContext(mock.patch.object(rename_unit_test_support, "config_environment", shutdown_fixture_configuration))
     _ = unittest.enterModuleContext(mock.patch.object(remote_test_support, "copies_environment", retirement_copies_environment))
     _ = unittest.enterModuleContext(mock.patch.object(socket_test_support, "config_environment", shutdown_fixture_configuration))
@@ -492,14 +590,6 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 
 @final
 class MoveTests(unittest.TestCase):
-    def test_help_teaches_only_numbered_claude_targets(self) -> None:
-        output = io.StringIO()
-        with redirect_stdout(output), self.assertRaises(SystemExit) as result:
-            _ = shutdown.main(["move", "--help"])
-        self.assertEqual(result.exception.code, 0)
-        self.assertIn("<claudeN>", output.getvalue())
-        self.assertNotIn("default", output.getvalue())
-
     def test_session_delegates_once_with_the_reason_and_preserves_the_result(self) -> None:
         with mock.patch.object(accounts, "main", return_value=1) as move:
             code = shutdown.main(["move", "TEST-nightly-review", "claude 2", "--why", "weekly limit"])
@@ -750,8 +840,8 @@ class RetireUnitTests(ShutdownRepositoryFixture):
 
     def limits(self, *, poll: str = "0.2", wait: str = "10", command: str = "900") -> Path:
         path = self.root / "production.conf"
-        _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
-                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n"
+        _ = path.write_text(f"# range: 5e-324..\nretire_poll_seconds={poll}\n# range: 5e-324..\nretire_term_wait_seconds={wait}\n"
+                            + f"# range: 5e-324..\nretire_command_timeout_seconds={command}\n"
                             + "# whole: 40..\nunits_table_columns=170\n"
                             + "# whole: 40..\nunits_table_floor_columns=120\n"
                             + "# whole: 1..4\nunits_table_cell_lines=4\n"
@@ -829,7 +919,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertNotIn("busy", output)
+            self.assertNotIn(": busy; held by ", output)
             self.assert_slot_held(tree)
             self.assertTrue(tree.exists())
         self.assertTrue(self.worktree.is_dir())
@@ -838,7 +928,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with copies.standing(str(self.unit_staff_id), self.checkout, copies.CommittedSource("HEAD")) as tree:
             code, output = self.retire()
             self.assertEqual(code, 0, output)
-            self.assertNotIn("busy", output)
+            self.assertNotIn(": busy; held by ", output)
             self.assert_slot_held(tree)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
@@ -1060,7 +1150,7 @@ class RetireUnitTests(ShutdownRepositoryFixture):
         with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}), self.assertRaises(conf.Unusable) as error:
             _ = RUN_COMMAND(["fixture-command"])
         self.assertIn(str(path), str(error.exception))
-        self.assertIn("RETIRE_COMMAND_TIMEOUT_SECONDS", str(error.exception))
+        self.assertIn("retire_command_timeout_seconds", str(error.exception))
 
     @override
     def build_repository(self) -> None:
@@ -2045,13 +2135,16 @@ class ResumeUnitTests(ShutdownRepositoryFixture):
         row = unit_membership("alpha", "alpha")
         before = self.staff.staff_file.read_bytes(), self.parked_facts().read_bytes()
         for name in (row.name, str(row.id), row.current_session):
-            with self.subTest(name=name), mock.patch.object(stop_resume, "resume") as start:
+            with (self.subTest(name=name), mock.patch.object(stop_resume, "resume") as start,
+                  mock.patch.object(shutdown, "unit_machine_is_local", return_value=False),
+                  mock.patch.object(shutdown, "run_remote") as forward):
                 output = io.StringIO()
                 with redirect_stderr(output):
                     code = shutdown.main(["resume", name])
                 self.assertEqual(code, 2)
                 self.assertIn(f"agents resume {row.name} --retired", output.getvalue())
                 start.assert_not_called()
+                forward.assert_not_called()
         self.assertEqual((self.staff.staff_file.read_bytes(), self.parked_facts().read_bytes()), before)
         self.assertEqual(self.calls, [])
 
@@ -2762,7 +2855,7 @@ class WorkerRenameTests(StaffTestCase):
                 self.addCleanup(fixture.doCleanups)
                 fixture.setUp()
                 write_text_atomic(fixture.root / "conf/production.conf",
-                                  "# range: 0.01..\nRENAME_COMMAND_TIMEOUT_SECONDS=30\n")
+                                  "# range: 0.01..\nrename_command_timeout_seconds=30\n")
                 owner = (staff.rename(fixture.parent.id, "TEST-old") if kind == "unit" else
                          fixture_member("showrunner", name="TEST-old", parent=fixture.parent.parent))
                 fixture.parent_id = owner.id
@@ -3114,6 +3207,14 @@ class WorkerRenameTests(StaffTestCase):
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        git_environment = shared_fixture_git_environment(self.root.parent)
+        self.env.update({key: value for key, value in git_environment.items() if key.startswith("GIT_")})
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            _ = production_admission.capture_rollout_inventory([self.production_row().id])
+
     def test_same_name_keeps_a_pane_with_another_native_session(self) -> None:
         row = self.production_row()
         displays = support.RenameDisplays(row)
@@ -3208,7 +3309,17 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(self.snapshot(), before)
 
     def test_retry_after_doc_move_updates_the_live_doc_on_the_same_staff_id(self) -> None:
+        forms = ("legacy", "guarded", "migrated")
+        stages = ("complete", "before staff", "after staff")
+        cases = [(form, stage) for form in forms for stage in stages]
+        cases.extend((("legacy", "before move"), ("legacy", "atomic source save"),
+                      ("legacy alias", "after staff"), ("legacy", "interrupted capture")))
         with saved_fixture(self.root) as restore:
+            for form, stage in cases:
+                with self.subTest(form=form, stage=stage):
+                    restore()
+                    with mock.patch.dict(os.environ, self.env, clear=True):
+                        self.check_admitted_document_rename(form, stage)
             for legacy, collision in ((False, ""), (True, ""),
                                       (False, "source tracked"), (False, "source removed")):
                 with self.subTest(legacy=legacy, collision=collision):
@@ -3251,6 +3362,163 @@ class ProductionRenameTests(support.ProductionRenameFixture):
                     self.assert_success(self.run_command(OLD, NEW, "--to-doc", str(self.new_doc), "--to-branch", NEW))
                     self.assertEqual(self.snapshot(), before)
                     self.assertEqual({path: path.read_bytes() for path in legacy_files}, legacy_files)
+
+    def check_admitted_document_rename(self, form: str, stage: str) -> None:
+        owner = self.production_row()
+        legacy = self.doc
+        source, destination = legacy, self.new_doc
+        machine = remote.local_machine()
+        folder = production_admission.admission_folder()
+        receipt = folder / f"{owner.id}.json"
+        inventory = folder / "rollout-inventory.json"
+        if form in ("guarded", "legacy alias") or stage == "interrupted capture":
+            receipt.unlink()
+            inventory.unlink()
+        if form == "legacy alias":
+            alias = source.parent / "alias" / ".." / source.name
+            (source.parent / "alias").mkdir()
+            owner = staff.set_doc(owner.id, staff.LiveDoc(machine, alias))
+            form = "legacy"
+        frozen = b""
+        if stage == "interrupted capture":
+            def stop_capture(path: Path, content: str) -> bool:
+                if path == receipt:
+                    raise OSError("Stopped before publishing the receipt")
+                return atomic_file.create_text_atomic(path, content)
+
+            with (mock.patch.object(production_admission, "create_text_atomic", side_effect=stop_capture),
+                  self.assertRaisesRegex(OSError, "Stopped before publishing the receipt")):
+                _ = production_admission.capture_rollout_inventory([owner.id])
+            self.assertTrue(inventory.is_file())
+            self.assertFalse(receipt.exists())
+            self.check_rename_refuses_without_receipt(owner, destination)
+            return
+        if form in ("legacy", "migrated"):
+            inventory = production_admission.capture_rollout_inventory([owner.id])
+            frozen = inventory.read_bytes()
+        if form != "legacy":
+            _ = self.git("switch", "-c", "main")
+            integration = self.root / "integration"
+            _ = self.git("worktree", "add", str(integration), OLD)
+            source = legacy.with_name("old-production-live.md")
+            destination = self.new_doc.with_name("new-production-live.md")
+            log = self.checkout / "production.log"
+            self.write(log, "Fixture LOG.\n")
+            excludes = self.checkout / ".git/info/exclude"
+            with excludes.open("a", encoding="utf-8") as output:
+                for path in (source, log):
+                    _ = output.write(f"\n/{path.relative_to(self.checkout).as_posix()}\n")
+            self.write(source, legacy.read_text().replace(
+                f"- **Showrunner checkout:** `{self.checkout}`",
+                f"- **Showrunner checkout:** `{integration}`\n"
+                + f"- **Repository:** `{self.checkout}`\n"
+                + f"- **{MERGE_CHECKOUT_FIELD}:** `{self.checkout}`"))
+            if form == "migrated":
+                production_admission.record_verified_move(read_production(owner), source)
+            owner = staff.set_doc(owner.id, staff.LiveDoc(machine, source))
+            if form == "guarded":
+                write_guard_proof(self.root, self.state, self.checkout)
+                with mock.patch.object(production_doc, "GUARD_REPOSITORY", self.checkout):
+                    production_admission.require_admission(read_production(owner))
+                (self.state / GUARD_READY_FILE).unlink()
+
+        binding = staff.LiveDoc(machine, destination)
+        rename = (OLD, NEW, "--to-doc", str(destination), "--to-branch", OLD)
+        if stage in ("before move", "atomic source save"):
+            prepare = production_admission.prepare_document_rebind
+
+            def stop_before_move(row: staff.StaffRow, target: production_admission.DocumentBinding) -> None:
+                prepare(row, target)
+                raise OSError("Stopped before moving the document")
+
+            with mock.patch.object(production_admission, "prepare_document_rebind", side_effect=stop_before_move):
+                interrupted = self.run_command(*rename)
+            self.assertIn("Stopped before moving the document", interrupted.stderr)
+            self.assertTrue(source.is_file())
+            self.assertFalse(destination.exists())
+            self.assertIn('"pending"', receipt.read_text())
+            if stage == "atomic source save":
+                write_text_atomic(source, source.read_text() + "\nAn edit before the rename.\n")
+        elif stage != "complete":
+            set_doc = staff.set_doc
+
+            def interrupt(identity: staff.StaffId, doc: staff.LiveDoc, *, expected: staff.LiveDoc) -> staff.StaffRow:
+                self.assertIn('"pending"', receipt.read_text())
+                if stage == "after staff":
+                    _ = set_doc(identity, doc, expected=expected)
+                raise OSError("Stopped during document publication")
+
+            with mock.patch.object(staff, "set_doc", side_effect=interrupt):
+                interrupted = self.run_command(*rename)
+            self.assertIn("Stopped during document publication", interrupted.stderr)
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.is_file())
+            current = staff.by_id(owner.id)
+            assert current is not None
+            self.assertEqual(current.doc, binding if stage == "after staff" else owner.doc)
+
+        content = (source if source.exists() else destination).read_bytes()
+        result = self.run_command(*rename)
+        self.assert_success(result)
+        self.assertNotIn("anomaly: document_move", result.stderr)
+        renamed = staff.by_id(owner.id)
+        assert renamed is not None
+        self.assertEqual(renamed.doc, binding)
+        self.assertNotIn('"pending"', receipt.read_text())
+        self.assertFalse(source.exists())
+        self.assertEqual(destination.read_bytes(), content)
+        self.check_renamed_document_admission(renamed)
+
+        if form in ("legacy", "migrated"):
+            self.assertEqual(production_admission.capture_rollout_inventory([owner.id]).read_bytes(), frozen)
+        if form == "migrated":
+            rolled_back = staff.set_doc(owner.id, staff.LiveDoc(machine, legacy))
+            production_admission.require_admission(read_production(rolled_back))
+            _ = staff.set_doc(owner.id, binding)
+        unrelated = self.checkout / "docs/plans/unrelated.md"
+        self.write(unrelated, self.production_doc())
+        for rejected in (staff.LiveDoc(machine, unrelated),
+                         staff.LiveDoc(remote.other_machine(), destination)):
+            with self.assertRaisesRegex(staff.StaffRefused, "requires a prepared move"):
+                _ = staff.set_doc(owner.id, rejected)
+            self.assertEqual(staff.by_id(owner.id), renamed)
+        uncaptured = fixture_member("showrunner", name="uncaptured", doc=staff.LiveDoc(machine, unrelated))
+        with self.assertRaisesRegex(Refusal, GUARD_READY_FILE):
+            production_admission.require_admission(read_production(uncaptured))
+
+    def check_rename_refuses_without_receipt(self, owner: staff.StaffRow, destination: Path) -> None:
+        document = self.doc.read_bytes()
+        index = (self.git("ls-files", "--stage"), self.git("rev-parse", "HEAD"))
+        refused = self.run_command(OLD, NEW, "--to-doc", str(destination), "--to-branch", NEW)
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn("requires an admission receipt", refused.stderr)
+        current = staff.by_id(owner.id)
+        assert current is not None
+        self.assertEqual(current, owner)
+        binding = staff.LiveDoc(remote.local_machine(), destination)
+        with self.assertRaisesRegex(staff.StaffRefused, "requires an admission receipt"):
+            production_admission.prepare_document_rebind(current, binding)
+        with self.assertRaisesRegex(staff.StaffRefused, "requires an admission receipt"):
+            _ = production_admission.complete_document_rebind(current, binding)
+        self.assertEqual(self.doc.read_bytes(), document)
+        self.assertFalse(destination.exists())
+        self.assertEqual((self.git("ls-files", "--stage"), self.git("rev-parse", "HEAD")), index)
+
+    def check_renamed_document_admission(self, owner: staff.StaffRow) -> None:
+        production = read_production(owner)
+        lines = production.doc.read_text().splitlines()
+        with mock.patch.object(production_lifecycle, "checkout_ready", side_effect=RuntimeError("Admission passed")):
+            for operation in ("load", "open"):
+                with self.subTest(operation=operation), self.assertRaisesRegex(RuntimeError, "Admission passed"):
+                    if operation == "load":
+                        production_lifecycle.load(production, lines, False, None)
+                    else:
+                        production_lifecycle.open_production(production, lines)
+        with (mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": owner.current_session}),
+              mock.patch.object(agents_log, "append"),
+              mock.patch.object(update_registration, "resolve_production_paths", side_effect=RuntimeError("Admission passed")),
+              self.assertRaisesRegex(RuntimeError, "Admission passed")):
+            update_registration.register(production)
 
     def production_row(self) -> staff.StaffRow:
         return next(row for row in staff.find(kind="showrunner") if row.name == OLD)
@@ -3478,19 +3746,20 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         content = self.doc.read_bytes()
         set_doc = staff.set_doc
 
-        def publish(identity: staff.StaffId, doc: staff.LiveDoc | staff.WrappedDoc) -> staff.StaffRow:
+        def publish(identity: staff.StaffId, doc: staff.LiveDoc | staff.WrappedDoc, *,
+                    expected: production_admission.DocumentBinding) -> staff.StaffRow:
             self.assertEqual(identity, row.id)
             self.assertFalse(self.doc.exists())
             self.assertEqual(self.new_doc.read_bytes(), content)
             current = staff.by_id(identity)
             assert current is not None
             self.assertEqual(current.doc, row.doc)
-            return set_doc(identity, doc)
+            return set_doc(identity, doc, expected=expected)
 
         with mock.patch.object(staff, "set_doc", side_effect=publish) as published:
             self.assert_success(self.run_command(OLD, NEW,
                 "--to-doc", str(self.new_doc), "--to-branch", NEW))
-        published.assert_called_once_with(row.id, staff.LiveDoc("natedev", self.new_doc))
+        published.assert_called_once_with(row.id, staff.LiveDoc("natedev", self.new_doc), expected=row.doc)
         self.assertEqual(staff.by_id(row.id), replace(row, name=NEW, doc=staff.LiveDoc("natedev", self.new_doc)))
         self.assertEqual(self.git("branch", "--show-current"), NEW)
         before = self.file_versions()
@@ -3900,7 +4169,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.write(output / "review/artifact", "review")
         self.env["COPIES_CONFIG"] = str(Path(self.env["CONF_DIR"]) / "copies.conf")
         with mock.patch.dict(os.environ, self.env, clear=True):
-            with build_slots.take_copy(self.checkout, "HEAD", showrunner="demo", unit="alpha",
+            with build_copies.take_copy(self.checkout, "HEAD", showrunner="demo", unit="alpha",
                                        work="rename", purpose="fixture") as copy:
                 self.assertEqual(copy.path, output / "1")
                 copy_git = git_files.at(copy.path).git_dir
@@ -4367,9 +4636,17 @@ class UnitRenameTests(UnitRenameFixture):
                         self.assertIsInstance(row.parent, staff.ReportsTo)
                         assert isinstance(row.parent, staff.ReportsTo)
                         document = destination / "docs/plans/alpha.md"
+                        self.write(document, document.read_text() + "\n".join((
+                            "", "## Production Context", "",
+                            f"- **Merge branch:** `{final_branch}`",
+                            f"- **Showrunner checkout:** `{destination}`",
+                            "- **Log:** `production.log`", "",
+                        )))
                         content = document.read_bytes()
                         promoted = staff.promote_unit(row.id, name="gamma", parent=row.parent.id,
                             doc=staff.LiveDoc("natedev", document))
+                        with mock.patch.dict(os.environ, self.env, clear=True):
+                            _ = production_admission.capture_rollout_inventory([promoted.id])
                         new_document = document.with_name("omega.md")
                         moved = self.invoke(["rename", str(promoted.id), "omega", "--to-doc", str(new_document),
                                              "--to-branch", "promoted-omega"])

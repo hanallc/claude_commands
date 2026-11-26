@@ -30,14 +30,18 @@ from scripts.lib import land_main, main_publish
 from scripts.message import sessions
 
 from scripts.production.merge_checkpoint import promote, request_from
-from scripts.production import merge_checkpoint
+from scripts.production import behavior_check, merge_checkpoint, production_doc, promotion, showrunners, staff
+from scripts.production.staff_test_support import isolated_staff_file
+from scripts.agents import remote
 from scripts.production import change_review
 from scripts.production.production_doc import Production, ProductionDocument
 
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import (
+    DELIVERS, MergeCheckpointFixture, STARTED, STUB, TRIAL, configure_test_environment, save_promotion_verdict,
+)
 
 
 MERGED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -52,7 +56,75 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_behavior_refusal_keeps_live_main_and_its_worktree(self) -> None:
+        path = "test_promotion.py"
+        original = "def test_fixture():\n    assert 1\n"
+        self.write(self.promote, path, original)
+        _ = self.git("add", path, cwd=self.promote)
+        _ = self.git("commit", "-m", "Set the current behavior", cwd=self.promote)
+        _ = self.git("push", "origin", "main", cwd=self.promote)
+        base = self.git("rev-parse", "HEAD", cwd=self.promote)
+        _ = self.git("merge", "--ff-only", base, cwd=self.checkout)
+        self.write(self.checkout, path, original.replace("1", "2"))
+        _ = self.git("commit", "-am", "Change the behavior", cwd=self.checkout)
+        _ = self.git("push", "origin", "production", cwd=self.checkout)
+        tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+        self.write(self.promote, "src/beta.txt", "staged edit\n")
+        _ = self.git("add", "src/beta.txt", cwd=self.promote)
+        self.write(self.promote, "src/beta.txt", "worktree edit\n")
+        status = self.git("status", "--porcelain", cwd=self.promote)
+        destinations = production_doc.PromoteTo((self.promote,), production_doc.NoMac())
+
+        with (mock.patch.dict(os.environ, self.env, clear=True),
+              mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check):
+            with self.assertRaisesRegex(checkpoint_gate.Stop, "no review is on record"):
+                _ = merge_checkpoint.promote_targets(
+                    destinations, "production", tip, source=self.checkout,
+                    approval=promotion.CollectedCi(self.doc), label="fixture", local_only=True)
+        check.assert_called_once_with(behavior_check.GitRange(self.promote, base, tip), timeout=None)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), base)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), base)
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.promote), status)
+        self.assertEqual(self.git("show", ":src/beta.txt", cwd=self.promote), "staged edit")
+        self.assertEqual((self.promote / "src/beta.txt").read_text(), "worktree edit\n")
+        self.assertEqual((self.promote / path).read_text(), original)
+
+    def test_standard_promotion_publishes_a_tip_without_a_workflow_or_ci_record(self) -> None:
+        self.write(self.checkout, "README.md", "candidate\n")
+        _ = self.git("commit", "-am", "candidate", cwd=self.checkout)
+        tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+        _ = self.git("push", "origin", "production", cwd=self.checkout)
+        self.write(self.checkout, ".github/workflows/ci.yml", "name: Untracked CI\n")
+
+        destinations = production_doc.PromoteTo((self.promote,), production_doc.NoMac())
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            result = merge_checkpoint.promote_targets(
+                destinations, "production", tip, source=self.checkout,
+                approval=promotion.CollectedCi(self.doc), label="fixture", local_only=True)
+        self.assertEqual(result, promotion.PublishedMain(tip))
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tip)
+
+    def test_standard_promotion_holds_a_tip_with_a_workflow_and_no_ci_record(self) -> None:
+        workflow = ".github/workflows/ci.yml"
+        self.write(self.checkout, workflow, "name: CI\n")
+        _ = self.git("add", workflow, cwd=self.checkout)
+        _ = self.git("commit", "-m", "add CI workflow", cwd=self.checkout)
+        tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+        _ = self.git("push", "origin", "production", cwd=self.checkout)
+        (self.checkout / workflow).unlink()
+
+        main = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+        destinations = production_doc.PromoteTo((self.promote,), production_doc.NoMac())
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            with self.assertRaisesRegex(checkpoint_gate.Stop, f"collect example CI on {tip}"):
+                _ = merge_checkpoint.promote_targets(
+                    destinations, "production", tip, source=self.checkout,
+                    approval=promotion.CollectedCi(self.doc), label="fixture", local_only=True)
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), main)
+
     def test_hook_failure_warns_without_stopping_either_promotion_path(self) -> None:
+        self.write(self.promote, land_main.HOOK_PATH, "#!/bin/sh\nexit 9\n")
         for advances in (False, True):
             with self.subTest(advances=advances):
                 if advances:
@@ -60,13 +132,16 @@ class MergeCheckpointTests(MergeCheckpointFixture):
                     _ = self.git("commit", "-am", "advance production", cwd=self.checkout)
                     _ = self.git("push", "origin", "production", cwd=self.checkout)
                 tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+                _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), self.doc, tip)
+                def install(approved: promotion.ApprovedPromotion) -> None:
+                    result = merge_checkpoint.promote_local_checkout(self.promote, "production", approved)
+                    self.assertIsInstance(result, merge_checkpoint.PromotionAdvanced if advances
+                                          else merge_checkpoint.PromotionAlreadyAtTip)
+
                 output = StringIO()
-                with mock.patch.dict(os.environ, self.env), redirect_stdout(output), mock.patch.object(
-                        land_main, "land", return_value=land_main.Landed(
-                            tip, "main", land_main.Pushed(), land_main.HookFailed(9, "retry"))):
-                    result = merge_checkpoint.promote_local_checkout(self.promote, "production", tip)
-                self.assertIsInstance(result, merge_checkpoint.PromotionAdvanced if advances
-                                      else merge_checkpoint.PromotionAlreadyAtTip)
+                with mock.patch.dict(os.environ, self.env, clear=True), redirect_stdout(output), mock.patch.object(
+                        land_main, "run_hook", return_value=land_main.HookFailed(9, "retry")):
+                    _ = promotion.publish(promotion.CollectedCi(self.doc), self.checkout, "production", tip, install)
                 self.assertIn("post-push: warning — post-push hook: failed (exit 9); rerun: retry", output.getvalue())
 
     def assert_completed_handoff_preserves_published_tip(self, *, with_review: bool) -> None:
@@ -344,7 +419,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         records: list[checkpoint_gate.BumpGateRecord] = []
         original_promote = merge_checkpoint.promote
 
-        def promote_after_gate(request: merge_checkpoint.MergeRequest, tip: str, *, local_only: bool = False) -> None:
+        def promote_after_gate(request: merge_checkpoint.MergeRequest, tip: str, *,
+                               local_only: bool = False) -> merge_checkpoint.CheckpointPublication:
             self.assertTrue(local_only)
             self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
             merge_head = self.git("rev-parse", "HEAD")
@@ -362,7 +438,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             records.append(record)
             if len(records) == 1:
                 raise InterruptedPromotion
-            original_promote(request, tip, local_only=local_only)
+            return original_promote(request, tip, local_only=local_only)
 
         with mock.patch.object(merge_checkpoint, "promote", side_effect=promote_after_gate):
             with self.assertRaises(InterruptedPromotion):
@@ -405,13 +481,14 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             else:
                 original_start(request, paths, merge_head, tip)
 
-        def local(request: merge_checkpoint.MergeRequest, tip: str, *, local_only: bool = False) -> None:
+        def local(request: merge_checkpoint.MergeRequest, tip: str, *,
+                  local_only: bool = False) -> merge_checkpoint.CheckpointPublication:
             self.assertTrue(local_only)
             path = merge_checkpoint.checkpoint_step_record(self.checkout, self.git("rev-parse", "HEAD"), "bump-gate")
             self.assertEqual(checkpoint_gate.read_record(path)["result"], "red")
             self.assertEqual(len(self.bump_notices()), 0 if launch_failure else 1,
                              "completed gate notices must wait until after local promotion")
-            original_promote(request, tip, local_only=local_only)
+            return original_promote(request, tip, local_only=local_only)
 
         def send(path: Path, record: checkpoint_gate.BumpGateRecord) -> None:
             self.assert_main_push_lock_available()
@@ -477,13 +554,13 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             check_lock("into")
             original_into(path, branch, reason, gates)
 
-        def pull(mac: Path, source: Path) -> None:
+        def pull(mac: PurePosixPath, source: Path, published: promotion.PublishedMain) -> None:
             self.assertEqual(mac, self.root / "mac-installed")
             self.assertEqual(source, self.promote)
+            self.assertEqual(published.sha, self.git("rev-parse", "HEAD", cwd=self.promote))
             check_lock("mac")
 
-        def zone(mac: PurePosixPath) -> None:
-            self.assertEqual(mac, self.root / "mac-installed")
+        def zone() -> None:
             check_lock("zone")
 
         with mock.patch.object(merge_checkpoint, "into", side_effect=announce), \
@@ -678,9 +755,10 @@ with lock.open("a") as held:
             started.append(time.monotonic())
             return original_push(production, may_undo)
 
-        def promote_with_contender(checkout: Path, branch: str, tip: str) -> (
+        def promote_with_contender(checkout: Path, branch: str, approved: promotion.ApprovedPromotion) -> (
                 merge_checkpoint.PromotionAlreadyAtTip | merge_checkpoint.PromotionOriginPushed |
-                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed):
+                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed |
+                merge_checkpoint.PromotionRetainedNewerCheckout):
             with lock_path.open("a") as held:
                 with self.assertRaises(BlockingIOError, msg="promotion must hold the common push lock"):
                     fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -691,7 +769,7 @@ with lock.open("a") as held:
             wait_until(lambda: attempted.exists() and attempted.read_text() != "", self.root,
                        processes=(process,))
             self.assertEqual(attempted.read_text(), "contended")
-            result = original_promote(checkout, branch, tip)
+            result = original_promote(checkout, branch, approved)
             spans.append(time.monotonic() - started[0])
             return result
 
@@ -754,6 +832,82 @@ with lock.open("a") as held:
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), pushed)
         self.assertIn(f"already pushed at {pushed}", retried.process.stdout)
         self.assertIn(f"promote: ok — {self.promote} already at {pushed}\n", retried.process.stdout)
+
+        for enrolled in (False, True):
+            with self.subTest(secondary=True, enrolled=enrolled):
+                self.check_secondary_promotion_verdict(enrolled=enrolled)
+
+    def check_secondary_promotion_verdict(self, *, enrolled: bool) -> None:
+        primary = self.checkout
+        secondary = self.root / f"secondary-{enrolled}"
+        _ = self.git("clone", "--branch", "main", str(self.origin), str(secondary), cwd=self.root)
+        source = primary
+        doc = self.doc
+        name = "example"
+        policy: checkpoint_gate.PromotionCiPolicy = "standard"
+        if enrolled:
+            _ = self.git("switch", "--detach", cwd=self.promote)
+            _ = self.git("switch", "main", cwd=primary)
+            source = self.root / "integration"
+            _ = self.git("worktree", "add", str(source), "production", cwd=primary)
+            doc = primary / "cargo-liner-production.md"
+            self.write(primary, doc.name, f"- **Merge checkout:** `{primary}`\n"
+                       + f"- **Showrunner checkout:** `{source}`\n"
+                       + "- **Merge branch:** `production`\n- **Log:** `production.log`\n")
+            name = "cargo-liner"
+            policy = "cargo-liner"
+            with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+                owner = showrunners.owner_for("example")
+                owner = staff.rename(owner.id, name)
+                _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
+        else:
+            workflow = ".github/workflows/ci.yaml"
+            self.write(source, workflow, "name: CI\n")
+            _ = self.git("add", workflow, cwd=source)
+
+        def next_tip(label: str) -> str:
+            self.write(source, "secondary.txt", label)
+            _ = self.git("add", "secondary.txt", cwd=source)
+            _ = self.git("commit", "-m", label, cwd=source)
+            _ = self.git("push", "origin", "production", cwd=source)
+            return self.git("rev-parse", "HEAD", cwd=source)
+
+        def refs() -> tuple[str, str, str]:
+            return (self.git("rev-parse", "main", cwd=primary),
+                    self.git("rev-parse", "main", cwd=secondary),
+                    self.git("rev-parse", "main", cwd=self.origin))
+
+        def publish(tip: str) -> None:
+            destinations = production_doc.PromoteTo((secondary,), production_doc.NoMac())
+            with mock.patch.dict(os.environ, self.env, clear=True):
+                _ = merge_checkpoint.promote_targets(destinations, "production", tip, source=source,
+                    approval=promotion.CollectedCi(doc), label="fixture secondary", local_only=True)
+
+        first = next_tip(f"{name} first candidate")
+        before = refs()
+        _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), doc, first, policy).unlink()
+        with self.assertRaisesRegex(checkpoint_gate.Stop, f"collect {name} CI on"):
+            publish(first)
+        self.assertEqual(refs(), before)
+
+        _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), doc, first, policy)
+        hook = self.origin / "hooks/pre-receive"
+        self.executable(hook, '#!/bin/sh\nwhile read old new ref; do\n'
+                        + '  if [ "$ref" = refs/heads/main ]; then echo "hold main" >&2; exit 1; fi\n'
+                        + "done\n")
+        with self.assertRaisesRegex(checkpoint_gate.Stop, "hold main"):
+            publish(first)
+        self.assertEqual(refs(), (before[0], first, before[2]))
+        hook.unlink()
+
+        latest = next_tip(f"{name} second candidate")
+        before = refs()
+        with self.assertRaisesRegex(checkpoint_gate.Stop, f"collect {name} CI on"):
+            publish(latest)
+        self.assertEqual(refs(), before)
+        _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), doc, latest, policy)
+        publish(latest)
+        self.assertEqual(refs(), (before[0], latest, latest))
     def test_local_foreign_main_commit_never_reaches_origin(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()
@@ -768,22 +922,30 @@ with lock.open("a") as held:
         self.assertIn(str(self.promote), result.process.stdout)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), origin_main)
     def test_rerun_never_pushes_a_main_that_holds_a_foreign_commit(self) -> None:
-        self.promotions = str(self.promote)
+        self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()
         sha = self.checkpoint()
         first = self.run_checkpoint(sha)
         self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
         pushed = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+        marker = merge_checkpoint.checkpoint_step_record(self.checkout, pushed, "promotion")
+        marker.unlink()
+        self.log.unlink()
         self.write(self.promote, "foreign-main.txt", "another session\n")
         _ = self.git("add", "foreign-main.txt", cwd=self.promote)
         _ = self.git("commit", "-m", "foreign main commit", cwd=self.promote)
+        before = self.events("ssh")
         rerun = self.run_checkpoint(sha)
-        self.assertEqual(rerun.process.returncode, 0, rerun.process.stderr + rerun.process.stdout)
-        self.assertIn(f"promote: ok — {self.promote} main at {pushed}; "
+        self.assertEqual(rerun.process.returncode, 1, rerun.process.stderr + rerun.process.stdout)
+        self.assertIn(f"promote: held — {self.promote} main at {pushed}; "
                       + "main holds commits not on origin/production and was not pushed\n",
                       rerun.process.stdout)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), pushed)
-    def test_promote_at_tip_with_foreign_remote_history_says_already_at_without_push(self) -> None:
+        self.assertEqual(self.events("ssh"), before)
+        self.assertFalse(marker.exists())
+        self.assertFalse(self.log.exists())
+
+    def test_promote_at_tip_with_foreign_remote_history_reports_published_main(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()
         sha = self.checkpoint()
@@ -801,12 +963,13 @@ with lock.open("a") as held:
                 cancel_prior=False, started=STARTED, regime="after", holds=0,
                 merge_defects=0, excluded=None, scratch=str(self.root / "scratch"),
             ))
-        output = StringIO()
-        with redirect_stdout(output):
-            promote(request, tip)
-        self.assertIn(f"promote: ok — {self.promote} already at {tip}; "
-                      + "main holds commits not on origin/production and was not pushed\n", output.getvalue())
+        _ = save_promotion_verdict(Path(self.env["SHOWRUNNER_STATE_DIR"]), self.doc, tip)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            with self.assertRaisesRegex(checkpoint_gate.Stop, f"main at {base}"):
+                _ = promote(request, tip)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), base)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+
     def test_promote_reports_already_at_tip_when_both_mains_match(self) -> None:
         self.promotions = str(self.promote)
         self.production_doc()
@@ -818,6 +981,25 @@ with lock.open("a") as held:
         self.assertEqual(second.process.returncode, 0, second.process.stderr + second.process.stdout)
         self.assertIn(f"promote: ok — {self.promote} already at {tip}\n", second.process.stdout)
         self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tip)
+    def test_legacy_main_push_keeps_the_tested_tip_when_the_branch_moves(self) -> None:
+        main = self.promote
+        _ = self.git("commit", "--allow-empty", "-m", "Tested commit", cwd=main)
+        tested = self.git("rev-parse", "HEAD", cwd=main)
+        production = ProductionDocument(self.doc, "example", "main", main, self.log,
+                                        ZoneInfo("America/Los_Angeles"))
+        original_git = merge_checkpoint.git
+
+        def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            if checkout == main and args[:2] == ("push", "origin"):
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit before push", cwd=main)
+            return original_git(checkout, *args)
+
+        with mock.patch.object(merge_checkpoint, "git", side_effect=git):
+            self.assertEqual(merge_checkpoint.push_git(production, tested), tested)
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tested)
+        self.assertEqual(self.git("rev-parse", "HEAD^", cwd=main), tested)
+        self.assertEqual(self.git("log", "-1", "--format=%s", cwd=main), "Operator commit before push")
+
     def test_git_push_merges_diverged_main_promotes_pushed_tip_and_records(self) -> None:
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()
@@ -855,12 +1037,13 @@ with lock.open("a") as held:
             missing_at.append("push")
             return original_push(production, may_undo)
 
-        def promote_without_refs(checkout: Path, branch: str, tip: str) -> (
+        def promote_without_refs(checkout: Path, branch: str, approved: promotion.ApprovedPromotion) -> (
                 merge_checkpoint.PromotionAlreadyAtTip | merge_checkpoint.PromotionOriginPushed |
-                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed):
+                merge_checkpoint.PromotionAdvanced | merge_checkpoint.PromotionNotPushed |
+                merge_checkpoint.PromotionRetainedNewerCheckout):
             remove_origin_refs(checkout)
             missing_at.append("promote")
-            return original_promote(checkout, branch, tip)
+            return original_promote(checkout, branch, approved)
 
         with (mock.patch("scripts.production.merge_checkpoint.datetime", wraps=datetime, now=now),
               mock.patch.object(merge_checkpoint, "prepare_checkpoint", side_effect=prepare_without_refs),
@@ -958,10 +1141,13 @@ with lock.open("a") as held:
             assert isinstance(pending, main_publish.PendingMacPull)
             self.assertEqual(pending.text, "")
             self.assertIn("connection timed out", pending.reason)
+            published = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+            self.assertEqual(pending.pulls, (main_publish.ProductionMacPull(
+                PurePosixPath(self.root / "mac-installed"), self.promote, published),))
 
     def test_mac_pull_retries_once_then_succeeds(self) -> None:
         config = self.root / "merge_checkpoint.conf"
-        _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+        _ = config.write_text("# whole: 1..\nmac_pull_tries=3\n# range: 0..\nmac_pull_retry_seconds=0\n")
         self.env["CONF_DIR"] = str(Path(config).parent)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()
@@ -979,7 +1165,7 @@ with lock.open("a") as held:
 
     def test_mac_pull_stops_after_configured_tries_with_the_last_failure(self) -> None:
         config = self.root / "merge_checkpoint.conf"
-        _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=2\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+        _ = config.write_text("# whole: 1..\nmac_pull_tries=2\n# range: 0..\nmac_pull_retry_seconds=0\n")
         self.env["CONF_DIR"] = str(Path(config).parent)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()

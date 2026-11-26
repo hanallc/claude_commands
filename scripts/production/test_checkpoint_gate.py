@@ -1,7 +1,7 @@
 """Test how checkpoint gates enter placement and report the result."""
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import io
 from dataclasses import replace
@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from textwrap import dedent
 from typing import cast, final
 import unittest
 from unittest import mock
@@ -36,15 +37,77 @@ from scripts.production.production_doc import ProductionDocument
 GATE = ("python3", "scripts/production/gate.py", "--tests-only")
 
 
-def run_child(run: Callable[[], subprocess.CompletedProcess[str]]) -> subprocess.CompletedProcess[str]:
-    return run()
+def write_gate(folder: Path, command: Sequence[str], status: int, diagnostic: str = "",
+               *, lease_fd: int | None = None) -> None:
+    script = folder / command[1]
+    script.parent.mkdir(parents=True, exist_ok=True)
+    _ = script.write_text(dedent(f"""\
+        import os
+        import sys
+
+        with os.fdopen(int(os.environ[{copies.PREPARED_GATE_FD!r}]), "rb") as handoff:
+            assert handoff.read(32) == f"{{os.getpid()}}\\n".encode("ascii")
+        lease_fd = {lease_fd!r}
+        if lease_fd is not None:
+            assert os.read(lease_fd, 32) == b"gate fixture lease\\n"
+        assert sys.argv[1:] == {list(command[2:])!r}
+        print("gate fixture started", file=sys.stderr, flush=True)
+        sys.stderr.write({diagnostic!r})
+        raise SystemExit({status})
+        """))
+
+
+def run_gate_step(case: unittest.TestCase, argv: list[str]) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryFile(mode="w+") as errors, redirect_stderr(errors):
+        # Capture the gate child and the cleanup messages in the same stream.
+        saved_stderr = os.dup(2)
+        try:
+            _ = os.dup2(errors.fileno(), 2)
+            code = copies.main(argv)
+        finally:
+            _ = os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
+        _ = errors.seek(0)
+        diagnostic = errors.read()
+    case.assertEqual(diagnostic.splitlines().count("gate fixture started"), 1, diagnostic)
+    return subprocess.CompletedProcess(argv, code, "", diagnostic)
 
 
 class CheckpointGateTests(unittest.TestCase):
-    def test_named_gate_uses_a_supervisor_with_the_gate_command(self) -> None:
+    def test_merge_gate_uses_the_committed_copy_for_the_initial_run_and_flake_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary).resolve()
+            production = ProductionDocument(folder / "production.md", "fixture", "merge", folder,
+                                            folder / "production.log", ZoneInfo("UTC"))
+            prefix = ["env", "HERDR_BIN=/nonexistent/herdr"]
+            command = [*prefix, *GATE, "--checkout", "."]
+            step = checkpoint_gate.CheckpointTestStep("merge test 1", command, folder)
+            log = folder / "test.log"
+            script_dir = Path(checkpoint_gate.__file__).resolve().parents[1]
+            expected = [*prefix, str(script_dir / "lib/py"), str(script_dir / "copies/copies.py"), "run",
+                        "--repo", str(folder), "--commit", "merged-tip", "--", *GATE, "--checkout", "{tree}"]
+            retry = [*expected, "--module", "known_flake"]
+
+            with mock.patch.object(subprocess, "run", side_effect=[
+                    subprocess.CompletedProcess(expected, 1, RED_OUTPUT, ""),
+                    subprocess.CompletedProcess(retry, 0, "", ""),
+            ]) as run:
+                result = checkpoint_gate.run_test_steps(production, [step], frozenset(), frozenset({"known_flake"}),
+                                                        log, merge_head="merged-tip")
+            options = {"cwd": folder, "capture_output": True, "text": True, "check": False, "pass_fds": ()}
+            self.assertEqual(run.call_args_list, [mock.call(expected, **options), mock.call(retry, **options)])
+            self.assertEqual(result, "merge test 1")
+            self.assertIn("merge_test_1_EXIT=1", log.read_text())
+            self.assertIn("merge_test_1_RERUN_EXIT=0", log.read_text())
+            self.assertIn("known flaky tests known_flake", production.log.read_text())
+
+    def test_named_gate_uses_a_supervisor_with_the_gate_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryFile() as lease:
             folder = Path(temporary)
-            token = copies.COMMAND_LOCKS.set((9,))
+            _ = lease.write(b"gate fixture lease\n")
+            _ = lease.seek(0)
+            descriptor = lease.fileno()
+            token = copies.COMMAND_LOCKS.set((descriptor,))
             self.addCleanup(copies.COMMAND_LOCKS.reset, token)
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "natedev,mac-linux"}),
                   mock.patch.object(subprocess, "run",
@@ -53,29 +116,27 @@ class CheckpointGateTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0)
                 run.assert_called_once()
                 argv = cast(list[str], run.call_args.args[0])
-                self.assertEqual(run.call_args.kwargs["pass_fds"], (9,))
+                self.assertEqual(run.call_args.kwargs["pass_fds"], (descriptor,))
                 self.assertEqual(argv[2:], ["gate-step", "--repo", str(folder),
-                    "--lease-fd", "9", "--", *GATE])
+                    "--lease-fd", str(descriptor), "--", *GATE])
 
             process = folder / "42"
             write_process(folder, 42, start="123")
             _ = (process / "cmdline").write_text("\0".join(("python3", *argv[1:])) + "\0")
             self.assertEqual(gate_job_from_process("gate", process, start_time="123"), StepJob("test-all"))
 
+            write_gate(folder, GATE, 0, lease_fd=descriptor)
             with (mock.patch.dict(os.environ, {"BUILDLOG_GATE_TARGETS": "natedev,mac-linux"}),
-                  mock.patch.object(first_step, "admitted_run") as place,
-                  mock.patch.object(subprocess, "run",
-                      return_value=subprocess.CompletedProcess(GATE, 0)) as child):
+                  mock.patch.object(first_step, "admitted_run") as place):
                 handoff = mock.Mock()
-
                 admitted = mock.Mock(spec=first_step.FirstStepAdmission, handoff=handoff,
-                                     grant=first_step.HandedOff(), run_gate=run_child)
+                                     grant=first_step.HandedOff())
                 place.return_value = nullcontext(admitted)
-                self.assertEqual(copies.main(argv[2:]), 0)
+                result = run_gate_step(self, argv[2:])
+                self.assertEqual(result.returncode, 0, result.stderr)
                 place.assert_called_once_with(list(GATE), folder, targets=placement.GateTargets(
                     ("natedev", "mac-linux"), (("aws", placement.GATE_CALLER_EXCLUSION),), caller_supplied=True))
                 handoff.assert_called_once_with(folder)
-                child.assert_called_once_with(list(GATE), cwd=folder, pass_fds=[9], check=False, text=True)
 
     def test_gate_without_targets_starts_directly(self) -> None:
         folder = Path("/fixture")
@@ -200,7 +261,8 @@ class CheckpointPackageTests(unittest.TestCase):
         rows = "".join(f"verify.sh: step result: test {name} exit=0\n" for name in ("alpha", "beta", "gamma"))
         with mock.patch.object(subprocess, "run",
                                return_value=subprocess.CompletedProcess(fixture.joined, 0, "", rows)) as run:
-            result = checkpoint_gate.run_test_steps(fixture.production, fixture.steps, frozenset(), frozenset(), fixture.log)
+            result = checkpoint_gate.run_test_steps(fixture.production, fixture.steps, frozenset(), frozenset(),
+                                                    fixture.log, merge_head="merged-tip")
         run.assert_called_once_with(fixture.joined, cwd=fixture.production.checkout, capture_output=True, text=True,
                                     check=False, pass_fds=())
         self.assertEqual(result, "package alpha, package beta, package gamma")
@@ -330,7 +392,8 @@ class GatePlacementFixture:
         admission_wire.write_assignment(self.assignment_file, self.local)
 
     def run_step(self, child: mock.Mock, *, retry_failed_steps: bool = False) -> str:
-        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
+        def run(command: list[str], folder: Path, *, merge_head: str) -> subprocess.CompletedProcess[str]:
+            self.case.assertEqual(merge_head, "")
             return first_step.run_gate_with_placement(
                 lambda: cast("subprocess.CompletedProcess[str]", child(command, folder)),
                 self.assignment_file, self.request, self.place_again)
@@ -343,6 +406,10 @@ class GatePlacementFixture:
         _ = self.report_file.write_text(admission_wire.encode_request(self.refusal))
         return subprocess.CompletedProcess(COMMAND, 79, RED_OUTPUT, "")
 
+    def run_gate_step(self, command: list[str], folder: Path, *, merge_head: str) -> subprocess.CompletedProcess[str]:
+        self.case.assertEqual(merge_head, "")
+        return run_gate_step(self.case, ["gate-step", "--repo", str(folder), "--", *command])
+
 
 @final
 class CheckpointGatePlacementTests(unittest.TestCase):
@@ -351,30 +418,26 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         production = ProductionDocument(root / "production.md", "fixture", "merge", root,
                                         root / "production.log", ZoneInfo("UTC"))
         log = root / "test.log"
-        step = checkpoint_gate.CheckpointTestStep("merge test 1", COMMAND, root)
-        admitted = mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.HandedOff(), run_gate=run_child)
+        command = ["env", "HERDR_BIN=/nonexistent/herdr", *GATE]
+        step = checkpoint_gate.CheckpointTestStep("merge test 1", command, root)
 
-        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
-            args = copies.CopyArguments(repo=str(folder), targets="mac-linux,natedev")
-            result = copies.run_gate_step(args, command)
-            return subprocess.CompletedProcess(command, result, RED_OUTPUT, "")
-
-        with (mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as place,
-              mock.patch.object(subprocess, "run",
-                                return_value=subprocess.CompletedProcess(COMMAND, status)) as child,
-              mock.patch.object(checkpoint_gate, "run_test_command", side_effect=run),
+        with (mock.patch.object(subprocess, "run",
+                                return_value=subprocess.CompletedProcess(command, status, RED_OUTPUT, "")) as child,
               self.assertRaises(checkpoint_gate.Stop) as stopped):
             _ = checkpoint_gate.run_test_steps(production, [step], frozenset(), frozenset({"known_flake"}), log,
-                                               retry_failed_steps=retry_failed_steps)
-        place.assert_called_once_with(COMMAND, root, targets=("mac-linux", "natedev"))
+                                               retry_failed_steps=retry_failed_steps, merge_head="merged-tip")
         child.assert_called_once()
         if status == 1:
             assert isinstance(stopped.exception, checkpoint_gate.RedCheckpointTests)
             self.assertEqual(stopped.exception.red, (checkpoint_gate.RedStep(step, frozenset({"lib/test_infrastructure.py"})),))
         else:
             self.assertEqual(stopped.exception.state, "blocked")
-            self.assertIn(f"gate status {status}", stopped.exception.detail.lower())
-            self.assertNotIn("RERUN", log.read_text())
+            self.assertIn(f"status {status}", stopped.exception.detail)
+            self.assertIn(str(log), stopped.exception.detail)
+            output = log.read_text()
+            self.assertIn(f"merge_test_1_EXIT={status}", output)
+            self.assertNotIn("RERUN", output)
+            self.assertNotIn("BASE", output)
         self.assertFalse(production.log.exists())
 
     def test_silent_guest_requests_placement_again_at_original_queue_time(self) -> None:
@@ -451,10 +514,13 @@ class CheckpointGatePlacementTests(unittest.TestCase):
                                                frozenset(), fixture.log)
         self.assertEqual(stopped.exception.state, "blocked")
         self.assertIn("settlement", stopped.exception.detail)
-        run.assert_called_once_with(COMMAND, fixture.step.folder)
+        run.assert_called_once_with(COMMAND, fixture.step.folder, merge_head="")
 
     def test_queue_loss_during_replacement_preserves_exit_79(self) -> None:
         fixture = GatePlacementFixture(self)
+        _ = fixture.refuse_guest()
+        write_gate(fixture.step.folder, COMMAND, GATE_PRELAUNCH_REFUSED_STATUS)
+
         @contextmanager
         def tool_folder(_tool: str) -> Generator[Path]:
             try:
@@ -462,11 +528,10 @@ class CheckpointGatePlacementTests(unittest.TestCase):
             finally:
                 raise OSError("fixture folder cleanup failed")
 
-        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
-            with redirect_stderr(io.StringIO()) as errors:
-                code = copies.main(["gate-step", "--repo", str(folder), "--", *command])
-            self.assertEqual(code, GATE_PRELAUNCH_REFUSED_STATUS, errors.getvalue())
-            return subprocess.CompletedProcess(command, code, "", errors.getvalue())
+        def run(command: list[str], folder: Path, *, merge_head: str) -> subprocess.CompletedProcess[str]:
+            result = fixture.run_gate_step(command, folder, merge_head=merge_head)
+            self.assertEqual(result.returncode, GATE_PRELAUNCH_REFUSED_STATUS, result.stderr)
+            return result
 
         with (PlacementFixture(), mock.patch.dict(os.environ),
               mock.patch.object(first_step, "gate_targets", return_value=placement.GateTargets(("mac-linux",), ())),
@@ -476,7 +541,6 @@ class CheckpointGatePlacementTests(unittest.TestCase):
               mock.patch.object(admission_client, "_connect", side_effect=FileNotFoundError("fixture socket is gone")),
               mock.patch.object(admission_client, "acquire_placement",
                   return_value=admission_wire.Assignment(fixture.guest)) as acquire,
-              mock.patch.object(subprocess, "run", return_value=fixture.refuse_guest()) as invoked,
               mock.patch.object(checkpoint_gate, "run_test_command", side_effect=run) as runner,
               redirect_stdout(io.StringIO())):
             _ = os.environ.pop("BUILDLOG_PLACEMENT_FILE", None)
@@ -485,8 +549,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         self.assertEqual(stopped.exception.state, "blocked")
         fixture.report_failure.assert_not_called()
         acquire.assert_called_once_with(fixture.request)
-        invoked.assert_called_once()
-        runner.assert_called_once_with(COMMAND, fixture.step.folder)
+        runner.assert_called_once_with(COMMAND, fixture.step.folder, merge_head="")
         output = fixture.log.read_text()
         self.assertIn("Gate cleanup failed. no socket", output)
         self.assertIn("Gate cleanup failed. fixture folder cleanup failed", output)
@@ -495,6 +558,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
 
     def test_queue_loss_after_guest_exit_80_preserves_checkpoint_settlement(self) -> None:
         fixture = GatePlacementFixture(self)
+        write_gate(fixture.step.folder, COMMAND, GATE_UNSETTLED_LAUNCH_STATUS, "guest end unproven\n")
 
         @contextmanager
         def tool_folder(_tool: str) -> Generator[Path]:
@@ -503,12 +567,6 @@ class CheckpointGatePlacementTests(unittest.TestCase):
             finally:
                 raise OSError("fixture folder cleanup failed")
 
-        def run(command: list[str], folder: Path) -> subprocess.CompletedProcess[str]:
-            with redirect_stderr(io.StringIO()) as errors:
-                code = copies.main(["gate-step", "--repo", str(folder), "--", *command])
-            return subprocess.CompletedProcess(command, code, "", errors.getvalue())
-
-        child = subprocess.CompletedProcess(COMMAND, GATE_UNSETTLED_LAUNCH_STATUS, "", "guest end unproven\n")
         with (PlacementFixture(),
               mock.patch.dict(os.environ, {"BUILDLOG_PLACEMENT_FILE": ""}, clear=False),
               mock.patch.object(first_step, "gate_targets", return_value=placement.GateTargets(("mac-linux",), ())),
@@ -517,8 +575,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
               mock.patch.object(admission_records, "process_start_time", return_value="456"),
               mock.patch.object(build_folders, "tool_folder", side_effect=tool_folder),
               mock.patch.object(admission_client, "_connect", side_effect=FileNotFoundError("fixture socket is gone")) as connect,
-              mock.patch.object(subprocess, "run", return_value=child) as invoked,
-              mock.patch.object(checkpoint_gate, "run_test_command", side_effect=run) as runner):
+              mock.patch.object(checkpoint_gate, "run_test_command", side_effect=fixture.run_gate_step) as runner):
             del os.environ["BUILDLOG_PLACEMENT_FILE"]
             with self.assertRaises(checkpoint_gate.Stop) as stopped:
                 _ = checkpoint_gate.run_test_steps(fixture.production, [fixture.step], frozenset(),
@@ -526,8 +583,7 @@ class CheckpointGatePlacementTests(unittest.TestCase):
         self.assertEqual(stopped.exception.state, "blocked")
         self.assertIn("launch settlement", stopped.exception.detail)
         connect.assert_called_once()
-        invoked.assert_called_once()
-        runner.assert_called_once_with(COMMAND, fixture.step.folder)
+        runner.assert_called_once_with(COMMAND, fixture.step.folder, merge_head="")
         output = fixture.log.read_text()
         self.assertIn("guest end unproven", output)
         self.assertIn("Gate cleanup failed. no socket", output)
@@ -558,3 +614,8 @@ class CheckpointGatePlacementTests(unittest.TestCase):
 
     def test_red_gate_remains_a_test_failure(self) -> None:
         self.check_exit_status(1, retry_failed_steps=False)
+
+    def test_copy_setup_errors_block_the_checkpoint_without_a_test_retry(self) -> None:
+        for status in (copies.COPY_ERROR_STATUS, os.EX_TEMPFAIL, 127):
+            with self.subTest(status=status):
+                self.check_exit_status(status, retry_failed_steps=True)

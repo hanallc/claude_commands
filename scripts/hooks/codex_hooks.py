@@ -5,7 +5,8 @@ The tool checks match `apply_patch` or `Bash`. STE runs at SessionStart and
 SubagentStart. Their `*` matchers cover every session source and subagent type.
 Session sources include startup, resume, clear and compact; they are not tool
 names. PreCompact records the start of manual and automatic compaction.
-UserPromptSubmit and PostCompact clear the session's compaction marker.
+UserPromptSubmit clears compaction and adds director hold or producer goal context.
+PostCompact also clears the session's compaction marker.
 Stop sends worker turn completion to the shared handler.
 Listing and trust use the event, matcher, command and timeout together,
 so two events can share one script without sharing a trust identity.
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Generator
 from enum import Enum
 from typing import NamedTuple, cast
 
@@ -46,6 +48,23 @@ class PythonHookScript(NamedTuple):
         return command + (" " + shlex.join(self.arguments) if self.arguments else "")
 
 
+_GOAL_CARD_COMMAND = PythonHookScript("goal_card.py").command()
+_DIRECTOR_HOLD_COMMAND = PythonHookScript("conversation_pause.py", ("codex-director-hold",)).command()
+# Worker launches set UNIT_TEAM_ROLE. Skip the launcher when no marker needs a read.
+PROMPT_COMMAND = (
+    'if [ -n "${UNIT_TEAM_ROLE:-}" ] && [ -z "${STAFF_ID:-}" ]; then '
+    + 'if [ -n "${ZSH_VERSION:-}" ]; then unsetopt nomatch; fi; '
+    + 'set -- "$HOME"/.local/state/compaction/*.json; [ -e "$1" ] || exit 0; fi; '
+    + _GOAL_CARD_COMMAND + " 2>/dev/null || true"
+)
+RETIRED_PROMPT_COMMANDS = frozenset({
+    '"$HOME/.claude/scripts/hooks/compaction-marker-clear.sh"',
+    _GOAL_CARD_COMMAND,
+    _GOAL_CARD_COMMAND + " 2>/dev/null || true",
+    _DIRECTOR_HOLD_COMMAND,
+})
+
+
 class ShellHookFront(NamedTuple):
     """A hook front that starts Python only when its checks need it."""
 
@@ -60,10 +79,10 @@ class CodexHook:
 
     __slots__: tuple[str, ...] = ("name", "command", "event", "_timeout", "matcher")
 
-    def __init__(self, name: str, script: PythonHookScript | ShellHookFront, event: str = "PostToolUse", timeout: int = 10,
+    def __init__(self, name: str, script: PythonHookScript | ShellHookFront | str, event: str = "PostToolUse", timeout: int = 10,
                  matcher: str = "apply_patch") -> None:
         self.name: str = name
-        self.command: str = script.command()
+        self.command: str = script if isinstance(script, str) else script.command()
         self.event: str = event
         self._timeout: int = timeout
         self.matcher: str = matcher
@@ -96,8 +115,7 @@ HOOKS: tuple[CodexHook, ...] = (
     CodexHook("queue-tools", PythonHookScript("codex-queue-drain.py"), matcher="*"),
     CodexHook("compaction-marker", PythonHookScript("pre-compact-marker.py", ("--family", "codex")),
               "PreCompact", matcher="*"),
-    CodexHook("compaction-clear-turn", ShellHookFront("compaction-marker-clear.sh"),
-              "UserPromptSubmit", matcher="*"),
+    CodexHook("compaction-clear-turn", PROMPT_COMMAND, "UserPromptSubmit", matcher="*"),
     CodexHook("compaction-clear-end", PythonHookScript("compaction-marker-clear.py"),
               "PostCompact", matcher="*"),
     CodexHook("turn-end", PythonHookScript("../herdr/turn_end.py"), "Stop", matcher="*"),
@@ -187,11 +205,13 @@ def _managed_handlers(group: object, hook: CodexHook) -> list[dict[str, object]]
     ]
 
 
-def _is_retired_handler(handler: object) -> bool:
+def _is_retired_handler(event: str, handler: object) -> bool:
     if not isinstance(handler, dict):
         return False
     entry = cast(dict[str, object], handler)
-    return entry.get("type") == "command" and entry.get("command") == RETIRED_COMMAND
+    command = entry.get("command")
+    return (entry.get("type") == "command" and isinstance(command, str)
+            and (command == RETIRED_COMMAND or event == "UserPromptSubmit" and command in RETIRED_PROMPT_COMMANDS))
 
 
 class HandlerRepairs(NamedTuple):
@@ -205,7 +225,7 @@ def _repair_handlers(hooks: dict[str, object], path: str) -> HandlerRepairs:
     changed = False
     retired_removed = False
     needs_manual_removal = False
-    for groups in hooks.values():
+    for event, groups in hooks.items():
         if not isinstance(groups, list):
             continue
         for group in cast(list[object], groups):
@@ -216,7 +236,7 @@ def _repair_handlers(hooks: dict[str, object], path: str) -> HandlerRepairs:
             if not isinstance(handlers, list):
                 continue
             entries = cast(list[object], handlers)
-            kept = [handler for handler in entries if not _is_retired_handler(handler)]
+            kept = [handler for handler in entries if not _is_retired_handler(event, handler)]
             removed = len(kept) != len(entries)
             retired_removed |= removed
             changed |= removed
@@ -495,15 +515,26 @@ def _failure(entry: LocatedHook | MissingHook, listed: list[dict[str, object]]) 
     return f"{entry.hook.name}: hooks/list " + "; ".join(differences)
 
 
+def _ready(entry: LocatedHook | MissingHook) -> bool:
+    return isinstance(entry, LocatedHook) and entry.trust_status == "trusted" and entry.enabled
+
+
+@contextlib.contextmanager
+def _read_hooks(binary: str, codex_home: str) -> Generator[tuple[AppServer, list[dict[str, object]]]]:
+    server = AppServer(binary, codex_home)
+    try:
+        _initialize(server)
+        yield server, _listed_hook_entries(server, os.path.join(codex_home, "hooks.json"))
+    finally:
+        server.close()
+
+
 def _run(action: str) -> int:
     codex_home = _codex_home()
     binary = _command_binary()
     path = os.path.join(codex_home, "hooks.json")
     previously_trusted = _install_file(path, binary, codex_home) if action == "install" else []
-    server = AppServer(binary, codex_home)
-    try:
-        _initialize(server)
-        listed = _listed_hook_entries(server, path)
+    with _read_hooks(binary, codex_home) as (server, listed):
         if previously_trusted and _restore_moved_trust(server, listed, previously_trusted):
             listed = _listed_hook_entries(server, path)
         entries = _select_hooks(listed)
@@ -514,17 +545,14 @@ def _run(action: str) -> int:
                     _trust_handlers(server, {entry.key: {"trusted_hash": entry.current_hash}})
                     listed = _listed_hook_entries(server, path)
                     entries = _select_hooks(listed)
-    finally:
-        server.close()
-    success = all(isinstance(entry, LocatedHook) and entry.trust_status == "trusted" and entry.enabled
-                  for entry in entries.values())
+    success = all(_ready(entry) for entry in entries.values())
     for hook in HOOKS:
         entry = entries[hook]
         if action == "install" and success and isinstance(entry, LocatedHook):
             print(f"{hook.name} codex hook: trusted {entry.key}")
         else:
             print(f"{hook.name} codex hook: {_status(entry)}")
-        if not isinstance(entry, LocatedHook) or entry.trust_status != "trusted" or not entry.enabled:
+        if not _ready(entry):
             print(f"codex hooks: {action}: {_failure(entry, listed)}", file=sys.stderr)
     return 0 if success else 1
 

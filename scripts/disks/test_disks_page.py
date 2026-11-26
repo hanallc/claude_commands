@@ -19,18 +19,18 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.build_queue import memory_files
-from scripts.build_queue.test_memory_hover import RAM_FIXTURE, SWAP_FIXTURE
 from scripts.review_links.browser_test_support import assert_status_states
-from scripts.disks import disks_page, slots
+from scripts.disks import disks_page
 from scripts.production import staff
 from scripts.review_links import staff_names
 from scripts.lib import file_lock, test_hang_guard
+from scripts.lib.process_group import run_process_group
 from scripts.review_links import page_frame, test_page_frame
 
 GIB = 1 << 30
 KEEP = 256 << 20
 SETTINGS: disks_page.PageSettings = {"slider_min_gib": 1, "slider_default_gib": 10, "cache_seconds": 600, "poll_seconds": 5,
-                                     "wait_seconds": 3600, "builds_data": "../builds/memory.json", "builds_max_age_seconds": 30,
+                                     "wait_seconds": 3600,
                                      "names": {"/build": "Build </script> drive"}}
 
 
@@ -40,24 +40,14 @@ def folder(name: str, size: int, children: list[dict[str, object]] | None = None
 
 
 TREE = folder("/build", 100 * GIB, [
-    folder("cargo", 60 * GIB, [folder("slot1", 30 * GIB, [folder("debug", 20 * GIB)]), folder("slot2", 20 * GIB),
-                               folder("slot3", 5 * GIB), folder("slot4", 4 * GIB)]),
+    folder("cargo", 60 * GIB, [folder("1", 30 * GIB, [folder("debug", 20 * GIB)]), folder("2", 20 * GIB),
+                               folder("3", 5 * GIB), folder("4", 4 * GIB)]),
     folder("paths", 30 * GIB, [folder("home", 2 * GIB)]),
     folder("small", 3 * GIB),
 ])
 
 
 NOW = 1000 * 86400
-SLOTS: slots.SlotReport = {"root": "/build", "machine": "natedev", "unused_days": 2, "groups": [
-    {"repository": "hana/report", "maximum": None, "slots": [
-        {"name": "1", "key": "hana/report/1", "number": 1, "size": 70 * GIB, "last_used": NOW, "needs_review": False,
-         "used_by": {"name": "report integrate", "showrunner": "builds"}},
-        {"name": "2", "key": "hana/report/2", "number": 2, "size": 0, "last_used": NOW - 9 * 86400, "used_by": None,
-         "needs_review": True}]},
-    {"repository": "<b>/other", "maximum": None, "slots": [
-        {"name": "1", "key": "<b>/other/1", "number": 1, "size": None, "last_used": None, "used_by": None, "needs_review": False}]}]}
-
-
 def session(name: str, size: int | None, state: str, held: list[dict[str, object]] | None = None) -> dict[str, object]:
     return {"name": name, "size": size, "state": state, "held": held or []}
 
@@ -75,86 +65,31 @@ class DisksPageTests(unittest.TestCase):
     def setUp(self) -> None:
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (configuration / "disks.conf").write_text("# whole: 1..\ncache_seconds=600\n")
-        # The page reads staff names, and staff reads the machine list.
+        _ = (configuration / "statusline.conf").write_text("role.unit-director=#ffaf02\nrole.showrunner=#a379fd\n")
+        staff_file = configuration / "staff.json"
+        _ = staff_file.write_text('{"schema": 1, "rows": []}')
+        # Staff reads the machine list.
         _ = shutil.copy(Path(__file__).parents[2] / "config" / "machines.conf", configuration)
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(configuration), "STAFF_FILE": str(staff_file)})))
 
-    def test_current_builds_keep_staff_parts_in_slot_names(self) -> None:
-        member = staff.StaffRow(staff.StaffId("builder"), "unit", "builder", staff.StaffRoot(),
-                                current_session=staff.StaffId("builder"))
-        setup = "globalThis.window=globalThis;" + staff_names.script(
-            staff_names.StaffNames(staff.StaffSnapshot((member,))).registry())[8:-9]
-        for waiting in (False, True):
-            with self.subTest(waiting=waiting):
-                row = {"key": "current", "name": "builder check", "slot_folder": "hana/report/1",
-                    "slot_machine": "natedev", "name_parts": [{"kind": "staff", "text": "builder"},
-                                                               {"kind": "text", "text": " check"}]}
-                result = str(self.run_drive(setup + """
-                    Date.now = () => input.now * 1000;
-                    slotReport = input.slots;
-                    builds = input.builds;
-                    result = slotsHtml(slotReport, KEEP, input.now, new Set(['hana/report']), slotStep);
-                """, extra={"slots": SLOTS, "now": NOW,
-                            "builds": {"read_at": NOW, "walk": [] if waiting else [row],
-                                       "waiters": [row] if waiting else []}}))
-                self.assertEqual(re.findall(r'<span class="staff-name"[^>]*>([^<]*)</span>', result),
-                                 ["builder", "builder"])
-                self.assertEqual(result.count('</span> check</span>'), 2)
-
-    def test_slot_work_parts_color_only_the_recorded_staff_reference(self) -> None:
-        members = staff.StaffSnapshot(tuple(staff.StaffRow(staff.StaffId(name), "unit", name,
-            staff.StaffRoot(), current_session=staff.StaffId(name)) for name in ("builder", "helper")))
-        setup = "globalThis.window=globalThis;" + staff_names.script(staff_names.StaffNames(members).registry())[8:-9]
-        report = {"root": "/build", "groups": [{"repository": "repo/unit", "maximum": None, "slots": [
-            {"name": "1", "key": "repo/unit/1", "number": 1, "size": 0, "last_used": NOW, "needs_review": False,
-             "used_by": {"name": "builder helper", "showrunner": "", "name_parts": [
-                 {"kind": "staff", "text": "builder"}, {"kind": "text", "text": " helper"}]}}]}]}
-        body = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(report)
-            + ",0," + str(NOW) + ",new Set(['repo/unit']),()=>null);})()"))
-        self.assertEqual(re.findall(r'<span class="staff-name"[^>]*>([^<]*)</span>', body), ["builder", "builder"])
-        plain = str(self.run_page("(()=>{const report=" + json.dumps(report)
-            + ";delete report.groups[0].slots[0].used_by.name_parts;return slotsHtml(report,0,"
-            + str(NOW) + ",new Set(['repo/unit']),()=>null);})()"))
-        self.assertEqual(re.sub(r'<[^>]+>', '', body), re.sub(r'<[^>]+>', '', plain))
-        current = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(report)
-            + ",0," + str(NOW) + ",new Set(['repo/unit']),()=>({name:'Current work'}));})()"))
-        self.assertEqual(current.count('>Current work</span>'), 2)
-        self.assertNotIn('class="staff-name"', current)
-
-    def test_slot_staff_names_have_role_colors_and_task_names_stay_plain(self) -> None:
-        runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(), current_session=staff.StaffId("builds"))
-        names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
-        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
-        body = str(self.run_page("(()=>{" + setup + "return slotsHtml(" + json.dumps(SLOTS)
-                                + ", 0, " + str(NOW) + ", new Set(['hana/report']), ()=>null);})()"))
-        self.assertRegex(body, r'data-color-text="role.showrunner"[^>]*>builds</span>')
-        self.assertIn('>report integrate</span>', body)
-        self.assertNotRegex(body, r'class="staff-name"[^>]*>report integrate</span>')
-
-    def test_tooltip_keeps_task_and_repository_text_plain_when_it_matches_staff(self) -> None:
+    def test_session_tooltip_keeps_held_folder_names_plain(self) -> None:
         runner = staff.StaffRow(staff.StaffId("builds"), "showrunner", "builds", staff.StaffRoot(),
                                 current_session=staff.StaffId("builds"))
         names = staff_names.StaffNames(staff.StaffSnapshot((runner,)))
         page = self.page_html()
-        functions = page[page.index("function slotTip("):page.index("function smallerTip(")]
-        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9] + functions
-        body = str(self.run_page("(()=>{" + setup + "return stepTip.tipRowsHtml(slotTip("
-            + "{name:'builds',size:0,last_used:0,used_by:{name:'builds',showrunner:'builds'}},"
-            + "{repository:'builds'},0,100,30));})()"))
-        grid = ElementTree.fromstring(body)
-        self.assertEqual(grid[0].text, "builds")
-        self.assertEqual(list(grid[0]), [])
-        for label in ("Repository", "Used by"):
-            value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
-            self.assertEqual(value.text, "builds")
-            self.assertEqual(list(value), [])
-        value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Showrunner")
-        self.assertEqual(value.findtext("span"), "builds")
+        self.assertIn('"roleLabels": {"showrunner"', page)
+        session_tip = page[page.index("const SESSION_TIP_FOLDER_LIMIT"):page.index("function fitSessionTip(")]
+        setup = "globalThis.window=globalThis;" + staff_names.script(names.registry(), names.role_labels())[8:-9] + session_tip
         session_body = str(self.run_page("(()=>{" + setup
             + "return stepTip.tipRowsHtml(sessionTip({name:'builds',state:'running',size:0,"
             + "held:[{name:'builds',task:'builds'}]},0));})()"))
         session_grid = ElementTree.fromstring(session_body)
-        self.assertEqual(session_grid[0].findtext("span"), "builds")
+        name = session_grid[0].find("span")
+        assert name is not None
+        self.assertEqual(name.text, "builds")
+        self.assertEqual(name.get("data-color-text"), "role.showrunner")
+        self.assertEqual(name.get("style"), "color:#a379fd")
         folder = next(cell for cell in session_grid if cell.tag == "dt" and cell.text == "builds")
         self.assertEqual(list(folder), [])
 
@@ -162,6 +97,8 @@ class DisksPageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             page = disks_page.publish(Path(directory) / "page", SETTINGS).read_text()
         self.assertIn(page_frame.STYLE, page)
+        self.assertIn(page_frame.action_failure("measure-failure"), page)
+        self.assertIn(page_frame.ACTION_STATUS_SCRIPT, page)
         button = re.search(r'<button type="button" id="measure-now"[^>]*>.*?</button>', page, re.DOTALL)
         assert button is not None
         self.assertIn('aria-label="Measure now" title="Measure now"', button[0])
@@ -170,7 +107,8 @@ class DisksPageTests(unittest.TestCase):
         self.assertIn('</h1><p class="page-status"', page)
         self.assertIn('data-status-age hidden></span><span data-status-trip hidden></span>', page)
         self.assertIn('data-status-render hidden></span><span data-status-reason hidden></span>', page)
-        self.assertNotIn("__", page.split("<script>", 1)[0].split("</style>", 1)[1])
+        body = re.sub(r'<script\b[^>]*>.*?</script>', '', page.split('<body>', 1)[1], flags=re.DOTALL)
+        self.assertNotIn("__", body)
         settings_text = page.split('type="application/json">', 1)[1].split("</script>", 1)[0]
         self.assertEqual(json.loads(settings_text.replace("<\\/", "</")), SETTINGS)
         # The step tooltip rules and code come from the Builds page as they are, so the two pages share them.
@@ -195,7 +133,7 @@ class DisksPageTests(unittest.TestCase):
         # The user, 11-16: the size filter is for the top level only; the Other row opens.
         rows = self.rows(10 * GIB, ["/build/cargo"])
         self.assertEqual([(row["name"], row["depth"], row["kind"]) for row in rows], [
-            ("/build/cargo", 0, "open"), ("slot1", 1, "shut"), ("slot2", 1, "leaf"), ("slot3", 1, "leaf"), ("slot4", 1, "leaf"),
+            ("/build/cargo", 0, "open"), ("1", 1, "shut"), ("2", 1, "leaf"), ("3", 1, "leaf"), ("4", 1, "leaf"),
             ("Files and small folders", 1, "files"), ("/build/paths", 0, "shut"), ("/build/small", 0, "leaf"),
             ("Files and small folders", 0, "files")])
         rows = self.rows(31 * GIB, ["other:/build", "/build/paths"])
@@ -207,9 +145,9 @@ class DisksPageTests(unittest.TestCase):
             ("/build/small", 1, "leaf", 3, 40, 90), ("Files and small folders", 1, "files", 7, 40, 93)])
 
     def test_each_row_starts_where_the_row_before_it_ends_inside_its_parent(self) -> None:
-        rows = self.rows(GIB, ["/build/cargo", "/build/cargo/slot1"])
+        rows = self.rows(GIB, ["/build/cargo", "/build/cargo/1"])
         debug = next(row for row in rows if row["name"] == "debug")
-        self.assertEqual((debug["path"], debug["start"], debug["parentStart"]), ("/build/cargo/slot1/debug", 0, 0))
+        self.assertEqual((debug["path"], debug["start"], debug["parentStart"]), ("/build/cargo/1/debug", 0, 0))
         top = [row for row in rows if row["depth"] == 0]
         self.assertEqual([row["start"] for row in top], [0, 60 * GIB, 90 * GIB, 93 * GIB])
         self.assertEqual(sum(cast(int, row["size"]) for row in top), 100 * GIB)
@@ -266,7 +204,7 @@ class DisksPageTests(unittest.TestCase):
         self.assertIn(page_frame.REFRESH_SCRIPT, page)
         self.assertIn("createPageRefresh(loadDisks,()=>settings.poll_seconds)", page)
         self.assertIn('readAt:data.measured_at,renderSeconds:data.render_seconds', page)
-        self.assertIn('setMeasuring(null,"The measure did not finish.")', page)
+        self.assertIn('showActionFailure(measureFailure, "The measure did not finish.")', page)
         scenario = r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
 let generation=0,fileAt=now/1000-4200,measureState='current',stalled=false,failedReads=false;
@@ -276,6 +214,7 @@ function render(){}
 function renderCards(){}
 const payload=()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]});
 const fetch=async(url)=>{
+ if(url==='measure' && measureState==='refused') return {ok:false,status:503,json:async()=>({reason:'Measure refused.'})};
  if(url==='measure') return {ok:true,json:async()=>({state:measureState,target:generation+(measureState==='current' ? 0 : 1)})};
  if(failedReads) return {ok:false,status:502};
  if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
@@ -300,10 +239,13 @@ START
  measureState='started';await pageRefresh.refresh();
  advanceTime((settings.wait_seconds+1)*1000);pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
- check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+ check(!measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
   'A measure timeout must keep its failure after the age clock runs.');
+ measureState='refused';await pageRefresh.refresh();
+ check(line.dataset.state==='Live' && !measureIssue.hidden && measureIssue.textContent==='Measure refused.',
+  'A refused automatic measure must show its reason with the old sizes.');
  measureState='current';await pageRefresh.refresh();
- check(line.dataset.state==='Live','A server answer must recover with the old sizes.');
+ check(line.dataset.state==='Live' && measureIssue.hidden,'A server answer must clear the measure failure.');
  measureState='started';await pageRefresh.refresh();
  failedReads=true;await pageRefresh.refresh();pageRefresh.changed();
  await Promise.resolve();await Promise.resolve();
@@ -315,6 +257,8 @@ START
  check(measuring===null,'Failed reads after the wait limit must clear measuring.');
  check(line.dataset.state==='Failed' && parts.reason.textContent==='HTTP 502',
   'Failed reads after the wait limit must show Failed and HTTP 502.');
+ check(!measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
+  'The timeout notice must show beside the read failure.');
  failedReads=false;measureState='current';await pageRefresh.refresh();
  check(line.dataset.state==='Live','A good read after failed reads must return to Live.');
  stalled=true;const pendingRead=pageRefresh.refresh();
@@ -339,6 +283,22 @@ START
 """
         self.assert_status_scenario(scenario)
 
+    def test_a_refused_first_measure_shows_failed_without_data(self) -> None:
+        self.assert_status_scenario(r"""
+function render(){}
+function renderCards(){}
+const fetch=async(url)=>url==='measure'
+ ? {ok:false,status:503,json:async()=>({reason:'Measure refused.'})}
+ : {ok:false,status:404};
+START
+(async()=>{
+ await pageRefresh.refresh();
+ if(line.dataset.state!=='Failed' || parts.reason.textContent!=='Measure refused.' || !measureIssue.hidden)
+  throw new Error('A refused first measure must show its reason in the Failed status.');
+ console.log('PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+
     def test_the_first_measure_keeps_its_data_age_when_the_next_read_stalls(self) -> None:
         self.assert_status_scenario(r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
@@ -348,7 +308,7 @@ function render(){}
 function renderCards(){}
 const fetch=async(url)=>{
  if(url==='measure') return {ok:true,json:async()=>({state:'started',target:1})};
- if(stalled) return new Promise(resolve=>pendingReads.push(resolve));
+ if(stalled) return new Promise(()=>pendingReads.push(url.split('?')[0]));
  return {ok:true,json:async()=>({measured_at:fileAt,render_seconds:.03,drives:[]})};
 };
 START
@@ -359,7 +319,7 @@ START
  check(!parts.age.hidden && parts.age.textContent==='70 min ago',
   'The first measure must record the old data age.');
  stalled=true;void pageRefresh.refresh();
- check(pendingReads.length===2,'The Disks and Builds reads must have separate pending resolvers.');
+ check(pendingReads.length===1 && pendingReads[0]===DATA_FILE,'Only the Disks data read must be pending.');
  const ageLimit=JSON.parse(line.dataset.statusOptions).ageLimit;
  now+=(Math.max(settings.wait_seconds,ageLimit)+1)*1000;pageRefresh.changed();
  check(line.dataset.state==='Late' && parts.reason.textContent==='The feed has stopped.',
@@ -400,11 +360,11 @@ START
  now+=1000;generation++;fileAt=now/1000;await pageRefresh.refresh();
  check(!measureButton.disabled && line.dataset.state==='Live','New data enables the button.');
  failed=true;await measureButton.press();
- check(!measureButton.disabled && line.dataset.state==='Failed' && parts.reason.textContent==='Launch failed.',
+ check(!measureButton.disabled && !measureIssue.hidden && measureIssue.textContent==='Launch failed.' && line.dataset.state==='Live',
   'A failed press shows its reason and enables the button.');
  failed=false;await measureButton.press();
  advanceTime((settings.wait_seconds+1)*1000);
- check(!measureButton.disabled && line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+ check(!measureButton.disabled && !measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
   'The wait limit enables the button and shows the failure.');
  if(failures.length) throw new Error(failures.join('\n'));
  console.log('PASS');
@@ -414,8 +374,8 @@ START
     def test_a_press_owns_its_request_and_its_deadline_despite_stalled_or_older_reads(self) -> None:
         self.assert_status_scenario(r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
-let generation=0,fileAt=now/1000,stallBuilds=false,stallData=false,missing=false,stallPost=false;
-const pendingBuilds=[],pendingData=[],pendingPosts=[],posts=[];
+let generation=0,fileAt=now/1000,stallData=false,missing=false,stallPost=false;
+const pendingData=[],pendingPosts=[],posts=[];
 const flush=async()=>{for(let i=0;i<20;i++) await Promise.resolve();};
 const payload=()=>({generation,measured_at:fileAt,render_seconds:.03,drives:[]});
 const dataReply=()=>({ok:true,json:async()=>payload()});
@@ -433,10 +393,6 @@ const fetch=async(url,options)=>{
   }
   return {ok:true,json:async()=>({state:'current',target:generation})};
  }
- if(url.startsWith(settings.builds_data)){
-  if(stallBuilds) return new Promise(resolve=>pendingBuilds.push(resolve));
-  return dataReply();
- }
  if(missing) return {ok:false,status:404};
  if(stallData) return new Promise(resolve=>pendingData.push(resolve));
  return dataReply();
@@ -445,16 +401,16 @@ const forced=()=>posts.filter(body=>body==='force=1').length;
 START
 (async()=>{
  await pageRefresh.refresh();
- stallBuilds=true;const older=pageRefresh.refresh();
- check(pendingBuilds.length===1,'The older refresh must wait for Builds.');
+ stallData=true;const older=pageRefresh.refresh();
+ check(pendingData.length===1,'The older refresh must wait for Disks data.');
  stallPost=true;const press=measureButton.press();
- check(forced()===1 && pendingPosts.length===1,'The press must POST before the Builds read ends.');
+ check(forced()===1 && pendingPosts.length===1,'The press must POST before the older data read ends.');
  check(measuring.since===now/1000 && measuring.target===null,'The press must record its start before the target arrives.');
- pendingBuilds.shift()(dataReply());await older;
+ pendingData.shift()(dataReply());await older;
  check(measureButton.disabled && measuring!==null,'The older refresh must not enable the button.');
  await measureButton.press();
  check(forced()===1,'A second press must not send another POST.');
- stallBuilds=false;stallPost=false;pendingPosts.shift()(postReply());await press;
+ stallData=false;stallPost=false;pendingPosts.shift()(postReply());await press;
  now+=1000;generation++;fileAt=now/1000;await pageRefresh.refresh();
  check(!measureButton.disabled && measuring===null,'New data must end the measure state.');
 
@@ -470,10 +426,11 @@ START
  check(forced()===3 && pendingData.length===1,'The next read must remain pending after the forced POST.');
  advanceTime(settings.wait_seconds*1000);
  check(measuring===null && !measureButton.disabled,'The timer must end the measure state at the wait limit.');
- check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+ check(!measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
   'The timer must show the failure before the stalled read ends.');
  stallData=false;pendingData.shift()(dataReply());await timedPress;
- check(!measureButton.disabled && line.dataset.state==='Failed','The abandoned read must not replace the timeout failure.');
+ check(!measureButton.disabled && !measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
+  'The abandoned read must keep the timeout failure.');
  if(failures.length) throw new Error(failures.join('\n'));
  console.log('PASS');
 })().catch(error=>{console.error(error);process.exitCode=1;});
@@ -508,7 +465,7 @@ START
  pendingPosts.shift()({ok:false,status:503,json:async()=>({reason:'Forced launch failed.'})});
  await failedPress;
  check(measuring===null && !measureButton.disabled,'A failed POST must clear the press after a poll.');
- check(line.dataset.state==='Failed' && parts.reason.textContent==='Forced launch failed.',
+ check(!measureIssue.hidden && measureIssue.textContent==='Forced launch failed.',
   'The failed POST must show its reason after a poll.');
 
  const answeredPress=measureButton.press(),before=fileAt;
@@ -541,12 +498,11 @@ START
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """)
 
-    def test_the_target_ends_a_press_at_the_reply_or_data_arrival_without_waiting_for_builds(self) -> None:
+    def test_the_target_ends_a_press_at_the_reply_or_data_arrival(self) -> None:
         self.assert_status_scenario(r"""
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
-let generation=0,stallBuilds=false,omitGeneration=true;
-const pendingPosts=[],pendingBuilds=[];
-const flush=async()=>{for(let i=0;i<20;i++) await Promise.resolve();};
+let generation=0,omitGeneration=true;
+const pendingPosts=[];
 const payload=()=>({...(omitGeneration ? {} : {generation}),measured_at:100-generation,render_seconds:.03,drives:[]});
 const reply=()=>({ok:true,json:async()=>payload()});
 function render(){}
@@ -556,8 +512,6 @@ const fetch=async(url,options)=>{
   if(options.body==='force=1') return new Promise(resolve=>pendingPosts.push(resolve));
   return {ok:true,json:async()=>({state:'current',target:generation})};
  }
- if(url.startsWith(settings.builds_data) && stallBuilds)
-  return new Promise(resolve=>pendingBuilds.push(resolve));
  return reply();
 };
 START
@@ -576,14 +530,11 @@ START
  const press=measureButton.press();
  pendingPosts.shift()({ok:true,json:async()=>({state:'running',target:2})});
  await press;
- generation=1;stallBuilds=true;const older=pageRefresh.refresh();await flush();
+ generation=1;await pageRefresh.refresh();
  check(measuring!==null && measureButton.disabled,'Older data received after the reply must retain the press.');
- generation=3;const newer=pageRefresh.refresh(true);await flush();
- check(pendingBuilds.length===2,'Both Builds reads must remain pending.');
+ generation=3;await pageRefresh.refresh(true);
  check(measuring===null && !measureButton.disabled && line.dataset.state==='Live',
-  'A later generation must end the press before the Builds read ends.');
- stallBuilds=false;pendingBuilds.splice(0).forEach(resolve=>resolve(reply()));
- await Promise.all([older,newer]);
+  'A later generation must end the press.');
  if(failures.length) throw new Error(failures.join('\n'));
  console.log('PASS');
 })().catch(error=>{console.error(error);process.exitCode=1;});
@@ -602,7 +553,7 @@ START
  check(data===null && measuring!==null && measureButton.disabled,'The first measure must start without earlier data.');
  advanceTime(settings.wait_seconds*1000);
  check(measuring===null && !measureButton.disabled,'The timer must clear the first measure at the wait limit.');
- check(line.dataset.state==='Failed' && parts.reason.textContent==='The measure did not finish.',
+ check(!measureIssue.hidden && measureIssue.textContent==='The measure did not finish.',
   'The timer must report failure without earlier data.');
  if(failures.length) throw new Error(failures.join('\n'));
  console.log('PASS');
@@ -619,7 +570,9 @@ const settingsText=SETTINGS;
 const measureButton={disabled:false,addEventListener:(key,run)=>{
  measureButton.press=()=>measureButton.disabled ? undefined : run({currentTarget:measureButton});
 }};
-document.getElementById=key=>key==='measure-now' ? measureButton : {textContent:JSON.stringify(settingsText)};
+const measureIssue={hidden:true,textContent:''};
+const elements={'measure-now':measureButton,'measure-failure':measureIssue};
+document.getElementById=key=>elements[key] || {textContent:JSON.stringify(settingsText)};
 const localStorage={getItem:()=>null};
 """.replace("SETTINGS", json.dumps(SETTINGS))
         functions = page[page.index("const GIB ="):page.index("const updateSessions =")]
@@ -627,8 +580,8 @@ const localStorage={getItem:()=>null};
         assert start is not None
         scenario = scenario.replace("START", start[0])
         node = shutil.which("node") or str(next(Path("/nix/store").glob("*nodejs*/bin/node")))
-        done = subprocess.run([node, "--unhandled-rejections=strict", "-e",
-                               environment + functions + page_frame.REFRESH_SCRIPT + scenario],
+        script = environment + functions + page_frame.REFRESH_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + scenario
+        done = subprocess.run([node, "--unhandled-rejections=strict", "-"], input=script,
                               capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "PASS"), done.stderr)
 
@@ -641,31 +594,9 @@ const localStorage={getItem:()=>null};
             _ = disks_page.publish(Path(directory), {**SETTINGS, "poll_seconds": 6})
             self.assertNotEqual(page.stat().st_mtime, 0)
 
-    def test_the_slots_card_shows_each_group_and_each_slot_with_its_use(self) -> None:
-        now = 1000 * 86400
-        report = SLOTS
-        def cells(opened: list[str]) -> tuple[str, list[str]]:
-            html = cast(str, self.run_page(f"slotsHtml({json.dumps(report)}, {KEEP}, {now}, new Set({json.dumps(opened)}))"))
-            rows = cast(list[str], re.findall(r"<tr[^>]*>(.*?)</tr>", re.sub(r'<div class="narrow">.*?</div>', "", html)))
-            return html, ["|".join(part for part in re.split(r"<[^>]+>", row) if part) for row in rows[1:]]
-
-        # An open group lists the numbered copies for that repository and unit.
-        self.assertEqual(cells([])[1], ["hana/report|2 slots · 70 GiB", "&lt;b&gt;/other|1 slot · —"])
-        html, shown = cells(["hana/report", "<b>/other"])
-        self.assertEqual(shown, ["hana/report|2 slots · 70 GiB", "1|70 GiB|now|report integrate|builds",
-                                 "2|&lt; 256 MiB|9 days ago|review", "&lt;b&gt;/other|1 slot · —",
-                                 "1|—|—|—"])
-        self.assertEqual(re.findall(r'aria-expanded="(\w+)" data-group="([^"]*)"', cells(["hana/report"])[0]),
-                         [("true", "hana/report"), ("false", "&lt;b&gt;/other")])
-        self.assertEqual(re.findall(r'<div class="narrow">(.*?)</div>', html), [
-            '<span class="tag run">report integrate</span><span class="dim">builds</span>', '<span class="tag go">review</span>'])
-        empty = cast(str, self.run_page(f"slotsHtml({json.dumps({'root': '/s', 'groups': []})}, {KEEP}, {now}, new Set())"))
-        self.assertIn("No slots yet.", empty)
-
     def test_the_sessions_card_shows_every_session_and_a_size_filter_joins_the_smaller_ones(self) -> None:
         # The user, 11-16: "sessions should show all sessions and have a filter that limits the minimum size - like disks".
-        self.assertRegex(self.page_html(), r'id="cards">\s*<section[^>]+id="slots"[^>]*></section>\s*'
-                         + r'<section[^>]+id="sessions"[^>]*></section>')
+        self.assertRegex(self.page_html(), r'id="cards">\s*<section[^>]+id="sessions"[^>]*></section>')
 
         def cells(limit: int) -> list[str]:
             html = cast(str, self.run_page(f"sessionRows({json.dumps(SESSIONS)}, {KEEP}, {limit})"))
@@ -696,7 +627,7 @@ const localStorage={getItem:()=>null};
         held: list[dict[str, object]] = [
             {"name": f"scratch/phase-review-{index:02d}/long-folder-name-for-the-layout-check",
              "task": "phase:disksdesign/1", "ended": index % 2 == 0} for index in range(40)]
-        measure = json.dumps({"state": "current", "slots": SLOTS, "sessions": {"root": "/session", "sessions": [
+        measure = json.dumps({"state": "current", "sessions": {"root": "/session", "sessions": [
             session("report", 28 * GIB, "running", held), session("other", 9 * GIB, "ended")]}}).encode()
         reading = json.dumps({"measured_at": NOW, "render_seconds": 0.01, "keep_bytes": KEEP, "drives": []}).encode()
         probe = """
@@ -712,11 +643,9 @@ async function checkSessionLayout() {
     const cell = rows[0].querySelector('.held');
     if (innerWidth === 1440) {
       const cards = bounds(document.querySelector('#cards'));
-      const slots = bounds(document.querySelector('#slots'));
       const sessions = bounds(document.querySelector('#sessions'));
-      check(slots.height > 0 && slots.bottom <= sessions.top, 'Slots is above Sessions.');
-      check([slots, sessions].every(card => close(card.left, cards.left) && close(card.right, cards.right)),
-            'Both cards use the full width.');
+      check(close(sessions.left, cards.left) && close(sessions.right, cards.right),
+            'The Sessions card uses the full width.');
       for (const row of rows) {
         const height = Math.max(...[...row.cells].map(cell => {
           const style = getComputedStyle(cell);
@@ -828,11 +757,11 @@ async function checkSessionLayout() {
                         profile = Path(directory) / f"profile-{width}"
                         profile.mkdir()
                         _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
-                        done = subprocess.run(
+                        done = run_process_group(
                             ["firefox", "--headless", "--no-remote", "--profile", str(profile),
                              "--window-size", f"{width},900", "--screenshot", str(profile / "disks.png"),
                              f"http://127.0.0.1:{server.server_port}/"],
-                            capture_output=True, text=True, timeout=45, check=False)
+                            timeout=45)
                         self.assertEqual(done.returncode, 0, done.stderr)
                         self.assertEqual(results, [{"width": width, "failures": []}])
             finally:
@@ -861,77 +790,19 @@ async function checkSessionLayout() {
         self.assertEqual(result, {"writes": 1, "sameSlider": True, "all": [5, "any size"], "top": [2, "28 GiB"],
                                   "after": [2, "7.0 GiB"], "small": [2, "any size", True], "empty": True})
 
-    def test_a_slot_shows_the_builds_tooltip_without_a_title_field(self) -> None:
-        row = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": NOW - 60,
-               "key": "run", "used": 2.0, "slot_folder": "hana/report/1", "slot_machine": "natedev",
-               "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
-        builds = {"read_at": NOW, "walk": [row], "waiters": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE}
-        body = cast(str, self.run_drive("""
-            Date.now = () => input.now * 1000;
-            slotReport = input.slots;
-            builds = input.builds;
-            result = tipFor("slot:hana/report/1");
-        """, extra={"slots": SLOTS, "now": NOW, "builds": builds}))
-        self.assertIn("report · integrate", body)
-
-    def test_each_row_and_card_title_has_a_tooltip_and_a_slot_in_use_shows_its_builds_step(self) -> None:
-        # The user, 11-16: "every row should contain a tooltip that for slots should be the same tooltip that is shown in
-        # the build queue so they share code and data".
-        now = NOW
-        step = {"name": "report integrate", "unit": "report", "showrunner": "builds", "started_at": now - 600, "used": 2.0,
-                "slot_folder": "hana/report/1", "pid": 4242, "progress": {"kind": "NoProgress", "reason": "none"}}
-        builds = {"read_at": now, "waiters": [], "swap_by": [], "ram": RAM_FIXTURE, "swap": SWAP_FIXTURE,
-                  "walk": [{**step, "key": "mac-run", "slot_machine": "mac"}, {**step, "key": "run", "slot_machine": "natedev"},
-                           {**step, "key": "free-run", "slot_folder": "hana/report/2", "slot_machine": "natedev"}]}
+    def test_session_rows_and_title_have_tooltips(self) -> None:
         result = cast(dict[str, str], self.run_drive("""
-            Date.now = () => input.now * 1000;
             data = {keep_bytes: KEEP};
-            slotReport = input.slots;
             sessionReport = input.sessions;
-            builds = input.builds;
             sessionLimit = 5 * GIB;
             const text = html => html.replace(/<[/](dt|dd)>/g, "|").replace(/<[^>]+>/g, "");
-            result = {run: tipFor("slot:hana/report/1"), shared: stepTip.tooltipHtml("row:run", builds),
-                      review: text(tipFor("slot:hana/report/2")), group: text(tipFor("group:hana/report")),
-                      slots: text(tipFor("about:slots")),
-                      sessions: text(tipFor("about:sessions")), session: text(tipFor("session:fps")),
-                      smaller: text(tipFor("smaller:sessions")), gone: tipFor("slot:gone")};
-            const usedBy = () => slotsHtml(slotReport, KEEP, input.now, new Set(["hana/report"]), slotStep).match(/<td class="use wide">(.*?)<[/]td>/)[1];
-            result.runName = usedBy();
-            // A step that waits in a held slot names the slot and gives its tooltip, as the Builds page waiting row does.
-            builds.walk = builds.walk.filter(row => row.key !== "run");
-            builds.waiters = [{...input.wait, key: "wait", slot_folder: "hana/report/1", slot_machine: "natedev"}];
-            result.wait = [tipFor("slot:hana/report/1") === stepTip.tooltipHtml("wait:wait", builds), usedBy()];
-            // Builds data older than the configured age gives the Disks rows and the lease's name.
-            builds.read_at = input.now - 31;
-            result.stale = text(tipFor("slot:hana/report/1"));
-            result.staleName = usedBy();
-            // Builds data with no read time is not current.
-            delete builds.read_at;
-            result.noTime = usedBy();
-        """, extra={"slots": SLOTS, "sessions": SESSIONS, "builds": builds,
-                    "now": now, "wait": {"name": "report test named", "unit": "report", "showrunner": "builds", "pid": 4343,
-                                         "since": now - 60, "need": 3.0, "reason": "its turn", "fits": False, "why": "turn",
-                                         "place": 1}}))
-        self.assertEqual(result["run"], result["shared"])
-        # The builds showrunner, 11-16: "map the Disks "Used by" lease words through the same build_steps names that the
-        # Builds page uses, so one step has one name on both pages."
-        self.assertEqual(result["runName"], '<span class="tag run">report integrate</span><span class="dim">builds</span>')
-        self.assertEqual(result["wait"], [True, '<span class="tag run">report test named</span><span class="dim">builds</span>'])
-        self.assertIn("report · integrate", result["run"])
-        self.assertEqual(result["review"], "|".join([
-            "2", "review", "Repository", "hana/report", "Size", "&lt; 256 MiB", "Last used", "9 days ago",
-            "The nightly sweep lists this folder after 2 days without use.", "",
-        ]))
-        self.assertEqual(result["group"], "hana/report|2 slots|Size|70 GiB|In use|1 of 2|Limit|not set|")
-        self.assertIn("The nightly sweep lists a free copy for review after 2 days without use.", result["slots"])
+            result = {sessions: text(tipFor("about:sessions")), session: text(tipFor("session:fps")),
+                      smaller: text(tipFor("smaller:sessions")), gone: tipFor("session:gone")};
+        """, extra={"sessions": SESSIONS}))
         self.assertIn("A session folder holds the temporary files of one Claude session", result["sessions"])
         self.assertEqual(result["session"], "fps|running|Size|28 GiB|run|held · Task phase:fps/3|center-shot|unsaved work · Task phase:fps/3|")
         self.assertEqual(result["smaller"], "3 smaller sessions|1.0 GiB|Each is below 5.0 GiB. Move the size filter to the left to show them.|")
         self.assertEqual(result["gone"], "")
-        self.assertTrue(result["stale"].startswith("1|in use|Repository|hana/report|"), result["stale"])
-        self.assertEqual(result["staleName"], result["runName"])
-        self.assertEqual(result["noTime"], result["runName"])
 
     def test_a_measure_starts_only_when_the_sizes_are_old_and_no_measure_runs(self) -> None:
         launches: list[str] = []
@@ -1044,7 +915,7 @@ raise SystemExit(measure.measure(settings(folder, str(folder)), floors=no_floors
         child_code = """
 import sys
 from pathlib import Path
-from scripts.disks import disks_page, slots
+from scripts.disks import disks_page
 from scripts.lib import file_lock
 folder, descriptor = Path(sys.argv[1]), int(sys.argv[2])
 assert sys.stdin.buffer.read(1) == b'x'
@@ -1149,7 +1020,7 @@ with file_lock.exclusive(folder / disks_page.COORD_FILE):
         """))
         self.assertEqual(result, {"writes": 1, "sameSlider": True, "output": "60 GiB", "rows": [4, 9, 7]})
 
-    def test_open_rows_stay_open_across_a_reload_until_their_folder_or_repository_is_gone(self) -> None:
+    def test_open_rows_stay_open_across_a_reload_until_their_folder_is_gone(self) -> None:
         # The user, 11-16: "disks should start out collapsed and should remember it's collapse points as long as they are
         # still valid between data updates and page refreshes".
         load = """
@@ -1161,18 +1032,16 @@ with file_lock.exclusive(folder / disks_page.COORD_FILE):
         first = cast(dict[str, object], self.run_drive(load + """
             const closed = shown();
             card.querySelector("tbody").fire("click", {target: {closest: () => ({dataset: {path: "/build/cargo"}})}});
-            toggleOpen(opened.groups, "hana");
             result = {closed, open: shown(), storage: localStorage.getItem(OPEN_KEY)};
         """))
         self.assertEqual((first["closed"], first["open"]), ([], ["/build/cargo"]))
         second = cast(dict[str, object], self.run_drive(load + """
             const reloaded = shown();
-            slotReport = {groups: [{repository: "cargo-liner", slots: []}]};
             data.drives[0].tree = {...input.tree, children: input.tree.children.filter(child => child.name !== "cargo")};
             forgetGone();
             result = {reloaded, storage: JSON.parse(localStorage.getItem(OPEN_KEY))};
         """, storage=cast(str, first["storage"])))
-        self.assertEqual(second, {"reloaded": ["/build/cargo"], "storage": {"folders": [], "groups": []}})
+        self.assertEqual(second, {"reloaded": ["/build/cargo"], "storage": {"folders": []}})
         # A joined name, a folder named "|other", and a gone folder on a drive inside a drive with no tree.
         drives = [{"mount": "/", "tree": None},
                   {"mount": "/build", "tree": folder("/build", 2 * GIB, [folder("cargo/project", GIB), folder("|other", GIB)])}]

@@ -211,7 +211,7 @@ def run() -> None:
     """Read the current limit and check all recorded producer folders."""
     config = conf.read("staff")
     limit_mb = config.value("producer_folder_limit_mb", conf.positive_whole)
-    root = Path(config.text("PRODUCER_FOLDER_ROOT")).expanduser().absolute()
+    root = Path(config.text("producer_folder_root")).expanduser().absolute()
     directory = schedule_directory("job")
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "folder-size.lock").open("a") as lock:

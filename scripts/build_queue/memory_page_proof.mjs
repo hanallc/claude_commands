@@ -13,13 +13,21 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
+// Use --ci-services with a private memory.json copy for the CI service proof.
+// Use --outside-queue after the output folder to check the outside command table.
+// Add a published page from main to save the before image.
 // Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
 // Use the fourth argument to select the older page.
 // Use --guest-tip after the output folder for the guest row tooltip screenshot.
-// Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
+// Use --standing-orders to check the current page with real-shape rows. A fourth argument adds a rendered baseline.
+
+// Use --rowask to capture the rows and the New item dialog.
+// Use <output-folder> --tip-design for the six dark tooltip captures.
 // Use <output-folder> --aws-cost-shots to capture the approved AWS costs example.
 // Add a folder with live memory.json, report.json, and memory_live.html for the Day images.
 // Add --awscosts as the fourth argument for the AWS costs proof and images.
+// Use --kill-shot or --kill-control as the third argument for the Kill fixture.
+// Use --kill-both-shot with an output PNG path for the full Builds page.
 // Set SWAP_BEFORE_PAGE to compare the swap tooltip with the previous page.
 import assert from 'node:assert/strict';
 import {accessSync, constants, statSync} from 'node:fs';
@@ -31,6 +39,8 @@ import {inflateSync} from 'node:zlib';
 import {delimiter, join, dirname, resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {fileURLToPath} from 'node:url';
+
+const memoryTenths = text => text.startsWith("<") ? 1 : Math.round(parseFloat(text) * 10);
 
 function chromeExecutable() {
   if (process.env.CHROME) return process.env.CHROME;
@@ -56,18 +66,26 @@ const args = process.argv.slice(2);
 const gateMode = args[0] === '--gate';
 if (gateMode) args.shift();
 const [callerFolder, ...comparisonArgs] = args;
+const tipDesignComparison = !gateMode && comparisonArgs[0] === '--tip-design';
 const awsCostShots = !gateMode && comparisonArgs[0] === '--aws-cost-shots';
 const liveAwsCostSource = awsCostShots ? comparisonArgs[1] : undefined;
 const approvedAwsCostShot = awsCostShots && !liveAwsCostSource;
-const [previousPage, comparison] = awsCostShots ? [] : comparisonArgs;
+const [previousPage, comparison] = tipDesignComparison || awsCostShots ? [] : comparisonArgs;
 const requestedShot = gateMode ? undefined : process.env.MEMORY_PAGE_SHOT;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
+const ciServicesProof = previousPage === '--ci-services';
+const outsideQueueProof = previousPage === '--outside-queue';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
 const guestTipProof = previousPage === '--guest-tip';
 const standingProof = previousPage === '--standing-orders';
-const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof || standingProof;
+const killShot = previousPage === '--kill-shot';
+const killControlProof = previousPage === '--kill-control';
+const killBothShot = previousPage === '--kill-both-shot';
+const killProof = killShot || killControlProof || killBothShot;
+const focusedProof = verifyCallProof || buildToolsProof || ciServicesProof || queueDragProof || queueRowsProof || guestTipProof
+  || standingProof || outsideQueueProof || killProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
 const runningHeaders = ['Stage','Done','Dur','Verify','Step','Pid','Machine','vCPU','Tokens','Moved'];
@@ -169,7 +187,8 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
       await writeFile(join(shotFolder, `real-${width}.png`), Buffer.from(shot.data,'base64'));
     }
     const kinds = new Set(shown.rows.map(row => row.kind));
-    assert.ok(kinds.has('tools') && kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
+    assert.ok(kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
+    if (path !== 'before.html') assert.ok(!kinds.has('tools'), `Running shows a Build tools row at ${width} px.`);
     assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
       `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
     if (path === 'memory_live.html') {
@@ -268,14 +287,14 @@ const folder = callerFolder ? resolve(callerFolder) : await mkdtemp(join(tmpdir(
 try {
   await mkdir(folder, {recursive:true});
   const fixtureOutput = liveAwsCostSource ? '' : execFileSync(process.env.PYTHON || 'python3', ['-c',
-    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE, aws_cost_fixture; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); (Path(sys.argv[1]) / "aws_cost_fixture.json").write_text(json.dumps(aws_cost_fixture()))' + (focusedProof || awsCostShots ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
+    'from pathlib import Path; import json,sys; from scripts.build_queue.test_memory_feed import write_browser_fixture; write_browser_fixture(Path(sys.argv[1])); from scripts.build_queue.test_memory_hover import RAM_FIXTURE, aws_cost_fixture; (Path(sys.argv[1]) / "legend_ram.json").write_text(json.dumps(RAM_FIXTURE)); (Path(sys.argv[1]) / "aws_cost_fixture.json").write_text(json.dumps(aws_cost_fixture())); from scripts.review_links import new_item_dialog, page_frame; from scripts.production import staff; page = Path(sys.argv[1]) / "memory_live.html"; page.write_bytes(page_frame.with_owner(page.read_bytes(), "builds", page_frame.NoShownOwner(), staff.StaffSnapshot(()), new_item_dialog.render))' + (focusedProof || awsCostShots ? '' : '; from scripts.lib import conf; print(Path(conf.read("build_folders").text("roots.system")).expanduser())'), folder],
     {cwd:repo, env:{...process.env, HERDR_BIN:'/nonexistent/herdr'}, encoding:'utf8'}).trim();
   const systemTemporaryRoot = focusedProof || awsCostShots ? tmpdir() : fixtureOutput;
   const page = await readFile(join(liveAwsCostSource ?? folder, 'memory_live.html'));
-  const beforePath = queueRowsProof || standingProof ? comparison : focusedProof ? null : previousPage;
+  const beforePath = queueRowsProof || standingProof || outsideQueueProof ? comparison : focusedProof ? null : previousPage;
   const beforePage = beforePath ? (await readFile(beforePath, 'utf8'))
     .replace('__MEMORY_FEED_INTERVAL_SECONDS__', '0.125') : null;
-  const swapBeforePage = process.env.SWAP_BEFORE_PAGE
+  const swapBeforePage = !gateMode && process.env.SWAP_BEFORE_PAGE
     ? (await readFile(process.env.SWAP_BEFORE_PAGE, 'utf8')).replace('__MEMORY_FEED_INTERVAL_SECONDS__','0.125') : null;
   const queuedComparison = comparison === '--queued';
   const consoleComparison = comparison === '--console';
@@ -287,6 +306,7 @@ try {
   const waitTipComparison = comparison === '--wait-tip';
   const macrouteComparison = comparison === '--macroute';
   const headcountComparison = comparison === '--headcount';
+  const rowAskComparison = comparison === '--rowask';
   const awsCostsComparison = comparison === '--awscosts';
   const comparisonImages = Boolean(comparison || beforePage || swapBeforePage || requestedShot);
   const readings = liveAwsCostSource
@@ -417,6 +437,42 @@ try {
 
   let servedReading = base;
   let currentFixture = base;
+  const killTime = killProof ? execFileSync(process.env.PYTHON || 'python3', ['-c', [
+    'from datetime import datetime',
+    'from scripts.lib.user_zone import user_zone',
+    'print(datetime.fromisoformat("2026-11-19T00:41:00+00:00").astimezone(user_zone()).strftime("%H:%M %Z"))',
+  ].join('\n')], {cwd:repo, encoding:'utf8'}).trim() : '';
+  const killMessage = (step, pid) => `nate killed your run "${step}" (pid ${pid}) from the Builds page at ${killTime}.`;
+  const killWarning = name => `The run stops at once and its work is lost. This message goes to ${name}:`;
+  const killWordsLabel = 'Your own words, added to the message (optional)';
+  const killPath = '/console/build-kill';
+  const killRef = 'a'.repeat(64);
+  const killOffer = {handle:'b'.repeat(64),pid:2712994,started_by:'impl3, a worker of unit-board',
+    recipient_name:'impl3',step:'check',
+    message:killMessage('check', 2712994)};
+  const researchRef = 'c'.repeat(64);
+  const researchOffer = {handle:'e'.repeat(64),pid:2637799,started_by:'test, a worker of research',
+    recipient_name:'test',step:'nextest',
+    message:killMessage('nextest', 2637799)};
+  const killedResult = {reference:killRef,step:'check',pid:killOffer.pid,stop:'Stopped',delivery:'Message sent',
+    time:killTime,recipient_role:'worker',recipient_name:'impl3'};
+  const killToken = 'fixture-token';
+  const killRefreshSeconds = 17;
+  const stoppingResult = {...killedResult,stop:'Stopping',delivery:''};
+  const outsideRows = readings.outside_queue?.outside_queue ?? [];
+  const outsideRow = outsideRows.find(row => row.pid === 8102);
+  const outsideRef = outsideRow?.kill_ref;
+  const outsideOffers = Object.fromEntries(outsideRows.map(row => [row.kill_ref, {
+    handle:'d'.repeat(64), pid:row.pid, started_by:row.pid === 8102 ? 'test, a worker of queue' : 'builds, a showrunner',
+    recipient_name:row.owner, step:row.command,
+    message:killMessage(row.command, row.pid),
+  }]));
+  const outsideStopped = {reference:outsideRef,step:outsideRow?.command,pid:outsideRow?.pid,
+    stop:'Stopped',delivery:'Message sent',time:killTime,recipient_role:'worker',recipient_name:outsideRow?.owner};
+  let killPost;
+  let killPostReply;
+  let killResults = [];
+  let submittedItem;
   let queueFixture = null;
   let unnamedPlace = -1;
   let confirmedQueueLine = null;
@@ -432,6 +488,26 @@ try {
     return {revision:reading.move_revision, members, kept_runs:[]};
   };
   const server = createServer(async (req, res) => {
+    if (req.url.split('?', 1)[0] === '/console/review/new-item') {
+      res.writeHead(200, {'Content-Type':'application/json'});
+      if (req.method === 'POST') {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        const payload = JSON.parse(Buffer.concat(chunks));
+        if (payload.page_capture) {
+          server.emit('page-capture', payload.page_capture);
+          res.end('{}');
+        } else {
+          submittedItem = payload;
+          res.end(JSON.stringify({id:'Q1'}));
+        }
+      } else {
+        res.end(JSON.stringify({token:'proof-token',recipients:[
+          {id:'fixture-hana',name:'hana',proposal:true}, {id:'fixture-builds',name:'builds',proposal:true}
+        ]}));
+      }
+      return;
+    }
     if (req.url === '/console/builds/queue-move') {
       const json = (status, result) => {
         res.writeHead(status, {'Content-Type':'application/json'});
@@ -475,6 +551,40 @@ try {
       queueFixture.move_revision += '1';
       confirmedQueueLine = line();
       return json(200, {line:confirmedQueueLine});
+    }
+    if (req.url === killPath) {
+      res.setHeader('Content-Type','application/json');
+      if (!killProof) {
+        res.writeHead(403).end('{}');
+      } else if (req.method === 'POST') {
+        if (killShot || killBothShot) {
+          res.writeHead(405).end('{}');
+          return;
+        }
+        const fields = [];
+        req.setEncoding('utf8');
+        req.on('data', part => fields.push(part));
+        req.on('end', () => {
+          killPost = Object.fromEntries(new URLSearchParams(fields.join('')));
+          killPostReply = (reason, accepted) => {
+            if (reason) {
+              res.writeHead(409).end(JSON.stringify({reason}));
+              return;
+            }
+            const result = accepted ?? (killPost.reference === outsideRef
+              ? {...outsideStopped,stop:'Stopping',delivery:''} : stoppingResult);
+            killResults = [result];
+            res.end(JSON.stringify({result}));
+          };
+          server.emit('kill-post');
+        });
+      } else {
+        const offers = {[killRef]:killOffer, ...(killShot ? {} : outsideOffers)};
+        if (killBothShot) offers[researchRef] = researchOffer;
+        for (const result of killResults) if (result.stop !== 'Stop unconfirmed') delete offers[result.reference];
+        res.end(JSON.stringify({token:killToken,offers,results:killResults,refresh_seconds:killRefreshSeconds}));
+      }
+      return;
     }
     const isData = req.url.startsWith('/memory.json'), isReport = req.url.startsWith('/report.json');
     res.writeHead(200, {'Content-Type':isData || isReport ? 'application/json' : 'text/html; charset=utf-8'});
@@ -567,8 +677,9 @@ try {
           source:'window.proofSetInterval = window.setInterval; window.setInterval = () => 0;'
             + 'Date.now = () => ' + clockTime + ';'});
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-        await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
-        const navigate = async path => {
+        const desktopWidth = gateMode ? 1400 : 1600;
+        await call('Emulation.setDeviceMetricsOverride', {width:desktopWidth,height:1200,deviceScaleFactor:1,mobile:false});
+        const navigate = async (path, freezeRender = true) => {
           currentFixture = servedReading;
           const loaded = new Promise((resolve, reject) => events.set(`${sessionId}:Page.loadEventFired`, {resolve,reject}));
           await Promise.all([loaded, call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/${path}`})]);
@@ -581,7 +692,7 @@ try {
           window.proofRun = index => latest.walk[index].key;
           window.renderReading = render;
           window.proofData = structuredClone(latest);
-          window.render = () => {};
+          if (${freezeRender}) window.render = () => {};
           await document.fonts.ready;
           const legend = document.querySelector('.legend-box');
           if (${JSON.stringify(path)} === 'memory_live.html' && legend.open) throw new Error('The legend starts open.');
@@ -598,10 +709,401 @@ try {
           console.log(JSON.stringify({shots,output:folder}));
           break browserProof;
         }
+        if (killProof) {
+          const source = structuredClone(base.walk.find(row => row.queued && !row.ci));
+          source.progress = {kind:'RowProgress',phase:'testing',done:13,total:200,percent:6.5,unit:'tests'};
+          const local = {...source,key:'kill-fixture',machine:'natedev',pid:killOffer.pid,
+            name:'unit-board check',unit:'unit-board',kill_ref:killRef,started_at:fixtureTime - 660};
+          const other = {...source,key:'research-fixture',machine:'natedev',pid:researchOffer.pid,
+            name:'research nextest',unit:'research',kill_ref:researchRef,started_at:fixtureTime - 1200};
+          servedReading = {...(killBothShot ? readings.outside_queue : base),
+            psi:{some:0,full:0}, pressure:'none',
+            walk:[other,local], waiters:[], queued_priority_units:[], outside_queue:killShot ? [] : outsideRows};
+          await call('Emulation.setDeviceMetricsOverride',{width:1600,height:1200,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          if (killBothShot) {
+            const width = 1600;
+            const height = await evaluate(`(async () => {
+              document.querySelector('.legend-box').open = false;
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+              return Math.max(1400, document.documentElement.scrollHeight);
+            })()`);
+            await call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+            await evaluate('scrollTo(0, 0)');
+            // The modal blocks pointer input. Force the hover style for the comparison image.
+            await call('DOM.enable');
+            await call('CSS.enable');
+            const {root} = await call('DOM.getDocument');
+            const hoverTarget = 'tr[data-tip="row:kill-fixture"] .kill-run';
+            const {nodeId} = await call('DOM.querySelector', {nodeId:root.nodeId, selector:hoverTarget});
+            await call('CSS.forcePseudoState',{nodeId,forcedPseudoClasses:['hover']});
+            const shown = await evaluate(`(() => {
+              const queue = document.querySelectorAll('.walk-table .kill-run');
+              const outside = document.querySelectorAll('#outside-queue .kill-run');
+              const dialog = document.querySelector('#kill-dialog');
+              const box = dialog.getBoundingClientRect();
+              return {queue:queue.length,outside:outside.length,open:dialog.open,
+                belowTable:box.top >= document.querySelector('#outside-queue table').getBoundingClientRect().bottom,
+                fits:box.top >= 0 && box.bottom <= innerHeight && dialog.scrollHeight <= dialog.clientHeight,
+                label:getComputedStyle(document.querySelector(${JSON.stringify(hoverTarget)}),'::after').content,
+                dark:matchMedia('(prefers-color-scheme: dark)').matches,
+                pressure:document.querySelector('#pill-t').textContent,height:document.documentElement.scrollHeight};
+            })()`);
+            assert.deepEqual(shown,{queue:servedReading.walk.length,outside:outsideRows.length,open:true,
+              belowTable:true,fits:true,label:'"Kill this run"',dark:true,pressure:'no memory pressure',height});
+            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,
+              clip:{x:0,y:0,width,height,scale:1}});
+            const path = comparison ? resolve(comparison) : join(folder,'kill-both-tables-dark.png');
+            await writeFile(path,Buffer.from(shot.data,'base64'));
+            console.log(JSON.stringify({pass:true,path,width,height}));
+            break browserProof;
+          }
+          const confirmation = await evaluate(`(async () => {
+            document.querySelector('.legend-box').open = false;
+            for (const section of document.querySelectorAll('#leftovers, #swap, #report-charts')) section.hidden = true;
+            document.body.style.paddingBottom = '520px';
+            await refreshKill();
+            document.querySelector('#walk-title').scrollIntoView({block:'start'});
+            const control = document.querySelector('.kill-run');
+            control.click();
+            document.querySelector('#kill-words').value = 'Start it again after 21:50.';
+            const rect = document.querySelector('#walk').getBoundingClientRect();
+            const top = document.querySelector('#walk-title').getBoundingClientRect();
+            const dialog = document.querySelector('#kill-dialog');
+            const pop = dialog.getBoundingClientRect();
+            const unit = dialog.querySelector('#kill-name strong [data-color-text="role.unit-director"]');
+            return {
+              icons:document.querySelectorAll('.walk-table .kill-run').length, icon:control.innerHTML,
+              unavailable:document.querySelector('tr[data-tip="row:research-fixture"] .pid').title,
+              labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
+              fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
+              unit:unit?.textContent, unitWeight:unit ? getComputedStyle(unit).fontWeight : '',
+              preview:document.querySelector('#kill-message').textContent,
+              warning:document.querySelector('#kill-warning').textContent,
+              wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
+              clip:{x:Math.max(0,rect.left-8)+scrollX,y:Math.max(0,Math.min(top.top,pop.top)-8)+scrollY,
+                width:Math.min(innerWidth,rect.right+8)-Math.max(0,rect.left-8),
+                height:Math.max(rect.bottom,pop.bottom)+8-Math.max(0,Math.min(top.top,pop.top)-8),scale:1}
+            };
+          })()`);
+          if (killShot) {
+            const shot = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:confirmation.clip});
+            await writeFile(join(folder,'kill-dark.png'),Buffer.from(shot.data,'base64'));
+            killResults = [killedResult];
+            const killedClip = await evaluate(`(async () => {
+              document.querySelector('#kill-dialog').close();
+              await refreshKill();
+              const walk = document.querySelector('#walk').getBoundingClientRect();
+              const heading = document.querySelector('#walk-title').getBoundingClientRect();
+              const left = Math.max(0,walk.left-8), top = Math.max(0,heading.top-8);
+              return {x:left+scrollX,y:top+scrollY,width:Math.min(innerWidth,walk.right+8)-left,
+                height:walk.bottom+8-top,scale:1};
+            })()`);
+            const killed = await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:killedClip});
+            await writeFile(join(folder,'killed-row-dark.png'),Buffer.from(killed.data,'base64'));
+            console.log(join(folder,'kill-dark.png'));
+            console.log(join(folder,'killed-row-dark.png'));
+          } else {
+            assert.equal(confirmation.icons,1);
+            assert.equal(confirmation.unavailable,'Kill is not available for this run yet');
+            assert.deepEqual(confirmation.labels,['Run','Pid','Progress','Started by']);
+            assert.deepEqual(confirmation.fields,
+              ['unit-board · check','2712994 and its child processes','6.5% done after 11 min','impl3, a worker of unit-board']);
+            assert.equal(confirmation.unit,'unit-board');
+            assert.equal(confirmation.unitWeight,'700');
+            assert.equal(confirmation.preview,killOffer.message);
+            assert.equal(confirmation.warning,killWarning(killOffer.recipient_name));
+            assert.equal(confirmation.wordsLabel,killWordsLabel);
+            killResults = [{...killedResult,stop:'Run already ended',delivery:''}];
+            assert.deepEqual(await evaluate(`(async () => {
+              await refreshKill();
+              return [document.querySelector('.kill-state').textContent, document.querySelectorAll('.walk-table .kill-run').length];
+            })()`),['Run already ended',0]);
+            killResults = [{...killedResult,delivery:''}];
+            assert.equal(await evaluate(`(async () => {
+              await refreshKill();
+              return document.querySelector('.kill-state').textContent;
+            })()`),`Killed by you at ${killTime} · Message pending`);
+            killResults = [];
+            await evaluate(`refreshKill()`);
+            await evaluate(`document.querySelector('#kill-submit').click()`);
+            assert.equal(await evaluate(`document.querySelector('.kill-state').textContent`),'Stopping');
+            // Remove the fixture row while the action is pending.
+            await evaluate(`renderReading({...latest,walk:latest.walk.filter(row => !row.kill_ref)})`);
+            assert.match(await evaluate(`document.querySelector('#kill-results').textContent`),/Stopping/);
+            const received = await new Promise(resolve => {
+              if (killPostReply) resolve(killPost);
+              else server.once('kill-post', () => resolve(killPost));
+            });
+            assert.deepEqual(received,{reference:killRef,token:killToken,handle:killOffer.handle,
+              words:'Start it again after 21:50.'});
+            killPostReply();
+            servedReading = {...servedReading,walk:servedReading.walk.filter(row => !row.kill_ref)};
+            const refresh = await evaluate(`(async () => {
+              await refreshKill();
+              return {interval:killRefreshSeconds,text:document.querySelector('#kill-results').textContent};
+            })()`);
+            assert.deepEqual(refresh,{interval:killRefreshSeconds,text:'check (pid 2712994) · Stopping'});
+            killResults = [killedResult];
+            const returned = await evaluate(`(async () => {
+              await tick();
+              const early = document.querySelector('#kill-results').textContent;
+              const read = refreshKill;
+              let reply;
+              refreshKill = () => reply = read();
+              try {
+                nextKillRead = performance.now();
+                await tick();
+                await reply;
+                return {early,finished:document.querySelector('#kill-results').textContent};
+              } finally {
+                refreshKill = read;
+              }
+            })()`);
+            assert.deepEqual(returned,{early:'check (pid 2712994) · Stopping',
+              finished:`check (pid 2712994) · Killed by you at ${killTime} · worker impl3 informed`});
+            assert.ok(outsideRef, 'The outside feed must publish a Kill reference for a registered owner.');
+            killResults = [];
+            killPost = killPostReply = undefined;
+            const outside = await evaluate(`(async () => {
+              await refreshKill();
+              const control = document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run');
+              control.click();
+              const dialog = document.querySelector('#kill-dialog');
+              const box = dialog.getBoundingClientRect();
+              const table = document.querySelector('#outside-queue table').getBoundingClientRect();
+              const unit = dialog.querySelector('#kill-name strong [data-color-text="role.unit-director"]');
+              return {icons:document.querySelectorAll('#outside-queue .kill-run').length, icon:control.innerHTML,
+                pid:control.closest('.outside-pid')?.firstChild.textContent,
+                label:control.getAttribute('aria-label'), fields:[...dialog.querySelectorAll('dd')].map(field => field.textContent),
+                unit:unit?.textContent, unitWeight:unit ? getComputedStyle(unit).fontWeight : '',
+                labels:[...dialog.querySelectorAll('dt')].map(label => label.textContent),
+                warning:document.querySelector('#kill-warning').textContent,
+                wordsLabel:document.querySelector('label[for="kill-words"]').textContent,
+                belowTable:box.top >= table.bottom, fits:box.top >= 0 && box.bottom <= innerHeight,
+                preview:document.querySelector('#kill-message').textContent, submit:document.querySelector('#kill-submit').textContent};
+            })()`);
+            assert.deepEqual(outside,{icons:2,icon:confirmation.icon,pid:'8102',label:'Kill this run',
+              fields:['queue · targeted_test.py','8102 and its child processes','5 min','test, a worker of queue'],
+              unit:'queue',unitWeight:'700',
+              labels:['Run','Pid','Age','Started by'],warning:killWarning(outsideRow.owner),wordsLabel:killWordsLabel,
+              belowTable:true,fits:true,preview:outsideOffers[outsideRef].message,submit:'Kill the run'});
+            const outsideState = () => evaluate(`document.querySelector('[data-kill-ref="${outsideRef}"]')
+              ?.closest('tr').querySelector('.kill-state')?.textContent`);
+            const submitOutside = async () => {
+              await evaluate("document.querySelector('#kill-submit').click()");
+              assert.equal(await outsideState(),'Stopping');
+              const request = await new Promise(resolve => {
+                if (killPostReply) resolve(killPost);
+                else server.once('kill-post', () => resolve(killPost));
+              });
+              assert.deepEqual(request,{reference:outsideRef,token:killToken,handle:outsideOffers[outsideRef].handle,words:''});
+            };
+            await submitOutside();
+            killPostReply('The run or its stop route changed.');
+            await evaluate(`(async () => {
+              while (pendingKills.size) await new Promise(resolve => setTimeout(resolve, 10));
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+            })()`);
+            assert.equal(await outsideState(),'Not stopped: The run or its stop route changed.');
+            killPost = killPostReply = undefined;
+            await submitOutside();
+            killPostReply(undefined, {...outsideStopped,stop:'Stop unconfirmed',delivery:'',
+              reason:'Still running after Kill: pid 8105'});
+            await evaluate(`(async () => {
+              while (pendingKills.size) await new Promise(resolve => setTimeout(resolve, 10));
+              await refreshKill();
+              document.querySelector('[data-kill-ref="${outsideRef}"] .kill-run').click();
+            })()`);
+            assert.equal(await outsideState(),'Not stopped: Still running after Kill: pid 8105');
+            killPost = killPostReply = undefined;
+            await submitOutside();
+            killPostReply();
+            await evaluate('refreshKill()');
+            assert.equal(await outsideState(),'Stopping');
+            killResults = [outsideStopped];
+            await evaluate('refreshKill()');
+            assert.equal(await outsideState(),`Killed by you at ${killTime} · worker test informed`);
+            servedReading = {...servedReading,outside_queue:outsideRows.filter(row => row.kill_ref !== outsideRef)};
+            await evaluate('(async () => { window.render = renderReading; await pageRefresh.refresh(true); })()');
+            assert.equal(await outsideState(),undefined);
+            const unavailable = await evaluate(`(() => {
+              const rows = latest.outside_queue.map(row => ({...row,kill_ref:undefined}));
+              renderReading({...latest,outside_queue:rows});
+              const row = document.querySelector('.outside-queue-row');
+              return {label:row.querySelector('.outside-pid').title, icon:!!row.querySelector('.kill-run')};
+            })()`);
+            assert.deepEqual(unavailable,{label:'Kill is not available for this run yet',icon:false});
+            console.log(JSON.stringify({pass:true,proof:'Kill control'}));
+          }
+          break browserProof;
+        }
+        if (outsideQueueProof || !focusedProof) {
+          const inspectOutside = () => evaluate(`(() => {
+            const section = document.querySelector('#outside-queue');
+            section.scrollIntoView({block:'center'});
+            return {heading:section.querySelector('.section-head').textContent,
+              previousCard:section.previousElementSibling?.id, nextCard:section.nextElementSibling?.id,
+              headers:Array.from(section.querySelectorAll('thead th'), cell => cell.textContent),
+              rows:Array.from(section.querySelectorAll('.outside-queue-row'), row => ({
+                cells:Array.from(row.children, cell => cell.textContent),
+                color:row.querySelector('[data-color-text]')?.getAttribute('data-color-text'),
+                clipped:Array.from(row.children).some(cell => cell.scrollWidth > cell.clientWidth),
+              })),
+              emptyText:section.querySelector('#outside-queue-rows').textContent,
+              visible:!section.hidden};
+          })()`);
+          const saveOutside = async name => {
+            await evaluate("scrollTo(0, 0); document.querySelector('.legend-box').open = false;");
+            const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:false});
+            await writeFile(join(folder, name), Buffer.from(shot.data, 'base64'));
+          };
+          servedReading = readings.outside_first;
+          await navigate('memory_live.html');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells[4]), ['—', '—']);
+          servedReading = readings.outside_queue;
+          await navigate('memory_live.html', false);
+          const result = await inspectOutside();
+          assert.equal(result.visible, true);
+          assert.equal(result.heading, 'Tests outside the queue');
+          assert.equal(result.previousCard, 'build-limits', 'Tests outside the queue must follow Build limits.');
+          assert.equal(result.nextCard, 'aws-costs', 'AWS costs must follow Tests outside the queue.');
+          assert.deepEqual(result.headers, ['Command', 'Owner', 'Pid', 'Age', 'Current CPU', 'CPU total']);
+          assert.deepEqual(result.rows, [
+            {cells:['verify_cache_test.py', 'builds', '8112', '5 min', '25%', '153 s'],
+              color:'role.showrunner', clipped:false},
+            {cells:['targeted_test.py', 'queue · test', '8102', '5 min', '75%', '139 s'],
+              color:'role.unit-director', clipped:false},
+          ]);
+          assert.equal(await evaluate(`(() => {
+            const row = document.querySelector('.outside-queue-row');
+            const box = row.getBoundingClientRect();
+            row.dispatchEvent(new PointerEvent('pointermove', {bubbles:true, pointerType:'mouse',
+              clientX:box.left + 10, clientY:box.top + 10}));
+            const values = [...document.querySelectorAll('#tip dd:not(.title)')];
+            return values.length === 4 && values.every(cell => getComputedStyle(cell).textAlign === 'right');
+          })()`), true);
+          if (outsideQueueProof) {
+            await evaluate('hideTip()');
+            await saveOutside('i390-page-after-dark.png');
+          }
+          servedReading = {...readings.outside_queue, outside_queue:readings.outside_queue.outside_queue
+            .filter(row => row.pid !== 8102)};
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells[2]), ['8112']);
+          servedReading = readings.outside_empty;
+          await evaluate('pageRefresh.refresh(true)');
+          const empty = await inspectOutside();
+          assert.equal(empty.visible, true);
+          assert.equal(empty.emptyText, 'No test runs outside the queue now.');
+          assert.deepEqual(empty.rows, []);
+          servedReading = {...readings.outside_queue, outside_queue:[
+            {command:'older_test.py', owner:'builds', pid:8112, cpu_seconds:153},
+            {command:'missing_pid.py', owner:'builds', cpu_seconds:139},
+          ]};
+          await evaluate('pageRefresh.refresh(true)');
+          assert.deepEqual((await inspectOutside()).rows.map(row => row.cells.slice(2)),
+            [['8112', '—', '—', '153 s'], ['—', '—', '—', '139 s']]);
+          if (outsideQueueProof) {
+            if (beforePage) {
+              servedReading = readings.outside_queue;
+              await navigate('before.html');
+              const before = await inspectOutside();
+              assert.equal(before.rows.length, result.rows.length);
+              assert.deepEqual(before.headers, []);
+              await saveOutside('i390-page-before-dark.png');
+            }
+            console.log(JSON.stringify({pass:true, rows:result.rows.length}));
+            break browserProof;
+          }
+        }
+        if (ciServicesProof) {
+          const live = JSON.parse(await readFile(comparison, 'utf8'));
+          const service = live.walk.find(row => row.ci);
+          const names = service?.ci_runners?.map(runner => runner.name) ?? live.ram.ci_services?.map(runner => runner.name);
+          assert.deepEqual(names, ['hana-linux-1', 'hana-linux-2']);
+          const gib = 1024**3;
+          const ciServices = [{name:names[0], bytes:704*1024**2}, {name:names[1], bytes:16*1024**2}];
+          const overhead = ciServices.reduce((total, runner) => total + runner.bytes, 0);
+          const oldOverhead = live.ram.ci_bytes ?? live.ram.ci_services.reduce((total, runner) => total + runner.bytes, 0);
+          const delta = overhead - oldOverhead;
+          const cargo = {...structuredClone(base.walk.find(row => row.queued)),
+            key:'ci-cargo-proof', name:'hana CI: nextest', queued:true, verify:null, pid:701002,
+            ci_label:'hana CI · hana-linux-1', title:{unit:'', step:'hana CI · hana-linux-1'},
+            unit:'', showrunner:'', caller:'', owner_text:'', name_parts:[], machine:'natedev',
+            used:0.5, counted:0.5, reserved:0, started_at:live.read_at-45,
+            progress:{kind:'RowProgress', phase:'testing', unit:'tests', done:17, total:22, percent:77.3}};
+          const ram = {...live.ram, ci_bytes:0, ci_services:ciServices,
+            build_tools_bytes:live.ram.build_tools_bytes + overhead - (live.ram.ci_bytes === undefined ? oldOverhead : 0),
+            queued_builds_bytes:live.ram.queued_builds_bytes + gib/2,
+            available_bytes:live.ram.available_bytes - delta - gib/2};
+          const freeAfterSystem = Math.max(0, ram.available_bytes - ram.safety_covered_bytes - ram.swap_covered_bytes);
+          ram.build_covered_bytes = Math.min(ram.build_target_bytes, freeAfterSystem);
+          ram.build_missing_bytes = ram.build_target_bytes - ram.build_covered_bytes;
+          ram.room_bytes = freeAfterSystem - ram.build_covered_bytes;
+          ram.shortfall_bytes = ram.build_missing_bytes + ram.swap_missing_bytes + ram.safety_missing_bytes;
+          ram.cap_bytes = ram.build_tools_bytes + ram.queued_builds_bytes + ram.build_covered_bytes + ram.room_bytes;
+          servedReading = {...live, read_at:base.read_at, report_version:base.report_version, ram,
+            cap:ram.cap_bytes/gib, room:ram.room_bytes/gib, shortfall:ram.shortfall_bytes/gib,
+            walk:[...live.walk.filter(row => !row.ci && !row.ci_label), {...cargo, started_at:base.read_at-45}]};
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1100,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          const {cssContentSize} = await call('Page.getLayoutMetrics');
+          await call('Emulation.setDeviceMetricsOverride', {width:1600,
+            height:Math.ceil(cssContentSize.height),deviceScaleFactor:1,mobile:false});
+          const proof = await evaluate(`(async () => {
+            window.scrollTo(0, 0);
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const tools = document.querySelector('#s-tools');
+            const box = tools.getBoundingClientRect();
+            showTip('tools', box.left+box.width/2, box.top+box.height/2);
+            const header = document.querySelector('#walk-title').getBoundingClientRect();
+            const tipBox = document.querySelector('#tip').getBoundingClientRect();
+            const serviceLines = [...document.querySelectorAll('#tip dt')].filter(cell =>
+              cell.textContent.startsWith('+ hana CI service ')).map(cell => {
+                const range = document.createRange();
+                range.selectNodeContents(cell);
+                return range.getClientRects().length;
+              });
+            return {tooltip:tipText('tools', latest), barWidth:box.width, serviceLines,
+              headerClear:tipBox.bottom <= header.top || tipBox.right <= header.left || tipBox.left >= header.right,
+              toolsRow:!!document.querySelector('#walk [data-tip="tools"]'),
+              title:document.querySelector('#walk-title').textContent,
+              rows:[...document.querySelectorAll('#walk .wrow[data-run]')].map(row => row.dataset.run),
+              taken:document.querySelector('#walk-sum').textContent,
+              totals:Object.fromEntries(tooltipRows('walksum', latest).map(({label,value}) => [label,value])),
+              serviceRow:!!document.querySelector('#walk td.pid') && Array.from(
+                document.querySelectorAll('#walk td.pid')).some(cell => cell.textContent === ${JSON.stringify(String(service?.pid))}),
+              cargo:document.querySelector('tr[data-tip="row:ci-cargo-proof"] td.pid')?.textContent,
+              legend:!!document.querySelector('.legend [data-tip="ci"]')};
+          })()`);
+          assert.ok(proof.barWidth > 0);
+          assert.deepEqual(proof.serviceLines, [1, 1]);
+          assert.equal(proof.headerClear, true);
+          assert.equal(proof.toolsRow, false);
+          const statusRows = servedReading.walk.filter(row => row.kind === 'mac-unavailable');
+          assert.equal(proof.title, `Running, in start order (${proof.rows.length-statusRows.length})`);
+          const taken = memoryTenths(proof.totals.Builds)
+            + memoryTenths(proof.totals['+ Build reserved'] ?? proof.totals['+ Full reserve']);
+          assert.equal(memoryTenths(proof.totals.Taken), taken);
+          assert.ok(proof.taken.startsWith(`${(taken/10).toFixed(1)} of `));
+          assert.equal(proof.cargo, '701002');
+          assert.equal(proof.serviceRow, false);
+          assert.equal(proof.legend, false);
+          assert.match(proof.tooltip[1], /hana CI service hana-linux-1  0\.7 GiB/);
+          assert.match(proof.tooltip[1], /hana CI service hana-linux-2  <0\.1 GiB/);
+          const shot = await call('Page.captureScreenshot', {format:'png'});
+          await writeFile(join(folder, 'cisvc-dark.png'), Buffer.from(shot.data, 'base64'));
+          console.log(JSON.stringify({pass:true, ...proof}));
+          break browserProof;
+        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;
-          Object.assign(ram, {python_tests_bytes: 0.25*gib, waiting_runs_bytes: 0.125*gib,
+          Object.assign(ram, {ci_bytes: 0, python_tests_bytes: 0.25*gib, waiting_runs_bytes: 0.125*gib,
             other_build_tools_bytes: 0.125*gib});
           servedReading = {...base, ram};
           const views = [];
@@ -753,8 +1255,7 @@ try {
           const reading = {...structuredClone(readings.good), staff_names:readings.verify_calls.staff_names};
           const rust = structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify));
           const waiting = structuredClone(readings.verify_calls.waiters.find(row => !row.verify));
-          // bob, 2026-11-23: a Mac build with no unit starts with who started it, here a terminal.
-          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.started_by);
+          const mac = readings.mac_three.walk.find(row => row.kind === 'mac-build' && row.unit === 'trunk');
           Object.assign(rust, {unit:'natest',showrunner:'builds',machine:'natedev',caller:'test',
             title:{unit:'natest',step:'nextest'}});
           const {verify:_verify, ...unverified} = rust;
@@ -765,8 +1266,8 @@ try {
           // admin-console is longer than every running label, so its widest word sets the label column.
           Object.assign(waiting, {unit:'admin-console',showrunner:'builds',caller:'impl3',
             title:{unit:'admin-console',step:'test affected'},targets:['natedev','hana-aws']});
-          const ci = {key:'shot-ci',name:'hana CI',ci:true,admitted:true,started_at:reading.read_at-120,
-            machine:'natedev',used:0.5,reserved:0,counted:0.5,ci_runners:[{state:'busy',job:'doctests'}]};
+          const ci = {key:'shot-ci',name:'hana CI',ci_label:'hana CI',queued:true,started_at:reading.read_at-120,
+            machine:'natedev',used:0.5,reserved:0,counted:0.5};
           reading.walk = [rust, guest, mac, ci];
           reading.waiters = [waiting];
           const runAgeMinutes = 3;
@@ -838,7 +1339,7 @@ try {
               const iconDetails = icon => [icon?.getAttribute('aria-label'), icon?.dataset.machine,
                 icon?.querySelector('svg use')?.getAttribute('href') ?? icon?.querySelector('.machine-emoji')?.textContent,
                 icon?.getAttribute('data-badge')];
-              return {headers:[...walk.querySelectorAll('thead th')].map(cell => cell.textContent),
+              return {headers:[...walk.querySelectorAll('thead th:not(.row-action)')].map(cell => cell.textContent),
                 tight:walk.classList.contains('tight'),
                 keptCut:keptChart ? [...keptChart.querySelectorAll('.name, .owner'), ...keptTable.cells]
                   .filter(cell => cell.scrollWidth > cell.clientWidth).map(cell => cell.textContent) : [],
@@ -857,7 +1358,7 @@ try {
                   .map(cell => cell.closest('tr').dataset.tip),
                 legend:[...document.querySelectorAll('#machine-key .key')].map(key =>
                   [key.lastChild.textContent, ...iconDetails(key.querySelector('.machine-icon'))]),
-                colors:[chart(keys[0]),chart(keys[4])].map(row => [
+                colors:[chart(keys[0]),chart(keys[2]),chart(keys[4])].map(row => [
                   row.querySelector('.name [data-color-text]')?.dataset.colorText,
                   row.querySelector('.owner [data-color-text]')?.dataset.colorText]),
                 waitingNameLines:lines(waitingName),
@@ -877,13 +1378,13 @@ try {
               await assertRowCenters(evaluate);
               assert.deepEqual(rows.headers, runningHeaders);
               assert.deepEqual(rows.names, [['natest','builds',rust.verify.verb,'nextest'],
-                ['queue','builds','','gate'],['terminal','hana','','build'],['hana CI','','',''],
+                ['queue','builds','','gate'],['trunk','hana','','nextest'],['hana CI','','',''],
                 ['admin-console','builds','','test affected']]);
               assert.deepEqual(rows.icons, [[runningIcon('natedev')],[runningIcon('mac-linux')],[runningIcon('mac')],
                 [runningIcon('natedev')],waitingIcons]);
               assert.deepEqual(rows.wrappedIcons, [], `A Machine icon row wraps at ${width} px.`);
               assert.deepEqual(rows.legend, Object.keys(machineGraphics).map(name => [name, ...expectedIcon(name)]));
-              assert.deepEqual(rows.colors, [['role.unit-director','role.showrunner'],['role.unit-director','role.showrunner']]);
+              assert.deepEqual(rows.colors, Array.from({length:3},()=>['role.unit-director','role.showrunner']));
               assert.equal(rows.heading, 'Waiting, in queue order');
               assert.equal(rows.runAge, `${runAgeMinutes} min`);
               assert.equal(rows.keptDeadline, `until ${keptUntil.split(' ', 1)[0]}`);
@@ -892,6 +1393,25 @@ try {
                 assert.ok(rows.handleFits && !rows.waitingNameCut, 'The move handle or waiting name is cut at 1440 px.');
               }
               if (width === 900) {
+                const pidLayouts = await evaluate(`(() => {
+                  const walk = document.querySelector('#walk');
+                  const scroll = walk.closest('.walk-scroll');
+                  const layouts = [[999999,999999], [999999,4194304], [4194304,4194304]].map(([runningPid,waitingPid]) => {
+                    renderWalk({...latest, walk:latest.walk.map(row => ({...row,pid:runningPid})),
+                      waiters:latest.waiters.map(row => ({...row,pid:waitingPid}))});
+                    fitLabels();
+                    return {
+                      runningPid, waitingPid, pidWidth:walk.querySelector('thead .pid').getBoundingClientRect().width,
+                      overflow:scroll.scrollWidth - scroll.clientWidth,
+                      trackWidth:walk.querySelector('.track').getBoundingClientRect().width,
+                    };
+                  });
+                  renderWalk(latest);
+                  fitLabels();
+                  return layouts;
+                })()`);
+                assert.ok(pidLayouts.every(({overflow, trackWidth}) => overflow <= 1 && trackWidth >= 159),
+                  'The 900 px walk does not fit both PID widths. ' + JSON.stringify(pidLayouts));
                 assert.deepEqual(rows.keptCut, [], 'A kept place value is cut at 900 px.');
                 assert.ok(rows.walkOverflow <= 1, `The walk overflows by ${rows.walkOverflow} px at 900 px.`);
                 assert.ok(rows.trackWidth >= 159, `The chart track is only ${rows.trackWidth} px at 900 px.`);
@@ -1129,11 +1649,11 @@ try {
           servedReading.ram = {...servedReading.ram, build_tools_bytes:real.build_tools_bytes};
           // The queue-move stub gives the page a token, so the reorder handles draw.
           queueFixture = servedReading;
-          await checkStandingOrders(navigate, evaluate, call, standingProof && beforePage ? 'before.html' : 'memory_live.html',
-            standingProof ? folder : '');
+          if (standingProof && beforePage) await checkStandingOrders(navigate, evaluate, call, 'before.html', folder);
+          await checkStandingOrders(navigate, evaluate, call, 'memory_live.html', standingProof && !beforePage ? folder : '');
           queueFixture = null;
           if (standingProof) {
-            console.log(JSON.stringify({pass:true}));
+            console.log(JSON.stringify({pass:true, pages:beforePage ? ['baseline', 'current'] : ['current'], widths:[1440, 900]}));
             break browserProof;
           }
           await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
@@ -1150,8 +1670,12 @@ try {
           await checkPage(navigate, evaluate, call);
         }
       } finally {
-        if(ws) ws.close();
-        chrome.kill('SIGTERM');
+        if (killProof && ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({id:0,method:'Browser.close'}));
+        } else {
+          if (ws) ws.close();
+          chrome.kill('SIGTERM');
+        }
         await exited;
       }
 
@@ -1365,7 +1889,7 @@ try {
         const headerState = `({
           running:document.querySelector('[data-tip="walkhead"]').textContent,
           queued:document.querySelector('#walk .queue-title')?.textContent ?? '',
-          tools:document.querySelector('#walk .wrow.tools .name')?.textContent,
+          tools:document.querySelector('#walk .wrow.tools .name')?.textContent ?? '',
           free:document.querySelector('#walk .wrow.room .name')?.textContent
         })`;
         const captureHeadings = async name => {
@@ -1390,7 +1914,7 @@ try {
         }
         await navigate('memory_live.html');
         assert.deepEqual(await evaluate(headerState), {running:'Running, in start order (3)',
-          queued:'Queued, in order of submission (4)',tools:'Build tools',free:'Free'});
+          queued:'Queued, in order of submission (4)',tools:'',free:'Free'});
         if (headcountComparison) await captureHeadings('after');
         await evaluate('window.render = window.renderReading');
         const longUnit = 'research-with-a-long-unit-name'.repeat(8);
@@ -1404,7 +1928,7 @@ try {
           await evaluate('pageRefresh.refresh(true)');
           assert.deepEqual(await evaluate(headerState), {
             running:`Running, in start order (${walk.filter(row=>row.kind!=='mac-unavailable').length})`,
-            queued,tools:'Build tools',free:'Free'});
+            queued,tools:'',free:'Free'});
           assert.deepEqual(await evaluate(`[
             document.querySelectorAll('#walk .wrow.wait').length,
             document.querySelectorAll('#walk tr.wait').length
@@ -1673,8 +2197,8 @@ try {
           const shot = await call('Page.captureScreenshot', {format:'png',captureBeyondViewport:true,clip});
           return pngPixels(Buffer.from(shot.data,'base64'))(0,0);
         };
-        const saveScreenshot = async (name, options = {}) => {
-          if (!comparisonImages) return;
+        const saveScreenshot = async (name, options = {}, enabled = comparisonImages) => {
+          if (!enabled) return;
           const shot = await call('Page.captureScreenshot', {format:'png', ...options});
           await writeFile(join(folder,name+'.png'),Buffer.from(shot.data,'base64'));
         };
@@ -1780,21 +2304,21 @@ try {
           })()`);
           for(const group of legendSums?totals:[]) {
             if(group.total==='unavailable') continue;
-            const amount=text=>text==='unavailable'?0:Number.parseFloat(text.replace('<',''));
+            const amount=text=>text==='unavailable' ? 0 : memoryTenths(text);
             const sum=group.rows.reduce((total,text)=>total+amount(text),0);
-            // Every displayed total is the sum of its displayed leaves.
-            assert.ok(Math.abs(amount(group.total)-sum)<=1e-9,
+            assert.equal(amount(group.total),sum,
               'A legend total differs from its rows: '+JSON.stringify(group));
           }
           return true;
         };
         // The same step keeps its screen position and hover after work above it changes.
+        // The last twelve steps stay below the moved ones, so the page can scroll to keep the viewed step in place.
         const steady = structuredClone(base);
-        steady.waiters = Array.from({length: 12}, (_, index) => ({...steady.waiters[0],
+        steady.waiters = Array.from({length: 24}, (_, index) => ({...steady.waiters[0],
           key: 'steady-wait-' + index, pid: 8000 + index, name: 'steady waiting ' + index}));
         servedReading = steady;
         await call('Emulation.setDeviceMetricsOverride', {width:1400,height:700,deviceScaleFactor:1,mobile:false});
-        await navigate(process.env.STEADY_BASELINE ? 'before.html' : 'memory_live.html');
+        await navigate(!gateMode && process.env.STEADY_BASELINE ? 'before.html' : 'memory_live.html');
         const beforeSteady = await evaluate(`(() => {
           const row = document.querySelector('.wrow[data-tip="wait:steady-wait-3"]');
           window.scrollBy(0, row.getBoundingClientRect().top - 200);
@@ -1810,7 +2334,8 @@ try {
         const changedSteady = structuredClone(steady);
         changedSteady.walk.unshift(...[1,2].map(index => ({...changedSteady.walk.find(row=>row.queued),
           key:'steady-new-'+index, pid:9000+index, name:'new running '+index})));
-        changedSteady.waiters = [...changedSteady.waiters.slice(6), ...changedSteady.waiters.slice(0,6)];
+        changedSteady.waiters = [...changedSteady.waiters.slice(6,12), ...changedSteady.waiters.slice(0,6),
+          ...changedSteady.waiters.slice(12)];
         servedReading = changedSteady;
         const afterSteady = await evaluate(`(async () => {
           await tick();
@@ -1858,6 +2383,12 @@ try {
         assert.ok(Math.abs(outOfViewTop-outOfView.top)<1, 'A focused row out of view moves the rows in view: '+JSON.stringify({outOfView,outOfViewTop}));
         servedReading = base;
         await navigate('memory_live.html');
+        for (const width of [600, 800, 1200, 1600]) {
+          await call('Emulation.setDeviceMetricsOverride', {width,height:1200,deviceScaleFactor:1,mobile:false});
+          await show(readings.step_unknown);
+          const text = await evaluate("document.querySelector('#walk').textContent");
+          assert.ok(!text.includes('owner not recorded'), `The walk shows an unknown owner at ${width} px.`);
+        }
         // A reload of the same page keeps its scroll; the pixel checks below read the page from its top.
         await evaluate('scrollTo(0,0)');
         for (const theme of themes) {
@@ -1909,6 +2440,8 @@ try {
                 return values[0]*0.2126+values[1]*0.7152+values[2]*0.0722;
               };
               const contrast = (a,b) => (Math.max(luminance(a),luminance(b))+0.05)/(Math.min(luminance(a),luminance(b))+0.05);
+              // The swap rows and gauges have a layout only while their dialog is open.
+              document.querySelector('[data-page-action="builds-swap"]').click();
               const swap = [...document.querySelectorAll('#swaprows .row')];
               const small = swap.find(row => row.classList.contains('owner'))?.querySelector('small');
               // A long detail wraps at phone width, so compare the first text lines, not the boxes.
@@ -1921,10 +2454,10 @@ try {
               const owner = row.querySelector('.owner');
               const card = document.querySelector('#walk').closest('.card');
               const metrics = {
-                headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+                headings:[...table.querySelectorAll('thead th:not(.row-action)')].map(e=>e.textContent),
                 slotCells:table.querySelectorAll('.slot').length,
                 answer:text('#answer'),
-                queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th')].map(e=>e.textContent),
+                queueHeaders:[...table.querySelectorAll('tbody tr.queue-head th:not(.row-action)')].map(e=>e.textContent),
                 queueHeaderHeight:table.querySelector('tr.queue-head')?.getBoundingClientRect().height,
                 queueSpacerHeight:document.querySelector('.walk-chart .queue-head')?.getBoundingClientRect().height,
                 stages:[...table.querySelectorAll('tbody tr[data-tip^="row:"] .place')].map(e=>e.textContent),
@@ -1956,13 +2489,13 @@ try {
                   return room.getClientRects().length?room.textContent:null;
                 })(),
                 machine:table.querySelector('td.machine')?.textContent,
-                capText:text('#cap-value'), room:text('#v-room'),
+                capText:text('#cap-value'), legendCap:text('#v-cap'), room:text('#v-room'),
                 roomBar:rect(document.querySelector('#s-room')), roomColor:color('--room'),
                 rowLeft:rect(row.querySelector('.row-label')).left,
                 headingLeft:rect(card.querySelector('.section-head')).left,
                 reservedAmount:getComputedStyle(row.querySelector('.reserved-amount')).color,
                 dimColor:color('--ink-2'),
-                leftover:text('#leftover-rows'), history:text('#report-charts'), top:text('#report-top'),
+                leftover:text('#leftover-rows'), history:text('#builds-costs-dialog'), top:text('#report-top'),
                 costWindow:text('#cost-window'), pressureReason:text('#pressure-reason'),
                 charts:document.querySelectorAll('#history-charts svg').length,
                 progress:progress?rect(progress):null, capLine:rect(cap),
@@ -1977,10 +2510,11 @@ try {
                 name:row.querySelector('.name').textContent, owner:owner?.textContent||'',
                 walk:rect(document.querySelector('#walk')), card:rect(card),
                 amountHeader:document.querySelector('.walk-amount-head')?.textContent||document.querySelector('#walk').textContent,
-                swapBars:document.querySelectorAll('#swap .gt').length,
-                legacySwapBar:!!document.querySelector('#swap .swapbar'),
+                swapBars:document.querySelectorAll('#builds-swap-dialog .gt').length,
+                legacySwapBar:!!document.querySelector('#builds-swap-dialog .swapbar'),
                 scroll:document.documentElement.scrollWidth, client:document.documentElement.clientWidth,
               };
+              document.querySelector('#builds-swap-dialog [data-close]').click();
               return metrics;
             })()`);
             assert.deepEqual(proof.headings, runningHeaders);
@@ -2024,7 +2558,7 @@ try {
             assert.match(proof.swapText.at(-1), /All swap used7\.8 GiB/);
             assert.equal(proof.swapBytes.slice(0,-1).reduce((sum,bytes)=>sum+bytes,0),proof.swapBytes.at(-1));
             assert.equal(proof.swapBytes.at(-1),base.swap.used_bytes);
-            assert.equal(proof.capText,'Queue cap '+base.cap.toFixed(1)+' GiB');
+            assert.equal(proof.capText,'Queue cap '+proof.legendCap);
             assert.ok(!proof.legacySwapBar, 'The page repeats the swap bar.');
             assert.equal(proof.swapBars, 3);
             for (const ratio of proof.reservedRatios) assert.ok(ratio >= 3, 'The reservation contrast is below 3:1.');
@@ -2052,6 +2586,88 @@ try {
             await checkPixel(proof.roomBar.left+5,proof.roomBar.top+4,proof.roomColor,
               'The room pixels differ at '+theme+' '+width+' px.');
             if (comparisonImages) proofs.push({theme,width,metrics:proof});
+            // The user, 11-22: each section opens from its heading button in a dialog; Escape closes it and returns focus.
+            for (const action of ['builds-swap','builds-costs','builds-leftovers']) {
+              const button=await evaluate(`(() => {
+                const box=document.querySelector('[data-page-action="${action}"]').getBoundingClientRect();
+                return {x:box.left+box.width/2,y:box.top+box.height/2};
+              })()`);
+              await call('Input.dispatchMouseEvent',{type:'mousePressed',...button,button:'left',buttons:1,clickCount:1});
+              await call('Input.dispatchMouseEvent',{type:'mouseReleased',...button,button:'left',buttons:0,clickCount:1});
+              const opened=await evaluate(`(() => {
+                const dialog=document.querySelector('#${action}-dialog'), body=dialog.querySelector('.console-dialog-body');
+                return {modal:dialog.matches(':modal'),right:dialog.getBoundingClientRect().right,
+                  capturePlace:pageCapturePlace(),
+                  sideways:body.scrollWidth-body.clientWidth};
+              })()`);
+              assert.ok(opened.modal, action+' does not open its dialog.');
+              assert.equal(opened.capturePlace, '/memory_live.html#console-window=' + action + '-dialog');
+              assert.ok(opened.right<=width, action+' leaves the window at '+width+' px.');
+              assert.ok(opened.sideways<=0, action+' scrolls sideways at '+width+' px.');
+              if (action==='builds-swap') {
+                // Closed, the page does not place the limit labels; the ResizeObserver places them when the dialog opens.
+                const limits=await evaluate(`(async () => {
+                  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+                  const lefts=() => ['some','full'].map(key => document.querySelector('#limit-'+key).style.left);
+                  const observed=lefts();
+                  placeLimitLabels();
+                  return {observed,placed:lefts()};
+                })()`);
+                assert.deepEqual(limits.observed,limits.placed,'The swap dialog opens with its limit labels out of place.');
+                assert.ok(limits.placed.every(left => left!==''),'The swap dialog opens with no limit label place.');
+              }
+              for (const type of ['keyDown','keyUp'])
+                await call('Input.dispatchKeyEvent',{type,key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+              // The dialog close event returns focus after the close, so read it one frame later.
+              const closed=await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(resolve));
+                return {open:document.querySelector('#${action}-dialog').open,focus:document.activeElement.dataset.pageAction};
+              })()`);
+              assert.deepEqual(closed,{open:false,focus:action},action+' does not close or return focus.');
+            }
+            // The pressure pill opens Swap without its tooltip. Escape returns focus to the pill.
+            for (const input of ['mouse', 'keyboard', 'touch']) {
+              if (input === 'touch') await call('Emulation.setTouchEmulationEnabled', {enabled:true});
+              const pill=await evaluate(`(() => {
+                hideTip();
+                const button = document.querySelector('#pill');
+                button.focus({preventScroll:true});
+                const box = button.getBoundingClientRect();
+                return {x:box.left+box.width/2,y:box.top+box.height/2};
+              })()`);
+              if (input === 'mouse') {
+                await call('Input.dispatchMouseEvent',{type:'mouseMoved',...pill});
+                await call('Input.dispatchMouseEvent',{type:'mousePressed',...pill,button:'left',buttons:1,clickCount:1});
+                await call('Input.dispatchMouseEvent',{type:'mouseReleased',...pill,button:'left',buttons:0,clickCount:1});
+              } else if (input === 'keyboard') {
+                await pressSpace();
+              } else {
+                await call('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[pill]});
+                await call('Input.dispatchTouchEvent',{type:'touchEnd',touchPoints:[]});
+              }
+              const pillOpened = await evaluate(`({open:document.querySelector('#builds-swap-dialog').open,
+                tip:document.querySelector('#tip').classList.contains('on')})`);
+              assert.deepEqual(pillOpened,{open:true,tip:false},'Swap or its tooltip is wrong for '+input+'.');
+              for (const type of ['keyDown','keyUp'])
+                await call('Input.dispatchKeyEvent',{type,key:'Escape',code:'Escape',windowsVirtualKeyCode:27});
+              const pillClosed=await evaluate(`(async () => {
+                await new Promise(resolve => requestAnimationFrame(resolve));
+                return {open:document.querySelector('#builds-swap-dialog').open,focus:document.activeElement.id};
+              })()`);
+              assert.deepEqual(pillClosed,{open:false,focus:'pill'},'The swap dialog does not return focus to the pressure pill.');
+              if (input === 'touch') await call('Emulation.setTouchEmulationEnabled', {enabled:false});
+            }
+            // A queue outage closes an open section dialog and hides the section buttons with the cards.
+            const outage=await evaluate(`(async () => {
+              document.querySelector('[data-page-action="builds-swap"]').click();
+              showQueueError('The queue did not answer.');
+              await new Promise(resolve => requestAnimationFrame(resolve));
+              const shown=[...document.querySelectorAll('[data-page-action^="builds-"]')].filter(button=>button.getClientRects().length).length;
+              const open=document.querySelectorAll('dialog[id^="builds-"][open]').length;
+              document.body.classList.remove('queue-unavailable');
+              return {shown,open};
+            })()`);
+            assert.deepEqual(outage,{shown:0,open:0},'A queue outage leaves a section button or dialog on the page.');
             const tokenReview=structuredClone(base);
             const running=tokenReview.walk.find(row=>row.queued&&!row.ci);
             tokenReview.walk=[
@@ -2075,11 +2691,13 @@ try {
                 }),
                 pool:[...document.querySelectorAll('#walk-tokens dt')].map(label=>[label.textContent,label.nextElementSibling.textContent]),
                 poolAlignment:[...document.querySelectorAll('#walk-tokens dd')].map(value=>getComputedStyle(value).textAlign),
+                lastColumns:rows.map(row=>[...row.children].slice(-3).map(cell=>cell.className)),
                 overflow:document.documentElement.scrollWidth>document.documentElement.clientWidth,
                 clip:box ? {x:Math.floor(box.left)-4,y:Math.floor(box.top+scrollY)-4,
                   width:Math.ceil(box.width)+8,height:Math.ceil(bottom-box.top)+8,scale:1} : undefined};
             })()`);
             assert.deepEqual(tokenColumn.tokens,['6','—']);
+            assert.deepEqual(tokenColumn.lastColumns, [['tokens','moved','row-action'],['tokens','moved','row-action']]);
             assert.deepEqual(tokenColumn.pool,[['Total','31'],['Available','4']]);
             assert.deepEqual(tokenColumn.poolAlignment,['right','right']);
             assert.equal(tokenColumn.overflow,false);
@@ -2104,17 +2722,16 @@ try {
                   clipped:box.left<0||box.right>innerWidth||box.top<0||box.bottom>innerHeight};
               })()`);
               const fields=Object.fromEntries(tokenView.rows.map(row=>[row.label,row.value]));
-              assert.equal(fields.Tokens,'');
+              assert.equal(fields.Tokens,state==='unavailable'?'unavailable':'');
               assert.equal(tokenView.grids,1);
               assert.ok(tokenView.values.every(value=>value==='right'));
               assert.equal(tokenView.clipped,false);
               if(state==='unavailable') {
-                assert.equal(fields.Status,'unavailable');
-                assert.equal(fields.Because,'steve exited 1');
+                assert.deepEqual(fields,{Tokens:'unavailable'});
               } else {
                 assert.equal(fields.Total,'31');
                 assert.equal(fields.Available,state==='paused'?'0':'4');
-                assert.equal(fields['Pause below free RAM'],'12.0 GiB');
+                assert.equal(fields['Pause below'],'12.0 GiB');
                 assert.equal(fields.Pool,state);
                 assert.equal(fields['Per-build counts'],state==='paused'?'unavailable':'known');
                 if(state==='paused') assert.equal(fields.Because,'steve cannot be asked');
@@ -2163,22 +2780,24 @@ try {
             assert.match(await evaluate("document.querySelector('#top-costs').textContent"), /Updated cost action/);
             await show(base);
 
-            // A disagree reading hides the memory bar; the Running chart keeps the layout of the agree reading.
+            // The Running chart keeps its layout when the RAM readings disagree.
             const disagreeReading=structuredClone(readings.cloud_region);
             disagreeReading.ram.agreement='disagree';
             const detailLayouts={};
-            for(const [name,detail,reading] of [
-              ['cloud_stage','tools ready',readings.cloud_stage],
-              ['cloud_region','tests start · eu-south-2, zone a',readings.cloud_region],
-              ['cloud_region_disagree','tests start · eu-south-2, zone a',disagreeReading],
-              ['cloud_zone','eu-south-2, zone us-east-1b',readings.cloud_zone],
-              ['cloud_empty','',readings.cloud_empty]]) {
+            for(const [name,stage,location,reading] of [
+              ['cloud_stage','tools ready','',readings.cloud_stage],
+              ['cloud_region','tests start','eu-south-2, zone a',readings.cloud_region],
+              ['cloud_region_disagree','tests start','eu-south-2, zone a',disagreeReading],
+              ['cloud_zone','testing','eu-south-2, zone us-east-1b',readings.cloud_zone],
+              ['cloud_empty','testing','',readings.cloud_empty]]) {
               await show(reading);
               const detailProof=await evaluate(`(() => {
                 const row=[...document.querySelectorAll('.walk-table tbody tr')].find(row=>row.textContent.includes('700001'));
                 const chart=document.querySelector('.wrow[data-tip="'+row.dataset.tip+'"]');
                 const amounts=chart.querySelector('.amounts');
-                return {text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
+                const fields=Object.fromEntries(tooltipRows(row.dataset.tip,latest).map(({label,value})=>[label,value]));
+                return {stage:row.querySelector('.place').textContent,fields,
+                  text:amounts.textContent,font:getComputedStyle(amounts).fontSize,
                   ownerFont:getComputedStyle(chart.querySelector('.owner')).fontSize,
                   rootFont:getComputedStyle(document.documentElement).fontSize,
                   beside:document.querySelector('#walk').classList.contains('beside'),
@@ -2191,8 +2810,11 @@ try {
                   chartHeight:chart.getBoundingClientRect().height,rowHeight:row.getBoundingClientRect().height,
                   scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth};
               })()`);
-              const expected=[detail,'7 of 12 modules','1 failed module','no update for 2 min'].filter(Boolean).join(' · ');
-              assert.equal(detailProof.text,expected,'The AWS detail text differs.');
+              assert.equal(detailProof.stage,stage,'The AWS Stage differs.');
+              assert.equal(detailProof.text,'1 failed module · no update for 2 min','The AWS detail text differs.');
+              assert.equal(detailProof.fields.Where,location || undefined,'The AWS tooltip location differs.');
+              const stageLabel=stage[0].toUpperCase()+stage.slice(1);
+              assert.equal(detailProof.fields[stageLabel],'7 of 12 modules','The AWS tooltip module count differs.');
               assert.equal(detailProof.font,detailProof.ownerFont,'The AWS detail font differs from the owner font.');
               assert.equal(parseFloat(detailProof.font),parseFloat(detailProof.rootFont)*0.75);
               if(detailProof.beside) assert.ok(detailProof.detailRight<detailProof.tableLeft,
@@ -2207,7 +2829,7 @@ try {
                   assert.equal(detailProof[key],agree[key],'The disagree note changes the Running chart '+key+'.');
                 assert.deepEqual(detailProof.bars,agree.bars,'The disagree note changes the Running chart bars.');
               }
-              if(name.startsWith('cloud_region') && process.env.MEMORY_PAGE_SHOT) {
+              if(name.startsWith('cloud_region') && requestedShot) {
                 const clip=await evaluate(`(() => {
                   const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                   return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
@@ -2233,8 +2855,10 @@ try {
               const cloudText=(running?.textContent || '')+' '+(runningDetails?.textContent || '');
               const stale=[...(runningDetails?.querySelectorAll('*') || [])].find(element=>
                 element.childElementCount===0 && element.textContent.includes('no update for'));
-              return {headings:[...table.querySelectorAll('thead th')].map(e=>e.textContent),
+              return {headings:[...table.querySelectorAll('thead th:not(.row-action)')].map(e=>e.textContent),
                 running:cloudText,waiting:(waiting?.textContent || '')+' '+(waitingDetails?.textContent || ''),
+                stage:running?.querySelector('.place')?.textContent,
+                moduleCount:tooltipRows(running.dataset.tip,latest).find(row=>row.label==='Testing')?.value,
                 machine:running?.querySelector('td.machine .machine')?.dataset.machine,
                 place:waiting?.querySelector('.place')?.textContent,
                 waitingMachine:waiting?.querySelector('td.machine .machine')?.dataset.machine,
@@ -2272,12 +2896,12 @@ try {
             assert.equal(cloudProof.machine,'aws');
             assert.equal(cloudProof.vcpus,'32');
             assert.ok(!/\brunning\b/.test(cloudProof.running),'The cloud row repeats the running state.');
-            for(const value of [modules,failed,'no update for '+cloudRow.late_age])
-              assert.ok(cloudProof.running.includes(value),value+' is absent from the cloud row.');
+            assert.equal(cloudProof.stage,'testing');
+            assert.equal(cloudProof.amounts,`${failed} · no update for ${lateAge}`,'The AWS detail text differs.');
+            assert.equal(cloudProof.moduleCount,modules,'The AWS tooltip module count differs.');
             assert.ok(cloudProof.progressInTrack,'The cloud progress line is absent from the track.');
             assert.ok(Math.abs(cloudProof.progressWidth-cloudProof.progressTrackWidth*cloudRow.progress.percent/100)<1,
               'The cloud progress width differs from its percent.');
-            assert.ok(cloudProof.amounts.includes(modules),'The cloud module count is absent from the amounts.');
             assert.equal(cloudProof.trackText,'','The cloud track contains text.');
             assert.ok(!cloudProof.waitingBar,'The waiting cloud row has a progress line.');
             assert.ok(Math.abs(cloudProof.height-cloudProof.tableHeight)<1,'The cloud row heights differ.');
@@ -2298,14 +2922,14 @@ try {
             assert.ok(cloudProof.localMemory,'The local memory bar is absent.');
             assert.equal(cloudProof.staleColor,cloudProof.errorColor,'The stale age is not red.');
             assert.ok(cloudProof.scroll<=cloudProof.client,'Cloud rows overflow the page.');
-            if(process.env.MEMORY_PAGE_SHOT && theme==='light' && width===1400 && name==='cloud') {
+            if(requestedShot && theme==='light' && width===1400 && name==='cloud') {
               const clip=await evaluate(`(() => {
                 const r=document.querySelector('#walk').closest('.card').getBoundingClientRect();
                 return {x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height,scale:1};
               })()`);
               const shot=await call('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
-              await mkdir(dirname(process.env.MEMORY_PAGE_SHOT),{recursive:true});
-              await writeFile(process.env.MEMORY_PAGE_SHOT,Buffer.from(shot.data,'base64'));
+              await mkdir(dirname(requestedShot),{recursive:true});
+              await writeFile(requestedShot,Buffer.from(shot.data,'base64'));
             }
             proof[name]=cloudProof;
             }
@@ -2375,7 +2999,6 @@ try {
               const line=document.querySelector('#walk .walk-bud');
               const track=document.querySelector('#walk .wrow[data-run] .track').getBoundingClientRect();
               const room=document.querySelector('#walk .wrow.room .roomb')?.getBoundingClientRect();
-              const tools=document.querySelector('#walk .wrow.tools .seg-tools').getBoundingClientRect();
               const memoryTools=document.querySelector('#s-tools').getBoundingClientRect();
               const memoryBar=document.querySelector('#barwrap .bar').getBoundingClientRect();
               const memoryCap=document.querySelector('#b-cap').getBoundingClientRect();
@@ -2387,16 +3010,13 @@ try {
                 .sort((a,b)=>b.box.height-a.box.height)[0];
               return {layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',present:!!line&&getComputedStyle(line).display!=='none'&&box.width>0&&box.height>0,
                 left:box?box.left+1:null,top:part?.box.top,bottom:part?.box.bottom,roomRight:room?room.right:null,
-                tools:{left:tools.left,right:tools.right,width:tools.width,trackLeft:track.left},
                 memoryTools:{left:memoryTools.left,right:memoryTools.right,width:memoryTools.width,
                   barLeft:memoryBar.left,capRight:memoryCap.right},
                 expected:track.left+track.width*latest.cap*${gib}/latest.ram.total_bytes,color:part?getComputedStyle(part.element).borderLeftColor:'',
                 scrollY,card:card ? {x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1} : undefined};
             })()`);
             assert.ok(capLine.present,'The Running chart has no cap line.');
-            assert.ok(capLine.tools.width>0 && capLine.memoryTools.width>0);
-            assert.ok(Math.abs(capLine.tools.left-capLine.tools.trackLeft)<=1,'Build tools do not start at the chart left edge.');
-            assert.ok(capLine.tools.right<capLine.left,'Build tools extend beyond the chart cap mark.');
+            assert.ok(capLine.memoryTools.width>0);
             assert.ok(Math.abs(capLine.memoryTools.left-capLine.memoryTools.barLeft)<=1,'Build tools do not start at the memory bar left edge.');
             assert.ok(capLine.memoryTools.right<capLine.memoryTools.capRight,'Build tools extend beyond the memory bar cap mark.');
             if(width===1400) assert.equal(capLine.layout,'beside','The Running chart stays stacked after a narrow page.');
@@ -2462,56 +3082,61 @@ try {
             Object.assign(shortReading.ram,{build_covered_bytes:shortReading.ram.build_covered_bytes+shortReading.ram.room_bytes,room_bytes:0});
             Object.assign(shortReading.ram,{build_target_bytes:shortReading.ram.build_covered_bytes+4*gib,build_missing_bytes:4*gib,shortfall_bytes:4*gib});
             Object.assign(shortReading,{room:0,taken:shortReading.cap,shortfall:4});
+            delete shortReading.build_reserve;
             await show(shortReading);
             if(comparisonImages&&theme==='dark'&&width===1400) {
               const shortClip=await evaluate(`(()=>{
-                const memory=document.querySelector('#barwrap').getBoundingClientRect();
+                const alert=document.getElementById('mac-idle-alert').getBoundingClientRect();
                 const running=document.querySelector('#walk').closest('.card').getBoundingClientRect();
-                return {x:running.left,y:memory.top+scrollY,width:running.width,height:running.bottom-memory.top,scale:1};
+                return {x:running.left,y:alert.top+scrollY,width:running.width,height:running.bottom-alert.top,scale:1};
               })()`);
               await saveScreenshot('over-cap-dark-desktop',{captureBeyondViewport:true,clip:shortClip});
             }
-            // The bar draws the uncovered reserve past the cap line, with a dashed brace and a tooltip.
+            // The user, 11-17: a short reserve has a red outline, one alert line names it, and its tooltip names the missing part.
             const overBar=await evaluate(`(() => {
-              const box=id=>{const r=document.getElementById(id).getBoundingClientRect();return {left:r.left,right:r.right,width:r.width};};
-              const tip=Object.fromEntries(tooltipRows('over',latest).map(row=>[row.label,row.value]));
-              return {hidden:document.getElementById('b-overlay').hidden,overlay:box('b-overlay'),cap:box('b-cap'),over:box('b-over'),
-                brace:document.getElementById('b-over').textContent,reserved:document.getElementById('b-reserved').textContent,tip};
+              const outline=id=>({short:document.getElementById(id).classList.contains('short-reserve'),
+                shadow:getComputedStyle(document.getElementById(id)).boxShadow});
+              const probe=document.createElement('i');
+              probe.style.color='var(--error)';
+              document.body.append(probe);
+              const errorColor=getComputedStyle(probe).color;
+              probe.remove();
+              const alert=document.getElementById('mac-idle-alert');
+              return {reserved:outline('s-reserved'),safety:outline('s-safety'),swap:outline('s-swap'),errorColor,
+                alert:alert.hidden?'':alert.textContent,old:['b-overlay','b-over','bc-reserved'].filter(id=>document.getElementById(id)),
+                tip:Object.fromEntries(tooltipRows('reserved',latest).map(row=>[row.label,row.value]))};
             })()`);
-            assert.equal(overBar.hidden,false,'The bar draws no over-cap box.');
-            // A small hana CI part stays visible, so the builds parts add up on screen.
-            assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
-            assert.ok(Math.abs(overBar.overlay.left-overBar.cap.right)<=3,'The over-cap box does not start at the cap line. '+JSON.stringify(overBar));
-            assert.ok(Math.abs(overBar.overlay.width-overBar.over.width)<=1,'The over-cap box and its brace differ in width. '+JSON.stringify(overBar));
-            assert.equal(overBar.brace,'over cap 4.0');
-            assert.match(overBar.reserved,/^build reserved [0-9.]+ · [0-9.]+ covered$/);
-            assert.equal(overBar.tip['Over cap'],'4.0 GiB');
-            assert.equal(overBar.tip['= Over cap'],'4.0 GiB');
-            assert.ok(Math.abs(parseFloat(overBar.tip['Build reserved (full)'])-parseFloat(overBar.tip['− Free RAM after safety net and swap'])-4)<=0.1+1e-9,
-              'Build reserved (full) − covered is not the amount over the cap. '+JSON.stringify(overBar.tip));
+            assert.equal(overBar.reserved.short,true,'Build reserved has no red outline when it is short.');
+            assert.ok(overBar.reserved.shadow.includes(overBar.errorColor),'The short outline is not the error color. '+JSON.stringify(overBar));
+            assert.equal(overBar.safety.short,false);
+            assert.equal(overBar.swap.short,false);
+            assert.deepEqual(overBar.old,[],'The old over-cap drawing is still on the page.');
+            assert.match(overBar.alert,/Free RAM is short by 4\.0 GiB\. Build reserved holds [0-9.]+ of [0-9.]+ GiB\./);
+            assert.equal(overBar.tip['Not covered'],'4.0 GiB');
+            assert.equal(await evaluate(`document.getElementById('s-ci') === null`),true);
             proof.overBar=overBar;
             const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
               sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
               cap:getComputedStyle(document.querySelector('#walk .walk-bud .cap-part')||document.querySelector('#walk .walk-bud')).borderLeftColor}))()`);
             // Taken counts the full reserve, so it reads 4 GiB more than the cap.
-            assert.equal(overHeader.sum,(shortReading.cap+4).toFixed(1)+' of '+shortReading.cap.toFixed(1)+' GiB taken · 4.0 GiB over cap');
+            assert.match(overHeader.sum,/ · 4\.0 GiB over cap$/);
             assert.equal(overHeader.sumColor,overHeader.cap,'The over-cap total is not in the cap color.');
             const fields=Object.fromEntries(overHeader.rows.map(row=>[row.label,row.value]));
-            assert.equal(fields.Taken,(shortReading.cap+4).toFixed(1)+' GiB');
-            assert.equal(fields['Queue cap'],shortReading.cap.toFixed(1)+' GiB');
+            assert.equal(overHeader.sum,`${fields.Taken.split(' ')[0]} of ${fields['Queue cap']} taken · 4.0 GiB over cap`);
             assert.equal(fields['Over cap'],'4.0 GiB');
-            assert.ok('+ Build reserved (full)' in fields,overHeader.hover);
+            assert.equal(fields['+ Full reserve'],overBar.tip['Target']);
+            assert.ok(!('+ Build reserved' in fields),overHeader.hover);
             // Taken includes the full reserve. The difference from the cap is the uncovered reserve.
             const number=(text,pattern)=>Number.parseFloat(text.match(pattern)[1]);
             const header={taken:number(overHeader.sum,/^([0-9.]+) of/),cap:number(overHeader.sum,/of ([0-9.]+) GiB/),over:number(overHeader.sum,/· ([0-9.]+) GiB over cap/)};
-            const tip={builds:parseFloat(fields.Builds),reserved:parseFloat(fields['+ Build reserved (full)']),
+            const tip={builds:parseFloat(fields.Builds),reserved:parseFloat(fields['+ Full reserve']),
               taken:parseFloat(fields.Taken),over:parseFloat(fields['Over cap']),cap:parseFloat(fields['Queue cap'])};
-            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.1+1e-9,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
-            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.1+1e-9,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.builds+tip.reserved-tip.taken)<=0.15,'Builds + Build reserved is not Taken. '+JSON.stringify(tip));
+            assert.ok(Math.abs(tip.taken-tip.cap-tip.over)<=0.15,'Taken - Queue cap is not the amount over the cap. '+JSON.stringify(tip));
             assert.deepEqual([header.taken,header.cap,header.over],[tip.taken,tip.cap,tip.over],'The header and its tooltip differ.');
             const plainHeader=await (async()=>{await show(base);return evaluate(`document.querySelector('#walk-sum').textContent`);})();
             assert.ok(!plainHeader.includes('over cap'),'The header names an over-cap amount when nothing is over the cap.');
-            assert.equal(await evaluate(`document.getElementById('b-overlay').hidden`),true,'The bar draws an over-cap box when nothing is over the cap.');
+            assert.equal(await evaluate(`document.querySelectorAll('.short-reserve').length`),0,'A reserve has a red outline when nothing is short.');
             proof.overHeader=overHeader;
             // Cloud status text and bar labels are as wide as on the live page; none of it may show on the cap line.
             const cloudReading=structuredClone(base);
@@ -2601,6 +3226,20 @@ try {
                 await evaluate("hideTip();window.scrollTo(0,0)");
               }
             }
+            // Use the pending and refused notices from the memory feed test.
+            await show({...base, bump_notices:[
+              {unit:'queue', detail:'not applied: the step left the queue'},
+              {unit:'report', detail:'saved at 08:30 PST, waiting for the queue'},
+            ]});
+            const notices = await evaluate(`(() => {
+              const panel = document.querySelector('#bump-notices');
+              return {visible:!!panel?.getClientRects().length,
+                lines:[...(panel?.children ?? [])].map(row => row.textContent)};
+            })()`);
+            assert.deepEqual(notices, {visible:true, lines:[
+              'Bump for queue not applied: the step left the queue',
+              'Bump for report saved at 08:30 PST, waiting for the queue',
+            ]}, 'The page must show the pending and refused bump notices.');
             await show(base);
 
             for (const state of ['idle','waiting','unmatched','busy']) {
@@ -2624,11 +3263,10 @@ try {
                   builds:document.querySelector('#v-g-builds').textContent,
                   reserved:document.querySelector('#v-reserved').textContent,cap:document.querySelector('#v-cap').textContent};
               })()`);
-              assert.equal(ciProof.table,state==='busy');
-              assert.equal(ciProof.chart,state==='busy');
-              if(state==='busy') assert.equal(ciProof.stage,'—');
+              assert.equal(ciProof.table,false);
+              assert.equal(ciProof.chart,false);
               assert.equal(ciProof.ci,0.125);
-              const takenTenths=Math.round(parseFloat(ciProof.builds)*10)+Math.round(parseFloat(ciProof.reserved)*10);
+              const takenTenths=memoryTenths(ciProof.builds)+memoryTenths(ciProof.reserved);
               assert.equal(ciProof.taken,(takenTenths/10).toFixed(1)+' of '+ciProof.cap.replace(' GiB','')+' GiB taken');
             }
             await show(base);
@@ -2652,14 +3290,13 @@ try {
               });
             })()`);
             assert.equal(macProof.length,3);
-            // A Mac build with no unit starts with its owner; the step after ": " goes in Step.
-            assert.deepEqual(macProof.map(row=>row.name),['terminal','trunk','cargo-liner']);
+            assert.deepEqual(macProof.map(row=>row.name),['trunk-p172-assembly-rows','trunk','cargo-liner']);
             assert.deepEqual(macProof.map(row=>row.percent),['60.4%','64.7%','98.3%']);
             assert.deepEqual(macProof.map(row=>row.step),['build','nextest','nextest']);
             const macLabels=await evaluate(`latest.walk.map((row,index)=>({row,index})).filter(({row})=>row.kind==='mac-build').map(({index})=>({
-              repository:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
+              owner:document.querySelector('.wrow[data-run="'+proofRun(index)+'"] .owner').textContent,
               jobs:document.querySelector('tr[data-tip="'+proofTip('row',index)+'"] .vcpus').textContent}))`);
-            assert.deepEqual(macLabels.map(row=>row.repository),['hana','hana','']);
+            assert.deepEqual(macLabels.map(row=>row.owner),['','hana','']);
             assert.deepEqual(macLabels.map(row=>row.jobs),['—','12','6']);
             for(const row of macProof) {
               assert.equal(row.stage,'building');
@@ -2679,7 +3316,7 @@ try {
             assert.equal(failedMac.unknown,'—');
             await show(base);
 
-            // A waiting step sizes the Step column, so it can move the columns to the right of Step, but no column before it.
+            // Waiting step names must leave Duration and Verify in place.
             const positions=()=>evaluate(`(() => {
               const row=document.querySelector('.walk-table tr[data-tip^="row:"]');
               return ['.duration','.verify'].map(selector=>{
@@ -2700,6 +3337,125 @@ try {
               if(index===0) assert.ok(Math.abs(beforeWait[index].width-afterWait[index].width)<=1,
                 'A waiting row changes the Duration width. '+JSON.stringify({width,theme,beforeWait,afterWait}));
             }
+            const longStep = 'check generated-artifacts-and-cross-platform-test-manifests';
+            const walkOverflow = () => evaluate(`(() => {
+              const walk = document.querySelector('.walk-scroll');
+              return walk.scrollWidth - walk.clientWidth;
+            })()`);
+            const beforeLongOverflow = await walkOverflow();
+            const waiter = waiting.waiters[0];
+            waiter.name = waiter.name.split(': ', 1)[0] + ': ' + longStep;
+            if (waiter.title) waiter.title.step = longStep;
+            await show(waiting);
+            const longName = await evaluate(`(() => {
+              const row = document.querySelector('.walk-table tr.wait');
+              return {step:row.querySelector('.step').textContent, tip:tipText(row.dataset.tip, latest)[0]};
+            })()`);
+            assert.equal(longName.step, longStep);
+            const afterLongWait = await positions();
+            for (let index = 0; index < beforeWait.length; index++) {
+              assert.ok(Math.abs(beforeWait[index].left - afterLongWait[index].left) <= 1,
+                'A long waiting step moves a table column. ' + JSON.stringify({width,theme,beforeWait,afterLongWait}));
+              assert.ok(Math.abs(beforeWait[index].width - afterLongWait[index].width) <= 1,
+                'A long waiting step changes a column width. ' + JSON.stringify({width,theme,beforeWait,afterLongWait}));
+            }
+            assert.ok(await walkOverflow() <= beforeLongOverflow + 1, 'A long waiting step adds horizontal overflow.');
+            assert.ok(longName.tip.includes(longStep), 'The waiting row tooltip omits the full step name.');
+            if (width === 900 || width === 1400) {
+              const onlyWaiting = structuredClone(waiting);
+              onlyWaiting.walk = [];
+              const cargoStyle = onlyWaiting.waiters[0];
+              cargoStyle.unit = '';
+              cargoStyle.name = 'cargo-liner: build cargo-style';
+              cargoStyle.title = {unit:'', step:cargoStyle.name};
+              await show(onlyWaiting);
+              const waitingLayout = () => evaluate(`(() => {
+                const table = document.querySelector('.walk-table');
+                const text = table.querySelector('tr.wait .step .cell-text');
+                const columns = ['.duration','.verify','.step'].map(selector => {
+                  const {left, width} = table.querySelector('thead ' + selector).getBoundingClientRect();
+                  return {left, width};
+                });
+                const cut = [text, ...text.children].some(part => part.scrollWidth > part.clientWidth);
+                return {columns, cut, step:text.textContent, running:table.querySelectorAll('tr[data-tip^="row:"]').length};
+              })()`);
+              const cargoLayout = await waitingLayout();
+              assert.equal(cargoLayout.running, 0);
+              assert.equal(cargoLayout.step, 'build cargo-style');
+              assert.equal(cargoLayout.cut, false, `The cargo-style waiting step is cut at ${width} px in ${theme} mode.`);
+              onlyWaiting.waiters = structuredClone(waiting.waiters);
+              await show(onlyWaiting);
+              const changedLayout = await waitingLayout();
+              assert.deepEqual(changedLayout.columns, cargoLayout.columns,
+                'Changing the waiting rows moves the columns with no running steps.');
+              if (width === 1400) {
+                const setWidth = width => call('Emulation.setDeviceMetricsOverride',
+                  {width,height:1200,deviceScaleFactor:1,mobile:false});
+                Object.assign(cargoStyle, {
+                  unit:'cargo-liner-in-a-long-fixture-unit', targets:['natedev','mac'],
+                  title:{unit:'cargo-liner-in-a-long-fixture-unit',step:'build cargo-style'},
+                });
+                onlyWaiting.waiters = [cargoStyle];
+                await show(onlyWaiting);
+                const atWidth = async width => {
+                  await setWidth(width);
+                  const layout = await evaluate(`(() => {
+                    fitLabels();
+                    return {label:parseFloat(document.documentElement.style.getPropertyValue('--amt')),
+                      tight:document.querySelector('#walk').classList.contains('tight')};
+                  })()`);
+                  const {columns, cut, step} = await waitingLayout();
+                  return {width, ...layout, stepWidth:columns[2].width, cut, step};
+                };
+                const originalEdge = [await atWidth(930), await atWidth(931), await atWidth(932)];
+                // The viewport widths at the layout changes depend on the browser font.
+                const layoutEdge = async (property, start) => {
+                  let narrow = await atWidth(start);
+                  let wide = await atWidth(1200);
+                  assert.notEqual(wide[property], narrow[property], 'The fixture needs both values of ' + property);
+                  while (wide.width - narrow.width > 1) {
+                    const middle = await atWidth(Math.floor((narrow.width + wide.width) / 2));
+                    if (middle[property] === narrow[property]) narrow = middle;
+                    else wide = middle;
+                  }
+                  return [narrow, wide, await atWidth(wide.width + 1)];
+                };
+                const adjacent = await layoutEdge('label', 900);
+                const tightEdge = await layoutEdge('tight', 760);
+                await setWidth(1440);
+                const dualTargets = structuredClone(base);
+                dualTargets.walk = [
+                  structuredClone(readings.verify_calls.walk.find(row => row.queued && row.verify)),
+                  structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build')),
+                ];
+                dualTargets.walk[0].machine = 'natedev';
+                dualTargets.walk[1].machine = 'mac';
+                dualTargets.waiters = [];
+                await show(dualTargets);
+                const emptyQueue = await positions();
+                dualTargets.waiters = [{...cargoStyle, unit:'cargo-liner', title:{unit:'cargo-liner',step:'build cargo-style'}}];
+                await show(dualTargets);
+                assert.equal(await evaluate("document.querySelectorAll('tr.wait td.machine .machine-icon').length"), 2);
+                const twoIcons = await positions();
+                dualTargets.waiters = structuredClone(readings.three_target_gate_wait.waiters);
+                await show(dualTargets);
+                assert.deepEqual(await evaluate(`[...document.querySelectorAll('tr.wait td.machine .machine-icon')]
+                  .map(icon => icon.dataset.machine)`), ['natedev','mac-linux','hana-aws']);
+                const threeIcons = await positions();
+                const stepFits = group => group.every((view, index) =>
+                  !view.cut && view.step === 'build cargo-style' && (!index || view.stepWidth >= group[index - 1].stepWidth));
+                const labelFits = [originalEdge, adjacent].every(stepFits);
+                const tightFits = stepFits(tightEdge);
+                const columnsStay = withIcons => emptyQueue.every((column, index) =>
+                  column.left === withIcons[index].left && column.width === withIcons[index].width);
+                const twoStay = columnsStay(twoIcons);
+                const threeStay = columnsStay(threeIcons);
+                assert.ok(labelFits && tightFits && twoStay && threeStay, 'Step clips or a waiting row moves Duration or Verify. ' +
+                  JSON.stringify({theme, originalEdge, adjacent, tightEdge, labelFits, tightFits,
+                    emptyQueue, twoIcons, threeIcons, twoStay, threeStay}));
+                await setWidth(width);
+              }
+            }
             const absent=structuredClone(base);
             const absentRun=absent.walk.find(row=>row.queued);
             absentRun.unit='';absentRun.showrunner='';delete absentRun.machine;
@@ -2711,6 +3467,32 @@ try {
               machine:document.querySelector('.walk-table td.machine').textContent})`);
             // A row with no unit starts with the owner before ": " in its name, and its step goes in Step.
             assert.equal(absentCells.step,'nextest');assert.equal(absentCells.owner,'');assert.equal(absentCells.machine,'—');
+
+            await show(readings.step_unknown);
+            const unknown = await evaluate(`(() => {
+              const rows = [...document.querySelectorAll('.wrow[data-run], .wrow.wait')];
+              const unrecorded = value => !value || value === '—' || value === 'owner not recorded';
+              return rows.flatMap(chart => {
+                const row = stepRow(chart.dataset.tip, latest);
+                if (!unrecorded(row.unit) || !unrecorded(row.showrunner)) return [];
+                const name = chart.querySelector('.name');
+                const step = document.querySelector('tr[data-tip="' + chart.dataset.tip + '"] .step');
+                return [{key:chart.dataset.tip, source:row.name, name:name.textContent, step:step.textContent,
+                  owner:chart.querySelector('.owner').textContent,
+                  staffColor:!!name.querySelector('.staff-name') || !!step.querySelector('.staff-name'),
+                  plainColor:getComputedStyle(name).color === getComputedStyle(chart).color &&
+                    getComputedStyle(step).color === getComputedStyle(step.parentElement).color}];
+              });
+            })()`);
+            assert.ok(unknown.some(row => row.key.startsWith('row:')));
+            assert.ok(unknown.some(row => row.key.startsWith('wait:')));
+            for (const row of unknown) {
+              const [name, ...step] = row.source.split(': ');
+              assert.equal(row.name, name, row.key);
+              assert.equal(row.step, step.join(': '), row.key);
+              assert.equal(row.owner, '', row.key);
+              assert.ok(row.plainColor && !row.staffColor, row.key + ' uses a staff color.');
+            }
 
             for (const [name, expected] of [['pressure','memory'],['spacing','its turn'],['head','its turn']]) {
               await show(readings[name]);
@@ -2773,9 +3555,9 @@ try {
               for(const [label,value] of Object.entries(headProof.values)) {
                 assert.ok(headProof.hover.includes(label+'  '+value),'The head tooltip omits the term: '+label);
               }
-              const tenths=text=>Math.round(parseFloat(text)*10);
-              assert.equal(tenths(headProof.values['Queue cap'])-tenths(headProof.values.Builds)
-                -tenths(headProof.values['Build reserved']),tenths(headProof.values.Free));
+              const tenths=memoryTenths;
+              assert.ok(Math.abs(tenths(headProof.values['Queue cap'])-tenths(headProof.values.Builds)
+                -tenths(headProof.values['Build reserved'])-tenths(headProof.values.Free))<=2);
               for(const [label,value] of Object.entries(headProof.values))
                 assert.equal(value,headProof.legend[label].value,'The head changes a legend amount: '+label);
               assert.ok(!headProof.hover.includes('Safety net') && !headProof.hover.includes('Swap coming back'));
@@ -2817,17 +3599,57 @@ try {
             for (const name of ['old_cap','missing_cap','missing_use']) {
               await show(readings[name]);
               const state=await evaluate(`({rows:document.querySelectorAll('.wrow[data-run]').length,
-                cap:document.querySelector('#cap-value').textContent, text:document.body.textContent,
+                cap:document.querySelector('#cap-value').textContent, note:document.querySelector('#cap-reason').textContent,
                 room:document.querySelector('#v-room').textContent})`);
               assert.equal(state.cap, 'Queue cap unavailable', 'The missing cap has a value.');
               assert.ok(state.rows > 0);
               assert.equal(state.room, proof.room);
-              assert.match(state.text, /unavailable/);
-              if (name==='missing_use') assert.match(state.text, /private memory.stat is missing/);
+              const [reason, ...amounts] = state.note.split('; ');
+              assert.match(reason, /unavailable/);
+              if (name==='missing_use') assert.match(reason, /private memory.stat is missing/);
+              assert.deepEqual(amounts.map(term => term.replace(/ [^ ]+ GiB$/, '')),
+                ['free RAM', 'safety', 'swap coming back', 'kept aside', 'room']);
+              if (name === 'missing_cap') {
+                const checkColumns = () => evaluate(`(() => {
+                  const scroll = document.querySelector('.walk-scroll');
+                  const dialog = document.querySelector('#review-new-item');
+                  const positions = () => {
+                    scroll.scrollLeft = 0;
+                    const columns = [...scroll.querySelectorAll('th[scope="col"]:not(.row-action)')].map(cell => {
+                      const {left, width} = cell.getBoundingClientRect();
+                      return {left, width, padding: getComputedStyle(cell).paddingRight};
+                    });
+                    return {columns, tight: document.querySelector('#walk').classList.contains('tight')};
+                  };
+                  fitLabels();
+                  const withAction = positions();
+                  dialog.removeAttribute('id');
+                  fitLabels();
+                  const withoutAction = positions();
+                  dialog.id = 'review-new-item';
+                  fitLabels();
+                  scroll.scrollLeft = scroll.scrollWidth;
+                  const action = scroll.querySelector('.row-add').getBoundingClientRect();
+                  const clip = scroll.getBoundingClientRect();
+                  const reachable = scroll.scrollLeft > 0 && action.left >= clip.left && action.right <= clip.right;
+                  scroll.scrollLeft = 0;
+                  return {withAction, withoutAction, reachable};
+                })()`);
+                for (const capWidth of new Set([width, 390])) {
+                  if (capWidth !== width) await call('Emulation.setDeviceMetricsOverride',
+                    {width:capWidth,height:1200,deviceScaleFactor:1,mobile:false});
+                  const {withAction, withoutAction, reachable} = await checkColumns();
+                  if (capWidth === 390) assert.ok(withAction.tight, 'The no-cap proof needs compact gaps at 390 px.');
+                  assert.deepEqual(withAction, withoutAction, `The action moves data columns with no cap at ${capWidth} px.`);
+                  assert.ok(reachable, `The action is clipped with no cap at ${capWidth} px.`);
+                }
+                if (width !== 390) await call('Emulation.setDeviceMetricsOverride',
+                  {width,height:1200,deviceScaleFactor:1,mobile:false});
+              }
             }
             for (const name of ['empty_report','missing_report']) {
               await show(readings[name]);
-              const state=await evaluate(`({history:document.querySelector('#report-charts').textContent,
+              const state=await evaluate(`({history:document.querySelector('#builds-costs-dialog').textContent,
                 top:document.querySelector('#report-top').textContent, rows:document.querySelectorAll('.wrow[data-run]').length})`);
               assert.ok(state.rows>0);
               if(name==='missing_report') {
@@ -2878,7 +3700,7 @@ try {
             word:part('word').textContent,
             icons:[...line.querySelectorAll('[data-status-icon]')].filter(icon=>!icon.hidden).map(icon=>icon.dataset.statusIcon),
             timingsHidden:part('trip').hidden&&part('render').hidden,
-            position:getComputedStyle(line).position});
+            position:getComputedStyle(line.closest('.page-top')).position});
           const good=async()=>{
             reading.read_at=now/1000;
             reading.fresh_until=reading.read_at+ageLimit;
@@ -2928,14 +3750,14 @@ try {
           assert.equal(states[name].state,'Live');
           assert.ok(!states[name].ageHidden && states[name].reason==='');
         }
-        const capture = async (name, selector) => {
-          if (!comparisonImages) return;
+        const capture = async (name, selector, enabled = comparisonImages) => {
+          if (!enabled) return;
           await evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);
           const clip=await evaluate(`(() => {
             const r=document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect();
             return {x:Math.max(0,r.left+scrollX),y:r.top+scrollY,width:r.width,height:r.height,scale:1};
           })()`);
-          await saveScreenshot(name,{captureBeyondViewport:true,clip});
+          await saveScreenshot(name,{captureBeyondViewport:true,clip},enabled);
         };
         if (cloudOwnerComparison) {
           await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
@@ -2989,14 +3811,15 @@ try {
             const state=await evaluate(`(() => {
               const index=latest.walk.findIndex(row=>row.kind==='mac-build');
               const chart=document.querySelector('.wrow[data-run="'+proofRun(index)+'"]');
-              const headers=[...document.querySelectorAll('.walk-table thead th')].map(cell=>cell.textContent);
-              const waiting=[...document.querySelectorAll('.walk-table tr.queue-head th')].map(cell=>cell.textContent);
+              const headers=[...document.querySelectorAll('.walk-table thead th:not(.row-action)')].map(cell=>cell.textContent);
+              const waiting=[...document.querySelectorAll('.walk-table tr.queue-head th:not(.row-action)')].map(cell=>cell.textContent);
               const spacings=[...document.querySelectorAll('.walk-table thead th,.walk-table tr.queue-head th')]
-                .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling)
+                .filter(cell=>getComputedStyle(cell).display!=='none' && cell.nextElementSibling &&
+                  !cell.nextElementSibling.matches('.action-spacer,.row-action'))
                 .map(cell=>parseFloat(getComputedStyle(cell).paddingRight));
-              const table=document.querySelector('tr[data-tip="'+proofTip('row',index)+'"]');
+              const queued=document.querySelector('.wrow.wait[data-tip="' + proofTip('wait', 0) + '"]');
               return {index,name:chart.querySelector('.name').textContent,small:chart.querySelector('.owner').textContent,
-                step:table.querySelector('.step')?.textContent,
+                step:document.querySelector('tr[data-tip="' + proofTip('row', index) + '"] .step')?.textContent,
                 waitingStep:document.querySelector('tr[data-tip="' + proofTip('wait', 0) + '"] .step')?.textContent,
                 headers,waiting,spacings,scroll:document.documentElement.scrollWidth,client:innerWidth,
                 tip:tooltipHtml(proofTip('row',index),latest)};
@@ -3044,12 +3867,6 @@ try {
             }
             await capture(version+'-owner-tooltip','#tip');
             if (comparisonImages) comparisons.push({version,...state});
-          }
-          for(const width of [600,800,1200,1600]) {
-            await call('Emulation.setDeviceMetricsOverride',{width,height:1200,deviceScaleFactor:1,mobile:false});
-            await show(readings.step_unknown);
-            const text = await evaluate(`document.querySelector('#walk').textContent`);
-            assert.ok(!text.includes('owner not recorded'));
           }
           await call('Emulation.setDeviceMetricsOverride',{width:600,height:1200,deviceScaleFactor:1,mobile:false});
           await show(readings.step_ci);
@@ -3185,7 +4002,7 @@ try {
                     return range.getBoundingClientRect().bottom;
                   };
                   return {title:heading.textContent,font:getComputedStyle(heading).font,
-                    hover:heading.title,truncated:heading.firstElementChild.scrollWidth>heading.firstElementChild.clientWidth,
+                    hover:tipText(heading.dataset.tip,latest).join('\\n'),truncated:heading.firstElementChild.scrollWidth>heading.firstElementChild.clientWidth,
                     clipped:getComputedStyle(heading.firstElementChild).textOverflow==='ellipsis' && getComputedStyle(heading.firstElementChild).overflow==='hidden',
                     withinChart:heading.getBoundingClientRect().right<=header.getBoundingClientRect().right+1,
                     headerHeight:header.getBoundingClientRect().height,
@@ -3206,9 +4023,8 @@ try {
                     }),beside:walk.classList.contains('beside')};
                 })()`);
                 assert.equal(state.title,`${title} (${readings[name].waiters.length})`);
-                assert.ok(state.hover.startsWith(title+'\n'));
-                assert.match(state.hover,/Showrunner:/);
-                assert.match(state.hover,/Unit:/);
+                assert.ok(state.hover.startsWith('Queued  ' + readings[name].waiters.length + '\n'));
+                assert.match(state.hover,/Order  submission order/);
                 assert.equal(state.font,state.runningFont);
                 assert.equal(state.headerHeight,30);
                 assert.equal(state.nextGap,0);
@@ -3454,7 +4270,7 @@ try {
             [['showrunner','builds'],['unit','this run is from the showrunner']]);
           assert.equal(lefts(showrunnerState).length,1);
         }
-        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison && !macrouteComparison) {
+        if (beforePage && !queuedComparison && !consoleComparison && !ownersComparison && !blocksComparison && !identityComparison && !waitTipComparison && !macrouteComparison && !rowAskComparison) {
           const review = structuredClone(readings.spacing);
           review.priority_text = "queue priority: port (the user's bump)";
           review.head_text = 'Head: need 1.9 GiB > room 0.0 GiB (free 8.5 GiB − safety 3.0 GiB − 6.0 GiB swapped outside builds) · cloud 2 of 9 slots';
@@ -3463,12 +4279,11 @@ try {
           const mac = structuredClone(readings.mac_three.walk.find(row => row.kind === 'mac-build'));
           Object.assign(mac, {name:'hana nextest',used:3.5,unit:'trunk',stage:{kind:'MacTestingCounter'},
             progress:{kind:'RowProgress',phase:'testing',unit:'units',done:722,total:727,percent:100*722/727}});
-          delete mac.started_by;
           const aws = structuredClone(readings.cloud.walk.find(row => row.kind === 'cloud'));
           Object.assign(aws, {machine:'aws',used:1.5});
           const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,
             started_at:fixtureTime-60,unit:'hana CI',machine:'natedev',pid:701,vcpus:32,
-            progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
+            progress:{kind:'NoProgress',reason:'no counter'}};
           review.walk = [local, mac, aws, ci];
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',place:1,
@@ -3490,7 +4305,7 @@ try {
                 const mac=document.querySelector('.wrow[data-run="' + proofRun(1) + '"]');
                 const macBar=mac.querySelector('.seg-remote,.seg-used');
                 const awsBar=document.querySelector('.wrow[data-run="' + proofRun(2) + '"] .seg-remote');
-                return {headers:[...table.querySelectorAll('thead th')].map(cell=>cell.textContent),
+                return {headers:[...table.querySelectorAll('thead th:not(.row-action)')].map(cell=>cell.textContent),
                   done:table.querySelector('tr[data-tip="' + proofTip('row', 1) + '"] .done')?.textContent,
                   underBar:!!mac.querySelector('.progress-amount'),
                   remoteColor:getComputedStyle(macBar).backgroundColor,
@@ -3568,6 +4383,7 @@ try {
           await navigate(version==='before' ? 'before.html' : 'memory_live.html');
           const reading=structuredClone(readings.macroute_running);
           const row=reading.walk.find(row=>row.kind==='mac-build');
+          row.started_at = reading.read_at - 600;
           if(version==='before') row.name += ' · '+row.gate_label;
           await show(reading);
           const index=reading.walk.findIndex(row=>row.kind==='mac-build');
@@ -3635,6 +4451,7 @@ try {
                 build_tools_bytes:1.04*GIB,rust_analyzer_bytes:1.04*GIB,sccache_bytes:0,other_build_tools_bytes:0,
                 queued_builds_bytes:1.04*GIB,ci_bytes:1.04*GIB,
                 swap_covered_bytes:GIB,swap_target_bytes:2*GIB,swap_missing_bytes:GIB,build_covered_bytes:1.04*GIB,room_bytes:1.04*GIB},
+                swap:{...latest.swap,window_seconds:0},
                 unmatched_priority_entries:[{unit:'research'},{unit:'cables'}],
                 walk:[{key:'fractional-run',name:'Codex servers',group:'codex',used:0.4,parts:[
                   {who:'codex',pid:123,started_at:100,gib:0.2},{who:'codex',pid:456,started_at:100,gib:0.2}]}],
@@ -3648,11 +4465,11 @@ try {
             })()`);
             const amounts=rows=>Object.fromEntries(rows.map(row=>[row.label,row.value]));
             const builds=review['g-builds'].filter(row=>row.kind!=='caption');
-            assert.equal(Math.round(parseFloat(builds[0].value)*10),
-              builds.slice(1).reduce((sum,row)=>sum+Math.round(parseFloat(row.value)*10),0));
+            const [buildsTotal, ...buildsParts] = builds.map(row=>memoryTenths(row.value));
+            assert.equal(buildsTotal,31);
+            assert.deepEqual(buildsParts.sort(),[10,21]);
             const wait=amounts(review['wait:fractional-wait']);
-            assert.equal(Math.round(parseFloat(wait['Short by'])*10),
-              Math.round(parseFloat(wait.Needs)*10)-Math.round(parseFloat(wait['= Free'])*10));
+            assert.equal(wait['Short by'],'<0.1 GiB');
             const cap=amounts(review.cap);
             assert.equal(cap.Builds,review.legend.builds);
             assert.equal(cap['+ Build reserved'],review.legend.reserved);
@@ -3672,7 +4489,8 @@ try {
               for(const [key,reserve] of [['reserved','build'],['safety','safety'],
                 ['swap','swap'],['swap-pool:outside','swap']]) {
                 for(const target of [2,3]) {
-                  const reading={...latest,swap:{...latest.swap,outside_bytes:2*GIB},
+                  // Without a recorded basis, a Target row shows only when it differs from the title.
+                  const reading={...latest,build_reserve:undefined,swap:{...latest.swap,outside_bytes:2*GIB,window_seconds:0},
                     ram:{...latest.ram,[reserve+'_covered_bytes']:2*GIB,
                       [reserve+'_target_bytes']:target*GIB,[reserve+'_missing_bytes']:(target-2)*GIB}};
                   cases.push({key,target,rows:tooltipRows(key,reading)});
@@ -3680,6 +4498,21 @@ try {
               }
               return cases;
             })()`);
+            const basisProof = await evaluate(`(() => {
+              const reading={...latest,
+                build_reserve:{growth_bytes:5*GIB,share_percent:80,between_steps_bytes:GIB,unread_bytes:0},
+                swap:{...latest.swap,reserve_share_percent:20,window_seconds:600,swap_in_window_bytes:10*GIB},
+                ram:{...latest.ram,build_covered_bytes:5*GIB,build_target_bytes:5*GIB,build_missing_bytes:0,
+                  swap_covered_bytes:2*GIB,swap_target_bytes:2*GIB,swap_missing_bytes:0}};
+              return Object.fromEntries(['reserved','swap'].map(key=>[key,tooltipRows(key,reading)]));
+            })()`);
+            // With a recorded basis, each tooltip ends in its sum, also when the sum equals the title.
+            assert.deepEqual(basisProof.reserved.filter(row=>row.kind!=='title'&&row.kind!=='caption')
+              .map(row=>[row.label,row.value]),
+              [['Room to grow','5.0 GiB'],['× Share held','80.0%'],['+ Between steps','1.0 GiB'],['= Target','5.0 GiB']]);
+            assert.deepEqual(basisProof.swap.filter(row=>row.kind!=='title'&&row.kind!=='caption')
+              .map(row=>[row.label,row.value]),
+              [['Lookback','10 min'],['Swap-in','10.0 GiB'],['× Share held','20.0%'],['= Target','2.0 GiB']]);
             for(const {key,target,rows} of reserveProof) {
               const title=rows.find(row=>row.kind==='title');
               const targetRow=rows.find(row=>row.label==='Target');
@@ -3691,26 +4524,29 @@ try {
               }
             }
             const leafProof = await evaluate(`(() => {
-              const reading={...latest,cap:3.06,taken:2.04,ram:{...latest.ram,
+              const reading={...latest,cap:3.06,taken:2.04,build_reserve:undefined,ram:{...latest.ram,
                 rust_analyzer_bytes:1.02*GIB,sccache_bytes:0,other_build_tools_bytes:0,
                 build_tools_bytes:1.02*GIB,queued_builds_bytes:0,ci_bytes:0,
-                build_covered_bytes:1.02*GIB,room_bytes:1.02*GIB,
+                build_covered_bytes:1.02*GIB,build_target_bytes:1.02*GIB,room_bytes:1.02*GIB,
                 desktop_bytes:10*GIB,agents_bytes:0,programs:[],smaller_programs_bytes:0,other_programs_bytes:0,
                 compressed_swap_bytes:0,kernel_structures_bytes:0,kernel_counters_bytes:0,kernel_bytes:0,
                 cache_bytes:0,unattributed_bytes:-GIB,kernel_no_counter_bytes:0}};
+              const ram=reading.ram;
+              ram.available_bytes=ram.build_covered_bytes+ram.room_bytes+ram.safety_covered_bytes+ram.swap_covered_bytes;
+              ram.total_bytes=ram.build_tools_bytes+ram.available_bytes+ram.desktop_bytes+ram.unattributed_bytes;
               window.renderReading(reading);
               const keys=['tools','g-builds','cap','walksum','g-free','g-else','budget'];
               return {tips:Object.fromEntries(keys.map(key=>[key,tooltipRows(key,reading)])),
                 legend:Object.fromEntries(['tools','g-builds','g-free','g-else','unattributed','cap']
                   .map(key=>[key,document.querySelector('#v-'+key).textContent]))};
             })()`);
-            const tenths=value=>Math.round(parseFloat(value)*10);
+            const tenths=memoryTenths;
             for(const [key,rows] of Object.entries(leafProof.tips)) {
               const values=rows.filter(row=>row.value.endsWith(' GiB')).map(row=>tenths(row.value));
-              assert.equal(values[0],values.slice(1).reduce((sum,value)=>sum+value,0),key);
+              assert.equal(values[0], values.slice(1).reduce((sum,value)=>sum+value,0),key);
               if(key in leafProof.legend) assert.equal(rows[0].value,leafProof.legend[key]);
             }
-            assert.equal(leafProof.tips.cap[0].value,'3.0 GiB');
+            assert.equal(leafProof.tips.cap[0].value,'3.1 GiB');
             assert.equal(leafProof.tips.walksum[0].value,'2.0 GiB');
             assert.equal(leafProof.tips['g-else'][0].value,'9.0 GiB');
             assert.equal(leafProof.legend.unattributed,'-1.0 GiB');
@@ -3798,39 +4634,40 @@ try {
         const mockState = structuredClone(legendReading);
         const shotAt = mockState.read_at;
         const bytes = gib => gib * 1024**3;
-        Object.assign(mockState,{cap:11.3,total:44.4,taken:11.3,used:3.2,reserved:8.1,room:0,shortfall:0});
-        Object.assign(mockState.ram,{queued_builds_bytes:bytes(3.2),build_tools_bytes:0,ci_bytes:0,
+        Object.assign(mockState,{cap:18.3,total:51.4,taken:18.3,used:10.2,reserved:8.1,room:0,shortfall:0});
+        Object.assign(mockState.ram,{queued_builds_bytes:bytes(10.2),build_tools_bytes:0,ci_bytes:0,
           rust_analyzer_bytes:0,sccache_bytes:0,other_build_tools_bytes:0,
           safety_target_bytes:bytes(4),safety_covered_bytes:bytes(4),safety_missing_bytes:0,
           swap_target_bytes:bytes(2.1),swap_covered_bytes:bytes(2.1),swap_missing_bytes:0,
           build_covered_bytes:bytes(8.1),build_target_bytes:bytes(8.1),build_missing_bytes:0,
-          available_bytes:bytes(14.2),total_bytes:bytes(44.4),cap_bytes:bytes(11.3),room_bytes:0,shortfall_bytes:0});
+          available_bytes:bytes(14.2),total_bytes:bytes(51.4),cap_bytes:bytes(18.3),room_bytes:0,shortfall_bytes:0});
+        mockState.build_reserve = {growth_bytes:bytes(10.125),share_percent:80,between_steps_bytes:0,unread_bytes:0};
         mockState.waiters = [
           {name:'fps test',unit:'fps',showrunner:'hana',since:shotAt-720,place:1,why:'memory',need:1,free:0,
-            runs_on:'natedev or Mac',first_in_line:true,head_room:{unavailable:'',rows:[{label:'Queue cap',gib:11.3},
-              {label:'− Builds',gib:3.2},
+            runs_on:'natedev or Mac',first_in_line:true,head_room:{unavailable:'',rows:[{label:'Queue cap',gib:18.3},
+              {label:'− Builds',gib:10.2},
               {label:'− Build reserved',gib:8.1},{label:'= Free',gib:0}]}},
           {name:'cables build',unit:'cables',showrunner:'hana',since:shotAt-51*3600,
-            place:2,why:'memory',need:1,free:0,runs_on:'natedev only',because:'edits the merged checkout'},
-          {name:'cables build',unit:'cables',showrunner:'hana',since:shotAt-51*3600,
-            place:3,why:'memory',need:1,free:0,runs_on:'natedev only',because:localReason}];
+            place:2,why:'its turn',need:1,free:0,runs_on:'natedev only',because:localReason}];
+        const waitingState = {...mockState,waiters:[{...mockState.waiters[1],place:1,why:'memory',
+          first_in_line:true,because:'edits the merged checkout'}]};
         mockState.walk = [{name:'cables build',unit:'cables',showrunner:'hana',runner:'worker',worker:'codex2',
-          started_at:shotAt-840,used:3.2,reserved:8.1,counted:11.3,queued:true,machine:'natedev',
+          started_at:shotAt-840,used:3.2,reserved:2,counted:5.2,queued:true,machine:'natedev',
           progress:{kind:'RowProgress',phase:'testing',done:412,total:993,percent:100*412/993,unit:'tests'}}];
+        await show(mockState);
         // Compare every global legend reference in both covered and shortfall states.
         for(const state of [mockState,readings.head_memory,readings.head_shortfall,readings.head_swap_shortfall]) {
           await show(state);
           const references = await evaluate(`(() => {
-            const shown=shownReading(latest);
             const legend = Object.fromEntries([
-              ...RAM_BLOCKS.map(([,name,amount])=>[name,ramAmount(amount(shown.ram))]),
+              ...RAM_BLOCKS.map(([key,name])=>[name,document.getElementById('v-'+key).textContent]),
               ['Builds',document.querySelector('#v-g-builds').textContent],
               ['Free RAM',document.querySelector('#v-g-free').textContent],
               ['System reserved',document.querySelector('#v-system').textContent],
               ['Queue cap',document.querySelector('#v-cap').textContent],
               ['Everything else',document.querySelector('#v-g-else').textContent]]);
-            const keys=[...Object.keys(TIPS),...(latest.waiters||[]).flatMap((row,index)=>row.head_room?[proofTip('wait',index)]:[]),
-              ...(latest.walk.length===1 && latest.walk[0].queued ? [proofTip('row', 0)] : [])];
+            const keys=Object.keys(TIPS).filter(key=>key!=='shortfall')
+              .concat(latest.waiters.flatMap((row,index)=>row.head_room?[proofTip('wait',index)]:[]));
             return keys.flatMap(key=>tooltipRows(key,latest).flatMap(row=> {
               const label=row.label.replace(/^[+−=] /,'');
               return label in legend ? [{key,label,value:row.value,legend:legend[label]}] : [];
@@ -3838,6 +4675,9 @@ try {
           })()`);
           for(const reference of references) assert.equal(reference.value,reference.legend,
             'A tooltip changes a legend amount: '+JSON.stringify(reference));
+          const swapNote = await evaluate("document.querySelector('#swap-reserve').textContent");
+          const swapLegend = references.find(reference=>reference.key==='swap' && reference.label==='Swap coming back');
+          assert.equal(swapNote,`Swap coming back: ${swapLegend.legend}`);
           const capSums=await evaluate(`Object.keys(TIPS).concat((latest.waiters||[]).map((row,index)=>proofTip('wait',index)))
             .map(key=>({key,rows:tooltipRows(key,latest)})).filter(tip=>tip.rows.some(row=>row.label==='Queue cap'))`);
           for(const tip of capSums) assert.ok(!tip.rows.some(row=>/Safety net|Swap coming back/.test(row.label)),
@@ -3845,15 +4685,43 @@ try {
           if (comparisonImages) comparisons.push({legendReferences:references});
         }
         await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
-        for(const [name,key] of [['waiting',proofTip('wait',1,mockState)],['first-in-line',proofTip('wait',0,mockState)],
-          ['running',proofTip('row',0,mockState)],['queue-cap','cap'],['build-reserved','reserved'],['long-reason',proofTip('wait',2,mockState)]]) {
-          const reading = mockState;
-          await show(reading);
-          await evaluate(`showTip(${JSON.stringify(key)},700,700)`);
-          await capture(name,'#tip');
-          const rows=await evaluate(`tooltipRows(${JSON.stringify(key)},latest)`);
+        const mockTips = [['queue-cap','cap'], ['waiting',null],
+          ['first-in-line',proofTip('wait',0,mockState)], ['running',proofTip('row',0,mockState)],
+          ['build-reserved','reserved'], ['long-reason',proofTip('wait',1,mockState)]];
+        await show(mockState);
+        for (const [name,mockKey] of gateMode ? mockTips.slice(0,1) : mockTips) {
+          if (name==='waiting') await show(waitingState);
+          const key = mockKey ?? proofTip('wait',0,waitingState);
+          const shape = await evaluate(`(() => {
+            showTip(${JSON.stringify(key)},700,700);
+            const grid = document.querySelector('#tip > .tip');
+            const style = getComputedStyle(grid);
+            const labels = [...grid.querySelectorAll(':scope > dt')];
+            const values = labels.map(label=>label.nextElementSibling);
+            const long = grid.querySelector('.long');
+            const box = grid.getBoundingClientRect();
+            return {grids: grid.querySelectorAll('dl').length + 1, columns:style.gridTemplateColumns.split(' ').length,
+              title:grid.querySelectorAll('dt.title').length, dark:matchMedia('(prefers-color-scheme: dark)').matches,
+              labels:labels.map(cell=>[getComputedStyle(cell).textAlign,cell.getBoundingClientRect().left]),
+              values:values.map(cell=>[getComputedStyle(cell).textAlign,cell.getBoundingClientRect().right]),
+              fits:grid.scrollWidth<=grid.clientWidth && box.left>=0 && box.right<=innerWidth &&
+                box.top>=0 && box.bottom<=innerHeight,
+              long:long ? [getComputedStyle(long).textAlign,getComputedStyle(long).gridColumn] : null,
+              rows:tooltipRows(${JSON.stringify(key)},latest)};
+          })()`);
+          const {rows, labels, values} = shape;
+          assert.deepEqual([shape.grids,shape.columns,shape.title,shape.dark,shape.fits],[1,2,1,true,true],name);
+          assert.ok(labels.every(([align,left])=>align==='left' && left===labels[0][1]),name);
+          assert.ok(values.every(([align,right])=>align==='right' && right===values[0][1]),name);
+          assert.ok(rows.every(({label,value})=>!label.includes(':') && !/[.!?]$/.test(value)),name);
+          assert.equal(new Set(rows.map(({label,value})=>label+'  '+value)).size,rows.length,name);
+          assert.deepEqual(shape.long,name==='long-reason' ? ['left','1 / -1'] : null,name);
+          await capture(name,'#tip',comparisonImages || tipDesignComparison);
+          console.log(JSON.stringify({tooltip:name,rows:rows.map(({label,value})=>[label,value]),dark:shape.dark}));
           const amounts=Object.fromEntries(rows.map(row=>[row.label,row.value]));
-          const tenths=value=>Math.round(parseFloat(value)*10);
+          if(name==='waiting') assert.deepEqual([amounts['Place in line'],amounts.Free,amounts['Short by']],
+            ['1','0.0 GiB','1.0 GiB']);
+          const tenths=memoryTenths;
           if(amounts.Free||amounts['= Free']) assert.equal(tenths(amounts['Short by']||'0'),
             Math.max(0,tenths(amounts.Needs)-tenths(amounts.Free||amounts['= Free'])));
           if(name==='first-in-line') assert.equal(tenths(amounts['= Free']),
@@ -3861,7 +4729,10 @@ try {
           if(name==='running') assert.equal(tenths(amounts['= In queue cap']),tenths(amounts.Uses)+tenths(amounts['+ Build reserved']));
           if(name==='queue-cap') assert.equal(tenths(amounts['Queue cap']),
             tenths(amounts.Builds)+tenths(amounts['+ Build reserved'])+tenths(amounts['+ Free']));
+          if(name==='build-reserved') assert.equal(tenths(amounts['= Target']),
+            Math.round(tenths(amounts['Room to grow'])*parseFloat(amounts['× Share held'])/100));
           if (comparisonImages) comparisons.push({mock:name,rows});
+          if (name==='waiting') await show(mockState);
         }
 
         // Both swap images use the same current reading and dark desktop viewport.
@@ -3875,7 +4746,7 @@ try {
             : await evaluate("document.querySelector('#tip').innerText");
           if(version==='after') {
             const share=rows.findIndex(row=>row.label==='Share held');
-            assert.equal(rows[share].value,'20%');
+            assert.equal(rows[share].value,'20.0%');
             assert.ok(!rows.some(row=>row.label==='Target'));
             assert.equal(rows.find(row=>row.kind==='title').value,'2.1 GiB');
             const alignment=await evaluate("getComputedStyle(document.querySelector('#tip dt').nextElementSibling).textAlign");
@@ -3910,6 +4781,150 @@ try {
           && document.querySelector('#tip .tip').scrollWidth<=document.querySelector('#tip .tip').clientWidth`);
         assert.ok(gateFit,'The gate tooltip clips its text.');
         await capture('gate-tooltip-dark-desktop','#tip');
+        const rowAskWidth = rowAskComparison ? 1440 : 1400;
+        const dataColumns = () => evaluate(`[...document.querySelectorAll('.walk-table th[scope="col"]:not(.row-action)')].map(cell => {
+          const box = cell.getBoundingClientRect();
+          return {text:cell.textContent,left:box.left,width:box.width};
+        })`);
+        let beforeColumns;
+        if (rowAskComparison) {
+          assert.ok(beforePage, 'The row comparison needs the previous page.');
+          await call('Emulation.setDeviceMetricsOverride', {width:rowAskWidth,height:1100,deviceScaleFactor:1,mobile:false});
+          servedReading = gateReading;
+          await navigate('before.html');
+          assert.equal(await evaluate("document.querySelectorAll('.row-add').length"), 0);
+          beforeColumns = await dataColumns();
+          await capture('before-rows-dark','#walk');
+          await navigate('memory_live.html');
+        }
+        const gateButton = `'tr[data-tip="' + proofTip('row', ${gateIndex}) + '"] .row-add'`;
+        assert.deepEqual(await evaluate(`(() => {
+          const button = document.querySelector(${gateButton});
+          return {label:button.getAttribute('aria-label'),icon:!!button.querySelector('.lucide-plus'),
+            queued:document.querySelectorAll('tr.wait .row-add').length};
+        })()`), {label:'New item for natemerge integrate',icon:true,queued:gateReading.waiters.length});
+        const actions = await evaluate(`[...document.querySelectorAll('.row-add')].map(button => {
+          const cell = button.closest('td');
+          const box = button.getBoundingClientRect();
+          return {last:cell === cell.parentElement.lastElementChild, column:cell.className,
+            left:box.left, right:box.right, width:box.width};
+        })`);
+        assert.ok(actions.length > 1);
+        for (const action of actions) {
+          assert.equal(action.last, true);
+          assert.equal(action.column, 'row-action');
+          assert.equal(action.left, actions[0].left);
+          assert.equal(action.width, 22);
+          assert.ok(action.right <= rowAskWidth, 'The action column is outside the desktop view.');
+        }
+        if (rowAskComparison) {
+          assert.deepEqual(await dataColumns(), beforeColumns, 'The action column moved a data column.');
+          await capture('after-rows-dark','#walk');
+        }
+        const rowAskStep = async (step, expression) => {
+          let timer;
+          try {
+            return await Promise.race([evaluate(expression), new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error(step + ' timed out.')), 5000);
+            })]);
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+        const openRowAsk = () => rowAskStep('Load New item recipients', `(async () => {
+          const dialog = document.querySelector('#review-new-item');
+          const loaded = new Promise(resolve => {
+            const options = dialog.querySelector('[data-recipients]');
+            const observer = new MutationObserver(() => {
+              if (options.querySelector('input')) { observer.disconnect(); resolve(); }
+            });
+            observer.observe(options, {childList:true});
+          });
+          document.querySelector(${gateButton}).click();
+          await loaded;
+          const preview = dialog.querySelector('.new-item-evidence .tip');
+          const tooltip = document.createElement('template');
+          tooltip.innerHTML = tooltipHtml(proofTip('row', ${gateIndex}), latest);
+          const bounds = dialog.getBoundingClientRect();
+          const regions = [dialog.querySelector('.new-item-body'), preview, ...preview.children];
+          return {open:dialog.matches(':modal'),
+            recipient:dialog.querySelector('[name="recipient_id"]:checked').value,
+            kind:dialog.querySelector('[name="kind"]:checked').value, sameTip:preview.isEqualNode(tooltip.content.firstElementChild),
+            fits:bounds.left >= 0 && bounds.right <= innerWidth && bounds.top >= 0 && bounds.bottom <= innerHeight &&
+              regions.every(region => region.scrollWidth <= region.clientWidth),
+            evidence:dialog.querySelector('.new-item-evidence').textContent};
+        })()`);
+        const checkRowAsk = dialog => {
+          assert.deepEqual({...dialog,evidence:undefined},
+            {open:true,recipient:'fixture-builds',kind:'question',sameTip:true,fits:true,evidence:undefined});
+          assert.ok(dialog.evidence.includes(gateAbout) && dialog.evidence.includes('Overall memory'));
+        };
+        const submitRowAsk = async row => {
+          submittedItem = undefined;
+          const result = await rowAskStep('Send New item evidence', `(async () => {
+            const dialog = document.querySelector('#review-new-item');
+            const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+            const words = dialog.querySelector('textarea');
+            words.value = 'Can we check this gate?';
+            words.dispatchEvent(new Event('input', {bubbles:true}));
+            dialog.querySelector('[type="submit"]').click();
+            const closedAtSend = !dialog.open;
+            const {detail} = await created;
+            return {closedAtSend,id:detail.id};
+          })()`);
+          assert.deepEqual(result, {closedAtSend:true,id:'Q1'});
+          assert.equal(submittedItem.recipient_id, 'fixture-builds');
+          assert.equal(submittedItem.words, 'Can we check this gate?');
+          const evidence = submittedItem.evidence;
+          assert.equal(evidence.kind, 'build-step');
+          assert.equal(evidence.step_id, row.key);
+          assert.equal(evidence.title, row.name);
+          assert.equal(evidence.owner, row.showrunner);
+          assert.ok(evidence.cells.some(cell => cell.label === 'Machine' && cell.value === 'natedev'));
+          assert.ok(evidence.cells.every(cell => cell.label), 'Evidence includes the action column.');
+          assert.ok(evidence.memory.segments.some(segment => segment.label === 'Queued builds' && segment.gib > 0));
+          assert.ok(evidence.tip.some(entry => entry.label === 'Changes' && entry.value === 'sdlc branch'));
+          assert.ok(evidence.tip.some(entry => entry.kind === 'detail' && entry.text === gateAbout));
+        };
+        checkRowAsk(await openRowAsk());
+        if (rowAskComparison) await capture('after-dialog-dark','#review-new-item');
+        await submitRowAsk(gateRow);
+
+        const evidenceReading = structuredClone(gateReading);
+        const evidenceRow = evidenceReading.walk[gateIndex];
+        Object.assign(evidenceRow, {key:'gate-without-unit', name:'Builds gate', unit:'',
+          title:{unit:'', step:'Builds gate'}, showrunner:'builds'});
+        delete evidenceRow.started_by;
+        await show(evidenceReading);
+        checkRowAsk(await openRowAsk());
+        await submitRowAsk(evidenceRow);
+        if (!gateMode) {
+          await call('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
+          const mobileActions = await evaluate(`(async () => {
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const scroll = document.querySelector('.walk-scroll');
+            const buttons = [...scroll.querySelectorAll('.row-add')];
+            return {width:innerWidth, pageFits:document.documentElement.scrollWidth <= innerWidth,
+              buttons:buttons.map(button => {
+                button.scrollIntoView({block:'center',inline:'nearest'});
+                scroll.scrollLeft = scroll.scrollWidth;
+                const bounds = button.getBoundingClientRect(), clip = scroll.getBoundingClientRect();
+                const hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+                const visible = bounds.width === 22 && bounds.height === 22 && bounds.left >= clip.left &&
+                  bounds.right <= clip.right && bounds.left >= 0 && bounds.right <= innerWidth && button.contains(hit);
+                return {visible,bounds:bounds.toJSON(),clip:clip.toJSON(),hit:hit?.tagName};
+              })};
+          })()`);
+          assert.equal(mobileActions.width, 390);
+          assert.ok(mobileActions.pageFits && mobileActions.buttons.length === actions.length &&
+            mobileActions.buttons.every(button => button.visible),
+            'A plus button is clipped or the page overflows at 390 px. ' + JSON.stringify(mobileActions));
+          await evaluate(`document.querySelector(${gateButton}).scrollIntoView({block:'center',inline:'nearest'})`);
+          checkRowAsk(await openRowAsk());
+          await evaluate("document.querySelector('#review-new-item [data-cancel]').click()");
+          await call('Emulation.setDeviceMetricsOverride',
+            {width:rowAskWidth,height:1100,deviceScaleFactor:1,mobile:false});
+        }
         if (awsCostsComparison) {
           servedReading = readings.aws_costs;
           await navigate('memory_live.html');
@@ -3920,12 +4935,38 @@ try {
           await show(base);
           await evaluate('hideTip()');
           const endClip=await evaluate(`(() => {
-            const start=document.querySelector('#swap').getBoundingClientRect();
-            const bottom=document.querySelector('main').getBoundingClientRect().bottom;
-            return {x:0,y:start.top+scrollY,width:innerWidth,height:bottom-start.top+24,scale:1};
+            document.querySelector('[data-page-action="builds-swap"]').click();
+            const box=document.querySelector('#builds-swap-dialog').getBoundingClientRect();
+            return {x:box.left,y:box.top+scrollY,width:box.width,height:box.height,scale:1};
           })()`);
           await saveScreenshot('after-dark-desktop',{captureBeyondViewport:true,clip:endClip});
+          await evaluate("document.querySelector('#builds-swap-dialog [data-close]').click()");
         }
+
+        await show(base);
+        const [[captureRequest]] = await Promise.all([
+          once(server, 'page-capture', {signal:AbortSignal.timeout(5000)}),
+          evaluate(`(() => {
+            document.querySelector('#pill').click();
+            document.querySelector('#builds-swap-dialog [data-owner-new]').click();
+            return document.querySelector('#review-new-item').matches(':modal');
+          })()`).then(open => assert.ok(open, 'New item does not open above Swap.')),
+        ]);
+        assert.equal(captureRequest.place, '/memory_live.html#console-window=builds-swap-dialog');
+        const captureDialogs = await evaluate(`(async () => {
+          const frame = document.createElement('iframe');
+          frame.src = ${JSON.stringify(captureRequest.place)};
+          frame.style.cssText = 'position:fixed;left:-2000px;width:1400px;height:1100px';
+          const loaded = new Promise(resolve => frame.addEventListener('load', resolve, {once:true}));
+          document.body.append(frame);
+          try {
+            await loaded;
+            return [...frame.contentDocument.querySelectorAll('dialog:modal')].map(dialog => dialog.id);
+          } finally {
+            frame.remove();
+          }
+        })()`);
+        assert.deepEqual(captureDialogs, ['builds-swap-dialog'], 'The screenshot address does not restore Swap.');
 
         if (comparisonImages) {
           await writeFile(join(folder,'proof.json'),JSON.stringify({proofs,comparisons,

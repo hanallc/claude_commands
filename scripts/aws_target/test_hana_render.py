@@ -33,7 +33,7 @@ UNSHIPPED_IMPORTS = {
     'build_queue/admission_client.py': {'accounts/__init__.py', 'accounts/outage_alerts.py',
         'message/send_budget.py', 'message/send_result.py', 'message/session_send.py', 'notify/push_texts.py'},
     'build_queue/first_step.py': {'build_hold/build_hold.py'},
-    'build_queue/slot_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
+    'build_queue/queue_wait.py': {'hooks/checkpoint_gate.py', 'lib/shell_test_support.py'},
     'build_queue/snapshot_codec.py': {'message/unit_labels.py'},
     'build_queue/step_estimator.py': {'lint/tmp_sweep.py'},
     'buildlog/record.py': {'aws_target/config.py', 'direct/step_record.py'},
@@ -48,7 +48,7 @@ UNSHIPPED_IMPORTS = {
     'lint/memory_admit.py': {'message/unit_labels.py'},
     'mac_test/claim_state.py': {'buildlog/transfer_bytes.py'},
     'production/staff.py': {'agents/worker_lifecycle.py', 'agents/remote.py', 'lib/operation_environment.py',
-        'accounts/__init__.py', 'accounts/role_map.py'},
+        'accounts/__init__.py', 'accounts/role_map.py', 'message/address.py'},
 }
 
 
@@ -114,7 +114,6 @@ class HanaRenderTests(unittest.TestCase):
                 + '# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n'
                 + 'patterns.tool={purpose}\npatterns.tool.fixture-guest={purpose}{suffix}\n'
                 + 'roots.build=/default/build\nroots.build.fixture-guest=/fixture/build\n'
-                + 'roots.slots.fixture-guest=/fixture/slots\n'
                 + 'slots.fixture-guest.hana.max=3\nslots.fixture-guest.hana.max_bytes=1000\n')
             _ = folders.write_text(folder_values)
             (checkout / 'config').mkdir(exist_ok=True)
@@ -308,9 +307,9 @@ class HanaRenderTests(unittest.TestCase):
             imported = subprocess.run([sys.executable, '-IB', '-c',
                 'import sys; sys.path.insert(0, sys.argv[1]); '
                 + 'from scripts.aws_target import hana_runner, hana_protocol; '
-                + 'from scripts.build_queue import slot_wait; '
+                + 'from scripts.build_queue import queue_wait; '
                 + 'from scripts.copies import copies; '
-                + 'from scripts.lib import build_slots, git_rescue; '
+                + 'from scripts.lib import build_copies, git_rescue; '
                 + 'assert copies.checked_owner("hana") == "hana"; '
                 + 'assert not any(name in sys.modules for name in '
                 + '("scripts.agents.remote", "scripts.aws_target.aws_cli", "scripts.aws_target.hana_provider", '

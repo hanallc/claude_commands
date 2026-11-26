@@ -53,12 +53,12 @@ An addressed reviewer's lens comes from dispatch evidence.
 - A reword of a file with a kept context fails the repository test until that file's kept text in `role_terms.toml` is refreshed.
 - Stored record fields and addresses that hold a retired word are kept contracts. `role_terms.toml` lists each one, and a change to one adds a kept context in the same change.
 - `Job` values equal their first display name, so key and display text look the same. Code uses the key.
-- The broadcast line is a contract with its readers: `zone.py` counts ` - sent\b`, and the Codex winddown tests parse it. Change them together.
+- `zone.py` counts broadcast lines that match ` - sent\b`. Update both files if the line format changes.
 - A config edit does not retitle a live tab. Fixtures pass a config path or patch `runtime_names`, and never read the live config.
 
 ## Why
 
-- **A merge-gate check, not a periodic review.** A retired name that returns fails at once, in the change that brought it back.
+- **A gate check, not a periodic review.** A retired name that returns fails at once, in the change that brought it back.
 - **Per-file kept contexts.** Global path masking would hide a returning name in a kept file.
 - **Explicit inflected forms.** A general English plural rule would match words with other meanings.
 - **No count in a plain check.** The sentence count is not a finding, and it sets a floor of about 2.5 s.

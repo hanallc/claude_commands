@@ -808,8 +808,8 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
-        override_fixture_settings(self.root / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
-        override_fixture_settings(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
+        override_fixture_settings(self.root / "gate.conf", "gate_time_limit_factor=2")
+        override_fixture_settings(self.root / "test_times.conf", "top_runs=3\ngate_failure_log_kib=4")
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
         override_fixture_settings(self.root / 'cloud_gate.conf',
             '# one of: on, off\nenabled=on\n'
@@ -3824,6 +3824,47 @@ wait_for_watchdog()
 
 
 class GateDispatchJournalTests(unittest.TestCase):
+    def test_assigned_route_preserves_a_verdict_with_open_settlement(self) -> None:
+        assignment = aws_gate_assignment().assignment
+        claim = placement.assigned_claim_reference(assignment)
+        root = Path('/fixture')
+        binding = ledger.GateDispatchBinding(claim, root / 'journal.json', root / 'aws',
+                                             root / 'build_targets.conf', root / 'aws_target.conf')
+        dispatch = cloud_gate.AssignedCloudGate(binding, placement.ClaimHolderIdentity('fixture', 1, '1'))
+        pending = placement.DispatchPathPending('The worker\n\tstill holds the lock')
+        declined = cloud_gate.CloudDeclined('No worker verdict')
+
+        with (mock.patch.object(cloud_gate, 'begin_assigned_gate', return_value=dispatch),
+              mock.patch.object(ledger.GateDispatchJournal, 'settle', return_value=pending) as settle,
+              mock.patch.object(admission_client, 'consume_permission', return_value=wire.FirstAuthorization(assignment, claim)),
+              mock.patch.object(admission_client, 'report_execution') as report,
+              mock.patch.object(cloud_gate, 'run') as run):
+            for status in (0, 1):
+                with self.subTest(status=status), redirect_stderr(StringIO()) as errors:
+                    verdict = gate.GateRun((gate.GateJobResult('fixture', 'test_ok.py', status, 1, ''),), 1, 2)
+                    run.return_value = cloud_gate.CloudCompleted(verdict)
+                    result = cloud_gate.route(root, mode=gate.SuiteMode.GATE, full=True,
+                                              module_time_limit_s=10, assignment=assignment)
+                    self.assertIs(result, verdict)
+                    self.assertEqual(errors.getvalue(), 'AWS gate settlement remains open. The worker still holds the lock\n')
+                    report.assert_called_once()
+                    sent = cast(wire.ExecutionReport, report.call_args.args[0])
+                    self.assertEqual((sent.claim, sent.outcome, sent.path),
+                                     (claim, placement.AttemptCompleted(status), pending))
+                    report.reset_mock()
+
+            run.return_value = declined
+            with redirect_stderr(StringIO()) as errors, self.assertRaises(gate.AwsGateLaunchPending) as raised:
+                _ = cloud_gate.route(root, mode=gate.SuiteMode.GATE, full=True,
+                                     module_time_limit_s=10, assignment=assignment)
+            self.assertEqual(str(raised.exception), f'{pending.reason}. {declined.reason}')
+            self.assertEqual(errors.getvalue(), '')
+            report.assert_called_once()
+            sent = cast(wire.ExecutionReport, report.call_args.args[0])
+            self.assertEqual((sent.claim, sent.outcome, sent.path),
+                             (claim, placement.AttemptDeclined(declined.reason), pending))
+            self.assertEqual(settle.call_args_list, [mock.call(claim, dispatch.holder)] * 3)
+
     def test_assigned_route_reports_no_launch_or_an_unknown_result(self) -> None:
         for launch_pending in (False, True):
             with self.subTest(launch_pending=launch_pending), TemporaryDirectory() as directory:
@@ -4045,6 +4086,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                           redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
                         for patch in (mock.patch.object(gate, 'BuildHoldWait'),
                                       mock.patch.object(gate, 'fetch_branches'),
+                                      mock.patch.object(gate, 'gate_production', return_value=repo),
                                       mock.patch.object(gate, 'change_review_list', return_value=(repo, None)),
                                       mock.patch.object(change_review, 'missing', return_value=[]),
                                       mock.patch.object(change_review, 'unit_producer', return_value=None),
@@ -5435,7 +5477,6 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                     self.assertIn('--property=UnsetEnvironment=AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_CONFIG_FILE AWS_PROFILE', command)
 
     def test_forwarded_worker_records_keep_the_callers_labels_and_unit(self) -> None:
-        override_fixture_settings(self.root / 'build_steps.conf', 'owned.gate={unit} merge\n')
         owner = UnitLabels('fixture caller', 'fixture-production', 'fixture-unit', OwnerRole.UNIT)
         for paired in (False, True):
             for session_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):

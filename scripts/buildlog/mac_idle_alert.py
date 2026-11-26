@@ -170,7 +170,9 @@ def alert_line(path: Path, now: float, zone: ZoneInfo, *, block: BlockText = Blo
     if saved["state"] == "unreachable":
         if live_agrees is not None and not live_agrees(saved):
             return quiet
-        return f"MAC UNREACHABLE until {clock_text(saved['until'], zone)}: {waiting_steps_text(waiting)} for the Mac."
+        if saved["until"] > now:
+            return f"MAC UNREACHABLE until {clock_text(saved['until'], zone)}: {waiting_steps_text(waiting)} for the Mac."
+        return f"MAC UNREACHABLE: the last probe failed: {waiting_steps_text(waiting)} for the Mac."
     elapsed = now - saved["since"]
     if elapsed < settings.alert_seconds or (saved["cause"] == "blocked" and block is BlockText.OMITTED):
         return quiet

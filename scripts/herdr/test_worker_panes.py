@@ -28,6 +28,7 @@ from weakref import finalize
 
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import fake_unit_host, staff, worker_admission
+from scripts.production.production_doc import EnrolledPaths
 from scripts.herdr import herdr_types
 from scripts.agents import pane_record, restart, stop_resume
 from scripts.agents.stop_results import SourceReleased
@@ -46,6 +47,13 @@ from scripts.agents import detached_run_process, detached_runs, worker_lifecycle
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 LAUNCH_PREPARED_AGENT = herdr.launch_prepared_agent
+
+
+def prepare_recorder_history(path: Path) -> Path:
+    """Create the recorder history file if it is absent."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+    return path
 
 
 def final_reply(row: staff.StaffRow, message: str = "The conversation is complete.") -> None:
@@ -132,17 +140,19 @@ class PaneWorld(herdr.Herdr):
         """Install shared accounts, configuration, and process facts."""
         config = test.root / "conf"
         config.mkdir()
-        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                          + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
-                          + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
-                          + "WORKER_FIRST_TURN_TEXT=Reply with ready. Do not use tools.\n"
-                          + "# range: 1..600\nWORKER_FIRST_TURN_SECONDS=120\n"
-                          + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
-                          + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
-        write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=2\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=2\n")
+        write_text_atomic(config / "direct.conf", "# range: 0.1..0.9\nworker_split_ratio=0.667\n"
+                          + "# whole: 1..\nunit_compact_above_tokens=43000\n"
+                          + "# range: 1..1800\nworker_compact_seconds=300\n"
+                          + "worker_first_turn_text=Reply with ready. Do not use tools.\n"
+                          + "# range: 1..600\nworker_first_turn_seconds=120\n"
+                          + "# range: 0.01..600\nworker_publish_lock_seconds=15\n"
+                          + "# range: 1..600\npane_agent_start_seconds=90\n")
+        write_text_atomic(config / "shutdown.conf", "# whole: 1..300\nstop_grace_seconds=2\n# whole: 1..300\nkill_grace_seconds=2\n# whole: 1..300\nmove_stop_margin_seconds=2\n")
         _ = write_config_fixture(config / "codex_daemon.conf", "# range: 0.001..\ntimeout_seconds=1\n"
                           + "agents_slice=app-agents.slice\n")
         _ = write_config_fixture(config / "script_prompts.conf", "# whole: 1..\nmax_records=4096\n")
+        for name in ("detached_runs.conf", "postmaster.conf"):
+            _ = write_config_fixture(config / name)
         registry = write_registry(config / "models.conf")
         _ = cast(object, test.enterContext(patch.dict(os.environ, {
             "XDG_STATE_HOME": str(test.root / "state"), "CONF_DIR": str(config),
@@ -250,8 +260,7 @@ class PaneWorld(herdr.Herdr):
     def process_start(self, pid: int) -> str | None:
         """Read the process generation from the private stat file."""
         if pid in self.processes:
-            with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
-                observed = process_start.process_start(pid)
+            observed = process_start.proc_table_start(pid, self.process_root)
         else:
             observed = process_start.process_start(pid)
         return observed.start if isinstance(observed, process_start.Started) else None
@@ -262,8 +271,7 @@ class PaneWorld(herdr.Herdr):
         observed_start = process_start.process_start
         def read(pid: int) -> process_start.ProcessStart:
             if pid in self.processes:
-                with patch.dict(os.environ, {"VERIFY_PROC_ROOT": str(self.process_root)}):
-                    return observed_start(pid)
+                return process_start.proc_table_start(pid, self.process_root)
             return observed_start(pid)
         with patch.object(process_start, "process_start", side_effect=read):
             yield
@@ -383,7 +391,7 @@ class PaneWorld(herdr.Herdr):
                                          if identity.split(":p")[-1].isdigit()), default=0))
             anchor = self.locations[destination.of_pane]
             self.locations[pane] = {**anchor, "pane_id": pane, "label": destination.label,
-                                    "terminal_id": "terminal-" + pane, "focused": False}
+                                    "terminal_id": "terminal-" + pane, "focused": False, "agent_status": "idle"}
             _ = self.locations[pane].pop("agent_session", None)
             self.split_leaf(destination.of_pane, pane, destination.direction, destination.ratio)
         else:
@@ -942,11 +950,11 @@ class WorkerPaneTests(StaffTestCase):
         run = Path(os.environ["UNIT_RUN_DIR"])
         state = run / "progress_history_state.json"
         if not state.exists():
-            run.mkdir(exist_ok=True)
+            history = prepare_recorder_history(run / "history.jsonl")
             write_text_atomic(state, json.dumps({"owner_staff_id": self.parent.id, "working_dir": str(self.root),
                 "open_phases": [{"id": "earlier", "title": "Earlier", "instance_id": "earlier-phase", "started_at": 1,
                                  "status": "active"}], "pass": {}, "events": [],
-                "history_file": str(run / "history.jsonl"),
+                "history_file": str(history),
                 "main_agent": {"session_id": self.parent.current_session, "family": "claude",
                                "model": "fixture", "effort": "high"}}))
         return run
@@ -976,8 +984,10 @@ class WorkerPaneTests(StaffTestCase):
                 write_text_atomic(prompt, "Preserve the source behavior.\n")
                 _ = progress_history.begin_dispatch(run, slot="impl", phase="earlier", role="impl",
                     worker_name=row.name, worker_id=row.id, launcher_command=[], prompt=prompt, kind="impl", lens="")
-                self.record_command("finish-pass", "--status", status, "--orphaned-launcher", at=3)
                 before = self.staff_state()
+                self.record_command("finish-pass", "--status", status, "--orphaned-launcher", at=3)
+                if status == "canceled":
+                    self.assertEqual(self.world.closed, [*expected, (pane, "terminal-" + pane)])
                 result = worker_panes.close(self.parent.id, staff.WorkerName.parse(row.name))
                 self.assertIsInstance(result, worker_panes.Closed)
                 expected.append((pane, "terminal-" + pane))
@@ -985,8 +995,11 @@ class WorkerPaneTests(StaffTestCase):
                 self.assertEqual(self.staff_state(), before)
 
     def test_pass_end_and_restore_close_an_interrupted_worker_without_a_reply_and_keep_a_live_turn(self) -> None:
+        from scripts.message import send
         from scripts.production import worker
 
+        _ = self.enterContext(patch.object(send, "delivery_timeout", return_value=1.0))
+        _ = self.enterContext(patch.object(send, "send", return_value=send.Result("sent", "fixture director")))
         cases = (("restore", "idle"), ("restore", "done"), ("restore", "working"),
                  ("finish-phase", "idle"), ("finish-phase", "working"), ("finish-run", "idle"))
         for index, (operation, status) in enumerate(cases, start=1):
@@ -1294,7 +1307,7 @@ class WorkerPaneTests(StaffTestCase):
     def test_failed_published_worker_closes_its_created_pane_and_keeps_its_row(self) -> None:
         name = staff.WorkerName.parse("held-lock")
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("WORKER_PUBLISH_LOCK_SECONDS=15", "WORKER_PUBLISH_LOCK_SECONDS=0.05"))
+        write_text_atomic(config, config.read_text().replace("worker_publish_lock_seconds=15", "worker_publish_lock_seconds=0.05"))
         flock = fcntl.flock
 
         def acquire(handle: int | worker_lifecycle.LockFileDescriptor, operation: int) -> None:
@@ -1354,7 +1367,7 @@ class WorkerPaneTests(StaffTestCase):
         assert isinstance(opened, worker_panes.OpenWorker)
         self.completed_dispatch(opened.row, "impl")
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=37"))
+        write_text_atomic(config, config.read_text().replace("pane_agent_start_seconds=90", "pane_agent_start_seconds=37"))
         before = time.monotonic()
         changed = self.start(role="review")
         after = time.monotonic()
@@ -1626,8 +1639,8 @@ class WorkerPaneTests(StaffTestCase):
         self.assertIn(["-c", "notice.hide_rate_limit_model_nudge=true"],
                       [arguments[index:index + 2] for index in range(len(arguments) - 1)])
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
-                                                             "UNIT_COMPACT_ABOVE_TOKENS=67000"))
+        write_text_atomic(config, config.read_text().replace("unit_compact_above_tokens=43000",
+                                                             "unit_compact_above_tokens=67000"))
         self.world.end_agent(first.pane)
         resumed = self.start("reviewer", "review")
         self.assertIsInstance(resumed, worker_panes.OpenWorker)
@@ -1667,8 +1680,8 @@ class WorkerPaneTests(StaffTestCase):
     def test_claude_launch_ignores_the_codex_compaction_limit(self) -> None:
         _ = write_registry(self.root / "conf/models.conf", {"assignments": {"direct": "claude"}})
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
-                                                             "UNIT_COMPACT_ABOVE_TOKENS=invalid"))
+        write_text_atomic(config, config.read_text().replace("unit_compact_above_tokens=43000",
+                                                             "unit_compact_above_tokens=invalid"))
         self.assertIsInstance(self.start(), worker_panes.OpenWorker)
         family, arguments, _ = self.world.requests[-1]
         self.assertEqual(family, "claude")
@@ -1686,8 +1699,8 @@ class WorkerPaneTests(StaffTestCase):
         original = config.read_text()
         for index, value in enumerate(("", "invalid", "0", "-1", "1.5")):
             with self.subTest(value=value):
-                write_text_atomic(config, original.replace("UNIT_COMPACT_ABOVE_TOKENS=43000",
-                                                           "UNIT_COMPACT_ABOVE_TOKENS=" + value))
+                write_text_atomic(config, original.replace("unit_compact_above_tokens=43000",
+                                                           "unit_compact_above_tokens=" + value))
                 result = self.start(f"compact-{index}")
                 self.assertIsInstance(result, worker_panes.OpenWorker)
                 family, arguments, _ = self.world.requests[-1]
@@ -1915,7 +1928,7 @@ class WorkerPaneTests(StaffTestCase):
     def test_first_turn_reads_its_text_and_wait_limit_from_configuration(self) -> None:
         path = self.root / "conf/direct.conf"
         write_text_atomic(path, path.read_text().replace("Reply with ready. Do not use tools.", "Reply with configured-ready.")
-                          .replace("WORKER_FIRST_TURN_SECONDS=120", "WORKER_FIRST_TURN_SECONDS=45"))
+                          .replace("worker_first_turn_seconds=120", "worker_first_turn_seconds=45"))
         with patch.object(time, "monotonic", return_value=100.0):
             result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.OpenWorker)
@@ -1960,19 +1973,19 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_configured_launch_timeout_applies_to_fresh_start_and_resume(self) -> None:
         path = self.root / "conf/direct.conf"
-        write_text_atomic(path, path.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=37"))
+        write_text_atomic(path, path.read_text().replace("pane_agent_start_seconds=90", "pane_agent_start_seconds=37"))
         opened = self.start("reviewer", "review")
         self.assertIsInstance(opened, worker_panes.OpenWorker)
         assert isinstance(opened, worker_panes.OpenWorker)
         self.assertTrue(self.world.stop(opened.row, self.world))
-        write_text_atomic(path, path.read_text().replace("PANE_AGENT_START_SECONDS=37", "PANE_AGENT_START_SECONDS=61"))
+        write_text_atomic(path, path.read_text().replace("pane_agent_start_seconds=37", "pane_agent_start_seconds=61"))
         resumed = self.start("reviewer", "review")
         self.assertIsInstance(resumed, worker_panes.OpenWorker)
         self.assertEqual(self.world.launch_timeouts, [37000, 61000])
 
     def test_unusable_launch_timeout_refuses_start_without_a_split(self) -> None:
         path = self.root / "conf/direct.conf"
-        write_text_atomic(path, path.read_text().replace("PANE_AGENT_START_SECONDS=90", "PANE_AGENT_START_SECONDS=invalid"))
+        write_text_atomic(path, path.read_text().replace("pane_agent_start_seconds=90", "pane_agent_start_seconds=invalid"))
         result = self.start()
         self.assertIsInstance(result, worker_panes.StartRefused)
         assert isinstance(result, worker_panes.StartRefused)
@@ -2021,7 +2034,7 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_missing_report_at_the_first_turn_deadline_closes_the_unpublished_pane(self) -> None:
         path = self.root / "conf/direct.conf"
-        write_text_atomic(path, path.read_text().replace("WORKER_FIRST_TURN_SECONDS=120", "WORKER_FIRST_TURN_SECONDS=1"))
+        write_text_atomic(path, path.read_text().replace("worker_first_turn_seconds=120", "worker_first_turn_seconds=1"))
         self.world.report_reads_before_publish = 1000000
         result = self.start("reviewer", "review")
         self.assertIsInstance(result, worker_panes.UnpublishedWorker)
@@ -2353,12 +2366,12 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_first_split_uses_the_private_live_ratio_and_the_next_split_is_below_it(self) -> None:
         config = self.root / "conf/direct.conf"
-        write_text_atomic(config, config.read_text().replace("WORKER_SPLIT_RATIO=0.667", "WORKER_SPLIT_RATIO=0.25"))
+        write_text_atomic(config, config.read_text().replace("worker_split_ratio=0.667", "worker_split_ratio=0.25"))
         first = self.start("first")
         self.assertIsInstance(first, worker_panes.OpenWorker)
         assert isinstance(first, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches[0], herdr.SplitPane("w1:p0", "right", 0.25, "unit-first"))
-        write_text_atomic(config, config.read_text().replace("WORKER_SPLIT_RATIO=0.25", "WORKER_SPLIT_RATIO=0.75"))
+        write_text_atomic(config, config.read_text().replace("worker_split_ratio=0.25", "worker_split_ratio=0.75"))
         second = self.start("second")
         self.assertIsInstance(second, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches[1], herdr.SplitPane(first.pane, "down", 0.75, "unit-second"))
@@ -3067,20 +3080,62 @@ class WorkerPaneTests(StaffTestCase):
         self.assertEqual(self.world.launches, [])
 
     def test_showrunner_can_start_a_worker(self) -> None:
-        self.parent_id = fixture_member("showrunner", name="showrunner").id
+        main, integration, run = (self.root / name for name in ("main", "integration", "review-run"))
+        for directory in (main, integration, run):
+            directory.mkdir()
+        doc = main / "production-live.md"
+        paths = EnrolledPaths(main=main, live_doc=doc, log=main / "LOG.md", notes=main / "notes", integration=integration)
+        legacy = fixture_member("showrunner", name="legacy-showrunner")
+        enrolled = fixture_member("showrunner", name="enrolled-showrunner", doc=staff.LiveDoc("natedev", doc))
         self.world.foreground.clear()
-        self.world.add(self.parent, "w1:p0")
-        with patch.dict(os.environ, {"CODEX_THREAD_ID": self.parent.current_session}):
-            code, _, errors = self.command("start-or-resume", "helper", "--role", "test")
-        self.assertEqual(code, worker_panes.ExitCode.OK, errors)
-        self.assertEqual(len(staff.snapshot().find(kind="worker", parent=self.parent.id)), 1)
+        self.world.add(legacy, "w2:p0", workspace="w2", tab="w2:t0")
+        self.world.add(enrolled, "w3:p0", workspace="w3", tab="w3:t0")
+        assignments: tuple[tuple[staff.StaffRow, staff.WorkerRole, Literal["claude", "codex"]], ...] = (
+            (legacy, "test", "codex"), (enrolled, "review", "claude"), (enrolled, "astra-reviewer", "codex"))
+        with patch.object(worker_panes, "resolve_production_paths", return_value=paths):
+            _ = staff.set_run(enrolled.id, staff.OpenRun(self.root))
+            with self.subTest(run="recorded run contains both checkouts"):
+                refused = worker_panes.start_or_resume(enrolled.id, staff.WorkerName.parse("review"), "review")
+                self.assertIsInstance(refused, worker_panes.AdmissionRefused)
+                self.assertEqual(self.world.launches, [])
+            _ = staff.set_run(enrolled.id, staff.OpenRun(run))
+            for owner, role, family in assignments:
+                with self.subTest(owner=owner.name, role=role, family=family):
+                    self.parent_id = owner.id
+                    if owner.id == legacy.id:
+                        with patch.dict(os.environ, {"CODEX_THREAD_ID": owner.current_session}):
+                            code, _, errors = self.command("start-or-resume", "helper", "--role", role)
+                        self.assertEqual(code, worker_panes.ExitCode.OK, errors)
+                        self.assertEqual(len(staff.snapshot().find(kind="worker", parent=owner.id)), 1)
+                        continue
+                    selected = worker_panes.LaunchPolicy(models_registry.LaunchSettings(family, "fixture", "high", ""),
+                                                         "read-only", "plan")
+                    name = staff.WorkerName.parse(role)
+                    opened = worker_panes.start_or_resume(self.parent.id, name, role, policy=selected)
+                    self.assertIsInstance(opened, worker_panes.OpenWorker)
+                    assert isinstance(opened, worker_panes.OpenWorker)
+                    self.assertEqual(self.world.locations[opened.pane]["cwd"], str(main))
+                    pid, backend, arguments = self.world.foreground[opened.pane]
+                    if family == "claude":
+                        self.assertEqual(arguments[arguments.index("--tools") + 1], "Read,Grep,Glob")
+                        self.assertEqual(arguments[arguments.index("--permission-mode") + 1], "plan")
+                    else:
+                        self.assertEqual(arguments[arguments.index("--sandbox") + 1], "read-only")
+                        self.assertEqual(arguments[arguments.index("--ask-for-approval") + 1], "never")
+                        unsafe = arguments.copy()
+                        unsafe[unsafe.index("--sandbox") + 1] = "danger-full-access"
+                        self.world.foreground[opened.pane] = (pid, backend, unsafe)
+                        result = worker_panes.start_or_resume(self.parent.id, name, role, policy=selected)
+                        self.assertIsInstance(result, worker_panes.AdmissionRefused)
+            self.assertEqual(len(self.world.launches), 3)
+            self.assertEqual(len(staff.snapshot().find(kind="worker", parent=enrolled.id)), 2)
 
     def test_unusable_configuration_opens_no_split(self) -> None:
         config = self.root / "conf/direct.conf"
         original = config.read_text()
         for value in ("0.01", "0.99", "invalid"):
             with self.subTest(value=value):
-                write_text_atomic(config, original.replace("WORKER_SPLIT_RATIO=0.667", "WORKER_SPLIT_RATIO=" + value))
+                write_text_atomic(config, original.replace("worker_split_ratio=0.667", "worker_split_ratio=" + value))
                 result = self.start()
                 self.assertIsInstance(result, worker_panes.StartRefused)
                 assert isinstance(result, worker_panes.StartRefused)
@@ -3089,8 +3144,8 @@ class WorkerPaneTests(StaffTestCase):
 
     def test_split_uses_the_range_from_configuration(self) -> None:
         path = self.root / "conf/direct.conf"
-        write_text_atomic(path, path.read_text().replace("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667",
-                                                          "# range: 0.05..0.95\nWORKER_SPLIT_RATIO=0.95"))
+        write_text_atomic(path, path.read_text().replace("# range: 0.1..0.9\nworker_split_ratio=0.667",
+                                                          "# range: 0.05..0.95\nworker_split_ratio=0.95"))
         result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)
         self.assertEqual(self.world.launches, [herdr.SplitPane("w1:p0", "right", 0.95, "unit-impl2")])
@@ -3101,7 +3156,7 @@ class WorkerPaneTests(StaffTestCase):
                            "commit", "-qm", "private configuration")):
             _ = subprocess.run(["git", "-C", str(self.root), *arguments], check=True, capture_output=True,
                                text=True, timeout=TEST_HANG_GUARD_SECS)
-        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nWORKER_SPLIT_RATIO=invalid\n")
+        write_text_atomic(self.root / "conf/direct.conf", "# range: 0.1..0.9\nworker_split_ratio=invalid\n")
         with redirect_stderr(io.StringIO()) as errors:
             result = self.start()
         self.assertIsInstance(result, worker_panes.OpenWorker)

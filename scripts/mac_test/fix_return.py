@@ -56,6 +56,7 @@ import subprocess
 import sys
 from typing import Literal, TypedDict, cast
 
+from scripts.buildlog import repository, store
 from scripts.lib import berth_board
 
 
@@ -413,11 +414,11 @@ def apply_fix(repo_root: Path, staging: Path, changes: MirrorChanges,
     return FixApplied(changes.changed, changes.removed, withheld)
 
 
-COPY_NAME = "verify-lint-copy"
+COPY_NAME = repository.LINT_COPY_FOLDER_STEM
 OWNER_NAME = "owner"
-ALLOCATION_NAME = "allocation-id"
+ALLOCATION_NAME = repository.LINT_COPY_ALLOCATION_FILE
 SENT_NAME = "sent.json"
-TREE_NAME = "tree"
+TREE_NAME = repository.LINT_COPY_TREE_NAME
 FileStat = tuple[int, int, int, int]
 
 
@@ -518,8 +519,8 @@ def claim_folder(parent: Path, owner: int) -> ClaimedLintCopy:
     old_stage = parent / f".{COPY_NAME}-{owner}.new"
     if not old_stage.is_symlink() and old_stage.is_dir():
         report_retained_lint_copy(old_stage, "an earlier lint claim used this path")
-    allocation_id = secrets.token_hex(16)
-    for name in (COPY_NAME, f"{COPY_NAME}-{owner}", f"{COPY_NAME}-{owner}-{allocation_id}"):
+    allocation_id = secrets.token_hex(repository.LINT_COPY_ALLOCATION_BYTES)
+    for name in repository.lint_copy_folder_names(str(owner), allocation_id):
         folder = parent / name
         try:
             folder.mkdir(mode=0o700)
@@ -574,7 +575,11 @@ def make_copy(repo_root: Path, metadata: CargoMetadata, owner: int,
                 raise OSError(f"{relative} changed while the copy was made")
             sent[relative] = before
         _ = (folder / SENT_NAME).write_text(json.dumps(sent), encoding="utf-8")
-    except OSError as error:
+        source_key = repository.repository_key(str(root))
+        if source_key != store.UNKNOWN_IDENTITY:
+            marker = folder / repository.LINT_COPY_REPOSITORY_KEY_FILE
+            _ = marker.write_text(source_key + "\n", encoding="utf-8")
+    except (OSError, ValueError) as error:
         shutil.rmtree(folder, ignore_errors=True)
         return FixFailed(str(error))
     _CREATED_LINT_COPIES[folder.absolute()] = claimed

@@ -25,6 +25,7 @@ MAX_PAGE_SECTIONS = 16
 MAX_PAGE_SECTION_ROWS = 128
 MAX_BUG_PAGE_STATE_BYTES = 512 * 1024
 MAX_PAGE_URL_LENGTH = 8192
+BUILD_EVIDENCE_LIMITS = {"title": 300, "label": 200, "text": 4_000, "tipEntries": 64}
 IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
 
 
@@ -101,13 +102,16 @@ class MemorySegment:
     label: str
     gib: float
     tone: MemoryTone
+    text: str | None = None
 
 
 @dataclass(frozen=True)
 class MemoryReading:
-    free_for_next_gib: float
-    queue_cap_gib: float
+    free_for_next_gib: float | None
+    queue_cap_gib: float | None
     segments: tuple[MemorySegment, ...]
+    free_text: str | None = None
+    cap_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -178,7 +182,17 @@ def evidence_fields(evidence: Evidence) -> dict[str, object]:
     """Preserve the fields used by existing request digests."""
     if isinstance(evidence, PageDataEvidence):
         return {**evidence.page_data(), "kind": evidence.kind}
-    return cast(dict[str, object], asdict(evidence))
+    fields = cast(dict[str, object], asdict(evidence))
+    if isinstance(evidence, BuildStepEvidence):
+        # Keep the digest of requests saved before display text was added.
+        memory = cast(dict[str, object], fields["memory"])
+        for field_name in ("free_text", "cap_text"):
+            if memory[field_name] is None:
+                del memory[field_name]
+        for segment in cast(tuple[dict[str, object], ...], memory["segments"]):
+            if segment["text"] is None:
+                del segment["text"]
+    return fields
 
 
 @dataclass(frozen=True)
@@ -283,6 +297,38 @@ class PageRecipient(StrEnum):
     PAGE_OWNER = "page-owner"
     LIST_OWNER = "list-owner"
     SELECTED = "selected"
+    PRODUCER = "producer"
+
+
+class DefaultSubmissionNotice(StrEnum):
+    FILED_KIND_FROM_REVIEW = "filed-kind-from-review"
+
+
+@dataclass(frozen=True)
+class SubmissionNotice:
+    kind: SubmissionKind | Literal["feedback", "efficiency", "enhancement"]
+    from_command: bool = False
+
+
+type Notice = SubmissionNotice | DefaultSubmissionNotice
+
+
+@dataclass(frozen=True)
+class ChosenAssignee:
+    id: staff.StaffId
+
+
+@dataclass(frozen=True)
+class ProducerAssigns:
+    """The producer chooses the assignee."""
+
+
+type Assignment = ChosenAssignee | ProducerAssigns
+
+
+def assignment_id(assignment: Assignment) -> staff.StaffId | None:
+    """Write the assignee ID in the existing request format."""
+    return assignment.id if isinstance(assignment, ChosenAssignee) else None
 
 
 @dataclass(frozen=True)
@@ -296,6 +342,8 @@ class NewItemRequest:
     page: str = ""
     page_state: BugPageState | None = None
     page_recipient: PageRecipient = PageRecipient.PAGE_OWNER
+    notice: Notice = DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    assignment: Assignment = ProducerAssigns()
 
 
 @dataclass(frozen=True)
@@ -316,6 +364,9 @@ class ReviewSubmission:
     capture_intent: SubmissionCaptureIntent = NoDeferredCapture.ABSENT
     reply_token_nonce: str = ""
     legacy_reply_token: str = field(default="", repr=False, compare=False)
+    notice: Notice = DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    assignment: Assignment = ProducerAssigns()
+    image_digests: tuple[tuple[str, str], ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
         if reply_tokens.valid(self.reply_token_sha256):
@@ -370,6 +421,14 @@ class ScopedSubmissionKey:
 def check_recipient_id(recipient: staff.StaffId) -> None:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", recipient):
         raise SubmissionError("Invalid recipient ID.")
+
+
+def _read_assignment(value: object) -> Assignment:
+    if value is None:
+        return ProducerAssigns()
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+        raise SubmissionError("Invalid assignee ID.")
+    return ChosenAssignee(staff.StaffId(value))
 
 
 def request_recipient(kind: SubmissionKind, request_id: str) -> staff.StaffId:
@@ -432,6 +491,14 @@ def _gib(value: object) -> float:
     return float(cast(float, value))
 
 
+def _optional_gib(value: object) -> float | None:
+    return None if value is None else _gib(value)
+
+
+def _optional_memory_text(value: object) -> str | None:
+    return None if value is None else _text(value, "Displayed memory", 32)
+
+
 def _time(value: str) -> datetime:
     result = datetime.fromisoformat(value)
     if result.utcoffset() is None:
@@ -450,12 +517,12 @@ def _tip_entry(value: object) -> TipEntry:
     row = _mapping(value, "Tooltip entry")
     match row.get("kind"):
         case "caption":
-            return TipCaption(_text(row.get("text"), "Tooltip caption", 4000))
+            return TipCaption(_text(row.get("text"), "Tooltip caption", BUILD_EVIDENCE_LIMITS["text"]))
         case "field":
-            return TipField(_text(row.get("label"), "Tooltip label", 200),
-                            _text(row.get("value"), "Tooltip value", 4000, allow_empty=True))
+            return TipField(_text(row.get("label"), "Tooltip label", BUILD_EVIDENCE_LIMITS["label"]),
+                            _text(row.get("value"), "Tooltip value", BUILD_EVIDENCE_LIMITS["text"], allow_empty=True))
         case "detail":
-            return TipDetail(_text(row.get("text"), "Tooltip detail", 4000))
+            return TipDetail(_text(row.get("text"), "Tooltip detail", BUILD_EVIDENCE_LIMITS["text"]))
         case _:
             raise SubmissionError("Select a valid tooltip entry type.")
 
@@ -488,25 +555,28 @@ def read_evidence(value: object) -> Evidence:
             captured_at = _text(data.get("captured_at"), "Capture time", 80)
             _ = _time(captured_at)
             cells = tuple(
-                BuildCell(_text(cell.get("label"), "Cell label", 200),
-                          _text(cell.get("value"), "Cell value", 4000, allow_empty=True))
+                BuildCell(_text(cell.get("label"), "Cell label", BUILD_EVIDENCE_LIMITS["label"]),
+                          _text(cell.get("value"), "Cell value", BUILD_EVIDENCE_LIMITS["text"], allow_empty=True))
                 for entry in _entries(data.get("cells"), "Row cells", 32)
                 for cell in (_mapping(entry, "Row cell"),))
             memory = _mapping(data.get("memory"), "Memory reading")
             segments = tuple(
-                MemorySegment(_text(segment.get("label"), "Memory label", 200),
-                              _gib(segment.get("gib")), MemoryTone(segment.get("tone")))
+                MemorySegment(_text(segment.get("label"), "Memory label", BUILD_EVIDENCE_LIMITS["label"]),
+                              _gib(segment.get("gib")), MemoryTone(segment.get("tone")),
+                              _optional_memory_text(segment.get("text")))
                 for entry in _entries(memory.get("segments"), "Memory segments", 32)
                 for segment in (_mapping(entry, "Memory segment"),))
             return BuildStepEvidence(
-                captured_at, _text(data.get("step_id"), "Step ID", 300),
-                _text(data.get("title"), "Step title", 300),
-                _text(data.get("owner"), "Step owner", 300, allow_empty=True), cells,
-                MemoryReading(_gib(memory.get("free_for_next_gib")), _gib(memory.get("queue_cap_gib")),
-                              segments),
-                _text(data.get("tip_title"), "Tooltip title", 300),
-                _text(data.get("tip_status"), "Tooltip status", 300, allow_empty=True),
-                tuple(_tip_entry(entry) for entry in _entries(data.get("tip"), "Tooltip entries", 64)))
+                captured_at, _text(data.get("step_id"), "Step ID", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("title"), "Step title", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("owner"), "Step owner", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True), cells,
+                MemoryReading(_optional_gib(memory.get("free_for_next_gib", "")),
+                              _optional_gib(memory.get("queue_cap_gib", "")),
+                              segments, _optional_memory_text(memory.get("free_text")),
+                              _optional_memory_text(memory.get("cap_text"))),
+                _text(data.get("tip_title"), "Tooltip title", BUILD_EVIDENCE_LIMITS["title"]),
+                _text(data.get("tip_status"), "Tooltip status", BUILD_EVIDENCE_LIMITS["title"], allow_empty=True),
+                tuple(_tip_entry(entry) for entry in _entries(data.get("tip"), "Tooltip entries", BUILD_EVIDENCE_LIMITS["tipEntries"])))
         case _:
             raise SubmissionError("Select a valid evidence type.")
 
@@ -600,12 +670,30 @@ def read_bug_page_state(value: object) -> BugPageState | None:
         _text(row.get("title", ""), "Page title", 240, allow_empty=True))
 
 
+def _read_notice(value: object) -> Notice:
+    if value is None or value == DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW:
+        return DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
+    fields = _mapping(value, "Submission notice")
+    kind = fields.get("kind")
+    from_command = fields.get("from_command", False)
+    if not isinstance(from_command, bool):
+        raise SubmissionError("Invalid submission notice source.")
+    if isinstance(kind, str) and (kind == "feedback" or kind == "efficiency" or kind == "enhancement"):
+        return SubmissionNotice(kind, from_command)
+    return SubmissionNotice(read_kind(kind), from_command)
+
+
 def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
     """Decode the JSON fields for Send."""
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
     kind_value = data.get("kind")
     kind = "enhancement" if kind_value == "enhancement" else read_kind(kind_value)
+    notice = _read_notice(data.get("notice"))
+    if isinstance(notice, SubmissionNotice):
+        notice_kind = SubmissionKind.INVESTIGATION if notice.kind in ("feedback", "efficiency") else notice.kind
+        if notice_kind != kind:
+            raise SubmissionError("The submission notice does not match the item type.")
     if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Open the New item dialog from a page owner.")
     try:
@@ -614,6 +702,9 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
         raise SubmissionError("Select a recipient from the New item dialog.") from error
     if not page and page_recipient != PageRecipient.PAGE_OWNER:
         raise SubmissionError("Select a recipient from the New item dialog.")
+    assignment = _read_assignment(data.get("assignee_id"))
+    if isinstance(assignment, ChosenAssignee) and page_recipient != PageRecipient.PRODUCER:
+        raise SubmissionError("Select a producer for the assignee.")
     try:
         evidence = read_evidence(data.get("evidence"))
     except SubmissionError:
@@ -637,7 +728,7 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
         read_request_id(data.get("request_id")), kind,
         staff.StaffId(_text(data.get("recipient_id"), "Recipient ID", 128)),
         _text(data.get("words"), "Your words", MAX_WORDS_LENGTH),
-        evidence, images, page, page_state, page_recipient)
+        evidence, images, page, page_state, page_recipient, notice, assignment)
 
 
 def read_image_reference(value: object) -> ImageReference:
@@ -656,6 +747,15 @@ def stored_submission(details: ReviewSubmission) -> dict[str, object]:
     fields = cast(dict[str, object], asdict(details))
     fields["evidence"] = evidence_fields(details.evidence)
     _ = fields.pop("legacy_reply_token")
+    if details.image_digests:
+        fields["image_digests"] = dict(details.image_digests)
+    else:
+        _ = fields.pop("image_digests")
+    if isinstance(details.notice, DefaultSubmissionNotice):
+        _ = fields.pop("notice")
+    _ = fields.pop("assignment")
+    if isinstance(details.assignment, ChosenAssignee):
+        fields["assignee_id"] = details.assignment.id
     if not details.reply_token_nonce:
         _ = fields.pop("reply_token_nonce")
     if details.page_state is None:
@@ -687,7 +787,13 @@ def _read_capture_intent(value: object) -> DeferredCaptureIntent:
 
 def read_submission(value: object) -> ReviewSubmission:
     row = _mapping(value, "Review submission")
-    images = _entries(row.get("images"), "Image references", MAX_IMAGES)
+    images = tuple(read_image_reference(image) for image in _entries(row.get("images"), "Image references", MAX_IMAGES))
+    image_ids = {image.id for image in images}
+    image_digests: list[tuple[str, str]] = []
+    for identity, digest in _mapping(row.get("image_digests", {}), "Image digests").items():
+        if identity not in image_ids or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise SubmissionError("Invalid saved image digest.")
+        image_digests.append((identity, digest))
     page = _text(row.get("page", ""), "Console page", 32, allow_empty=True)
     if page and page not in page_frame.OWNER_PAGES:
         raise SubmissionError("Invalid page in Review submission.")
@@ -705,11 +811,13 @@ def read_submission(value: object) -> ReviewSubmission:
         raise SubmissionError("Invalid reply token nonce.")
     return ReviewSubmission(
         read_request_id(row.get("request_id")), _text(row.get("request_digest"), "Request digest", 64),
-        read_evidence(row.get("evidence")), tuple(read_image_reference(image) for image in images),
+        read_evidence(row.get("evidence")), images,
         digest, page, read_bug_page_state(row.get("page_state")), data,
         capture_intent=_read_capture_intent(row["capture_intent"]) if "capture_intent" in row else NoDeferredCapture.ABSENT,
         reply_token_nonce=nonce,
-        legacy_reply_token=legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "")
+        image_digests=tuple(image_digests),
+        legacy_reply_token=legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "",
+        notice=_read_notice(row.get("notice")), assignment=_read_assignment(row.get("assignee_id")))
 
 
 def hashed_submission_fields(value: dict[str, object], details: ReviewSubmission) -> dict[str, object]:
@@ -758,6 +866,61 @@ def read_words(value: object, label: str, *, kind: SubmissionKind | Literal["enh
     return f"Enhancement: {words.lstrip()}" if kind == "enhancement" else words
 
 
+SCHEDULED_KIND = "scheduled"
+SCHEDULED_DRAFT_ID = re.compile(r"s1-[0-9a-f]{32}")
+
+
+class ScheduledDraftRequired(SubmissionConflict):
+    def __init__(self) -> None:
+        super().__init__("This draft ID is invalid for Scheduled. Start a new Scheduled draft.")
+
+
+@dataclass(frozen=True)
+class ScheduledDraftId:
+    """A draft ID reserved for a Scheduled Send."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if not SCHEDULED_DRAFT_ID.fullmatch(self.value):
+            raise ScheduledDraftRequired()
+
+
+def read_scheduled_draft_id(value: object) -> ScheduledDraftId:
+    if not isinstance(value, str):
+        raise ScheduledDraftRequired()
+    return ScheduledDraftId(value)
+
+
+@dataclass(frozen=True)
+class ScheduledSubmission:
+    request_id: ScheduledDraftId
+    recipient_id: staff.StaffId
+    words: str
+    page: str
+    producer_route: bool = False
+    assignment: Assignment = ProducerAssigns()
+
+
+def read_scheduled_request(fields: dict[str, object]) -> ScheduledSubmission:
+    """Read the Scheduled Send fields."""
+    page = fields.get("page")
+    route = fields.get("page_recipient")
+    if (not isinstance(page, str) or page not in page_frame.OWNER_PAGES
+            or route not in (PageRecipient.SELECTED, PageRecipient.PRODUCER)):
+        raise SubmissionError("Select a recipient from the New item dialog.")
+    allowed = {"kind", "page", "page_recipient", "request_id", "recipient_id", "token", "words"}
+    producer_route = route == PageRecipient.PRODUCER
+    if producer_route:
+        allowed.add("assignee_id")
+    if set(fields) - allowed:
+        raise SubmissionError("Send the instruction, start, and repeat for a Scheduled item.")
+    recipient = staff.StaffId(_text(fields.get("recipient_id"), "Recipient ID", 128))
+    check_recipient_id(recipient)
+    return ScheduledSubmission(read_scheduled_draft_id(fields.get("request_id")), recipient,
+                               read_words(fields.get("words"), "Your words"), page, producer_route,
+                               _read_assignment(fields.get("assignee_id")))
+
 
 _SPARKLES = """<!-- @license lucide-static v0.468.0 - ISC -->
 <svg aria-hidden="true" focusable="false" class="lucide lucide-sparkles"
@@ -775,11 +938,12 @@ KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
          ("feedback", "Feedback", "message-circle-question"),
          (SubmissionKind.PROPOSAL, "Proposal", "lamp"),
          (SubmissionKind.INVESTIGATION, "Investigation", "microscope"),
-         ("enhancement", "Enhancement", "sparkles"))
+         ("enhancement", "Enhancement", "sparkles"),
+         (SCHEDULED_KIND, "Scheduled", "clock-alert"))
 
 
 def render() -> str:
-    """Render the dialog that the page owner button opens."""
+    """Render the dialog for the page owner and Builds row buttons."""
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
         + f'<span data-button-face>{_SPARKLES if icon == "sparkles" else page_frame.icon_svg(icon)}'
@@ -790,18 +954,41 @@ def render() -> str:
                          "totalImageBytes": MAX_TOTAL_IMAGE_BYTES, "pageDataBytes": MAX_PAGE_DATA_BYTES,
                          "pageRows": MAX_PAGE_ROWS, "pageSections": MAX_PAGE_SECTIONS,
                          "sectionRows": MAX_PAGE_SECTION_ROWS,
-                         "pageUrlLength": MAX_PAGE_URL_LENGTH})
+                         "pageUrlLength": MAX_PAGE_URL_LENGTH, "buildEvidence": BUILD_EVIDENCE_LIMITS})
     body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset data-recipient-group><legend>To</legend>
     <p data-owner-reason hidden><span id="review-new-item-owner-reason"></span>&nbsp;<span aria-hidden="true">&#x1F986;</span></p>
+    <p data-recipients-loading role="status" hidden>Loading recipients…</p>
     <p data-recipients-status role="status" hidden></p>
     <div class="new-item-chips" data-recipients></div>
    </fieldset>
+   <section class="new-item-route" data-route aria-labelledby="new-item-route-title" hidden>
+    <h3 id="new-item-route-title">Where it goes</h3>
+    <div class="page-state-box">
+     <div class="route-steps">
+      <div><strong>You</strong></div>{_ROUTE_ARROW}
+      <div><strong data-route-producer></strong><small>tracks it</small></div>{_ROUTE_ARROW}
+      <div>
+       <div class="route-assignment"><strong data-route-assignee></strong>
+        <button type="button" data-route-change aria-expanded="false" hidden>Change {page_frame.icon_svg("chevron-down")}</button>
+       </div>
+       <small data-route-assigned hidden>assigned</small>
+      </div>
+     </div>
+     <p data-route-copy aria-live="polite"></p>
+     <fieldset class="route-assignees" id="new-item-assignees" aria-label="Assignee" hidden>
+      <div class="new-item-chips" data-assignees></div>
+     </fieldset>
+    </div>
+   </section>
    <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
     placeholder="Type your words. You can paste an image." required></textarea>
+   <p data-scheduled-help hidden>Enter the instruction. Then add <code>Start Mon Nov 30 09:00.</code>
+    You can add <code>Repeat every 2 weeks on Monday and Thursday.</code></p>
    <section class="page-state-box sent-details" data-sent-details aria-labelledby="sent-details-title">
     <h4 id="sent-details-title">Sent with your words</h4>
+    <div class="new-item-evidence" data-evidence hidden></div>
     <div data-bug-page-state hidden>
      <dl class="page-state"></dl>
      <p data-visible-text>Page data and visible text</p>
@@ -817,6 +1004,10 @@ def render() -> str:
      <div data-taking role="status"><span class="capture-spinner" aria-hidden="true"></span>Taking a screenshot. You can send now. The screenshot joins the saved item when ready.</div>
     </div>
     <p data-capture-expired role="status" hidden>The screenshot expired.</p>
+    <div data-replace-capture hidden>
+     <button type="button" data-renew-capture>Renew screenshot</button>
+     <button type="button" data-omit-capture>Omit screenshot</button>
+    </div>
     <p data-fallback role="status" hidden>Screenshot unavailable. Page data and visible text go instead.</p>
     <div class="new-item-previews" data-previews hidden></div>
    </section>
@@ -825,15 +1016,24 @@ def render() -> str:
   <footer>
    <p data-send-disabled role="status" hidden></p>
    <p class="new-item-error" role="alert" hidden></p>
-   <p id="new-item-saved" role="status" hidden></p>
-   <div data-send-controls><button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button></div>
+   <p id="new-item-saved" data-saved-confirmation role="status" hidden></p>
+   <div data-send-controls>
+    <span id="new-item-producer-hint" data-producer-hint hidden>Pick a producer</span>
+    <button type="button" data-later-draft hidden>Edit a separate draft</button>
+    <button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button>
+   </div>
    <div data-saved-controls hidden><button type="button" data-done aria-describedby="new-item-saved">Done</button></div>
   </footer>
 '''
     dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,
                                        footer=footer, form=True, body_class='new-item-body')
     return (f'<style>{STYLE}{PAGE_STATE_STYLE}</style>{dialog}'
-            f'<script>{SCRIPT.replace("__LIMITS__", limits)}</script>')
+            f'<script>{page_frame.HELD_SEND_SCRIPT}{SCRIPT.replace("__LIMITS__", limits)}</script>')
+
+
+_ROUTE_ARROW = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+                'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+                '<path d="M5 12h14m-7-7 7 7-7 7"/></svg>')
 
 
 PAGE_STATE_STYLE = '''
@@ -854,146 +1054,278 @@ PAGE_STATE_STYLE = '''
 
 STYLE = '''
 /* Keep the page at the same scroll position when a save adds a row. */
-:root:has(#review-new-item[open]) { overflow-anchor: none; }
-#review-new-item button:where(:not([data-close])) { margin: 0; min-height: 0; font: inherit; cursor: pointer; }
-#review-new-item button:disabled { opacity: .55; cursor: default; }
-#review-new-item button:focus-visible, #review-new-item textarea:focus-visible,
-#review-new-item input:focus-visible + span { outline: 2px solid var(--accent, #3987e5); outline-offset: 2px; }
-#review-new-item .new-item-body:not([hidden]) {
+:root:has(:is(#review-new-item,[data-new-item-draft])[open]) { overflow-anchor: none; }
+:is(#review-new-item,[data-new-item-draft]) button:where(:not([data-close])) { margin: 0; min-height: 0; font: inherit; cursor: pointer; }
+:is(#review-new-item,[data-new-item-draft]) button:disabled { opacity: .55; cursor: default; }
+:is(#review-new-item,[data-new-item-draft]) button:focus-visible, :is(#review-new-item,[data-new-item-draft]) textarea:focus-visible,
+:is(#review-new-item,[data-new-item-draft]) input:focus-visible + span { outline: 2px solid var(--accent, #3987e5); outline-offset: 2px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-body {
  display: grid; align-content: start; gap: 18px;
 }
-#review-new-item fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
-#review-new-item legend, #review-new-item h3 {
+:is(#review-new-item,[data-new-item-draft]) fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
+:is(#review-new-item,[data-new-item-draft]) legend, :is(#review-new-item,[data-new-item-draft]) h3 {
  margin: 0 0 8px; padding: 0; font-size: 11px; line-height: 1.3; font-weight: 500;
  text-transform: uppercase; color: var(--ink-3, #9a988f);
 }
-#review-new-item .new-item-chips { display: flex; flex-wrap: wrap; gap: 8px; }
-#review-new-item .new-item-chip { position: relative; display: inline-flex; max-width: 100%; }
-#review-new-item .new-item-chip[hidden] { display: none; }
-#review-new-item .new-item-chip input {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip { position: relative; display: inline-flex; max-width: 100%; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[hidden] { display: none; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip input {
  position: absolute; width: 1px; height: 1px; padding: 0; margin: 0; opacity: 0;
 }
-#review-new-item .new-item-chip > span {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip > span {
  display: flex; align-items: center; gap: 7px; padding: 7px 14px; border-radius: 999px;
  border: 1px solid var(--line, #34332f); color: var(--ink-2, #c3c2b7);
  font-size: 14px; overflow-wrap: anywhere; cursor: pointer;
 }
-#review-new-item .new-item-chip input:checked + span,
-#review-new-item button[type="submit"], #review-new-item [data-done] {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip input:checked + span,
+:is(#review-new-item,[data-new-item-draft]) button[type="submit"] {
  background: #2670c5; color: white; border-color: transparent;
 }
-#review-new-item .new-item-chip svg { width: 16px; height: 16px; flex: none; }
-#review-new-item .new-item-chip[data-kind="question"] { --item-icon: #af90ed; }
-#review-new-item .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
-#review-new-item .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
-#review-new-item .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
-#review-new-item .new-item-chip[data-kind="enhancement"] { --item-icon: #efbd63; }
-#review-new-item .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
-#review-new-item [data-recipients-status] { margin: 0; color: var(--ink-2, #c3c2b7); }
-#review-new-item [data-recipient-group] { display: flow-root; }
-#review-new-item [data-recipient-group] > legend { float: left; margin-right: 12px; }
-#review-new-item [data-owner-reason] {
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip svg { width: 16px; height: 16px; flex: none; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="question"] { --item-icon: #af90ed; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="proposal"] { --item-icon: #ed7da9; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="investigation"] { --item-icon: #1cc1b5; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="bug"] { --item-icon: #ed876b; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="enhancement"] { --item-icon: #efbd63; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip[data-kind="scheduled"] { --item-icon: #4fd1d9; }
+:is(#review-new-item,[data-new-item-draft]) [data-scheduled-help] { margin: 0; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]).scheduled-locked .new-item-chip:has(input:disabled:not(:checked)) > span { opacity: .55; cursor: default; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-chip input:not(:checked) + span svg { color: var(--item-icon); }
+:is(#review-new-item,[data-new-item-draft]) :is([data-recipients-status], [data-recipients-loading]) {
+ margin: 0; color: var(--ink-2, #c3c2b7);
+}
+:is(#review-new-item,[data-new-item-draft]) [data-recipient-group] { display: flow-root; }
+:is(#review-new-item,[data-new-item-draft]) [data-recipient-group] > legend { float: left; margin-right: 12px; }
+:is(#review-new-item,[data-new-item-draft]) [data-owner-reason] {
  margin: 0 0 8px; font-size: 12px; line-height: 1.2; text-align: right; text-wrap: balance; overflow-wrap: anywhere;
  color: var(--ink-3, #9a988f);
 }
-#review-new-item [data-recipients-status], #review-new-item [data-recipients] { clear: both; }
-#review-new-item textarea {
+:is(#review-new-item,[data-new-item-draft]) :is([data-recipients-status], [data-recipients-loading], [data-recipients]) {
+ clear: both;
+}
+.new-item-route .route-steps {
+ display: grid; gap: 8px;
+ grid-template-columns: max-content minmax(16px, 1fr) minmax(0, 1.45fr) minmax(16px, 1fr) minmax(0, 2.8fr);
+}
+.new-item-route .route-steps strong { font-weight: 650; }
+.new-item-route .route-steps small:not([hidden]) { display: block; color: var(--ink-3); font-size: 12px; }
+.new-item-route .route-steps > svg { justify-self: center; width: 16px; height: 16px; margin-top: 3px; color: var(--ink-3); }
+.new-item-route .route-assignment { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 9px; }
+:is(#review-new-item,[data-new-item-draft]) [data-route-change]:not([hidden]) {
+ display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: none;
+ color: var(--accent); font-size: 13px; text-decoration: underline; text-underline-offset: 2px;
+}
+.new-item-route [data-route-change] svg { width: 14px; height: 14px; transform: rotate(-90deg); }
+.new-item-route [data-route-change][aria-expanded="true"] svg { transform: none; }
+.new-item-route [data-route-copy] { margin: 10px 0 0; font-size: 14px; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]) .route-assignees { margin-top: 12px; max-height: 12rem; overflow: auto; }
+:is(#review-new-item,[data-new-item-draft]) [data-producer-hint] {
+ align-self: center; margin-right: 4px; color: var(--ink-2); font-size: 13px;
+}
+:is(#review-new-item,[data-new-item-draft]) textarea {
  display: block; width: 100%; min-width: 0; margin: 0; padding: 10px 12px; resize: vertical;
  border: 1px solid var(--line, #34332f); border-radius: 8px;
  background: var(--bg, #121211); color: inherit; font: 16px/1.45 system-ui, sans-serif;
 }
-#review-new-item textarea::placeholder { color: var(--ink-3, #9a988f); }
-#review-new-item[data-page-bug] textarea { resize: none; }
-#review-new-item .new-item-page-capture:not([hidden]) { display: flex; align-items: center; gap: 9px; margin: 0; }
-#review-new-item .new-item-page-capture input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
-#review-new-item h2:focus { outline: none; }
-#review-new-item .sent-details h4 { margin: 0 0 11px; }
-#review-new-item [data-bug-page-state] { margin: 0 0 12px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
-#review-new-item [data-bug-page-state] dd { min-width: 0; overflow-wrap: anywhere; }
-#review-new-item .sent-details p { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
-#review-new-item .sent-details .new-item-page-capture { font-size: 14px; }
-#review-new-item .sent-details .new-item-previews { margin-top: 10px; }
-#review-new-item .capture-slot {
+:is(#review-new-item,[data-new-item-draft]) textarea::placeholder { color: var(--ink-3, #9a988f); }
+:is(#review-new-item,[data-new-item-draft])[data-page-bug] textarea { resize: none; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-page-capture:not([hidden]) { display: flex; align-items: center; gap: 9px; margin: 0; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-page-capture input { margin: 0; width: 16px; height: 16px; accent-color: var(--accent); }
+:is(#review-new-item,[data-new-item-draft]) h2:focus { outline: none; }
+:is(#review-new-item,[data-new-item-draft]) .sent-details h4 { margin: 0 0 11px; }
+:is(#review-new-item,[data-new-item-draft]) [data-bug-page-state] { margin: 0 0 12px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
+:is(#review-new-item,[data-new-item-draft]) [data-bug-page-state] dd { min-width: 0; overflow-wrap: anywhere; }
+:is(#review-new-item,[data-new-item-draft]) .sent-details p { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]) .sent-details .new-item-page-capture { font-size: 14px; }
+:is(#review-new-item,[data-new-item-draft]) .sent-details .new-item-previews { margin-top: 10px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-evidence {
+ background: #141413; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
+ padding: 10px; font-size: 12px; min-width: 0; overflow-wrap: anywhere;
+}
+:is(#review-new-item,[data-new-item-draft]) .new-item-evidence h4 { font-size: inherit; margin: 0 0 4px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-evidence-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-muted { color: #c3c2b7; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-cells {
+ display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 10px; margin: 7px 0 10px;
+}
+:is(#review-new-item,[data-new-item-draft]) .new-item-cells div { min-width: 0; max-width: 100%; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-cells dt { font-weight: 600; color: #c3c2b7; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-cells dd, :is(#review-new-item,[data-new-item-draft]) .new-item-tip dd { margin: 0; white-space: pre-wrap; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory { padding: 8px 0; border-block: 1px solid #34332f; margin-bottom: 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory p { margin: 0; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory strong { font-size: 16px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-cap { color: #ef7372; font-weight: 650; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory-bar { display: flex; height: 12px; margin: 6px 0; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory-bar span { min-width: 0; background: var(--segment); border-radius: 2px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory-legend { display: flex; flex-wrap: wrap; gap: 3px 12px; color: #c3c2b7; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-memory-legend span::before {
+ content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 4px;
+ border-radius: 2px; background: var(--segment);
+}
+:is(#review-new-item,[data-new-item-draft]) [data-tone="build"] { --segment: #3987e5; }
+:is(#review-new-item,[data-new-item-draft]) [data-tone="free"] { --segment: #199e70; }
+:is(#review-new-item,[data-new-item-draft]) [data-tone="tools"] { --segment: #c98500; }
+:is(#review-new-item,[data-new-item-draft]) [data-tone="system"] { --segment: #9585e0; }
+:is(#review-new-item,[data-new-item-draft]) [data-tone="other"] { --segment: #6c6b66; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip {
+ background: #242422; color: #f0efec; border: 1px solid #34332f; border-radius: 8px;
+ padding: 10px 12px; font-size: .85rem; line-height: 1.45;
+}
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip dl { margin: 0; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip dl > div {
+ display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 12px;
+}
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip dd { text-align: right; font-variant-numeric: tabular-nums; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip p { margin: 3px 0; color: #c3c2b7; white-space: pre-wrap; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-tip h4 { font-weight: 700; }
+:is(#review-new-item,[data-new-item-draft]) .capture-slot {
  position: relative; width: min(320px, 100%); aspect-ratio: 1440 / 1000; margin-top: 10px;
  overflow: hidden; background: var(--card); border-radius: 7px; border: 1px solid var(--line);
 }
-#review-new-item .capture-slot a, #review-new-item [data-taking] { position: absolute; inset: 0; }
-#review-new-item .capture-slot img { display: block; width: 100%; height: 100%; object-fit: contain; }
-#review-new-item .capture-slot a span {
+:is(#review-new-item,[data-new-item-draft]) .capture-slot a, :is(#review-new-item,[data-new-item-draft]) [data-taking] { position: absolute; inset: 0; }
+:is(#review-new-item,[data-new-item-draft]) .capture-slot img { display: block; width: 100%; height: 100%; object-fit: contain; }
+:is(#review-new-item,[data-new-item-draft]) .capture-slot a span {
  position: absolute; right: 8px; bottom: 8px; padding: 4px 8px; font-size: 12px;
  border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--ink);
 }
-#review-new-item .capture-slot a:is(:hover, :focus-visible) span { border-color: var(--accent); }
-#review-new-item [data-taking]:not([hidden]) {
+:is(#review-new-item,[data-new-item-draft]) .capture-slot a:is(:hover, :focus-visible) span { border-color: var(--accent); }
+:is(#review-new-item,[data-new-item-draft]) [data-taking]:not([hidden]) {
  display: flex; justify-content: center; align-items: center; gap: 9px; color: var(--ink-2); font-size: 14px;
 }
-#review-new-item .capture-spinner {
+:is(#review-new-item,[data-new-item-draft]) .capture-spinner {
  width: 14px; height: 14px; border: 2px solid var(--line);
  border-top-color: var(--accent); border-right-color: var(--accent); border-radius: 50%;
 }
-#review-new-item .new-item-previews:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
-#review-new-item .new-item-preview {
+:is(#review-new-item,[data-new-item-draft]) .new-item-previews:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-preview {
  position: relative; border: 1px solid var(--line, #34332f); border-radius: 7px;
  max-width: 100%; background: var(--bg, #121211);
 }
-#review-new-item .new-item-preview img { display: block; width: 145px; height: 80px; object-fit: contain; }
-#review-new-item .new-item-preview button {
+:is(#review-new-item,[data-new-item-draft]) .new-item-preview img { display: block; width: 145px; height: 80px; object-fit: contain; }
+:is(#review-new-item,[data-new-item-draft]) .new-item-preview button {
  position: absolute; top: 3px; right: 3px; width: 28px; height: 28px; padding: 0;
  border: 1px solid #6c6b66; border-radius: 5px; background: #1a1a19; color: #f0efec;
 }
-#review-new-item footer { padding-block: 0 20px; }
-#review-new-item footer > div {
+:is(#review-new-item,[data-new-item-draft]) footer { padding-block: 0 20px; }
+:is(#review-new-item,[data-new-item-draft]) footer > div:not([hidden]) {
  display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line, #34332f);
  padding-top: 14px;
 }
-#review-new-item footer button {
+:is(#review-new-item,[data-new-item-draft]) [data-replace-capture]:not([hidden]) { display: flex; gap: 8px; flex-wrap: wrap; }
+:is(#review-new-item,[data-new-item-draft]) [data-send-controls] { flex-wrap: wrap; }
+:is(#review-new-item,[data-new-item-draft]) footer button, :is(#review-new-item,[data-new-item-draft]) [data-replace-capture] button {
  min-height: 38px; padding: 6px 14px; border: 1px solid var(--ink-3, #9a988f); border-radius: 8px;
  background: transparent; color: inherit;
 }
-#review-new-item [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
-#review-new-item .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
-#review-new-item #new-item-saved { margin: 0 0 12px; }
+:is(#review-new-item,[data-new-item-draft]) [data-send-disabled] { margin: 0 0 8px; color: var(--ink-2); }
+:is(#review-new-item,[data-new-item-draft]) .new-item-error { color: var(--error, #ef7372); margin: 0 0 8px; overflow-wrap: anywhere; }
+:is(#review-new-item,[data-new-item-draft]) [data-saved-confirmation] { margin: 0 0 12px; white-space: pre-line; }
 @media (max-width: 480px) {
- #review-new-item footer { padding-bottom: 14px; }
- #review-new-item .new-item-body { gap: 14px; }
+ :is(#review-new-item,[data-new-item-draft]) footer { padding-bottom: 14px; }
+ :is(#review-new-item,[data-new-item-draft]) .new-item-body { gap: 14px; }
 }
 '''
 
 
-SCRIPT = r'''(() => {
+SCRIPT = page_frame.ACTION_STATUS_SCRIPT + r'''(() => {
  const endpoint = '/console/review/new-item';
  const limits = __LIMITS__;
- const dialog = document.querySelector('#review-new-item');
- const heading = dialog.querySelector('#new-item-title');
+ const original = document.querySelector('#review-new-item');
+ const template = original.cloneNode(true);
+ const drafts = [];
+ const listSendKey = 'console.list.pending-send';
+ const listDraftPrefix = listSendKey + '.';
+ const listStatePrefix = listDraftPrefix + 'state.';
+ const browserDraftId = /^(?:r6|s1)-[0-9a-f]{32}$/;
+ const submittedKey = 'console.new-item.submitted';
+ const submittedPrefix = submittedKey + '.';
+ let nextDraft = 0;
+
+ function storedListDraft() {
+  try {
+   const legacy = sessionStorage.getItem(listSendKey);
+   if (legacy !== null) {
+    try {
+     const draft = browserDraftId.test(legacy) ? {id: legacy, recipient: null} : JSON.parse(legacy);
+     if (typeof draft?.id === 'string' && browserDraftId.test(draft.id)) {
+      const key = listDraftPrefix + draft.id;
+      if (sessionStorage.getItem(key) === null) {
+       const recipient = draft.assignee ? JSON.stringify({recipient: draft.recipient || null, assignee: draft.assignee})
+                                        : draft.recipient || '';
+       sessionStorage.setItem(key, recipient);
+       if (typeof draft.awaitingSend === 'boolean')
+        sessionStorage.setItem(listStatePrefix + draft.id, String(draft.awaitingSend));
+      }
+     }
+    } catch (_) {}
+    sessionStorage.removeItem(listSendKey);
+   }
+   for (let index = 0; index < sessionStorage.length; index++) {
+    const key = sessionStorage.key(index);
+    if (!key.startsWith(listDraftPrefix)) continue;
+    const id = key.slice(listDraftPrefix.length);
+    if (!browserDraftId.test(id) || drafts.some(draft => draft.id === id)) continue;
+    const state = sessionStorage.getItem(listStatePrefix + id);
+    const stored = sessionStorage.getItem(key) || '';
+    const route = stored.startsWith('{') ? JSON.parse(stored) : {recipient: stored || null};
+    return {id, ...route, awaitingSend: state === null ? undefined : state === 'true'};
+   }
+  } catch (_) {}
+  return null;
+ }
+
+function bindDraft(dialog, fresh = false) {
+ const heading = dialog.querySelector('h2');
  heading.tabIndex = -1;
  const form = dialog.querySelector('form'), body = dialog.querySelector('.new-item-body');
  const recipientChips = dialog.querySelector('[data-recipients]');
  const recipientStatus = dialog.querySelector('[data-recipients-status]');
+ const recipientLoading = dialog.querySelector('[data-recipients-loading]');
  const recipientGroup = dialog.querySelector('[data-recipient-group]');
  const ownerReason = dialog.querySelector('[data-owner-reason]');
- const ownerReasonText = ownerReason.querySelector('#review-new-item-owner-reason');
+ const ownerReasonText = ownerReason.querySelector('span');
+ const route = dialog.querySelector('[data-route]'), changeAssignee = dialog.querySelector('[data-route-change]');
+ const routeProducer = route.querySelector('[data-route-producer]'), routeAssignee = route.querySelector('[data-route-assignee]');
+ const routeAssigned = route.querySelector('[data-route-assigned]'), routeCopy = route.querySelector('[data-route-copy]');
+ const assigneeChips = route.querySelector('[data-assignees]'), assigneeGroup = assigneeChips.closest('fieldset');
+ changeAssignee.setAttribute('aria-controls', assigneeGroup.id);
  const words = form.elements.words, previews = dialog.querySelector('[data-previews]');
+ const wordsPlaceholder = words.placeholder;
  const includePage = form.elements.include_page, sentDetails = dialog.querySelector('[data-sent-details]');
  const bugStateBox = dialog.querySelector('[data-bug-page-state]');
+ const evidenceBox = sentDetails.querySelector('[data-evidence]');
  const slot = dialog.querySelector('[data-capture-slot]'), shot = slot.querySelector('[data-shot]');
  const preview = shot.querySelector('img'), taking = slot.querySelector('[data-taking]');
  const fallback = sentDetails.querySelector('[data-fallback]');
  const fallbackText = fallback.textContent;
  const expired = sentDetails.querySelector('[data-capture-expired]');
+ const replaceCapture = sentDetails.querySelector('[data-replace-capture]');
+ const renewButton = replaceCapture.querySelector('[data-renew-capture]');
+ const omitButton = replaceCapture.querySelector('[data-omit-capture]');
+ const laterButton = dialog.querySelector('[data-later-draft]');
  const send = dialog.querySelector('[type="submit"]'), error = dialog.querySelector('.new-item-error');
+ const scheduledHelp = dialog.querySelector('[data-scheduled-help]');
+ const kindInputs = [...form.querySelectorAll('input[name="kind"]')];
  const sendNotice = dialog.querySelector('[data-send-disabled]');
- const confirmation = dialog.querySelector('#new-item-saved'), done = dialog.querySelector('[data-done]');
+ const confirmation = dialog.querySelector('[data-saved-confirmation]'), done = dialog.querySelector('[data-done]');
+ const closeButton = dialog.querySelector('[data-close]');
  const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
- const fields = [...form.querySelectorAll('fieldset'), words, includePage, dialog.querySelector('[data-close]'),
+ const producerHint = dialog.querySelector('[data-producer-hint]');
+ const fields = [...form.querySelectorAll('fieldset'), changeAssignee, words, includePage, closeButton,
                  dialog.querySelector('[data-cancel]')];
- const listSendKey = 'console.list.pending-send';
- const listDraftId = /^r6-[0-9a-f]{32}$/;
  let launcher, opening, token, recipients, images = [], sending = false;
  let draftId, keepDraft = false, ownerPage = '';
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
- let captureSession, pageContext, savedItem, deferredCapture, pendingItem, pendingEdited = false;
+ let assignees, selectedAssignee = '';
+ let captureSession, pageContext, savedItem, laterDraft, laterBase;
+ let awaitingEarlierSend = false, awaitingNativeRecovery = false, submittedDraft;
+ let separateFromNativeDraft = false, nativeListEdit, separateListEdit;
+ let draftDatabase, submittedStorageKey;
+
+ let source = '', evidence = {kind: 'none'}, tipPreview = null;
 
  function node(tag, text = '', css = '') {
   const element = document.createElement(tag);
@@ -1002,14 +1334,149 @@ SCRIPT = r'''(() => {
   return element;
  }
 
+ function captionAndValue(label, value) {
+  const row = node('div');
+  row.append(node('dt', label), node('dd', value));
+  return row;
+ }
+
+ function showEvidence() {
+  evidenceBox.replaceChildren();
+  evidenceBox.hidden = evidence.kind !== 'build-step';
+  if (evidenceBox.hidden) return;
+  const heading = node('div', '', 'new-item-evidence-heading');
+  heading.append(node('h4', evidence.title), node('span', evidence.owner, 'new-item-muted'));
+  const cells = node('dl', '', 'new-item-cells');
+  for (const cell of evidence.cells) cells.append(captionAndValue(cell.label, cell.value));
+
+  const memory = node('div', '', 'new-item-memory');
+  memory.append(node('h4', 'Overall memory'));
+  const figures = node('div', '', 'new-item-evidence-heading'), free = node('p');
+  free.append(node('strong', evidence.memory.free_text || 'unavailable'), ' Free for the next step');
+  figures.append(free, node('p', 'Queue cap ' + (evidence.memory.cap_text || 'unavailable'), 'new-item-cap'));
+  memory.append(figures);
+  const bar = node('div', '', 'new-item-memory-bar');
+  bar.setAttribute('aria-hidden', 'true');
+  const legend = node('div', '', 'new-item-memory-legend');
+  for (const segment of evidence.memory.segments) {
+   const section = node('span'), key = node('span', segment.label + ' ' + (segment.text || 'unavailable'));
+   section.dataset.tone = key.dataset.tone = segment.tone;
+   section.style.flexGrow = String(segment.gib);
+   bar.append(section);
+   legend.append(key);
+  }
+  if (legend.childElementCount) memory.append(bar, legend);
+
+  if (tipPreview) {
+   evidenceBox.append(heading, cells, memory, tipPreview);
+   return;
+  }
+  const tip = node('div', '', 'new-item-tip'), tipHeading = node('div', '', 'new-item-evidence-heading');
+  tipHeading.append(node('h4', evidence.tip_title), node('strong', evidence.tip_status));
+  tip.append(tipHeading);
+  let table = null;
+  for (const entry of evidence.tip) {
+   if (entry.kind === 'field') {
+    if (!table) { table = node('dl'); tip.append(table); }
+    table.append(captionAndValue(entry.label, entry.value));
+   } else {
+    table = null;
+    tip.append(node('p', entry.text));
+   }
+  }
+  evidenceBox.append(heading, cells, memory, tip);
+ }
+
  function setError(reason) {
-  error.textContent = reason;
-  error.hidden = !reason;
+  showActionFailure(error, reason);
+ }
+
+ function isScheduled() {
+  return form.elements.kind.value === 'scheduled';
+ }
+
+ function isRecovering() {
+  return submittedDraft?.mode === 'retry' || submittedDraft?.mode === 'screenshot-expired';
+ }
+
+ function isEditingLater() {
+  return submittedDraft?.mode === 'edit-later';
+ }
+
+ function pendingPayload() {
+  if (isRecovering()) return submittedDraft.payload;
+ }
+
+ function canEditSeparateListDraft() {
+  const canResume = separateListEdit && !words.value && !images.length;
+  return ownerPage === 'list' && token && !savedItem && !submittedDraft &&
+    !separateFromNativeDraft && (awaitingNativeRecovery || canResume);
  }
 
  function updateSend() {
-  send.disabled = !!savedItem || sending || !token || (!pendingItem &&
-    (!recipientChips.querySelector('input:checked') || !words.value.trim() || words.value.length > words.maxLength));
+  const recipient = recipientChips.querySelector('input:checked');
+  const scheduled = isScheduled();
+  const recovering = isRecovering();
+  const locked = recovering || (scheduled && !!savedItem);
+  dialog.classList.toggle('scheduled-locked', scheduled && locked);
+  words.readOnly = locked;
+  includePage.disabled = sending || locked;
+  changeAssignee.disabled = sending || locked;
+  for (const button of previews.querySelectorAll('button')) button.disabled = sending || locked;
+  for (const fieldset of form.querySelectorAll('fieldset')) fieldset.disabled = sending || locked;
+  send.textContent = sending ? 'Sending…' : recovering ? 'Retry' : 'Send';
+  laterButton.hidden = !canEditSeparateListDraft() && !['retry', 'edit-later'].includes(submittedDraft?.mode);
+  laterButton.disabled = sending;
+  laterButton.textContent = isEditingLater() ? 'Return to Retry' : 'Edit a separate draft';
+  sentDetails.hidden = scheduled;
+  scheduledHelp.hidden = !scheduled || !!savedItem;
+  words.placeholder = scheduled ? 'Enter the instruction, start time, and repeat.' : wordsPlaceholder;
+  for (const input of kindInputs) {
+   input.disabled = sending || locked || !!savedItem ||
+     (input.value === 'scheduled' && awaitingEarlierSend && !isEditingLater());
+  }
+  send.disabled = !!savedItem || sending || !token || isEditingLater() || submittedDraft?.mode === 'screenshot-expired' ||
+    (scheduled && awaitingEarlierSend && !recovering) ||
+    (!pendingPayload() && (!recipient || !words.value.trim() || words.value.length > words.maxLength));
+  renewButton.disabled = sending || !token || !pageContext?.place;
+  omitButton.disabled = sending || !token;
+  producerHint.hidden = !assignees || !token || !!recipient || !!pendingPayload();
+  if (producerHint.hidden) send.removeAttribute('aria-describedby');
+  else send.setAttribute('aria-describedby', producerHint.id);
+ }
+
+ function choiceChip(name, choice, selected) {
+  const chip = node('label', '', 'new-item-chip'), input = node('input');
+  input.type = 'radio';
+  input.name = name;
+  input.value = choice.id;
+  input.checked = choice.id === selected;
+  const face = node('span', choice.name);
+  face.setAttribute('data-button-face', '');
+  chip.append(input, face);
+  return chip;
+ }
+
+ function showAssigneeChoices(open) {
+  changeAssignee.setAttribute('aria-expanded', String(open));
+  assigneeGroup.hidden = !open;
+ }
+
+ function showRoute() {
+  route.hidden = !assignees;
+  if (route.hidden) return;
+  const producer = recipients.find(choice => choice.id === selectedRecipient);
+  const assignee = assignees.find(choice => choice.id === selectedAssignee);
+  const kind = form.elements.kind.value || 'item';
+  routeProducer.textContent = producer?.name || 'a producer';
+  routeAssignee.textContent = assignee?.name || 'the producer assigns it';
+  routeAssigned.hidden = !assignee;
+  changeAssignee.hidden = !producer || !assignees.length;
+  if (changeAssignee.hidden) showAssigneeChoices(false);
+  const subject = producer?.name || 'The producer';
+  routeCopy.textContent = producer && assignee
+   ? subject + ' tracks this ' + kind + ' and gives it to ' + assignee.name + '.'
+   : subject + ' tracks this ' + kind + ' and chooses who does the work.';
  }
 
  function showRecipients() {
@@ -1017,25 +1484,19 @@ SCRIPT = r'''(() => {
   const proposal = form.elements.kind.value === 'proposal';
   const available = recipients.filter(recipient => !proposal || recipient.proposal);
   if (selectedRecipient && !available.some(recipient => recipient.id === selectedRecipient)) {
-   selectedRecipient = null;
-   storeListDraft();
+   if (isRecovering() && selectedRecipient === submittedDraft.payload.recipient_id) {
+    available.push({id: selectedRecipient, name: submittedDraft?.recipientName || selectedRecipient});
+   } else {
+    selectedRecipient = null;
+    storeListDraft();
+   }
   }
   recipientChips.replaceChildren();
-  for (const recipient of available) {
-   const chip = node('label', '', 'new-item-chip'), input = node('input');
-   input.type = 'radio';
-   input.name = 'recipient_id';
-   input.value = recipient.id;
-   input.checked = recipient.id === selectedRecipient;
-   const face = node('span', recipient.name);
-   face.setAttribute('data-button-face', '');
-   chip.append(input, face);
-   recipientChips.append(chip);
-  }
-  recipientStatus.textContent = selectedRecipient === null
-   ? 'The recipient you chose is not available. Choose a recipient.'
-   : available.length ? '' : 'No recipients are available.';
-  recipientStatus.hidden = !recipientStatus.textContent;
+  for (const recipient of available)
+   recipientChips.append(choiceChip('recipient_id', recipient, selectedRecipient));
+  showActionFailure(recipientStatus, selectedRecipient === null
+   ? (assignees ? 'The producer you chose is unavailable.' : 'The recipient you chose is not available. Choose a recipient.')
+   : available.length ? '' : (assignees ? 'No producers are available.' : 'No recipients are available.'));
   showOwnerReason();
  }
 
@@ -1048,11 +1509,18 @@ SCRIPT = r'''(() => {
  }
 
  function editDraft(event) {
-  if (sending) return;
-  if (pendingItem) pendingEdited = true;
+  if (sending || isRecovering()) return;
   if (event?.target.name === 'kind') {
+   discardCapture();
+   if (!awaitingNativeRecovery || isEditingLater()) {
+    if (!awaitingEarlierSend && !isEditingLater()) forgetListDraft();
+    draftId = undefined;
+   }
+   ensureDraftId();
    showRecipients();
    showBugPage();
+   storeListDraft();
+   startCapture();
   }
   if (event?.target.name === 'recipient_id') {
    selectedRecipient = event.target.value;
@@ -1060,7 +1528,12 @@ SCRIPT = r'''(() => {
    recipientStatus.hidden = true;
    showOwnerReason();
   }
-  if (event?.target === includePage && !pendingItem) startCapture();
+  if (event?.target.name === 'assignee_id') {
+   selectedAssignee = event.target.value;
+   storeListDraft();
+  }
+  if (event?.target === includePage && !pendingPayload()) startCapture();
+  showRoute();
   showSentDetails();
   setError('');
   updateSend();
@@ -1077,17 +1550,17 @@ SCRIPT = r'''(() => {
  }
 
  words.addEventListener('paste', event => {
-  if (sending) return;
+  if (sending || isScheduled() || isRecovering()) return;
   const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
   if (!files.length) return;
   event.preventDefault();
   const total = [...images.map(image => image.file), ...files].reduce((sum, file) => sum + file.size, 0);
   if (files.some(file => !limits.types.includes(file.type))) {
-   setError('Paste PNG, JPEG, GIF or WebP images.'); return;
+   showActionFailure(error, 'Paste PNG, JPEG, GIF or WebP images.'); return;
   }
   if (images.length + files.length > limits.images || total > limits.totalImageBytes ||
       files.some(file => !file.size || file.size > limits.imageBytes)) {
-   setError('Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
+   showActionFailure(error, 'Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
   }
   addImagePreviews(files);
   editDraft();
@@ -1126,11 +1599,11 @@ SCRIPT = r'''(() => {
   const data = await response.json().catch(() => null);
   if (!response.ok || !data) {
    const failure = new Error(data?.error || data?.reason || fallback);
-   failure.definiteRefusal = response.status >= 400 && response.status < 500;
+   failure.definiteRefusal = response.status >= 400 && response.status < 500 && data?.code !== 'draft_pending';
    failure.staleToken = response.status === 403 && data?.code === 'stale_token';
    failure.screenshotExpired = response.status === 409 && data?.code === 'screenshot_expired';
    if (response.status === 409 && data?.code === 'already_filed' &&
-       typeof data.id === 'string' && /^[QPI][1-9][0-9]*$/.test(data.id)) {
+       typeof data.id === 'string' && /^[QPIL][1-9][0-9]*$/.test(data.id)) {
     failure.filedId = data.id;
    }
    throw failure;
@@ -1140,7 +1613,7 @@ SCRIPT = r'''(() => {
 
  async function loadOptions(signal, page = ownerPage) {
   const path = page ? endpoint + '?' + new URLSearchParams({page}) : endpoint;
-  const response = await fetch(path, {cache: 'no-store', signal});
+  const response = await fetch(path, {cache: 'no-store', signal, headers: {'X-New-Item-Route': 'producer'}});
   const data = await responseData(response, 'Could not load recipients.');
   if (!Array.isArray(data.recipients) || typeof data.token !== 'string' || (!data.token && !data.send_disabled)) {
    throw new Error('Could not load recipients.');
@@ -1148,20 +1621,31 @@ SCRIPT = r'''(() => {
   return data;
  }
 
- function setOptions(data) {
+ function setOptions(data, newDraft = false, recipientName = '') {
   token = data.token;
   sendNotice.textContent = data.send_disabled || '';
   sendNotice.hidden = !data.send_disabled;
-  includePage.closest('label').hidden = !sendNotice.hidden;
+  includePage.closest('label').hidden = !pageContext || !sendNotice.hidden;
   recipients = data.recipients;
+  assignees = ownerPage && Array.isArray(data.assignees) ? data.assignees : null;
   pageOwner = data.page_owner || '';
   ownerReasonText.textContent = data.page_owner_reason || '';
+  if (newDraft) {
+   selectedRecipient = ownerPage ? pageOwner : recipients.find(recipient => recipient.name === recipientName)?.id || '';
+   selectedAssignee = assignees ? data.page_assignee || '' : '';
+  }
+  if (assignees && !assignees.some(choice => choice.id === selectedAssignee))
+   selectedAssignee = '';
+  assigneeChips.replaceChildren(...(assignees || []).map(choice => choiceChip('assignee_id', choice, selectedAssignee)));
   showRecipients();
+  showRoute();
+  updateSend();
  }
 
- async function post(payload, keepalive = false) {
-  const response = await fetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                          body: JSON.stringify(payload), keepalive});
+ async function post(payload, {keepalive = false, hold = false, receiver} = {}) {
+  const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify(payload), keepalive};
+  const response = await (hold ? heldFetch(endpoint, options, receiver) : fetch(endpoint, options));
   return responseData(response, 'Could not send this item.');
  }
 
@@ -1259,18 +1743,18 @@ SCRIPT = r'''(() => {
 
  function collectPageContext() {
   const filters = [];
-  for (const chip of document.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip],[data-filter-value]')) {
+  for (const chip of document.querySelectorAll('[data-filter-row] [data-filter-value]')) {
    if (chip.getAttribute('aria-pressed') !== 'true' || !visible(chip)) continue;
    const group = chip.closest('[role="group"]')?.getAttribute('aria-label');
    if (!group) continue;
    const label = chip.cloneNode(true);
    label.querySelector('b')?.remove();
-   filters.push((group === 'Show' ? 'State' : group) + ' ' + clip(label.textContent));
+   filters.push(group + ' ' + clip(label.textContent));
   }
   const search = document.querySelector('#list-search,[data-filter-words]');
   if (search?.value && visible(search)) filters.push('Search ' + clip(search.value));
   const notices = new Set();
-  const selector = '[data-review-source-notices] li,[data-review-notice],[data-missing-item],.notice,' +
+  const selector = '[data-review-source-notices] li,[data-review-notice],[data-hidden-action-status],[data-missing-item],.notice,' +
                    '[role="alert"],[data-page-status][data-state="Failed"] [data-status-reason]';
   for (const element of document.querySelectorAll(selector)) {
    if (!visible(element)) continue;
@@ -1301,9 +1785,12 @@ SCRIPT = r'''(() => {
   const bug = isPageBug();
   dialog.toggleAttribute('data-page-bug', Boolean(bug));
   words.rows = bug ? 3 : 4;
-  bugStateBox.hidden = !bug;
+  bugStateBox.hidden = !bug || !pageContext;
   fallback.textContent = bug ? 'Screenshot unavailable.' : fallbackText;
-  if (!bug || !pageContext) return;
+  if (!bug || !pageContext?.state) {
+   bugStateBox.querySelector('dl').replaceChildren();
+   return;
+  }
   const {state} = pageContext;
   const rows = [
    ['Page', state.title],
@@ -1323,8 +1810,22 @@ SCRIPT = r'''(() => {
  }
 
  function showSentDetails() {
+  const choosing = submittedDraft?.mode === 'screenshot-expired';
+  replaceCapture.hidden = !choosing;
+  const key = submittedDraft?.payload.capture_key;
+  const hasOriginalPreview = key && (captureSession?.capture.key === key || captureSession?.image?.key === key);
+  if (isRecovering() && (choosing || !hasOriginalPreview || captureSession?.image === null)) {
+   slot.hidden = true;
+   expired.hidden = !choosing;
+   fallback.hidden = choosing || !includePage.checked;
+   fallback.textContent = submittedDraft.payload.defer_capture
+    ? 'The screenshot joins the saved item when ready.'
+    : key ? 'Retry includes the screenshot.' : 'Retry sends the page data without a screenshot.';
+   updateSend();
+   return;
+  }
   const image = captureSession?.image;
-  const include = includePage.checked && sendNotice.hidden;
+  const include = Boolean(pageContext) && includePage.checked && sendNotice.hidden;
   const unavailable = include && (image === null || !hasCaptureSpace(image));
   slot.hidden = !include || unavailable;
   taking.hidden = !!image;
@@ -1338,10 +1839,13 @@ SCRIPT = r'''(() => {
  }
 
  function startCapture(renewed = false) {
-  if ((savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
+  if (isScheduled() || isRecovering() || isEditingLater() || (savedItem && !renewed) || !pageContext || !includePage.checked || !token || captureSession) return;
   const {place, viewport} = pageContext;
-  const capture = deferredCapture || {key: ensureDraftId() + randomNonce(), request: {place, ...viewport}};
-  const session = {token, renewed, capture, sent: Boolean(deferredCapture), page: ownerPage,
+  const item = pendingPayload();
+  const capturing = item?.defer_capture;
+  const capture = capturing ? {key: item.capture_key, request: capturing}
+   : {key: ensureDraftId() + randomNonce(), request: {place, ...viewport}};
+  const session = {token, renewed, capture, sent: Boolean(capturing), page: ownerPage,
                    controller: new AbortController()};
   captureSession = session;
   showSentDetails();
@@ -1381,7 +1885,9 @@ SCRIPT = r'''(() => {
  }
 
  function ensureDraftId() {
-  return draftId ||= 'r6-' + randomNonce();
+  const prefix = isScheduled() ? 's1-' : 'r6-';
+  if (!draftId?.startsWith(prefix)) draftId = prefix + randomNonce();
+  return draftId;
  }
 
  async function renewCapture() {
@@ -1402,7 +1908,7 @@ SCRIPT = r'''(() => {
   clearCapturePreview(session);
   showSentDetails();
   if (!used && !session.sent) {
-   void session.key.then(key => key && post({token: session.token, discard_capture: key}, true)).catch(() => {});
+   void session.key.then(key => key && post({token: session.token, discard_capture: key}, {keepalive: true})).catch(() => {});
   }
  }
 
@@ -1413,108 +1919,385 @@ SCRIPT = r'''(() => {
   session.image = null;
  }
 
- function storedListDraft() {
-  try {
-   const stored = sessionStorage.getItem(listSendKey);
-   if (!stored) return null;
-   if (listDraftId.test(stored)) return {id: stored, recipient: null};
-   const draft = JSON.parse(stored);
-   if (typeof draft?.id !== 'string' || !listDraftId.test(draft.id)) return null;
-   const recipient = typeof draft.recipient === 'string' && draft.recipient ? draft.recipient : null;
-   return {id: draft.id, recipient};
-  } catch (_) { return null; }
+ function isShippedListDraft(draft) {
+  return draft?.id.startsWith('r6-') && draft.awaitingSend === undefined;
  }
 
  function storeListDraft() {
-  if (ownerPage !== 'list' || !draftId) return;
+  if (ownerPage !== 'list' || !draftId || isEditingLater() ||
+      separateFromNativeDraft || !sendNotice.hidden) return;
   try {
-   sessionStorage.setItem(listSendKey, JSON.stringify({id: draftId, recipient: selectedRecipient}));
+   const saved = assignees ? JSON.stringify({recipient: selectedRecipient || null, assignee: selectedAssignee})
+                           : selectedRecipient || '';
+   sessionStorage.setItem(listDraftPrefix + draftId, saved);
+   if (!awaitingNativeRecovery) sessionStorage.setItem(listStatePrefix + draftId, String(awaitingEarlierSend));
   } catch (_) {}
  }
 
- function finishDraft() {
-  draftId = deferredCapture = pendingItem = undefined;
-  pendingEdited = false;
-  if (ownerPage === 'list') {
-   try { sessionStorage.removeItem(listSendKey); } catch (_) {}
+ function draftTransaction(mode, action) {
+  draftDatabase ||= new Promise((resolve, reject) => {
+   const request = indexedDB.open('console.new-item', 1);
+   request.onupgradeneeded = () => request.result.createObjectStore('submitted');
+   request.onsuccess = () => resolve(request.result);
+   request.onerror = () => reject(request.error);
+  });
+  return draftDatabase.then(database => new Promise((resolve, reject) => {
+   const transaction = database.transaction('submitted', mode);
+   const request = action(transaction.objectStore('submitted'));
+   transaction.oncomplete = () => resolve(request.result);
+   transaction.onabort = () => reject(transaction.error);
+  }));
+ }
+
+ async function storeSubmittedDraft(draft) {
+  const id = draft.payload.request_id;
+  const key = submittedStorageKey || (sessionStorage.getItem(submittedKey) ? submittedPrefix + id : submittedKey);
+  const earlier = sessionStorage.getItem(key);
+  let pointer;
+  try {
+   sessionStorage.setItem(key, JSON.stringify(draft));
+  } catch (failure) {
+   if (failure?.name !== 'QuotaExceededError') throw failure;
+   await draftTransaction('readwrite', store => store.put(draft, id));
+   pointer = id;
+   sessionStorage.setItem(key, pointer);
+  }
+  if (earlier && browserDraftId.test(earlier) && earlier !== pointer) {
+   void draftTransaction('readwrite', store => store.delete(earlier)).catch(() => {});
+  }
+  submittedStorageKey = key;
+  submittedDraft = draft;
+ }
+
+ async function restoreSubmittedDraft() {
+  if (submittedDraft) return submittedDraft;
+  const keys = draftId ? [submittedPrefix + draftId, submittedKey] :
+   [...Object.keys(sessionStorage).filter(key => key.startsWith(submittedPrefix)), submittedKey];
+  for (const key of keys) {
+   const stored = sessionStorage.getItem(key);
+   if (!stored) continue;
+   const saved = browserDraftId.test(stored)
+    ? await draftTransaction('readonly', store => store.get(stored)) : JSON.parse(stored);
+   const id = saved?.payload?.request_id || '';
+   const prefix = saved?.payload?.kind === 'scheduled' ? 's1-' : 'r6-';
+   if (!browserDraftId.test(id) || !id.startsWith(prefix)) throw new Error('Could not restore the submitted New item.');
+   if (drafts.some(other => other !== draft && other.id === id)) continue;
+   submittedDraft = {...saved, mode: saved.mode || 'retry'};
+   submittedStorageKey = key;
+   break;
+  }
+  return submittedDraft;
+ }
+
+ function clearSubmittedDraft() {
+  if (!submittedDraft) return;
+  const key = submittedStorageKey;
+  const stored = sessionStorage.getItem(key);
+  sessionStorage.removeItem(key);
+  submittedDraft = undefined;
+  submittedStorageKey = undefined;
+  if (stored && browserDraftId.test(stored)) {
+   void draftTransaction('readwrite', store => store.delete(stored)).catch(() => {});
   }
  }
+
+ function forgetListDraft() {
+  if (ownerPage === 'list' && draftId && !separateFromNativeDraft) {
+   try {
+    sessionStorage.removeItem(listDraftPrefix + draftId);
+    sessionStorage.removeItem(listStatePrefix + draftId);
+   } catch (_) {}
+  }
+ }
+
+ function finishDraft() {
+  clearSubmittedDraft();
+  forgetListDraft();
+  draftId = undefined;
+  awaitingEarlierSend = awaitingNativeRecovery = false;
+ }
+
+ function replaceImages(files) {
+  for (const image of images) URL.revokeObjectURL(image.url);
+  images = [];
+  previews.replaceChildren();
+  addImagePreviews(files);
+ }
+
+ function editSnapshot() {
+  return {kind: form.elements.kind.value, recipient: selectedRecipient, assignee: selectedAssignee, words: words.value,
+          include: includePage.checked, files: images.map(image => image.file), pageContext, ownerPage, id: draftId};
+ }
+
+ function showLaterDraft() {
+  const draft = laterDraft;
+  laterDraft = undefined;
+  if (draft) showEdit(draft);
+ }
+
+ function showEdit(draft) {
+  ownerPage = draft.ownerPage;
+  pageContext = draft.pageContext;
+  form.elements.kind.value = draft.kind;
+  draftId = draft.id;
+  selectedRecipient = draft.recipient;
+  selectedAssignee = draft.assignee || '';
+  words.value = draft.words;
+  includePage.checked = draft.include;
+  replaceImages(draft.files);
+  showRecipients();
+  showRoute();
+  showBugPage();
+ }
+
+ function decodePastedFiles(uploads) {
+  return uploads.map(image => new File([
+   Uint8Array.from(atob(image.base64_data), character => character.charCodeAt(0))
+  ], 'Pasted image', {type: image.media_type}));
+ }
+
+ function showSubmittedDraft(draft) {
+  const original = draft.payload;
+  const editingLater = isEditingLater();
+  if (editingLater) {
+   const draft = editSnapshot();
+   const sameFiles = draft.files.length === laterBase.files.length &&
+    draft.files.every((file, index) => file === laterBase.files[index]);
+   if (draft.words !== laterBase.words || draft.kind !== laterBase.kind || draft.recipient !== laterBase.recipient ||
+       draft.assignee !== laterBase.assignee || draft.include !== laterBase.include || !sameFiles) laterDraft = draft;
+   laterBase = undefined;
+  }
+  draft.mode = draft.mode === 'screenshot-expired' ? 'screenshot-expired' : 'retry';
+  draftId = original.request_id;
+  ownerPage = original.page ?? '';
+  if (ownerPage === 'list') {
+   const stored = storedListDraft();
+   separateFromNativeDraft = isShippedListDraft(stored) && stored.id !== draftId;
+   if (separateFromNativeDraft) {
+    awaitingNativeRecovery = false;
+    if (!nativeListEdit && draft.nativeListEdit) {
+     nativeListEdit = {...draft.nativeListEdit, files: decodePastedFiles(draft.nativeListEdit.files)};
+    }
+   }
+  }
+  awaitingEarlierSend = true;
+  form.elements.kind.value = draft.selectedKind || original.kind;
+  selectedRecipient = original.recipient_id;
+  selectedAssignee = original.assignee_id || '';
+  words.value = original.words;
+  includePage.checked = draft.includeScreenshot ?? Boolean(original.capture_key);
+  const url = original.page_state?.url ? new URL(original.page_state.url) : null;
+  pageContext = draft.pageContext || {
+   state: original.page_state, data: original.evidence,
+   place: original.defer_capture?.place || (url ? url.pathname + url.search + url.hash : ''),
+   viewport: original.defer_capture || original.page_state?.viewport || viewport()
+  };
+  if (editingLater || images.length !== (original.images?.length || 0)) {
+   replaceImages(decodePastedFiles(original.images || []));
+  }
+  if (!keepDraft || error.hidden || draft.mode === 'screenshot-expired') {
+   setError(draft.mode === 'retry' ? 'Retry to confirm the save.' : '');
+  }
+  showRecipients();
+  showRoute();
+  showBugPage();
+  showSentDetails();
+ }
+
+ laterButton.addEventListener('click', () => {
+  if (canEditSeparateListDraft()) {
+   discardCapture();
+   if (awaitingNativeRecovery) {
+    nativeListEdit = editSnapshot();
+    separateFromNativeDraft = true;
+    awaitingEarlierSend = awaitingNativeRecovery = false;
+   }
+   showEdit(separateListEdit || {...nativeListEdit, kind: 'scheduled', id: undefined, words: '', files: []});
+   separateListEdit = undefined;
+   ensureDraftId();
+   setError('');
+   showSentDetails();
+   startCapture();
+   words.focus();
+   return;
+  }
+  if (isEditingLater()) {
+   showSubmittedDraft(submittedDraft);
+   setError('Retry to confirm the save.');
+   send.focus();
+   return;
+  }
+  if (!isRecovering()) return;
+  laterBase = editSnapshot();
+  submittedDraft.mode = 'edit-later';
+  discardCapture();
+  draftId = undefined;
+  showLaterDraft();
+  ensureDraftId();
+  setError('Confirm the earlier Send before you send these edits.');
+  showSentDetails();
+  words.focus();
+ });
+
+ async function chooseScreenshot(renew) {
+  if (submittedDraft?.mode !== 'screenshot-expired' || sending) return;
+  const payload = {...submittedDraft.payload};
+  delete payload.capture_key;
+  delete payload.defer_capture;
+  if (payload.page_state) {
+   payload.page_state = {...payload.page_state, include_screenshot: false};
+  }
+  if (renew) {
+   payload.capture_key = draftId + randomNonce();
+   payload.defer_capture = {place: pageContext.place, ...pageContext.viewport};
+  }
+  setSending(true);
+  try {
+   await storeSubmittedDraft({...submittedDraft, payload, mode: 'retry', includeScreenshot: renew});
+   includePage.checked = renew;
+   setError('');
+  } catch (failure) {
+   setError(failure.message);
+  } finally {
+   setSending(false);
+   showSentDetails();
+  }
+  send.focus();
+ }
+
+ renewButton.addEventListener('click', () => void chooseScreenshot(true));
+ omitButton.addEventListener('click', () => void chooseScreenshot(false));
 
  function showConfirmation(item) {
   savedItem = item;
   const saved = Boolean(item);
-  confirmation.textContent = saved ? 'Saved ' + item.id + '.' : '';
+  const scheduled = saved && item.id.startsWith('L');
+  confirmation.textContent = scheduled
+   ? ['Saved List item ' + item.id.slice(1) + '.', item.receipt?.replace(/ List item [1-9][0-9]*\.$/, ''),
+      ...(item.readback || []), item.notice_warning].filter(Boolean).join('\n')
+   : saved ? ['Saved ' + item.id + '.', item.attachment_warning].filter(Boolean).join('\n') : '';
   confirmation.hidden = savedControls.hidden = !saved;
-  body.hidden = sendControls.hidden = saved;
+  body.hidden = saved && !scheduled;
+  sendControls.hidden = saved;
+  closeButton.hidden = Boolean(item?.attachment_warning);
   updateSend();
   if (saved) done.focus();
  }
 
- function close({sent = false} = {}) {
-  if (!dialog.open || sending) return;
+ function close({sent = false, acknowledged = false} = {}) {
+  if (sending || (!sent && !dialog.open)) return;
   const result = savedItem;
+  if (result?.attachment_warning) {
+   if (!acknowledged) return;
+   discardCapture();
+   finishDraft();
+   if (laterDraft) {
+    showConfirmation();
+    showLaterDraft();
+    showSentDetails();
+    startCapture();
+    updateSend();
+    words.focus();
+    dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: result}));
+    return;
+   }
+  }
+  if (isEditingLater()) showSubmittedDraft(submittedDraft);
+  const returnToNative = separateFromNativeDraft && !submittedDraft;
+  if (returnToNative) {
+   if (!sent && !result) separateListEdit = editSnapshot();
+   separateFromNativeDraft = false;
+   draftId = undefined;
+   awaitingEarlierSend = false;
+  }
   discardCapture();
   opening.abort();
-  dialog.close();
-  keepDraft = !sent && !result && Boolean(pendingItem || words.value || images.length);
+  if (dialog.open) hideDialog();
+  keepDraft = !returnToNative && !sent && !result &&
+    Boolean(submittedDraft || awaitingEarlierSend || words.value || images.length);
   if (!keepDraft) {
-   if (ownerPage !== 'list' || !storedListDraft()) finishDraft();
+   if (!returnToNative) finishDraft();
+   if (result) showConfirmation();
    for (const image of images) URL.revokeObjectURL(image.url);
    images = [];
    previews.replaceChildren();
    previews.hidden = true;
+   source = '';
   }
-  if (launcher?.isConnected) launcher.focus({preventScroll: true});
   launcher = null;
-  if (result) {
-   showConfirmation();
-   dialog.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: result}));
+  if (fresh && !keepDraft) {
+   dialog.remove();
+   drafts.splice(drafts.indexOf(draft), 1);
   }
+ }
+
+ function hideDialog() {
+  dialog.close();
+  if (launcher?.isConnected) launcher.focus({preventScroll: true});
  }
 
  function setSending(value) {
   sending = value;
   for (const control of [...fields, ...previews.querySelectorAll('button')]) control.disabled = value;
-  send.textContent = value ? 'Sending…' : 'Send';
   form.setAttribute('aria-busy', String(value));
   updateSend();
  }
 
- async function open(trigger, page) {
-  // A press on the New item button inside the open New item window moves focus to the words.
-  // In the Saved state the words are hidden, so the focus goes to Done.
+ async function open(trigger, page, key, {kind = 'bug', recipientName = '',
+                                        capture = {kind: 'none'}, shownTip = null} = {}) {
   if (dialog.open) {
-   (body.hidden ? done : words).focus({preventScroll: true});
+   (savedItem ? done : words).focus({preventScroll: true});
    return;
   }
   if (sending) return;
-  if (pendingItem) page = pendingItem.page;
-  ownerPage = page;
-  pageContext = collectPageContext();
+  source = key;
+  if (!keepDraft) {
+   evidence = structuredClone(capture);
+   tipPreview = shownTip;
+  }
+  ownerPage = submittedDraft ? submittedDraft.payload.page ?? '' : page;
+  if (!keepDraft || !submittedDraft) pageContext = ownerPage ? collectPageContext() : null;
   launcher = trigger;
   token = '';
-  if (ownerPage === 'list' && !draftId) {
+  if (ownerPage === 'list' && !draftId && !keepDraft) {
    const stored = storedListDraft();
    if (stored) {
     draftId = stored.id;
     selectedRecipient = stored.recipient;
+    selectedAssignee = stored.assignee || '';
+    // The shipped List dialog stores no Send state.
+    awaitingNativeRecovery = isShippedListDraft(stored);
+    awaitingEarlierSend = awaitingNativeRecovery || stored.awaitingSend === true;
    }
   }
   const newDraft = !keepDraft && !draftId;
-  if (newDraft) selectedRecipient = '';
+  if (newDraft) {
+   selectedRecipient = '';
+   selectedAssignee = '';
+   showAssigneeChoices(false);
+  }
+  // A refusal belongs to the page that sent it, so a new dialog starts without one.
   sendNotice.hidden = true;
-  includePage.closest('label').hidden = false;
+  sendNotice.textContent = '';
+  includePage.closest('label').hidden = !pageContext;
   recipients = null;
+  assignees = null;
+  route.hidden = true;
   recipientChips.replaceChildren();
   pageOwner = '';
   showOwnerReason();
   if (!keepDraft) {
    form.reset();
    setError('');
-   form.elements.kind.value = 'bug';
+   form.elements.kind.value = kind;
+   if (nativeListEdit && awaitingNativeRecovery && nativeListEdit.id === draftId) {
+    showEdit(nativeListEdit);
+    nativeListEdit = undefined;
+   }
   }
-  recipientStatus.textContent = 'Loading recipients…';
-  recipientStatus.hidden = false;
+  showActionFailure(recipientStatus);
+  recipientLoading.hidden = false;
+  showEvidence();
   showBugPage();
   showSentDetails();
   updateSend();
@@ -1525,49 +2308,54 @@ SCRIPT = r'''(() => {
   focus.focus({preventScroll: true});
   body.scrollTop = 0;
   try {
+   const restored = await restoreSubmittedDraft();
+   if (controller.signal.aborted) return;
+   const original = restored?.payload;
+   if (original) showSubmittedDraft(restored);
    const data = await loadOptions(controller.signal);
    if (controller.signal.aborted) return;
-   if (newDraft) selectedRecipient = data.page_owner || '';
-   setOptions(data);
+   setOptions(data, newDraft && !original, recipientName);
    startCapture();
    showSentDetails();
   } catch (failure) {
-   if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
+   if (!controller.signal.aborted) showActionFailure(recipientStatus, failure.message);
+  } finally {
+   if (!controller.signal.aborted) recipientLoading.hidden = true;
   }
  }
 
  form.addEventListener('input', editDraft);
- window.addEventListener('pagehide', () => { if (!sending) discardCapture(); });
- window.addEventListener('pageshow', event => {
-  if (event.persisted && dialog.open) startCapture();
- });
+ changeAssignee.addEventListener('click', () => showAssigneeChoices(assigneeGroup.hidden));
  bindConsoleDialog(dialog, close);
- for (const control of dialog.querySelectorAll('[data-cancel], [data-done]')) {
-  control.addEventListener('click', () => close());
- }
+ dialog.querySelector('[data-cancel]').addEventListener('click', () => close());
+ done.addEventListener('click', () => close({acknowledged: true}));
  async function submissionPayload() {
-  if (pendingItem) return pendingItem;
+  const pending = pendingPayload();
+  if (pending) return pending;
   const type = form.elements.kind.value, recipient = recipientChips.querySelector('input:checked');
   if (!recipient) throw new Error('Select a recipient.');
   const kind = type === 'feedback' ? 'investigation' : type;
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
-                   page: ownerPage, page_recipient: 'selected'};
+                   ...(ownerPage && {page: ownerPage, page_recipient: assignees ? 'producer' : 'selected'}),
+                   ...(assignees && {assignee_id: selectedAssignee || null}),
+                   ...(type === 'feedback' && {notice: {kind: type}})};
   storeListDraft();
+  if (kind === 'scheduled') return payload;
   let key = '';
-  if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
+  const deferredCapture = !slot.hidden && !taking.hidden ? captureSession?.capture : undefined;
   if (!deferredCapture && !slot.hidden && !shot.hidden) {
    key = captureSession?.image?.key;
    if (!key) throw new Error('The screenshot is unavailable.');
   }
   const bug = isPageBug();
-  const data = bug || deferredCapture || !fallback.hidden ? pageContext.data : {kind: 'none'};
-  const state = bug && pageContext.state;
+  const data = evidence.kind !== 'none' ? evidence
+   : pageContext && (bug || deferredCapture || !fallback.hidden) ? pageContext.data : {kind: 'none'};
+  const state = bug && pageContext?.state;
   const files = await Promise.all(images.map(image => pastedData(image.file)));
   if (deferredCapture && captureSession?.capture === deferredCapture) captureSession.sent = true;
   const item = {...payload, evidence: data, images: files,
                 ...(deferredCapture && {capture_key: deferredCapture.key, defer_capture: deferredCapture.request}),
                 ...(key && {capture_key: key}), ...(state && {page_state: state})};
-  if (deferredCapture) pendingItem = item;
   return item;
  }
 
@@ -1575,32 +2363,82 @@ SCRIPT = r'''(() => {
   event.preventDefault();
   if (send.disabled) return;
   const onList = ownerPage === 'list';
-  let saved, submittedKind, usedPreview = false;
+  const hadEarlierSend = awaitingEarlierSend;
+  let saved, usedPreview = false, posted = false;
   setError('');
   setSending(true);
+  if (!isScheduled()) hideDialog();
   try {
    const item = await submissionPayload();
-   submittedKind = item.kind;
+   if (submittedDraft?.payload !== item) {
+    const recipientName = recipientChips.querySelector('input:checked')?.nextElementSibling.textContent;
+    const draft = {payload: item, mode: 'live', recipientName, pageContext, selectedKind: form.elements.kind.value,
+                   includeScreenshot: includePage.checked};
+    if (separateFromNativeDraft && nativeListEdit) {
+     const files = await Promise.all(nativeListEdit.files.map(pastedData));
+     draft.nativeListEdit = {...nativeListEdit, files};
+    }
+    await storeSubmittedDraft(draft);
+   }
+   awaitingEarlierSend = true;
+   storeListDraft();
    usedPreview = Boolean(item.capture_key && !item.defer_capture);
-   const sendItem = () => post({...item, token});
+   const sendItem = () => {
+    posted = true;
+    if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
+    const receiver = !hadEarlierSend && recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
+    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver: receiver || undefined});
+   };
    let result;
    try {
     result = await sendItem();
    } catch (failure) {
-    if (onList || !failure?.staleToken) throw failure;
+    if ((onList && item.kind !== 'scheduled') || !failure?.staleToken) throw failure;
     const fresh = await loadOptions(opening.signal);
     setOptions(fresh);
-    if (!pendingItem && selectedRecipient !== item.recipient_id) return;
+    if (!pendingPayload() && selectedRecipient !== item.recipient_id) throw failure;
     result = await sendItem();
    }
-   if (typeof result.id !== 'string' || !/^[QPI][1-9][0-9]*$/.test(result.id)) {
+   const expectedId = item.kind === 'scheduled' ? /^L[1-9][0-9]*$/ : /^[QPI][1-9][0-9]*$/;
+   if (typeof result.id !== 'string' || !expectedId.test(result.id)) {
     throw new Error('The server did not return a saved item ID.');
    }
    saved = result;
   } catch (failure) {
-   if (failure?.definiteRefusal && !failure.staleToken) {
-    pendingItem = deferredCapture = undefined;
-    pendingEdited = false;
+   if (!dialog.open) dialog.showModal();
+   if (failure instanceof SendUndone) {
+    if (!hadEarlierSend) {
+     clearSubmittedDraft();
+     awaitingEarlierSend = false;
+     if (captureSession) captureSession.sent = false;
+     storeListDraft();
+    }
+    setError(failure.message);
+    return;
+   }
+   if (posted && !failure?.definiteRefusal && submittedDraft && !isRecovering()) {
+    showSubmittedDraft(submittedDraft);
+    try { await storeSubmittedDraft(submittedDraft); } catch (_) {}
+   }
+   const chooseCapture = failure?.screenshotExpired && isRecovering();
+   if (chooseCapture) {
+    submittedDraft.mode = 'screenshot-expired';
+    try { await storeSubmittedDraft(submittedDraft); } catch (_) {}
+    discardCapture(!onList);
+    showSentDetails();
+   } else if (failure?.definiteRefusal) {
+    if (!failure.staleToken || !hadEarlierSend) {
+     const recovering = isRecovering();
+     clearSubmittedDraft();
+     if (recovering) {
+      showLaterDraft();
+      showRecipients();
+      showBugPage();
+      showSentDetails();
+     }
+    }
+    awaitingEarlierSend = awaitingNativeRecovery || (failure.staleToken && hadEarlierSend);
+    storeListDraft();
    }
    if (failure?.filedId) {
     discardCapture();
@@ -1608,12 +2446,12 @@ SCRIPT = r'''(() => {
     setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.');
     void renewCapture();
    } else {
-    setError(failure?.message || 'Could not send this item.');
-    if (failure?.screenshotExpired && includePage.checked) {
+    setError(chooseCapture ? '' : failure?.message || 'Could not send this item.');
+    if (failure?.screenshotExpired && !chooseCapture && includePage.checked) {
      discardCapture(!onList);
      void renewCapture();
     } else if (onList && (failure?.staleToken || failure instanceof TypeError)) {
-     if (!pendingItem && (failure?.staleToken || !captureSession?.image)) discardCapture();
+     if (!pendingPayload() && (failure?.staleToken || !captureSession?.image)) discardCapture();
      const signal = opening.signal;
      const fresh = await loadOptions(signal).catch(() => null);
      if (!signal.aborted && fresh) {
@@ -1626,32 +2464,86 @@ SCRIPT = r'''(() => {
   } finally {
    setSending(false);
   }
-  if (saved) {
-   const keepEdits = pendingEdited;
+  if (saved?.attachment_warning) {
+   if (!dialog.open) dialog.showModal();
+   showConfirmation(saved);
+   dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+  } else if (saved) {
+   const keepEdits = Boolean(laterDraft);
    discardCapture(usedPreview);
    finishDraft();
+   showLaterDraft();
+   showSentDetails();
    if (keepEdits) {
+    if (!dialog.open) dialog.showModal();
     setError('Saved ' + saved.id + '. Your edits are still in the dialog.');
     dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
     startCapture();
     updateSend();
     send.focus();
-   } else if (onList || submittedKind === 'enhancement') {
+   } else if (!saved.id.startsWith('L')) {
     close({sent: true});
-    dialog.dispatchEvent(new CustomEvent(onList ? 'review-item-created' : 'review-item-saved',
-      {bubbles: true, detail: saved}));
+    const target = dialog.isConnected ? dialog : document;
+    if (!onList) target.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
+    target.dispatchEvent(new CustomEvent('review-item-created', {bubbles: true, detail: saved}));
    } else {
     showConfirmation(saved);
     dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
    }
   } else {
    send.focus();
+   return;
   }
  });
 
+ const draft = {
+  dialog, open,
+  get id() { return draftId; },
+  get source() { return source; },
+  get sending() { return sending; },
+  pagehide() { if (!sending) discardCapture(); },
+  pageshow() { if (dialog.open) startCapture(); },
+ };
+ return draft;
+}
+
+ drafts.push(bindDraft(original));
+ function newDraft() {
+  const dialog = template.cloneNode(true), suffix = '-' + (++nextDraft);
+  dialog.dataset.newItemDraft = '';
+  dialog.id += suffix;
+  for (const element of dialog.querySelectorAll('[id]')) element.id += suffix;
+  for (const attr of ['aria-labelledby', 'aria-describedby', 'for'])
+   for (const element of [dialog, ...dialog.querySelectorAll('[' + attr + ']')]) {
+    if (element.hasAttribute(attr))
+     element.setAttribute(attr, element.getAttribute(attr).split(' ').map(id => id + suffix).join(' '));
+   }
+  original.after(dialog);
+  const draft = bindDraft(dialog, true);
+  drafts.push(draft);
+  return draft;
+ }
+ window.addEventListener('pagehide', () => drafts.forEach(draft => draft.pagehide()));
+ window.addEventListener('pageshow', event => {
+  if (event.persisted) drafts.forEach(draft => draft.pageshow());
+ });
+ function openDraft(trigger, page, key, options) {
+  const active = drafts.find(draft => draft.dialog.open && draft.dialog.contains(trigger));
+  if (!active && drafts.some(draft => draft.dialog.open)) return null;
+  const available = drafts.filter(draft => !draft.sending);
+  const draft = active || available.findLast(draft => draft.source === key)
+   || available.findLast(draft => !draft.source) || newDraft();
+  void draft.open(trigger, page, key, options);
+  return draft.dialog;
+ }
+ window.reviewNewItem = {
+  open: ({trigger, kind = 'question', recipientName, evidence: capture, tipPreview: shownTip}) =>
+   openDraft(trigger, '', 'step:' + capture.step_id, {kind, recipientName, capture, shownTip}),
+  evidenceLimits: Object.freeze(limits.buildEvidence)
+ };
  document.addEventListener('click', event => {
   const trigger = event.target.closest('[data-owner-new]');
   const page = trigger?.closest('[data-page-owner]')?.dataset.pageOwner;
-  if (page) void open(trigger, page);
+  if (page) openDraft(trigger, page, 'page:' + page);
  });
 })();'''

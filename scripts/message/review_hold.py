@@ -1,7 +1,13 @@
 """Keep local Claude messages while a review is open."""
 from __future__ import annotations
+try:
+    with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
+except FileNotFoundError:
+    pass
 
+import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -12,6 +18,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from time import time
 from typing import cast
 
 from scripts.lib import conf
@@ -31,6 +38,7 @@ class ReviewMessage:
     native_id: str = "unavailable"
     key: str = ""
     key_recipient: str = ""
+    once_per_key: bool = False
 
 
 type RecordReleasedKeys = Callable[[tuple[ReviewMessage, ...], str, float], None]
@@ -76,6 +84,7 @@ class ReleasedMessages:
     new_message: ReviewMessage | NoNewMessage = NoNewMessage.OUTSIDE_THE_BATCH
     accepted_at: float | UnconfirmedRelease = UnconfirmedRelease.NO_RECEIPT
     filed: HeldFileAppend | NothingFiled = NothingFiled.NOT_FILED
+    record_keys: RecordReleasedKeys | None = None
 
     @property
     def messages(self) -> tuple[ReviewMessage, ...]:
@@ -169,17 +178,18 @@ def _read_state(count: Path, path: Path) -> ReviewState:
                            else EndedReview.HOLD_ENDED)
     at = value["last_activity"]
     activity = EndedReview.HOLD_ENDED if at is None else float(cast(float, at))
-    messages = cast(list[dict[str, str | float]], value["messages"])
-    reserved = cast(list[dict[str, str | float]], value.get("reserved", []))
+    messages = cast(list[dict[str, str | float | bool]], value["messages"])
+    reserved = cast(list[dict[str, str | float | bool]], value.get("reserved", []))
     return ReviewState(activity, _read_messages(messages), _read_messages(reserved),
                        release_pending=value.get("release_pending") is True)
 
 
-def _read_messages(messages: list[dict[str, str | float]]) -> tuple[ReviewMessage, ...]:
+def _read_messages(messages: list[dict[str, str | float | bool]]) -> tuple[ReviewMessage, ...]:
     return tuple(
         ReviewMessage(str(item["sender"]), float(item["sent"]), str(item["text"]),
                       str(item.get("native_id", "unavailable")), str(item.get("key", "")),
-                      str(item.get("key_recipient", "")))
+                      str(item.get("key_recipient", "")),
+                      item.get("once_per_key", str(item.get("key", "")).startswith("agents-resume:")) is True)
         for item in messages)
 
 
@@ -190,6 +200,19 @@ def _write_state(path: Path, state: ReviewState) -> None:
               "reserved": [asdict(item) for item in state.reserved],
               "release_pending": state.release_pending}
     write_text_atomic(path, json.dumps(record), new_file_mode=0o600)
+
+
+def kept_once(key: str) -> bool:
+    """Recover acceptance if a sender stopped after saving the review message."""
+    directory = _state_file(_count_file("lookup")).parent
+    for path in directory.glob("*.json"):
+        try:
+            state = _read_state(directory.parent / path.stem, path)
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+        if any(item.key == key and item.once_per_key for item in (*state.reserved, *state.messages)):
+            return True
+    return False
 
 
 def _enabled(settings: conf.ConfigRead) -> bool:
@@ -278,6 +301,40 @@ def _carries_held_notice(text: str, path: Path) -> bool:
     return re.search(pattern, text) is not None
 
 
+def _file_once(target: Path, messages: tuple[ReviewMessage, ...], header: str) -> list[str]:
+    """Publish each keyed entry once and reuse its notice after an interrupted release."""
+    try:
+        existing = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        existing = ""
+    new: dict[str, ReviewMessage] = {}
+    released: dict[str, int] = {}
+    seen: set[str] = set()
+    for message in messages:
+        if message.key in seen:
+            continue
+        seen.add(message.key)
+        digest = hashlib.sha256(message.key.encode()).hexdigest()
+        marker = f"\n<!-- review key {digest} -->\n"
+        location = existing.find(marker)
+        if location == -1:
+            new[digest] = message
+        else:
+            saved_header = existing[:location].rsplit("\n" + RELEASED_AT, 1)[-1].splitlines()[0]
+            saved_header = saved_header.removeprefix(RELEASED_AT)
+            section = RELEASED_AT + saved_header
+            released[section] = released.get(section, 0) + 1
+    if new:
+        section_id = next(iter(new))[:12]
+        section = f"{header} ({section_id})"
+        entries = numbered_entries(tuple(new.values()))
+        markers = "".join(f"\n<!-- review key {digest} -->\n" for digest in new)
+        contents = existing + ("\n" if existing else "") + f"{section}\n{markers}\n{entries}\n"
+        write_text_atomic(target, contents, new_file_mode=0o600)
+        released[section] = len(new)
+    return [held_notice(count, target, section) for section, count in released.items()]
+
+
 def _file_release(count: Path, batch: ReleasedMessages, at: float, *, batch_only: bool) -> str:
     """Append the batch's held part to the held messages file and give the notice that names it."""
     if not isinstance(batch.filed, NothingFiled):
@@ -289,11 +346,21 @@ def _file_release(count: Path, batch: ReleasedMessages, at: float, *, batch_only
     released = datetime.fromtimestamp(at, timezone.utc)
     header = RELEASED_AT + (_zone_time(released, "%H:%M:%S", unreadable="review hold: release time in UTC")
                             or f"{released:%H:%M:%S} UTC")
+    once = tuple(item for item in messages if item.key and item.once_per_key)
+    ordinary = tuple(item for item in messages if item not in once)
+    notices: list[str] = []
+    if once:
+        with _locked(_state_file(count)):
+            notices = _file_once(target, once, header)
+        if batch.record_keys is not None:
+            batch.record_keys(once, f"session:{count.name}", at)
+    if not ordinary:
+        return "\n".join(notices)
     with _locked(_state_file(count)):
         descriptor = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             size_before = os.fstat(descriptor).st_size
-            text = ("\n" if size_before else "") + f"{header}\n\n{numbered_entries(messages)}\n"
+            text = ("\n" if size_before else "") + f"{header}\n\n{numbered_entries(ordinary)}\n"
             remaining = memoryview(text.encode("utf-8", errors="replace"))
             try:
                 while remaining:
@@ -306,7 +373,8 @@ def _file_release(count: Path, batch: ReleasedMessages, at: float, *, batch_only
         finally:
             os.close(descriptor)
     batch.filed = HeldFileAppend(target, size_before, size_after)
-    return held_notice(len(messages), target, header)
+    notices.append(held_notice(len(ordinary), target, header))
+    return "\n".join(notices)
 
 
 def file_release(session: str, batch: ReleasedMessages, at: float, *, batch_only: bool) -> str:
@@ -340,6 +408,7 @@ def _reserve(path: Path, state: ReviewState, delivery: ExitStack, *, key: str = 
 @contextmanager
 def _settle_release(count: Path, path: Path, batch: ReleasedMessages,
                     record_keys: RecordReleasedKeys) -> Generator[ReleasedMessages]:
+    batch.record_keys = record_keys
     try:
         yield batch
     finally:
@@ -430,10 +499,10 @@ def record_user_prompt(session: str, at: float, emit: Callable[[str], None], *,
             write_text_atomic(path.with_suffix(".prompt"), repr(at), new_file_mode=0o600)
             if isinstance(state.last_activity, EndedReview):
                 held = _reserve(path, state, delivery)
-                # The user is back in a review with open items, so the hold starts again.
-                # A release in transport passes the open hold by its notice; messages it left wait for the hold end.
                 if _read_count(count) and _enabled(conf.read("send")):
-                    _write_state(path, replace(_read_state(count, path), last_activity=at, release_pending=False))
+                    # Restart the hold and keep any release requested before this prompt.
+                    _write_state(path, replace(_read_state(count, path), last_activity=at,
+                                               release_pending=state.release_pending))
             else:
                 held = ()
         _emit_saved(count, path, held, at, emit, record_keys)
@@ -449,20 +518,32 @@ def deliver_if_disabled(session: str, at: float, emit: Callable[[str], None], *,
         _deliver_saved(session, at, emit, record_keys)
 
 
-def _deliver_saved(session: str, at: float, emit: Callable[[str], None], record_keys: RecordReleasedKeys) -> None:
+def _deliver_saved(session: str, at: float, emit: Callable[[str], None], record_keys: RecordReleasedKeys, *,
+                   end_now: bool = False) -> None:
     count = _count_file(session)
     path = _state_file(count)
-    if not path.exists():
+    notice = "No review hold is open."
+    if not (path.exists() or (end_now and count.exists())):
+        if end_now:
+            emit(notice)
         return
     with ExitStack() as delivery:
+        held: tuple[ReviewMessage, ...] = ()
         with _locked(path):
             state = _read_state(count, path)
-            if not (state.messages or state.reserved):
+            has_messages = bool(state.messages or state.reserved)
+            if not end_now and not has_messages:
                 return
-            if _hold_open(count, state, at, conf.read("send")):
+            hold_open = _hold_open(count, state, at, conf.read("send"))
+            if hold_open and not end_now:
                 return
-            held = _reserve(path, _end_review(path, state), delivery)
-        _emit_saved(count, path, held, at, emit, record_keys)
+            if has_messages or hold_open:
+                held = _reserve(path, _end_review(path, state), delivery)
+                notice = "A release of held messages is in progress." if has_messages else "No messages were held."
+        if held:
+            _emit_saved(count, path, held, at, emit, record_keys)
+        elif end_now:
+            emit(notice)
 
 
 @contextmanager
@@ -520,3 +601,25 @@ def route(session: str, message: ReviewMessage, *, urgent: bool,
                     yield batch
                     return
     yield ReleasedMessages(())
+
+
+def main(argv: list[str] | None = None) -> int:
+    from scripts.hooks import review_hold_delivery
+
+    parser = argparse.ArgumentParser(description="End the current review hold and release its messages.")
+    _ = parser.add_argument("command", choices=("end-now",))
+    _ = parser.parse_args(argv)
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session:
+        parser.error("CLAUDE_CODE_SESSION_ID is required")
+    try:
+        _deliver_saved(session, time(), lambda notice: print(notice, flush=True),
+                       review_hold_delivery.record_keys, end_now=True)
+    except (OSError, ValueError) as error:
+        print(f"review hold: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

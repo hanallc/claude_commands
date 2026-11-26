@@ -6,28 +6,29 @@ try:
 except FileNotFoundError:
     pass
 
-from collections.abc import Callable, Generator, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager, suppress
+from collections.abc import Callable, Collection, Container, Generator, Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import ctypes
 import fcntl
 import json
 import os
 import errno
 import re
 import secrets
-import shutil
 import signal
 import stat
 import subprocess
 from enum import Enum, auto
+from importlib import import_module
 from pathlib import Path
 import sys
 import tempfile
 from threading import Lock
 import time
-from typing import TYPE_CHECKING, Literal, cast, final, override
+from typing import TYPE_CHECKING, Literal, Protocol, cast, final, overload, override
 
 from urllib.parse import urlsplit
 
@@ -44,6 +45,7 @@ TEST_RUN_FOLDER_ENV = "DEVTOOLS_TEST_RUN_FOLDER"
 MKDTEMP_SUFFIX_PATTERN = r"[a-z0-9_]{8}"
 # Read old shell mktemp folders until 2026-12-03.
 LEGACY_MKTEMP_SUFFIX_PATTERN = r"[A-Za-z0-9]{6}"
+_TEMPORARY_BUILD_NAME = re.compile(rf"p-(?:{MKDTEMP_SUFFIX_PATTERN}|{LEGACY_MKTEMP_SUFFIX_PATTERN})")
 BUSY = ".claude-busy"
 REMOVAL_RECORD_PREFIX = ".scratch-removing-"
 REMOVAL_RECORD_SUFFIX = ".json"
@@ -69,6 +71,26 @@ def open_busy_mark(mark: Path, *, create: bool, exclusive: bool = False) -> int:
     return descriptor
 
 
+def hidden_removal_path(path: Path) -> bool:
+    """Return whether the path is inside a tree staged for removal."""
+    return any(_HIDDEN_REMOVAL.fullmatch(part) is not None for part in path.parts)
+
+
+def _reject_staged_allocation(path: Path) -> None:
+    if hidden_removal_path(path):
+        raise ValueError(f"{path}: the build folder is staged for removal")
+
+
+def allocation_parent_current(path: Path, directory: int) -> bool:
+    """Check the parent after marking the child lock that a removal scan sees."""
+    try:
+        parent = path.parent.resolve(strict=True)
+    except FileNotFoundError:
+        return False
+    _reject_staged_allocation(parent / path.name)
+    return build_folder_lock.parent_current(parent / path.name, directory)
+
+
 def require_no_removal_mark(path: Path) -> None:
     """Refuse to use a source with a deletion intent on it or an ancestor."""
     for folder in (path, *path.parents):
@@ -79,30 +101,94 @@ def require_no_removal_mark(path: Path) -> None:
         raise BlockingIOError(errno.EWOULDBLOCK, "source removal has already started", str(folder))
 
 
+class _SourceObjectCache(dict[Path, git_files.AlternateEvidence]):
+    """Identify callbacks that occur while the scan reads an alternates file."""
+
+    last_lookup: Path | None = None
+
+    @overload
+    def get(self, key: Path, default: None = None, /) -> git_files.AlternateEvidence | None: ...
+
+    @overload
+    def get(self, key: Path, default: git_files.AlternateEvidence, /) -> git_files.AlternateEvidence: ...
+
+    @overload
+    def get[Default](self, key: Path, default: Default, /) -> git_files.AlternateEvidence | Default: ...
+
+    @override
+    def get[Default](self, key: Path, default: Default | None = None, /) -> git_files.AlternateEvidence | Default | None:
+        self.last_lookup = key
+        return super().get(key, default)
+
+
+def _hold_git_source_claims(source: Path, stack: ExitStack) -> tuple[set[int], tuple[Path, ...]]:
+    descriptors = set(stack.enter_context(build_folder_use(source)))
+    root = build_root().resolve()
+    checked: set[Path] = set()
+
+    def hold(path: Path) -> None:
+        absolute = Path(os.path.abspath(path))
+        if absolute.is_relative_to(root) and absolute not in checked:
+            descriptors.update(stack.enter_context(build_folder_use(absolute)))
+            checked.add(absolute)
+
+    if (source / "HEAD").is_file() and (source / "objects").is_dir():
+        folders = (git_files.objects_in_git_directory(source, on_link=hold).parent, source)
+    else:
+        try:
+            checkout = git_files.locate(source, on_link=hold)
+        except git_files.NotACheckout:
+            return descriptors, ()
+        folders = checkout.common_dir, checkout.git_dir
+    descriptors.update(stack.enter_context(build_folder_use(*folders)))
+    cache = _SourceObjectCache()
+
+    def hold_object_path(path: Path) -> None:
+        # The scan caches each store after it reads the alternates file.
+        if cache:
+            try:
+                mode = path.stat().st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                mode = None
+            if mode is None or (cache.last_lookup in cache and not stat.S_ISDIR(mode)):
+                _ = cache.setdefault(path, git_files.AlternateEvidence((), frozenset(), ""))
+                return
+        hold(path)
+
+    _, _, unreadable = git_files.object_stores(folders[0] / "objects", cache,
+        time.monotonic() + repository_git_timeout(), hold=hold_object_path)
+    if unreadable:
+        raise OSError(errno.EIO, f"cannot verify Git object storage: {unreadable}", str(source))
+    return descriptors, folders
+
+
 @contextmanager
-def _linked_source_locks(source: Path) -> Generator[tuple[int, ...]]:
-    """Hold the checkout and its shared Git folder while Git creates a link."""
-    source = source.expanduser().resolve()
-    require_no_removal_mark(source)
-    try:
-        checkout = git_files.locate(source)
-    except git_files.NotACheckout:
-        yield ()
-        return
+def git_source_claims(source: Path) -> Generator[tuple[int, ...]]:
+    """Hold the build folders that a Git source uses."""
     with ExitStack() as stack:
-        descriptors: list[int] = []
-        for folder in dict.fromkeys((checkout.common_dir, checkout.git_dir)):
+        descriptors, _ = _hold_git_source_claims(source.expanduser().absolute(), stack)
+        yield tuple(sorted(descriptors))
+
+
+@contextmanager
+def linked_source_locks(source: Path) -> Generator[tuple[int, ...]]:
+    """Hold the Git source while Git creates a worktree or shared clone."""
+    source = source.expanduser().absolute()
+    require_no_removal_mark(source.resolve())
+    with ExitStack() as stack:
+        descriptors, folders = _hold_git_source_claims(source, stack)
+        for folder in dict.fromkeys(folders):
             mark = folder / BUSY
             descriptor = open_busy_mark(mark, create=True)
             _ = stack.callback(os.close, descriptor)
             fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            descriptors.append(descriptor)
+            descriptors.add(descriptor)
             require_no_removal_mark(folder)
             locked, present = os.fstat(descriptor), mark.lstat()
             if (locked.st_dev, locked.st_ino) != (present.st_dev, present.st_ino):
                 raise BlockingIOError(errno.EWOULDBLOCK, "source busy mark changed", str(mark))
-        require_no_removal_mark(source)
-        yield tuple(descriptors)
+        require_no_removal_mark(source.resolve())
+        yield tuple(sorted(descriptors))
 
 
 class FolderPrefixes(Mapping[str, str]):
@@ -153,6 +239,48 @@ class UniqueBuildFolder:
     """The request holds the prefix and parent for a unique build folder."""
     prefix: str
     parent: BuildFolderParent = InheritedTemporaryParent()
+
+
+@dataclass(frozen=True)
+class _NoGateBootIdentity:
+    """The gate has no boot identity to publish."""
+
+
+@dataclass(frozen=True)
+class _GateSuiteOwner:
+    """Identify the process that requests a gate suite folder."""
+
+    pid: int
+    start: process_start.ProcessStart
+    boot: str | _NoGateBootIdentity
+
+    @classmethod
+    def current(cls) -> _GateSuiteOwner:
+        pid = os.getpid()
+        start = process_start.process_start(pid)
+        if sys.platform == "darwin":
+            return cls(pid, start, _NoGateBootIdentity())
+        try:
+            return cls(pid, start, boot_identity())
+        except (OSError, ValueError):
+            return cls(pid, start, _NoGateBootIdentity())
+
+    def publish(self, path: Path, directory: int, folder: os.stat_result) -> None:
+        fields = _read_folder_lease(path, directory)
+        fields.update(pid=self.pid, device=folder.st_dev, inode=folder.st_ino)
+        if isinstance(self.start, process_start.Started):
+            fields["process_start"] = self.start.start
+        if isinstance(self.boot, str):
+            fields["boot_id"] = self.boot
+        _publish_lease(path, directory, fields)
+
+
+@final
+@dataclass(frozen=True)
+class GateSuiteFolder(UniqueBuildFolder):
+    """Read the owner identity before allocating a gate suite folder."""
+
+    owner: _GateSuiteOwner = field(default_factory=_GateSuiteOwner.current, init=False)
 
 
 @dataclass(frozen=True)
@@ -232,23 +360,23 @@ def _check_name(name: str) -> None:
 
 
 BuildFolderKind = Literal["temporary", "gate", "standing", "editable", "main", "mirror", "target",
-                          "scratch", "legacy-unique", "legacy-stable", "tool", "slot", "copy"]
+                          "scratch", "legacy-unique", "legacy-stable", "tool", "copy"]
 
 
 @dataclass(frozen=True)
-class SlotCheckout:
-    """The checkout holds the source repository and required commit for a slot."""
+class CopyCheckout:
+    """The checkout holds the source repository and required commit for a numbered copy."""
     source: Path
     commit: str
 
 
-class SlotSourceBusy(BlockingIOError):
-    """The source lock prevents creation of a slot checkout."""
+class CopySourceBusy(BlockingIOError):
+    """The source lock prevents creation of a numbered copy checkout."""
 
 
 @dataclass(frozen=True)
-class NoSlotCheckout:
-    """The folder does not contain a repository slot."""
+class NoCopyCheckout:
+    """The folder does not contain a numbered copy checkout."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -260,14 +388,14 @@ class BuildFolderSpec:
     repository: str = ""
     owner: str = ""
     purpose: str = ""
-    slot: int = 0
+    number: int = 0
     suffix: str = ""
     showrunner: str = ""
     unit: str = ""
     work: str = ""
     # The process the lease names; 0 names the allocating process.
     owner_pid: int = 0
-    slot_checkout: SlotCheckout | NoSlotCheckout = NoSlotCheckout()
+    copy_checkout: CopyCheckout | NoCopyCheckout = NoCopyCheckout()
     machine: str = ""
 
 
@@ -347,9 +475,14 @@ class UnverifiedFolderPath:
 ParsedFolder = FolderForm | OutsideFolderLayout | InvalidFolderComponents | UnverifiedFolderPath
 _DECIMAL_NAME = re.compile(r"[0-9]+")
 _METADATA = re.compile(r"(.+)\.(?:lock|lease\.json(?:\.[0-9a-f]{16}\.tmp)?)")
+_HIDDEN_REMOVAL = re.compile(r"\.removing-[0-9]+-[0-9a-f]{16}")
 _UNIT_LOCKS = ".unit-locks"
+_CLAIM_LOCKS = ".build-claim-locks"
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 4
 _unit_lock_claims: set[tuple[int, Path]] = set()
 _unit_lock_claims_guard = Lock()
+_shared_folder_claims: ContextVar[Mapping[Path, int]] = ContextVar("shared_folder_claims", default={})
 
 
 def metadata_folder_name(name: str) -> str:
@@ -361,7 +494,7 @@ def metadata_folder_name(name: str) -> str:
 def _form_name(name: str) -> str:
     if not name:
         raise InvalidFolderForm("a build folder name must not be empty")
-    if metadata_folder_name(name) != name or name == _UNIT_LOCKS:
+    if metadata_folder_name(name) != name or name in (_UNIT_LOCKS, _CLAIM_LOCKS):
         raise InvalidFolderForm(f"{name!r} is reserved for build folder metadata")
     try:
         _check_name(name)
@@ -470,9 +603,10 @@ def unit_folder(repo: str, unit: str, *, root: Path | UseConfiguredValue = UseCo
 
 
 @contextmanager
-def unit_allocation_lock(folder: Path, *, exclusive: bool) -> Generator[None]:
+def unit_allocation_lock(folder: Path, *, exclusive: bool, root: Path | None = None,
+                         create: bool = True, require_existing: bool = False) -> Generator[None]:
     """Reserve the unit name after its output folder moves or is removed."""
-    root = build_root()
+    root = build_root() if root is None else root
     lock = root / _UNIT_LOCKS / folder.relative_to(root)
     claim = (os.getpid(), root.resolve() / lock.relative_to(root))
     blocked = f"{folder}: the unit allocation lock is held. Rerun when idle"
@@ -481,19 +615,13 @@ def unit_allocation_lock(folder: Path, *, exclusive: bool) -> Generator[None]:
             raise BlockingIOError(blocked)
         _unit_lock_claims.add(claim)
     try:
-        with build_folder_lock.folder_parent(lock, root, create=True) as parent:
-            descriptor = build_folder_lock.open_lock(lock, parent, create=True)
-            try:
-                mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-                try:
-                    fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
-                except BlockingIOError as error:
-                    raise BlockingIOError(blocked) from error
-                if not build_folder_lock.lock_current(lock, parent, descriptor):
-                    raise ValueError(f"{folder}: the unit lock changed. Rerun when idle")
-                yield
-            finally:
-                os.close(descriptor)
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        with build_folder_lock.hold_named_lock(lock, root, mode=mode, create=create, allocation_check=allocation_parent_current,
+                busy=BlockingIOError(blocked),
+                changed=ValueError(f"{folder}: the unit lock changed. Rerun when idle")) as descriptor:
+            if descriptor is None and require_existing:
+                raise FileNotFoundError(f"{folder}: no unit allocation lock")
+            yield
     finally:
         with _unit_lock_claims_guard:
             _unit_lock_claims.remove(claim)
@@ -505,6 +633,94 @@ def _resolve_form_path(path: Path) -> Path:
         return path.resolve(strict=True)
     except FileNotFoundError:
         return path.resolve()
+
+
+class BuildFolderClaimHeld(BlockingIOError):
+    """A build folder claim prevents access."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"{path}: {reason}")
+        self.path: Path = path
+
+
+def _parent_lease_lock(path: Path, root: Path, *, publish: bool, create: bool) -> AbstractContextManager[int | None]:
+    # A parent lease can change whether a nested temporary folder is a claim candidate.
+    return build_folder_lock.hold_named_lock(root / _CLAIM_LOCKS / path.name / ".nested-claims", root,
+        mode=fcntl.LOCK_EX if publish else fcntl.LOCK_SH, create=create,
+        busy=BuildFolderClaimHeld(path, "the nested build folder claim lock is held"),
+        changed=BuildFolderClaimHeld(path, "the nested build folder claim lock changed"),
+        timing=_probe_timing(wait=True) if publish else build_folder_lock.NO_WAIT)
+
+
+@contextmanager
+def build_folder_claim_lock(path: Path, root: Path, *, exclusive: bool, create: bool = True) -> Generator[int | None]:
+    """Lock the name outside the folder so removal cannot release the lock."""
+    lock = root / _CLAIM_LOCKS / path.relative_to(root)
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    with ExitStack() as locks:
+        if (exclusive and path.parent.parent == root and is_temporary_build_folder(path, require_lease=False)
+                and is_temporary_build_folder(path.parent, require_lease=False)):
+            _ = locks.enter_context(_parent_lease_lock(path.parent, root, publish=False, create=create))
+        yield locks.enter_context(build_folder_lock.hold_named_lock(lock, root, mode=mode, create=create,
+            busy=BuildFolderClaimHeld(path, "the build folder claim lock is held"),
+            changed=BuildFolderClaimHeld(path, "the build folder claim lock changed")))
+
+
+def _claim_locations(path: Path, root: Path) -> set[Path]:
+    return {location for location in (Path(os.path.abspath(path)), path.resolve())
+            if location.is_relative_to(root) and location != root}
+
+
+@contextmanager
+def build_folder_use(*paths: Path) -> Generator[tuple[int, ...]]:
+    """Take shared claim locks for numbered copies and temporary folders that contain the paths."""
+    root = build_root().resolve()
+    folders: set[Path] = set()
+    for path in paths:
+        for location in _claim_locations(path, root):
+            parts = location.relative_to(root).parts
+            for depth in (1, 2):
+                if len(parts) >= depth and _TEMPORARY_BUILD_NAME.fullmatch(parts[depth - 1]):
+                    folders.add(root.joinpath(*parts[:depth]))
+            if len(parts) >= 3:
+                numbered = root.joinpath(*parts[:3])
+                if isinstance(parse_resolved_form(numbered, root), BuildCopy):
+                    folders.add(numbered)
+    with _shared_claims(folders, root) as claims:
+        yield claims
+
+
+@contextmanager
+def _shared_claims(folders: set[Path], root: Path) -> Generator[tuple[int, ...]]:
+    if not folders:
+        yield ()
+        return
+    with ExitStack() as stack:
+        claims = dict(_shared_folder_claims.get())
+        for folder in sorted(folders.difference(claims)):
+            descriptor = stack.enter_context(build_folder_claim_lock(folder, root, exclusive=False))
+            assert descriptor is not None
+            claims[folder] = descriptor
+        token = _shared_folder_claims.set(claims)
+        try:
+            yield tuple(claims[folder] for folder in sorted(folders))
+        finally:
+            _shared_folder_claims.reset(token)
+
+
+@contextmanager
+def build_folder_creation(path: Path, *, publish_lease: bool = False) -> Generator[tuple[int, ...]]:
+    """Take shared claim locks before creating a build folder or any parent."""
+    root = build_root().resolve()
+    locations = _claim_locations(path, root)
+    folders = {folder for location in locations for folder in (location, *location.parents)
+               if folder.is_relative_to(root) and folder != root}
+    with _shared_claims(folders, root) as claims, ExitStack() as locks:
+        if publish_lease:
+            for location in sorted(locations):
+                if location.parent == root and is_temporary_build_folder(location, require_lease=False):
+                    _ = locks.enter_context(_parent_lease_lock(location, root, publish=True, create=True))
+        yield claims
 
 
 def parse_form(path: Path) -> ParsedFolder:
@@ -545,7 +761,7 @@ def parse_resolved_form(path: Path, build_root: Path) -> ParsedFolder:
 
 
 def test_runs_parent(checkout: Path) -> Path:
-    """Use the selected checkout's build output or its temporary parent."""
+    """Select a test parent from the checkout output or the caller's private temporary folder."""
     target = checkout / "target"
     output = None
     if isinstance(parse_form(checkout), BuildCopy):
@@ -562,14 +778,26 @@ def test_runs_parent(checkout: Path) -> Path:
             raise InvalidFolderForm(f"{parent}: a model test folder must not be a link")
         return parent
 
+    from scripts.lib import session_folder, unit_runs
+
     inherited = inherited_temporary_parent().resolve()
-    if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV):
-        return inherited.parent
-    return inherited / "test-runs"
+    parent = inherited.parent if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV) else inherited / "test-runs"
+    build = build_root().resolve()
+    protected = (
+        build / "test-runs",
+        session_folder.configured_root().resolve(),
+        session_folder.former_root().resolve(),
+        unit_runs.RUN_ROOT.resolve(),
+        unit_runs.FORMER_RUN_ROOT.resolve(),
+    )
+    resolved = parent.resolve()
+    if inherited == build or any(folder.is_relative_to(root) for root in protected for folder in (inherited, resolved)):
+        raise InvalidFolderForm(f"{checkout}: test runs from {inherited} require an assigned build output")
+    return parent
 
 
 def repository_git_timeout() -> float:
-    """Keep the copies Git deadline when the maker creates a slot."""
+    """Keep the copies Git deadline when the maker creates a numbered copy."""
     from scripts.lib import conf
 
     path = os.environ.get("COPIES_CONFIG")
@@ -605,10 +833,7 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
         return spec.parent / _form_name(spec.repository) / "main"
     settings = _settings()
     if spec.kind == "copy":
-        return copy_path(spec.repository, spec.unit, spec.slot)
-    if spec.kind == "slot":
-        _check_name(spec.repository)
-        return spec.parent / f"{spec.repository}-slot{spec.slot}"
+        return copy_path(spec.repository, spec.unit, spec.number)
     for component in (spec.repository, spec.owner, spec.purpose, spec.suffix, spec.showrunner, spec.unit, spec.work):
         _check_name(component)
     if spec.suffix_length < 0:
@@ -625,14 +850,14 @@ def build_folder_path(spec: BuildFolderSpec) -> Path:
     elif spec.kind == "editable":
         pattern = settings.text("patterns.editable")
     elif spec.kind == "mirror":
-        pattern = "{repository}/{owner}-s{slot}"
+        pattern = "{repository}/{owner}-s{number}"
     else:
         pattern = settings.text(f"patterns.{spec.kind}")
     for field, value in (("repository", spec.repository), ("owner", spec.owner), ("purpose", spec.purpose)):
         if "{" + field + "}" in pattern and not value and spec.kind != "legacy-unique":
             raise ValueError(f"{spec.kind} needs {field}")
     relative = pattern.format(
-        repository=spec.repository, owner=spec.owner, purpose=spec.purpose, suffix=suffix, slot=spec.slot,
+        repository=spec.repository, owner=spec.owner, purpose=spec.purpose, suffix=suffix, number=spec.number,
         showrunner=spec.showrunner, unit=spec.unit, work=spec.work or suffix)
     if not relative or Path(relative).is_absolute() or any(part in (".", "..") for part in relative.split("/")):
         raise ValueError("a build folder pattern must stay below its parent")
@@ -655,9 +880,39 @@ def _take_lock(descriptor: int, mode: int, *, wait: bool = True) -> bool:
     return build_folder_lock.take_lock(descriptor, mode, _probe_timing(wait=wait))
 
 
-def build_folder_state(path: Path) -> Literal["held", "free"]:
-    """Check the lock with the host configuration."""
-    return build_folder_lock.probe(path, path.parent, _probe_timing)
+COPY_KEEP_ENV = "COPIES_KEEP_FILE"
+
+
+def copy_keep_file(path: Path) -> Path:
+    """Return the path where the child can record a reason to keep the copy."""
+    return path.with_name(path.name + ".keep")
+
+
+def _copy_is_kept(path: Path, directory: int | None = None) -> bool:
+    marker = copy_keep_file(path)
+    try:
+        info = os.stat(marker if directory is None else marker.name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 0
+
+
+def _kept_build_copy(path: Path, directory: int | None = None) -> bool:
+    return (_DECIMAL_NAME.fullmatch(path.name) is not None and _copy_is_kept(path, directory)
+            and isinstance(parse_form(path), BuildCopy))
+
+
+BuildFolderState = Literal["held", "free", "kept"]
+
+
+def build_folder_state(path: Path) -> BuildFolderState:
+    """Check the lock and the numbered copy keep file."""
+    state = build_folder_lock.probe(path, path.parent, _probe_timing)
+    if state == "free" and _kept_build_copy(path):
+        return "kept"
+    return state
 
 
 def build_folder_lock_fd(path: Path) -> int:
@@ -779,7 +1034,7 @@ def may_remove_build_path(path: Path) -> bool:
     physical = path.resolve()
     root = build_root().resolve()
     if (root.is_relative_to(physical) or physical == Path("/build")
-            or physical.is_relative_to(root / _UNIT_LOCKS)):
+            or physical.is_relative_to(root / _UNIT_LOCKS) or physical.is_relative_to(root / _CLAIM_LOCKS)):
         return False
     if physical.parent in (root, Path("/build")):
         try:
@@ -831,13 +1086,35 @@ def lease_path(path: Path) -> Path:
     return path.with_name(path.name + ".lease.json")
 
 
-def _read_copy_lease(path: Path, directory: int) -> dict[str, object]:
+def is_temporary_build_folder(path: Path, *, require_lease: bool = True,
+                              directory_entries: Container[str] | None = None) -> bool:
+    """Check the temporary build name and, by default, its lease record."""
+    if not _TEMPORARY_BUILD_NAME.fullmatch(path.name):
+        return False
+    if not require_lease:
+        return True
+    lease = lease_path(path)
+    return lease.name in directory_entries if directory_entries is not None else os.path.lexists(lease)
+
+
+def _temporary_claim_location(path: Path, root: Path | None = None) -> Path | None:
+    if is_temporary_build_folder(path):
+        canonical = path.parent.resolve() / path.name
+        root = build_root().resolve() if root is None else root
+        if root in (canonical.parent, canonical.parent.parent):
+            return canonical
+    return None
+
+
+def _read_folder_lease(path: Path, directory: int, *, allow_empty: bool = False) -> dict[str, object]:
     sidecar = lease_path(path)
     descriptor = os.open(sidecar.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     with os.fdopen(descriptor, encoding="utf-8") as record:
         info = os.fstat(record.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
             raise ValueError(f"{sidecar}: invalid lease file")
+        if allow_empty and info.st_size == 0:
+            return {}
         fields = cast(object, json.load(record))
     if not isinstance(fields, dict):
         raise ValueError(f"{sidecar}: invalid lease record")
@@ -847,7 +1124,13 @@ def _read_copy_lease(path: Path, directory: int) -> dict[str, object]:
 def folder_lease_fields(path: Path) -> dict[str, object]:
     """Read lease fields for a status display."""
     with build_folder_lock.folder_parent(path, build_root(), create=False) as directory:
-        return _read_copy_lease(path, directory)
+        return _read_folder_lease(path, directory)
+
+
+def gate_folder_lease_fields(path: Path, root: Path) -> dict[str, object]:
+    """Read a lease under the gate root without acquiring a removal lock."""
+    with build_folder_lock.folder_parent(path, root, create=False) as directory:
+        return _read_folder_lease(path, directory)
 
 
 @dataclass(frozen=True)
@@ -898,11 +1181,12 @@ class UnreadableNumberedCopySource:
     reason: str
 
 
-NumberedCopyRecord = (NumberedCopySource | NumberedCopyRemovalPending
-                      | NoNumberedCopySource | UnreadableNumberedCopySource)
+NumberedSourceEvidence = NumberedCopySource | NumberedCopyRemovalPending | UnreadableNumberedCopySource
+NumberedCopyRecord = NumberedSourceEvidence | NoNumberedCopySource
 
 
 _COMMIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_CARGO_REMOVAL = "cargo_removal"
 
 
 def _record_numbered_copy_path(path: Path) -> BuildCopy:
@@ -916,7 +1200,7 @@ def _record_numbered_copy_path(path: Path) -> BuildCopy:
     return form
 
 
-def _recorded_directory(fields: dict[str, object], key: str) -> CopyDirectoryIdentity:
+def _recorded_directory(fields: Mapping[str, object], key: str) -> CopyDirectoryIdentity:
     device, inode = fields.get(key + "_device"), fields.get(key + "_inode")
     if type(device) is not int or type(inode) is not int:
         raise ValueError(f"missing {key} identity")
@@ -959,7 +1243,7 @@ def _copy_identity_fields(fields: dict[str, object], copy: NumberedCopySource) -
 
 def _numbered_copy_record(path: Path, form: BuildCopy, directory: int) -> NumberedCopyRecord:
     try:
-        fields = _read_copy_lease(path, directory)
+        fields = _read_folder_lease(path, directory)
     except FileNotFoundError:
         return NoNumberedCopySource()
     return _validate_numbered_copy_record(path, form, directory, fields)
@@ -971,7 +1255,7 @@ def _validate_numbered_copy_record(path: Path, form: BuildCopy, directory: int,
         return NoNumberedCopySource()
     commit = fields.get("commit")
     if (fields.get("unit") != form.unit or fields.get("repository") != form.repo
-            or fields.get("slot") != form.number or not isinstance(commit, str) or not _COMMIT_ID.fullmatch(commit)
+            or not isinstance(commit, str) or not _COMMIT_ID.fullmatch(commit)
             or _recorded_path(fields, "copy_path") != path.absolute()):
         raise ValueError("copy source record has the wrong path or commit")
     source = _recorded_path(fields, "source_path")
@@ -1081,22 +1365,26 @@ def _copy_creation_fields(path: Path, info: os.stat_result, source: Path, fields
 
 
 def _prepare_copy_reuse(path: Path, directory: int, spec: BuildFolderSpec, fields: dict[str, object]) -> bool:
-    form = BuildCopy(spec.repository, spec.unit, spec.slot)
-    assert isinstance(spec.slot_checkout, SlotCheckout)
+    form = BuildCopy(spec.repository, spec.unit, spec.number)
+    if _copy_is_kept(path, directory):
+        raise FileExistsError(f"{path}: numbered copy is kept")
+    assert isinstance(spec.copy_checkout, CopyCheckout)
     try:
-        record = _numbered_copy_record(path, form, directory)
-        if (not isinstance(record, NumberedCopySource) or record.source != spec.slot_checkout.source
+        lease = _read_folder_lease(path, directory)
+        record = _validate_numbered_copy_record(path, form, directory, lease)
+        if (not isinstance(record, NumberedCopySource) or record.source != spec.copy_checkout.source
                 or not may_remove_folder_tree(path, record.git_directory)):
             raise ValueError("copy has no matching source record")
+        _recover_copy_cargo(path, directory, lease)
         _copy_identity_fields(fields, record)
         fields["commit"] = record.commit
         return True
     except git_files.NotACheckout as error:
         try:
-            lease = _read_copy_lease(path, directory)
-            repository = git_files.at(spec.slot_checkout.source)
+            lease = _read_folder_lease(path, directory)
+            repository = git_files.at(spec.copy_checkout.source)
             if (lease.get("ready") is False and "git_directory" not in lease
-                    and _recorded_path(lease, "source_path") == spec.slot_checkout.source
+                    and _recorded_path(lease, "source_path") == spec.copy_checkout.source
                     and _recorded_path(lease, "common_directory") == repository.common_dir
                     and _recorded_directory(lease, "common") == CopyDirectoryIdentity.from_stat(repository.common_dir_status)
                     and not any(path.iterdir())
@@ -1118,6 +1406,52 @@ def _current_copy_lock(path: Path, directory: int) -> None:
         raise ValueError(f"{path}: the numbered copy lock changed")
 
 
+def _recover_copy_cargo(path: Path, directory: int, fields: Mapping[str, object]) -> None:
+    if _CARGO_REMOVAL not in fields:
+        return
+    raw = fields[_CARGO_REMOVAL]
+    if not isinstance(raw, dict) or (stage := StagedRemoval.read(cast(dict[str, object], raw))) is None:
+        raise ValueError(f"{path}: invalid Cargo removal record")
+    target = path / "target"
+    copy_fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+    try:
+        identity = CopyDirectoryIdentity.from_stat(os.fstat(copy_fd))
+        if identity != _recorded_directory(fields, "copy") or not build_folder_lock.parent_current(target, copy_fd):
+            raise ValueError(f"{target}: the numbered copy changed")
+        if not stage.recover(target, dir_fd=copy_fd):
+            raise FileExistsError(f"{target}: the staged Cargo output could not be removed")
+        released = _release_removed_folder_at(target, copy_fd, reject_parent_links=False)
+        if released not in (FolderPairRelease.RELEASED, FolderPairRelease.PAIR_ABSENT, FolderPairRelease.FOLDER_PRESENT):
+            raise FileExistsError(f"{target}: the Cargo removal lock could not be released")
+    finally:
+        os.close(copy_fd)
+
+
+def reset_numbered_copy_cargo(path: Path) -> bool:
+    """Remove Cargo output and record its stage under the numbered copy lock."""
+    root = build_root()
+    with build_folder_lock.folder_parent(path, root, create=False) as directory:
+        _current_copy_lock(path, directory)
+        fields = _read_folder_lease(path, directory)
+        identity = _recorded_directory(fields, "copy")
+        target = path / "target"
+        _recover_copy_cargo(path, directory, fields)
+
+        def record_stage(tree: CheckedRemovalTree) -> None:
+            if (CopyDirectoryIdentity.from_stat(os.fstat(tree.parent)) != identity
+                    or not build_folder_lock.parent_current(target, tree.parent)):
+                raise ValueError(f"{target}: the numbered copy changed")
+            fields[_CARGO_REMOVAL] = StagedRemoval.from_tree(tree).fields()
+            _publish_lease(path, directory, fields)
+
+        if not remove_build_folder(target, wait=False, before_stage=record_stage):
+            return False
+        if _CARGO_REMOVAL in fields:
+            del fields[_CARGO_REMOVAL]
+            _publish_lease(path, directory, fields)
+        return True
+
+
 def record_numbered_copy_source(path: Path, source: Path, commit: str) -> None:
     """Publish the prepared commit while the maker holds the numbered copy lock."""
     form = _record_numbered_copy_path(path)
@@ -1129,7 +1463,7 @@ def record_numbered_copy_source(path: Path, source: Path, commit: str) -> None:
         head = git_files.head(git_files.at(path))
         if not _COMMIT_ID.fullmatch(commit) or not isinstance(head, git_files.DetachedHead) or head.commit != commit:
             raise ValueError(f"{path}: the prepared checkout does not match the requested commit")
-        fields = _read_copy_lease(path, directory)
+        fields = _read_folder_lease(path, directory)
         _copy_identity_fields(fields, record)
         fields.update(commit=commit, ready=True)
         _publish_lease(path, directory, fields)
@@ -1142,7 +1476,7 @@ def mark_numbered_copy_removal(copy: NumberedCopySource) -> None:
         _current_copy_lock(path, directory)
         if _numbered_copy_record(path, form, directory) != copy:
             raise ValueError(f"{path}: the numbered copy source changed")
-        fields = _read_copy_lease(path, directory)
+        fields = _read_folder_lease(path, directory)
         _copy_identity_fields(fields, copy)
         fields["removing"] = True
         _publish_lease(path, directory, fields)
@@ -1176,23 +1510,27 @@ def numbered_copy_use_lease(path: Path) -> Generator[NumberedCopyUseLease | Numb
     with ExitStack() as stack:
         try:
             form = _record_numbered_copy_path(path)
+            claims = stack.enter_context(build_folder_use(path))
             directory = stack.enter_context(build_folder_lock.folder_parent(path, build_root(), create=False))
             inherited = next((str(fd) for fd, held in _locks.items() if held == path),
                              os.environ.get(NUMBERED_COPY_LOCK_ENV, ""))
             descriptor = build_folder_lock.open_lock(path, directory, create=False)
             _ = stack.callback(os.close, descriptor)
+            has_inherited_lock = False
             if inherited.isdecimal():
                 with suppress(OSError, OverflowError):
                     if build_folder_lock.lock_current(path, directory, int(inherited)):
                         descriptor = os.dup(int(inherited))
                         _ = stack.callback(os.close, descriptor)
+                        has_inherited_lock = True
             if not _take_lock(descriptor, fcntl.LOCK_EX, wait=False) or not build_folder_lock.lock_current(path, directory, descriptor):
                 raise BlockingIOError(f"{path}: numbered copy is busy")
             record = _numbered_copy_record(path, form, directory)
             if (not isinstance(record, NumberedCopySource)
-                    or _read_copy_lease(path, directory).get("ready") is not True):
+                    or (not has_inherited_lock and _copy_is_kept(path, directory))
+                    or _read_folder_lease(path, directory).get("ready") is not True):
                 raise ValueError(f"{path}: no available numbered copy source")
-            result = NumberedCopyUseLease(record, (descriptor,))
+            result = NumberedCopyUseLease(record, (descriptor, *claims))
         except (OSError, ValueError, RuntimeError) as error:
             yield NumberedCopyUseRefused(str(error))
         else:
@@ -1246,9 +1584,15 @@ def _copy_owner_record(path: Path, form: BuildCopy, fields: dict[str, object], *
                             form.unit, form.repo, commit, _lease_time(fields.get("last_use")))
 
 
-BUILD_ROOT_EXCEPTIONS = frozenset({
-    _UNIT_LOCKS, "sccache", "session", "lost+found", "old-cargo", "old-paths", "old-slot", "old-claude",
+USER_REMOVAL_ROOTS = build_folder_lock.USER_REMOVAL_ROOTS
+BUILD_ROOT_EXCEPTIONS = USER_REMOVAL_ROOTS | frozenset({
+    _UNIT_LOCKS, _CLAIM_LOCKS, "sccache", "session", "lost+found", "old-cargo", "old-paths", "old-claude",
 })
+
+
+def excluded_build_root_child(name: str) -> bool:
+    """Identify root entries that the copy inventories must skip."""
+    return name in BUILD_ROOT_EXCEPTIONS or name.startswith("old-") or name in ("cargo", "paths", "hana-ci")
 
 
 def copy_numbers(parent: Path) -> dict[int, bool]:
@@ -1283,7 +1627,7 @@ def _copy_leases_in_unit(unit: Path, root: Path, timing: build_folder_lock.Probe
                         raise ValueError("lock changed during the read")
                     if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                         raise ValueError("copy is not a directory")
-                    fields = _read_copy_lease(path, directory)
+                    fields = _read_folder_lease(path, directory)
                     owner = _copy_owner_record(path, form, fields, held=not free)
                     if free and (fields.get("ready") is not True or not isinstance(
                             _validate_numbered_copy_record(path, form, directory, fields), NumberedCopySource)):
@@ -1296,7 +1640,9 @@ def _copy_leases_in_unit(unit: Path, root: Path, timing: build_folder_lock.Probe
             yield UnknownFolderLease(path, str(error))
 
 
-def copy_unit_folders(root: Path) -> Iterator[Path | UnknownFolderLease]:
+def copy_unit_folders(root: Path, *,
+                      exclude_root_child: Callable[[str], bool] = BUILD_ROOT_EXCEPTIONS.__contains__
+                      ) -> Iterator[Path | UnknownFolderLease]:
     """List unit directories or report the directory whose state is unreadable."""
     try:
         repositories = list(root.iterdir())
@@ -1306,7 +1652,7 @@ def copy_unit_folders(root: Path) -> Iterator[Path | UnknownFolderLease]:
         yield UnknownFolderLease(root, str(error))
         return
     for repo in repositories:
-        if repo.name in BUILD_ROOT_EXCEPTIONS:
+        if exclude_root_child(repo.name) or is_temporary_build_folder(repo):
             continue
         try:
             if not stat.S_ISDIR(repo.lstat().st_mode):
@@ -1316,7 +1662,7 @@ def copy_unit_folders(root: Path) -> Iterator[Path | UnknownFolderLease]:
             yield UnknownFolderLease(repo, str(error))
             continue
         for unit in units:
-            if unit.name in ("ci", "main"):
+            if unit.name in ("ci", "main") or is_temporary_build_folder(unit):
                 continue
             try:
                 mode = unit.lstat().st_mode
@@ -1353,7 +1699,147 @@ def copy_folders(root: Path) -> Iterator[tuple[Path, BuildCopy]]:
                 yield unit / str(number), BuildCopy(unit.parent.name, unit.name, number)
 
 
-def numbered_copy_records() -> Iterator[NumberedCopySource | NumberedCopyRemovalPending | UnreadableNumberedCopySource]:
+@dataclass(frozen=True)
+class KeptCopy:
+    path: Path
+    reason: str
+    kept_since: datetime
+
+
+@dataclass(frozen=True)
+class Clear:
+    pass
+
+
+@dataclass(frozen=True)
+class NotClear:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CheckFailed:
+    reason: str
+
+
+KeptCopyCheck = Clear | NotClear | CheckFailed
+
+
+class CheckoutProcessScan(Protocol):
+    def check_checkout(self, checkout: Path, /) -> KeptCopyCheck: ...
+
+
+@contextmanager
+def _open_copy_directory(path: str, parent: int) -> Generator[int]:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _kept_copy_metadata(path: Path, info: os.stat_result, *, list_unreadable: bool) -> KeptCopy:
+    reason = ""
+    regular = stat.S_ISREG(info.st_mode)
+    if not regular or info.st_nlink != 1:
+        reason = f"{copy_keep_file(path)}: the keep file must be a regular file with one link"
+        if not list_unreadable or not regular or info.st_nlink < 2:
+            raise ValueError(reason)
+    elif info.st_size == 0:
+        raise ValueError(f"{copy_keep_file(path)}: the keep file is empty")
+    return KeptCopy(path, reason, datetime.fromtimestamp(info.st_mtime, timezone.utc))
+
+
+def _read_kept_copy(path: Path, directory: int, *, list_unreadable: bool = False) -> KeptCopy:
+    marker = copy_keep_file(path)
+    info = os.stat(marker.name, dir_fd=directory, follow_symlinks=False)
+    row = _kept_copy_metadata(path, info, list_unreadable=list_unreadable)
+    if row.reason:
+        return row
+    try:
+        descriptor = os.open(marker.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except OSError as error:
+        if not list_unreadable:
+            raise
+        info = os.stat(marker.name, dir_fd=directory, follow_symlinks=False)
+        row = _kept_copy_metadata(path, info, list_unreadable=True)
+        return replace(row, reason=row.reason or f"the keep file could not be read: {error}")
+    with os.fdopen(descriptor, encoding="utf-8") as reason:
+        row = _kept_copy_metadata(path, os.fstat(reason.fileno()), list_unreadable=list_unreadable)
+        if row.reason:
+            return row
+        try:
+            text = reason.read().strip()
+        except (OSError, UnicodeDecodeError) as error:
+            if not list_unreadable:
+                raise
+            text = f"the keep file could not be read: {error}"
+        return replace(row, reason=text)
+
+
+def _kept_copies_in_unit(unit: Path, directory: int) -> Iterator[KeptCopy]:
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".keep") or not entry.is_file(follow_symlinks=False):
+                continue
+            name = entry.name.removesuffix(".keep")
+            with suppress(OSError, ValueError, OverflowError):
+                path = unit / _folder_number(_parse_number(name))
+                if stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
+                    yield _read_kept_copy(path, directory, list_unreadable=True)
+
+
+def _kept_copy_directories(parent: Path, directory: int, *, repositories: bool = False) -> Iterator[str]:
+    with os.scandir(directory) as entries:
+        children = {entry.name: entry for entry in entries}
+        for name, entry in children.items():
+            if repositories and excluded_build_root_child(name):
+                continue
+            if is_temporary_build_folder(parent / name, directory_entries=children):
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                yield name
+
+
+def kept_build_copies(root: Path) -> list[KeptCopy]:
+    """List numbered copies with keep files under this build root."""
+    root = Path(os.path.abspath(root))
+    kept: list[KeptCopy] = []
+    with suppress(OSError), build_folder_lock.open_folder_parent(root / "1", Path(root.anchor), create=False) as directory:
+        for repo in _kept_copy_directories(root, directory, repositories=True):
+            with suppress(OSError), _open_copy_directory(repo, directory) as repository:
+                for name in _kept_copy_directories(root / repo, repository):
+                    unit = root / repo / name
+                    if not isinstance(parse_resolved_form(unit / "1", root), BuildCopy):
+                        continue
+                    with suppress(OSError), _open_copy_directory(name, repository) as unit_directory:
+                        kept.extend(_kept_copies_in_unit(unit, unit_directory))
+    return sorted(kept, key=lambda copy: copy.path)
+
+
+def recheck_kept_copy(copy: KeptCopy, scan: CheckoutProcessScan) -> KeptCopyCheck:
+    """Check a kept copy against the supplied scan while holding its folder lock."""
+    path = copy.path
+    try:
+        with build_folder_lock.folder_parent(path, path.parents[2], create=False) as directory:
+            descriptor = build_folder_lock.open_lock(path, directory, create=False)
+            try:
+                if not build_folder_lock.take_lock(descriptor, fcntl.LOCK_EX, build_folder_lock.NO_WAIT):
+                    return CheckFailed("the folder lock is held")
+                if not build_folder_lock.lock_current(path, directory, descriptor):
+                    return CheckFailed("the folder lock file changed")
+                folder = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                if not stat.S_ISDIR(folder.st_mode) or _read_kept_copy(path, directory) != copy:
+                    return CheckFailed("the kept copy changed")
+                if not build_folder_lock.parent_current(path, directory):
+                    return CheckFailed("the kept copy parent changed")
+                return scan.check_checkout(path)
+            finally:
+                os.close(descriptor)
+    except (OSError, ValueError, RuntimeError, OverflowError, IndexError) as error:
+        return CheckFailed(str(error))
+
+
+def numbered_copy_records() -> Iterator[NumberedSourceEvidence]:
     """List numbered copy records, including interrupted removals and unreadable entries."""
     for unit in copy_unit_folders(build_root()):
         if isinstance(unit, UnknownFolderLease):
@@ -1369,7 +1855,8 @@ def numbered_copy_records() -> Iterator[NumberedCopySource | NumberedCopyRemoval
             record = numbered_copy_record(path)
             if not isinstance(record, NoNumberedCopySource):
                 yield record
-            elif numbers[number]:
+            elif numbers[number] and any(os.path.lexists(entry) for entry in (
+                    lease_path(path), path.with_suffix(".lock"), path / ".git")):
                 yield UnreadableNumberedCopySource(path, "numbered copy has no source record")
 
 
@@ -1379,19 +1866,17 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
     record: dict[str, object] = {"showrunner": spec.showrunner, "unit": spec.unit or spec.owner,
               "work": spec.work, "purpose": spec.purpose, "pid": spec.owner_pid or os.getpid(),
               "start_time": now}
-    if spec.kind in ("copy", "slot") and isinstance(spec.slot_checkout, SlotCheckout):
+    if spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout):
         if released:
-            record = _read_copy_lease(path, directory)
-        elif spec.kind == "copy":
+            record = _read_folder_lease(path, directory)
+        else:
             started = process_start.process_start(spec.owner_pid or os.getpid())
             if isinstance(started, (process_start.Started, process_start.Zombie)):
                 record["process_start"] = started.start
-        if spec.kind == "copy":
-            record["released"] = released
-        record.update(machine=spec.machine, repository=spec.repository, slot=spec.slot,
-                      last_use=now)
-        if spec.kind != "copy" or not released:
-            record.update(commit=spec.slot_checkout.commit, ready=ready)
+        record["released"] = released and not _copy_is_kept(path, directory)
+        record.update(machine=spec.machine, repository=spec.repository, last_use=now)
+        if not released:
+            record.update(commit=spec.copy_checkout.commit, ready=ready)
             record.update(copy_fields)
     _publish_lease(path, directory, record)
 
@@ -1454,7 +1939,7 @@ def _request_spec(request: BuildFolderRequest | BuildFolderSpec | _TemporaryFold
 
 
 def _stable_folder(spec: BuildFolderSpec) -> bool:
-    return spec.kind in ("standing", "editable", "main", "mirror", "target", "legacy-stable", "slot", "copy")
+    return spec.kind in ("standing", "editable", "main", "mirror", "target", "legacy-stable", "copy")
 
 
 FolderCreationNotice = Callable[[Path, os.stat_result], None] | Literal["untracked"]
@@ -1468,7 +1953,7 @@ def create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempora
     with ExitStack() as source_locks:
         descriptors: tuple[int, ...] = ()
         if isinstance(original, LinkedEditableRepository):
-            descriptors = source_locks.enter_context(_linked_source_locks(original.source))
+            descriptors = source_locks.enter_context(linked_source_locks(original.source))
         return _create_build_folder(request, spec, descriptors, on_create)
 
 
@@ -1489,24 +1974,35 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
     renamed = not stable and not (spec.suffix or spec.work) and spec.kind != "tool"
     descriptor = -1
     try:
-        with ExitStack() as allocation_scope:
+        with ExitStack() as allocation_scope, ExitStack() as folder_use:
             parents = request.cleanup if isinstance(request, _TemporaryFolderRequest) else allocation_scope
             directories: dict[Path, int] = {}
+            retry_parent = False
+            allocation = spec
             while True:
-                allocation = (replace(spec, work=_new_suffix(spec.suffix_length, _settings()))
-                              if spec.kind not in ("copy", "slot") and (spec.showrunner or spec.unit) and not spec.work else spec)
+                if not retry_parent:
+                    allocation = (replace(spec, work=_new_suffix(spec.suffix_length, _settings()))
+                                  if spec.kind != "copy" and (spec.showrunner or spec.unit)
+                                  and not spec.work else spec)
                 path = (original.path.expanduser().absolute()
                         if isinstance(original, (LinkedEditableRepository, RemoteEditableRepository))
                         else build_folder_path(allocation))
+                _reject_staged_allocation(path)
+                folder_use.close()
+                claims = folder_use.enter_context(build_folder_creation(path, publish_lease=True))
                 directory = directories.get(path.parent)
                 if directory is None:
-                    directory = parents.enter_context(build_folder_lock.folder_parent(path, spec.parent,
+                    directory = parents.enter_context(build_folder_lock.open_folder_parent(path, spec.parent,
                         create=stable or not isinstance(original, UniqueBuildFolder)))
                     directories[path.parent] = directory
                 try:
                     descriptor = build_folder_lock.open_lock(path, directory, create=True)
                 except FileNotFoundError:
-                    if spec.kind != "copy":
+                    if not retry_parent and not build_folder_lock.parent_current(path, directory):
+                        del directories[path.parent]
+                        retry_parent = True
+                        continue
+                    if spec.kind != "copy" or retry_parent:
                         raise
                     del directories[path.parent]
                     continue
@@ -1514,11 +2010,19 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                 allocated: os.stat_result | None = None
                 new_folder = False
                 try:
-                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind not in ("copy", "slot") and not editable_repository else fcntl.LOCK_EX,
-                                      wait=spec.kind not in ("copy", "slot") and not isinstance(original, UniqueBuildFolder)):
+                    if not _take_lock(descriptor, fcntl.LOCK_SH if stable and spec.kind != "copy" and not editable_repository else fcntl.LOCK_EX,
+                                      wait=spec.kind != "copy" and not isinstance(original, UniqueBuildFolder)):
                         if renamed:
                             continue
                         raise BlockingIOError(errno.EWOULDBLOCK, "build folder is held", str(path))
+                    build_folder_lock.mark_lock(descriptor)
+                    if not allocation_parent_current(path, directory):
+                        if retry_parent:
+                            raise FileNotFoundError(errno.ENOENT, "the build folder parent changed", str(path.parent))
+                        del directories[path.parent]
+                        retry_parent = True
+                        continue
+                    retry_parent = False
                     if not build_folder_lock.lock_current(path, directory, descriptor):
                         if spec.kind == "copy":
                             del directories[path.parent]
@@ -1540,39 +2044,26 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             raise FileExistsError(errno.EEXIST, "build folder is not a directory", str(path))
                     copy_fields: dict[str, object] = {}
                     checkout_ready = False
-                    if isinstance(spec.slot_checkout, SlotCheckout):
-                        if spec.kind == "copy":
-                            if existing is not None:
-                                checkout_ready = _prepare_copy_reuse(path, directory, spec, copy_fields)
-                            else:
-                                try:
-                                    lease = _read_copy_lease(path, directory)
-                                except FileNotFoundError:
-                                    lease = {}
-                                except (OSError, ValueError) as error:
-                                    raise FileExistsError(f"{path}: copy lease cannot be read") from error
-                                if "source_path" in lease or "removing" in lease:
-                                    raise FileExistsError(f"{path}: a recorded copy checkout is missing")
+                    if spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout):
+                        if existing is not None:
+                            checkout_ready = _prepare_copy_reuse(path, directory, spec, copy_fields)
                         else:
                             try:
-                                lease = _read_copy_lease(path, directory)
-                            except (OSError, ValueError):
+                                lease = _read_folder_lease(path, directory)
+                            except FileNotFoundError:
                                 lease = {}
-                            checkout_ready = lease.get("ready") is True
+                            except (OSError, ValueError) as error:
+                                raise FileExistsError(f"{path}: copy lease cannot be read") from error
+                            if "source_path" in lease or "removing" in lease or _copy_is_kept(path, directory):
+                                raise FileExistsError(f"{path}: a recorded copy checkout is missing")
                         if existing is None or not checkout_ready:
                             try:
-                                source_descriptors = allocation_scope.enter_context(_linked_source_locks(spec.slot_checkout.source))
+                                source_descriptors = allocation_scope.enter_context(linked_source_locks(spec.copy_checkout.source))
                             except BlockingIOError as error:
-                                raise SlotSourceBusy(errno.EWOULDBLOCK, f"slot source is busy: {error}",
-                                                     str(spec.slot_checkout.source)) from error
-                        if existing is not None and not checkout_ready and spec.kind != "copy":
-                            print(f"kept for a manual removal list: {path} (build_folders, incomplete slot)",
-                                  file=sys.stderr)
-                            raise FileExistsError(f"{path}: the slot checkout is incomplete")
+                                raise CopySourceBusy(errno.EWOULDBLOCK, f"copy source is busy: {error}",
+                                                     str(spec.copy_checkout.source)) from error
                     new_folder = existing is None
-                    if spec.kind == "slot":
-                        _write_lease(path, directory, allocation, ready=not new_folder)
-                    elif spec.kind != "copy":
+                    if spec.kind != "copy":
                         _write_lease(path, directory, allocation)
                     if existing is None:
                         mode = original.mode if isinstance(original, StableOwnerFolder) else 0o777 if stable and spec.kind != "main" else 0o700
@@ -1585,6 +2076,10 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                                 raise
                     allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                    if isinstance(original, GateSuiteFolder):
+                        if made_inode is None or not stat.S_ISDIR(allocated.st_mode) or not os.path.samestat(made_inode, allocated):
+                            raise OSError(errno.ESTALE, "the gate suite folder changed during allocation", str(path))
+                        original.owner.publish(path, directory, allocated)
                     if isinstance(original, (LinkedEditableRepository, RemoteEditableRepository)):
 
                         if isinstance(original, LinkedEditableRepository):
@@ -1597,9 +2092,9 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                                 _ = subprocess.run(["git", "-C", str(original.source), "branch", "--",
                                                     original.branch.name, original.branch.start_point], check=True,
                                                     capture_output=True, text=True, timeout=repository_git_timeout(),
-                                                    pass_fds=source_descriptors)
+                                                    pass_fds=(*source_descriptors, *claims))
                             _ = subprocess.run(command, check=True, capture_output=True, text=True,
-                                               timeout=repository_git_timeout(), pass_fds=source_descriptors)
+                                               timeout=repository_git_timeout(), pass_fds=(*source_descriptors, *claims))
                         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                             detail: str | bytes = (str(error) if isinstance(error, OSError)
                                                    else cast(str | bytes, error.stderr or str(error)))
@@ -1609,27 +2104,25 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                         if made_inode is not None and callable(on_create):
                             on_create(path, made_inode)
                         return path
-                    if spec.kind == "copy" and isinstance(spec.slot_checkout, SlotCheckout):
+                    if spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout):
                         if not checkout_ready:
-                            _copy_creation_fields(path, allocated, spec.slot_checkout.source, copy_fields)
+                            _copy_creation_fields(path, allocated, spec.copy_checkout.source, copy_fields)
                         _write_lease(path, directory, allocation, ready=False, copy_fields=copy_fields.items())
-                    if (isinstance(spec.slot_checkout, SlotCheckout)
-                            and (new_folder or (spec.kind == "copy" and not checkout_ready))):
-                        _ = subprocess.run(["git", "-C", str(spec.slot_checkout.source), "worktree", "add", "--detach",
-                                            str(path), spec.slot_checkout.commit], check=True,
+                    if (spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout)
+                            and (new_folder or not checkout_ready)):
+                        _ = subprocess.run(["git", "-C", str(spec.copy_checkout.source), "worktree", "add", "--detach",
+                                            str(path), spec.copy_checkout.commit], check=True,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                            pass_fds=(descriptor, *held_build_folder_descriptors(), *source_descriptors),
+                                            pass_fds=tuple(dict.fromkeys((descriptor, *held_build_folder_descriptors(),
+                                                                         *source_descriptors, *claims))),
                                            timeout=repository_git_timeout())
-                        if spec.kind == "copy":
-                            form = BuildCopy(spec.repository, spec.unit, spec.slot)
-                            record = _numbered_copy_record(path, form, directory)
-                            if not isinstance(record, NumberedCopySource):
-                                raise ValueError(f"{path}: copy registration has no source record")
-                            fields = _read_copy_lease(path, directory)
-                            _copy_identity_fields(fields, record)
-                            _publish_lease(path, directory, fields)
-                        else:
-                            _write_lease(path, directory, allocation)
+                        form = BuildCopy(spec.repository, spec.unit, spec.number)
+                        record = _numbered_copy_record(path, form, directory)
+                        if not isinstance(record, NumberedCopySource):
+                            raise ValueError(f"{path}: copy registration has no source record")
+                        fields = _read_folder_lease(path, directory)
+                        _copy_identity_fields(fields, record)
+                        _publish_lease(path, directory, fields)
                     if made_inode is not None and callable(on_create):
                         on_create(path, made_inode)
                     os.set_inheritable(descriptor, True)
@@ -1672,40 +2165,193 @@ def _empty_editable_destination(path: Path, parent: int, expected: os.stat_resul
 
 def _remove_failed_allocation(path: Path, directory: int, allocated: os.stat_result | None) -> None:
     if allocated is not None:
-        remove_folder(path, directory, allocated)
+        _ = _remove_folder(path, directory, allocated, repair_access=True)
     if not _folder_exists(path, directory):
         _unlink_metadata(path, directory)
 
 
-def remove_folder(path: Path, directory: int | None = None, allocated: os.stat_result | None = None) -> None:
-    """Remove an owned folder and repair permissions when removal needs it."""
-    removal_path = path if directory is None else Path(path.name)
-    name = os.fspath(removal_path)
+class RemovalTreeChanged(OSError):
+    """The removal name no longer identifies the checked folder."""
 
-    def repair(function: object, name: str, error: BaseException) -> None:
-        if not isinstance(error, PermissionError):
-            raise error
-        entry = Path(name)
-        for candidate in (entry.parent, entry):
-            if not candidate.is_relative_to(removal_path):
-                continue
-            inode = os.stat(candidate, dir_fd=directory, follow_symlinks=False)
-            if inode.st_uid == os.geteuid() and not stat.S_ISLNK(inode.st_mode):
-                os.chmod(candidate, 0o700, dir_fd=directory, follow_symlinks=False)
-        if function is os.open:
-            shutil.rmtree(name, dir_fd=directory, onexc=repair)
-        else:
-            _ = cast(Callable[..., object], function)(name, dir_fd=directory)
 
+def _same_removal_tree(path: Path, directory: int, expected: os.stat_result) -> bool:
     try:
-        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        return os.path.samestat(expected, os.stat(path.name, dir_fd=directory, follow_symlinks=False))
     except FileNotFoundError:
-        return
-    if allocated is not None and not os.path.samestat(current, allocated):
-        return
-    if not may_remove_build_path(path):
-        raise PermissionError(f"{path}: retain the protected build folder")
-    shutil.rmtree(name, dir_fd=directory, onexc=repair)
+        return False
+
+
+def _delete_renamed_folder(path: Path, directory: int, expected: os.stat_result, *,
+                           repair_access: bool, metadata_last: Collection[str] = ()) -> None:
+    """Delete contents through the checked directory descriptor."""
+    with ExitStack() as opened:
+        descriptor = _open_removal_directory(path, directory, expected, opened, repair_access=repair_access)
+        inode = os.fstat(descriptor)
+        permissions = stat.S_IMODE(inode.st_mode)
+        if repair_access and inode.st_uid == os.geteuid() and permissions & 0o300 != 0o300:
+            _ = opened.callback(os.fchmod, descriptor, permissions)
+            os.fchmod(descriptor, permissions | 0o300)
+        entries = os.listdir(descriptor)
+        if metadata_last:
+            entries.sort(key=lambda name: name in metadata_last)
+        for name in entries:
+            try:
+                child = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(child.st_mode):
+                _delete_renamed_folder(path / name, descriptor, child, repair_access=repair_access)
+            else:
+                with suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=descriptor)
+        if not _same_removal_tree(path, directory, expected):
+            raise RemovalTreeChanged(f"{path}: the removal folder changed before rmdir")
+        os.rmdir(path.name, dir_fd=directory)
+
+
+def _rename_without_replacing(directory: int, source: str, destination: str) -> None:
+    """Rename entries in one parent and refuse an occupied destination."""
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        if sys.platform == "linux":
+            rename = cast(Callable[[int, bytes, int, bytes, int], int], library.renameat2)
+            status = rename(directory, os.fsencode(source), directory, os.fsencode(destination), _RENAME_NOREPLACE)
+        elif sys.platform == "darwin":
+            rename = cast(Callable[[int, bytes, int, bytes, int], int], library.renameatx_np)
+            status = rename(directory, os.fsencode(source), directory, os.fsencode(destination), _RENAME_EXCL)
+        else:
+            raise AttributeError("exclusive rename")
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "exclusive rename is unavailable", source) from error
+    if status != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), source, None, destination)
+
+
+def _restore_removal(path: Path, hidden: Path, directory: int) -> None:
+    try:
+        _rename_without_replacing(directory, hidden.name, path.name)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        print(f"kept for a manual removal list: {hidden} (build_folders, restore to {path} failed: {error})",
+              file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class CheckedRemovalTree:
+    """Keep the parent descriptor and the checked identity for deletion."""
+
+    path: Path
+    parent: int
+    info: os.stat_result
+
+    def remove(self, *, repair_access: bool = False, metadata_last: Collection[str] = ()) -> None:
+        _delete_renamed_folder(self.path, self.parent, self.info,
+                               repair_access=repair_access, metadata_last=metadata_last)
+
+
+RemovalTreeAction = Callable[[CheckedRemovalTree], None]
+
+
+@dataclass(frozen=True)
+class StagedRemoval:
+    """Identify a removal stage independently of the source path."""
+
+    name: str
+    device: int
+    inode: int
+
+    @classmethod
+    def from_tree(cls, tree: CheckedRemovalTree) -> StagedRemoval:
+        return cls(tree.path.name, tree.info.st_dev, tree.info.st_ino)
+
+    @classmethod
+    def read(cls, fields: Mapping[str, object]) -> StagedRemoval | None:
+        if "removal_stage" not in fields:
+            return None
+        name = fields.get("removal_stage")
+        device, inode = fields.get("copy_device"), fields.get("copy_inode")
+        if not isinstance(name, str) or type(device) is not int or type(inode) is not int:
+            raise ValueError("invalid removal stage")
+        return cls(name, device, inode)
+
+    def fields(self) -> dict[str, object]:
+        return {"removal_stage": self.name, "copy_device": self.device, "copy_inode": self.inode}
+
+    def recover(self, source: Path, *, dir_fd: int | None = None) -> bool:
+        return recover_staged_folder(source, self.name, self.device, self.inode, dir_fd=dir_fd)
+
+
+def _staging_identity(info: os.stat_result) -> dict[str, object]:
+    return {"device": info.st_dev, "inode": info.st_ino}
+
+
+def _remove_folder(path: Path, directory: int, allocated: os.stat_result, *,
+                   wait: bool = True, repair_access: bool = False,
+                   child_locks: tuple[int, ...] = (), delete: RemovalTreeAction | None = None,
+                   before_stage: RemovalTreeAction | None = None, review_temporary: bool = False) -> bool:
+    """Rename the checked tree, check for new leases, and delete it."""
+    if not stat.S_ISDIR(allocated.st_mode) or not may_remove_folder_tree(path):
+        return False
+    hidden = path.with_name(f".removing-{os.getpid()}-{secrets.token_hex(8)}")
+    held = {(inode.st_dev, inode.st_ino) for inode in map(os.fstat, child_locks)}
+    review_root = path.absolute() if review_temporary else None
+    with ExitStack() as leases:
+        try:
+            refusal = _hold_child_leases(path, directory, leases, wait=wait, held=held,
+                                         repair_access=repair_access, review_root=review_root)
+            current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        except (OSError, ValueError):
+            return False
+        if isinstance(refusal, RefusedRemovalLease) or not os.path.samestat(current, allocated):
+            return False
+        if not stat.S_ISDIR(current.st_mode) or not may_remove_build_path(path):
+            return False
+        stage = _hold_free_lease(hidden, directory, leases, wait=False, create=True, check_parent=False, mark=True)
+        if not isinstance(stage, HeldFolderRemovalLease):
+            return False
+        moved = False
+        removed = False
+        keep_staging_record = False
+        try:
+            tree = CheckedRemovalTree(hidden, directory, allocated)
+            _publish_lease(hidden, directory, _staging_identity(allocated))
+            if before_stage is not None:
+                before_stage(tree)
+            try:
+                _rename_without_replacing(directory, path.name, hidden.name)
+            except (FileExistsError, FileNotFoundError):
+                return False
+            moved = True
+            try:
+                renamed = os.stat(hidden.name, dir_fd=directory, follow_symlinks=False)
+                if not os.path.samestat(renamed, allocated) or not may_remove_folder_tree(hidden):
+                    return False
+                refusal = _hold_child_leases(
+                    hidden, directory, leases, wait=False, held=held, repair_access=repair_access,
+                    review_root=review_root)
+            except (OSError, ValueError):
+                return False
+            if isinstance(refusal, RefusedRemovalLease):
+                return False
+            try:
+                if delete is None:
+                    tree.remove(repair_access=repair_access)
+                else:
+                    delete(tree)
+            except OSError:
+                keep_staging_record = True
+                raise
+            removed = not _folder_exists(hidden, directory)
+            return removed
+        finally:
+            if moved and not removed and _same_removal_tree(hidden, directory, allocated):
+                _restore_removal(path, hidden, directory)
+                keep_staging_record = False
+            if (not keep_staging_record and not _folder_exists(hidden, directory)
+                    and build_folder_lock.lock_current(hidden, directory, stage.descriptor)):
+                _unlink_metadata(hidden, directory)
 
 
 def _folder_exists(path: Path, directory: int) -> bool:
@@ -1749,7 +2395,12 @@ def _parent_has_symlink(parent: Path) -> bool:
 
 @dataclass(frozen=True)
 class RefusedRemovalLease:
-    """A busy or unreadable lock prevents removal."""
+    """A lock or keep file prevents removal."""
+
+
+@dataclass(frozen=True)
+class KeptCopyRemovalLease(RefusedRemovalLease):
+    """A keep file prevents removal of the numbered copy."""
 
 
 @dataclass(frozen=True)
@@ -1757,8 +2408,30 @@ class RemovalLockHeld(RefusedRemovalLease):
     lock: Path
 
 
+@dataclass(frozen=True, kw_only=True)
+class FreeFolderRemovalLease:
+    """Hold any child locks found during the lease scan."""
+
+    child_locks: tuple[int, ...] = field(default=(), repr=False, compare=False)
+
+    def remove_tree(self, path: Path, expected: os.stat_result, *, wait: bool = True,
+                    repair_access: bool = False, delete: RemovalTreeAction | None = None,
+                    before_stage: RemovalTreeAction | None = None) -> bool:
+        """Remove the same tree while retaining the child locks."""
+        if isinstance(self, HeldFolderRemovalLease):
+            if (self.folder != path or _locks.get(self.descriptor) != path
+                    or not build_folder_lock.lock_current(path, self.directory, self.descriptor)
+                    or not build_folder_lock.parent_current(path, self.directory)):
+                return False
+            return _remove_folder(path, self.directory, expected, wait=wait, repair_access=repair_access,
+                                  child_locks=self.child_locks, delete=delete, before_stage=before_stage)
+        return remove_build_folder(path, wait=wait, expected=expected, repair_access=repair_access,
+                                   child_locks=self.child_locks, delete=delete, transient_lock=True,
+                                   before_stage=before_stage)
+
+
 @dataclass(frozen=True)
-class UnreservedRemovalFolder:
+class UnreservedRemovalFolder(FreeFolderRemovalLease):
     """The folder has no lock file to hold."""
 
 
@@ -1766,12 +2439,13 @@ SidecarIdentity = tuple[int, int, int]
 
 
 @dataclass(frozen=True)
-class HeldFolderRemovalLease:
+class HeldFolderRemovalLease(FreeFolderRemovalLease):
     """The descriptor reserves the folder name until lock removal."""
 
     folder: Path
     directory: int
     descriptor: int
+    created: bool = field(default=False, repr=False, compare=False, kw_only=True)
 
     def _sidecar_identity(self, name: str) -> SidecarIdentity | None:
         try:
@@ -1797,6 +2471,10 @@ class HeldFolderRemovalLease:
         identities = {lease_name: lease_identity} if lease_identity is not None else {}
         identities[lock_name] = lock_identity
         return identities
+
+    def owner_state(self, *, allow_released: bool = False) -> LeaseOwnerState:
+        """Read the state of the recorded owner."""
+        return _lease_owner_state(self.folder, self.directory, allow_released=allow_released)
 
     def _source_removed(self) -> bool:
         try:
@@ -1832,54 +2510,251 @@ class HeldFolderRemovalLease:
 FolderRemovalLease = RefusedRemovalLease | UnreservedRemovalFolder | HeldFolderRemovalLease
 
 
+class BuildFolderParentChanged(FileNotFoundError):
+    """The parent path stopped naming the open directory."""
+
+
 def _hold_free_lease(path: Path, directory: int, stack: ExitStack, *, wait: bool = True,
-                     create: bool = False) -> FolderRemovalLease:
+                     create: bool = False, check_parent: bool = True,
+                     transient_lock: bool = False, mark: bool = False) -> FolderRemovalLease:
     """Hold the lock if it is free. The stack owns the descriptor."""
+    if create and check_parent and mark:
+        _reject_staged_allocation(path)
+    created = False
     try:
-        descriptor = build_folder_lock.open_lock(path, directory, create=create)
+        if transient_lock:
+            try:
+                descriptor = build_folder_lock.open_lock(path, directory, create=True, exclusive=True)
+                created = True
+            except FileExistsError:
+                descriptor = build_folder_lock.open_lock(path, directory, create=False)
+        else:
+            descriptor = build_folder_lock.open_lock(path, directory, create=create)
     except FileNotFoundError:
+        if create and check_parent and not build_folder_lock.parent_current(path, directory):
+            raise BuildFolderParentChanged(str(path.parent)) from None
+        if _kept_build_copy(path, directory):
+            return KeptCopyRemovalLease()
         return UnreservedRemovalFolder()
-    _ = stack.callback(os.close, descriptor)
-    acquired = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait)
-    if not build_folder_lock.lock_current(path, directory, descriptor):
-        return RefusedRemovalLease()
-    if not acquired:
-        return RemovalLockHeld(path.with_name(path.name + ".lock"))
-    _ = stack.callback(_locks.pop, descriptor, None)
-    _locks[descriptor] = path
-    return HeldFolderRemovalLease(path, directory, descriptor)
+    with ExitStack() as opened:
+        _ = opened.callback(os.close, descriptor)
+        acquired = _take_lock(descriptor, fcntl.LOCK_EX, wait=wait)
+        if acquired and (mark or created):
+            build_folder_lock.mark_lock(descriptor)
+        if create and check_parent:
+            parent_check = allocation_parent_current if mark else build_folder_lock.parent_current
+            if not parent_check(path, directory):
+                raise BuildFolderParentChanged(str(path.parent))
+        if not build_folder_lock.lock_current(path, directory, descriptor):
+            return RefusedRemovalLease()
+        if not acquired:
+            return RemovalLockHeld(path.with_name(path.name + ".lock"))
+        lease = HeldFolderRemovalLease(path, directory, descriptor, created=created)
+        if _kept_build_copy(path, directory):
+            if created:
+                _unlink_transient_lock(lease)
+            return KeptCopyRemovalLease()
+        _ = opened.callback(_locks.pop, descriptor, None)
+        _locks[descriptor] = path
+        _ = stack.enter_context(opened.pop_all())
+    return lease
 
 
-def _hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True,
-                       probe_fds: list[int] | None = None) -> RefusedRemovalLease | None:
-    """Hold every lease lock below the path. Return a refusal if a lock prevents removal."""
-    def unreadable(error: OSError) -> None:
-        if not isinstance(error, FileNotFoundError):
-            raise error
+EXTERNAL_LINK_REASON = "the folder contains a symbolic link that can point outside the folder"
+_LOOSE_OBJECT_HASH = re.compile(r"[0-9a-fA-F]+")
 
-    for top, folders, files, directory in os.fwalk(path, follow_symlinks=False, onerror=unreadable):
-        for name in files:
-            stem = name.removesuffix(".lock")
-            if stem != name and (stem in folders or stem + ".lease.json" in files):
-                lease = _hold_free_lease(Path(top) / stem, directory, stack, wait=wait)
+
+class TemporaryFolderReview(RuntimeError):
+    """The temporary folder requires review before removal."""
+
+
+def _link_can_leave_folder(root: Path, folder: Path, target: Path) -> bool:
+    if target.is_absolute():
+        if not target.is_relative_to(root):
+            return True
+        target = target.relative_to(root)
+        folder = root
+    depth = len(folder.relative_to(root).parts)
+    entered = False
+    for part in target.parts:
+        if part == "..":
+            # A preceding component can be a symbolic link.
+            if entered or not depth:
+                return True
+            depth -= 1
+        else:
+            entered = True
+    return False
+
+
+def _check_removal_directory(path: Path, parent: int, directory: int, expected: os.stat_result) -> None:
+    from scripts.lib.removal_guard import Refused, mount_id
+
+    if not os.path.samestat(os.fstat(directory), expected):
+        raise RemovalTreeChanged(f"{path}: the removal folder changed before open")
+    try:
+        same_mount = (expected.st_dev == os.fstat(parent).st_dev
+                      and mount_id(directory) == mount_id(parent))
+    except Refused as error:
+        raise RemovalTreeChanged(f"{path}: cannot check the removal mount") from error
+    if not same_mount:
+        raise RemovalTreeChanged(f"{path}: the removal crosses a mount")
+
+
+def _open_removal_directory(path: Path, parent: int, expected: os.stat_result, opened: ExitStack, *,
+                            repair_access: bool) -> int:
+    permissions = stat.S_IMODE(expected.st_mode)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if repair_access and expected.st_uid == os.geteuid() and permissions & 0o500 != 0o500:
+        if sys.platform == "linux":
+            # Check and repair the same directory, even if its name changes.
+            handle = os.open(path.name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            _ = opened.callback(os.close, handle)
+            _check_removal_directory(path, parent, handle, expected)
+            entry = Path(f"/proc/self/fd/{handle}")
+            _ = opened.callback(entry.chmod, permissions)
+            entry.chmod(permissions | 0o500)
+        else:
+            if (expected.st_dev != os.fstat(parent).st_dev or not _same_removal_tree(path, parent, expected)
+                    or not may_remove_folder_tree(path)):
+                raise RemovalTreeChanged(f"{path}: cannot check the removal folder before access repair")
+
+            def restore() -> None:
+                if _same_removal_tree(path, parent, expected):
+                    os.chmod(path.name, permissions, dir_fd=parent, follow_symlinks=False)
+
+            _ = opened.callback(restore)
+            os.chmod(path.name, permissions | 0o500, dir_fd=parent, follow_symlinks=False)
+    directory = os.open(path.name, flags, dir_fd=parent)
+    _ = opened.callback(os.close, directory)
+    _check_removal_directory(path, parent, directory, expected)
+    return directory
+
+
+def hold_child_leases(path: Path, stack: ExitStack, *, wait: bool = True, check_owners: bool = False,
+                      review_temporary: bool = False,
+                      inspect: Callable[[Path, set[str], set[str]], None] | None = None) -> RefusedRemovalLease | None:
+    """Check child leases and inspect a folder before a claim."""
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        return _hold_child_leases(path, parent, stack, wait=wait, check_owners=check_owners,
+                                  review_root=path.absolute() if review_temporary else None, inspect=inspect)
+    finally:
+        os.close(parent)
+
+
+def _hold_child_leases(path: Path, parent: int, stack: ExitStack, *, wait: bool = True,
+                       probe_fds: list[int] | None = None, held: set[tuple[int, int]] | None = None,
+                       repair_access: bool = False, check_owners: bool = False,
+                       review_root: Path | None = None,
+                       inspect: Callable[[Path, set[str], set[str]], None] | None = None) -> RefusedRemovalLease | None:
+    """Hold child leases through the open parent. Skip inodes already held."""
+    scan_root = path
+
+    def visit(path: Path, parent: int) -> RefusedRemovalLease | None:
+        try:
+            expected = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISDIR(expected.st_mode):
+            return None
+        with ExitStack() as opened:
+            try:
+                directory = _open_removal_directory(path, parent, expected, opened, repair_access=repair_access)
+            except FileNotFoundError:
+                return None
+            folders: set[str] = set()
+            files: set[str] = set()
+            links: set[str] = set()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.name.endswith(".keep") and _kept_build_copy(
+                            path / entry.name.removesuffix(".keep"), directory):
+                        return KeptCopyRemovalLease()
+                    if entry.is_dir(follow_symlinks=False):
+                        folders.add(entry.name)
+                    elif entry.is_symlink():
+                        links.add(entry.name)
+                    else:
+                        files.add(entry.name)
+            entries = files | links
+            children = folders | links
+            if review_root is not None:
+                original = review_root / path.relative_to(scan_root)
+                if ("pack" in folders or git_files.has_git_storage(original, folders, entries)
+                        or any(len(name) in (38, 40, 62, 64) and _LOOSE_OBJECT_HASH.fullmatch(name) for name in files)):
+                    raise TemporaryFolderReview(git_files.GIT_STORAGE_REASON)
+                for name in links:
+                    target = Path(os.readlink(name, dir_fd=directory))
+                    if _link_can_leave_folder(review_root, original, target):
+                        raise TemporaryFolderReview(EXTERNAL_LINK_REASON)
+            if inspect is not None:
+                inspect(path, children, entries)
+            for name in entries:
+                stem = name.removesuffix(".lock")
+                if not stem or stem == name:
+                    continue
+                paired = stem in children or stem + ".lease.json" in entries
+                try:
+                    lock = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    # Older allocations wrote an empty lock beside a folder or lease record.
+                    legacy = paired and lock.st_size == 0
+                    if not (legacy or (check_owners and paired)
+                            or build_folder_lock.is_marked_lock(name, directory, lock)):
+                        continue
+                except FileNotFoundError:
+                    continue
+                key = (lock.st_dev, lock.st_ino)
+                if held is not None and key in held:
+                    continue
+                lease = _hold_free_lease(path / stem, directory, stack, wait=wait)
                 if isinstance(lease, RefusedRemovalLease):
                     return lease
-                if probe_fds is not None and isinstance(lease, HeldFolderRemovalLease):
-                    probe_fds.append(lease.descriptor)
-    return None
+                if isinstance(lease, HeldFolderRemovalLease):
+                    if held is not None:
+                        locked = os.fstat(lease.descriptor)
+                        held.add((locked.st_dev, locked.st_ino))
+                    if probe_fds is not None:
+                        probe_fds.append(lease.descriptor)
+            if check_owners:
+                for name in children:
+                    child = path / name
+                    if name + ".lease.json" in entries and _lease_owner_state(child, directory) is not LeaseOwnerState.ENDED:
+                        return RemovalLockHeld(lease_path(child))
+            for child in folders:
+                refusal = visit(path / child, directory)
+                if refusal is not None:
+                    return refusal
+        return None
+
+    return visit(path, parent)
 
 
 @contextmanager
 def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = True,
                          create: bool = False, root: Path | None = None,
-                         probe_fds: list[int] | None = None) -> Generator[FolderRemovalLease]:
+                         probe_fds: list[int] | None = None,
+                         transient_lock: bool = False) -> Generator[FolderRemovalLease]:
     """Hold the collector's locks and return the reservation for a folder."""
     metadata = _METADATA.fullmatch(path.name)
     folder = path.with_name(metadata[1]) if metadata else path
     with ExitStack() as stack:
         try:
-            directory = stack.enter_context(build_folder_lock.folder_parent(folder, root or folder.parent, create=False))
-            lease = _hold_free_lease(folder, directory, stack, wait=wait, create=create)
+            for attempt in range(2):
+                directory = stack.enter_context(build_folder_lock.folder_parent(
+                    folder, root or folder.parent, create=create and root is not None))
+                try:
+                    lease = _hold_free_lease(folder, directory, stack, wait=wait, create=create,
+                                             mark=create and not transient_lock, transient_lock=transient_lock)
+                except BuildFolderParentChanged:
+                    if attempt == 1:
+                        raise
+                else:
+                    break
+            else:
+                raise AssertionError("the lease attempt must resolve")
+            if isinstance(lease, HeldFolderRemovalLease) and lease.created:
+                _ = stack.callback(_unlink_transient_lock, lease)
             if probe_fds is not None:
                 probe_fds.append(directory)
                 if isinstance(lease, HeldFolderRemovalLease):
@@ -1887,11 +2762,17 @@ def folder_removal_lease(path: Path, *, children: bool = False, wait: bool = Tru
             if not isinstance(lease, RefusedRemovalLease):
                 if metadata is not None:
                     lease = UnreservedRemovalFolder()
+                elif children and not build_folder_lock.parent_current(folder, directory):
+                    lease = RefusedRemovalLease()
                 elif children:
+                    child_locks: list[int] = []
                     with suppress(FileNotFoundError):
-                        refusal = _hold_child_leases(folder, stack, wait=wait, probe_fds=probe_fds)
-                        if refusal is not None:
-                            lease = refusal
+                        refusal = _hold_child_leases(folder, directory, stack, wait=wait, probe_fds=child_locks)
+                        lease = refusal if refusal is not None else replace(lease, child_locks=tuple(child_locks))
+                    if probe_fds is not None:
+                        probe_fds.extend(child_locks)
+        except BuildFolderParentChanged:
+            lease = RefusedRemovalLease()
         except FileNotFoundError:
             lease = UnreservedRemovalFolder()
         except (OSError, ValueError):
@@ -1924,7 +2805,7 @@ def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | MainOutput, 
 
 
 @contextmanager
-def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
+def copy_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
     """Keep the checkout locked and record its last use before release."""
     path = create_build_folder(spec)
     try:
@@ -1934,9 +2815,17 @@ def slot_build_folder(spec: BuildFolderSpec) -> Generator[Path]:
             if spec.kind == "copy":
                 mark_folder_use(path)
             with build_folder_lock.folder_parent(path, spec.parent, create=False) as directory:
+                if spec.kind == "copy" and not _copy_is_kept(path, directory):
+                    with suppress(FileNotFoundError):
+                        os.unlink(copy_keep_file(path).name, dir_fd=directory)
                 _write_lease(path, directory, spec, released=True)
         finally:
             _release_build_folder(path)
+
+
+def _unlink_transient_lock(lease: HeldFolderRemovalLease) -> None:
+    if build_folder_lock.lock_current(lease.folder, lease.directory, lease.descriptor):
+        os.unlink(lease.folder.name + ".lock", dir_fd=lease.directory)
 
 
 class _FolderRemoval(Enum):
@@ -1944,48 +2833,87 @@ class _FolderRemoval(Enum):
     PROTECTED = "the folder is protected"
     LOCK_HELD = "the folder lock is held"
     LOCK_CHANGED = "the folder lock file changed"
+    REVIEW_ONLY = "the folder requires review"
     CLEANUP_KEPT = "the cleanup kept the folder"
     FOLDER_PRESENT = "the folder still exists after cleanup"
 
 
-def remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
-                        dir_fd: int | None = None, wait: bool = True) -> bool:
-    """Run cleanup under the free folder's lock, then remove temporary metadata."""
-    return _remove_build_folder(path, cleanup, temporary=temporary, dir_fd=dir_fd,
-                                wait=wait) is _FolderRemoval.REMOVED
+def remove_build_folder(path: Path, *, temporary: bool = True, dir_fd: int | None = None,
+                        wait: bool = True, expected: os.stat_result | None = None,
+                        repair_access: bool = False, prepare: Callable[[], bool] | None = None,
+                        child_locks: tuple[int, ...] = (), delete: RemovalTreeAction | None = None,
+                        transient_lock: bool = False, before_stage: RemovalTreeAction | None = None) -> bool:
+    """Remove a free folder. Run optional preparation at its original path."""
+    return _remove_build_folder(path, temporary=temporary, dir_fd=dir_fd, wait=wait, expected=expected,
+                                repair_access=repair_access, prepare=prepare, child_locks=child_locks,
+                                delete=delete, transient_lock=transient_lock, before_stage=before_stage) is _FolderRemoval.REMOVED
 
 
-def _remove_build_folder(path: Path, cleanup: Callable[[], object], *, temporary: bool = True,
-                         dir_fd: int | None = None, wait: bool = True) -> _FolderRemoval:
+def _remove_build_folder(path: Path, *, temporary: bool = True, dir_fd: int | None = None,
+                         wait: bool = True, expected: os.stat_result | None = None,
+                         repair_access: bool = False, prepare: Callable[[], bool] | None = None,
+                         child_locks: tuple[int, ...] = (), delete: RemovalTreeAction | None = None,
+                         transient_lock: bool = False,
+                         before_stage: RemovalTreeAction | None = None,
+                         owner_finished: bool = False) -> _FolderRemoval:
     if not may_remove_build_path(path):
         return _FolderRemoval.PROTECTED
-    with ExitStack() as parents:
-        try:
-            directory = dir_fd if dir_fd is not None else parents.enter_context(
-                build_folder_lock.folder_parent(path, path.parent, create=False))
-        except FileNotFoundError:
-            # An absent parent has no folder or metadata to lock.
-            return _FolderRemoval.CLEANUP_KEPT if cleanup() is False else _FolderRemoval.REMOVED
-        descriptor = build_folder_lock.open_lock(path, directory, create=True)
-        try:
-            if not _take_lock(descriptor, fcntl.LOCK_EX, wait=wait):
-                return _FolderRemoval.LOCK_HELD
-            if not build_folder_lock.lock_current(path, directory, descriptor):
-                return _FolderRemoval.LOCK_CHANGED
+    for _attempt in range(2):
+        with ExitStack() as parents:
             try:
-                if cleanup() is False:
-                    return _FolderRemoval.CLEANUP_KEPT
+                directory = dir_fd if dir_fd is not None else parents.enter_context(
+                    build_folder_lock.folder_parent(path, path.parent, create=False))
             except FileNotFoundError:
-                if temporary and not _folder_exists(path, directory):
+                if expected is None and (prepare is None or prepare() is not False):
+                    return _FolderRemoval.REMOVED
+                return _FolderRemoval.CLEANUP_KEPT
+            try:
+                lease = _hold_free_lease(path, directory, parents, wait=wait, create=True,
+                                         check_parent=dir_fd is None, transient_lock=transient_lock)
+            except BuildFolderParentChanged:
+                continue
+            if isinstance(lease, RemovalLockHeld):
+                return _FolderRemoval.LOCK_HELD
+            if isinstance(lease, KeptCopyRemovalLease):
+                return _FolderRemoval.PROTECTED
+            if not isinstance(lease, HeldFolderRemovalLease):
+                return _FolderRemoval.LOCK_CHANGED
+            if lease.created:
+                _ = parents.callback(_unlink_transient_lock, lease)
+            try:
+                allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                if temporary:
                     _unlink_metadata(path, directory)
-                raise
+                if expected is None and (prepare is None or prepare() is not False):
+                    return _FolderRemoval.REMOVED
+                return _FolderRemoval.CLEANUP_KEPT
+            if expected is not None and not os.path.samestat(expected, allocated):
+                return _FolderRemoval.CLEANUP_KEPT
+            if prepare is not None and (not may_remove_folder_tree(path) or not prepare()):
+                return _FolderRemoval.CLEANUP_KEPT
+            review_temporary = (_temporary_claim_location(path) is not None
+                                and (owner_finished or _lease_owner_state(path, directory) is LeaseOwnerState.ENDED))
+            try:
+                if not _remove_folder(path, directory, allocated, wait=wait, repair_access=repair_access,
+                                      child_locks=child_locks, delete=delete, before_stage=before_stage,
+                                      review_temporary=review_temporary):
+                    return _FolderRemoval.CLEANUP_KEPT
+            except TemporaryFolderReview:
+                return _FolderRemoval.REVIEW_ONLY
             if _folder_exists(path, directory):
                 return _FolderRemoval.FOLDER_PRESENT
             if temporary:
                 _unlink_metadata(path, directory)
             return _FolderRemoval.REMOVED
-        finally:
-            os.close(descriptor)
+    return _FolderRemoval.LOCK_CHANGED
+
+
+def remove_folder(path: Path) -> None:
+    """Remove a free folder and repair its permissions when needed."""
+    removal = _remove_build_folder(path, repair_access=True)
+    if removal is not _FolderRemoval.REMOVED:
+        raise PermissionError(f"{path}: {removal.value}")
 
 
 def expired_folder(path: Path, *, cutoff: float) -> bool:
@@ -2016,7 +2944,7 @@ def _folder_has_expired(path: Path, directory: int, cutoff: float, form: FolderF
             if not isinstance(form, BuildCopy):
                 return False
             try:
-                fields = _read_copy_lease(path, directory)
+                fields = _read_folder_lease(path, directory)
                 return (fields.get("ready") is False
                         and _lease_time(fields.get("last_use")).timestamp() <= cutoff
                         and isinstance(_numbered_copy_record(path, form, directory), NumberedCopySource))
@@ -2043,22 +2971,34 @@ def release_removed_folder(path: Path) -> FolderPairRelease:
     path = path.absolute()
     if _parent_has_symlink(path.parent):
         return FolderPairRelease.PARENT_LINK
-    with ExitStack() as stack:
-        try:
-            directory = stack.enter_context(build_folder_lock.folder_parent(path, Path(path.anchor), create=False))
-        except FileNotFoundError:
-            return FolderPairRelease.PARENT_ABSENT
-        if _folder_exists(path, directory):
-            return FolderPairRelease.FOLDER_PRESENT
-        lock_name = path.name + ".lock"
-        names = (path.name + ".lease.json", lock_name)
-        present = {name for name in names if _folder_exists(path.with_name(name), directory)}
-        if not present:
-            return FolderPairRelease.PAIR_ABSENT
-        lease = _hold_free_lease(path, directory, stack, wait=False, create=True)
+    for _attempt in range(2):
+        with ExitStack() as parents:
+            try:
+                directory = parents.enter_context(build_folder_lock.folder_parent(path, Path(path.anchor), create=False))
+            except FileNotFoundError:
+                return FolderPairRelease.PARENT_ABSENT
+            try:
+                return _release_removed_folder_at(path, directory, reject_parent_links=True)
+            except BuildFolderParentChanged:
+                continue
+    return FolderPairRelease.LOCK_HELD
+
+
+def _release_removed_folder_at(path: Path, directory: int, *, reject_parent_links: bool) -> FolderPairRelease:
+    if not build_folder_lock.parent_current(path, directory):
+        raise BuildFolderParentChanged(str(path.parent))
+    if _folder_exists(path, directory):
+        return FolderPairRelease.FOLDER_PRESENT
+    lock_name = path.name + ".lock"
+    names = (path.name + ".lease.json", lock_name)
+    present = {name for name in names if _folder_exists(path.with_name(name), directory)}
+    if not present:
+        return FolderPairRelease.PAIR_ABSENT
+    with ExitStack() as locks:
+        lease = _hold_free_lease(path, directory, locks, wait=False, create=True)
         if not isinstance(lease, HeldFolderRemovalLease):
             return FolderPairRelease.LOCK_HELD
-        removed = lease.unlink_matching_sidecars(lease.sidecar_identities(), reject_parent_links=True)
+        removed = lease.unlink_matching_sidecars(lease.sidecar_identities(), reject_parent_links=reject_parent_links)
         if present <= removed and lock_name in removed:
             return FolderPairRelease.RELEASED
         if removed:
@@ -2068,33 +3008,99 @@ def release_removed_folder(path: Path) -> FolderPairRelease:
         return FolderPairRelease.PAIR_KEPT
 
 
+class _ScratchBorrowerCheck(Protocol):
+    def build_folder_has_borrowers(self, path: Path) -> bool: ...
+
+
 def _finish_temporary(path: Path, directory: int, allocated: os.stat_result, *,
                       descriptor: int, temporary: bool) -> None:
     if _locks.get(descriptor) != path:
         return
     _release_build_folder(path, descriptor=descriptor)
-    _ = remove_build_folder(path, lambda: remove_folder(path, directory, allocated),
-                            temporary=temporary, dir_fd=directory)
+    with ExitStack() as claim:
+        root = build_root().resolve()
+        canonical = _temporary_claim_location(path, root)
+        if canonical is not None:
+            try:
+                _ = claim.enter_context(build_folder_claim_lock(canonical, root, exclusive=True))
+            except BuildFolderClaimHeld:
+                return
+
+        def prepare() -> bool:
+            if canonical is None:
+                return True
+            scratch = cast(_ScratchBorrowerCheck, cast(object, import_module("scripts.lib.scratch")))
+            return not scratch.build_folder_has_borrowers(canonical)
+
+        _ = _remove_build_folder(path, temporary=temporary, dir_fd=directory, expected=allocated,
+                                 repair_access=True, prepare=prepare, owner_finished=True)
 
 
 def _remove_free(path: Path, directory: int, *, wait: bool) -> bool:
-    """Remove a folder and its records when no process holds its lock or a lease below it."""
-    def cleanup() -> bool:
-        try:
-            allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
-        except FileNotFoundError:
-            return True
-        with ExitStack() as children:
-            # A held lease below a free folder, or an unreadable folder below it, keeps the folder.
-            try:
-                if _hold_child_leases(path, children, wait=wait) is not None:
-                    return False
-            except OSError:
-                return False
-            remove_folder(path, directory, allocated)
-        return True
+    """Remove a folder and its records when the folder and its children are free."""
+    return remove_build_folder(path, dir_fd=directory, wait=wait)
 
-    return remove_build_folder(path, cleanup, dir_fd=directory, wait=wait)
+
+def recover_staged_folder(source: Path, name: str, device: int, inode: int, *, dir_fd: int | None = None) -> bool:
+    """Resolve the staging folder recorded in the source removal intent."""
+    if _HIDDEN_REMOVAL.fullmatch(name) is None or name == source.name:
+        return False
+    path = source.with_name(name)
+    if dir_fd is not None:
+        return _recover_staged_folder(path, dir_fd, wait=False, identity=(device, inode))
+    with ExitStack() as parents:
+        try:
+            directory = parents.enter_context(build_folder_lock.folder_parent(path, source.parent, create=False))
+        except FileNotFoundError:
+            return False
+        return _recover_staged_folder(path, directory, wait=False, identity=(device, inode))
+
+
+def _recover_staged_folder(path: Path, directory: int, *, wait: bool,
+                           identity: tuple[int, int] | None = None) -> bool:
+    """Hold the staging lock through deletion of the matching folder."""
+    with ExitStack() as leases:
+        original: os.stat_result | None = None
+        try:
+            stage = _hold_free_lease(path, directory, leases, wait=wait)
+            if isinstance(stage, UnreservedRemovalFolder):
+                return not _folder_exists(path, directory) and not _folder_exists(lease_path(path), directory)
+            if not isinstance(stage, HeldFolderRemovalLease):
+                return False
+            lock_name = path.name + ".lock"
+            lock = os.fstat(stage.descriptor)
+            if (lock.st_uid != os.geteuid() or not build_folder_lock.is_marked_lock(lock_name, directory, lock)
+                    or not build_folder_lock.parent_current(path, directory) or not may_remove_build_path(path)):
+                return False
+            if _folder_exists(path, directory):
+                original = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                if not stat.S_ISDIR(original.st_mode) or not may_remove_folder_tree(path):
+                    return False
+                if identity is not None and identity != (original.st_dev, original.st_ino):
+                    return False
+                try:
+                    recorded = _read_folder_lease(path, directory, allow_empty=True)
+                except FileNotFoundError:
+                    recorded = {}
+                if not recorded and identity is None:
+                    _publish_lease(path, directory, _staging_identity(original))
+                elif recorded != _staging_identity(original):
+                    return False
+                refusal = _hold_child_leases(path, directory, leases, wait=wait, repair_access=True)
+                if isinstance(refusal, RefusedRemovalLease):
+                    return False
+        except (OSError, ValueError):
+            return False
+        if original is not None:
+            try:
+                CheckedRemovalTree(path, directory, original).remove(repair_access=True)
+            except RemovalTreeChanged:
+                return False
+        if (_folder_exists(path, directory)
+                or not build_folder_lock.lock_current(path, directory, stage.descriptor)):
+            return False
+        _unlink_metadata(path, directory)
+        return True
 
 
 def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
@@ -2105,10 +3111,17 @@ def sweep_temporary_build_folders(parent: Path, *, wait: bool = True) -> None:
             names: set[str] = set()
             for entry in os.listdir(directory):
                 match = _METADATA.fullmatch(entry)
-                if match is not None:
-                    names.add(match[1])
+                if match is None:
+                    continue
+                name = match[1]
+                if _HIDDEN_REMOVAL.fullmatch(name) is None or entry == name + ".lock":
+                    names.add(name)
             for name in sorted(names):
-                _ = _remove_free(parent / name, directory, wait=wait)
+                path = parent / name
+                if _HIDDEN_REMOVAL.fullmatch(name) is not None:
+                    _ = _recover_staged_folder(path, directory, wait=wait)
+                else:
+                    _ = _remove_free(path, directory, wait=wait)
     except FileNotFoundError:
         pass
 
@@ -2134,37 +3147,45 @@ def _claim_tool_folder(tool: str, parent: Path | None, allocate: Callable[[Build
                                suffix_length=0, owner_pid=owner_pid)
         try:
             return allocate(spec)
+        except BuildFolderClaimHeld:
+            raise
         except BlockingIOError:
             number += 1
         except FileExistsError:
             path = build_folder_path(spec)
             with build_folder_lock.folder_parent(path, root, create=False) as directory:
-                leftover = _lease_owner_ended(path, directory) and _remove_free(path, directory, wait=False)
+                leftover = remove_build_folder(path, dir_fd=directory, wait=False,
+                                               prepare=lambda: _lease_owner_state(path, directory) is LeaseOwnerState.ENDED)
             if not leftover:
                 number += 1
 
 
-def _lease_owner_ended(path: Path, directory: int) -> bool:
-    """True when the lease names a process that no longer runs. An unreadable lease is not proof."""
+class LeaseOwnerState(Enum):
+    ENDED = "ended"
+    ACTIVE = "active"
+    UNKNOWN = "unknown"
+
+
+def _lease_owner_state(path: Path, directory: int, *, allow_released: bool = False) -> LeaseOwnerState:
+    """Check the recorded owner PID. Accept a release only when the caller permits it."""
     try:
-        descriptor = os.open(path.name + ".lease.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
-    except OSError:
-        return False
-    with os.fdopen(descriptor) as lease:
-        try:
-            record = cast(object, json.load(lease))
-        except ValueError:
-            return False
-    pid = cast(dict[str, object], record).get("pid") if isinstance(record, dict) else None
-    if not isinstance(pid, int) or pid <= 0:
-        return False
+        fields = _read_folder_lease(path, directory)
+    except (OSError, ValueError):
+        return LeaseOwnerState.UNKNOWN
+    if allow_released and fields.get("released") is True:
+        return LeaseOwnerState.ENDED
+    pid = fields.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return LeaseOwnerState.UNKNOWN
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return True
+        return LeaseOwnerState.ENDED
     except PermissionError:
-        return False
-    return False
+        return LeaseOwnerState.ACTIVE
+    except (OSError, OverflowError):
+        return LeaseOwnerState.UNKNOWN
+    return LeaseOwnerState.ACTIVE
 
 
 @contextmanager
@@ -2175,9 +3196,6 @@ def tool_folder(tool: str, parent: Path | None = None) -> Generator[Path]:
     """
     with ExitStack() as cleanup:
         yield _claim_tool_folder(tool, parent, lambda spec: cleanup.enter_context(temporary_build_folder(spec)))
-
-
-OWNER_MARKER = ".build-folder-owner.json"
 
 
 def run_build_command(command: Sequence[str], *, path: Path, environment: Mapping[str, str],
@@ -2205,7 +3223,7 @@ def run_build_command(command: Sequence[str], *, path: Path, environment: Mappin
             pass
         _ = child.wait()
         if sys.platform == "darwin":
-            # A descendant outside the group still holds the slot if it inherits the lock descriptor.
+            # A descendant outside the group still holds the folder if it inherits the lock descriptor.
             try:
                 send_process_group(child.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -2235,6 +3253,8 @@ def run_build(owner: str, name: str, command: Sequence[str], *, showrunner: str 
               work: str = "") -> int:
     """Keep the folder until the command and its descendants stop."""
     import json
+
+    from scripts.lib.removal_guard import OWNER_MARKER
 
     settings = _settings()
     root = Path(os.path.expandvars(settings.text("roots.temporary").replace("${TMPDIR}", str(inherited_temporary_parent())))).expanduser().resolve()
@@ -2363,12 +3383,7 @@ def _command(argv: Sequence[str]) -> int:
             if not may_remove_build_path(path):
                 raise PermissionError(f"{path}: retain the protected build folder")
             _release_build_folder(path)
-            def cleanup() -> None:
-                try:
-                    shutil.rmtree(path)
-                except FileNotFoundError:
-                    pass
-            removal = _remove_build_folder(path, cleanup)
+            removal = _remove_build_folder(path)
             if removal is not _FolderRemoval.REMOVED:
                 print(f"build folders: {path}: {removal.value}", file=sys.stderr)
                 return 1

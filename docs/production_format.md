@@ -90,7 +90,7 @@ The showrunner staff row gives its path. The row's `name` is the production name
 
 - **Source plans:** <path(s)> — split on <date> by /producer:to_production
 - **Repository:** <main checkout path>
-- **Merge branch:** `<branch>` — every unit merges here; only the showrunner pushes it
+- **Merge branch:** `<branch>` — every unit merges here
 - **Kind:** style — optional; absent means a product production. A style production
   reads `~/.claude/docs/style_production.md`
 - **Branch point:** `<branch>` — style productions only: the parent's merge branch
@@ -98,8 +98,9 @@ The showrunner staff row gives its path. The row's `name` is the production name
 - **Parent production:** <path to parent production doc> — style productions only:
   the hand-off destination and the doc used to merge hand-offs while a root
 - **Showrunner checkout:** <path, on the merge branch>
+- **Merge checkout:** <absolute main checkout path> — add for an enrolled production
 - **Log:** <repo-relative path> — git-excluded; one line per event
-- **Merge tests:** <backticked commands for the showrunner checkout on every merge,
+- **Merge tests:** <backticked commands for the integration checkout on every merge,
   in addition to the changed packages' tests. The nightly run checks types.
   Exclude type checks from Merge tests.
   Use `bash ~/.claude/scripts/direct/verify.sh test app`, for example.
@@ -178,6 +179,15 @@ Direct units use `style_sync.py` for normal main merges; see `docs/style_product
 - <standing rules the user set for this production or project, each with its
   source; omit the section if none>
 ```
+
+An enrolled production uses `Repository` for the showrunner session directory.
+`Merge checkout` names the same main checkout as an absolute path.
+`Showrunner checkout` names the integration worktree on `Merge branch`.
+The serving merge unit uses a separate staging worktree.
+The live production document uses the name `<old-stem>-live.md`.
+Resolve its relative `Log` path from the main checkout.
+Keep both files and the production notes untracked and ignored.
+A document without `Merge checkout` uses the legacy layout.
 
 A production doc has no list of units. A unit is its staff row.
 The row gives its name, parent and worktree; git there gives the repository and branch.
@@ -278,7 +288,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    1. Run `git fetch origin`, then `git merge --no-ff origin/main` on the tip.
       Push the join commit. Do not fetch again before step 3.
    2. Run the affected tests of the join through the queue, with no `--module`:
-      `python3 ~/.claude/scripts/copies/copies.py run --repo ~/.claude --commit <join> -- ./scripts/lib/py scripts/production/gate.py --affected`.
+      `~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py run --repo ~/.claude --commit <join> -- ./scripts/lib/py scripts/production/gate.py --affected`.
       The selector finds each module that imports, embeds, copies or reads a
       changed file. Do not choose the modules by hand. Single cases do not
       replace this run.
@@ -461,7 +471,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     Continue if the tests pass. If the code blocks you, use item 10's line.
     While you wait, take the work the showrunner names.
     You can also start independent phase work, tests, docs, or research.
-    Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_slots.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
+    Build a fix in a numbered copy. Run `~/.claude/scripts/lib/py ~/.claude/scripts/lib/build_copies.py run --source <worktree> --commit <hash> --showrunner <name> --unit <unit> --work <word> --purpose <word> -- <command>`.
 15. **A failed lint** (user, 2026-10-01: 12 lint runs in a row on an
     unchanged tree failed on the same error; 60 failed lints in one day cost
     about 75 minutes). Lint covers the whole workspace. When it fails, fix

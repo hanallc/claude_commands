@@ -10,13 +10,13 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from shlex import quote
-from typing import Literal, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 
 Machine = Literal["natedev", "mac"]
 REVISION = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -24,6 +24,14 @@ FULL_NEED_COMMIT = re.compile(r"[0-9a-f]{40}")
 SHORT_COMMIT = re.compile(r"[0-9a-f]{4,39}")
 GENERATION = re.compile(r"system-[0-9]+-link")
 NO_REASON = "No reason given"
+
+
+class SourceWatch(Protocol):
+    """Record file observations that determine whether a result can be saved."""
+
+    def watch(self, path: Path) -> None: ...
+    def verified_absence(self, path: Path) -> bool: ...
+    def mark_incomplete(self) -> None: ...
 
 
 class NeedRecord(TypedDict):
@@ -88,17 +96,32 @@ def request_time(value: str) -> datetime:
     return created if created.tzinfo is not None else created.replace(tzinfo=timezone.utc)
 
 
-def _open_needs(errors: list[str] | None = None) -> list[NeedRecord]:
+def _open_needs(errors: list[str] | None = None, *, watch: SourceWatch | None = None) -> list[NeedRecord]:
+    folder = needs_folder()
+    if watch is not None:
+        watch.watch(folder)
+    try:
+        paths = sorted(path for path in folder.iterdir() if path.suffix == ".json")
+    except FileNotFoundError:
+        if watch is not None and not watch.verified_absence(folder):
+            raise
+        return []
     records: list[NeedRecord] = []
-    for path in sorted(needs_folder().glob("*.json")):
+    for path in paths:
+        if watch is not None:
+            watch.watch(path)
         try:
             fields = _read_fields(path)
             if path.stem != fields["id"]:
                 raise ValueError("The file name and request ID differ.")
             records.append(cast(NeedRecord, cast(object, fields)))
         except FileNotFoundError:
+            if watch is not None:
+                watch.mark_incomplete()
             continue
         except (OSError, ValueError, RecursionError) as error:
+            if watch is not None:
+                watch.mark_incomplete()
             message = f"Rebuild request {path.name}: {error}"
             if errors is None:
                 print(message, file=sys.stderr)
@@ -161,10 +184,10 @@ def add_need(machine: Machine, commit: str, reason: str, concerns: str,
         _write_record(folder / filename, record, create_only=True)
 
 
-def read_needs(errors: list[str] | None = None) -> list[MachineNeeds]:
+def read_needs(errors: list[str] | None = None, *, watch: SourceWatch | None = None) -> list[MachineNeeds]:
     """Read the needs folder and return one summary per machine without subprocesses."""
     groups: dict[Machine, list[NeedRecord]] = {}
-    for record in _open_needs(errors):
+    for record in _open_needs(errors, watch=watch):
         groups.setdefault(record["machine"], []).append(record)
     summaries: list[MachineNeeds] = []
     for machine in sorted(groups):
@@ -327,8 +350,20 @@ def active_system(output: str, log: str = "") -> ActiveSystem | None:
     return unknown
 
 
+def resolve_legacy_commit(commit: str, nixos_repo: Path, run: Callable[[list[str]], str]) -> str:
+    """Resolve a unique abbreviated need hash to a commit."""
+    if not SHORT_COMMIT.fullmatch(commit):
+        return ""
+    git = ["git", "-C", str(nixos_repo), "rev-parse"]
+    resolved = run([*git, "--verify", "--quiet", "--end-of-options", f"{commit}^{{commit}}"])
+    if (FULL_NEED_COMMIT.fullmatch(resolved) and resolved.startswith(commit)
+            and run([*git, f"--disambiguate={commit}"]) == resolved):
+        return resolved
+    return ""
+
+
 def clear_running_needs(machine: Machine, system: ActiveSystem, nixos_repo: Path,
-                        run: Callable[[list[str]], str]) -> None:
+                        run: Callable[[list[str]], str], *, legacy_commits: Mapping[str, str] | None = None) -> None:
     """Archive requests covered by the clean active revision."""
     revision = system.revision
     if not system.evidence or not REVISION.fullmatch(revision):
@@ -339,13 +374,11 @@ def clear_running_needs(machine: Machine, system: ActiveSystem, nixos_repo: Path
         if record["machine"] != machine:
             continue
         commit = record["nixos_commit"]
-        if not FULL_NEED_COMMIT.fullmatch(commit):
-            resolved = run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
-                            f"{commit}^{{commit}}"])
-            if (not FULL_NEED_COMMIT.fullmatch(resolved) or not resolved.startswith(commit)
-                    or run(["git", "-C", repo, "rev-parse", f"--disambiguate={commit}"]) != resolved):
+        if SHORT_COMMIT.fullmatch(commit):
+            commit = (resolve_legacy_commit(commit, nixos_repo, run) if legacy_commits is None
+                      else legacy_commits.get(commit, ""))
+            if not commit:
                 continue
-            commit = resolved
         base = run(["git", "-C", repo, "merge-base", commit, revision])
         if base == commit:
             _archive(record, commit, system.evidence)
@@ -369,13 +402,18 @@ def clear_needs(machine: Machine, generations: Path, nixos_repo: Path) -> None:
         clear_running_needs(machine, system, nixos_repo, command_output)
 
 
-def command_output(command: list[str], *, timeout: int = 30) -> str:
-    """Return command output when the command succeeds within its time limit."""
+def command_result(command: list[str], *, timeout: int = 30) -> str | None:
+    """Return stdout on success and None on failure."""
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return result.stdout.strip(" \t\r\n") if result.returncode == 0 else ""
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def command_output(command: list[str], *, timeout: int = 30) -> str:
+    """Return command output when the command succeeds within its time limit."""
+    return (command_result(command, timeout=timeout) or "").strip(" \t\r\n")
 
 
 class Arguments(argparse.Namespace):
