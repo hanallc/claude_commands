@@ -48,6 +48,12 @@ type PromotionApproval = CollectedCi | LifecycleCi | LifecycleNoCi | FastTrackIn
 
 
 @dataclass(frozen=True)
+class MainInstallation:
+    checkout: Path
+    advance: Callable[[], None]
+
+
+@dataclass(frozen=True)
 class ApprovedPromotion:
     """The exact commit that this operation permits at each destination."""
 
@@ -56,11 +62,12 @@ class ApprovedPromotion:
     def install(self, checkout: Path, expected_head: str) -> None:
         waiting_rows.move_to(checkout, self.sha, fast_forward=True, expected_head=expected_head)
 
-    def land(self, checkout: Path) -> land_main.Landed:
-        if git(checkout, "rev-parse", "HEAD") == self.sha:
-            return land_main.land(checkout, self.sha)
+    def land(self, checkout: Path, *, installation: MainInstallation | None = None) -> land_main.Landed:
+        advance = installation.advance if installation else None
+        if (installation and installation.checkout == checkout) or git(checkout, "rev-parse", "HEAD") == self.sha:
+            return land_main.land(checkout, self.sha, install_checkout=advance)
         with land_main.exact_hook_checkout(checkout, self.sha) as exact:
-            return land_main.land(exact, self.sha, retry_source=checkout)
+            return land_main.land(exact, self.sha, retry_source=checkout, install_checkout=advance)
 
 
 @dataclass(frozen=True)

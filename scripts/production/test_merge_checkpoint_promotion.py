@@ -30,7 +30,7 @@ from scripts.lib import land_main, main_publish
 from scripts.message import sessions
 
 from scripts.production.merge_checkpoint import promote, request_from
-from scripts.production import merge_checkpoint, production_doc, promotion, showrunners, staff
+from scripts.production import behavior_check, merge_checkpoint, production_doc, promotion, showrunners, staff
 from scripts.production.staff_test_support import isolated_staff_file
 from scripts.agents import remote
 from scripts.production import change_review
@@ -56,6 +56,39 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_behavior_refusal_keeps_live_main_and_its_worktree(self) -> None:
+        path = "test_promotion.py"
+        original = "def test_fixture():\n    assert 1\n"
+        self.write(self.promote, path, original)
+        _ = self.git("add", path, cwd=self.promote)
+        _ = self.git("commit", "-m", "Set the current behavior", cwd=self.promote)
+        _ = self.git("push", "origin", "main", cwd=self.promote)
+        base = self.git("rev-parse", "HEAD", cwd=self.promote)
+        _ = self.git("merge", "--ff-only", base, cwd=self.checkout)
+        self.write(self.checkout, path, original.replace("1", "2"))
+        _ = self.git("commit", "-am", "Change the behavior", cwd=self.checkout)
+        _ = self.git("push", "origin", "production", cwd=self.checkout)
+        tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+        self.write(self.promote, "src/beta.txt", "staged edit\n")
+        _ = self.git("add", "src/beta.txt", cwd=self.promote)
+        self.write(self.promote, "src/beta.txt", "worktree edit\n")
+        status = self.git("status", "--porcelain", cwd=self.promote)
+        destinations = production_doc.PromoteTo((self.promote,), production_doc.NoMac())
+
+        with (mock.patch.dict(os.environ, self.env, clear=True),
+              mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check):
+            with self.assertRaisesRegex(checkpoint_gate.Stop, "no review is on record"):
+                _ = merge_checkpoint.promote_targets(
+                    destinations, "production", tip, source=self.checkout,
+                    approval=promotion.CollectedCi(self.doc), label="fixture", local_only=True)
+        check.assert_called_once_with(behavior_check.GitRange(self.promote, base, tip), timeout=None)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), base)
+        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), base)
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.promote), status)
+        self.assertEqual(self.git("show", ":src/beta.txt", cwd=self.promote), "staged edit")
+        self.assertEqual((self.promote / "src/beta.txt").read_text(), "worktree edit\n")
+        self.assertEqual((self.promote / path).read_text(), original)
+
     def test_standard_promotion_publishes_a_tip_without_a_workflow_or_ci_record(self) -> None:
         self.write(self.checkout, "README.md", "candidate\n")
         _ = self.git("commit", "-am", "candidate", cwd=self.checkout)
@@ -91,6 +124,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), main)
 
     def test_hook_failure_warns_without_stopping_either_promotion_path(self) -> None:
+        self.write(self.promote, land_main.HOOK_PATH, "#!/bin/sh\nexit 9\n")
         for advances in (False, True):
             with self.subTest(advances=advances):
                 if advances:
@@ -106,8 +140,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
 
                 output = StringIO()
                 with mock.patch.dict(os.environ, self.env, clear=True), redirect_stdout(output), mock.patch.object(
-                        land_main, "land", return_value=land_main.Landed(
-                            tip, "main", land_main.Pushed(), land_main.HookFailed(9, "retry"))):
+                        land_main, "run_hook", return_value=land_main.HookFailed(9, "retry")):
                     _ = promotion.publish(promotion.CollectedCi(self.doc), self.checkout, "production", tip, install)
                 self.assertIn("post-push: warning — post-push hook: failed (exit 9); rerun: retry", output.getvalue())
 

@@ -90,7 +90,7 @@ from scripts.lib.build_steps import (
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
-    affected_modules, change_review, land_runs, nightly_schedule, promotion, session_staff,
+    affected_modules, behavior_check, change_review, land_runs, nightly_schedule, promotion, session_staff,
     showrunners, staff, unit_config, unit_lookup, unit_names,
 )
 from scripts.production.gate_modules import GateRefused, discover_test_modules, is_test_module, test_module_name
@@ -2520,21 +2520,18 @@ def write_push_record(path: Path, record: RecordedPush) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str, *, legacy: Path | None = None) -> str:
+def checkpoint_retry_record(repo: Path, origin: str, checkpoint: str, head: str, *,
+                            legacy: Path | None = None) -> RecordedPush | NoRecordedPush:
     """Trust only this checkpoint's recorded merge, with its original parents."""
     record = read_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint))
     if isinstance(record, NoRecordedPush) and legacy is not None:
         record = read_push_record(push_record_path(legacy, "checkpoint", origin + ":" + checkpoint))
-    if isinstance(record, NoRecordedPush):
-        return origin
-    head = checked_git(repo, "rev-parse", "HEAD")
-    if head != record.commit or record.source_commit != checkpoint:
-        return origin
+    if isinstance(record, NoRecordedPush) or head != record.commit or record.source_commit != checkpoint:
+        return NoRecordedPush()
+    if checked_git(repo, "rev-parse", origin) == head:
+        return NoRecordedPush()
     parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()
-    if (parents != [record.commit, record.base, checkpoint]
-            or checked_git(repo, "rev-parse", origin) != record.base):
-        return origin
-    return record.commit
+    return record if parents == [record.commit, record.base, checkpoint] else NoRecordedPush()
 
 
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
@@ -2570,17 +2567,19 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             raise GateRefused(refusal)
 
         def install(approved: promotion.ApprovedPromotion) -> None:
-            # Save the receipt before the ref update. A retry can verify the local tip.
-            path = promotion_record_path(source, args.merge_branch, approved.sha)
-            if not create_text_atomic(path, json.dumps({"base": origin, "commit": approved.sha, "source_commit": approved.sha})):
-                existing = read_push_record(path)
-                if not isinstance(existing, RecordedPush) or existing.commit != approved.sha or existing.source_commit != approved.sha:
-                    raise GateRefused(f"promotion receipt changed: {path}")
-            try:
-                approved.install(main_repo, head)
-            except (OSError, UnicodeError) as error:
-                raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
-            landed = approved.land(source)
+            def advance() -> None:
+                # Save the receipt before the ref update. A retry can verify the local tip.
+                path = promotion_record_path(source, args.merge_branch, approved.sha)
+                if not create_text_atomic(path, json.dumps({"base": origin, "commit": approved.sha, "source_commit": approved.sha})):
+                    existing = read_push_record(path)
+                    if not isinstance(existing, RecordedPush) or existing.commit != approved.sha or existing.source_commit != approved.sha:
+                        raise GateRefused(f"promotion receipt changed: {path}")
+                try:
+                    approved.install(main_repo, head)
+                except (OSError, UnicodeError) as error:
+                    raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
+
+            landed = approved.land(source, installation=promotion.MainInstallation(main_repo, advance))
             print(land_main.hook_report(landed.hook), flush=True)
 
         try:
@@ -2734,11 +2733,11 @@ def notify_style(repo: Path, branch: str, tip: str) -> None:
 DOC_COMMIT_HEAD = "production("
 
 
-def check_local_doc_commits(repo: Path, origin: str) -> None:
-    """The merge HEAD is origin's merge branch plus only production doc commits, which go out with the merge."""
-    if git(repo, "merge-base", "--is-ancestor", origin, "HEAD").returncode:
+def check_local_doc_commits(repo: Path, origin: str, merge_base: str) -> None:
+    """Permit only production doc commits between the remote branch and the pre-merge tip."""
+    if git(repo, "merge-base", "--is-ancestor", origin, merge_base).returncode:
         raise GateRefused("merge HEAD differs from origin merge branch")
-    ahead = checked_git(repo, "log", "--format=%H %P%x09%s", f"{origin}..HEAD")
+    ahead = checked_git(repo, "log", "--format=%H %P%x09%s", f"{origin}..{merge_base}")
     for line in ahead.splitlines():
         hashes, _, subject = line.partition("\t")
         if len(hashes.split()) != 2 or not subject.startswith(DOC_COMMIT_HEAD):
@@ -2767,7 +2766,9 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     checkpoint = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.checkpoint}^{{commit}}")
     origin = f"origin/{args.merge_branch}"
     legacy = Path(args.main_repo).expanduser() if args.enrolled else None
-    check_local_doc_commits(repo, checkpoint_retry_origin(repo, origin, checkpoint, legacy=legacy))
+    retry = checkpoint_retry_record(repo, origin, checkpoint, baseline, legacy=legacy)
+    pre_merge = retry.base if isinstance(retry, RecordedPush) else baseline
+    check_local_doc_commits(repo, origin, pre_merge)
     previous = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.previous_checkpoint}^{{commit}}")
     if git(repo, "merge-base", "--is-ancestor", checkpoint, f"origin/{args.unit_branch}").returncode:
         raise GateRefused("checkpoint is not on origin unit branch")
@@ -2792,6 +2793,12 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
         raise GateRefused(f"cannot preview checkpoint merge: {failure_detail(preview)}")
     if refusal := live_file_refusal(repo, preview.stdout.splitlines()[0]):
         raise GateRefused(refusal)
+    if args.legacy_direct_main:
+        try:
+            change = behavior_check.GitRange(repo, pre_merge, checkpoint).comparison_range()
+            behavior_check.require_review(change)
+        except (behavior_check.BehaviorCheckError, OSError) as error:
+            raise GateRefused(str(error)) from error
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     recovery = ACTIVE_GATE_RECOVERY.get()
     merged = ""
