@@ -354,7 +354,7 @@ class EscalateTests(unittest.TestCase):
         delivered = self.run_script("due")
         self.assertEqual((delivered.returncode, delivered.stdout), (0, "choice: sent to the user\n"))
         self.assertIn("--text-id decision.choices", self.log())
-        self.assertIn("--question " + str(question), self.log())
+        self.assertIn("--push-reference " + json.dumps(held.reference), self.log())
         self.assertIn("--value choices=" + values["choices"], self.log())
 
     def question_file(self, status: str = "open", since: str = "opening") -> Path:

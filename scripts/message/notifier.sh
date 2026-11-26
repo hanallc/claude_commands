@@ -501,6 +501,19 @@ clear_check() {
   log_error "clear-check: ${output//$'\n'/ / }"
 }
 
+question_push_drain() {
+  local output fired
+  if [[ -n ${NOTIFIER_SEND:-} ]]; then
+    output=$("$NOTIFIER_SEND" question-push-drain 2>&1)
+  else
+    output=$("$PY" "$SEND" question-push-drain 2>&1)
+  fi
+  if (( $? != 0 )) && [[ -n $output ]]; then
+    fired=$(fired_stamp)
+    log_error "question-push-drain: ${output//$'\n'/ / }"
+  fi
+}
+
 ensure_production_backup() {
   [[ -z ${NOTIFIER_STATE_DIR:-} && $(hostname -s) == natedev ]] || return 0
   local name=production-backup command backup_script="${SCRIPT:h:h}/production/log_backup.py"
@@ -563,6 +576,13 @@ cmd_tick() {
     fi
     launch_job "send-repeat-notices-$$-$RANDOM" "${drain_command[@]}" || log_error "repeat drain launcher unavailable"
 
+  fi
+  local question_pushes=${NOTIFY_STATE_DIR:-$HOME/.local/state/notify}/question-pushes
+  if [[ -z ${NOTIFIER_STATE_DIR:-} || -n ${NOTIFY_STATE_DIR:-} ]]; then
+    local -a bindings=("$question_pushes"/*.json(N))
+    if (( ${#bindings} )); then
+      question_push_drain
+    fi
   fi
   [[ -n $EMERGENCIES && -s $EMERGENCIES ]] && clear_check
   return 0

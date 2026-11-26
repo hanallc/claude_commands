@@ -153,7 +153,7 @@ from scripts.herdr import herdr_types, message_proof as _message_proof
 from scripts.lib import process_group
 from scripts.message.address import CODEX_PREFIX, SESSION_PREFIX, SOCKET_PREFIX, STAFF_PREFIX, USER as USER, WORKER_PREFIX
 from scripts.production import session_staff, staff, unit_lookup, unit_names
-from scripts.lib import conf, models_registry, process_start
+from scripts.lib import conf, models_registry, operation_deadline, process_start
 from scripts.lib.atomic_file import write_bytes_atomic
 from scripts.lib.atomic_file import write_text_atomic as write_atomic
 from scripts.notify import decision_priority
@@ -181,6 +181,7 @@ if TYPE_CHECKING:
     from scripts.whoami.account import named_account_environment
 from scripts.notify import push_texts  # noqa: E402
 from scripts.notify import push_reference
+from scripts.notify import question_pushes
 from scripts.whoami import mac_fallback_token, token_expiry
 from scripts.message import rca  # noqa: E402
 from scripts.message import repeat_guard  # noqa: E402
@@ -461,6 +462,11 @@ class OnceRemoteDestination(TypedDict):
     recipient: str
 
 
+class QuestionSend(TypedDict):
+    source: str
+    reference: push_reference.QuestionReference
+
+
 class KeyState(TypedDict):
     # Map each recipient to its claim time. A failed send releases its claim.
     last: dict[str, str]
@@ -471,6 +477,7 @@ class KeyState(TypedDict):
     once_accepted: NotRequired[bool]
     once_remote: NotRequired[OnceRemoteDestination]
     once_delivery_interrupted: NotRequired[bool]
+    user_question: NotRequired[QuestionSend]
 
 
 KeyStates = dict[str, KeyState]
@@ -1495,7 +1502,7 @@ def remove_queued_key(to: str, key: str, *,
     return removed
 
 
-def retire(to: str, sender: str, key: str) -> int:
+def retire(to: str, sender: str, key: str, *, exact_sender: bool = False) -> int:
     """Remove obsolete messages for the selected queue owner."""
     if to == USER:
         owner, direct = USER, queue_path(USER)
@@ -1533,8 +1540,9 @@ def retire(to: str, sender: str, key: str) -> int:
                 saved = _saved_mailbox_key(entry)
                 legacy_owner = (path == direct and "stable_recipient" not in entry and "claude_recipient" not in entry
                                 and not entry["to"].startswith(("uds:", "session:", "staff:")))
-                if (saved == owner or legacy_owner) and (entry["key"] == key
-                        or entry["key"] is None and entry["from"] == sender):
+                matched = (entry["key"] == key and entry["from"] == sender if exact_sender
+                           else entry["key"] == key or entry["key"] is None and entry["from"] == sender)
+                if (saved == owner or legacy_owner) and matched:
                     removed += 1
                 else:
                     kept.append(row)
@@ -1543,10 +1551,11 @@ def retire(to: str, sender: str, key: str) -> int:
     return removed
 
 
-def cancel_user_push(sender: str, key: str) -> tuple[int, str]:
+def cancel_user_push(sender: str, key: str, *, exact_tag: bool = False) -> tuple[int, str]:
     """Stop the user's emergency push sent with key, through the same channel user() sends on."""
-    code, out, err = run([sys.executable, str(USER_CHANNEL), "cancel", "--source", sender, key], "",
-                         user_cancel_timeout())
+    code, out, err = run([sys.executable, str(USER_CHANNEL), "cancel", *(["--exact-tag-key"] if exact_tag else []),
+                         "--source", sender, key], "",
+                         operation_deadline.remaining(user_cancel_timeout()))
     if code == 0 and "pushover: nothing to cancel" in out:
         return 0, f"nothing to cancel: no emergency push for {key} is repeating"
     if code == 0:
@@ -1560,10 +1569,28 @@ def retire_user(sender: str, key: str) -> tuple[int, list[str]]:
     removed = retire(USER, sender, key)
     # The event is over: a new send with the key pushes at once.
     forget_sent(key, USER)
-    dropped = silence.drop(sender, key)
+    try:
+        dropped = silence.drop(sender, key)
+        drop_line = f"dropped {dropped} kept push{'es' if dropped != 1 else ''}"
+        failed = False
+    except silence.RemoteDropFailed as error:
+        drop_line = f"FAILED: {error}"
+        failed = True
     code, line = cancel_user_push(sender, key)
-    return code, [f"retired {removed} queued message{'s' if removed != 1 else ''}",
-                  f"dropped {dropped} kept push{'es' if dropped != 1 else ''}", line]
+    return EXIT["failed"] if failed else code, [f"retired {removed} queued message{'s' if removed != 1 else ''}", drop_line, line]
+
+
+def retire_question_copies(binding: question_pushes.Binding) -> str:
+    """Drop copies and cancel tagged repeats while the silence lock is held."""
+    removed = retire(USER, binding.source, binding.key, exact_sender=True)
+    dropped = silence.drop_locked(binding.source, binding.key, binding.reference)
+    result = f"retired {removed} queued and {dropped} kept copies for {binding.source} / {binding.key}"
+    if binding.emergency:
+        code, line = cancel_user_push(binding.source, binding.tag_key, exact_tag=True)
+        if code != 0:
+            raise OSError(f"{result}. {line}")
+    forget_sent(binding.key, USER, question=QuestionSend(source=binding.source, reference=binding.reference))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1581,6 +1608,7 @@ class Emergency(TypedDict):
     # UTC ISO times.
     sent: str
     expires: str
+    question: NotRequired[push_reference.QuestionReference]
 
 
 EMERGENCY_FIELDS = ("key", "sender", "check", "machine", "sent", "expires")
@@ -1638,6 +1666,8 @@ def check_exit(command: str, timeout: float) -> int | None:
 
 def retire_record(record: Emergency) -> tuple[int, str]:
     """Retire the push as `retire --to user` does, on the host that posted it; the exit code and the cancel line."""
+    if "question" in record:
+        return retire_recorded_question(record["sender"], record["key"], record["question"])
     if record["machine"] == machine():
         code, lines = retire_user(record["sender"], record["key"])
         return code, lines[-1]
@@ -1646,11 +1676,28 @@ def retire_record(record: Emergency) -> tuple[int, str]:
     forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"]])
     command = ["ssh", "-o", "BatchMode=yes", record["machine"], f"{REMOTE} {forwarded}"]
     code, out, err = run(command, "", user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
-    last = (out.strip().splitlines() or [""])[-1]
+    lines = out.strip().splitlines()
+    last = next((line for line in lines if line.startswith("FAILED:")), lines[-1] if lines else "")
     if code == 0:
         return 0, f"on {record['machine']}: {last}"
     why = one_line(err or last) or ("timed out" if code is None else f"exit {code}")
     return EXIT["failed"], f"on {record['machine']}: the emergency push for {record['key']} may still repeat: {why}"
+
+
+def retire_recorded_question(sender: str, key: str, reference: push_reference.QuestionReference) -> tuple[int, str]:
+    """Apply a passed clear check to its own Question binding."""
+    if not silence.on_mac():
+        try:
+            return 0, question_pushes.retire_matching(sender, key, reference)
+        except (OSError, ValueError) as error:
+            return EXIT["failed"], str(error)
+    command = shlex.join(["question-push-clear", sender, key, json.dumps(reference)])
+    code, out, err = run([*silence.SSH, f"{REMOTE} {command}"], "",
+                         user_cancel_timeout() + conf.read("send").number("remote_transport_seconds"))
+    if code == 0:
+        forget_sent(key, USER, question=QuestionSend(source=sender, reference=reference))
+        return 0, out.strip()
+    return EXIT["failed"], one_line(err or out) or "natedev did not confirm Question push retirement"
 
 
 @contextmanager
@@ -2237,7 +2284,8 @@ def _finish_clearing(state: KeyState) -> None:
 def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None, at: datetime, *,
           delivery_limit: float,
           legacy_aliases: tuple[str, ...] = (), live: bool = False, postmaster_recipient: str = "",
-          clears_when: str = "", posted_on: str = "", emergency: bool = False) -> ClaimGranted | RepeatAccepted | RepeatPending:
+          clears_when: str = "", posted_on: str = "", emergency: bool = False,
+          question: QuestionSend | None = None) -> ClaimGranted | RepeatAccepted | RepeatPending:
     """Check acceptance before recording an attempt under the stable recipient.
 
     The lock prevents overlapping sends with one key from both sending.
@@ -2266,8 +2314,9 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
             if "pending" in state:
                 _ = state["pending"].pop(alias, None)
         # An abandoned delivery must not block a window with no end.
+        new_opening = question is not None and "user_question" in state and state["user_question"] != question
         timestamps = [state["last"][alias] for alias in (recipient.value, *legacy_aliases)
-                      if alias in state["last"]
+                      if alias in state["last"] and not new_opening
                       and not (alias in pending and pending[alias]["started"] == state["last"][alias]
                                and at - datetime.fromisoformat(state["last"][alias])
                                >= timedelta(seconds=pending[alias]["limit_seconds"]))]
@@ -2302,6 +2351,8 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
         if clears_when:
             clearing = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
                                  sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
+            if question is not None:
+                clearing["question"] = question["reference"]
             if message.key.startswith("github.keys_cold:"):
                 # A warm-check command also clears an interrupted cold-key claim.
                 _record_emergency_locked(clearing)
@@ -2310,6 +2361,11 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
             else:
                 _record_emergency_locked(clearing)
         state["last"][recipient.value] = at.isoformat()
+        if message.to == USER:
+            if question is None:
+                _ = state.pop("user_question", None)
+            else:
+                state["user_question"] = question
         state.setdefault("pending", {})[recipient.value] = attempt
         states[message.key] = state
     return ClaimGranted()
@@ -2360,7 +2416,7 @@ def still_live(key: str, sender: str, sent: datetime, lifetime: timedelta) -> st
             + f" {retire_command}")
 
 
-def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
+def forget_sent(key: str, to: str, at: datetime | None = None, *, question: QuestionSend | None = None) -> None:
     """Remove this recipient's claim after a failed send.
 
     With `at`, keep the claim when a later attempt owns it.
@@ -2368,6 +2424,8 @@ def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
     with key_states() as states:
         state = states.get(key)
         if state is None or to not in state["last"] or (at is not None and state["last"][to] != at.isoformat()):
+            return
+        if question is not None and state.get("user_question") != question:
             return
         owned = pending_deliveries(state).get(to)
         if at is not None and owned is not None and not _owns_attempt(owned):
@@ -5982,7 +6040,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             message, attempt_recipient, window, started, delivery_limit=send_budget.seconds(options.timeout) if emergency else options.timeout,
             legacy_aliases=legacy_aliases, live=live, postmaster_recipient=postmaster_identity.to, clears_when=options.clears_when if emergency else cold_check,
             emergency=emergency,
-            posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
+            posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine(),
+            question=QuestionSend(source=sender, reference=options.reference) if options.reference["kind"] == "question" else None)
     log_route: Route = NO_CLAUDE_ROUTE
     review_session = ""
     review_route: review_hold.OpenReview | review_hold.AlreadyKeptForReview | review_hold.ReleasedMessages
@@ -6362,6 +6421,17 @@ def main(argv: list[str]) -> int:
         print("REFUSED: " + push_texts.TEMPLATE_REQUIRED)
         return EXIT["refused"]
     match argv:
+        case ["question-push-drain"]:
+            return question_pushes.drain()
+        case ["question-push-clear", sender, key, encoded]:
+            try:
+                reference = push_reference.read_reference(cast(object, json.loads(encoded)))
+                if reference["kind"] == "question":
+                    print(question_pushes.retire_matching(sender, key, reference))
+                    return 0
+            except (OSError, ValueError) as error:
+                print(error, file=sys.stderr)
+            return EXIT["failed"]
         case ["repeat-notices"]:
             repeat_guard.drain(Path(os.environ.get("SEND_REPEAT_STATE", str(STATE / "repeats"))), attempt_repeat_notice, now().timestamp(),
                                cleanup_seconds=2 * kill_grace())

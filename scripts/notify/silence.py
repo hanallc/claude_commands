@@ -119,10 +119,10 @@ def on_mac(system: str | None = None) -> bool:
 
 
 @contextmanager
-def locked() -> Generator[None]:
+def locked(*, nonblocking: bool = False) -> Generator[None]:
     state_dir().mkdir(parents=True, exist_ok=True)
     with (state_dir() / "silence.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
         yield
 
 
@@ -145,16 +145,22 @@ def write_state(record: SilenceRecord) -> None:
     _ = state_file().write_text(json.dumps(record), encoding="utf-8")
 
 
-def read_kept() -> list[KeptPush]:
+def read_kept(*, strict: bool = False) -> list[KeptPush]:
     try:
         lines = kept_file().read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
     except OSError:
+        if strict:
+            raise
         return []
     kept: list[KeptPush] = []
     for line in lines:
         push = parse_push(line)
         if push is not None:
             kept.append(push)
+        elif strict:
+            raise ValueError(f"invalid kept push in {kept_file()}")
     return kept
 
 
@@ -233,25 +239,29 @@ def past_end(record: SilenceRecord) -> bool:
 
 def active() -> bool:
     with locked():
-        record = read_state()
-        return record is not None and not past_end(record)
+        return active_locked()
+
+
+def active_locked() -> bool:
+    record = read_state()
+    return record is not None and not past_end(record)
 
 
 def keep_here(push: KeptPush, runner: Run | None = None, deliver: Deliver | None = None) -> Kept | NotSilent:
     _ = end_if_past(runner, deliver)
     with locked():
-        record = read_state()
-        if record is None or past_end(record):
-            return NotSilent()
-        older = read_kept() if push["key"] else []
-        newer = [old for old in older if (old["source"], old["key"]) != (push["source"], push["key"])]
-        if len(newer) != len(older):
-            temporary = kept_file().with_suffix(".tmp")
-            _ = temporary.write_text("".join(json.dumps(old) + "\n" for old in newer), encoding="utf-8")
-            _ = temporary.replace(kept_file())
-        with kept_file().open("a", encoding="utf-8") as out:
-            _ = out.write(json.dumps(push) + "\n")
-        return Kept(ends(record))
+        return keep_locked(push)
+
+
+def keep_locked(push: KeptPush) -> Kept | NotSilent:
+    """Keep the push while the caller holds the silence lock."""
+    record = read_state()
+    if record is None or past_end(record):
+        return NotSilent()
+    _ = drop_locked(push["source"], push["key"])
+    with kept_file().open("a", encoding="utf-8") as out:
+        _ = out.write(json.dumps(push) + "\n")
+    return Kept(ends(record))
 
 
 def drop_here(source: str, key: str) -> int:
@@ -259,12 +269,20 @@ def drop_here(source: str, key: str) -> int:
     if not key:
         return 0
     with locked():
-        kept = read_kept()
-        left = [push for push in kept if (push["source"], push["key"]) != (source, key)]
-        if len(left) != len(kept):
-            temporary = kept_file().with_suffix(".tmp")
-            _ = temporary.write_text("".join(json.dumps(push) + "\n" for push in left), encoding="utf-8")
-            _ = temporary.replace(kept_file())
+        return drop_locked(source, key)
+
+
+def drop_locked(source: str, key: str, reference: push_reference.QuestionReference | None = None) -> int:
+    """Drop matching kept pushes while the caller holds the silence lock."""
+    if not key:
+        return 0
+    kept = read_kept(strict=reference is not None)
+    left = [push for push in kept if (push["source"], push["key"]) != (source, key)
+            or reference is not None and push.get("reference") != reference]
+    if len(left) != len(kept):
+        temporary = kept_file().with_suffix(".tmp")
+        _ = temporary.write_text("".join(json.dumps(push) + "\n" for push in left), encoding="utf-8")
+        _ = temporary.replace(kept_file())
     return len(kept) - len(left)
 
 
@@ -273,14 +291,20 @@ def ask(argv: Sequence[str], text: str) -> tuple[int, str]:
     return done.returncode, done.stdout
 
 
+class RemoteDropFailed(OSError):
+    """The notification owner did not confirm the drop."""
+
+
 def drop(source: str, key: str, system: str | None = None, asker: Ask = ask) -> int:
     """Remove the kept pushes with this source and key; how many. On the Mac natedev removes them."""
     if not on_mac(system):
         return drop_here(source, key)
-    code, out = asker([*SSH, f"{REMOTE} {shlex.join(['drop', '--source', source, '--key', key])}"], "")
+    try:
+        code, out = asker([*SSH, f"{REMOTE} {shlex.join(['drop', '--source', source, '--key', key])}"], "")
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RemoteDropFailed(f"silence: natedev could not drop {key}: {error}") from error
     if code != 0 or not out.strip().isdigit():
-        print(f"silence: natedev could not be asked to drop {key} (exit {code})", file=sys.stderr)
-        return 0
+        raise RemoteDropFailed(f"silence: natedev did not confirm the drop for {key} (exit {code})")
     return int(out.strip())
 
 
