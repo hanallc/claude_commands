@@ -256,6 +256,12 @@ A kept Mac claim is not busy, because the next claim takes it over.
 Before this, a dead copy's kept claim held the Mac with no work until the claim watcher released it after 15 idle minutes.
 The service also freed the dead copy's placement only when the claim watcher released the claim. On 2026-11-14 this held the Mac with no hana step for 16 minutes.
 Other temporary Mac refusals delay that destination for 180 seconds.
+A missing or stale `mac-linux` reading returns `EvidenceNeeded`.
+Placement waits before it considers any later candidate.
+A reading taken before the last backoff failure is also stale.
+The queue allows 30 seconds for the reading, including time spent in the reader's queue.
+The SSH probe shares the same 30-second limit across its connection attempts.
+The usual queue pass and client poll still apply after the reading or deadline.
 A current `mac-linux` assignment of another episode makes the guest busy.
 The guest gate consumes its launch permission before the guest run starts, so its assignment stays current while the gate runs.
 A guest gate that took no run sends its claim failure after the gate process ends, and the queue closes the attempt with the guest delay.
