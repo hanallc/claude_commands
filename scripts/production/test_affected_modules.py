@@ -5,6 +5,7 @@ import ast
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -84,6 +85,9 @@ class AffectedModulesTests(unittest.TestCase):
 
     def cache_dir(self) -> Path:
         return self.repo / ".git" / "gate-state"
+
+    def cache_file(self) -> Path:
+        return self.cache_dir() / affected.FACT_CACHE_NAME
 
     def test_config_selection_uses_the_newest_full_record_and_direct_names(self) -> None:
         self.write("config/limits.conf", "value=one\n")
@@ -664,28 +668,105 @@ FILES = collect(Path(__file__).parent)
         self.write("scripts/component/test_subject.py", "VALUE = 20\n")
         _ = self.commit()
         _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
+        old_blob = self.git("rev-parse", "HEAD:scripts/component/test_subject.py")
         self.write("scripts/component/test_subject.py", "VALUE = 21\n")
         _ = self.commit()
-        with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
+        new_blob = self.git("rev-parse", "HEAD:scripts/component/test_subject.py")
+        with closing(sqlite3.connect(self.cache_file())) as database, database:
+            _ = database.executescript("""
+                CREATE TABLE writes (operation TEXT, blob TEXT);
+                CREATE TRIGGER log_insert AFTER INSERT ON facts BEGIN
+                    INSERT INTO writes VALUES ('insert', new.blob);
+                END;
+                CREATE TRIGGER log_update AFTER UPDATE ON facts BEGIN
+                    INSERT INTO writes VALUES ('update', new.blob);
+                END;
+                CREATE TRIGGER log_delete AFTER DELETE ON facts BEGIN
+                    INSERT INTO writes VALUES ('delete', old.blob);
+                END;
+                """)
+        with (mock.patch.object(ast, "parse", wraps=ast.parse) as parse,
+              mock.patch.object(affected, "fact_row", wraps=affected.fact_row) as encode):
             actual = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
         self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list],
                          ["scripts/component/test_subject.py"])
+        self.assertEqual([call.args[0] for call in encode.call_args_list], [new_blob])
+        with closing(sqlite3.connect(self.cache_file())) as database:
+            writes = cast(list[tuple[str, str]], database.execute("SELECT operation, blob FROM writes").fetchall())
+        self.assertCountEqual(writes, [("insert", new_blob), ("delete", old_blob)])
         self.assertEqual(actual, affected.dependency_graph(self.repo))
 
-    def test_invalid_cache_rebuilds_without_changing_the_graph(self) -> None:
-        expected = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-        cache = self.cache_dir() / "affected-module-facts.json"
-        for contents in ("broken json", "[]",
-                         json.dumps({"format": -1, "extractor": affected.EXTRACTOR_VERSION, "blobs": {}}),
-                         json.dumps({"format": affected.CACHE_FORMAT_VERSION, "extractor": -1, "blobs": {}}),
-                         json.dumps({"format": affected.CACHE_FORMAT_VERSION, "extractor": affected.EXTRACTOR_VERSION,
-                                     "blobs": {"bad": {"imports": None, "tokens": []}}})):
-            with self.subTest(contents=contents):
-                _ = cache.write_text(contents)
+    def test_invalid_cache_rebuilds_without_changing_selection(self) -> None:
+        self.write("scripts/subject.py", "VALUE = 1\n")
+        self.add_test("checks/test_reader.py", "from scripts import subject\n")
+        self.certify()
+        self.write("scripts/subject.py", "VALUE = 2\n")
+        _ = self.commit()
+        expected = self.selection()
+        self.assertEqual(expected.modules, (self.repo / "scripts/checks/test_reader.py",))
+        cache = self.cache_file()
+        legacy = cache.with_suffix(".json")
+        legacy.parent.mkdir(parents=True)
+        _ = legacy.write_text("legacy cache")
+        for condition in ("cold", "warm", "file damage", "old format", "old extractor", "bad digest", "bad payload"):
+            with self.subTest(condition=condition):
+                if condition == "file damage":
+                    _ = cache.write_bytes(b"broken database")
+                if condition in {"old format", "old extractor", "bad digest", "bad payload"}:
+                    with closing(sqlite3.connect(cache)) as database, database:
+                        if condition == "old format":
+                            _ = database.execute("UPDATE cache_version SET format = -1")
+                        elif condition == "old extractor":
+                            _ = database.execute("UPDATE cache_version SET extractor = -1")
+                        elif condition == "bad digest":
+                            _ = database.execute("UPDATE facts SET digest = X'00'")
+                        else:
+                            payload = b'{"imports": null, "tokens": []}'
+                            blob = self.git("rev-parse", "HEAD:scripts/subject.py")
+                            _ = database.execute("UPDATE facts SET payload = ?, digest = ? WHERE blob = ?",
+                                                 (payload, affected.fact_digest(blob, payload), blob))
                 with mock.patch.object(ast, "parse", wraps=ast.parse) as parse:
-                    actual = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-                self.assertGreater(parse.call_count, 0)
+                    actual = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+                self.assertEqual(parse.call_count, 0 if condition == "warm" else 3)
                 self.assertEqual(actual, expected)
+                self.assertIsNotNone(affected.read_fact_cache(cache))
+                self.assertEqual(legacy.read_text(), "legacy cache")
+
+    def test_busy_cache_reads_published_facts_without_writing(self) -> None:
+        subject = "scripts/subject.py"
+        self.write(subject, "VALUE = 1\n")
+        self.add_test("checks/test_reader.py", "from scripts import subject\n")
+        self.certify()
+        _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
+        self.write(subject, "VALUE = 2\n")
+        _ = self.commit()
+        expected = self.selection()
+        before = self.cache_file().read_bytes()
+        graph_for_files = affected.graph_for_files
+
+        def interleave(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
+                       cached: dict[str, affected.SourceFacts], *, worktree: bool) -> affected.SourceGraph:
+            with (mock.patch.object(affected, "graph_for_files", graph_for_files),
+                  mock.patch.object(ast, "parse", wraps=ast.parse) as parse,
+                  mock.patch.object(affected, "write_fact_cache", wraps=affected.write_fact_cache) as write,
+                  mock.patch.object(fcntl, "flock", wraps=fcntl.flock) as lock):
+                reader = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+            self.assertEqual(reader, expected)
+            self.assertEqual([call.kwargs["filename"] for call in parse.call_args_list], [subject])
+            attempts = [call for call in lock.call_args_list if call.args[1] == fcntl.LOCK_EX | fcntl.LOCK_NB]
+            self.assertEqual(len(attempts), 1)
+            write.assert_not_called()
+            self.assertEqual(self.cache_file().read_bytes(), before)
+            return graph_for_files(repo, paths, blobs, dirty, cached, worktree=worktree)
+
+        with mock.patch.object(affected, "graph_for_files", side_effect=interleave) as graph:
+            writer = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
+        graph.assert_called_once()
+        self.assertEqual(writer, expected)
+        facts = affected.read_fact_cache(self.cache_file())
+        self.assertIsNotNone(facts)
+        assert facts is not None
+        self.assertIn(self.git("rev-parse", f"HEAD:{subject}"), facts)
 
     def test_deleted_blob_is_pruned_and_new_targets_resolve_cached_facts(self) -> None:
         self.write("scripts/component/test_caller.py", "import test_future_subject\n")
@@ -705,7 +786,10 @@ FILES = collect(Path(__file__).parent)
         with mock.patch.object(ast, "parse", side_effect=AssertionError("unchanged source parsed")):
             graph, _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
         self.assertEqual(graph["scripts/component/test_caller.py"], set())
-        self.assertNotIn(blob, affected.read_fact_cache(self.cache_dir() / "affected-module-facts.json"))
+        facts = affected.read_fact_cache(self.cache_file())
+        self.assertIsNotNone(facts)
+        assert facts is not None
+        self.assertNotIn(blob, facts)
 
     def test_shared_blob_resolves_relative_imports_from_each_current_path(self) -> None:
         for component in ("first", "second"):
@@ -1100,12 +1184,13 @@ FILES = collect(Path(__file__).parent)
         expected = self.selection()
         self.assertEqual(expected.modules, (self.repo / "scripts/checks/test_reader.py",))
         _ = affected.dependency_graph(self.repo, state_dir=self.cache_dir())
-        cache_path = self.cache_dir() / "affected-module-facts.json"
+        cache_path = self.cache_file()
         cache = affected.read_fact_cache(cache_path)
+        assert cache is not None
         blob = self.git("rev-parse", "HEAD:scripts/checks/test_reader.py")
         facts = cache[blob]
         cache[blob] = replace(facts, scan_scopes=(*facts.scan_scopes, affected.ScanScope("", (), (), (), ())))
-        affected.write_fact_cache(cache_path, cache)
+        affected.write_fact_cache(cache_path, cache, None, set(cache))
         with mock.patch.object(ast, "parse", side_effect=AssertionError("warm cache parsed source")):
             result = affected.select_affected(self.repo, self.base, self.modules, set(), state_dir=self.cache_dir())
         self.assertEqual(result, expected)
@@ -1173,6 +1258,7 @@ FILES = collect(Path(__file__).parent)
         expected = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo),
                                             state_dir=self.cache_dir())
         self.assertIsInstance(expected, affected.AffectedSelection)
+        published = self.cache_file().read_bytes()
         self.write("scripts/checks/test_dirty.py", "VALUE = 2\n")
         with mock.patch.object(affected, "write_fact_cache", wraps=affected.write_fact_cache) as write:
             result = affected.select_affected(self.repo, self.base, self.modules, affected.dirty_paths(self.repo),
@@ -1181,6 +1267,7 @@ FILES = collect(Path(__file__).parent)
         assert isinstance(result, affected.AffectedSelection)
         self.assertEqual([path.name for path in result.modules], ["test_dirty.py"])
         write.assert_not_called()
+        self.assertEqual(self.cache_file().read_bytes(), published)
 
     def test_invalid_non_test_python_sources_still_select_their_importers(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
