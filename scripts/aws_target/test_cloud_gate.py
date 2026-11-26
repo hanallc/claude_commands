@@ -853,8 +853,8 @@ class CloudGateTests(CloudGateHangGuard, CostFixture):
     def setUp(self) -> None:
         super().setUp()
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root / "buildlog")})))
-        override_fixture_settings(self.root / "gate.conf", "GATE_TIME_LIMIT_FACTOR=2")
-        override_fixture_settings(self.root / "test_times.conf", "TOP_RUNS=3\nGATE_FAILURE_LOG_KIB=4")
+        override_fixture_settings(self.root / "gate.conf", "gate_time_limit_factor=2")
+        override_fixture_settings(self.root / "test_times.conf", "top_runs=3\ngate_failure_log_kib=4")
         # The fixture keeps two sizes, so the shipped type list can change without these cases.
         override_fixture_settings(self.root / 'cloud_gate.conf',
             '# one of: on, off\nenabled=on\n'
@@ -4379,6 +4379,7 @@ class CloudRouteTests(CloudGateHangGuard, CostFixture):
                           redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors):
                         for patch in (mock.patch.object(gate, 'BuildHoldWait'),
                                       mock.patch.object(gate, 'fetch_branches'),
+                                      mock.patch.object(gate, 'gate_production', return_value=repo),
                                       mock.patch.object(gate, 'change_review_list', return_value=(repo, None)),
                                       mock.patch.object(change_review, 'missing', return_value=[]),
                                       mock.patch.object(change_review, 'unit_producer', return_value=None),

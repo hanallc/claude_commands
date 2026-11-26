@@ -211,7 +211,7 @@ class ProgramMemoryFeed:
         views: list[tuple[int, ProgramMemoryView]] = []
         for index, _, reservation, admitted in sorted(trace_rows, key=lambda entry: entry[1]):
             live = self._read_live(reservation.get("reservation_id", ""))
-            if (live is None or live.header.compile_reserve_bytes != reservation["need"]
+            if (live is None or live.header.general is not None or live.header.compile_reserve_bytes != reservation["need"]
                     or not int(admitted * 1000) <= live.header.scope_started_at_ms <= now_ms):
                 continue
             shapes.add(live.header.shape_key)

@@ -13,6 +13,7 @@ import json
 import os
 import re
 from pathlib import Path
+from select import select
 import shlex
 import shutil
 import signal
@@ -32,6 +33,7 @@ from uuid import uuid4
 
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
+from scripts.lib.git_test_support import write_fixture_git_config
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog.store import host_name
 from scripts.agents import remote
@@ -43,6 +45,8 @@ from scripts.lint import folder_audit, sweep, tmp_sweep
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.mac_test import mac_test
 from scripts.production import staff
+from scripts.production.production_names import CARGO_LINER_PRODUCTION
+from scripts.production.test_production_doc import enrolled_document
 from scripts.worktree import worktree_links, worktree_records, worktrees
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
@@ -251,8 +255,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.trees.mkdir()
         self.state = self.root / "worktrees-state"
         config = self.root / "staff.conf"
-        _ = config.write_text("# range: 0.001..\nOPERATION_LOCK_SECONDS=5\n"
-                              + "# range: 0.001..\nREMOTE_SECONDS=5\n")
+        _ = config.write_text("# range: 0.001..\noperation_lock_seconds=5\n"
+                              + "# range: 0.001..\nremote_seconds=5\n")
         staff_file = self.root / "staff.json"
         self.environment = {
             **config_environment(self.root / "settings"),
@@ -264,7 +268,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             "CODEX_HOME": str(self.root / "codex"),
             **interpreter_cache_environment(self.root / "cache"), "PYTHONPATH": str(CHECKOUT / "scripts/lib/python_startup"),
             "HERDR_BIN": MISSING_HERDR_BIN,
-            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(write_fixture_git_config(self.root)),
             "GIT_TERMINAL_PROMPT": "0", "GIT_ALLOW_PROTOCOL": "file",
             "GIT_AUTHOR_NAME": "Worktree fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
             "GIT_COMMITTER_NAME": "Worktree fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
@@ -274,7 +278,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = (self.repository / "code.txt").write_text("base\n")
         document = self.repository / "docs/production.md"
         document.parent.mkdir()
-        _ = document.write_text("# Fixture production\n")
+        _ = document.write_text("# Fixture production\n- **Merge branch:** integration\n")
         _ = (self.repository / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
         _ = self.git(self.repository, "add", ".")
         _ = self.git(self.repository, "commit", "-m", "Create the fixture")
@@ -312,6 +316,20 @@ class WorktreeLifecycleTests(unittest.TestCase):
     def register_process(self, pid: int) -> None:
         (self.proc / str(pid)).symlink_to(Path("/proc") / str(pid), target_is_directory=True)
 
+    @contextmanager
+    def process_in(self, cwd: Path) -> Generator[int]:
+        source = "import sys; print('ready', flush=True); sys.stdin.read()"
+        with subprocess.Popen([sys.executable, "-c", source], cwd=cwd, env=self.environment,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+            assert child.stdout is not None
+            self.assertTrue(select([child.stdout], [], [], 20)[0], "The fixture process did not start")
+            self.assertEqual(cast(str, child.stdout.readline()), "ready\n")
+            self.register_process(child.pid)
+            try:
+                yield child.pid
+            finally:
+                (self.proc / str(child.pid)).unlink()
+
     def finish_landed(self, *, reviewed: tuple[Path, ...] = ()) -> list[EndResult]:
         python = self.home / ".claude/scripts/lib/py"
         result = self.command(self.repository, [str(python), "-c", END_LANDED,
@@ -327,6 +345,79 @@ class WorktreeLifecycleTests(unittest.TestCase):
         python = self.home / ".claude/scripts/lib/py"
         return self.command(self.repository, [str(python), str(WORKTREES), "cleanup", str(tree)])
 
+    def test_cleanup_and_end_landed_keep_an_enrolled_integration_and_its_refs(self) -> None:
+        _ = self.git(self.repository, "switch", "main")
+        doc = self.repository / "docs/fixture-production-live.md"
+        enrolled_document(doc, self.repository, self.merge_tree, "integration")
+        staff_file = Path(self.environment["STAFF_FILE"])
+        fields = cast(dict[str, object], json.loads(staff_file.read_text()))
+        runner = cast(list[dict[str, object]], fields["rows"])[0]
+        cast(dict[str, object], runner["doc"])["path"] = str(doc)
+        _ = staff_file.write_text(json.dumps(fields))
+        _ = self.commit(self.merge_tree, "landed.txt", "landed\n")
+        self.publish(self.merge_tree, "integration")
+        record = self.record_path(self.merge_tree)
+        record.parent.mkdir(parents=True)
+        _ = record.write_text(json.dumps({
+            "version": 1, "path": str(self.merge_tree), "repo": str(self.repository),
+            "branch": "integration", "base": self.base, "merge_branch": "integration",
+            "owner": "fixture-production", "made_at": datetime.now(UTC).isoformat(),
+        }))
+        refs = self.git(self.repository, "for-each-ref", "--format=%(refname) %(objectname)")
+        remote = self.git(self.origin, "for-each-ref", "--format=%(refname) %(objectname)")
+        cleanup = self.cleanup_result(self.merge_tree)
+        self.assertEqual(cleanup.returncode, 1)
+        self.assertIn("protected production", cleanup.stdout)
+        kept, = self.finish_landed()
+        self.assertEqual(kept["kind"], "Kept")
+        self.assertIn("protected production", kept["detail"])
+        self.assertTrue(record.is_file())
+        self.assertEqual((self.merge_tree / "landed.txt").read_text(), "landed\n")
+        self.assertEqual(self.git(self.repository, "for-each-ref", "--format=%(refname) %(objectname)"), refs)
+        self.assertEqual(self.git(self.origin, "for-each-ref", "--format=%(refname) %(objectname)"), remote)
+
+    def test_cargo_liner_record_update_reverses_only_the_original_main_targets(self) -> None:
+        state = self.state / "made"
+        state.mkdir(parents=True)
+        other_repo = self.root / "other"
+        _ = self.git(self.root, "init", "--initial-branch=main", str(other_repo))
+        staff_file = Path(self.environment["STAFF_FILE"])
+        fields = cast(dict[str, object], json.loads(staff_file.read_text()))
+        runner = cast(list[dict[str, object]], fields["rows"])[0]
+        runner["name"] = CARGO_LINER_PRODUCTION
+        document = Path(cast(str, cast(dict[str, object], runner["doc"])["path"]))
+        _ = document.write_text(f"- **Repository:** {self.repository}\n")
+        _ = staff_file.write_text(json.dumps(fields))
+        target_branch = f"{CARGO_LINER_PRODUCTION}-merges-integration"
+        for name, repository, target in (("cargo", self.repository, "main"),
+                                         ("integration", self.repository, target_branch),
+                                         ("other", other_repo, "main")):
+            path = self.trees / name
+            _ = self.record_path(path).write_text(json.dumps({
+                "version": 1, "path": str(path), "repo": str(repository),
+                "branch": name, "base": self.base, "merge_branch": target,
+                "owner": name, "made_at": datetime.now(UTC).isoformat(),
+            }))
+        receipt = self.root / "retarget.json"
+        python = self.home / ".claude/scripts/lib/py"
+        arguments = [str(python), str(WORKTREES), "cargo-liner-target"]
+        for repository, switches, target, count in (
+                (other_repo, [], "main", 0),
+                (self.repository, [], target_branch, 1), (self.repository, [], target_branch, 0),
+                (self.repository, ["--reverse"], "main", 1), (self.repository, ["--reverse"], "main", 0)):
+            with self.subTest(repository=repository, reverse=bool(switches), count=count):
+                result = self.command(self.repository, arguments + [str(repository), target_branch, str(receipt)] + switches)
+                if repository == other_repo:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("expected the cargo-liner production repository", result.stderr)
+                    self.assertFalse(receipt.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"updated {count}", result.stdout)
+                for name, expected in (("cargo", target), ("integration", target_branch), ("other", "main")):
+                    record = self.record(self.trees / name)
+                    self.assertEqual(record["merge_branch"], expected)
+
     def make(self, tree: Path, branch: str) -> None:
         result = self.legacy_fixture(tree, branch)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -339,10 +430,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
         build = self.root / "build"
         scratch_root = self.root / "scratch"
         session_root = self.root / "session-root"
+        host_key = conf.local_host_key_name()
         _ = write_config_fixture(config / "build_folders.conf",
-            f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{host_name()}={build}\n"
-            + f"roots.scratch={scratch_root}\nroots.scratch.{host_name()}={scratch_root}\n"
-            + f"roots.session={session_root}\nroots.session.{host_name()}={session_root}\n"
+            f"roots.workspace={self.trees}\nroots.build={build}\nroots.build.{host_key}={build}\n"
+            + f"roots.scratch={scratch_root}\nroots.scratch.{host_key}={scratch_root}\n"
+            + f"roots.session={session_root}\nroots.session.{host_key}={session_root}\n"
             + f"folders.check={mode}\n# range: 0..1\nlocks.probe_wait_seconds=0.01\n"
             + "# range: 0.001..1\nlocks.probe_retry_seconds=0.005\n")
         copies = config / "copies.conf"
@@ -728,10 +820,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
                         with self.assertRaisesRegex(worktree_records.Refused, f"{re.escape(str(lock))} held"):
                             _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
 
-                with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
-                                      cwd=nested, stdin=subprocess.PIPE, env=self.environment) as child:
-                    self.register_process(child.pid)
-                    with self.assertRaisesRegex(worktree_records.Refused, f"pids {child.pid}"):
+                with self.process_in(nested) as pid:
+                    with self.assertRaisesRegex(worktree_records.Refused, f"pids {pid}"):
                         _ = worktrees.move_worktree(old, "origin", "fixture-unit", "demo")
                 copy_source.assert_not_called()
                 self.assertTrue(old.is_dir() and not old.is_symlink())
@@ -1763,10 +1853,8 @@ class WorktreeLifecycleTests(unittest.TestCase):
         _ = list_file.write_text(f"{busy} fixture-unit busy\n{idle} fixture-unit idle\n")
         command = self.migration_command("--all", "--list", list_file)
 
-        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
-                              cwd=nested, stdin=subprocess.PIPE, env=self.environment) as child:
-            self.register_process(child.pid)
-            reason = f"keep {busy}: in use (pids {child.pid})"
+        with self.process_in(nested) as pid:
+            reason = f"keep {busy}: in use (pids {pid})"
             dry = self.command(self.root, [*command, "--dry-run"])
             self.assertEqual(dry.returncode, 0, dry.stderr)
             self.assertIn(reason, dry.stdout)
@@ -2029,10 +2117,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
             def open_then_start_process(move: worktrees.WorktreeMove, *,
                                         clone_members: tuple[Path, ...] = ()) -> worktrees.MoveJournal:
                 journal = open_move(move, clone_members=clone_members)
-                child = children.enter_context(subprocess.Popen(
-                    [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"], cwd=old, stdin=subprocess.PIPE))
-                self.register_process(child.pid)
-                pids.append(child.pid)
+                pids.append(children.enter_context(self.process_in(old)))
                 return journal
 
             with patch.object(worktrees, "_open_move", open_then_start_process), redirect_stdout(first := StringIO()):
@@ -2109,6 +2194,11 @@ class WorktreeLifecycleTests(unittest.TestCase):
             _ = (parent / "status").write_text(f"State:\tS\nUid:\t{os.geteuid()}\t{os.geteuid()}\nThreads:\t1\n")
             _ = (parent / "stat").write_text(f"{pid} (fixture) S {ppid}\n")
             _ = (parent / "cmdline").write_bytes(argv)
+            (parent / "cwd").symlink_to(self.root)
+            (parent / "root").symlink_to("/")
+            (parent / "exe").symlink_to(sys.executable)
+            (parent / "fd").mkdir()
+            _ = (parent / "maps").write_text("")
         responses: dict[str, dict[str, object]] = {}
         for pid, (name, old) in enumerate(trees.items(), 200):
             pane = f"w1:p{pid}"
@@ -2188,9 +2278,22 @@ class WorktreeLifecycleTests(unittest.TestCase):
             self.assertIn(f"keep {trees['reused-pid']}: in use (pids {reused})", report.getvalue())
             return
 
+        command = self.migration_command("--list", list_file)
+        if "missing-fd" in cases:
+            pid = 200 + cases.index("missing-fd")
+            for flags in (["--dry-run"], []):
+                result = self.command(self.root, [*command, *flags])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for old in trees.values():
+                    self.assertIn(f"keep {old}: in use: unreadable process {pid}", result.stdout)
+                    self.assertFalse(old.is_symlink())
+            descriptors = self.proc / str(pid) / "fd"
+            descriptors.mkdir()
+            (descriptors / "7").symlink_to(trees["missing-fd"] / "code.txt")
+
         new = self.trees / "origin/fixture-unit/stopped"
         for flags in (["--dry-run"], []):
-            result = self.command(self.root, self.migration_command("--list", list_file, *flags))
+            result = self.command(self.root, [*command, *flags])
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"move {trees['stopped']} -> {new}", result.stdout)
             for pid, name in enumerate(cases[1:], 201):
@@ -2527,7 +2630,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 root = Path(folder)
                 build = root / "build"
                 _ = write_config_fixture(config, f"roots.workspace={root}/trees\nroots.build={build}\n"
-                                         + f"roots.build.{host_name()}={build}\n")
+                                         + f"roots.build.{conf.local_host_key_name()}={build}\n")
                 scratch_root = build / "claude/scratch"
                 scratch_root.mkdir(parents=True)
                 damaged = scratch_root / "damaged"
@@ -2628,7 +2731,7 @@ class WorktreeLifecycleTests(unittest.TestCase):
                 root = Path(folder)
                 build = root / "build"
                 _ = write_config_fixture(config, f"roots.workspace={root}/trees\nroots.build={build}\n"
-                                         + f"roots.build.{host_name()}={build}\n")
+                                         + f"roots.build.{conf.local_host_key_name()}={build}\n")
                 scratch_root = build / "claude/scratch"
                 scratch_root.mkdir(parents=True)
                 clone = scratch_root / "clone"
@@ -3190,6 +3293,93 @@ class WorktreeLifecycleTests(unittest.TestCase):
         for path in (tree, output):
             self.assertIn(f"kept for a manual removal list: {path}", gone.stderr)
 
+    def test_remove_uses_the_repository_of_the_worktree_path(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "probe")
+        other = self.other_main()
+        result = self.command(other, [sys.executable, str(WORKTREES), "remove", str(tree)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"kept for a manual removal list: {tree} (worktrees, the checkout is selected for removal)",
+                      result.stderr)
+        self.assertTrue(tree.is_dir())
+
+    def test_remove_refuses_a_worktree_from_a_different_named_repository(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "probe")
+        _ = self.other_main()
+        result = self.command(self.home / "rust/origin",
+                              [sys.executable, str(WORKTREES), "remove", str(tree), "--repo", "other"])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr.splitlines(), [f"{tree}: worktree belongs to another repository"])
+        self.assertTrue(tree.is_dir())
+
+    def test_remove_refuses_a_missing_checkout_recorded_for_another_repository(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "probe")
+        output = (tree / "target").readlink()
+        _ = self.other_main()
+        record = self.record_path(tree)
+        saved = record.read_bytes()
+        _ = self.git(self.home / "rust/origin", "worktree", "remove", "--force", str(tree))
+
+        command = [sys.executable, str(WORKTREES), "remove", str(tree), "--repo"]
+        refused = self.command(self.root, [*command, "other"])
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stderr.splitlines(), [f"{tree}: worktree belongs to another repository"])
+        self.assertEqual(record.read_bytes(), saved)
+
+        reported = self.command(self.root, [*command, "origin"])
+        self.assertEqual(reported.returncode, 0, reported.stdout + reported.stderr)
+        self.assertIn(f"kept for a manual removal list: {output}", reported.stderr)
+        self.assertFalse(record.exists())
+
+    def test_remove_checks_git_registration_for_a_missing_checkout_without_a_record(self) -> None:
+        self.layout_fixture()
+        main = self.migration_main()
+        tree = self.add_linked_tree(main, self.trees / "registered", "registered")
+        _ = tree.rename(self.trees / "renamed")
+        command = [sys.executable, str(WORKTREES), "remove", "--repo", "origin"]
+
+        reported = self.command(self.root, [*command, str(tree)])
+        self.assertEqual(reported.returncode, 0, reported.stdout + reported.stderr)
+        self.assertIn(f"kept for a manual removal list: {tree}", reported.stderr)
+
+        missing = self.trees / "unregistered"
+        refused = self.command(self.root, [*command, str(missing)])
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stderr.splitlines(), [f"{missing}: worktree is not registered in {main}"])
+
+    def test_remove_keeps_the_record_of_a_missing_detached_worktree(self) -> None:
+        self.layout_fixture()
+        tree = self.make_layout("demo", "probe")
+        record = self.record_path(tree)
+        saved = record.read_bytes()
+        _ = self.git(tree, "switch", "--detach")
+        _ = tree.rename(tree.with_name("unavailable"))
+
+        result = self.command(self.root, [sys.executable, str(WORKTREES), "remove", "--repo", "origin", str(tree)])
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"kept for a manual removal list: {tree}", result.stderr)
+        self.assertEqual(record.read_bytes(), saved)
+
+    def test_remove_refuses_an_absorbed_submodule_main_checkout(self) -> None:
+        submodule = self.repository / "modules/sample"
+        _ = self.git(self.repository, "submodule", "add", str(self.origin), str(submodule))
+        self.assertTrue((submodule / ".git").is_file())
+        result = self.command(self.root, [sys.executable, str(WORKTREES), "remove", str(submodule)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr.splitlines(), [f"{submodule}: cannot remove the main checkout"])
+
+    def test_remove_requests_the_checkout_root_for_other_paths(self) -> None:
+        for path in (self.repository / "missing", self.trees, self.merge_tree / "docs"):
+            with self.subTest(path=path):
+                result = self.command(self.repository, [sys.executable, str(WORKTREES), "remove", str(path)])
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), [
+                    f"{path}: not a Git checkout root. Give the checkout root, or use --repo WORD.",
+                ])
+
     def test_a_try_folder_is_a_named_worktree_and_removal_keeps_unsaved_work(self) -> None:
         self.layout_fixture()
         tree = self.make_layout("demo", "try-C12")
@@ -3208,9 +3398,13 @@ class WorktreeLifecycleTests(unittest.TestCase):
         code = "from scripts.worktree.worktrees import remove_named; print(*remove_named('other', 'try-C12'))"
         kept = self.command(self.repository, [str(python), "-c", code])
         self.assertEqual(kept.returncode, 0, kept.stderr)
-        self.assertTrue(kept.stdout.startswith(f"{other} kept: dirty worktree: ?? notes.txt. Save the work, then run: "))
-        self.assertTrue(kept.stdout.endswith(f"worktrees.py remove {other}\n"))
+        command = shlex.join([str(python), str(self.home / ".claude/scripts/worktree/worktrees.py"), "remove", str(other)])
+        self.assertEqual(kept.stdout, f"{other} kept: dirty worktree: ?? notes.txt. Save the work, then run: {command}\n")
         self.assertNotIn("kept for a manual removal list", kept.stderr)
+        printed = shlex.split(kept.stdout.split("then run: ", 1)[1])
+        reported = self.command(self.root, printed)
+        self.assertEqual(reported.returncode, 0, reported.stdout + reported.stderr)
+        self.assertIn(f"kept for a manual removal list: {other}", reported.stderr)
 
     def test_make_carries_direnv_permission_only_for_the_allowed_source_file(self) -> None:
         self.layout_fixture()
@@ -3423,19 +3617,19 @@ raise SystemExit(2)
         self.assertTrue(tree.is_dir())
         self.assertTrue(artifact.is_file())
 
-    def test_remove_reports_output_before_listing_a_missing_checkout(self) -> None:
+    def test_remove_lists_a_missing_checkout_before_reporting_output(self) -> None:
         self.layout_fixture()
         tree = self.make_layout("demo", "probe")
         output = (tree / "target").readlink()
         _ = tree.rename(tree.with_name("unavailable"))
         notices = StringIO()
         with (patch.dict(os.environ, self.environment, clear=True),
-              patch.object(worktrees, "worktree_branches", side_effect=worktree_records.Refused(1, "Git listing failed")),
+              patch.object(worktrees, "linked_trees", side_effect=worktree_records.Refused(1, "Git listing failed")),
               redirect_stderr(notices),
               self.assertRaisesRegex(worktree_records.Refused, "Git listing failed")):
             worktrees.remove_git_checkout(tree, self.home / "rust/origin")
-        self.assertEqual(notices.getvalue(),
-                         f"kept for a manual removal list: {output} (worktrees, the checkout is selected for removal)\n")
+        self.assertEqual(notices.getvalue(), "")
+        self.assertTrue(output.is_dir())
 
     def test_retire_lists_the_unit_folders_from_each_repo(self) -> None:
         self.layout_fixture()
@@ -3718,7 +3912,8 @@ raise SystemExit(2)
                     self.assertEqual(lease["purpose"], tree.name)
 
     def test_merged_checkpoint_and_plan_shrink_end_all_recorded_items(self) -> None:
-        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config"):
+        for branch in ("checkpoint", "ancestor-with-earlier-target-date", "without-branch-config",
+                       "protected-origin", "protected-origin-ahead", "protected-origin-unknown-commit"):
             with self.subTest(branch=branch):
                 if branch != "checkpoint":
                     self.setUp()
@@ -3744,9 +3939,29 @@ raise SystemExit(2)
 
                 if branch == "without-branch-config":
                     _ = self.git(self.repository, "config", "--local", "--remove-section", f"branch.{branch}")
-                cleanup = self.cleanup_result(tree)
-                self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
-                self.assertEqual(cleanup.stdout.splitlines(), ["cleanup: all work is on the target branch"])
+                protected = branch.startswith("protected-origin")
+                if branch in ("protected-origin-ahead", "protected-origin-unknown-commit"):
+                    writer = self.root / "writer"
+                    _ = self.git(self.root, "clone", "--branch", branch, str(self.origin), str(writer))
+                    advance = self.commit(writer, "remote-only.txt", "Only on origin.\n")
+                    self.publish(writer, branch)
+                    if branch == "protected-origin-ahead":
+                        _ = self.git(self.repository, "fetch", "origin", branch)
+                    else:
+                        missing = self.command(self.repository, ["git", "cat-file", "-e", f"{advance}^{{commit}}"])
+                        self.assertNotEqual(missing.returncode, 0)
+                before = self.git(self.origin, "rev-parse", f"refs/heads/{branch}")
+                if protected:
+                    document = self.root / "other-production.md"
+                    _ = document.write_text(f"- **Merge branch:** {branch}\n")
+                    with patch.dict(os.environ, self.environment, clear=True):
+                        identity = staff.StaffId(str(uuid4()))
+                        _ = staff.ensure("showrunner", name="other", runtime_id=identity,
+                                         doc=staff.LiveDoc(socket.gethostname().split(".", 1)[0], document))
+                if branch != "protected-origin-unknown-commit":
+                    cleanup = self.cleanup_result(tree)
+                    self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
+                    self.assertEqual(cleanup.stdout.splitlines(), ["cleanup: all work is on the target branch"])
                 results = self.finish_landed()
 
                 self.assertEqual(results, [{"kind": "Kept", "path": str(tree), "detail": "the checkout landed and requires manual review"}])
@@ -3756,6 +3971,7 @@ raise SystemExit(2)
                     self.assertEqual((self.merge_tree / "code.txt").read_text(), "later target work\n")
                 self.assertTrue(tree.is_dir())
                 self.assertTrue(self.record_path(tree).is_file())
+                self.assertEqual(self.git(self.origin, "rev-parse", f"refs/heads/{branch}"), before)
 
     def test_cherry_picked_content_ends_under_a_different_commit_hash(self) -> None:
         tree, branch = self.trees / "cherry", "cherry"

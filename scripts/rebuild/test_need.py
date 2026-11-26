@@ -77,6 +77,14 @@ class NeedTests(unittest.TestCase):
             need.add_need("natedev", "a" * 40, "", "staff-a")
         self.assertFalse(self.folder.exists())
 
+    def test_add_refuses_a_blank_reason_for_an_existing_need(self) -> None:
+        commit = "a" * 40
+        need.add_need("natedev", commit, "Apply the settings.", "staff-a")
+        before = self.record("natedev", commit)
+        with self.assertRaisesRegex(ValueError, "Give --reason"):
+            need.add_need("natedev", commit, " \t", "staff-b")
+        self.assertEqual(self.record("natedev", commit), before)
+
     def test_add_refuses_short_and_malformed_commits(self) -> None:
         for commit in ("a" * 7, "g" * 40, "a" * 64):
             with self.subTest(commit=commit), self.assertRaisesRegex(ValueError, "full 40-character Git hash"):

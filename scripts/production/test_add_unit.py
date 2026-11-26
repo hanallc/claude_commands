@@ -281,6 +281,9 @@ class NativeClaudeUnitTests(StaffTestCase):
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
     def test_plan_unit_type_controls_admission_and_repeated_launch(self) -> None:
+        with patch.dict(os.environ, self.env):
+            production = read_production(self.production_name)
+            self.assertIsNone(staff.serving_merge_unit(production.owner.id))
         _ = self.successful("alpha", "--unit-type", "style", "--plan", "docs/plans/given.md")
         self.assertEqual(self.opening_prompt(), "/unit:style docs/plans/given.md")
         with patch.dict(os.environ, self.env):
