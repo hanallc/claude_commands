@@ -7811,6 +7811,103 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(saved["delivery"], f"already delivered: {record['run_id']}")
         self.assertEqual(saved["push_retries"], 1)
 
+    def test_supervisor_retries_a_failed_parked_worker_restore(self) -> None:
+        row = self.fixture.worker(family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        dispatch, _ = self.begin_pane_pass(row)
+        stage = progress_history.dispatch_delivery(worker_panes.worker_pass(row, self.run_dir))
+        test_worker.DispatchAgent(self.fixture).append(pane, "user", stage.line)
+        launch = progress_history.ParkedWorkerLaunch(row.current_session, "codex", "fixture-model", "", "", "", "")
+        self.assertTrue(progress_history.record_worker_park(self.run_dir, row.id, dispatch, stage.completion_id,
+                                                            launch=launch))
+        self.fixture.world.remove_pane(pane)
+        record = self.record(row)
+        record["pane_dispatch_id"] = dispatch
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        attempts = 0
+
+        def restore(member: staff.StaffRow, parent: staff.StaffId, hold: worker_panes.WorkerLockHold) -> bool:
+            nonlocal attempts
+            self.assertEqual(member.id, row.id)
+            self.assertEqual(parent, self.fixture.parent.id)
+            self.assertTrue(hold.owns(member))
+            attempts += 1
+            if attempts == 1:
+                return False
+            self.assertEqual(attempts, 2)
+            self.fixture.world.add(row, pane, family="codex")
+            return True
+
+        def before_retry(_seconds: float) -> None:
+            self.assertEqual(attempts, 1)
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertIs(saved.get("completion_pending"), True)
+            self.assertNotIn("push_retries", saved)
+            self.assertEqual(self.inputs, [])
+
+        with (patch.object(worker, "restore_parked_worker", new=restore),
+              patch.object(detached_runs, "_run", return_value=0),
+              patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
+              patch.object(time, "sleep", side_effect=before_retry) as delay):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(attempts, 2)
+        delay.assert_called_once_with(5)
+        self.assertEqual(len(self.inputs), 1)
+        self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
+        saved = worker_lifecycle.read_json_object(path)
+        self.assertEqual(saved["delivery"], f"sent: worker {row.name} at {pane}")
+        self.assertNotIn("push_alert_attempted", saved)
+        self.assertFalse(progress_history.parked_worker_pass(worker_panes.worker_pass(row, self.run_dir)))
+
+    def test_supervisor_counts_a_stalled_prompt_with_no_receipt(self) -> None:
+        _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf",
+                                 "result_push_retries=1\nresult_push_retry_seconds=5\n")
+        row = self.fixture.worker(family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        record = self.record(row)
+        record["pane_dispatch_id"] = ""
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        self.defer_transcript = True
+        server = self.fixture.world.run
+        checks = 0
+
+        def stall(*arguments: str, deadline: float = math.inf) -> str:
+            result = server(*arguments, deadline=deadline)
+            if arguments[:3] == ("agent", "prompt", pane):
+                raise herdr_types.HerdrFailure("agent_prompt_stalled: no working or blocked state",
+                                              code="agent_prompt_stalled")
+            return result
+
+        def before_retry(_seconds: float) -> None:
+            nonlocal checks
+            checks += 1
+            self.assertLessEqual(checks, 3)
+            self.assertEqual(len(self.inputs), 1)
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertIs(saved.get("completion_pending"), True)
+            self.assertEqual(saved.get("push_retries", 0), int(checks > 1))
+            self.assertEqual(len(self.notices), int(checks == 3))
+            if checks == 3:
+                (source, receipt), = self.pending_transcripts
+                write_text_atomic(source, source.read_text() + receipt)
+
+        with (patch.object(detached_runs, "_run", return_value=0),
+              patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
+              patch.object(self.fixture.world, "run", new=stall),
+              patch.object(time, "sleep", side_effect=before_retry)):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(checks, 3)
+        self.assertEqual(len(self.inputs), 1)
+        (recipient, alert), = self.notices
+        self.assertEqual(recipient, self.fixture.parent.id)
+        self.assertIn("Result delivery is unconfirmed.", alert)
+        self.assertIn("agent_prompt_stalled", alert)
+        self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], f"already delivered: {record['run_id']}")
+
     def test_start_leaves_an_older_result_pending_when_the_pane_is_not_ready(self) -> None:
         _ = write_config_fixture(self.fixture.root / "conf/send.conf", "delivery_timeout=40\n")
         row = self.fixture.worker(family="codex")

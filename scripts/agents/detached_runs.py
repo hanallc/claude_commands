@@ -1547,7 +1547,7 @@ def _needs_pane_input_retry(record: RunRecord) -> bool:
     delivery = record.get("delivery", "")
     return record["status"] == "finished" and (_pane_submission_not_started(delivery) or (
         delivery.startswith(DEFERRED_WORKER_RESULT)
-        and delivery not in (PARKED_WORKER_RESULT, WORKER_STOPPED_RESULT, WORKER_CLOSED_RESULT)))
+        and delivery not in (WORKER_STOPPED_RESULT, WORKER_CLOSED_RESULT)))
 
 
 def _result_send_not_started(record: RunRecord, detail: str) -> str:
@@ -3126,7 +3126,9 @@ def _retry_result_delivery(path: Path) -> RunRecord | SupervisedResultPruned:
                 if _cancels_pass(current) and current.get("delivery") == ORPHAN_RESULT_PENDING:
                     _ = _finish_record(path, current)
                 else:
-                    _ = deliver(current, command_result(current))
+                    delivery = deliver(current, command_result(current))
+                    if delivery == PARKED_WORKER_RESULT:
+                        _ = _finish_record(path, current)
         except (Exception, SystemExit) as error:
             detail = " ".join(str(error).splitlines())
             print(f"detached_runs: {path.stem}: result retry failed: {detail}", file=sys.stderr)

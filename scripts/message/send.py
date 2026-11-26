@@ -5711,6 +5711,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         if isinstance(state, worker_panes.OpenWorker):
             checking_target = False
             attempting_input = False
+            prompt_input_uncertain = False
             boundary: worker_panes.TranscriptCursor | NoResultTranscript = NoResultTranscript.UNRECORDED
             ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
 
@@ -5783,21 +5784,24 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     elif isinstance(error, (herdr_types.HerdrFailure, OSError)):
                         if not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked)):
                             return WorkerResultNotSubmitted("retry", reason)
+                        # A stalled prompt sent input before it waited for the agent to start.
+                        prompt_input_uncertain = not (
+                            isinstance(error, herdr_types.HerdrFailure) and error.code == "agent_prompt_stalled")
                     else:
                         raise
                 if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
                     try:
                         if isinstance(receipt, WorkerResultSubmission):
                             confirmed = _confirm_worker_result(worker, state.pane, state.terminal, review_text or text, boundary)
-                            if isinstance(confirmed, WorkerResultUnconfirmed) and reason:
-                                return WorkerResultInputUncertain("retry", reason)
-                            return confirmed
-                        if receipt.received(worker, membership):
+                            if isinstance(confirmed, WorkerResultSubmitted) or not reason:
+                                return confirmed
+                        elif receipt.received(worker, membership):
                             return PaneTextDelivered("sent", f"worker {worker.name} at {state.pane}")
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
-                        if isinstance(receipt, WorkerResultSubmission) and reason:
-                            return WorkerResultInputUncertain("retry", reason)
-                        reason = f"worker transcript is unavailable: {error}"
+                        if not isinstance(receipt, WorkerResultSubmission) or not reason:
+                            reason = f"worker transcript is unavailable: {error}"
+                    if isinstance(receipt, WorkerResultSubmission) and prompt_input_uncertain:
+                        return WorkerResultInputUncertain("retry", reason)
                     return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
                 reason = f"worker is {state.status.value}"
