@@ -2204,6 +2204,19 @@ A `:has()` rule for each band shows the band of the pressed Producer tab, so a t
 `page.studio.owner` sets the owner when the console shows the Studio as unavailable.
 The Studio uses the List status age limit and has no `status.studio` key.
 
+#### Question and answer inventory
+
+Run `./scripts/lib/py -m scripts.review_links.answer_sources count` to count saved questions and answers.
+The command reads staff Questions, sent Question and scoped replies, inline List answers, and picture answers.
+For each source, it prints the number of records, exchanges, read and unread answers to Nate, and records with and without List links.
+It checks each List link against the saved List items and prints each broken link.
+Go, Approval, verdict replies, and chat transcripts are outside this inventory.
+
+`answer_sources.read_exchanges` keeps the source key and exchange ID with the direction, participants, words, times, read state, and List links.
+Follow-ups share the source key of their original Question.
+The reader preserves missing times and reports answers whose read state is unknown.
+The command reads the existing stores and reserves no List numbers.
+
 ### Images page
 
 `/console/images.html` shows registered images with their instructions, oldest first.
