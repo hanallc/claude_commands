@@ -199,6 +199,12 @@ class _Browser:
             raise
 
 
+class _ChromeCommandError(RuntimeError):
+    def __init__(self, method: str, error: dict[str, object]) -> None:
+        super().__init__(f"{method}: {error}")
+        self.error: dict[str, object] = error
+
+
 class _Chrome(_Browser):
     """Keep one fixture tab and close the extra tabs after each test."""
 
@@ -230,7 +236,7 @@ class _Chrome(_Browser):
             # The fixture tab keeps Chrome open after the startup tab closes.
             for tab in self.tabs():
                 if tab["targetId"] != self.target:
-                    _ = self.command("Target.closeTarget", {"targetId": tab["targetId"]})
+                    self.close_tab(tab["targetId"])
 
     def open_fixture_tab(self) -> None:
         target = self.command("Target.createTarget", {"url": "about:blank", "browserContextId": self.context})
@@ -246,20 +252,27 @@ class _Chrome(_Browser):
         targets = cast(list[dict[str, str]], self.command("Target.getTargets", {})["targetInfos"])
         return [target for target in targets if target["type"] == "page"]
 
+    def close_tab(self, target: str) -> None:
+        try:
+            _ = self.command("Target.closeTarget", {"targetId": target})
+        except _ChromeCommandError as error:
+            if error.error.get("code") != -32602 or error.error.get("message") != "No target with given id found":
+                raise
+
     def close_test_pages(self) -> None:
         if self.closed:
             return
         with self.stop_on_error():
             for opened in self.tabs():
                 if opened["targetId"] != self.target:
-                    _ = self.command("Target.closeTarget", {"targetId": opened["targetId"]})
+                    self.close_tab(opened["targetId"])
             if not self.blank:
                 self.navigate("about:blank")
             if self.session_storage_written:
                 # Closing the tab discards session storage for all its documents.
                 old_target = self.target
                 self.open_fixture_tab()
-                _ = self.command("Target.closeTarget", {"targetId": old_target})
+                self.close_tab(old_target)
             _ = self.command("Page.resetNavigationHistory", {}, self.session)
             _ = self.command("Emulation.clearDeviceMetricsOverride", {}, self.session)
             _ = self.command("Emulation.setEmulatedMedia", {"media": "", "features": []}, self.session)
@@ -329,7 +342,7 @@ class _Chrome(_Browser):
             reply = self.read(deadline)
             if reply.get("id") == self.sequence:
                 if "error" in reply:
-                    raise RuntimeError(f"{method}: {reply['error']}")
+                    raise _ChromeCommandError(method, cast(dict[str, object], reply["error"]))
                 return cast(dict[str, object], reply["result"])
 
     def navigate(self, destination: str) -> None:
@@ -7587,7 +7600,7 @@ window.fetch=()=>new Promise(resolve=>replies.push(resolve));
             self.browser_action_sequence(steps, reduced_motion=True, add_item=False)
         finally:
             if not browser.closed:
-                _ = browser.command("Target.closeTarget", {"targetId": other_tab})
+                browser.close_tab(other_tab)
                 _ = browser.command("Page.bringToFront", {}, browser.session)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
