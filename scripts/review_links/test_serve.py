@@ -231,6 +231,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         super().__init__(methodName)
         self.review_posts: HandlerCalls = HandlerCalls()
         self.new_item_posts: HandlerCalls = HandlerCalls()
+        self.new_item_deliveries: list[threading.Thread] = []
 
     @property
     def server(self) -> serve.ReviewLinksServer:
@@ -269,6 +270,17 @@ class ReviewLinksServerTests(unittest.TestCase):
         self._server = server
         review_posts = self.review_posts
         new_item_posts = self.new_item_posts
+        self.new_item_deliveries.clear()
+        start_delivery = server.start_new_item_delivery
+
+        def track_delivery(deliver: Callable[[], object], *,
+                           claim: change_page.MessageDelivery | None) -> threading.Thread | None:
+            thread = start_delivery(deliver, claim=claim)
+            if thread is not None:
+                self.new_item_deliveries.append(thread)
+            return thread
+
+        _ = self.enterContext(patch.object(server, "start_new_item_delivery", track_delivery))
 
         class ReviewFixtureHandler(serve.ReviewLinksHandler):
             @override
@@ -333,7 +345,14 @@ class ReviewLinksServerTests(unittest.TestCase):
         finally:
             connection.close()
             if finished:
-                self.assertTrue(self.new_item_posts.wait_until_none_run())
+                self.finish_new_item_posts()
+
+    def finish_new_item_posts(self) -> None:
+        self.assertTrue(self.new_item_posts.wait_until_none_run())
+        for thread in self.new_item_deliveries:
+            thread.join(TEST_HANG_GUARD_SECS)
+            self.assertFalse(thread.is_alive())
+        self.new_item_deliveries.clear()
 
     def new_item_body(self, request: new_item_dialog.NewItemRequest) -> bytes:
         fields = {**asdict(request), "token": self.server.new_item_token,
@@ -1126,6 +1145,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     cast(dict[str, object], json.loads(body)) if json_answer and body else {})
         finally:
             connection.close()
+            self.finish_new_item_posts()
 
     def hold_states(self) -> list[str]:
         """Return the state of each saved hold file."""
@@ -1609,7 +1629,7 @@ class ReviewLinksServerTests(unittest.TestCase):
               new_item_notice_log(self.root, morty.id) as log, redirect_stdout(output), redirect_stderr(errors)):
             arguments = [kind, unit.name, words, "--session", "another-session"]
             code = new_item.main(arguments)
-            self.assertTrue(self.new_item_posts.wait_until_none_run())
+            self.finish_new_item_posts()
             if fail_retry:
                 self.assertEqual(code, new_item.Outcome.FAILED)
                 self.assertEqual(output.getvalue(), "")
@@ -1619,7 +1639,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 if change_mapping:
                     _ = conf.path("producer_map").write_text("", encoding="utf-8")
                 code = new_item.main(arguments)
-                self.assertTrue(self.new_item_posts.wait_until_none_run())
+                self.finish_new_item_posts()
                 self.assertEqual(posts, [posts[0]] * 3)
             else:
                 self.assertEqual(code, new_item.Outcome.FAILED)
@@ -1630,7 +1650,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(the_list.records(morty.id), [])
                 self.assertEqual(read_new_item_notices(log), [])
                 code = new_item.main(arguments)
-                self.assertTrue(self.new_item_posts.wait_until_none_run())
+                self.finish_new_item_posts()
                 refused, retried = posts
                 self.assertNotEqual(refused, retried)
         self.assertEqual(code, new_item.Outcome.FILED, errors.getvalue())
@@ -3553,15 +3573,15 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(confirmed.status, 200)
         self.assertEqual(send.call_count, 2)
 
-    def test_new_item_reports_delivery_failure_and_retries_the_saved_item(self) -> None:
+    def test_native_new_item_retries_the_saved_notice_after_delivery_failure(self) -> None:
         _folder, _cache, request = self.page_bug_fixture()
         _ = write_config_fixture(conf.path("review_links"), "delivery_pause_seconds=0\n")
         request = replace(request, request_id="r6-" + uuid4().hex)
         with patch.object(change_page, "send_to_staff", side_effect=OSError("Delivery interrupted.")) as send:
             failed = self.new_item_http(self.new_item_body(request), finished=True)
-        self.assertEqual(failed.status, 503)
-        self.assertEqual(json.loads(failed.body)["error"], "Delivery interrupted. Try Send again.")
+        self.assertEqual(failed.status, 200, failed.body)
         first, = investigation.records(request.recipient_id)
+        self.assertEqual(json.loads(failed.body)["id"], first.id)
         with patch.object(change_page, "send_to_staff") as retry:
             confirmed = self.new_item_http(self.new_item_body(request), finished=True)
         self.assertEqual(confirmed.status, 200)
@@ -3577,7 +3597,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             with patch.object(self.server.delivery_status, "finish_intent_locked",
                               side_effect=OSError("Delivery cleanup interrupted.")):
                 interrupted = self.new_item_http(body, finished=True)
-            self.assertEqual(interrupted.status, 503)
+            self.assertEqual(interrupted.status, 200, interrupted.body)
             first, = investigation.records(request.recipient_id)
             confirmed = self.new_item_http(body, finished=True)
         self.assertEqual(confirmed.status, 200, confirmed.body)
@@ -4211,11 +4231,102 @@ class ReviewLinksServerTests(unittest.TestCase):
             saved = cast(dict[str, str], json.loads(response.body))
             item = the_list.load(morty.id, saved["id"])
             self.assertEqual((item.producer, item.owner, item.unit), (producer.id, case.fixture.unit.id, case.fixture.unit.name))
-            self.assertEqual(self.new_item_http(body, finished=True).body, response.body)
+            repeated = cast(dict[str, str], json.loads(self.new_item_http(body, finished=True).body))
+            self.assertEqual(repeated["id"], saved["id"])
+            self.assertNotIn("notices_pending", repeated)
             changed = json.dumps({**request, "assignee_id": None}).encode()
             self.assertEqual(self.new_item_http(changed, finished=True).status, 409)
             self.assertEqual(notify.call_count, 2)
         self.assertEqual(the_list.records(morty.id), [item])
+
+    def scheduled_notice_fixture(self) -> tuple[bytes, staff.StaffId, staff.StaffId, Path]:
+        case = self.review_fixture()
+        producer = fixture_member("producer", name="dwight")
+        _ = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("the_list"), "series_run_limit=730\n")
+        _ = write_config_fixture(conf.path("review_links"),
+                                 "delivery_tries=3\ndelivery_pause_seconds=0\nunrouted_alert_recipient=page-owner\n")
+        draft = "s1-" + uuid4().hex
+        body = json.dumps({"token": self.server.new_item_token, "kind": "scheduled", "page": "list",
+                           "page_recipient": "producer", "request_id": draft, "recipient_id": producer.id,
+                           "assignee_id": case.fixture.unit.id,
+                           "words": "Check the Scheduled item. Start 2099-11-30T09:00Z."}).encode()
+        return body, producer.id, case.fixture.showrunner_id, self.submission_draft_folder(draft) / "receipt.json"
+
+    def test_new_item_receipt_precedes_slow_notices(self) -> None:
+        body, _, _, receipt = self.scheduled_notice_fixture()
+        started = threading.Event()
+        release = threading.Event()
+        sent = send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("sent", "", ""))
+
+        def deliver(*_args: str) -> tuple[send_result.ConfirmedSendOutcome, str]:
+            started.set()
+            self.assertTrue(release.wait(TEST_HANG_GUARD_SECS))
+            return sent, ""
+
+        with patch.object(unrouted_alert, "message_outcome", side_effect=deliver):
+            try:
+                reply = self.new_item_http(body)
+                self.assertEqual(reply.status, 200, reply.body)
+                self.assertTrue(json.loads(reply.body)["notices_pending"])
+                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                saved = cast(dict[str, object], json.loads(receipt.read_text()))
+                self.assertEqual(saved["confirmed"], [])
+                concurrent = self.new_item_http(body)
+                self.assertEqual(concurrent.body, reply.body)
+            finally:
+                release.set()
+                self.finish_new_item_posts()
+
+    def test_scheduled_notice_retries_and_alerts_after_the_receipt(self) -> None:
+        body, producer, showrunner, receipt = self.scheduled_notice_fixture()
+        sent = send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("sent", "", ""))
+        attempts: list[tuple[str, str]] = []
+
+        def deliver(recipient: str, _sender: str, _message: str, *options: str
+                    ) -> tuple[send_result.ConfirmedSendOutcome | send_result.UnconfirmedSendOutcome, str]:
+            attempts.append((recipient, options[options.index("--key") + 1]))
+            if recipient == producer:
+                return send_result.UnconfirmedSendOutcome(), "The notice failed."
+            return sent, ""
+
+        with (patch.object(unrouted_alert, "message_outcome", side_effect=deliver),
+              patch.object(unrouted_alert, "send_message") as alert):
+            reply = self.new_item_http(body, finished=True)
+        self.assertEqual(reply.status, 200, reply.body)
+        self.assertEqual([recipient for recipient, _ in attempts], [producer, showrunner, producer, producer])
+        self.assertEqual(len({key for recipient, key in attempts if recipient == producer}), 1)
+        saved = cast(dict[str, object], json.loads(receipt.read_text()))
+        self.assertEqual(saved["confirmed"], [showrunner])
+        alert.assert_called_once()
+        self.assertIn(producer, cast(str, alert.call_args.args[2]))
+
+    def test_scheduled_retry_and_restart_send_only_unconfirmed_notices(self) -> None:
+        body, producer, showrunner, receipt = self.scheduled_notice_fixture()
+        sent = send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("sent", "", ""))
+        for recover in ("Retry", "restart"):
+            with self.subTest(recover=recover):
+                if recover == "restart":
+                    draft = "s1-" + uuid4().hex
+                    fields = cast(dict[str, object], json.loads(body))
+                    body = json.dumps({**fields, "request_id": draft}).encode()
+                    receipt = self.submission_draft_folder(draft) / "receipt.json"
+                rejected = (send_result.UnconfirmedSendOutcome(), "The notice failed.")
+                with (patch.object(unrouted_alert, "message_outcome", side_effect=[rejected, (sent, ""), rejected, rejected])
+                      as first, patch.object(unrouted_alert, "send_message")):
+                    saved = self.new_item_http(body, finished=True)
+                self.assertEqual(saved.status, 200, saved.body)
+                self.assertEqual(cast(dict[str, object], json.loads(receipt.read_text()))["confirmed"], [showrunner])
+                with patch.object(unrouted_alert, "message_outcome", return_value=(sent, "")) as retry:
+                    if recover == "Retry":
+                        repeated = self.new_item_http(body, finished=True)
+                        self.assertEqual(repeated.body, saved.body)
+                    else:
+                        new_item.recover_scheduled_notices(review_link.review_root())
+                    retry.assert_called_once_with(*first.call_args.args)
+                    self.assertEqual(retry.call_args.args[0], producer)
+                self.assertEqual(cast(dict[str, object], json.loads(receipt.read_text()))["confirmed"],
+                                 [showrunner, producer])
 
     def test_new_item_sends_each_type_to_each_producer_in_the_to_row(self) -> None:
         case = self.review_fixture()
@@ -4227,6 +4338,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\npage.review.owner={showrunner.id}\nowner.default={showrunner.id}\n")
         _ = write_config_fixture(conf.path("producer_map"), f"{showrunner.id}={producer.id}\n")
         _ = write_config_fixture(conf.path("the_list"), "series_run_limit=730\n")
+        _ = write_config_fixture(conf.path("review_links"), "delivery_pause_seconds=0\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         self.addCleanup(cache.close)
         notices: list[staff.StaffId] = []
@@ -4295,7 +4407,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                                     self.assertIn("Producer: producer (set for", str(result["receipt"]))
                                 count = len(the_list.records(morty.id))
                                 repeat = self.new_item_http(encoded, finished=True)
-                                self.assertEqual((repeat.status, json.loads(repeat.body)), (200, result))
+                                self.assertEqual(repeat.status, 200)
+                                _ = result.pop("notices_pending", None)
+                                self.assertEqual(json.loads(repeat.body), result)
                                 changed = self.new_item_http(json.dumps({**scheduled, "words": "Changed words"}).encode(),
                                                              finished=True)
                                 recovered = cast(dict[str, object], json.loads(changed.body))
@@ -4665,7 +4779,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     with (patch.object(review_submissions, "_write_location", fail_notice_progress)
                           if failure == "receipt progress" else nullcontext()):
                         failed = self.new_item_http(body, finished=True)
-                    self.assertEqual(failed.status, 503, failed.body)
+                    self.assertEqual(failed.status, 200, failed.body)
                     expected = [identity for identity in (producer.id, showrunner.id) if identity != recipient]
                     self.assertEqual(notices, expected)
                     first_keys = dict(attempts)
@@ -4683,7 +4797,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                     shutil.rmtree(self.submission_draft_folder(draft))
                     attempts.clear()
                     recovered = self.new_item_http(body, finished=True)
-                    self.assertEqual((recovered.status, recovered.body), (200, retry.body))
+                    self.assertEqual(recovered.status, 200)
+                    self.assertEqual(json.loads(recovered.body)["id"], json.loads(retry.body)["id"])
                     self.assertCountEqual(attempts, list(confirmed_keys.items()))
                     self.assertCountEqual(notices, [producer.id, showrunner.id])
 
@@ -4768,7 +4883,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(investigation.records(producer.id), [])
             send.assert_not_called()
 
-    def test_new_item_publishes_and_delivers_native_records_before_success(self) -> None:
+    def test_new_item_publishes_native_records_before_notices(self) -> None:
         from scripts.review_links.test_review_submissions import EVIDENCE, PNG, identify_fixture_image
 
         case = self.review_fixture()
@@ -4781,6 +4896,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         handler = cast(type[serve.ReviewLinksHandler], self.server.RequestHandlerClass)
         respond = handler.json_response
         delivered = threading.Event()
+        replies_seen: set[str] = set()
 
         def see_published(active: serve.ReviewLinksHandler, status: int, fields: Mapping[str, object]) -> None:
             if active.path == review_page.NEW_ITEM_PATH and status == 200:
@@ -4789,7 +4905,9 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIn(key, snapshot.records)
                 self.assertEqual(snapshot.version, fields['version'])
                 self.assertEqual(snapshot.records[key].state, review_items.ReviewState.WAITING)
-                self.assertTrue(delivered.is_set())
+                if key not in replies_seen:
+                    self.assertFalse(delivered.is_set())
+                    replies_seen.add(key)
             respond(active, status, fields)
 
         def message_sent(_recipient: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
@@ -4816,15 +4934,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                             first = workers.submit(self.new_item_http, body)
                             second = workers.submit(self.new_item_http, body)
                             replies = [first.result(TEST_HANG_GUARD_SECS), second.result(TEST_HANG_GUARD_SECS)]
-                        for index, reply in enumerate(replies):
-                            if reply.status == 503:
-                                self.assertEqual(json.loads(reply.body), {"error": "This item is still sending. Try Send again."})
-                                replies[index] = self.new_item_http(body)
                     else:
                         replies = [self.new_item_http(body), self.new_item_http(body)]
                     for reply in replies:
                         self.assertEqual(reply.status, 200, reply.body)
                     self.assertTrue(delivered.wait(TEST_HANG_GUARD_SECS))
+                    self.finish_new_item_posts()
                     saved = cast(dict[str, str], json.loads(replies[0].body))
                     self.assertEqual(saved, json.loads(replies[1].body))
                     self.assertEqual(set(saved), {'id', 'key', 'version'})
