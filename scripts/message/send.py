@@ -832,10 +832,6 @@ class WorkerResultUnconfirmed(Result):
     """The prompt may have sent input, and the transcript receipt is missing."""
 
 
-class WorkerResultInputUncertain(WorkerResultUnconfirmed):
-    """The prompt failed and could have sent input."""
-
-
 @dataclass(frozen=True)
 class BlockedWorkerResult:
     """The worker needs input, and the result must wait for the pane."""
@@ -5711,7 +5707,6 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
         if isinstance(state, worker_panes.OpenWorker):
             checking_target = False
             attempting_input = False
-            prompt_input_uncertain = False
             boundary: worker_panes.TranscriptCursor | NoResultTranscript = NoResultTranscript.UNRECORDED
             ordinary_states = (herdr.AgentStatus.WORKING, herdr.AgentStatus.IDLE, herdr.AgentStatus.DONE)
 
@@ -5781,12 +5776,10 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                             return WorkerMessageUnconfirmed("failed",
                                 f"worker message delivery unconfirmed: {reason}. "
                                 + "The message may already have arrived. Do not resend it.")
-                    elif isinstance(error, (herdr_types.HerdrFailure, OSError)):
+                    elif (isinstance(receipt, WorkerResultSubmission)
+                            or isinstance(error, (herdr_types.HerdrFailure, OSError))):
                         if not attempting_input or isinstance(error, (herdr.HerdrCommandNotStarted, herdr.AgentBlocked)):
                             return WorkerResultNotSubmitted("retry", reason)
-                        # A stalled prompt sent input before it waited for the agent to start.
-                        prompt_input_uncertain = not (
-                            isinstance(error, herdr_types.HerdrFailure) and error.code == "agent_prompt_stalled")
                     else:
                         raise
                 if isinstance(receipt, (WorkerResultProbe, WorkerResultSubmission)):
@@ -5800,8 +5793,6 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
                         if not isinstance(receipt, WorkerResultSubmission) or not reason:
                             reason = f"worker transcript is unavailable: {error}"
-                    if isinstance(receipt, WorkerResultSubmission) and prompt_input_uncertain:
-                        return WorkerResultInputUncertain("retry", reason)
                     return WorkerResultUnconfirmed("retry", reason or "the worker transcript has no result receipt")
             else:
                 reason = f"worker is {state.status.value}"

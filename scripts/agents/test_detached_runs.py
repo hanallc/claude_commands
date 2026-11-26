@@ -7710,7 +7710,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         def wait_for_idle(target: str, _timeout_ms: int) -> herdr.ObservedAgentState:
             self.assertEqual(target, pane)
-            self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], detached_runs.BUSY_WORKER_RESULT)
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved["delivery"], detached_runs.FAILED_WORKER_SUBMISSION + "fixture could not start the prompt")
+            self.assertNotIn("push_retries", saved)
             self.fixture.world.locations[pane]["agent_status"] = "idle"
             return herdr.ObservedAgentState(herdr.AgentStatus.IDLE)
 
@@ -7723,11 +7725,11 @@ class PaneRunDeliveryTests(unittest.TestCase):
         wait.assert_called_once()
         self.assertEqual(len(self.inputs), 1)
         self.assertEqual(self.notices, [])
-        self.assertNotIn("push_retries", worker_lifecycle.read_json_object(path))
+        self.assertEqual(worker_lifecycle.read_json_object(path)["push_retries"], 1)
 
     def test_supervisor_delivers_once_after_read_failures_busy_checks_and_a_failed_submit(self) -> None:
         _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf",
-                                 "result_push_retries=1\nresult_push_retry_seconds=5\n")
+                                 "result_push_retries=2\nresult_push_retry_seconds=5\n")
         row = self.fixture.worker(family="codex")
         pane = "w1:p1"
         self.fixture.world.add(row, pane, family="codex")
@@ -7776,6 +7778,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
             saved = worker_lifecycle.read_json_object(path)
             self.assertIs(saved["completion_pending"], True)
             if step in ("empty receipt", "alert"):
+                self.assertEqual(saved["push_retries"], 2)
+            elif step in ("submit", "receipt read", "busy after submit"):
                 self.assertEqual(saved["push_retries"], 1)
             else:
                 self.assertNotIn("push_retries", saved)
@@ -7809,7 +7813,7 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertIn("Result delivery is unconfirmed.", alert)
         saved = worker_lifecycle.read_json_object(path)
         self.assertEqual(saved["delivery"], f"already delivered: {record['run_id']}")
-        self.assertEqual(saved["push_retries"], 1)
+        self.assertEqual(saved["push_retries"], 2)
 
     def test_supervisor_retries_a_failed_parked_worker_restore(self) -> None:
         row = self.fixture.worker(family="codex")
@@ -7827,6 +7831,8 @@ class PaneRunDeliveryTests(unittest.TestCase):
         path = Path(record["log"]).with_suffix(".json")
         write_text_atomic(path, json.dumps(record))
         attempts = 0
+        prompts = 0
+        server = self.fixture.world.run
 
         def restore(member: staff.StaffRow, parent: staff.StaffId, hold: worker_panes.WorkerLockHold) -> bool:
             nonlocal attempts
@@ -7836,32 +7842,63 @@ class PaneRunDeliveryTests(unittest.TestCase):
             attempts += 1
             if attempts == 1:
                 return False
-            self.assertEqual(attempts, 2)
-            self.fixture.world.add(row, pane, family="codex")
+            if attempts == 2:
+                self.fixture.world.add(row, pane, family="codex")
+            self.assertLessEqual(attempts, 3)
             return True
 
         def before_retry(_seconds: float) -> None:
-            self.assertEqual(attempts, 1)
+            self.assertLessEqual(attempts, 2)
             saved = worker_lifecycle.read_json_object(path)
             self.assertIs(saved.get("completion_pending"), True)
             self.assertNotIn("push_retries", saved)
             self.assertEqual(self.inputs, [])
 
+        def submit(*arguments: str, deadline: float = math.inf) -> str:
+            nonlocal prompts
+            if arguments[:3] == ("agent", "prompt", pane):
+                prompts += 1
+                if prompts == 1:
+                    raise herdr.HerdrCommandNotStarted("fixture could not start the prompt")
+            return server(*arguments, deadline=deadline)
+
         with (patch.object(worker, "restore_parked_worker", new=restore),
               patch.object(detached_runs, "_run", return_value=0),
               patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
+              patch.object(self.fixture.world, "run", new=submit),
               patch.object(time, "sleep", side_effect=before_retry) as delay):
             self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
-        self.assertEqual(attempts, 2)
-        delay.assert_called_once_with(5)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(prompts, 2)
+        self.assertEqual(delay.call_count, 2)
         self.assertEqual(len(self.inputs), 1)
         self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
         saved = worker_lifecycle.read_json_object(path)
         self.assertEqual(saved["delivery"], f"sent: worker {row.name} at {pane}")
+        self.assertEqual(saved["push_retries"], 1)
         self.assertNotIn("push_alert_attempted", saved)
         self.assertFalse(progress_history.parked_worker_pass(worker_panes.worker_pass(row, self.run_dir)))
 
     def test_supervisor_counts_a_stalled_prompt_with_no_receipt(self) -> None:
+        self.check_prompt_without_receipt(herdr_types.HerdrFailure(
+            "agent_prompt_stalled: no working or blocked state", code="agent_prompt_stalled"))
+
+    def test_supervisor_counts_a_herdr_timeout_with_no_receipt(self) -> None:
+        self.check_prompt_without_receipt(subprocess.TimeoutExpired("herdr agent prompt", 10), through_herdr=True)
+
+    def test_supervisor_counts_transport_errors_with_no_receipt(self) -> None:
+        for error in (herdr_types.HerdrFailure("fixture transport failure"), OSError("fixture I/O failure"),
+                      ValueError("fixture invalid transport response"), subprocess.SubprocessError("fixture process failure"),
+                      SystemExit("fixture interrupted delivery after the input checkpoint")):
+            with self.subTest(error=type(error).__name__):
+                case = PaneRunDeliveryTests("runTest")
+                case.setUp()
+                try:
+                    case.check_prompt_without_receipt(error)
+                finally:
+                    _ = case.doCleanups()
+
+    def check_prompt_without_receipt(self, error: BaseException, *, through_herdr: bool = False) -> None:
         _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf",
                                  "result_push_retries=1\nresult_push_retry_seconds=5\n")
         row = self.fixture.worker(family="codex")
@@ -7873,14 +7910,24 @@ class PaneRunDeliveryTests(unittest.TestCase):
         write_text_atomic(path, json.dumps(record))
         self.defer_transcript = True
         server = self.fixture.world.run
+        herdr_run = super(pane_support.PaneWorld, self.fixture.world).run
         checks = 0
 
-        def stall(*arguments: str, deadline: float = math.inf) -> str:
+        def fail_after_input(*arguments: str, deadline: float = math.inf) -> str:
             result = server(*arguments, deadline=deadline)
             if arguments[:3] == ("agent", "prompt", pane):
-                raise herdr_types.HerdrFailure("agent_prompt_stalled: no working or blocked state",
-                                              code="agent_prompt_stalled")
+                if through_herdr:
+                    with patch.object(herdr, "run_program", side_effect=error):
+                        return herdr_run(*arguments, deadline=deadline)
+                raise error
             return result
+
+        def finish_delivery_process(record_path: Path) -> int:
+            try:
+                return deliver_in_fixture(record_path)
+            except SystemExit as interrupted:
+                self.assertIs(interrupted, error)
+                return 1
 
         def before_retry(_seconds: float) -> None:
             nonlocal checks
@@ -7896,8 +7943,9 @@ class PaneRunDeliveryTests(unittest.TestCase):
                 write_text_atomic(source, source.read_text() + receipt)
 
         with (patch.object(detached_runs, "_run", return_value=0),
+              patch.object(detached_runs, "deliver_in_fresh_process", new=finish_delivery_process),
               patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
-              patch.object(self.fixture.world, "run", new=stall),
+              patch.object(self.fixture.world, "run", new=fail_after_input),
               patch.object(time, "sleep", side_effect=before_retry)):
             self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
         self.assertEqual(checks, 3)
@@ -7905,8 +7953,74 @@ class PaneRunDeliveryTests(unittest.TestCase):
         (recipient, alert), = self.notices
         self.assertEqual(recipient, self.fixture.parent.id)
         self.assertIn("Result delivery is unconfirmed.", alert)
-        self.assertIn("agent_prompt_stalled", alert)
+        self.assertIn("no answer after 10 s" if through_herdr else str(error), alert)
         self.assertEqual(worker_lifecycle.read_json_object(path)["delivery"], f"already delivered: {record['run_id']}")
+
+    def test_supervisor_counts_definite_submit_failures(self) -> None:
+        for failure in (herdr.HerdrCommandNotStarted, herdr.HerdrLaunchRefused, herdr.AgentBlocked):
+            with self.subTest(failure=failure.__name__):
+                case = PaneRunDeliveryTests("runTest")
+                case.setUp()
+                try:
+                    case.check_definite_submit_failure(failure)
+                finally:
+                    _ = case.doCleanups()
+
+    def test_any_outcome_after_the_input_checkpoint_without_a_receipt_is_unconfirmed(self) -> None:
+        row = self.fixture.worker(family="codex")
+        self.fixture.world.add(row, "w1:p1", family="codex")
+        record = self.record(row)
+        record["pane_dispatch_id"] = ""
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+
+        def unexpected_outcome(*_args: object, receipt: send.WorkerResultSubmission, **_options: object) -> send.Result:
+            _ = receipt.before_input()
+            return send.Result("retry", "fixture unexpected submit outcome")
+
+        with patch.object(send, "deliver_worker_text", new=unexpected_outcome):
+            self.assertEqual(detached_runs.deliver(record, detached_runs.CompletedCommand(0)),
+                             detached_runs.UNCONFIRMED_WORKER_RESULT + "fixture unexpected submit outcome")
+
+    def check_definite_submit_failure(self, failure: type[herdr_types.HerdrFailure]) -> None:
+        _ = write_config_fixture(self.fixture.root / "conf/detached_runs.conf",
+                                 "result_push_retries=1\nresult_push_retry_seconds=5\n")
+        row = self.fixture.worker(family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        record = self.record(row)
+        record["pane_dispatch_id"] = ""
+        path = Path(record["log"]).with_suffix(".json")
+        write_text_atomic(path, json.dumps(record))
+        server = self.fixture.world.run
+        prompts = 0
+
+        def refuse_input(*arguments: str, deadline: float = math.inf) -> str:
+            nonlocal prompts
+            if arguments[:3] == ("agent", "prompt", pane):
+                prompts += 1
+                if prompts <= 2:
+                    raise failure("fixture prompt did not send input")
+                self.assertEqual(len(self.notices), 1)
+            return server(*arguments, deadline=deadline)
+
+        def before_retry(_seconds: float) -> None:
+            self.assertLessEqual(prompts, 2)
+            self.assertEqual(self.inputs, [])
+            saved = worker_lifecycle.read_json_object(path)
+            self.assertEqual(saved.get("push_retries", 0), prompts - 1)
+
+        with (patch.object(detached_runs, "_run", return_value=0),
+              patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}),
+              patch.object(self.fixture.world, "run", new=refuse_input),
+              patch.object(time, "sleep", side_effect=before_retry)):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(prompts, 3)
+        self.assertEqual(len(self.inputs), 1)
+        (recipient, alert), = self.notices
+        self.assertEqual(recipient, self.fixture.parent.id)
+        self.assertIn("Result delivery failed.", alert)
+        self.assertIn("fixture prompt did not send input", alert)
 
     def test_start_leaves_an_older_result_pending_when_the_pane_is_not_ready(self) -> None:
         _ = write_config_fixture(self.fixture.root / "conf/send.conf", "delivery_timeout=40\n")
