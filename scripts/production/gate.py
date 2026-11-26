@@ -431,12 +431,13 @@ class SharedCPUPool:
 
 
 @contextmanager
-def shared_cpu_pool(*, checkpoint: bool = False) -> Generator[SharedCPUPool | NoSharedCPU]:
+def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
     """Return owned slots before a standalone caller exits on SIGTERM."""
-    with unwind_gate_on_sigterm(checkpoint=checkpoint):
-        yield from _shared_cpu_pool()
+    with unwind_gate_on_sigterm(), _shared_cpu_pool() as pool:
+        yield pool
 
 
+@contextmanager
 def _shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
     path = cpu_pool_path()
     try:
@@ -1796,9 +1797,9 @@ _GATE_RECEIVED_SIGTERM: ContextVar[bool] = ContextVar("gate_received_sigterm", d
 
 
 @contextmanager
-def unwind_gate_on_sigterm(*, checkpoint: bool = False) -> Generator[None]:
+def unwind_gate_on_sigterm() -> Generator[None]:
     """Finish test cleanup before the default action for a stop signal."""
-    if checkpoint or threading.current_thread() is not threading.main_thread():
+    if threading.current_thread() is not threading.main_thread():
         yield
         return
     handlers = {
@@ -1868,7 +1869,7 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                local_grant: LocalGateAssignment | NoLocalGateGrant = NO_LOCAL_GATE_GRANT,
                selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
-    with unwind_gate_on_sigterm(checkpoint=source == "checkpoint"):
+    with unwind_gate_on_sigterm() if source != "checkpoint" else nullcontext():
         return _run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, source=source, full=full,
                            mode=mode, machine=machine, local_grant=local_grant, selected=selected, time_limit=time_limit)
 
@@ -2071,14 +2072,14 @@ def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
     hold_check = hold if hold is not None else NoBuildHoldCheck()
+    cpu_pool_scope = _shared_cpu_pool if source == "checkpoint" else shared_cpu_pool
     with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_suite(),
           gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
           (nullcontext(local_grant.suite_place()) if placed else
            gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if needs_shared_slots
            else nullcontext(None)) as reservation,
-          (shared_cpu_pool(checkpoint=source == "checkpoint") if needs_shared_slots
-           else nullcontext(NoSharedCPU())) as cpu_pool):
+          (cpu_pool_scope() if needs_shared_slots else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
         started_at = datetime.now(UTC).timestamp()
@@ -4250,7 +4251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
             target = "natedev"
         checkpoint = not (args.affected or args.tests_only or args.nightly or args.promote_only)
-        with unwind_gate_on_sigterm(checkpoint=checkpoint):
+        with unwind_gate_on_sigterm() if not checkpoint else nullcontext():
             return run_gate_command(args, target)
     except GatePlacementIncomplete as error:
         print(error, file=sys.stderr, flush=True)
