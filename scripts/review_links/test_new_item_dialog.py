@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from scripts.console_text.test_support import accepting_console_text
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib import conf
 from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff
 from scripts.review_links import (console_theme, new_item_dialog, page_frame, reply_tokens, review_page,
@@ -2178,6 +2179,40 @@ class NewItemDialogTests(unittest.TestCase):
         configuration = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = write_config_fixture(configuration / "review_links.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(configuration)})))
+
+    def test_saved_item_and_image_limits_use_the_machine_key(self) -> None:
+        _ = write_config_fixture(
+            conf.path("review_links"),
+            "# whole: 1..2\nnew_item.max_images=2\n"
+            + "# whole: 1..\nnew_item.max_images.testhost=3\n"
+            + "# whole: 1..101\nnew_item.max_image_bytes=101\n"
+            + "# whole: 1..202\nnew_item.max_image_bytes.testhost=199\n"
+            + "# whole: 1..2\nnew_item.max_page_rows=2\n"
+            + "# whole: 1..\nnew_item.max_page_rows.testhost=3\n")
+        evidence = new_item_dialog.PageDataEvidence("Fixture page", (("One",), ("Two",), ("Three",)))
+        fields = new_item_dialog.evidence_fields(evidence)
+        with patch.object(conf, "local_host_key_name", return_value="testhost"):
+            live = new_item_dialog.read_new_item_limits()
+            self.assertEqual((live.images, live.image_bytes), (3, 199))
+            saved = new_item_dialog.read_saved_item_limits()
+            self.assertEqual((saved.images, saved.image_bytes), (3, 202))
+            self.assertEqual(new_item_dialog.read_stored_image_byte_limit(), 202)
+            self.assertEqual(new_item_dialog.read_evidence(fields), evidence)
+        with patch.object(conf, "local_host_key_name", return_value="otherhost"):
+            self.assertEqual(new_item_dialog.read_saved_item_limits().images, 2)
+            self.assertEqual(new_item_dialog.read_stored_image_byte_limit(), 101)
+            with self.assertRaises(new_item_dialog.SubmissionError):
+                _ = new_item_dialog.read_evidence(fields)
+
+    def test_new_item_uses_a_machine_value_without_a_limit_line(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"),
+                                 "# whole: 1..20\nnew_item.max_images=10\nnew_item.max_images.natedev=50\n")
+        with patch.object(conf, "local_host_key_name", return_value="natedev"):
+            self.assertEqual(new_item_dialog.read_new_item_limits().images, 50)
+            self.assertEqual(new_item_dialog.read_saved_item_limits().images, 50)
+        with patch.object(conf, "local_host_key_name", return_value="otherhost"):
+            self.assertEqual(new_item_dialog.read_new_item_limits().images, 10)
+            self.assertEqual(new_item_dialog.read_saved_item_limits().images, 20)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_producer_route_and_assignee_change_in_the_browser(self) -> None:

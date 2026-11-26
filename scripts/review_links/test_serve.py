@@ -552,6 +552,45 @@ class ReviewLinksServerTests(unittest.TestCase):
                                  (400, {"error": "Invalid New item request size."}))
                 self.assertEqual(cache.get().records, {})
 
+    def test_new_item_accepts_a_request_at_the_machine_limits(self) -> None:
+        case = self.review_fixture(list_keeper=False)
+        producer = fixture_member("producer", name="fixture-producer")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        configuration = conf.path("review_links")
+        self.addCleanup(configuration.write_bytes, configuration.read_bytes())
+        _ = write_config_fixture(
+            configuration,
+            "# whole: 1..20\nnew_item.max_words_chars=20\n"
+            + "# whole: 1..\nnew_item.max_words_chars.testhost=30\n"
+            + "# whole: 1..60\nnew_item.max_total_image_bytes=60\n"
+            + "# whole: 1..\nnew_item.max_total_image_bytes.testhost=600\n"
+            + "# whole: 1..128\nnew_item.max_page_data_bytes=128\n"
+            + "# whole: 1..128\nnew_item.max_bug_page_state_bytes=128\n")
+        words = "Check the worker queue today."
+        request = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, producer.id)
+        body = self.new_item_body(replace(request, words=words.ljust(30, "?")))
+        machine_request_bytes = 256 * 1024 + 800 + 128 + 128
+        padded_body = body.ljust(machine_request_bytes, b" ")
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(change_page, "send_to_staff") as deliver):
+            with patch.object(conf, "local_host_key_name", return_value="otherhost"):
+                self.assertEqual(new_item_dialog.read_new_item_limits().words_chars, 20)
+                refused = self.new_item_http(body, finished=True)
+                self.assertEqual((refused.status, json.loads(refused.body)),
+                                 (400, {"error": "Your words must be text with at most 20 characters."}))
+                refused = self.new_item_http(padded_body, finished=True)
+                self.assertEqual((refused.status, json.loads(refused.body)),
+                                 (400, {"error": "Invalid New item request size."}))
+                deliver.assert_not_called()
+            with patch.object(conf, "local_host_key_name", return_value="testhost"):
+                limits = new_item_dialog.read_new_item_limits()
+                self.assertEqual((limits.words_chars, limits.body_read_bytes), (30, len(padded_body)))
+                reply = self.new_item_http(padded_body, finished=True)
+                self.assertEqual(reply.status, 200, reply.body)
+                deliver.assert_called_once()
+
     def test_new_item_route_lists_producers_and_uses_the_pages_assignee(self) -> None:
         case = self.review_fixture()
         owner = case.ready_submission_recipient()

@@ -964,7 +964,8 @@ The dialog shows Error lines and Script errors when the page has errors.
 
 The `new_item.*` keys and `page_capture.max_active` in `config/review_links.conf` set the New item limits.
 A new Send uses the live values.
-Saved items, restart recovery and attachment use the upper bound of each limit line.
+Request reads, saved items, restart recovery and attachment use the upper bound of the selected key's limit line.
+A machine key uses its value for these checks if it has an open whole-number limit or no whole-number limit line.
 If a limit is unusable, Send gets a 503 response and the dialog keeps the draft.
 The console unavailable view omits the owner controls and the dialog.
 

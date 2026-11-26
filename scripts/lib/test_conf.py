@@ -773,13 +773,14 @@ conf_reads.record('disabled')
                 with self.assertRaises(conf.Unusable):
                     conf.check("example", "amount", refused)
                 settings = conf.read("example")
+                if bounds == "..-2":
+                    self.assertEqual(settings.whole_upper_bound("amount"), -2)
+                else:
+                    reason = f"amount={accepted!r}: expected an upper bound"
+                    with self.assertRaisesRegex(conf.Unusable, re.escape(reason)):
+                        _ = settings.whole_upper_bound("amount")
                 with mock.patch("socket.gethostname", return_value="testhost.example"):
-                    if bounds == "..-2":
-                        self.assertEqual(settings.whole_upper_bound("amount"), -2)
-                    else:
-                        reason = f"amount={accepted!r}: expected an upper bound"
-                        with self.assertRaisesRegex(conf.Unusable, re.escape(reason)):
-                            _ = settings.whole_upper_bound("amount")
+                    self.assertEqual(settings.whole_upper_bound("amount"), 10)
 
         self.history()
         self.commit("# whole: 1..10\namount=3\n")
@@ -809,6 +810,24 @@ conf_reads.record('disabled')
                 self.assertEqual(len(warning.getvalue().splitlines()), warning_count)
                 if warning_count:
                     self.assertTrue(warning.getvalue().startswith(f"warning: {self.path}: amount="))
+
+    def test_whole_upper_bound_uses_the_machine_value_for_an_open_limit(self) -> None:
+        self.write("# whole: 1..4\namount=3\n# whole: 1..\namount.testhost=9\n")
+        settings = conf.read("example")
+        with mock.patch("socket.gethostname", return_value="testhost.example"):
+            self.assertEqual(settings.whole("amount"), 9)
+            self.assertEqual(settings.whole_upper_bound("amount"), 9)
+        with mock.patch("socket.gethostname", return_value="another.example"):
+            self.assertEqual(settings.whole("amount"), 3)
+            self.assertEqual(settings.whole_upper_bound("amount"), 4)
+
+    def test_whole_upper_bound_uses_the_machine_value_without_a_limit_line(self) -> None:
+        self.write("# whole: 1..20\nnew_item.max_images=10\nnew_item.max_images.natedev=50\n")
+        settings = conf.read("example")
+        with mock.patch.object(conf, "local_host_key_name", return_value="natedev"):
+            self.assertEqual(settings.whole_upper_bound("new_item.max_images"), 50)
+        with mock.patch.object(conf, "local_host_key_name", return_value="otherhost"):
+            self.assertEqual(settings.whole_upper_bound("new_item.max_images"), 20)
 
     def test_numeric_readers_refuse_the_wrong_limit_form_and_missing_limits(self) -> None:
         for reader, form in ((conf.ConfigRead.whole, "range"), (conf.ConfigRead.number, "whole"),

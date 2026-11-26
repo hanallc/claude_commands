@@ -56,7 +56,7 @@ def _body_budget(total_image_bytes: int, page_data_bytes: int, bug_state_bytes: 
 
 
 def read_new_item_limits() -> NewItemLimits:
-    """Read the intake values and keep them within the base bounds."""
+    """Read the intake values and the bounds for reading requests."""
     settings = conf.read("review_links")
 
     def limit(key: str) -> int:
@@ -66,7 +66,7 @@ def read_new_item_limits() -> NewItemLimits:
 
 
 def read_saved_item_limits() -> NewItemLimits:
-    """Read the base upper bounds for checks against a saved item."""
+    """Read the effective upper bounds for checks against a saved item."""
     upper_bound = conf.read("review_links").whole_upper_bound
     return _new_item_limits(upper_bound, upper_bound)
 
@@ -86,7 +86,7 @@ def _new_item_limits(read: Callable[[str], int], upper_bound: Callable[[str], in
 
 
 def read_stored_image_byte_limit() -> int:
-    """Bound saved image reads by the base limit line."""
+    """Read the effective upper bound for saved images."""
     settings = conf.read("review_links")
     key = "new_item.max_image_bytes"
     bound = settings.whole_upper_bound(key)

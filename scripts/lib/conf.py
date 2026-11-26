@@ -208,17 +208,17 @@ class ConfigRead:
                  recover_invalid: bool = True, use_file_limits: bool = True,
                  host_override: HostOverride = HostOverride.APPLIES
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
-        def read_value(setting: Setting) -> Result:
+        def read_value(selected_key: str, setting: Setting) -> Result:
             if not use_file_limits:
                 return convert(setting.value)
             if allow_blank and not setting.value and not setting.limit.startswith(_LIMIT_PREFIXES):
                 return convert("")
-            return _converted(setting, convert, self.source, key)
+            return _converted(setting, convert, self.source, key, require_whole_limit=selected_key == key)
 
         return self._resolve_setting(key, read_value, warn=warn, default=default, recover_invalid=recover_invalid,
                                      use_file_limits=use_file_limits, host_override=host_override)
 
-    def _resolve_setting(self, key: str, convert: Callable[[Setting], Result], *, warn: bool,
+    def _resolve_setting(self, key: str, convert: Callable[[str, Setting], Result], *, warn: bool,
                          default: Result | UseConfiguredValue = UseConfiguredValue.CURRENT,
                          recover_invalid: bool = True, use_file_limits: bool = True,
                          host_override: HostOverride
@@ -228,8 +228,10 @@ class ConfigRead:
 
         def read_key(settings: dict[str, Setting]) -> tuple[Result, str | None]:
             nonlocal bad
+            selected_key = (_effective_key(settings, key, local_host_key_name())
+                            if host_override is HostOverride.APPLIES else key)
             try:
-                setting = _setting(settings, key, host_override)
+                setting = _setting(settings, selected_key, HostOverride.IGNORED)
             except _MissingKey:
                 if isinstance(default, UseConfiguredValue):
                     raise
@@ -237,7 +239,7 @@ class ConfigRead:
             if isinstance(setting, _ShiftedSetting):
                 setting.origin.record()
             bad = setting.value
-            return convert(setting), setting.value
+            return convert(selected_key, setting), setting.value
 
         repository_allowed = False
         try:
@@ -319,13 +321,17 @@ class ConfigRead:
         return self.value(key, _whole)
 
     def whole_upper_bound(self, key: str) -> int:
-        """Read the upper bound of the base key's whole-number limit."""
-        def read_bound(setting: Setting) -> int:
+        """Read the effective upper bound. Use the machine value if its limit has no upper bound."""
+        def read_bound(selected_key: str, setting: Setting) -> int:
             limit = setting.limit
             if not limit.startswith("# whole:"):
+                if selected_key != key:
+                    return _whole(setting.value)
                 raise ValueError("expected a # whole: limit")
             low, high = _range_bounds(limit, "# whole:")
             if not high:
+                if selected_key != key:
+                    return _converted(setting, _whole, self.source, selected_key)
                 raise ValueError("expected an upper bound")
             upper = _whole(high)
             if low and upper < _whole(low):
@@ -333,7 +339,7 @@ class ConfigRead:
             return upper
 
         result = self._resolve_setting(key, read_bound, warn=True, use_file_limits=False,
-                                       host_override=HostOverride.IGNORED)
+                                       host_override=HostOverride.APPLIES)
         if isinstance(result, UnavailableValue):
             raise Unusable(f"{result.reason}; no usable whole-number upper bound")
         return result.value
@@ -635,9 +641,10 @@ def _committed_files(source: Path) -> Iterator[str]:
             yield committed.stdout
 
 
-def _converted(setting: Setting, convert: Callable[[str], Result], source: Path, key: str) -> Result:
+def _converted(setting: Setting, convert: Callable[[str], Result], source: Path, key: str, *,
+               require_whole_limit: bool = True) -> Result:
     whole = convert is _whole or convert is positive_whole or convert is positive_whole_seconds
-    if whole and not setting.limit.startswith("# whole:"):
+    if whole and require_whole_limit and not setting.limit.startswith("# whole:"):
         raise ValueError("expected a # whole: limit")
     if convert is _number and not setting.limit.startswith("# range:"):
         raise ValueError("expected a # range: limit")
