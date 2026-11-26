@@ -23,7 +23,8 @@ A green nightly sends a result push unless gate.conf disables it.
 A red nightly records its result and notifies sdlc.
 The nightly run sends type diagnostics to the units that changed the code.
 The user receives a push after the nightly run or after sdlc assigns the fix.
-A failure before the checks start sends the reason. Silence keeps the newest result.
+A failure before the checks start sends the reason and the next run time.
+Silence keeps the newest result.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
 the production's top-level showrunner keeps (`change_review.list_path`), with the doc stamped into
@@ -46,7 +47,7 @@ except FileNotFoundError:
 import argparse
 from collections import deque
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, closing, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -81,7 +82,7 @@ from scripts.lib.process_start import Started, Unreadable, Zombie, process_start
 from scripts.copies import copies
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 from scripts.lib import build_folders, cancellation, conf, land_main, main_push_lock, session_folder, unit_runs, waiting_rows
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.lib.build_steps import (
     CLAIM_FAILURE_SUFFIX, gate_job_for_command, gate_job_from_process, gate_natedev_only_flag,
     gate_target_kind, read_step_names,
@@ -89,9 +90,10 @@ from scripts.lib.build_steps import (
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
-    affected_modules, change_review, land_runs, session_staff, showrunners, staff, unit_config, unit_lookup, unit_names,
+    affected_modules, behavior_check, change_review, land_runs, nightly_schedule, promotion, session_staff,
+    showrunners, staff, unit_config, unit_lookup, unit_names,
 )
-from scripts.production.gate_modules import GateRefused, discover_test_modules, test_module_name
+from scripts.production.gate_modules import GateRefused, discover_test_modules, is_test_module, test_module_name
 from scripts.production.gate_routes import (
     ALL_MODULES as ALL_MODULES, AllModules as AllModules, GatePlacementIncomplete, GateResultUnknown, GateTookNoRun,
     GateJobKind as GateJobKind, GateJobResult as GateJobResult, GateRun as GateRun, GuestGateBlocked,
@@ -170,7 +172,7 @@ os.execvp(sys.argv[1], sys.argv[1:])
 @dataclass
 class GateArguments(argparse.Namespace):
     """Typed command-line boundary; merge fields are validated before use."""
-    repo: str = ""
+    repo: str = field(default_factory=lambda: str(Path.cwd()))
     merge_branch: str = ""
     unit_branch: str = ""
     checkpoint: str = ""
@@ -179,12 +181,12 @@ class GateArguments(argparse.Namespace):
     production: str = ""
     unit: str = ""
     phase: str = ""
-    body: str = ""
+    body: str = "The full suite verified this checkpoint."
     promote: bool = False
-    main_repo: str = ""
-    ssh: str = ""
-    mac_host: str = ""
-    mac_repo: str = ""
+    main_repo: str = "~/.claude"
+    ssh: str = "ssh"
+    mac_host: str = "mac"
+    mac_repo: str = "~/.claude"
     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     affected: bool = False
     tests_only: bool = False
@@ -193,6 +195,8 @@ class GateArguments(argparse.Namespace):
     nightly: bool = False
     modules: list[str] = field(default_factory=list)
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
+    enrolled: bool = False
+    legacy_direct_main: bool = False
     command: tuple[str, ...] = ()
     prepared_copy: bool = False
 
@@ -428,6 +432,13 @@ class SharedCPUPool:
 
 @contextmanager
 def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
+    """Return owned slots before a standalone caller exits on SIGTERM."""
+    with unwind_gate_on_sigterm(), _shared_cpu_pool() as pool:
+        yield pool
+
+
+@contextmanager
+def _shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
     path = cpu_pool_path()
     try:
         descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -499,7 +510,8 @@ def gate_reservation(repo: Path, temporary: Path, hold: BuildHoldWait | NoBuildH
         program: str | Sequence[str] = (mode.value, "--type-dirs", *type_dirs) if type_dirs else mode.value
         before_check = (no_hold_wait if isinstance(hold, NoBuildHoldCheck)
                         else AdmissionHoldCheck(hold.wait_until_free, hold.admits))
-        with queue_place(program, repo, before_check=before_check) as place:
+        with queue_place(program, repo, before_check=before_check,
+                         trace_sampling=admission_wire.ProcessTreeTraceSampling()) as place:
             yield place
     except QueuePlaceRefused as error:
         raise GateRefused(str(error)) from error
@@ -677,6 +689,10 @@ class HeldGateToken:
     value: str
 
 
+class RollbackRecoveryRefused(GateRefused):
+    """The resources are free, but the checkout still needs rollback."""
+
+
 @dataclass
 class GateRecovery:
     """Own the resources and merge baseline of one gate process."""
@@ -788,21 +804,22 @@ class GateRecovery:
             report_retained_gate_folder(folder, "the gate owner ended")
         if self.rollback:
             repo = Path(self.repo)
-            with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
-                    return
-                _ = cleanup.enter_context(scratch.copy_lock(repo))
-                head = checked_git(repo, "rev-parse", "HEAD")
-                if head not in (self.rollback, self.rollback_head):
-                    parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
-                    if parents != [self.rollback, self.rollback_source]:
-                        raise GateRefused(f"gate recovery kept {self.path}: HEAD {head} differs from the recorded merge")
-                rollback_merge(repo, self.rollback)
-                self.rollback = ""
-                self.save()
+            try:
+                with gate_operation_lock(repo) as descriptor, ExitStack() as cleanup:
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        print(f"Recovered gate {self.pid}: rollback waits for the live gate in {repo}", flush=True)
+                        return
+                    _ = cleanup.enter_context(scratch.copy_lock(repo))
+                    rollback_merge(repo, self.rollback, checkpoint=self.rollback_source,
+                                   recorded_merge=self.rollback_head, recovery=self)
+                    self.rollback = ""
+                    self.save()
+            except (GateRefused, copies.CopyError, scratch.ScratchError, OSError, subprocess.SubprocessError) as error:
+                if self.groups or self.tokens:
+                    raise
+                raise RollbackRecoveryRefused(f"gate recovery kept {self.path} for {repo}: {error}") from error
             print(f"Recovered gate {self.pid}: merge undone, not pushed", flush=True)
         self.finish()
 
@@ -824,8 +841,9 @@ class NoGateRecovery:
     """No gate owns resources in this calling context."""
 
 
+NO_GATE_RECOVERY = NoGateRecovery()
 ACTIVE_GATE_RECOVERY: ContextVar[GateRecovery | NoGateRecovery] = ContextVar(
-    "merge_gate_recovery", default=NoGateRecovery())
+    "merge_gate_recovery", default=NO_GATE_RECOVERY)
 _reported_foreign_gate_refusals: set[tuple[int, Path]] = set()
 
 
@@ -835,20 +853,28 @@ def gate_run_directory(repo: Path) -> Path:
 
 
 def recover_gate_runs(repo: Path) -> None:
+    requested_checkout = str(repo.resolve())
     current = ACTIVE_GATE_RECOVERY.get()
-    if isinstance(current, GateRecovery) and current.repo == str(repo.resolve()) and current.pid == os.getpid():
+    if isinstance(current, GateRecovery) and current.repo == requested_checkout and current.pid == os.getpid():
         return
     own_directory = gate_run_directory(repo)
     root = own_directory.parent
     if not root.exists():
         return
+    refusals: list[str] = []
     for directory in sorted(root.iterdir()):
         if directory.is_dir():
-            recover_gate_directory(directory, own_directory=own_directory)
+            try:
+                recover_gate_directory(directory, own_directory=own_directory)
+            except RollbackRecoveryRefused as error:
+                refusals.append(str(error))
+    if refusals:
+        raise RollbackRecoveryRefused("\n".join(refusals))
 
 
 def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
     """Recover dead owners while holding the directory lock."""
+    refusals: list[GateRefused] = []
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -857,7 +883,8 @@ def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
                 recover_gate_record(path)
             except GateRefused as error:
                 if directory == own_directory:
-                    raise
+                    refusals.append(error)
+                    continue
                 report_key = (os.getpid(), path)
                 if report_key not in _reported_foreign_gate_refusals:
                     reason = " ".join(str(error).splitlines())
@@ -865,6 +892,11 @@ def recover_gate_directory(directory: Path, *, own_directory: Path) -> None:
                     _reported_foreign_gate_refusals.add(report_key)
     finally:
         os.close(descriptor)
+    if refusals:
+        message = "\n".join(str(error) for error in refusals)
+        if all(isinstance(error, RollbackRecoveryRefused) for error in refusals):
+            raise RollbackRecoveryRefused(message)
+        raise GateRefused(message)
 
 
 def recover_gate_record(path: Path) -> None:
@@ -976,31 +1008,60 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 
 @contextmanager
 def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
+    request = build_folders.GateSuiteFolder(f"{tool}-", build_folders.ExplicitBuildParent(parent))
     with ExitStack() as cleanup:
-        with cancellation.defer_cleanup_signals():
-            request = build_folders.UniqueBuildFolder(f"{tool}-", build_folders.ExplicitBuildParent(parent))
-            folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
-            recovery.folders.append(str(folder))
-            recovery.save()
+        folder: Path | None = None
         try:
+            with cancellation.defer_cleanup_signals():
+                folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
+                recovery.folders.append(str(folder))
+                recovery.save()
+                journal = _ACTIVE_GATE_FOLDER_JOURNAL.get()
+                if journal is not None:
+                    owner = request.owner
+                    start: gate_record.GateFolderStart = {
+                        "folder": str(folder), "pid": owner.pid, "sha": journal.sha,
+                        "branch": journal.branch, "step": journal.step,
+                    }
+                    if isinstance(owner.start, Started):
+                        start["process_start"] = owner.start.start
+                    if isinstance(owner.boot, str):
+                        start["boot_id"] = owner.boot
+                    try:
+                        start["folder"] = str(folder.resolve())
+                    except (OSError, RuntimeError):
+                        pass
+                    journal.start = start
+                    gate_record.write_gate_folder_event(start)
             yield folder
         finally:
+            previous_signals = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            report_retention: Callable[[], None] | None = None
             try:
-                cleanup.close()
-            finally:
                 try:
-                    remaining = build_folders.temporary_allocation_entries(folder)
-                except OSError:
-                    report_retained_gate_folder(str(folder), "the gate could not confirm removal")
-                else:
-                    if folder in remaining:
-                        report_retained_gate_folder(str(folder), "the gate could not remove its folder")
-                    elif remaining:
-                        paths = ", ".join(map(str, remaining))
-                        report_retained_gate_folder(paths, "the gate could not remove its lease files")
-                    else:
-                        recovery.folders.remove(str(folder))
-                        recovery.save()
+                    cleanup.close()
+                finally:
+                    if folder is not None:
+                        try:
+                            remaining = build_folders.temporary_allocation_entries(folder)
+                        except OSError:
+                            report_retention = partial(
+                                report_retained_gate_folder, str(folder), "the gate could not confirm removal")
+                        else:
+                            if folder in remaining:
+                                report_retention = partial(
+                                    report_retained_gate_folder, str(folder), "the gate could not remove its folder")
+                            elif remaining:
+                                report_retention = partial(
+                                    report_retained_gate_folder, ", ".join(map(str, remaining)),
+                                    "the gate could not remove its lease files")
+                            else:
+                                recovery.folders.remove(str(folder))
+                                recovery.save()
+            finally:
+                _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous_signals)
+                if report_retention is not None:
+                    report_retention()
 
 
 def typecheck_venv_path() -> Path:
@@ -1132,7 +1193,7 @@ def read_time_limit(vcpus: int, modules: Sequence[str], jobs: int,
 
 def failure_log_tail(output: str) -> str:
     """Keep the same output limit as the saved failure log."""
-    limit = conf.read("test_times").whole("GATE_FAILURE_LOG_KIB") * 1024
+    limit = conf.read("test_times").whole("gate_failure_log_kib") * 1024
     return output.encode("utf-8")[-limit:].decode("utf-8", errors="replace")
 
 
@@ -1300,10 +1361,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         captured += f"\n{job.module}: a test attempted to write live configuration at {path or '(path unavailable)'}\n"
     times = (gate_record.TimingNotApplicable() if job.kind is GateJobKind.TYPE_CHECK
              else gate_record.read_module_times(job.log.parent / "test-times.json"))
-    try:
-        build_folders.remove_folder(job.log.parent)
-    finally:
-        job.folder_cleanup.close()
+    job.folder_cleanup.close()
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
@@ -1602,13 +1660,46 @@ def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | Unrecordabl
     return selection, ledger
 
 
+class GateFolderAllocation(Enum):
+    NOT_ALLOCATED = auto()
+
+
+@dataclass
+class GateFolderJournal:
+    sha: str
+    branch: str
+    step: str
+    start: gate_record.GateFolderStart | GateFolderAllocation = GateFolderAllocation.NOT_ALLOCATED
+    end_write_finished: bool = False
+
+
+_ACTIVE_GATE_FOLDER_JOURNAL: ContextVar[GateFolderJournal | None] = ContextVar(
+    "active_gate_folder_journal", default=None)
+
+
+def gate_folder_end(start: gate_record.GateFolderStart, end: gate_record.GateEnd) -> gate_record.GateFolderEnd:
+    fields: gate_record.GateFolderEnd = {"pid": start["pid"], "suite_folders": [start["folder"]], "end": end}
+    if "process_start" in start:
+        fields["process_start"] = start["process_start"]
+    if "boot_id" in start:
+        fields["boot_id"] = start["boot_id"]
+    return fields
+
+
+def gate_run_end(status: int) -> gate_record.GateEnd:
+    return "sigterm" if _GATE_RECEIVED_SIGTERM.get() else "red" if status else "normal"
+
+
 def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult],
                     results: Sequence[GateJobResult], suite_started: dict[str, float],
                     suite_finished: dict[str, float], *, started_at: float, wall_s: float,
                     hold_wait_s: float, selection: AffectedSelection | FullSuite | SelectedModules, reused: bool,
                     reason: str, status: int, max_jobs: int, peak_mib: float, cap_mib: float,
-                    aborted: bool, mode: SuiteMode) -> None:
+                    aborted: bool, mode: SuiteMode,
+                    folder_start: gate_record.GateFolderStart | GateFolderAllocation = GateFolderAllocation.NOT_ALLOCATED
+                    ) -> None:
     """Build one gate record without changing the gate verdict."""
+    end = gate_run_end(status)
     try:
         slow_test_s = gate_record.slow_test_s()
         recorded_executions = [
@@ -1625,7 +1716,9 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             for suite, began in suite_started.items()
         ]
         tested = ledger.tree
-        if isinstance(tested, CleanTestTree):
+        if not isinstance(folder_start, GateFolderAllocation):
+            sha, branch = folder_start["sha"], folder_start["branch"]
+        elif isinstance(tested, CleanTestTree):
             sha, branch = tested.commit, tested.branch
         else:
             sha, branch = checked_git(ledger.repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
@@ -1640,13 +1733,22 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             "checkout": str(ledger.repo), "branch": branch, "sha": sha,
             "tree": tested.tree if isinstance(tested, CleanTestTree) else "",
             "source": ledger.source, "step": mode.value, "aborted": aborted,
+            "end": end, "suite_folders": [],
             "dirty": isinstance(tested, UnrecordableTestTree),
             "dirty_paths": list(tested.dirty_paths[:50]) if isinstance(tested, UnrecordableTestTree) else [],
             "dirty_path_count": len(tested.dirty_paths) if isinstance(tested, UnrecordableTestTree) else 0,
             "suites": suites, "modules": modules, "slow_test_s": slow_test_s,
         }
+        if not isinstance(folder_start, GateFolderAllocation):
+            run.update(pid=folder_start["pid"], suite_folders=[folder_start["folder"]])
+            if "process_start" in folder_start:
+                run["process_start"] = folder_start["process_start"]
+            if "boot_id" in folder_start:
+                run["boot_id"] = folder_start["boot_id"]
     except Exception as error:
         gate_record.report_not_written(error)
+        if not isinstance(folder_start, GateFolderAllocation):
+            gate_record.write_gate_folder_event(gate_folder_end(folder_start, end), report_failure=False)
         return
     gate_record.write_gate_run(run, recorded_executions)
 
@@ -1692,6 +1794,73 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
             report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
+_GATE_RECEIVED_SIGTERM: ContextVar[bool] = ContextVar("gate_received_sigterm", default=False)
+
+
+@contextmanager
+def unwind_gate_on_sigterm() -> Generator[None]:
+    """Finish test cleanup before the default action for a stop signal."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    handlers = {
+        signum: handler
+        for signum in cancellation.CANCELLATION_SIGNALS
+        if (handler := signal.getsignal(signum)) is signal.SIG_DFL
+        or (signum is signal.SIGINT and handler is signal.default_int_handler)
+    }
+    if not handlers:
+        yield
+        return
+    token = _GATE_RECEIVED_SIGTERM.set(False)
+    stopped_by: signal.Signals | None = None
+    interrupted_journal: GateFolderJournal | None = None
+
+    def terminate(number: int, _frame: object) -> None:
+        nonlocal stopped_by, interrupted_journal
+        if stopped_by is not None:
+            return
+        stopped_by = signal.Signals(number)
+        _ = _GATE_RECEIVED_SIGTERM.set(stopped_by is signal.SIGTERM)
+        interrupted_journal = _ACTIVE_GATE_FOLDER_JOURNAL.get()
+        if handlers[stopped_by] is signal.default_int_handler:
+            raise KeyboardInterrupt
+        if stopped_by is not signal.SIGTERM:
+            # Preserve the operating system's immediate exit for these signals.
+            try:
+                write_interrupted_end()
+            finally:
+                _ = signal.signal(stopped_by, signal.SIG_DFL)
+                signal.raise_signal(stopped_by)
+        raise SystemExit(128 + number)
+
+    def write_interrupted_end() -> None:
+        if interrupted_journal is not None and not interrupted_journal.end_write_finished:
+            start = interrupted_journal.start
+            if not isinstance(start, GateFolderAllocation):
+                with cancellation.defer_cleanup_signals():
+                    gate_record.write_gate_folder_event(gate_folder_end(start, gate_run_end(1)))
+                    interrupted_journal.end_write_finished = True
+
+    def restore_handlers() -> None:
+        for signum, handler in handlers.items():
+            _ = signal.signal(signum, handler)
+        _GATE_RECEIVED_SIGTERM.reset(token)
+        if stopped_by is not None and handlers[stopped_by] is signal.SIG_DFL:
+            signal.raise_signal(stopped_by)
+
+    try:
+        for signum in handlers:
+            _ = signal.signal(signum, terminate)
+        yield
+    finally:
+        # The handler ignores later stop signals until the fallback ends.
+        try:
+            write_interrupted_end()
+        finally:
+            restore_handlers()
+
+
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1701,6 +1870,16 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                local_grant: LocalGateAssignment | NoLocalGateGrant = NO_LOCAL_GATE_GRANT,
                selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
+    with unwind_gate_on_sigterm() if source != "checkpoint" else nullcontext():
+        return _run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, source=source, full=full,
+                           mode=mode, machine=machine, local_grant=local_grant, selected=selected, time_limit=time_limit)
+
+
+def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float, max_running_jobs: int, *,
+                source: Literal["tests-only", "checkpoint"], full: bool, mode: SuiteMode,
+                machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine,
+                local_grant: LocalGateAssignment | NoLocalGateGrant, selected: AllModules | SelectedModules | NamedModules,
+                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit) -> GateRun:
     shared = not isinstance(machine, WholeMachine)
     rerun_failed_modules = shared or isinstance(selected, (SelectedModules, NamedModules)) or machine.rerun_failed_modules
     named = isinstance(selected, NamedModules)
@@ -1835,40 +2014,73 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
     time_limit_report = ""
+    if isinstance(tested_tree, CleanTestTree):
+        sha, branch = tested_tree.commit, tested_tree.branch
+    else:
+        try:
+            sha, branch = checked_git(repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
+        except Exception as error:
+            gate_record.report_not_written(error)
+            sha = branch = ""
+    journal = GateFolderJournal(sha, branch, mode.value)
+    began = time.monotonic()
+    started_at = time.time()
+    initial_hold_seconds = hold.seconds if hold is not None else 0.0
 
     def can_retry_memory_stop(result: GateJobResult) -> bool:
         return (result.memory_stopped and result.returncode != 0 and not result.tripwire_tripped
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
-        if ledger is None or admission is None or isinstance(selection, NamedModules):
-            return
-        waited = hold.waited_s() if hold is not None else 0.0
-        wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
-        record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
-                        wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
-                        reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
-                        cap_mib=admission.governor_mib, aborted=aborted, mode=mode)
+        with cancellation.defer_cleanup_signals():
+            end = gate_run_end(status)
+            if ledger is None or admission is None or isinstance(selection, NamedModules) or (
+                    aborted and not job_started and end != "sigterm"):
+                if not isinstance(journal.start, GateFolderAllocation):
+                    gate_record.write_gate_folder_event(gate_folder_end(journal.start, end))
+            else:
+                waited = hold.waited_s() if hold is not None else 0.0
+                wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
+                record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
+                                wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
+                                reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
+                                cap_mib=admission.governor_mib, aborted=aborted, mode=mode, folder_start=journal.start)
+            journal.end_write_finished = True
+
+    def suite_result() -> GateRun:
+        coverage = ModuleCoverage.COMPLETE if len(modules) == module_count else ModuleCoverage.SUBSET
+        return GateRun(tuple(results), elapsed, admission.peak_mib if admission is not None else 0.0, reused,
+                       isinstance(selection, (AffectedSelection, SelectedModules)), tuple(executions),
+                       time_limit_report, coverage=coverage)
 
     @contextmanager
-    def record_on_abort() -> Generator[None, None, None]:
+    def record_suite() -> Generator[None, None, None]:
+        nonlocal elapsed
+        token = _ACTIVE_GATE_FOLDER_JOURNAL.set(journal)
         try:
             yield
+            waited = hold.seconds if hold is not None else 0.0
+            elapsed = time.monotonic() - began - (waited - initial_hold_seconds)
+            status = int(not suite_result().passed)
+            record(status, aborted=False)
         except BaseException:
-            if job_started:
+            if not journal.end_write_finished and not isinstance(journal.start, GateFolderAllocation):
                 record(1, aborted=True)
             raise
+        finally:
+            _ACTIVE_GATE_FOLDER_JOURNAL.reset(token)
 
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
     hold_check = hold if hold is not None else NoBuildHoldCheck()
-    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(),
+    cpu_pool_scope = _shared_cpu_pool if source == "checkpoint" else shared_cpu_pool
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_suite(),
           gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
           (nullcontext(local_grant.suite_place()) if placed else
            gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if needs_shared_slots
            else nullcontext(None)) as reservation,
-          (shared_cpu_pool() if needs_shared_slots else nullcontext(NoSharedCPU())) as cpu_pool):
+          (cpu_pool_scope() if needs_shared_slots else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
         started_at = datetime.now(UTC).timestamp()
@@ -2099,13 +2311,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         if reservation is not None:
             reservation.status = int(any(result.returncode for result in results))
     hold_seconds = hold.seconds if hold is not None else 0.0
-    peak_mib = admission.peak_mib if admission is not None else 0.0
-    elapsed = time.monotonic() - began - (hold_seconds - initial_hold_seconds)
-    coverage = ModuleCoverage.COMPLETE if len(modules) == module_count else ModuleCoverage.SUBSET
-    run = GateRun(tuple(results), elapsed, peak_mib, reused,
-                  isinstance(selection, (AffectedSelection, SelectedModules)), tuple(executions), time_limit_report,
-                  coverage=coverage)
-    record(0 if run.passed else 1, aborted=False)
+    run = suite_result()
+    peak_mib = run.peak_memory_mib
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
     for suite in suites:
@@ -2186,6 +2393,19 @@ def promotion_edit_conflict(repo: Path, target: str, waiting: str = "") -> str:
     return ""
 
 
+def live_file_refusal(repo: Path, target: str) -> str:
+    """Report all conflicts between the incoming tree and enrolled live files."""
+    from scripts.production.production_doc import ProductionPathsError, live_file_conflicts
+
+    try:
+        conflicts = live_file_conflicts(repo, target)
+    except ProductionPathsError as error:
+        return f"cannot verify live files: {error}"
+    if conflicts:
+        return "incoming tree conflicts with live production files\n" + "\n".join(map(str, conflicts))
+    return ""
+
+
 def live_state_refusal(repo: Path, target: str) -> str:
     """Run the target tree's live state checks before its code is installed."""
     with tempfile.TemporaryDirectory(prefix="promotion-state-") as temporary:
@@ -2257,6 +2477,20 @@ def push_record_path(repo: Path, operation: str, source: str) -> Path:
     return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
 
 
+def promotion_record_path(repo: Path, branch: str, tip: str) -> Path:
+    return push_record_path(repo, "promotion", f"{branch}:{tip}")
+
+
+def promotion_retry_record(source: Path, main: Path, branch: str, tip: str) -> RecordedPush | NoRecordedPush:
+    """Find the receipt for the local tip in either checkout."""
+    for checkout in dict.fromkeys((source, main)):
+        for path in (promotion_record_path(checkout, branch, tip), push_record_path(checkout, "promotion", branch)):
+            record = read_push_record(path)
+            if isinstance(record, RecordedPush) and record.commit == tip and record.source_commit == tip:
+                return record
+    return NoRecordedPush()
+
+
 def read_push_record(path: Path) -> RecordedPush | NoRecordedPush:
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
@@ -2287,71 +2521,94 @@ def write_push_record(path: Path, record: RecordedPush) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
+def checkpoint_retry_record(repo: Path, origin: str, checkpoint: str, head: str, *,
+                            legacy: Path | None = None) -> RecordedPush | NoRecordedPush:
     """Trust only this checkpoint's recorded merge, with its original parents."""
     record = read_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint))
-    if isinstance(record, NoRecordedPush):
-        return origin
-    head = checked_git(repo, "rev-parse", "HEAD")
-    if head != record.commit or record.source_commit != checkpoint:
-        return origin
+    if isinstance(record, NoRecordedPush) and legacy is not None:
+        record = read_push_record(push_record_path(legacy, "checkpoint", origin + ":" + checkpoint))
+    if isinstance(record, NoRecordedPush) or head != record.commit or record.source_commit != checkpoint:
+        return NoRecordedPush()
+    if checked_git(repo, "rev-parse", origin) == head:
+        return NoRecordedPush()
     parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()
-    if (parents != [record.commit, record.base, checkpoint]
-            or checked_git(repo, "rev-parse", origin) != record.base):
-        return origin
-    return record.commit
+    return record if parents == [record.commit, record.base, checkpoint] else NoRecordedPush()
 
 
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
+    from scripts.production.checkpoint_gate import Stop
+
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
+    source = Path(args.repo).expanduser().resolve() if args.enrolled else main_repo
     hold = BuildHoldWait()
     hold.wait_until_free()
     wait_for_release_lock(release_lock_wait_s, release_lock_poll_s)
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
     hold.wait_until_free()
-    with main_push_lock.main_push_lock(main_repo):
-        fetch_branches(main_repo, "main", args.merge_branch)
-        head = checked_git(main_repo, "rev-parse", "HEAD")
-        origin = checked_git(main_repo, "rev-parse", "origin/main")
-        path = push_record_path(main_repo, "promotion", args.merge_branch)
-        target = checked_git(main_repo, "rev-parse", f"origin/{args.merge_branch}")
+    with main_push_lock.main_push_lock(source):
+        fetch_branches(source, "main", args.merge_branch)
+        head = checked_git(source, "rev-parse", "refs/heads/main")
+        origin = checked_git(source, "rev-parse", "origin/main")
+        target = checked_git(source, "rev-parse", f"origin/{args.merge_branch}")
         if head != origin:
-            record = read_push_record(path)
-            if (not isinstance(record, RecordedPush) or head != record.commit
-                    or record.source_commit != record.commit
-                    or git(main_repo, "merge-base", "--is-ancestor", origin, head).returncode
-                    or git(main_repo, "merge-base", "--is-ancestor", head, target).returncode):
+            record = promotion_retry_record(source, main_repo, args.merge_branch, head)
+            if (isinstance(record, NoRecordedPush)
+                    or git(source, "merge-base", "--is-ancestor", origin, head).returncode
+                    or git(source, "merge-base", "--is-ancestor", head, target).returncode):
                 raise GateRefused("main HEAD differs from origin/main")
-            target = record.commit
-        if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
+        if git(source, "merge-base", "--is-ancestor", origin, target).returncode:
             raise GateRefused("main is not an ancestor of the merge branch")
+        if refusal := live_file_refusal(source, target):
+            raise GateRefused(refusal)
         if conflict := promotion_edit_conflict(main_repo, target, waiting_rows.WAITING_PATHS):
             raise GateRefused(conflict)
-        if refusal := live_state_refusal(main_repo, target):
+        if refusal := live_state_refusal(source, target):
             raise GateRefused(refusal)
-        write_push_record(path, RecordedPush(origin, target, target))
+
+        def install(approved: promotion.ApprovedPromotion) -> None:
+            def advance() -> None:
+                # Save the receipt before the ref update. A retry can verify the local tip.
+                path = promotion_record_path(source, args.merge_branch, approved.sha)
+                if not create_text_atomic(path, json.dumps({"base": origin, "commit": approved.sha, "source_commit": approved.sha})):
+                    existing = read_push_record(path)
+                    if not isinstance(existing, RecordedPush) or existing.commit != approved.sha or existing.source_commit != approved.sha:
+                        raise GateRefused(f"promotion receipt changed: {path}")
+                try:
+                    approved.install(main_repo, head)
+                except (OSError, UnicodeError) as error:
+                    raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
+
+            landed = approved.land(source, installation=promotion.MainInstallation(main_repo, advance))
+            print(land_main.hook_report(landed.hook), flush=True)
+
         try:
-            waiting_rows.move_to(main_repo, target)
-        except (OSError, UnicodeError) as error:
-            raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
-        try:
-            landed = land_main.land(main_repo, target)
-        except land_main.LandError as error:
+            if args.legacy_direct_main:
+                published = promotion.publish_legacy_main(source, target, install)
+            else:
+                document = change_review.production_doc(args.production)
+                published = promotion.publish(promotion.CollectedCi(document), source, args.merge_branch, target, install)
+        except (Stop, change_review.ChangeReviewError, land_main.LandError, ValueError) as error:
             raise GateRefused(str(error)) from error
-        print(land_main.hook_report(landed.hook), flush=True)
-        promoted = checked_git(main_repo, "rev-parse", "HEAD")
+    promote_mac(args, main_repo, published)
+
+
+def promote_mac(args: GateArguments, main_repo: Path, published: promotion.PublishedMain) -> None:
+    promoted = published.sha
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
     mac_repo = str(args.mac_repo)
     remote_path = '"$HOME"/' + shlex.quote(mac_repo[2:]) if mac_repo.startswith("~/") else shlex.quote(mac_repo)
-    check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + " origin/main"
+    check = "python3 -c " + shlex.quote(PROMOTION_TRACKED_CHECK) + f" {shlex.quote(promoted)}"
     waiting = shlex.quote(waiting_rows.WAITING_PATHS)
     remote = (f"(cd {remote_path} && "
               "git fetch -q origin +refs/heads/main:refs/remotes/origin/main && "
+              f"if git merge-base --is-ancestor {shlex.quote(promoted)} HEAD; then "
               "if [ -f scripts/lib/waiting_rows.py ]; "
-              f"then {check} {waiting} && scripts/lib/py scripts/lib/waiting_rows.py fast-forward origin/main; "
-              f"else {check} && git merge --ff-only -q origin/main; fi); rc=$?; "
+              "then scripts/lib/py scripts/lib/waiting_rows.py fast-forward HEAD; fi; "
+              "elif [ -f scripts/lib/waiting_rows.py ]; "
+              f"then {check} {waiting} && scripts/lib/py scripts/lib/waiting_rows.py fast-forward {shlex.quote(promoted)}; "
+              f"else {check} && git merge --ff-only -q {shlex.quote(promoted)}; fi); rc=$?; "
               "printf 'ff_rc=%s\\n' \"$rc\"; exit 0")
     try:
         result = subprocess.run([args.ssh, args.mac_host, remote],
@@ -2366,23 +2623,93 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {detail}; the claude-sync job on the Mac retries within 15 minutes")
 
 
-def rollback_merge(repo: Path, baseline: str) -> None:
-    if git(repo, "rev-parse", "--verify", "MERGE_HEAD").returncode == 0:
-        _ = git(repo, "merge", "--abort")
-    merged = checked_git(repo, "rev-parse", "HEAD")
-    result = git(repo, "reset", "--keep", baseline)
-    if result.returncode == 0:
-        return
-    # The checkout started clean. Tracked edits created during the gate belong
-    # to this run; restore them to the merge tree before retrying once.
-    changed = checked_git(repo, "diff", "HEAD", "--name-only", "-z").split("\0")
-    tracked = [path for path in changed if path]
+@contextmanager
+def hold_rollback_head(repo: Path, baseline: str, head: str) -> Generator[None]:
+    """Prepare the ref change and commit it after the tree update."""
+    operation = f"verify HEAD {baseline}" if head == baseline else f"update HEAD {baseline} {head}"
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as errors:
+        with subprocess.Popen(["git", "update-ref", "-m", "gate rollback", "--stdin"], cwd=repo, stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=errors, text=True,
+                              errors="replace", pass_fds=copies.COMMAND_LOCKS.get()) as transaction:
+            input_stream = transaction.stdin
+            assert input_stream is not None
+            output = cast(TextIO, transaction.stdout)
+
+            def reply(commands: str) -> str:
+                with suppress(BrokenPipeError):
+                    _ = input_stream.write(commands + "\n")
+                    input_stream.flush()
+                return output.readline()
+
+            action = "prepare"
+            try:
+                response = reply("start")
+                if response == "start: ok\n":
+                    response = reply(f"{operation}\nprepare")
+                if response == "prepare: ok\n":
+                    try:
+                        yield
+                    except BaseException as error:
+                        aborted = reply("abort")
+                        if aborted != "abort: ok\n":
+                            error.add_note(f"Git did not confirm the rollback abort. {aborted.strip()}")
+                        raise
+                    action = "commit"
+                    response = reply("commit")
+                    if response == "commit: ok\n":
+                        return
+            finally:
+                # Git aborts an open transaction at EOF.
+                with suppress(BrokenPipeError):
+                    input_stream.close()
+            response = (response + output.read()).strip()
+        _ = errors.seek(0)
+        detail = "\n".join(part for part in (response, errors.read().strip()) if part)
+    raise rollback_failure(repo, head, f"cannot {action} the rollback ref transaction: {detail}")
+
+
+def rollback_failure(repo: Path, merged: str, detail: str) -> GateRefused:
+    blocking = git(repo, "status", "--porcelain", "--untracked-files=all").stdout.strip()
+    return GateRefused(f"merge NOT undone; merge commit {merged}; blocking files: {blocking or detail}; {detail}")
+
+
+def restore_rollback_files(repo: Path, merged: str) -> None:
+    staged = checked_git(repo, "diff", "--cached", merged, "--no-renames", "--name-only", "-z")
+    dirty = checked_git(repo, "diff", "--no-renames", "--name-only", "-z")
+    tracked = sorted(set(staged.split("\0") + dirty.split("\0")) - {""})
     if tracked:
-        _ = git(repo, "restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked)
-    result = git(repo, "reset", "--keep", baseline)
-    if result.returncode:
-        blocking = git(repo, "status", "--porcelain", "--untracked-files=all").stdout.strip()
-        raise GateRefused(f"merge NOT undone; merge commit {merged}; blocking files: {blocking or result.stderr.strip()}; {result.stderr.strip()}")
+        _ = checked_git(repo, "--literal-pathspecs", "restore", f"--source={merged}",
+                        "--staged", "--worktree", "--", *tracked)
+
+
+def rollback_merge(repo: Path, baseline: str, *, checkpoint: str = "", recorded_merge: str = "",
+                   recovery: GateRecovery | NoGateRecovery = NO_GATE_RECOVERY) -> None:
+    head = checked_git(repo, "rev-parse", "HEAD")
+    if head not in (baseline, recorded_merge):
+        if recorded_merge or (checkpoint and checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()[1:]
+                              != [baseline, checkpoint]):
+            raise GateRefused(f"rollback kept HEAD {head}: it differs from the gate merge")
+    merged = recorded_merge or head
+    # Keep the source tree in the record until the ref transaction ends.
+    if head != baseline and isinstance(recovery, GateRecovery) and recovery.rollback_head != merged:
+        recovery.rollback_head = merged
+        recovery.save()
+    with hold_rollback_head(repo, baseline, head):
+        pending = git(repo, "rev-parse", "--verify", "MERGE_HEAD")
+        if pending.returncode == 0:
+            if pending.stdout.strip() != checkpoint or git(repo, "rev-parse", "--verify", "MERGE_AUTOSTASH").returncode == 0:
+                raise GateRefused("rollback kept the pending merge: the gate cannot undo it")
+            restore_rollback_files(repo, merged)
+        result = git(repo, "read-tree", "-m", "-u", merged, baseline)
+        if result.returncode:
+            # Remove tracked edits from the gate before Git tries the tree update again.
+            restore_rollback_files(repo, merged)
+            result = git(repo, "read-tree", "-m", "-u", merged, baseline)
+        if result.returncode:
+            raise rollback_failure(repo, merged, failure_detail(result))
+        _ = checked_git(repo, "read-tree", "--reset", baseline)
+        if pending.returncode == 0:
+            _ = checked_git(repo, "merge", "--quit")
 
 
 def notify_style(repo: Path, branch: str, tip: str) -> None:
@@ -2407,11 +2734,11 @@ def notify_style(repo: Path, branch: str, tip: str) -> None:
 DOC_COMMIT_HEAD = "production("
 
 
-def check_local_doc_commits(repo: Path, origin: str) -> None:
-    """The merge HEAD is origin's merge branch plus only production doc commits, which go out with the merge."""
-    if git(repo, "merge-base", "--is-ancestor", origin, "HEAD").returncode:
+def check_local_doc_commits(repo: Path, origin: str, merge_base: str) -> None:
+    """Permit only production doc commits between the remote branch and the pre-merge tip."""
+    if git(repo, "merge-base", "--is-ancestor", origin, merge_base).returncode:
         raise GateRefused("merge HEAD differs from origin merge branch")
-    ahead = checked_git(repo, "log", "--format=%H %P%x09%s", f"{origin}..HEAD")
+    ahead = checked_git(repo, "log", "--format=%H %P%x09%s", f"{origin}..{merge_base}")
     for line in ahead.splitlines():
         hashes, _, subject = line.partition("\t")
         if len(hashes.split()) != 2 or not subject.startswith(DOC_COMMIT_HEAD):
@@ -2419,12 +2746,18 @@ def check_local_doc_commits(repo: Path, origin: str) -> None:
         print(f"Local doc commit goes out with this merge: {hashes.split()[0][:12]} {subject}", flush=True)
 
 
+def merge_for_gate(repo: Path, checkpoint: str, message: str) -> str:
+    result = git(repo, "merge", "--no-overwrite-ignore", "--no-ff", "-m", message, checkpoint)
+    if result.returncode:
+        conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
+        raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}")
+    return checked_git(repo, "rev-parse", "HEAD")
+
+
 def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     hold = BuildHoldWait()
     hold.wait_until_free()
-    repo = Path(str(args.repo)).resolve()
-    # Untracked files (each showrunner's LOG) never block; a merge that would
-    # overwrite one fails on its own and is aborted.
+    repo = Path(args.repo).expanduser().resolve()
     if checked_git(repo, "status", "--porcelain", "--untracked-files=no"):
         raise GateRefused("merge checkout has uncommitted tracked changes")
     if checked_git(repo, "branch", "--show-current") != args.merge_branch:
@@ -2433,7 +2766,10 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     baseline = checked_git(repo, "rev-parse", "HEAD")
     checkpoint = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.checkpoint}^{{commit}}")
     origin = f"origin/{args.merge_branch}"
-    check_local_doc_commits(repo, checkpoint_retry_origin(repo, origin, checkpoint))
+    legacy = Path(args.main_repo).expanduser() if args.enrolled else None
+    retry = checkpoint_retry_record(repo, origin, checkpoint, baseline, legacy=legacy)
+    pre_merge = retry.base if isinstance(retry, RecordedPush) else baseline
+    check_local_doc_commits(repo, origin, pre_merge)
     previous = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.previous_checkpoint}^{{commit}}")
     if git(repo, "merge-base", "--is-ancestor", checkpoint, f"origin/{args.unit_branch}").returncode:
         raise GateRefused("checkpoint is not on origin unit branch")
@@ -2453,30 +2789,37 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
             _ = change_review.publication_changes(commits, production, known_producer=producer)
         except (change_review.ChangeReviewError, OSError) as error:
             raise GateRefused(f"{error}: the staff record is read before the merge") from error
+    preview = git(repo, "merge-tree", "--write-tree", "--name-only", baseline, checkpoint)
+    if preview.returncode not in (0, 1) or not preview.stdout:
+        raise GateRefused(f"cannot preview checkpoint merge: {failure_detail(preview)}")
+    if refusal := live_file_refusal(repo, preview.stdout.splitlines()[0]):
+        raise GateRefused(refusal)
+    if args.legacy_direct_main:
+        try:
+            change = behavior_check.GitRange(repo, pre_merge, checkpoint).comparison_range()
+            behavior_check.require_review(change)
+        except (behavior_check.BehaviorCheckError, OSError) as error:
+            raise GateRefused(str(error)) from error
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     recovery = ACTIVE_GATE_RECOVERY.get()
+    merged = ""
     if isinstance(recovery, GateRecovery):
         recovery.rollback = baseline
-        recovery.rollback_head = baseline
+        recovery.rollback_head = merged
         recovery.rollback_source = checkpoint
         recovery.save()
     try:
         hold.wait_until_free()
-        result = git(repo, "merge", "--no-ff", "-m", f"{subject}\n\n{args.body}", checkpoint)
-        if result.returncode:
-            conflicts = git(repo, "diff", "--name-only", "--diff-filter=U").stdout.strip()
-            abort = git(repo, "merge", "--abort")
-            raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
-                              + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
-        merged = checked_git(repo, "rev-parse", "HEAD")
+        receipt = push_record_path(repo, "checkpoint", origin + ":" + checkpoint)
+        message = f"{subject}\n\n{args.body}"
+        merged = merge_for_gate(repo, checkpoint, message)
         if isinstance(recovery, GateRecovery):
             recovery.rollback_head = merged
             recovery.save()
         if isinstance(producer, str):
             change_review.record_merge_producer(change_review.KnownMergeProducer(merged, producer))
         if merged != baseline:
-            write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
-                              RecordedPush(baseline, merged, checkpoint))
+            write_push_record(receipt, RecordedPush(baseline, merged, checkpoint))
         previous_unit = os.environ.get(admission_records.BUILDLOG_UNIT)
         os.environ[admission_records.BUILDLOG_UNIT] = args.unit
         try:
@@ -2492,15 +2835,19 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
             if suites.time_limit_report:
                 tell_time_limit(args.unit, repo, suites)
             raise GateRefused("RED: " + (suites.time_limit_report or "types or suites failed"))
+        if checked_git(repo, "rev-parse", "HEAD") != merged:
+            raise GateRefused(f"checkout changed after the gate selected {merged}")
         fetch_branches(repo, "main")
-        if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
+        if git(repo, "merge-base", "--is-ancestor", "origin/main", merged).returncode:
             raise GateRefused("origin/main is not an ancestor of the merge branch")
         hold.wait_until_free()
+        if refusal := live_file_refusal(repo, merged):
+            raise GateRefused(refusal)
     except (KeyboardInterrupt, SystemExit):
         raise
     except BaseException as error:
         try:
-            rollback_merge(repo, baseline)
+            rollback_merge(repo, baseline, checkpoint=checkpoint, recorded_merge=merged, recovery=recovery)
             if isinstance(recovery, GateRecovery):
                 recovery.rollback = ""
                 recovery.save()
@@ -2517,9 +2864,16 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     if isinstance(recovery, GateRecovery):
         recovery.rollback = ""
         recovery.save()
-    _ = checked_git(repo, "push", "origin", str(args.merge_branch))
-    notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
-    print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
+    if args.legacy_direct_main:
+        _ = checked_git(repo, "push", "origin", "main")
+    else:
+        from scripts.production.checkpoint_gate import Stop
+        try:
+            promotion.push_integration(repo, merged, args.merge_branch)
+        except Stop as error:
+            raise GateRefused(error.detail) from error
+    notify_style(repo, str(args.merge_branch), merged)
+    print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', merged)}", flush=True)
     if args.promote:
         promote(args)
     if review_list is not None:
@@ -2529,7 +2883,31 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     return 0
 
 
-def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
+def gate_production(args: GateArguments) -> Path:
+    """Resolve the publication checkout from the exact staff document."""
+    from scripts.production.production_doc import EnrolledPaths, LegacyProduction, Refusal, production_field, resolve_production_paths
+
+    try:
+        document = change_review.production_doc(args.production)
+        paths = resolve_production_paths(document)
+        merge_branch = production_field(document.read_text(encoding="utf-8").splitlines(), "Merge branch")
+        if args.merge_branch != merge_branch:
+            raise GateRefused(f"{document}: expected merge branch {merge_branch}")
+        args.legacy_direct_main = isinstance(paths, LegacyProduction) and merge_branch == "main"
+        if isinstance(paths, EnrolledPaths):
+            if promotion.is_main_branch(merge_branch):
+                raise GateRefused(f"{document}: main is not an integration branch")
+            args.repo = str(paths.integration)
+            args.main_repo = str(paths.main)
+            args.enrolled = True
+        return document
+    except change_review.ChangeReviewError as error:
+        raise GateRefused(f"{error}: the gate adds this merge's change-review rows to its list") from error
+    except Refusal as error:
+        raise GateRefused(str(error)) from error
+
+
+def change_review_list(args: GateArguments, document: Path | None = None) -> tuple[Path, Path | None]:
     """The production whose merge this is, and the list its rows go to: --change-review, else its own.
 
     The production is --production, else the calling showrunner's. Rows always name their
@@ -2538,7 +2916,7 @@ def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
     if args.change_review and not args.production:
         raise GateRefused("--change-review needs --production: every row's list names its production")
     try:
-        production = change_review.production_doc(str(args.production))
+        production = document if document is not None else change_review.production_doc(str(args.production))
     except change_review.ChangeReviewError as error:
         raise GateRefused(f"{error}: the gate adds this merge's change-review rows to its list") from error
     if args.change_review:
@@ -2620,19 +2998,19 @@ def push_nightly_result(args: GateArguments, result: GateRun | Exception) -> Non
     try:
         from scripts.message import send_budget
         from scripts.notify import push_texts, review
-        from scripts.notify.pushover import MESSAGE_MAX
+        from scripts.notify.pushover import phone_message_limit
         config = conf.read("gate")
         if config.text("nightly_result_push") == "off":
             return
-        values = {"branch": args.merge_branch, "time": datetime.now(user_zone()).strftime("%H:%M %Z")}
         if isinstance(result, Exception):
-            values["action"] = "None. The next nightly run tries again."
-            values["reason"] = ""
+            values = {"action": "", "reason": "", "next_run": nightly_schedule.nightly_next_run()}
             empty = push_texts.render("nightly.not_run", **values)
             reason = " ".join(str(result).split()).rstrip(".") or type(result).__name__
-            values["reason"] = reason[:max(0, MESSAGE_MAX - len(empty.message))].rstrip(".")
+            room = phone_message_limit(empty.sender, empty.id) - len(empty.message)
+            values["reason"] = reason[:max(0, room)].rstrip(" .")
             rendered = push_texts.render("nightly.not_run", **values)
         else:
+            values = {"branch": args.merge_branch, "time": datetime.now(user_zone()).strftime("%H:%M %Z")}
             values.update(nightly_check_values(result))
             rendered = push_texts.render("nightly.result", **values)
         sent = subprocess.run(push_texts.user_send_argv(rendered, key="nightly-result"),
@@ -3182,8 +3560,8 @@ def nightly(args: GateArguments, target: GateTarget = "natedev") -> int:
         raise
 
 
-def add_suite_arguments(parser: argparse.ArgumentParser) -> None:
-    _ = parser.add_argument("--repo", "--checkout", default=str(Path.cwd()))
+def add_suite_arguments(parser: argparse.ArgumentParser, *, repo_default: str) -> None:
+    _ = parser.add_argument("--repo", "--checkout", default=repo_default)
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="stop a module after this many seconds (default: 1800). "
                                  + "Named modules on natedev have no time limit. "
@@ -3689,30 +4067,6 @@ def run_named_modules(repo: Path, names: Sequence[str], mode: SuiteMode, *,
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
 
-@contextmanager
-def unwind_gate_on_sigterm() -> Generator[None]:
-    """Finish test cleanup before the default SIGTERM action."""
-    if (threading.current_thread() is not threading.main_thread()
-            or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL):
-        yield
-        return
-    terminated = False
-
-    def terminate(number: int, _frame: object) -> None:
-        nonlocal terminated
-        if not terminated:
-            terminated = True
-            raise SystemExit(128 + number)
-
-    try:
-        _ = signal.signal(signal.SIGTERM, terminate)
-        yield
-    finally:
-        _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        if terminated:
-            signal.raise_signal(signal.SIGTERM)
-
-
 def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> int:
     try:
         repo = Path(args.repo).expanduser().resolve()
@@ -3767,46 +4121,39 @@ def _sweep_nightly_build_folders() -> None:
                       + " ".join(str(notice_error).splitlines()), flush=True)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    prepared = os.environ.get("BUILDLOG_PREPARED_COPY")
-    handed_off = copies.take_prepared_gate_handoff()
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
-        nightly_parser = argparse.ArgumentParser(prog=f"gate.py {arguments[0]}", allow_abbrev=False)
-        if arguments[0] == "nightly-assigned":
-            _ = nightly_parser.add_argument("--unit", required=True)
-            _ = nightly_parser.add_argument("--result", default="")
-        class NightlyArguments(argparse.Namespace):
-            unit: str = ""
-            result: str = ""
-        options = nightly_parser.parse_args(arguments[1:], namespace=NightlyArguments())
-        try:
-            return assign_nightly_red(options.unit, options.result) if arguments[0] == "nightly-assigned" else check_nightly_assignments()
-        except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
-            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
-            return 1
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    add_suite_arguments(parser)
+class NightlyArguments(argparse.Namespace):
+    unit: str = ""
+    result: str = ""
+
+
+def parse_nightly_arguments(arguments: Sequence[str], parser: argparse.ArgumentParser) -> NightlyArguments:
+    if arguments[0] == "nightly-assigned":
+        _ = parser.add_argument("--unit", required=True)
+        _ = parser.add_argument("--result", default="")
+    return parser.parse_args(arguments[1:], namespace=NightlyArguments())
+
+
+def parse_gate_arguments(arguments: Sequence[str], parser: argparse.ArgumentParser, *,
+                         repo_default: str) -> GateArguments:
+    parser.description = __doc__
+    add_suite_arguments(parser, repo_default=repo_default)
     for name in ("merge-branch", "unit-branch", "checkpoint", "previous-checkpoint", "unit", "phase"):
         _ = parser.add_argument(f"--{name}", default="")
-    _ = parser.add_argument("--body", default="The full suite verified this checkpoint.")
+    _ = parser.add_argument("--body", default=GateArguments.body)
     _ = parser.add_argument("--change-review", default="", help="the change-review list to add rows to")
     _ = parser.add_argument("--production", default="",
                             help="the production staff name (default: the calling showrunner's)")
     _ = parser.add_argument("--promote", action="store_true")
-    _ = parser.add_argument("--main-repo", "--main-checkout", default="~/.claude")
-    _ = parser.add_argument("--ssh", default="ssh")
-    _ = parser.add_argument("--mac-host", default="mac")
-    _ = parser.add_argument("--mac-repo", default="~/.claude")
+    _ = parser.add_argument("--main-repo", "--main-checkout", default=GateArguments.main_repo)
+    _ = parser.add_argument("--ssh", default=GateArguments.ssh)
+    _ = parser.add_argument("--mac-host", default=GateArguments.mac_host)
+    _ = parser.add_argument("--mac-repo", default=GateArguments.mac_repo)
     _ = parser.add_argument("--tests-only", action="store_true")
     _ = parser.add_argument("--affected", action="store_true", help="run affected tests in a temporary test folder")
     _ = parser.add_argument("--nightly", action="store_true", help="fetch and fully test origin/<merge-branch> in a shared clone")
     _ = parser.add_argument("--promote-only", action="store_true",
-                            help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
-    args = cast(GateArguments, parser.parse_args(arguments))
-    args.command = ("gate.py", *arguments)
-    args.gate_job = gate_job_for_command(args.command)
-    args.prepared_copy = bool(handed_off and prepared and Path(prepared) == Path(args.repo).expanduser().resolve())
+                            help="promote origin/<merge-branch> to main and the Mac with a collected CI verdict")
+    args = parser.parse_args(arguments, namespace=GateArguments(repo=repo_default))
     if args.affected and (args.tests_only or args.nightly or args.promote_only or args.promote):
         parser.error("--affected cannot be combined with --tests-only, --nightly or promotion")
     if args.promote_only and not args.merge_branch:
@@ -3825,6 +4172,66 @@ def main(argv: Sequence[str] | None = None) -> int:
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
+    for name in args.modules:
+        if name.startswith("scripts/"):
+            parser.error(f"--module {name!r} needs a path under scripts/, for example lib/test_x.py")
+    return args
+
+
+def check_named_modules(repo: Path, names: Sequence[str]) -> None:
+    scripts = repo / "scripts"
+    for name in names:
+        relative = Path(name)
+        path = scripts / relative
+        if (len(relative.parts) < 2 or relative.is_absolute() or relative.as_posix() != name
+                or ".." in relative.parts or "__pycache__" in relative.parts[:-1]
+                or not is_test_module(name)
+                or any((scripts / parent).is_symlink() for parent in relative.parents if parent != Path("."))
+                or not path.is_file()):
+            raise GateRefused(f"--module {name!r} does not name a test module in {repo}. "
+                              + "Use a path under scripts/, for example lib/test_x.py.")
+
+
+def check_prepared_gate_source(arguments: Sequence[str], parser: argparse.ArgumentParser, source: Path) -> None:
+    """Check the gate arguments and named modules in the prepared source."""
+    if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
+        _ = parse_nightly_arguments(arguments, parser)
+        return
+    args = parse_gate_arguments(arguments, parser, repo_default=".")
+    if args.nightly and args.unit:
+        try:
+            _ = _nightly_unit(args)
+        except copies.CopyError as error:
+            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+            raise SystemExit(1) from None
+    if not args.modules:
+        return
+    repo = (source / Path(args.repo).expanduser()).resolve()
+    if not repo.is_relative_to(source):
+        parser.error("The gate --repo must stay in the prepared source. Use --repo '{tree}'.")
+    try:
+        check_named_modules(repo, args.modules)
+    except GateRefused as error:
+        parser.error(str(error))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    prepared = os.environ.get("BUILDLOG_PREPARED_COPY")
+    handed_off = copies.take_prepared_gate_handoff()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {"nightly-assigned", "nightly-check"}:
+        nightly_parser = argparse.ArgumentParser(prog=f"gate.py {arguments[0]}", allow_abbrev=False)
+        options = parse_nightly_arguments(arguments, nightly_parser)
+        try:
+            return assign_nightly_red(options.unit, options.result) if arguments[0] == "nightly-assigned" else check_nightly_assignments()
+        except (GateRefused, OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"REFUSED: {error}", file=sys.stderr, flush=True)
+            return 1
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    args = parse_gate_arguments(arguments, parser, repo_default=str(Path.cwd()))
+    args.command = ("gate.py", *arguments)
+    args.gate_job = gate_job_for_command(args.command)
+    args.prepared_copy = bool(handed_off and prepared and Path(prepared) == Path(args.repo).expanduser().resolve())
     try:
         if args.affected and not args.prepared_copy:
             try:
@@ -3851,7 +4258,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
             target = "natedev"
-        with (unwind_gate_on_sigterm() if args.tests_only else nullcontext()):
+        checkpoint = not (args.affected or args.tests_only or args.nightly or args.promote_only)
+        with unwind_gate_on_sigterm() if not checkpoint else nullcontext():
             return run_gate_command(args, target)
     except GatePlacementIncomplete as error:
         print(error, file=sys.stderr, flush=True)
@@ -3864,6 +4272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     if args.affected or args.tests_only:
         source = Path(args.repo).expanduser().resolve()
+        check_named_modules(source, args.modules)
         mode = SuiteMode.TARGETED if args.affected else SuiteMode.GATE
         with gate_cleanup_scope(test_run_folder() if args.affected else nullcontext()) as cleanup:
             assigned = cleanup.enter_context(gate_suite_target(args, source, target))
@@ -3871,17 +4280,21 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
     try:
         if args.nightly:
             args.unit = _nightly_unit(args)
-        checkout = Path(args.main_repo if args.promote_only else args.repo).expanduser().resolve()
+        document = gate_production(args) if not args.nightly else None
+        checkout = Path(args.main_repo if args.promote_only and not args.enrolled else args.repo).expanduser().resolve()
         if not (args.nightly or args.promote_only):
             with gate_cleanup_scope(scratch.copy_lock(checkout), gate_recovery(checkout)):
                 return merge_checkpoint(args, target)
         if args.nightly:
-            with gate_cleanup_scope(scratch.copy_lock(checkout), admission_records.default_owner(args.unit)) as cleanup:
-                _ = cleanup.callback(_sweep_nightly_build_folders)
-                return nightly(args, target)
+            with gate_cleanup_scope(scratch.copy_lock(checkout), admission_records.default_owner(args.unit)):
+                try:
+                    return nightly(args, target)
+                finally:
+                    if not _GATE_RECEIVED_SIGTERM.get():
+                        _sweep_nightly_build_folders()
         with scratch.copy_lock(checkout):
             promote(args)
-            production, review_list = change_review_list(args)
+            production, review_list = change_review_list(args, document)
             if review_list is not None:
                 record_changes(checkout, review_list, production, args.merge_branch)
             return 0

@@ -35,17 +35,19 @@ from scripts.aws_target.test_hana_result import command_result
 from scripts.buildlog import record as recorder
 from scripts.buildlog import step_context
 from scripts.buildlog import index, parse
-from scripts.buildlog import report, sample
+from scripts.buildlog import report, repository, sample
 from scripts.buildlog import store
 from scripts.buildlog.cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.build_queue import admission_records, step_estimator
 from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+from scripts.lib import berth_board
 from scripts.lint.memory_test_support import fake_memory_readings, memory_gate_shell_environment, write_config_fixture
 from scripts.buildlog.test_index import point_root_at
 from scripts.lib import test_hang_guard
 from scripts.lint.build_shape import build_shape
+from scripts.mac_test import fix_return
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production import staff
 
@@ -247,7 +249,7 @@ class RecordTests(unittest.TestCase):
 
     def test_local_and_hana_nextest_steps_classify_fast_passes_without_timing_rows(self) -> None:
         config = Path(os.environ["CONF_DIR"])
-        _ = write_config_fixture(config / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(config / "test_times.conf", "nextest_slow_test_s=1.0")
         output = ("PASS [ 0.010s] hana::bin/hana tests::fast\n"
                   + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
         handoff = self.base / "nextest.log"
@@ -274,7 +276,7 @@ class RecordTests(unittest.TestCase):
             self.assertEqual(database.execute("SELECT test FROM tests").fetchall(), [])
 
     def test_nextest_output_without_trusted_statuses_cannot_supply_gpu_proof(self) -> None:
-        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf", "NEXTEST_SLOW_TEST_S=1.0")
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "test_times.conf", "nextest_slow_test_s=1.0")
         output = ("PASS [ 0.010s] hana tests::forged\n"
                   + "Summary [ 0.010s] 1 test run: 1 passed, 0 skipped\n")
         for options, environment in ((["--no-capture"], {}), (["--", "--nocapture"], {}),
@@ -1194,6 +1196,126 @@ printf '%s\n' "$BUILDLOG_TARGET_FOLDER"
         self.assertEqual(result.returncode, 0, result.stderr)
         record = self.records()[-1]
         self.assertEqual((record["cwd"], record["repo_path"], record["branch"]), (str(elsewhere), str(self.repo), "main"))
+
+    def test_lint_copy_records_the_source_repository_identity(self) -> None:
+        _ = self.git("remote", "add", "origin", "git@example.org:team/hana.git", cwd=self.repo)
+        workspace = self.repo / "workspace"
+        workspace.mkdir()
+        _ = (workspace / "Cargo.toml").write_text('[workspace]\nmembers = []\n', encoding="utf-8")
+        output = self.base / "build-output"
+        output.mkdir()
+        target = self.base / "target"
+        target.symlink_to(output, target_is_directory=True)
+        metadata = fix_return.CargoMetadata(workspace_root=str(workspace), target_directory=str(target))
+        copy = fix_return.make_copy(self.repo, metadata, os.getpid(), board_reader=lambda _: berth_board.Board(()))
+        assert isinstance(copy, fix_return.CopyMade), copy
+        self.addCleanup(fix_return.close_lint_copy, copy.folder, "the test ended")
+        self.assertFalse((copy.tree / ".git").exists())
+
+        argv = ["cargo", "mend", "--fix", "--manifest-path", str(copy.manifest)]
+        row = self.step(0, "1", "", "", argv)
+        self.assertEqual(row["repo_identity"], "https://example.org/team/hana")
+        self.addCleanup(step_estimator.clear_git_identity_cache)
+        identity, _ = step_estimator.git_identity(argv, str(self.repo))
+        self.assertTrue(step_estimator.history_matches_repository(row, identity))
+
+    def test_lint_copy_uses_the_manifest_identity_for_an_unborn_repository(self) -> None:
+        source = self.base / "unborn"
+        source.mkdir()
+        _ = self.git("init", "-q", "-b", "main", cwd=source)
+        _ = (source / "Cargo.toml").write_text('[workspace]\nmembers = []\n', encoding="utf-8")
+        metadata = fix_return.CargoMetadata(workspace_root=str(source), target_directory=str(self.base / "target"))
+        copy = fix_return.make_copy(source, metadata, os.getpid(), board_reader=lambda _: berth_board.Board(()))
+        assert isinstance(copy, fix_return.CopyMade), copy
+        self.addCleanup(fix_return.close_lint_copy, copy.folder, "the test ended")
+
+        argv = ["cargo", "mend", "--fix", "--manifest-path", str(copy.manifest)]
+        row = self.step(0, "1", "", "", argv)
+        self.assertEqual(row["repo_identity"], f"manifest-path:{copy.manifest.resolve()}")
+
+    def test_only_lint_copy_names_can_supply_a_marker_and_git_takes_priority(self) -> None:
+        origin = "https://example.org/team/hana"
+        _ = self.git("remote", "add", "origin", origin, cwd=self.repo)
+        cases = (
+            (self.base / "verify-lint-copy-examples", None),
+            (self.repo / "verify-lint-copy-examples", origin),
+        )
+        for folder, git_key in cases:
+            with self.subTest(folder=folder):
+                tree = folder / "tree"
+                tree.mkdir(parents=True)
+                manifest = tree / "Cargo.toml"
+                _ = manifest.write_text('[workspace]\nmembers = []\n', encoding="utf-8")
+                _ = (folder / "repository-key").write_text("https://example.org/other/repo\n", encoding="utf-8")
+                self.assertEqual(repository.repository_key(str(tree)), git_key or f"manifest-path:{manifest}")
+
+    def test_lint_copy_marker_works_at_a_git_ceiling(self) -> None:
+        origin = "https://example.org/team/hana"
+        _ = self.git("remote", "add", "origin", origin, cwd=self.repo)
+        workspace = self.repo / "workspace"
+        workspace.mkdir()
+        _ = (workspace / "Cargo.toml").write_text('[workspace]\nmembers = []\n', encoding="utf-8")
+        metadata = fix_return.CargoMetadata(workspace_root=str(workspace), target_directory=str(self.base / "target"))
+        for _ in range(3):
+            copy = fix_return.make_copy(self.repo, metadata, os.getpid(), board_reader=lambda _: berth_board.Board(()))
+            assert isinstance(copy, fix_return.CopyMade), copy
+            self.addCleanup(fix_return.close_lint_copy, copy.folder, "the test ended")
+            with self.subTest(folder=copy.folder):
+                argv = ["cargo", "mend", "--fix", "--manifest-path", str(copy.manifest)]
+                row = self.step(0, "1", "", "", argv, extra={"GIT_CEILING_DIRECTORIES": str(copy.tree)})
+                self.assertEqual(row["repo_identity"], origin)
+
+    def test_lint_copy_keeps_its_key_under_another_checkout(self) -> None:
+        source_origin = "https://example.org/team/hana"
+        target_origin = "https://example.org/team/target"
+        target_repo = self.base / "target-repo"
+        _ = shutil.copytree(self.repo, target_repo)
+        _ = self.git("remote", "add", "origin", target_origin, cwd=target_repo)
+        _ = self.git("remote", "add", "origin", source_origin, cwd=self.repo)
+        workspace = self.repo / "workspace"
+        workspace.mkdir()
+        _ = (workspace / "Cargo.toml").write_text('[workspace]\nmembers = []\n', encoding="utf-8")
+        metadata = fix_return.CargoMetadata(workspace_root=str(workspace), target_directory=str(target_repo / "target"))
+        copy = fix_return.make_copy(self.repo, metadata, os.getpid(), board_reader=lambda _: berth_board.Board(()))
+        assert isinstance(copy, fix_return.CopyMade), copy
+        self.addCleanup(fix_return.close_lint_copy, copy.folder, "the test ended")
+
+        argv = ["cargo", "mend", "--fix", "--manifest-path", str(copy.manifest)]
+        row = self.step(0, "1", "", "", argv)
+        self.assertEqual(row["repo_identity"], source_origin)
+
+        inner_origin = "https://example.org/team/inner"
+        _ = self.git("init", "-q", "-b", "main", cwd=copy.tree)
+        _ = self.git("remote", "add", "origin", inner_origin, cwd=copy.tree)
+        self.assertEqual(repository.repository_key(str(copy.manifest.parent)), inner_origin)
+
+    def test_lint_copy_marker_requires_an_allocation_token(self) -> None:
+        origin = "https://example.org/team/hana"
+        _ = self.git("remote", "add", "origin", origin, cwd=self.repo)
+        folder = self.repo / "examples" / "verify-lint-copy"
+        tree = folder / "tree"
+        tree.mkdir(parents=True)
+        _ = (folder / "repository-key").write_text("https://example.org/other/repo\n", encoding="utf-8")
+        for token in (None, "a" * 31, "A" * 32, "a" * 32 + "\n"):
+            with self.subTest(token=token):
+                if token is not None:
+                    _ = (folder / fix_return.ALLOCATION_NAME).write_text(token, encoding="utf-8")
+                self.assertEqual(repository.repository_key(str(tree)), origin)
+
+    def test_git_identity_skips_an_inaccessible_manifest(self) -> None:
+        origin = "https://example.org/team/hana"
+        _ = self.git("remote", "add", "origin", origin, cwd=self.repo)
+        workspace = self.repo / "workspace"
+        workspace.mkdir()
+        blocked = self.base / "blocked"
+        blocked.mkdir()
+        target = blocked / "Cargo.toml"
+        _ = target.write_text('[workspace]\nmembers = []\n', encoding="utf-8")
+        (workspace / "Cargo.toml").symlink_to(target)
+        blocked.chmod(0o000)
+        self.addCleanup(blocked.chmod, 0o700)
+
+        self.assertEqual(repository.repository_key(str(workspace)), origin)
 
     def test_gitless_build_uses_its_recorded_peak_after_the_first_fallback(self) -> None:
         directory = self.base / "sample"

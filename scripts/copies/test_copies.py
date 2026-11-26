@@ -23,13 +23,13 @@ from unittest import mock
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
-from scripts.build_queue import first_step, slot_wait
+from scripts.build_queue import admission_client, first_step, queue_wait
 from scripts.lib.build_steps import GATE_RESULT_UNKNOWN_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.copies.test_remote_copies import expected_remote_lease_columns
 from scripts.accounts import accounts
-from scripts.lib import build_folders, copy_record, nix_env, process_start, scratch, session_folder
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib import build_folders, conf, copy_record, nix_env, process_start, scratch, session_folder
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lint import folder_audit, tmp_sweep
 from scripts.lint.memory_test_support import ADMISSION_CONFIG_FIXTURE, write_config_fixture
 from textwrap import dedent
@@ -46,6 +46,10 @@ from scripts.production.staff_test_support import isolated_staff_file, fixture_m
 SSH_SOURCE_TRUST = copies.SshSourceTrust(trusted_caller=offload.trusted_linux_source, trusted_root=nix_env.trusted_root,
                                         registered_worktree=nix_env.registered_worktree)
 
+
+
+def launch_copy_fixture(launch: Callable[[], subprocess.CompletedProcess[str]]) -> subprocess.CompletedProcess[str]:
+    return launch()
 
 
 class ImportTests(unittest.TestCase):
@@ -141,11 +145,11 @@ class StandingTests(unittest.TestCase):
         temporary = self.base / "temporary"
         temporary.mkdir()
         _ = self.enterContext(mock.patch.object(tempfile, "tempdir", str(temporary)))
-        slot_configuration = private_slot_config(self.base, repository="origin", maximum=2, default_maximum=2)
-        configuration = Path(slot_configuration.environment["CONF_DIR"])
+        copy_configuration = private_copy_config(self.base)
+        configuration = Path(copy_configuration.environment["CONF_DIR"])
         home = self.base / "home"
         home.mkdir()
-        _ = write_config_fixture(slot_configuration.settings, """\
+        _ = write_config_fixture(copy_configuration.settings, """\
 locks.probe_wait_seconds=0.25
 locks.probe_retry_seconds=1
 names.repository_key_length=8
@@ -161,7 +165,8 @@ prefixes.admit-sock=admit-sock-
 prefixes.copies-index=copies-index-
 roots.system=/tmp
 roots.temporary=${TMPDIR}/builds
-""" + f"roots.scratch={self.base / 'scratch'}\nroots.scratch.{host_name()}={self.base / 'scratch'}\n")
+""" + f"roots.scratch={self.base / 'scratch'}\n"
+            + f"roots.scratch.{conf.local_host_key_name()}={self.base / 'scratch'}\n")
         _ = write_config_fixture(configuration / "scratch.conf", f"""\
 default_life_seconds=86400
 record_lock_attempts=3
@@ -211,9 +216,9 @@ source_check_seconds=1
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith(("GIT_", "COPIES_STEP_")) and key not in (
                            "UNIT_RUN_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_TARGET_DIR", "COPIES_RUN_PID",
-                           "BASH_ENV", "STAFF_CONFIG")}
+                           "BASH_ENV", "STAFF_CONFIG", admission_client.RESERVED_STEP_ENV)}
         environment.update({
-            **slot_configuration.environment,
+            **copy_configuration.environment,
             "HOME": str(home),
             "USER_ZONE": "UTC",
             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "Gate Tests",
@@ -387,14 +392,14 @@ source_check_seconds=1
                     self.assertEqual(result.stderr, "copies: calling session has no staff row or unit owner\n")
                     self.assertFalse(self.gates.exists())
 
-    def test_free_slot_does_not_resolve_the_queue_name(self) -> None:
+    def test_free_copy_does_not_resolve_the_queue_name(self) -> None:
         command = ("bash", "-c", "bash /fixture/verify.sh check hana")
-        with mock.patch.object(slot_wait, "command_slot_name", wraps=slot_wait.command_slot_name) as resolve:
+        with mock.patch.object(queue_wait, "command_queue_name", wraps=queue_wait.command_queue_name) as resolve:
             with copies.command_tree(self.owner_id, self.source, copies.CommittedSource(self.head), command) as tree:
                 self.assertTrue(tree.is_dir())
         resolve.assert_not_called()
 
-    def test_slot_uses_the_requested_tree_if_head_moves_after_lookup(self) -> None:
+    def test_copy_uses_the_requested_tree_if_head_moves_after_lookup(self) -> None:
         incoming = self.incoming()
         requested_tree = self.git(self.source, "rev-parse", f"{incoming}^{{tree}}")
         real_git = copies.git
@@ -413,22 +418,22 @@ source_check_seconds=1
                 advance_head()
             return result
 
-        output = self.base / "slot-tree"
+        output = self.base / "copy-tree"
         args = copies.CopyArguments()
         args.tree = requested_tree
-        args.command = ["sh", "-eu", "-c", 'git rev-parse HEAD^{tree} > "$1"', "slot-command", str(output)]
+        args.command = ["sh", "-eu", "-c", 'git rev-parse HEAD^{tree} > "$1"', "copy-command", str(output)]
         with mock.patch.object(copies, "git", side_effect=git):
-            self.assertEqual(copies.run_slot_step(self.source, args), 0)
+            self.assertEqual(copies.run_copy_step(self.source, args), 0)
         self.assertEqual(self.git(self.source, "rev-parse", "HEAD"), incoming)
         self.assertEqual(output.read_text().strip(), requested_tree)
 
-    def test_slot_accepts_a_source_that_configures_utf16_log_output(self) -> None:
+    def test_copy_accepts_a_source_that_configures_utf16_log_output(self) -> None:
         _ = self.git(self.source, "config", "i18n.logOutputEncoding", "UTF-16")
         tree = self.git(self.source, "rev-parse", "HEAD^{tree}")
-        output = self.base / "slot-head"
+        output = self.base / "copy-head"
         result = self.cli("hold", "--repo", str(self.source), "--tree", tree,
                           "--", "sh", "-eu", "-c",
-                          'git rev-parse HEAD > "$1"', "slot-command", str(output))
+                          'git rev-parse HEAD > "$1"', "copy-command", str(output))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.read_text().strip(), self.head)
 
@@ -535,8 +540,8 @@ source_check_seconds=1
         self.assertEqual(os.environ.get('CARGO_BUILD_BUILD_DIR'), previous)
         self.assertEqual(build_folders.build_folder_state(first), 'free')
         self.assertEqual(build_folders.build_folder_state(second), 'free')
-        # A command inside a build slot inherits that slot's cache; a gate it opens builds in its own slot's cache.
-        outer = str(self.base / "cargo" / "outer-slot1")
+        # A command inside a build copy inherits that copy's cache; a gate it opens builds in its own copy's cache.
+        outer = str(self.base / "cargo" / "outer-copy1")
         with mock.patch.dict(os.environ, {"CARGO_BUILD_BUILD_DIR": outer}):
             with copies.standing(self.owner_id, self.source, copies.CommittedSource('HEAD')) as first:
                 self.assertEqual(os.environ['CARGO_BUILD_BUILD_DIR'], str(first / "target"))
@@ -635,7 +640,7 @@ source_check_seconds=1
                 self.assertFalse(tree.exists())
                 root = copy_record.copies_root()
                 destination = (root.with_name(root.name + "-rescues.git") if source_gone
-                               else copies.slot_source(source))
+                               else copies.copy_source(source))
                 refs = self.git(destination, "for-each-ref", "--format=%(refname)", "refs/rescue/").splitlines()
                 self.assertTrue(refs)
                 self.assertTrue(any(subprocess.run(["git", "-C", str(destination), "merge-base", "--is-ancestor",
@@ -1185,9 +1190,11 @@ with patch.object(subprocess, 'run', pause_clone):
 
         remove = scratch.remove
 
+        original = clone.stat()
+
         def check_retry(path: Path) -> None:
-            self.assertEqual(path, clone)
-            with busy.open("rb") as other, self.assertRaises(BlockingIOError):
+            self.assertTrue(os.path.samestat(path.stat(), original))
+            with (path / busy.relative_to(clone)).open("rb") as other, self.assertRaises(BlockingIOError):
                 fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
             with self.assertRaises(BlockingIOError):
                 _ = build_folders.create_build_folder(request)
@@ -1329,7 +1336,7 @@ with patch.object(subprocess, 'run', pause_clone):
         remove = scratch.remove
 
         def delete(folder: Path) -> None:
-            self.assertTrue(scratch.removal_mark(folder).exists())
+            self.assertTrue(scratch.removal_mark(checkout).exists())
             self.assert_clone_project_removed(checkout, paths)
             remove(folder)
 
@@ -2466,11 +2473,310 @@ with patch.object(subprocess, 'run', pause_clone):
                 self.assertEqual(commit, self.head)
                 self.assertEqual(Path(path).read_bytes(), b"same artifact")
 
+    def commit_gate_script(self, program: str) -> str:
+        script = self.source / "scripts/production/gate.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        _ = script.write_text(dedent(program))
+        _ = self.git(self.source, "add", str(script))
+        _ = self.git(self.source, "commit", "-qm", "Install the gate fixture")
+        return self.git(self.source, "rev-parse", "HEAD")
+
+    def commit_gate_validator(self) -> str:
+        scripts = Path(__file__).resolve().parents[1]
+        package = self.source / "scripts/__init__.py"
+        package.parent.mkdir(exist_ok=True)
+        _ = package.write_text(f"__path__.append({str(scripts)!r})\n")
+        _ = self.git(self.source, "add", str(package))
+        return self.commit_gate_script((scripts / "production/gate.py").read_text())
+
     def test_run_refuses_a_named_gate_without_a_test_mode_before_admission(self) -> None:
+        _ = self.commit_gate_validator()
         with mock.patch.object(first_step, "admitted_run") as admit:
             result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py", "--module", "x"))
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr, "copies: --module needs --tests-only or --affected\n")
+        admit.assert_not_called()
+
+    def test_run_reports_the_gate_refusal_for_an_invalid_nightly_owner(self) -> None:
+        from scripts.production import gate
+
+        _ = self.commit_gate_validator()
+        arguments = ("--nightly", "--merge-branch", "builds", "--unit", "Bad!")
+        with (mock.patch.object(gate, "checked_gate_target", return_value=gate.NO_GATE_ASSIGNMENT),
+              redirect_stderr(io.StringIO()) as direct_errors):
+            self.assertEqual(gate.main(arguments), 1)
+        command = (sys.executable, "scripts/production/gate.py", *arguments)
+        with mock.patch.object(first_step, "admitted_run",
+                               side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:
+            result = self.run_cli(command=command)
+        admit.assert_not_called()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, direct_errors.getvalue())
+        self.assertEqual(result.stderr, "REFUSED: 'Bad!': owner must match [a-z0-9][a-z0-9_-]*\n")
+
+    def test_run_checks_the_absolute_merge_gate_parser_against_the_snapshot(self) -> None:
+        _ = self.commit_gate_script("""\
+            def check_prepared_gate_source(arguments, parser, source):
+                parser.error("The snapshot parser ran")
+            """)
+        launcher = Path(__file__).resolve().parents[1] / "production/merge_gate.py"
+        arguments = ("--checkout", "{tree}", "--tests-only", "--module", "copies/test_copies.py")
+        with mock.patch.object(first_step, "admitted_run",
+                               side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:
+            refused = self.run_cli(command=(sys.executable, str(launcher), *arguments))
+            admit.assert_not_called()
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("--module 'copies/test_copies.py' does not name a test module", refused.stderr)
+
+            snapshot = self.run_cli(command=(sys.executable, "{tree}/scripts/production/gate.py", *arguments))
+            admit.assert_not_called()
+            self.assertEqual(snapshot.returncode, 2)
+            self.assertEqual(snapshot.stderr, "copies: The snapshot parser ran\n")
+
+            module = self.source / "scripts/copies/test_copies.py"
+            module.parent.mkdir()
+            module.touch()
+            _ = self.git(self.source, "add", str(module))
+            _ = self.git(self.source, "commit", "-qm", "Add the named module to the snapshot")
+            result = self.run_cli(command=(sys.executable, str(launcher), *arguments))
+            admit.assert_called_once()
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stderr, "copies: Fixture reached admission\n")
+
+    def test_run_refuses_a_module_with_the_scripts_prefix_before_admission(self) -> None:
+        _ = self.commit_gate_validator()
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli(command=("./scripts/lib/py", "scripts/production/gate.py",
+                                           "--tests-only", "--module", "scripts/lib/test_fixture.py"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--module 'scripts/lib/test_fixture.py' needs a path under scripts/", result.stderr)
+        self.assertIn("lib/test_x.py", result.stderr)
+        admit.assert_not_called()
+
+    def test_run_refuses_a_module_absent_from_the_requested_commit_before_admission(self) -> None:
+        revision = self.commit_gate_validator()
+        test = self.source / "scripts/lib/test_fixture.py"
+        test.parent.mkdir(parents=True)
+        test.touch()
+        _ = self.git(self.source, "add", str(test))
+        _ = self.git(self.source, "commit", "-qm", "Add the test module")
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli("--commit", revision, command=(
+                "./scripts/lib/py", "scripts/production/gate.py", "--tests-only", "--module", "lib/test_fixture.py"))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--module 'lib/test_fixture.py' does not name a test module", result.stderr)
+        admit.assert_not_called()
+
+    def test_run_checks_both_gate_script_spellings_with_a_dot_segment(self) -> None:
+        _ = self.commit_gate_validator()
+        arguments = ("--tests-only", "--module", "lib/test_missing.py")
+        for script in ("./scripts/production/gate.py", "{tree}/./scripts/production/gate.py"):
+            with (self.subTest(script=script),
+                  mock.patch.object(first_step, "admitted_run",
+                                    side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit):
+                result = self.run_cli(command=(sys.executable, script, *arguments))
+                admit.assert_not_called()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--module 'lib/test_missing.py' does not name a test module", result.stderr)
+
+    def test_run_admits_a_module_from_the_requested_commit_once(self) -> None:
+        _ = self.commit_gate_validator()
+        test = self.source / "scripts/lib/test_fixture.py"
+        test.parent.mkdir(parents=True)
+        test.touch()
+        _ = self.git(self.source, "add", str(test))
+        _ = self.git(self.source, "commit", "-qm", "Add the test module")
+        revision = self.git(self.source, "rev-parse", "HEAD")
+        _ = self.git(self.source, "rm", str(test))
+        _ = self.git(self.source, "commit", "-qm", "Remove the test module")
+        with mock.patch.object(first_step, "admitted_run",
+                               side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:
+            result = self.run_cli("--commit", revision, command=("./scripts/lib/py", "scripts/production/gate.py",
+                "--affected", "--module", "lib/test_fixture.py", "--repo", "{tree}"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "copies: Fixture reached admission\n")
+        admit.assert_called_once()
+
+    def test_run_refuses_an_inner_repo_outside_the_requested_snapshot(self) -> None:
+        revision = self.commit_gate_validator()
+        test = self.source / "scripts/lib/test_fixture.py"
+        test.parent.mkdir()
+        test.touch()
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli("--commit", revision, command=(sys.executable, "scripts/production/gate.py",
+                "--tests-only", "--module", "lib/test_fixture.py", "--repo", str(self.source)))
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("The gate --repo must stay in the prepared source.", result.stderr)
+        admit.assert_not_called()
+
+    def test_run_refuses_a_repo_path_that_only_matches_the_validation_snapshot(self) -> None:
+        _ = self.commit_gate_validator()
+        test = self.source / "scripts/lib/test_fixture.py"
+        test.parent.mkdir()
+        test.touch()
+        _ = self.git(self.source, "add", str(test))
+        _ = self.git(self.source, "commit", "-qm", "Add the test module")
+        for repo in ("../source", "./{tree}"):
+            with self.subTest(repo=repo), mock.patch.object(first_step, "admitted_run") as admit:
+                result = self.run_cli(command=(sys.executable, "scripts/production/gate.py",
+                    "--tests-only", "--module", "lib/test_fixture.py", f"--checkout={repo}"))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("Use --repo '{tree}'.", result.stderr)
+                admit.assert_not_called()
+
+    def test_run_launches_alternate_gate_script_paths_without_early_validation(self) -> None:
+        revision = self.commit_gate_script("""\
+            from pathlib import Path
+            import sys
+
+            def check_prepared_gate_source(arguments, parser, source):
+                raise AssertionError("An alternate script path reached validation")
+
+            assert sys.argv[1:] == ["--targeted", str(Path.cwd())]
+            """)
+        for script in (str(self.source / "scripts/production/gate.py"),
+                       "{tree}/scripts/production/../production/gate.py", "scripts/production/../production/gate.py"):
+            with self.subTest(script=script):
+                run_gate = mock.Mock(side_effect=launch_copy_fixture)
+                admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+                with mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as admit:
+                    result = self.run_cli("--commit", revision,
+                                          command=(sys.executable, script, "--targeted", "{tree}"))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                admit.assert_called_once()
+                run_gate.assert_called_once()
+
+    def test_run_checks_only_the_requested_module_paths(self) -> None:
+        _ = self.commit_gate_validator()
+        named = self.source / "scripts/lib/test_fixture.py"
+        named.parent.mkdir()
+        named.touch()
+        unrelated = self.source / "scripts/test_unrelated.py"
+        unrelated.touch()
+        _ = self.git(self.source, "add", str(named), str(unrelated))
+        _ = self.git(self.source, "commit", "-qm", "Add the fixture modules")
+        with mock.patch.object(first_step, "admitted_run",
+                               side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:
+            result = self.run_cli(command=(sys.executable, "scripts/production/gate.py",
+                "--tests-only", "--module", "lib/test_fixture.py"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "copies: Fixture reached admission\n")
+        admit.assert_called_once()
+
+    def test_run_uses_the_gate_parser_from_the_requested_revision(self) -> None:
+        revision = self.commit_gate_script("""\
+            def check_prepared_gate_source(arguments, parser, source):
+                parser.add_argument("--selected-option", action="store_true", required=True)
+                parser.parse_args(arguments)
+            """)
+        _ = self.commit_gate_validator()
+        command = (sys.executable, "scripts/production/gate.py")
+        with mock.patch.object(first_step, "admitted_run",
+                               side_effect=first_step.FirstStepRefused("Fixture reached admission")) as admit:
+            refused = self.run_cli("--commit", revision, command=command)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("the following arguments are required: --selected-option", refused.stderr)
+            admit.assert_not_called()
+            result = self.run_cli("--commit", revision, command=(*command, "--selected-option"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "copies: Fixture reached admission\n")
+        admit.assert_called_once()
+
+    def test_run_preserves_a_legacy_gate_without_a_validator(self) -> None:
+        revision = self.commit_gate_script("""\
+            import argparse
+
+            assert __name__ == "__main__"
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--targeted", action="store_true", required=True)
+            parser.parse_args()
+            """)
+        _ = self.commit_gate_validator()
+        run_gate = mock.Mock(side_effect=launch_copy_fixture)
+        admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+        with mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as admit:
+            result = self.run_cli("--commit", revision,
+                                  command=(sys.executable, "scripts/production/gate.py", "--targeted"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        admit.assert_called_once()
+        run_gate.assert_called_once()
+
+    def test_run_does_not_validate_an_unrelated_gate_script_or_module(self) -> None:
+        _ = self.commit_gate_validator()
+        vendor_script = "vendor/tool/scripts/production/gate.py"
+        for name in ("tools/gate.py", vendor_script):
+            script = self.source / name
+            script.parent.mkdir(parents=True)
+            _ = script.write_text("import sys\nassert sys.argv[1:] == ['--report']\n")
+            _ = self.git(self.source, "add", str(script))
+        _ = self.git(self.source, "commit", "-qm", "Add the report commands")
+        for program in (("tools/gate.py",), ("-m", "tools.gate"), (vendor_script,)):
+            with self.subTest(program=program):
+                run_gate = mock.Mock(side_effect=launch_copy_fixture)
+                admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+                with mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)):
+                    result = self.run_cli(command=(sys.executable, *program, "--report"))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                run_gate.assert_called_once()
+
+    def test_run_passes_qualified_gate_module_arguments_to_the_child(self) -> None:
+        _ = self.commit_gate_script("""\
+            import sys
+
+            def check_prepared_gate_source(arguments, parser, source):
+                raise AssertionError("A module invocation reached validation")
+
+            assert sys.argv[1:] == ["--tests-only", "--module", "x"]
+            """)
+        run_gate = mock.Mock(side_effect=launch_copy_fixture)
+        admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+        command = (sys.executable, "-m", "scripts.production.gate")
+        with mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as admit:
+            refused = self.run_cli(command=(*command, "--module", "x"))
+            self.assertEqual(refused.returncode, 2)
+            self.assertEqual(refused.stderr, "copies: --module needs --tests-only or --affected\n")
+            admit.assert_not_called()
+            result = self.run_cli(command=(*command, "--tests-only", "--module", "x"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        admit.assert_called_once()
+        run_gate.assert_called_once()
+
+    def test_run_launches_the_qualified_gate_without_a_prepared_handoff(self) -> None:
+        revision = self.commit_gate_script(f"""\
+            import os
+            from pathlib import Path
+            import sys
+
+            def parse(arguments, parser):
+                parser.add_argument("--repo")
+                return parser.parse_args(arguments)
+
+            def check_prepared_gate_source(arguments, parser, source):
+                parse(arguments, parser)
+
+            if __name__ == "__main__":
+                import argparse
+
+                root = Path.cwd()
+                assert Path(__file__).parents[2] == root
+                assert parse(sys.argv[1:], argparse.ArgumentParser()).repo == str(root)
+                assert {copies.PREPARED_GATE_FD!r} not in os.environ
+            """)
+        _ = self.commit_gate_script("raise SystemExit(9)\n")
+        run_gate = mock.Mock(side_effect=launch_copy_fixture)
+        admitted = mock.Mock(spec=first_step.FirstStepAdmission, run_gate=run_gate)
+        with mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)):
+            result = self.run_cli("--commit", revision,
+                command=(sys.executable, "-m", "scripts.production.gate", "--repo", "{tree}"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run_gate.assert_called_once()
+
+    def test_run_prints_gate_help_without_admission(self) -> None:
+        _ = self.commit_gate_validator()
+        with mock.patch.object(first_step, "admitted_run") as admit:
+            result = self.run_cli(command=(sys.executable, "scripts/production/gate.py", "--help"))
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("usage: gate.py", result.stdout)
         admit.assert_not_called()
 
     def test_run_uses_tree_cwd_substitution_and_command_exit_status(self) -> None:
@@ -2499,7 +2805,7 @@ with patch.object(subprocess, 'run', pause_clone):
             exec "$python" "$script" hold --repo "$COPIES_STEP_SOURCE" --tree "$tree" \
                 -- "$python" -c "$@"
             """))
-        slot_write = program.replace("Path(relative)", "Path(os.environ['CARGO_TARGET_DIR']) / Path(relative).relative_to('target')").replace(
+        copy_write = program.replace("Path(relative)", "Path(os.environ['CARGO_TARGET_DIR']) / Path(relative).relative_to('target')").replace(
             "Path('target/debug/broken')", "(Path(os.environ['CARGO_TARGET_DIR']) / 'debug/broken')")
         cases = (
             ("plain", (), 7, False),
@@ -2511,13 +2817,13 @@ with patch.object(subprocess, 'run', pause_clone):
             ("not-built-command-failed", ("target/debug/missing",), 7, False),
             ("copy-failed", ("target/debug/x", "target/debug/broken"), 0, False),
             ("copy-and-command-failed", ("target/debug/x", "target/debug/broken"), 7, False),
-            ("retained-slot-file", ("target/debug/x",), 0, False),
-            ("touched-slot-file", ("target/debug/x",), 0, False),
+            ("retained-copy-file", ("target/debug/x",), 0, False),
+            ("touched-copy-file", ("target/debug/x",), 0, False),
             ("explicit-target-dir", ("target/debug/x",), 0, False),
             ("two-changed-target-dirs", ("target/debug/x",), 0, False),
             ("metadata-only", ("target/debug/x",), 0, False),
-            ("slot-symlink-loop", ("target/debug/loop", "report.txt"), 0, False),
-            ("replaced-slot-symlink-loop", ("target/debug/loop",), 0, False),
+            ("copy-symlink-loop", ("target/debug/loop", "report.txt"), 0, False),
+            ("replaced-copy-symlink-loop", ("target/debug/loop",), 0, False),
         )
         for label, requested, command_exit, apply in cases:
             with self.subTest(case=label):
@@ -2530,26 +2836,26 @@ with patch.object(subprocess, 'run', pause_clone):
                     options.extend(("--apply-uncommitted", str(self.source)))
                 folders_before = {folder.path for folder in scratch.folders()}
                 arguments = (str(output), "checkout={tree}/tracked.txt", str(evidence), str(command_exit))
-                if label in ("retained-slot-file", "touched-slot-file", "metadata-only", "slot-symlink-loop",
-                             "replaced-slot-symlink-loop"):
-                    with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as slot:
-                        old = slot / "target/debug/x"
+                if label in ("retained-copy-file", "touched-copy-file", "metadata-only", "copy-symlink-loop",
+                             "replaced-copy-symlink-loop"):
+                    with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as copy:
+                        old = copy / "target/debug/x"
                         old.parent.mkdir(parents=True, exist_ok=True)
                         _ = old.write_bytes(b"old binary")
-                        if label in ("slot-symlink-loop", "replaced-slot-symlink-loop"):
+                        if label in ("copy-symlink-loop", "replaced-copy-symlink-loop"):
                             loop = old.with_name("loop")
                             loop.unlink(missing_ok=True)
                             loop.symlink_to(loop.name)
                     touch = "from pathlib import Path\nPath('target/debug/x').touch()\n"
-                    slot_command = slot_write
-                    if label == "touched-slot-file":
-                        slot_command = touch + slot_write
+                    copy_command = copy_write
+                    if label == "touched-copy-file":
+                        copy_command = touch + copy_write
                     elif label == "metadata-only":
-                        slot_command = touch
-                    elif label == "slot-symlink-loop":
-                        slot_command = "from pathlib import Path\nPath('report.txt').write_text('step report\\n')"
-                    elif label == "replaced-slot-symlink-loop":
-                        slot_command = dedent("""
+                        copy_command = touch
+                    elif label == "copy-symlink-loop":
+                        copy_command = "from pathlib import Path\nPath('report.txt').write_text('step report\\n')"
+                    elif label == "replaced-copy-symlink-loop":
+                        copy_command = dedent("""
                             from pathlib import Path
                             path = Path("target/debug/loop")
                             path.unlink()
@@ -2557,23 +2863,23 @@ with patch.object(subprocess, 'run', pause_clone):
                             """)
                     result = self.run_cli(*options, command=(
                         "sh", "-eu", str(verifier), sys.executable,
-                        str(Path(copies.__file__).resolve()), slot_command, *arguments,
+                        str(Path(copies.__file__).resolve()), copy_command, *arguments,
                     ))
                     self.assertEqual(result.returncode, 0, result.stderr)
                     published = [Path(line.removeprefix("published: ").rsplit(" ", 1)[0])
                                  for line in result.stdout.splitlines() if line.startswith("published: ")]
                     if label == "metadata-only":
                         self.assertEqual(published, [])
-                    elif label == "slot-symlink-loop":
+                    elif label == "copy-symlink-loop":
                         self.assertEqual([path.name for path in published], ["report.txt"], result.stderr)
                         self.assertEqual(published[0].read_text(), "step report\n")
-                    elif label == "replaced-slot-symlink-loop":
+                    elif label == "replaced-copy-symlink-loop":
                         self.assertEqual([path.name for path in published], ["loop"], result.stderr)
                         self.assertEqual(published[0].read_bytes(), b"replacement")
                     else:
                         self.assertEqual(len(published), 1, result.stderr)
                         self.assertEqual(published[0].read_bytes(), b"binary\x00x")
-                    expected = b"binary\x00x" if label in ("retained-slot-file", "touched-slot-file") else b"old binary"
+                    expected = b"binary\x00x" if label in ("retained-copy-file", "touched-copy-file") else b"old binary"
                     self.assertEqual(old.read_bytes(), expected)
                     continue
                 if label in ("explicit-target-dir", "two-changed-target-dirs"):
@@ -3291,20 +3597,20 @@ with patch.object(subprocess, 'run', pause_clone):
             self.assertTrue(idle)
         self.assertEqual(build_folders.build_folder_state(tree), 'free')
 
-        slot = self.gates / "1"
+        copy = self.gates / "1"
         for verdict in ("green", "red"):
             with self.subTest(verdict=verdict):
                 with ExitStack() as patches, self.assertRaises(copies.PostUseError) as raised:
                     with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as held:
-                        self.assertEqual(held, slot)
+                        self.assertEqual(held, copy)
                         _ = patches.enter_context(mock.patch("scripts.lib.build_folders._write_lease",
                             side_effect=OSError("lease release failed")))
                         if verdict == "red":
                             raise failure
                 self.assertIs(raised.exception.caller_error, failure if verdict == "red" else None)
                 self.assertIn("lease release failed", str(raised.exception))
-                self.assertTrue(slot.exists())
-                self.assertEqual(build_folders.build_folder_state(slot), "free")
+                self.assertTrue(copy.exists())
+                self.assertEqual(build_folders.build_folder_state(copy), "free")
 
     def test_initial_record_names_requested_commit_before_git_initialization(self) -> None:
         real_git = shutil.which("git")
@@ -3399,7 +3705,7 @@ with patch.object(subprocess, 'run', pause_clone):
         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as tree:
             self.assertEqual(self.git(tree, "rev-parse", "HEAD"), self.head)
 
-    def test_slot_preparation_errors_name_the_git_command_and_stderr_before_use(self) -> None:
+    def test_copy_preparation_errors_name_the_git_command_and_stderr_before_use(self) -> None:
         real_git = shutil.which("git")
         assert real_git is not None
         wrappers = self.base / "bin"
@@ -3409,7 +3715,7 @@ with patch.object(subprocess, 'run', pause_clone):
             #!/bin/sh
             for arg do
                 if [ "$arg" = "$COPY_TEST_FAIL" ]; then
-                    printf '%s\\n' 'fixture slot Git failure' >&2
+                    printf '%s\\n' 'fixture copy Git failure' >&2
                     exit 47
                 fi
             done
@@ -3422,9 +3728,9 @@ with patch.object(subprocess, 'run', pause_clone):
                                                   "COPY_TEST_FAIL": step}):
                     with self.assertRaises(copies.CopyError) as refused:
                         with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)):
-                            self.fail("a slot preparation failure reached the caller")
+                            self.fail("a copy preparation failure reached the caller")
                 self.assertIn(step, str(refused.exception))
-                self.assertIn("fixture slot Git failure", str(refused.exception))
+                self.assertIn("fixture copy Git failure", str(refused.exception))
                 with copies.standing(self.owner_id, self.source, copies.CommittedSource(self.head)) as recovered:
                     self.assertEqual(self.git(recovered, "rev-parse", "HEAD"), self.head)
 

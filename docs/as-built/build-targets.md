@@ -213,8 +213,8 @@ It saves no pass because a saved pass describes this machine.
 - The hold and routing messages repeat only when their text or decline reason changes. `verify.sh: running on natedev` marks local execution.
 - After routing, every command checks the hold before taking the cargo token. A test gives this wait the same Mac retry hook, so a hold that starts just after routing still permits a Mac run. Per step, `scripts/lint/invoke.sh` checks it again after memory admission. A new hold returns the memory reservation, waits, then repeats memory admission. Mac runs answer to Mac claims, not natedev holds.
 - `verify.sh` and `invoke.sh` create a missing, nonempty `$TMPDIR` before they make temp files. The lint CLI sources `invoke.sh` before it runs a command, so it uses the same setup.
-- `buildlog-sample.timer` checks once per minute on natedev. `/build:page` and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. A future reach backoff shows `MAC UNREACHABLE`. Unreadable or stale state shows `MAC IDLE WATCH`.
-- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. Before a view shows a Mac condition line, it checks the live local block, claim and backoff files. A saved line that the live state does not agree with shows no Mac condition until the next sample. The watch message uses the reading that the watch just wrote, so it does not read the live state again. At the default three minutes the watch sends one message to the builds showrunner, resolved by `scripts/production/showrunners.py address builds`. The machine watch below sends the phone push. The idle interval and its send keys reset after an active job. No waiting steps means no idle line.
+- `buildlog-sample.timer` checks once per minute on natedev. `/build:page` and `/build:status` show the saved Mac idle alert. Three minutes without a natedev build or test on the Mac gives `MAC IDLE` when eligible steps wait. A block and an idle claim count as idle. A parked app does not count as build or test work. An active backoff or a failed probe mark shows `MAC UNREACHABLE` while eligible steps wait. Unreadable or stale state shows `MAC IDLE WATCH`.
+- Every pass atomically saves `~/.local/state/mac-idle/alert.json`. The views read that file and shared timing config without subprocesses or locks. Before a view shows a Mac condition line, it checks the local block, claim, backoff and failed probe files. The line shows only when the saved condition agrees with the live state. The watch message uses the reading from the current pass. After three minutes by default, the watch sends one message to the builds showrunner. It uses `scripts/production/showrunners.py address builds` to find the recipient. The machine watch sends the phone push. The idle interval and its send keys reset after an active job. The idle line requires waiting steps.
 - The machine watch, `scripts/buildlog/machine_watch.py`, is the one watch for every registered and pinned target: natedev, mac, mac-linux, hana-aws and hana-gpu. `buildlog sample` runs it each pass on natedev. It runs the Mac idle watch first, then one rule for each machine. A machine that is not off on purpose sends one notice when, for longer than its notice time, it is unusable or steps wait for it and it runs none.
 - The notice time is `excluded_notice_seconds.<machine>` in `config/build_targets.conf`, else `excluded_notice_seconds`. The Mac uses 600 seconds; every other machine uses 3600 seconds.
 - `mac_test.machine_off_on_purpose` decides off on purpose for every target. Each target reads `enabled.<target>=off`. The local target also reads the `/build:hold` holds in force through `build_hold.natedev_holds`; an unreadable hold state counts as in use. An SSH target also reads the block in its own state folder (the Mac in `MAC_TEST_STATE_DIR`, another target under `BUILD_TARGETS_STATE_DIR/<target>`), except when the block holder asks. A macOS target reads `offload=off` in its settings file; another SSH target reads `enabled=off` there (`hana_aws.conf`, and `cloud_gate.conf` for hana-gpu). A Hana GPU target also reads `hana_gpu_route_enabled=off` in its settings file. An unreadable record or a bad value counts as in use.
@@ -270,6 +270,8 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
   The report still decodes legacy `battery` and `mac_busy` decline reasons.
 
 - `offload.py run --settings <path>` reads that target's settings; `--last-decline busy|blocked` silences a decline line (and the claim's holder output) that repeats the last reason. A failed probe prints `mac_test: could not reach the Mac: <reason>`.
+- Each SSH target admits one claim per repository. Mac and mac-linux share one claim.
+- Linux cleanup checks the saved mirror for each old numbered claim before release.
 - A lost run keeps the Mac busy until its leftovers are gone. The runner claims with `--remote <host>`; the claim (`RemoteJobClaim`) outlives its process until the printed `mac_exit=<n>` line with a confirmed cleanup marker, or a leftover check that counted no process (`check_leftovers` → `LeftoversEnded | LeftoversRemain(count) | LeftoverCheckFailed(reason)`). A later `claim --remote` for the same repository takes a kept claim over (exit 13). Leftovers decline `busy`; a failed check declines `unreachable`.
 - Every claim, remote or process-bound, starts a claim watcher (`mac_test.py watch-claim`, one at a time under `claim_watch.lock`). Every `claim_poll_seconds` (60) it checks the claim's host over ssh for the user's mirror work, `cargo`, `rustc`, `cargo-nextest` or binaries under a `/target/` path, sending no signal. After `claim_idle_minutes` (15) with none it deletes the unchanged claim and messages the holder's session (`holder_session`) how to claim again. A failed check changes nothing. Details are in [mac-test-offload.md](mac-test-offload.md) ("The idle claim").
 - A `busy` decline names its holder: `BusyMacDecline(holder: MacHolder)`, `MacHolder = KnownMacJob(what) | LostRunLeftovers | UnreadableMacHolder`, written as `holder=` in the result file.
@@ -649,18 +651,20 @@ A step list reports the command and exit status for each step it runs, including
 On Linux, the parent initializes `BUILDLOG_RUN` once. Each step inherits it and uses its own call record.
 Both list forms keep the queue place during checkout, including for `doc`.
 The `doc` step acquires its own checkout and uses ordinary memory admission.
-It takes no memory handoff or repository slot.
+It releases its grant without a memory handoff.
+The repository's Verify run limit exempts the `doc` step.
 A busy Mac leaves a mend step at its existing queue rank for the next placement.
 The Cargo token report uses the existing `wait_s` field to locate the end of the token wait.
 The `admission_wait_s` field totals the waits for memory, routing, holds, and the Cargo token.
 The `step_wait_s` field gives the wait for each step, including separate waits for mend and clippy.
 Verify counts the placement samples after it receives a grant, a refusal, or a confirmed cancellation.
 A confirmed cancellation includes the cancellation that Verify requests before lint formatting.
-A canceled episode stops accruing wait before formatting starts.
-That mend wait ends at the last queue reply before Verify cancels; the cancel call itself, about one second, is not counted.
+The mend wait ends at the last queue reply before Verify cancels and starts formatting.
+The cancellation call takes about one second and adds no time to that wait.
 If Verify stops before it reads a final reply or a sample is missing, it records null for the step and admission totals.
-The `hold_wait_s` field is null when the call has no valid hold sample.
-A standalone step with its own checkout slot also uses `NO_RUN`.
+A skipped hold check records zero in `hold_wait_s`.
+A hold check without a valid sample records null.
+A standalone step with its own numbered copy uses `NO_RUN`.
 Steps with `NO_RUN` can leave their grants without a memory handoff.
 
 `parse_routing_arguments` removes routing flags into named shell values and returns the remaining `ARGS`.
@@ -796,7 +800,7 @@ Remote launch signals use `find_mac_runner_pid` and the rules in [Mac step offlo
 
 ## Cargo token ownership and wait holders
 
-`config/direct.conf` supplies `VERIFY_TOKEN_HOLD_SECONDS` and `VERIFY_TOKEN_RENEW_SECONDS`.
+`config/direct.conf` supplies `verify_token_hold_seconds` and `verify_token_renew_seconds`.
 The shipped values are 3600 and 60 seconds.
 The renewal interval cannot exceed one third of the lease.
 `start_token_renewer` and `stop_token_renewer` maintain one renewer while a step command runs.

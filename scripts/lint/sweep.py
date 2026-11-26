@@ -29,7 +29,9 @@ import json
 import math
 import os
 import re
+import select
 import shlex
+import signal
 import socket
 import stat
 import subprocess
@@ -46,13 +48,15 @@ from datetime import UTC, datetime
 from enum import Enum
 from functools import cache, cached_property
 from pathlib import Path
+from types import FrameType
 from typing import TYPE_CHECKING, Literal, TypeGuard, cast, overload, override
 
 from scripts.message import send_budget, send_result, session_send
 from scripts.message.session_send import session_send_argv
-from scripts.lib import file_lock
+from scripts.lib import file_lock, process_group
 from scripts.lib.file_lock import PROC_LOCKS as PROC_LOCKS
 from scripts.lib import build_folders, conf, removal_guard
+from scripts.lib.cancellation import CANCELLATION_SIGNALS
 from scripts.lib.cargo_target_config import (
     NoCargoManifest,
     cargo_build_folder,
@@ -984,6 +988,7 @@ def _build_trees(root: str, depth: int, *,
     for _ in range(depth + 1):
         next_frontier: list[str] = []
         for directory in frontier:
+            check_mac_floor_reader()
             if directory != root and is_cargo_target(directory, lint_settings=lint_settings):
                 continue
             if os.path.isdir(os.path.join(directory, FINGERPRINT_DIR)):
@@ -1154,8 +1159,8 @@ class LockHeld:
 
 
 @dataclass(frozen=True)
-class SlotBuildOutput:
-    """Build output that shares a repository slot's maker lease."""
+class CopyBuildOutput:
+    """Build output that shares a numbered copy's maker lease."""
 
     checkout: Path
 
@@ -1164,10 +1169,10 @@ class SlotBuildOutput:
         return str(self.checkout.with_name(self.checkout.name + ".lock"))
 
 
-def output_slot_leases(
+def output_copy_leases(
     path: str, *, outputs: CargoOutputIndex | UseConfiguredValue = UseConfiguredValue.CURRENT,
-) -> tuple[SlotBuildOutput, ...]:
-    """Locate slot leases for direct output and recorded external output."""
+) -> tuple[CopyBuildOutput, ...]:
+    """Locate copy leases for direct output and recorded external output."""
     if isinstance(outputs, UseConfiguredValue):
         outputs = OUTPUT_ROOTS.get()
     resolved = Path(path).resolve()
@@ -1185,41 +1190,41 @@ def output_slot_leases(
                 raise form.error
             if isinstance(form, build_folders.BuildCopy):
                 checkouts.add(candidate)
-    return tuple(SlotBuildOutput(checkout) for checkout in sorted(checkouts))
+    return tuple(CopyBuildOutput(checkout) for checkout in sorted(checkouts))
 
 
 @dataclass(frozen=True)
-class UnverifiedSlotLease:
-    """The target stays because the sweep cannot verify its slot lease."""
+class UnverifiedCopyLease:
+    """The target stays because the sweep cannot verify its copy lease."""
 
     reason: str
 
 
-def report_unverified_slot(path: str, error: Exception) -> UnverifiedSlotLease:
-    reason = f"cannot verify the slot lease: {error}"
+def report_unverified_copy(path: str, error: Exception) -> UnverifiedCopyLease:
+    reason = f"cannot verify the copy lease: {error}"
     print(f"lint sweep: {path} kept: {reason}", file=sys.stderr)
-    return UnverifiedSlotLease(reason)
+    return UnverifiedCopyLease(reason)
 
 
-def hold_trim_recovery_slots(roots: Sequence[str], guards: ExitStack,
-                             held_slots: Collection[SlotBuildOutput]) -> bool:
-    """Hold each slot lease before a paired trim retries deletion."""
+def hold_trim_recovery_copies(roots: Sequence[str], guards: ExitStack,
+                             held_copies: Collection[CopyBuildOutput]) -> bool:
+    """Hold each copy lease before a paired trim retries deletion."""
     current = OUTPUT_ROOTS.get()
     saved = saved_cargo_output_roots()
     outputs = CargoOutputIndex((*current.workspaces, *saved.workspaces, *saved.history))
-    held = set(held_slots)
+    held = set(held_copies)
     for root in roots:
         try:
             if not outputs.mappings_for(Path(root).resolve()):
                 raise ValueError("no recorded Cargo output mapping for the saved trim")
-            for slot in output_slot_leases(root, outputs=outputs):
-                if slot not in held:
-                    if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
-                        print(f"lint sweep: busy slot lease; {root} left alone")
+            for copy in output_copy_leases(root, outputs=outputs):
+                if copy not in held:
+                    if not guards.enter_context(build_folders.collector_lease(copy.checkout, wait=False)):
+                        print(f"lint sweep: busy copy lease; {root} left alone")
                         return False
-                    held.add(slot)
+                    held.add(copy)
         except (OSError, RuntimeError, ValueError) as error:
-            _ = report_unverified_slot(root, error)
+            _ = report_unverified_copy(root, error)
             return False
     return True
 
@@ -1599,7 +1604,7 @@ def floor_holders(busy: Mapping[str, FloorProtection], sizes: dict[str, int],
         use = direct_use(protection)
         if isinstance(use, (BuildHoldTarget, NoRecordedEvidence)):
             continue
-        if isinstance(use, UnverifiedSlotLease):
+        if isinstance(use, UnverifiedCopyLease):
             holders.append(FloorHolder(root, sizes.get(root, 0), None, use.reason, None))
             continue
         if isinstance(use, LockHeld):
@@ -1654,6 +1659,7 @@ def newest_times(directory: os.DirEntry[str], observations: ScanDirectoryObserva
 
 
 def listing(directory: str) -> list[os.DirEntry[str]]:
+    check_mac_floor_reader()
     try:
         with os.scandir(directory) as entries:
             return list(entries)
@@ -2007,12 +2013,12 @@ class TrimTake:
         self.save()
 
     def recover(
-        self, *, held_slots: Collection[SlotBuildOutput] = (),
+        self, *, held_copies: Collection[CopyBuildOutput] = (),
     ) -> ConfirmedDeletion | UnconfirmedReclaim | PairedTrimDeferred:
         """A missing or replaced name proves removal, never reclaimed blocks."""
         with ExitStack() as guards:
             if (len(self.output_roots) > 1 and self.stage == "deleting" and self.pending
-                    and not hold_trim_recovery_slots(self.output_roots, guards, held_slots)):
+                    and not hold_trim_recovery_copies(self.output_roots, guards, held_copies)):
                 return PairedTrimDeferred(self.output_roots)
             return self._recover()
 
@@ -2249,7 +2255,8 @@ def unit_age(group: Group, now: float) -> tuple[float, float]:
     return (-int((now - group.last_used) // DAY_SECONDS), group.compiled)
 
 
-def remove_checked_entry(checked: removal_guard.CheckedEntry) -> ConfirmedDeletion:
+def remove_checked_entry(checked: removal_guard.CheckedEntry,
+                         lease: build_folders.FreeFolderRemovalLease) -> ConfirmedDeletion:
     freed = removed = 0
     device_bytes: dict[int, int] = {}
 
@@ -2262,9 +2269,14 @@ def remove_checked_entry(checked: removal_guard.CheckedEntry) -> ConfirmedDeleti
         removed += result.removed
         device_bytes[entry.device] = device_bytes.get(entry.device, 0) + result.bytes
 
+    def delete(staged: build_folders.CheckedRemovalTree) -> None:
+        removal_guard.remove(replace(checked, path=staged.path, parent=staged.parent, name=staged.path.name),
+                             account=account)
+
     failures = 0
     try:
-        removal_guard.remove(checked, account=account)
+        if not lease.remove_tree(checked.path, checked.info, wait=False, delete=delete):
+            failures = 1
     except (OSError, removal_guard.Refused) as error:
         print(f"kept {checked.path}: {removal_guard.single_line(error)}")
         failures = 1
@@ -2301,7 +2313,7 @@ def reclaim(group: FloorTake, scan: Scan, remaining: dict[InodeKey, int],
 
 
 @contextmanager
-def form_folder_locks(path: Path) -> Generator[str]:
+def form_folder_locks(path: Path) -> Generator[str | build_folders.FreeFolderRemovalLease]:
     """Check existing leases, busy marks, and Cargo locks without adding files."""
     with build_folders.folder_removal_lease(path, children=True, wait=False) as lease:
         if isinstance(lease, build_folders.RefusedRemovalLease):
@@ -2323,7 +2335,7 @@ def form_folder_locks(path: Path) -> Generator[str]:
                     yield f"the Cargo lock is busy: {locks.path}"
                     return
                 try:
-                    yield ""
+                    yield lease
                 finally:
                     release(locks.held)
             finally:
@@ -2458,7 +2470,7 @@ def assess_form_folders(guard: removal_guard.RemovalGuard, plan: removal_guard.R
             print(f"review {legacy}: legacy build folder")
             if isinstance(plan, removal_guard.RemovalList):
                 _ = plan.add_manual(removal_guard.Tool.BUILD, legacy, guard.root, 0, "legacy build folder")
-    for repo in sorted(guard.names.repositories - removal_guard.LEGACY_TOP):
+    for repo in sorted(guard.names.repositories - removal_guard.PROTECTED_TOP):
         repo_path = guard.root / repo
         collect(repo_path)
         if not removal_guard.is_real_directory(repo_path):
@@ -2475,9 +2487,10 @@ def assess_form_folders(guard: removal_guard.RemovalGuard, plan: removal_guard.R
                     collect(Path(inner.path))
     for _, path in sorted(candidates):
         try:
-            with guard.check(path) as checked, form_folder_locks(path) as busy:
+            with guard.check(path) as checked, form_folder_locks(path) as lease:
                 checked.recheck()
-                if reason := busy or form_folder_use(path, guard):
+                reason = lease if isinstance(lease, str) else form_folder_use(path, guard)
+                if reason:
                     print(f"kept {str(path)!r}: {reason}")
                     continue
                 size = directory_blocks(str(path))
@@ -2495,14 +2508,16 @@ def remove_listed_output(row: removal_guard.ListedEntry, guard: removal_guard.Re
         return removal_guard.Kept("a whole build folder must match the selected path")
     path = str(row.path)
     settings = conf.read("lint")
-    with guard.check(row.path) as checked, form_folder_locks(row.path) as busy:
+    with guard.check(row.path) as checked, form_folder_locks(row.path) as lease:
         checked.recheck()
-        if reason := busy or form_folder_use(row.path, guard):
+        if isinstance(lease, str):
+            return removal_guard.Kept(lease)
+        if reason := form_folder_use(row.path, guard):
             return removal_guard.Kept(reason)
         if form_last_used(row.path, checked.info.st_mtime) > row.assessed_ns / 1_000_000_000:
             return removal_guard.Kept("the build folder was used after assessment")
         row.verify(checked)
-        account = remove_checked_entry(checked)
+        account = remove_checked_entry(checked, lease)
         cause = "floor take" if row.reason == "below the free-space floor" else "budget take"
         extent = "partial" if account.failures else "whole"
         stamp_error = ""
@@ -2659,14 +2674,21 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]], *,
         lint_settings = conf.read("lint")
     discovered = tuple(roots.discovered) if isinstance(roots, DiscoveredTargetRoots) else tuple(roots)
     output_index = OUTPUT_ROOTS.get()
+    mac_session = MAC_FLOOR_SESSION.get()
+
     def scan_target(cluster: tuple[str, ...]) -> Scan:
-        _ = OUTPUT_ROOTS.set(output_index)
-        scan = scan_roots(DiscoveredTargetRoots(cluster, discovered),
-                          [tree for root in cluster for tree in trees[root]], lint_settings=lint_settings)
-        choose_whole_entries(scan)
-        for root in cluster:
-            scan.target_bytes[root] = sum(scan.blocks[key] for key in scan.target_links.get(root, {}))
-        return scan
+        output_token = OUTPUT_ROOTS.set(output_index)
+        session_token = MAC_FLOOR_SESSION.set(mac_session)
+        try:
+            scan = scan_roots(DiscoveredTargetRoots(cluster, discovered),
+                              [tree for root in cluster for tree in trees[root]], lint_settings=lint_settings)
+            choose_whole_entries(scan)
+            for root in cluster:
+                scan.target_bytes[root] = sum(scan.blocks[key] for key in scan.target_links.get(root, {}))
+            return scan
+        finally:
+            MAC_FLOOR_SESSION.reset(session_token)
+            OUTPUT_ROOTS.reset(output_token)
 
     connected_roots = output_index.connected_roots_for
     clusters: list[tuple[str, ...]] = []
@@ -2800,6 +2822,91 @@ class TargetRootSearch:
 DISCOVERY_BRANCH_LEVELS = 3
 
 
+@dataclass(frozen=True)
+class MacFloorSession:
+    """The Mac supervisor keeps this pipe open until the offload sweep ends."""
+
+    supervisor_pipe_fd: int
+
+
+class NoOffloadCancellation(Enum):
+    CURRENT = "no offload cancellation"
+
+
+MAC_FLOOR_WORKER_FLAG = "--mac-floor-worker"
+MAC_FLOOR_DEADLINE_FLAG = "--mac-floor-deadline"
+MAC_FLOOR_CLEANUP_RECORD = "mac_floor_cleanup=complete"
+MAC_FLOOR_SESSION: ContextVar[MacFloorSession | NoOffloadCancellation] = ContextVar(
+    "mac_floor_session", default=NoOffloadCancellation.CURRENT)
+
+
+class MacFloorReaderCancelled(Exception):
+    """A directory reader can stop because the SSH caller has left."""
+
+
+def check_mac_floor_reader() -> None:
+    session = MAC_FLOOR_SESSION.get()
+    if isinstance(session, MacFloorSession) and select.select([session.supervisor_pipe_fd], [], [], 0)[0]:
+        raise MacFloorReaderCancelled
+
+
+def supervise_mac_floor(command: Sequence[str], timeout: float) -> int:
+    """End and reap the Mac sweep even if a directory read blocks."""
+    if timeout <= 0:
+        print("lint sweep: floor sweep timed out before startup", file=sys.stderr)
+        print(MAC_FLOOR_CLEANUP_RECORD, flush=True)
+        return 124
+    deadline = time.monotonic() + timeout
+    stop_reasons: list[int] = []
+
+    def notice(signum: int, frame: FrameType | None) -> None:
+        del frame
+        if signum != signal.SIGCHLD:
+            stop_reasons.append(signum)
+
+    with ExitStack() as resources:
+        ready, wake = socket.socketpair()
+        _ = resources.enter_context(ready)
+        _ = resources.enter_context(wake)
+        wake.setblocking(False)
+        for signum in (*CANCELLATION_SIGNALS, signal.SIGALRM, signal.SIGCHLD):
+            _ = resources.callback(signal.signal, signum, signal.signal(signum, notice))
+        _ = resources.callback(signal.set_wakeup_fd, signal.set_wakeup_fd(wake.fileno()))
+
+        worker = subprocess.Popen(command, stdin=subprocess.PIPE, start_new_session=True)
+        assert worker.stdin is not None
+        worker_status: int | None = None
+        try:
+            while not stop_reasons:
+                worker_status = worker.poll()
+                if worker_status is not None:
+                    break
+                remaining = max(0, deadline - time.monotonic())
+                if not remaining or not select.select([ready], [], [], remaining)[0]:
+                    break
+                _ = ready.recv(4096)
+            signum = stop_reasons[0] if stop_reasons else signal.SIGALRM
+        finally:
+            worker.stdin.close()
+            if worker.returncode is None:
+                try:
+                    process_group.send_process_group(worker.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _ = worker.wait()
+    if worker_status is None:
+        if signum == signal.SIGALRM:
+            print("lint sweep: floor sweep timed out", file=sys.stderr)
+            worker_status = 124
+        else:
+            print(f"lint sweep: floor sweep stopped by {signal.Signals(signum).name}", file=sys.stderr)
+            worker_status = 128 + signum
+    elif worker_status < 0:
+        return 128 - worker_status
+    print(MAC_FLOOR_CLEANUP_RECORD, flush=True)
+    return worker_status
+
+
 def target_dirs(roots: Sequence[str], *,
     lint_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
     checkouts: list[str] | UseConfiguredValue = UseConfiguredValue.CURRENT,
@@ -2814,8 +2921,10 @@ def target_dirs(roots: Sequence[str], *,
     tree_depth = lint_settings.whole("sweep_max_tree_depth")
     skipped = frozenset(lint_settings.words("sweep_floor_skip"))
     marker_names = frozenset(("Cargo.toml", RUSTC_INFO, CACHE_TAG))
+    session = MAC_FLOOR_SESSION.get()
 
     def visit(search: TargetRootSearch, directory: str, depth: int) -> None:
+        check_mac_floor_reader()
         if directory in search.owned_trees:
             return
         children: list[os.DirEntry[str]] = []
@@ -2859,10 +2968,14 @@ def target_dirs(roots: Sequence[str], *,
             search.frontier.extend((entry.path, depth + 1) for entry in children if entry.path not in search.owned_trees)
 
     def search_branch(search: TargetRootSearch) -> TargetRootSearch:
-        while search.frontier:
-            directory, depth = search.frontier.pop()
-            visit(search, directory, depth)
-        return search
+        token = MAC_FLOOR_SESSION.set(session)
+        try:
+            while search.frontier:
+                directory, depth = search.frontier.pop()
+                visit(search, directory, depth)
+            return search
+        finally:
+            MAC_FLOOR_SESSION.reset(token)
 
     def collect(search: TargetRootSearch) -> None:
         found.update(search.targets)
@@ -2966,22 +3079,22 @@ def shrink_floor(
         with ExitStack() as guards:
             lock = scratch.judgment_lock
             blocked_pair = False
-            held_slots: set[SlotBuildOutput] = set()
+            held_copies: set[CopyBuildOutput] = set()
             for paired in paired_roots:
                 try:
-                    slots = output_slot_leases(paired)
+                    copies = output_copy_leases(paired)
                 except (OSError, RuntimeError) as error:
-                    busy[paired] = report_unverified_slot(paired, error)
+                    busy[paired] = report_unverified_copy(paired, error)
                     blocked_pair = True
                     break
-                for slot in slots:
-                    if slot in held_slots:
+                for copy in copies:
+                    if copy in held_copies:
                         continue
-                    if not guards.enter_context(build_folders.collector_lease(slot.checkout, wait=False)):
-                        busy[paired] = LockHeld(slot.lock)
+                    if not guards.enter_context(build_folders.collector_lease(copy.checkout, wait=False)):
+                        busy[paired] = LockHeld(copy.lock)
                         blocked_pair = True
                         break
-                    held_slots.add(slot)
+                    held_copies.add(copy)
                 if blocked_pair:
                     break
                 if not guards.enter_context(lock(Path(paired))):
@@ -3091,7 +3204,7 @@ def free_bytes(path: str) -> int:
 
 
 def floor_setting_key(keys: Collection[str], base: str, host: str) -> str:
-    override_key = f"{base}.{host}"
+    override_key = f"{base}.{conf.host_key_name(host)}"
     return override_key if override_key in keys else base
 
 
@@ -3939,7 +4052,7 @@ class BuildHoldTarget:
     holder: str
 
 
-RootProtection = TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence | UnverifiedSlotLease
+RootProtection = TargetUse | LockHeld | BuildHoldTarget | NoRecordedEvidence | UnverifiedCopyLease
 
 
 @dataclass(frozen=True)
@@ -4078,14 +4191,38 @@ def floor_scan_targets(scan: Scan, idle: Sequence[str], target_uses: dict[str, f
 
 
 @dataclass(frozen=True)
+class AcquiredMacFloorLock:
+    """The SSH worker holds the floor lock while it reads claims and lists output."""
+
+    descriptor: int
+
+
+class AcquireFloorLock(Enum):
+    LOCALLY = "acquire the floor lock in the pass"
+
+
+@contextmanager
+def wait_for_mac_floor_lock(path: Path) -> Generator[AcquiredMacFloorLock]:
+    """Wait for the previous sweep before reading mirror leases."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield AcquiredMacFloorLock(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@dataclass(frozen=True)
 class MacFloor:
-    """Only marked output inside the three approved Mac roots can be removed."""
+    """List only marked output inside the approved Mac roots."""
 
     roots: tuple[str, ...]
     claims: floor_claims.ClaimSnapshot
     mirror: Path
     busy_mirrors: frozenset[Path] = frozenset()
     leased_mirrors: frozenset[Path] = frozenset()
+    floor_lock: AcquiredMacFloorLock | AcquireFloorLock = AcquireFloorLock.LOCALLY
 
     def allows(self, target: str) -> bool:
         path = Path(target)
@@ -4144,6 +4281,7 @@ def mac_folder_reclaimable_bytes(directory: str) -> int:
     shared: dict[InodeKey, os.stat_result] = {}
     frontier = [directory]
     while frontier:
+        check_mac_floor_reader()
         try:
             with os.scandir(frontier.pop()) as entries:
                 listed = list(entries)
@@ -4171,6 +4309,7 @@ def mac_folder_measurement(policy: MacFloor, targets: Sequence[str]) -> CurrentM
     """Measure root children and discovered targets without following directory symlinks."""
     folders = {target for target in targets if not os.path.islink(target) and os.path.isdir(target)}
     for root in policy.roots:
+        check_mac_floor_reader()
         try:
             with os.scandir(Path(root).expanduser().resolve()) as entries:
                 folders.update(entry.path for entry in entries if entry.is_dir(follow_symlinks=False))
@@ -4579,7 +4718,9 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     from scripts.lint import tmp_sweep
     from scripts.buildlog import record
 
-    guard: int | None = None
+    inherited_lock = policy.floor_lock if isinstance(policy, MacFloor) else AcquireFloorLock.LOCALLY
+    locked_before_claims = isinstance(inherited_lock, AcquiredMacFloorLock)
+    guard = inherited_lock.descriptor if locked_before_claims else None
     outcome = FloorOutcome(tmp_sweep.SkippedSweepAssessment())
     target_search: SearchedFloorTargets | FloorTargetsNotSearched = FloorTargetsNotSearched()
     protected: tuple[tuple[str, int], ...] = ()
@@ -4602,8 +4743,9 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
             return outcome
         if not dry_run:
             lock_path = str(lock)
-            os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-            guard = try_lock(lock_path)
+            if not locked_before_claims:
+                os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+                guard = try_lock(lock_path)
             if guard is None:
                 print(f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; another sweep is holding it")
                 if isinstance(policy, NatedevFloor):
@@ -4654,18 +4796,18 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
         no_evidence = {item.path for item in OUTPUT_ROOTS.get().no_recorded_evidence}
         for root in targets:
             try:
-                held_slots = [slot for slot in output_slot_leases(root)
-                              if build_folders.build_folder_state(slot.checkout) == "held"]
+                held_copies = [copy for copy in output_copy_leases(root)
+                              if build_folders.build_folder_state(copy.checkout) == "held"]
             except (OSError, RuntimeError) as error:
-                busy[root] = report_unverified_slot(root, error)
+                busy[root] = report_unverified_copy(root, error)
                 held_targets.add(root)
                 _ = known_trees.setdefault(root, [])
                 continue
-            if held_slots:
-                busy[root] = LockHeld(held_slots[0].lock)
+            if held_copies:
+                busy[root] = LockHeld(held_copies[0].lock)
                 held_targets.add(root)
                 _ = known_trees.setdefault(root, [])
-                print(f"lint sweep: busy slot lease; {root} left alone")
+                print(f"lint sweep: busy copy lease; {root} left alone")
                 continue
             with scratch.judgment_lock(Path(root)) as idle_copy:
                 if root in no_evidence and not idle_copy:
@@ -4863,6 +5005,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
     finally:
         try:
             if not dry_run:
+                check_mac_floor_reader()
                 held_targets.update(root for root, use in busy.items()
                                     if not isinstance(direct_use(use), NoRecordedEvidence))
                 for root in tuple(held_targets):
@@ -4874,7 +5017,7 @@ def _hold_floor_pass(floor: int, dry_run: bool, *,
                                      policy=policy)
         finally:
             try:
-                if guard is not None:
+                if guard is not None and not locked_before_claims:
                     os.close(guard)
             finally:
                 mirror_leases.close()
@@ -5240,7 +5383,7 @@ def sweep_unused_folders(dry_run: bool, *, now: float, lint_settings: conf.Confi
             if isinstance(plan, removal_guard.RemovalList):
                 _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "saved numbered copy removal")
     for repo in sorted(root.iterdir()):
-        if (repo.name in build_folders.BUILD_ROOT_EXCEPTIONS or repo.name in removal_guard.LEGACY_TOP
+        if (repo.name in build_folders.BUILD_ROOT_EXCEPTIONS or repo.name in removal_guard.PROTECTED_TOP
                 or repo.name.startswith("old-") or not removal_guard.is_real_directory(repo)):
             continue
         for path, form in _unused_form_paths(repo):
@@ -5259,7 +5402,7 @@ def switch_removal_list() -> int:
     root = build_folders.build_root()
     plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
     if removal_guard.is_real_directory(root):
-        for name in ("cargo", "paths", "slot", "hana-ci", "old-claude"):
+        for name in ("cargo", "paths", "hana-ci", "old-claude"):
             path = root / name
             if removal_guard.is_real_directory(path):
                 _ = plan.add_manual(removal_guard.Tool.BUILD, path, root, 0, "legacy build folder at the switch")
@@ -5275,12 +5418,44 @@ def main(argv: list[str]) -> int:
         return rebuilds_main(argv[1:])
     if argv in (["--unused-folders"], ["--unused-folders", "--dry-run"]):
         return sweep_unused_folders(len(argv) == 2, now=time.time(), lint_settings=conf.read("lint"))
+    if argv[:1] == [MAC_FLOOR_WORKER_FLAG]:
+        token = MAC_FLOOR_SESSION.set(MacFloorSession(sys.stdin.fileno()))
+        try:
+            return assess_and_report(argv[1:])
+        except MacFloorReaderCancelled:
+            return 129
+        finally:
+            MAC_FLOOR_SESSION.reset(token)
+    if argv[:1] == [MAC_FLOOR_DEADLINE_FLAG]:
+        sweep_args = argv[2:]
+        mac_floor = FLOOR_ONLY_FLAG in sweep_args and ("--host", "mac") in zip(sweep_args, sweep_args[1:])
+        if not (mac_floor and os.environ.get("SSH_TTY") and sys.stdin.isatty()):
+            print(f"lint sweep: {MAC_FLOOR_DEADLINE_FLAG} requires a Mac floor sweep over SSH", file=sys.stderr)
+            return 2
+        try:
+            expires_at = float(argv[1])
+        except ValueError:
+            expires_at = math.nan
+        if not math.isfinite(expires_at):
+            print(f"lint sweep: {MAC_FLOOR_DEADLINE_FLAG} needs a finite Unix time", file=sys.stderr)
+            return 2
+        try:
+            command = [sys.executable, "-u", __file__, MAC_FLOOR_WORKER_FLAG, *sweep_args]
+            return supervise_mac_floor(command, expires_at - time.time())
+        except OSError as error:
+            print(f"lint sweep: {removal_guard.single_line(error)}", file=sys.stderr)
+            return 1
+    return assess_and_report(argv)
+
+
+def assess_and_report(argv: list[str]) -> int:
     if "--dry-run" in argv:
         return assess(argv)
     plan = removal_guard.RemovalList(removal_guard.Tool.BUILD)
     token = BUILD_LIST.set(plan)
     try:
         status = assess(argv)
+        check_mac_floor_reader()
         plan.report()
         return status
     except InterruptedError:
@@ -5334,10 +5509,16 @@ def assess(argv: list[str]) -> int:
                 mac_floor, mac_roots = mac_floor_settings(mac_settings, mirror_root=mirror_root)
                 lint_settings = conf.read("lint")
                 timeout = mac_settings.number("probe_timeout_s")
-            with copies.mirror_sweep_leases(mirror_root.local_path()) as leases:
+            with ExitStack() as resources:
+                floor_lock = (resources.enter_context(wait_for_mac_floor_lock(floor_record_path().with_suffix(".lock")))
+                              if not dry_run and isinstance(MAC_FLOOR_SESSION.get(), MacFloorSession)
+                              else AcquireFloorLock.LOCALLY)
+                check_mac_floor_reader()
+                leases = resources.enter_context(copies.mirror_sweep_leases(mirror_root.local_path()))
                 claims = floor_claims.read_claims(timeout)
                 return hold_floor(mac_floor, dry_run, lint_settings=lint_settings,
-                                  policy=MacFloor(mac_roots, claims, mirror_root.local_path(), leases.busy, leases.held))
+                                  policy=MacFloor(mac_roots, claims, mirror_root.local_path(),
+                                                  leases.busy, leases.held, floor_lock))
         except conf.Unusable as error:
             print(f"lint sweep: {error}", file=sys.stderr)
             return 2

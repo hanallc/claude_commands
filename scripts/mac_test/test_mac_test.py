@@ -400,9 +400,6 @@ class MacTestCommandTests(NotificationGuardedTestCase):
             "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
-        _ = write_config_fixture(self.root / "build_folders.conf",
-                                 "slots.Nates-MacBook-Pro-2023.hana.max=1\n"
-                                 + "slots.Nates-MacBook-Pro-2023.cargo-liner.max=1\n")
         self.environment.update(interpreter_cache_environment(self.root / "cache"))
         self.children = []
         child_lifetime = self.root / "child-lifetime"
@@ -3437,13 +3434,70 @@ fi
         path, fence = self.saved_mirror_claim(idle_since=expired, work_idle_since=expired)
         fence.parent.mkdir(parents=True)
         fence.touch()
-        for status, output in ((255, ""), (0, "leftovers=0\nrc=0\n")):
+        for status, output, expected in (
+            (255, "", 'detail="SSH cleanup exited with status 255"'),
+            (0, "leftovers=0\nrc=0\n", "result=LeftoversEnded leftovers=0 rc=0"),
+        ):
             with self.subTest(status=status), self.watch_mirror(mac_test.MacIdle(), remote=lambda *args, **kwargs:
                     subprocess.CompletedProcess(args, status, output, "")) as check:
-                _ = self.watch_once()
+                diagnostic = self.watch_once()
+                self.assertIn(expected, diagnostic)
             self.assertTrue(path.exists())
             self.assertTrue(fence.exists())
             check.assert_called_once()
+
+        def timed_out(*_args: object, **_options: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(["ssh"], 1)
+
+        with self.watch_mirror(mac_test.MacIdle(), remote=timed_out) as check:
+            diagnostic = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        self.assertIn('detail="SSH leftover check timed out', diagnostic)
+        check.assert_called_once()
+
+    def test_kept_mirror_claim_reports_the_exact_check_reply(self) -> None:
+        expired = mac_test.timestamp(self.now - timedelta(minutes=15))
+        path, fence = self.saved_mirror_claim(pid=4317, cleanup_pending=True, idle_since=expired)
+        fence.parent.mkdir(parents=True)
+        fence.touch()
+        reply = subprocess.CompletedProcess(["ssh"], 1,
+            f"dispatch_mac_id={self.machine_id}\nleftovers=1\nrc=0\n", "remote work still holds the mirror\n")
+        with self.watch_mirror(mac_test.MacIdle(), remote=lambda *_args, **_options: reply) as check:
+            output = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        check.assert_called_once()
+        self.assertEqual(output, "Mac claim mirror check kept the claim: claim_id=fixture-claim pid=4317 "
+                         + 'what="alpha tests" result=LeftoverCheckFailed leftovers=1 rc=0 '
+                         + 'detail="remote work still holds the mirror"\n')
+
+        reply = subprocess.CompletedProcess(["ssh"], 0, reply.stdout, "")
+        with self.watch_mirror(mac_test.MacIdle(), remote=lambda *_args, **_options: reply) as check:
+            output = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        check.assert_called_once()
+        self.assertIn("result=LeftoversRemain leftovers=1 rc=0 count=1", output)
+
+    def test_kept_mirror_diagnostic_redacts_and_limits_the_detail(self) -> None:
+        credential = "AK" + "IA" + "0123456789ABCDEF"  # Split so the id scan finds no literal.
+        path, fence = self.saved_mirror_claim(what=f"copy {credential}")
+        fence.parent.mkdir(parents=True)
+        fence.touch()
+        reply = subprocess.CompletedProcess(["ssh"], 1,
+            f"dispatch_mac_id={self.machine_id}\nleftovers={credential}\nrc=0\n",
+            f"lookup failed for {credential}\n" + "x" * 160)
+        with self.watch_mirror(mac_test.MacIdle(), remote=lambda *_args, **_options: reply):
+            output = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertIn('what="copy [redacted]"', output)
+        self.assertIn("leftovers=invalid rc=0", output)
+        self.assertIn('detail="lookup failed for [redacted] ', output)
+        self.assertTrue(output.endswith('..."\n'))
+        self.assertNotIn(credential, output)
 
     def test_active_pass_clears_idle_since_with_state_lock_released(self) -> None:
         record = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")

@@ -190,12 +190,12 @@ def _parse_verify_package(step: str, arguments: tuple[str, ...]) -> str:
     return result.stdout
 
 
-def command_slot_name(command: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:
+def command_queue_name(command: Sequence[str], names: StepNames) -> QueueRowName | NoNamedStep:
     """Name the first build job or script in the command."""
-    return command_slot_job(command, names)[0]
+    return command_queue_job(command, names)[0]
 
 
-def command_slot_job(command: Sequence[str], names: StepNames
+def command_queue_job(command: Sequence[str], names: StepNames
                      ) -> tuple[QueueRowName | NoNamedStep, StepJob | GateJobNotRecorded, VerifyStep]:
     """Keep the gate job or Verify call with the step name."""
     script = ""
@@ -211,7 +211,7 @@ def command_slot_job(command: Sequence[str], names: StepNames
                     if arguments[:1] == ("--session-dir",):
                         arguments = arguments[2:]
                     package = verify_package(job.step, arguments[1:])
-                    # The slot waits for the whole call.
+                    # The queue row names the whole call.
                     facts = (VerifyCall(job.step, shlex.join(("verify", *arguments)), 1, 1)
                              if job.step in VERIFY_CALL_VERBS else NotVerifyCall())
                     return QueueRowName.step(job.step, package, names), GATE_JOB_NOT_RECORDED, facts

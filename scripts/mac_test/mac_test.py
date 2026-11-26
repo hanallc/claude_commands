@@ -364,7 +364,6 @@ class CliArguments(argparse.Namespace):
         self.repo_root: str = ""
         self.copy: bool = False
         self.target: str = ""
-        self.leased_slots: list[int] = []
         self.assignment_file: str = ""
         self.assignment: str = ""
         self.mac_repository: str = ""
@@ -860,15 +859,11 @@ def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:
     from scripts.mac_test import eligibility
 
     if isinstance(scope, RepositoryScope):
-        if paths.platform == "macos" and scope.key:
-            return paths.claims / f"{claim_state.mac_claim_stem(scope.key, scope.slot)}.json"
-        key = (eligibility.KnownRepository(scope.name, scope.key).path_key
-               if paths.platform == "linux" and scope.key else quote(scope.name, safe=""))
-        if not scope.slot:
-            return paths.claims / f"{key}.json"
-        # Quoting encodes ! in repository names and keys.
-        suffix = f"!{scope.slot}" if paths.platform == "macos" else f".slot-{scope.slot}"
-        return paths.claims / f"{key}{suffix}.json"
+        if paths.platform == "macos":
+            name = claim_state.mac_claim_stem(scope.key) if scope.key else quote(scope.name, safe="")
+            return paths.claims / f"{name}.json"
+        key = eligibility.KnownRepository(scope.name, scope.key).path_key
+        return paths.claims / f"{key}.json"
     return paths.run
 
 
@@ -910,34 +905,9 @@ def wait_claim_matches(paths: StatePaths, claim: HeldClaim, scope: ClaimScope, w
 def claim_blocks_scope(paths: StatePaths, claim: HeldClaim, scope: ClaimScope) -> bool:
     """Match a claim by scope or by the native mirror it holds."""
     return scopes_overlap(claim.scope, scope, mac=paths.platform == "macos") or (
-        paths.platform == "macos" and isinstance(claim.scope, RepositoryScope) and not claim.scope.slot
+        paths.platform == "macos" and isinstance(claim.scope, RepositoryScope)
+        and claim_kind(claim.record) is MacClaimKind.MIRROR
         and isinstance(scope, RepositoryScope) and scope.name == claim.scope.name)
-
-
-def slot_capacity(paths: StatePaths, scope: ClaimScope, *,
-                  configuration: conf.ConfigRead | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT) -> int:
-    if isinstance(scope, WholeMacScope):
-        return 1
-    if paths.platform == "macos":
-        from scripts.lib.build_slots import configured_maximum
-
-        hosts = conf.read_or_repository("machines").words("mac.hosts")
-        if not hosts:
-            raise ConfigError("machines.conf: mac.hosts needs a host name")
-        if scope.key.startswith("git-dir:"):
-            repository = Path(scope.key.removeprefix("git-dir:")).parent.name
-        else:
-            repository = scope.key.rsplit("/", 1)[-1] or scope.name
-        if repository == ".claude":
-            repository = "claude_commands"
-        maximum = configured_maximum(conf.read_or_repository("build_folders"), hosts[0], repository)
-        if maximum < 1:
-            raise ConfigError(f"build_folders.conf: {repository} on {hosts[0]} needs a positive slot limit")
-        return maximum
-    settings = conf.read(config_path(paths.target)) if isinstance(configuration, conf.UseConfiguredValue) else configuration
-    missing = (target_config.MissingSlotCapacity.REQUIRE_CONFIGURED if scope.key
-               else target_config.MissingSlotCapacity.SINGLE_SLOT)
-    return target_config.slot_capacity(settings, scope.name, missing=missing)
 
 
 class MacClaimKind(Enum):
@@ -950,65 +920,14 @@ def claim_kind(record: RunRecord) -> MacClaimKind:
     return MacClaimKind.GUEST if record["claim_id"].startswith(MAC_LINUX_CLAIM_ID_PREFIX) else MacClaimKind.MIRROR
 
 
-@dataclass(frozen=True)
-class MacClaimSlotsBusy:
-    holders: tuple[HeldClaim, ...]
-
-
-def mac_claim_slot(paths: StatePaths, scope: RepositoryScope, claims: tuple[HeldClaim, ...], capacity: int,
-                   *, kind: MacClaimKind, mirror_name: str = "") -> RepositoryScope | MacClaimSlotsBusy:
-    """Select a claim file within the shared repository limit."""
-    repository = RepositoryScope(scope.name, scope.key)
-    overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, repository, mac=True))
-    whole_mac = tuple(claim for claim in overlapping if isinstance(claim.scope, WholeMacScope))
-    if whole_mac:
-        return MacClaimSlotsBusy(whole_mac)
-    if kind is MacClaimKind.MIRROR:
-        mirror_holders = tuple(claim for claim in claims
-                               if not claim.record.get("slot") and isinstance(claim.scope, RepositoryScope)
-                               and claim.scope.name == (mirror_name or scope.name))
-        if mirror_holders:
-            return MacClaimSlotsBusy(mirror_holders)
-    # The native runner uses one mirror and the unnumbered claim file.
-    numbers = (0,) if kind is MacClaimKind.MIRROR else range(capacity, 0, -1)
-    has_capacity = len(overlapping) < capacity
-    if kind is MacClaimKind.GUEST and not has_capacity:
-        return MacClaimSlotsBusy(overlapping)
-    occupied_paths = {claim.path: claim for claim in claims}
-    occupied_slots = {claim.scope.slot: claim for claim in overlapping if isinstance(claim.scope, RepositoryScope)}
-    holders: list[HeldClaim] = []
-    for number in numbers:
-        candidate = RepositoryScope(scope.name, scope.key, number)
-        holder = occupied_paths.get(claim_path(paths, candidate)) or occupied_slots.get(number)
-        if holder is not None:
-            holders.append(holder)
-        elif has_capacity:
-            return candidate
-    return MacClaimSlotsBusy(tuple(holders) or overlapping)
-
-
-def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
-    from scripts.mac_test import eligibility
-
-    return paths.affinity / f"{eligibility.KnownRepository(scope.name, scope.key).path_key}.json"
-
-
-def preferred_slots(paths: StatePaths, scope: RepositoryScope, worktree: str, capacity: int) -> tuple[int, ...]:
-    affinity = read_json_object(affinity_path(paths, scope)) or {}
-    if any(type(slot) is not int or slot < 1 for slot in affinity.values()):
-        raise StateReadError("invalid repository slot affinity")
-    preferred = affinity.get(str(claim_worktree_path(worktree)))
-    slots = tuple(range(1, capacity + 1))
-    return (cast(int, preferred), *(slot for slot in slots if slot != preferred)) if preferred in slots else slots
-
-
-def remember_slot(paths: StatePaths, scope: RepositoryScope, record: RunRecord) -> None:
-    path = affinity_path(paths, scope)
-    affinity = {str(claim_worktree_path(worktree)): slot for worktree, slot in (read_json_object(path) or {}).items()
-                if Path(worktree).is_absolute() and Path(worktree).exists()}
-    affinity[str(claim_worktree_path(record["worktree"]))] = scope.slot
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_json(path, affinity)
+def mac_claim_holders(scope: RepositoryScope, claims: tuple[HeldClaim, ...], *,
+                      kind: MacClaimKind, mirror_name: str = "") -> tuple[HeldClaim, ...]:
+    """Find claims that share a repository or a native Mac mirror."""
+    return tuple(claim for claim in claims
+                 if scopes_overlap(claim.scope, scope, mac=True)
+                 or (kind is MacClaimKind.MIRROR and claim_kind(claim.record) is MacClaimKind.MIRROR
+                     and isinstance(claim.scope, RepositoryScope)
+                     and claim.scope.name == (mirror_name or scope.name)))
 
 
 def live_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
@@ -2152,7 +2071,8 @@ def finished_claim(args: CliArguments, record: RunRecord, path: Path, *, adopted
         lines.append("claim_fence=" + claim_state.claim_fence_scope_key(path, record))
         if "mac_repository" in record:
             lines.append("mac_repository=" + json.dumps(record["mac_repository"]))
-    slot = (f"slot: {record['slot']}",) if "slot" in record else ()
+    _, mirror_number = claim_state.legacy_linux_claim_name(path)
+    slot = (f"slot: {mirror_number}",) if mirror_number != 1 else ()
     if "remote_host" in record and record.get("cleanup_pending"):
         leftovers = f"leftovers: {record['remote_host']}"
         return ClaimFinished(13, (*lines, *slot, leftovers) if adopted else (*lines, leftovers, *slot))
@@ -2216,58 +2136,20 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
         if ("remote_host" in record and "replaced_reservation" not in record and record.get("cleanup_pending")
                 and record["pid"] == args.pid and claim_state.claim_identity(record) == identity
                 and claim_state.cleanup_scope_is_known(paths, claim)
-                and not run_is_kept(record)
-                and (not args.leased_slots or record.get("slot", 1) in args.leased_slots)):
+                and not run_is_kept(record)):
             return finished_claim(args, record, claim.path)
     if paths.platform == "macos" and isinstance(scope, RepositoryScope) and isinstance(block, NoMacBlock):
-        try:
-            capacity = slot_capacity(paths, scope)
-        except (OSError, ConfigError) as error:
-            return ClaimDenied(12, f"state unreadable: {error}")
         mirror = mac_repository.mirror_name if isinstance(mac_repository, claim_state.MacMirrorIdentity) else ""
-        slot = mac_claim_slot(paths, scope, claims, capacity, kind=mac_kind, mirror_name=mirror)
-        if isinstance(slot, RepositoryScope):
-            if isinstance(assignment, UnassignedClaim):
-                scope = slot
-            overlapping = ()
-        else:
-            overlapping = slot.holders
-    if (isinstance(assignment, UnassignedClaim)
-            and not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)):
-        try:
-            capacity = slot_capacity(paths, scope)
-            slots = preferred_slots(paths, scope, args.worktree, capacity)
-            if args.leased_slots:
-                slots = tuple(slot for slot in slots if slot in args.leased_slots)
-        except (OSError, StateReadError, ConfigError) as error:
-            return ClaimDenied(12, f"state unreadable: {error}")
+        overlapping = mac_claim_holders(scope, claims, kind=mac_kind, mirror_name=mirror)
+    if paths.platform == "linux" and isinstance(block, NoMacBlock):
         for claim in overlapping:
-            if (claim.record["pid"] == args.pid and recorded_worktree_matches(claim.record["worktree"], Path(args.worktree))
-                    and claim_state.claim_identity(claim.record) == identity
-                    and not run_is_kept(claim.record) and "slot" in claim.record
-                    and (not args.leased_slots or claim.record["slot"] in args.leased_slots)
-                    and isinstance(block, NoMacBlock)):
-                if reserve_wait and "remote_host" not in claim.record:
+            record = claim.record
+            if (record["pid"] == args.pid and recorded_worktree_matches(record["worktree"], Path(args.worktree))
+                    and claim_state.claim_identity(record) == identity and not run_is_kept(record)):
+                if reserve_wait and "remote_host" not in record:
                     claim_state.save_wait_location(paths, identity,
-                                                   claim_state.WaitReservationLocation.for_claim(claim.path, claim.record))
-                return finished_claim(args, claim.record, claim.path)
-        for slot in slots:
-            selected = RepositoryScope(scope.name, scope.key, slot)
-            selected_path = claim_path(paths, selected)
-            if not any(claim.path == selected_path or scopes_overlap(claim.scope, selected) for claim in claims):
-                scope = selected
-                overlapping = ()
-                break
-        else:
-            if args.leased_slots and slots:
-                selected_slot = next((claim.record["slot"] for claim in overlapping
-                                      if run_is_kept(claim.record) and "slot" in claim.record
-                                      and claim.record["slot"] in args.leased_slots), slots[0])
-                scope = RepositoryScope(scope.name, scope.key, selected_slot)
-                overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
-    if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope)
-            and args.leased_slots and scope.slot not in args.leased_slots):
-        return ClaimDenied(11, "the assigned claim slot is unavailable")
+                                                   claim_state.WaitReservationLocation.for_claim(claim.path, record))
+                return finished_claim(args, record, claim.path)
     if isinstance(replaces, _KeepOtherReservations) and (isinstance(args.remote, str) or reserve_wait):
         for claim in overlapping:
             record = claim.record
@@ -2278,7 +2160,7 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if not isinstance(block, NoMacBlock):
         return blocked_claim(block)
     owner = session
-    # A copy gives way to new work. It keeps the slot when the new request is a copy.
+    # A copy gives way to new work. It keeps the claim when the new request is a copy.
     if overlapping and (args.copy or not all(claim_scope_matches(paths, claim, scope) and copy_gives_way(claim.record)
                                               for claim in overlapping)):
         return ClaimBusy(overlapping[0].record)
@@ -2314,11 +2196,9 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if isinstance(scope, RepositoryScope):
         claimed["repo_name"] = scope.name
         claimed["repo_key"] = scope.key
-        if scope.slot:
-            claimed["slot"] = scope.slot
     path = claim_path(paths, scope)
     if isinstance(mac_repository, claim_state.MacMirrorIdentity) and isinstance(scope, RepositoryScope):
-        selected_repository = mac_repository.for_slot(scope.slot)
+        selected_repository = mac_repository.for_new_claim()
         if "remote_host" in claimed:
             selected_repository = selected_repository.for_remote_claim()
         claimed["mac_repository"] = selected_repository.record()
@@ -2344,8 +2224,6 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             return ClaimDenied(12, str(error), to_stderr=True)
         del claimed["replaced_reservation"]
         write_json(path, claimed)
-    if paths.platform == "linux" and isinstance(scope, RepositoryScope) and scope.slot:
-        remember_slot(paths, scope, claimed)
     return finished_claim(args, claimed, path)
 
 
@@ -2392,7 +2270,7 @@ def replace_incomplete_wait_claim(
         proof.unlink(missing_ok=True)
         return ClaimFinished(claim_state.LEGACY_WAIT_CLAIM_RELEASED, ("legacy reservation released",))
     else:
-        scope = RepositoryScope(scope.name, repository.key, scope.slot)
+        scope = RepositoryScope(scope.name, repository.key)
     replacement = copy(args)
     replacement.claim_id, replacement.episode, replacement.attempt = "", args.retire_wait, ""
     if not isinstance(assignment, UnassignedClaim):
@@ -2461,6 +2339,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
             and (paths.platform == "macos" or wait_claim_matches(paths, claim, scope, worktree)))
             or recorded_worktree_matches(claim.record["worktree"], worktree)),
     )
+    all_claims = owners
     for check, matches in checks:
         owners = tuple(claim for claim in owners if matches(claim))
         if not owners:
@@ -2474,12 +2353,13 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if args.retire_wait and (paths.platform != "macos" or "remote_host" in claim.record
                              or isinstance(saved, claim_state.MacRepositoryIdentity)):
         return ClaimDenied(12, "the Mac reservation changed before retirement")
-    if (not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(claim.scope, RepositoryScope)
-            and args.leased_slots and claim.scope.slot not in args.leased_slots):
-        return refuse_wait_claim(WaitClaimCheck.LEASED_SLOT, status=11)
     # A reservation grants capacity. A later block still prevents new work.
     # Retained remote work keeps its cleanup path.
     if "remote_host" not in claim.record:
+        for other in all_claims:
+            if (other.path != claim.path and scopes_overlap(other.scope, scope, mac=paths.platform == "macos")
+                    and run_is_live(other.record)):
+                return ClaimBusy(other.record)
         try:
             block = blocking_claim_block(paths, session)
         except (OSError, StateReadError):
@@ -2507,15 +2387,13 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     if not cleanup_only:
         record["worktree"] = str(claim_worktree_path(record["worktree"]))
     write_json(claim.path, record)
-    if isinstance(claim.scope, RepositoryScope) and claim.scope.slot and not cleanup_only:
-        remember_slot(paths, claim.scope, record)
     return finished_claim(args, record, claim.path, adopted=True)
 
 
 def command_claim_wait(args: CliArguments, paths: StatePaths, *, kind: str = "",
                        session: SubmittingSession | claim_state.CallingSession = claim_state.CALLING_SESSION,
                        assignment: placement.PlacementAssignment | UnassignedClaim = UNASSIGNED_CLAIM) -> int:
-    """Reserve a slot for a live local wait without starting remote work."""
+    """Reserve a claim for a live local wait without starting remote work."""
     from scripts.mac_test import eligibility
     settings = Path(args.settings) if args.settings else config_path(args.target)
     config = eligibility.read_target_settings(settings)
@@ -2564,7 +2442,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
         if destination.target != (args.target or "mac") or destination.provider not in ("mac", "ssh"):
             return 12
         scope = destination.scope
-        if destination.provider == "ssh" and (not isinstance(scope, RepositoryScope) or scope.slot != destination.slot):
+        if destination.provider == "ssh" and not isinstance(scope, RepositoryScope):
             return 12
         if paths.platform == "macos" and isinstance(scope, RepositoryScope) and not args.from_pid:
             if not isinstance(mac_repository, claim_state.MacMirrorIdentity):
@@ -2574,7 +2452,7 @@ def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = 
                 print("the assigned Mac repository has changed", file=sys.stderr)
                 return 12
             # Keep the mirror file name for an assignment from an older client.
-            scope = RepositoryScope(scope.name, mac_repository.key, scope.slot)
+            scope = RepositoryScope(scope.name, mac_repository.key)
         if not args.from_pid:
             args.episode, args.attempt = assignment.episode, assignment.attempt
             if not args.claim_id:
@@ -2670,12 +2548,48 @@ class ClaimReleaseRefused:
     idle_only: bool = False
 
 
+def mirror_diagnostic_text(value: str, limit: int) -> str:
+    """Redact and shorten journal text."""
+    from scripts.aws_target.admin_secrets import redact
+
+    text = " ".join("".join(char if char.isprintable() else " " for char in redact(value)).split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def watched_mirror_refusal(record: RunRecord, identity: claim_state.ClaimIdentity,
+                           observation: offload.LeftoverObservation) -> str:
+    """Report the result and protocol fields of a refused check."""
+    from scripts.mac_test import offload
+
+    lines = observation.output.splitlines()
+    fields = {"leftovers": "missing", "rc": "missing"}
+    for line in lines:
+        name, separator, value = line.partition("=")
+        if separator and name in fields:
+            digits = value.removeprefix("-")
+            fields[name] = value if len(digits) <= 12 and digits.isascii() and digits.isdecimal() else "invalid"
+    claim_id = mirror_diagnostic_text(record["claim_id"], 64)
+    what = json.dumps(mirror_diagnostic_text(record["what"], 64), ensure_ascii=False)
+    result = observation.result
+    reason = (f"claim_id={claim_id} pid={record['pid']} what={what} result={type(result).__name__} "
+              f"leftovers={fields['leftovers']} rc={fields['rc']}")
+    if isinstance(result, offload.LeftoverCheckFailed):
+        reason += " detail=" + json.dumps(mirror_diagnostic_text(result.reason, 120), ensure_ascii=False)
+    elif isinstance(result, offload.LeftoversRemain):
+        count = str(result.count) if isinstance(result.count, int) else "unresolved"
+        reason += f" count={mirror_diagnostic_text(count, 16)}"
+    if any(line.startswith(("dispatch_start_settled=", "dispatch_start_missing=", "dispatch_start_pending=",
+                            "dispatch_start_pending_mac=", "dispatch_start_holder=")) for line in lines):
+        fence_reason = offload.start_fence_reason(identity, observation.output) or "the remote start fence settled"
+        reason += " fence=" + json.dumps(mirror_diagnostic_text(fence_reason, 120), ensure_ascii=False)
+    return reason
+
+
 def same_cleanup_claim(current: RunRecord, record: RunRecord) -> bool:
     return (claim_owner(current) == claim_owner(record)
             and current.get("remote_host") == record.get("remote_host")
             and current.get("mac_repository") == record.get("mac_repository")
-            and current.get("mac_watch_origin") == record.get("mac_watch_origin")
-            and current.get("slot") == record.get("slot"))
+            and current.get("mac_watch_origin") == record.get("mac_watch_origin"))
 
 
 def release_exact_claims(
@@ -2742,7 +2656,7 @@ def release_exact_claims(
                     mirror = offload.mac_cleanup_scope(saved) if paths.platform == "macos" else remote_work.repository
                     fence = (offload.start_fence_relative(identity, paths.target, scope_key=scope_key).with_suffix(".lock")
                              if fence_pending and paths.platform == "macos" else None)
-                    slot = record.get("slot", 0) or 1
+                    slot = claim_state.legacy_linux_claim_name(path)[1] if paths.platform == "linux" else 1
                     command = (offload.leftover_check_script(mirror, paths.target, slot, fence=fence)
                                if fence is not None else offload.leftover_check_script(mirror, paths.target, slot)) + "\n"
                 else:
@@ -2784,8 +2698,7 @@ def release_exact_claims(
                         if not watched_idle:
                             return ClaimReleaseRefused("the exact start fence is missing", fence_missing=True)
                     elif not isinstance(observed.result, offload.LeftoversEnded) or lines != [*prefix, f"dispatch_start_settled={key}"]:
-                        reason = offload.start_fence_reason(identity, observed.output)
-                        return ClaimReleaseRefused(reason or "the mirror check gave no answer")
+                        return ClaimReleaseRefused(watched_mirror_refusal(record, identity, observed))
                 elif fence_pending:
                     reason = offload.start_fence_reason(identity, observed.output)
                     if reason is not None:
@@ -2856,13 +2769,13 @@ def free_now(
 
     Read local records without taking the claim lock or contacting the Mac.
     Mirror runs can replace a test copy and take over a kept claim for cleanup.
-    Guest runs use numbered claim files and skip the mirror checks.
+    Guest runs skip the mirror checks.
     """
     from scripts.mac_test import eligibility
     from scripts.buildlog import repository
 
     guest = paths.platform == "macos" and mac_kind is MacClaimKind.GUEST
-    capacity_settings = configuration
+    target_settings = configuration
     if paths.target == eligibility.MAC_LINUX_TARGET:
         if not eligibility.mac_linux_enabled(conf.read("build_targets")):
             return "off"
@@ -2870,10 +2783,10 @@ def free_now(
                                                    eligibility.ActiveBackoff):
             return "backoff"
     elif not guest:
-        if isinstance(capacity_settings, conf.UseConfiguredValue):
+        if isinstance(target_settings, conf.UseConfiguredValue):
             path = eligibility.config_path() if isinstance(settings, eligibility.DefaultMacSettings) else settings
-            capacity_settings = conf.read(path)
-        if not capacity_settings.value("offload", conf.on_off):
+            target_settings = conf.read(path)
+        if not target_settings.value("offload", conf.on_off):
             return "off"
         if not recover_mac_backoff and isinstance(eligibility.read_backoff(time.time(), paths.target),
                                                    eligibility.ActiveBackoff):
@@ -2902,32 +2815,16 @@ def free_now(
     if repository_name is not None and isinstance(
             eligibility.read_mirror_busy(time.time(), repository_name, paths.target), eligibility.ActiveBackoff):
         return "busy"
-    scopes: tuple[ClaimScope, ...] = (scope,)
-    if not guest and not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
-        try:
-            scopes = tuple(RepositoryScope(scope.name, scope.key, slot)
-                           for slot in range(1, slot_capacity(paths, scope, configuration=capacity_settings) + 1))
-        except (OSError, ConfigError) as error:
-            if isinstance(error, conf.Unusable) and isinstance(configuration, conf.ConfigRead):
-                raise
-            return "state"
     if paths.platform == "macos" and isinstance(scope, RepositoryScope):
-        try:
-            capacity = slot_capacity(paths, scope)
-        except (OSError, ConfigError):
-            return "state"
         active = tuple(claim for claim in claims if run_is_live(claim.record)
                        and (guest or not ((cleanup_claim_matches(paths, claim, scope)
                                           and recoverable_kept_claim(claim.record))
                                          or (not copy and claim_scope_matches(paths, claim, scope)
                                              and copy_gives_way(claim.record)))))
-        held = isinstance(mac_claim_slot(paths, scope, active, capacity, kind=mac_kind,
-                                        mirror_name=repository_name or ""), MacClaimSlotsBusy)
+        held = bool(mac_claim_holders(scope, active, kind=mac_kind, mirror_name=repository_name or ""))
     elif paths.platform == "linux":
-        held = all(any(
-            scopes_overlap(claim.scope, candidate) and run_holds_work(claim.record)
-            and (copy or not copy_gives_way(claim.record)) for claim in claims
-        ) for candidate in scopes)
+        held = any(scopes_overlap(claim.scope, scope) and run_holds_work(claim.record)
+                   and (copy or not copy_gives_way(claim.record)) for claim in claims)
     else:
         held = any(run_is_live(claim.record)
                    and not (cleanup_claim_matches(paths, claim, scope) and recoverable_kept_claim(claim.record))
@@ -3304,7 +3201,6 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
     _ = claim.add_argument("--copy", action="store_true")
 
-    _ = claim.add_argument("--leased-slot", dest="leased_slots", type=int, action="append", default=[])
     _ = claim.add_argument("--mac-repository", default="")
     _ = claim.add_argument("--from-pid", type=int, default=0)
     _ = claim.add_argument("--retire-wait", default="", metavar="REPLACEMENT_EPISODE", help=argparse.SUPPRESS)

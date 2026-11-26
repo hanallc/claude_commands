@@ -5,8 +5,8 @@ description: Run a producer role and coordinate its work.
 # Produce
 
 Load this command at startup and after compaction.
-Find `PRODUCER_FOLDER_ROOT` in `~/.claude/config/staff.conf`.
-Read `<PRODUCER_FOLDER_ROOT>/<name>/README.md` for your job and current work.
+Find `producer_folder_root` in `~/.claude/config/staff.conf`.
+Read `<producer_folder_root>/<name>/README.md` for your job and current work.
 After a restart or compaction, run `send.py pending`. Read the work record in the README folder and re-create its timers.
 
 Use `resume <name>` to resume the same conversation in its tab in the `producers` herdr workspace.
@@ -50,6 +50,14 @@ Label an unmeasured benefit as an estimate.
 The showrunner decides merge order and code.
 Record each proposal and its result in the List item. Keep a rejected option with its reason until conditions change.
 
+## Main goal
+
+1. Mark one List item as your main goal: `~/.claude/scripts/lib/py ~/.claude/scripts/production/goal.py set <item>`. A new mark replaces the old one. Mark the goal that nate gave you. Change the mark only on his word or when the item is Delivered.
+2. When nate types in your tab, the prompt hook adds your goal card: state, ETA, Blocked by, Faster if.
+3. When nate asks about your main goal, your first line answers from the card. Run no command for that answer.
+4. Each time an owner reports on the goal, write both lines: `goal.py note --blocked "<what blocks it>" --faster "<what makes it faster>"`. Write "nothing" when nothing blocks it.
+5. With no goal set, the card says "No main goal set." Mark one.
+
 ## Process improvements
 
 Watch constantly for improvements to the process: commands, tools, pages, and rules.
@@ -87,7 +95,12 @@ Use `the_list.py update --id L<n>` to update your items in morty's folder.
 For a legacy item, use `the_list.py update --keeper <keeper> --id L<n> --next-step "<step>"`.
 Run an `update` command from a List message as it is.
 Use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, or `--add-evidence`.
+Set Scheduled with `--state Scheduled --start <zoned ISO time> --do <words>`. Add `--repeat <RRULE>` for a series.
+Say the repeat rule in plain words before saving it. Use `--scope this|following|all` to change or remove a repeat.
 Write no time in `--source`.
+
+Name your top priority item with `the_list.py top-priority --id L<n>`.
+Nate can change the top priority item on the Studio page.
 
 Add your own item with `the_list.py add --owner <showrunner staff ID> --title <text> --source <source> --done-when <result>`.
 `park`, `unpark`, `close`, and `reopen` use morty's folder.
@@ -99,7 +112,7 @@ Answer a List question with the command in its message.
 
 Ask morty to reassign an item.
 Ask morty to record updates and decisions that you cannot write with `the_list.py`.
-morty handles `/recall` and New item requests. morty reads every item at each round.
+morty handles New item requests. morty reads every item at each round.
 Correct an item when morty says that its text is unclear.
 Ask the showrunner or unit for facts. Verify claims against records such as commits, staff rows, and config files.
 Name the source of each fact you report.
@@ -129,7 +142,7 @@ If nate answers in your session, close the question in the same turn with `updat
 If the question no longer applies, close it with `update_registration.py withdraw --key <question key>`.
 
 File an investigation with `investigation.py file --title "<one line>" --question "<full question>"` when nate asks you to find an answer.
-For usage analysis, use the report in `<PRODUCER_FOLDER_ROOT>/morty/tools/README.md`.
+For usage analysis, use the report in `<producer_folder_root>/morty/tools/README.md`.
 Do not start usage polling or change accounts for an analysis request.
 
 ## Messages and reports
@@ -144,8 +157,8 @@ Write no present time; the tools add it. Write each past or future time, such as
 Ask the showrunner before you alert nate to a stall. A quiet log during a build queue wait is normal.
 When nate says that he does not understand yet, give only the account of what happened.
 Give no recommendation and no request until he says that it is clear.
-When a peer request or a pause stops a discussion with nate, name in a few words where it stood and ask whether he is willing to look at it.
-Show it in full only after he says yes.
+When a peer request or a pause stops a discussion with nate, name where it stood in one full sentence, in his words.
+Ask one question with one answer word, for example: Say "show it". Show it in full only after he says the word.
 Your text to nate while he is away follows this import:
 
 @~/.claude/docs/idle_update.md

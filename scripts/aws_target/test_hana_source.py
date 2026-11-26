@@ -23,7 +23,7 @@ from scripts.aws_target import hana_source as source, hana_transport as transpor
 from scripts.aws_target.ledger_test_support import install_aws_fixture_settings, override_fixture_settings
 from scripts.copies import copies
 from scripts.lib import build_folders, conf
-from scripts.lib.build_slots_test_support import private_slot_config
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.git_test_support import commit_repository
 
 
@@ -78,7 +78,7 @@ class HanaSourceTests(unittest.TestCase):
             'wait_seconds=1\ngit_timeout_seconds=60\nguard_timeout_seconds=10\n')
         _ = (config_dir / 'build_targets.conf').write_text(
             '# range: 0.001..\nloopback.shell_timeout_s=120\n')
-        private = private_slot_config(self.root, repository='hana')
+        private = private_copy_config(self.root)
         self.enterContext(mock.patch.dict(os.environ, private.environment))
         self.enterContext(mock.patch.dict(os.environ, {'HOME': str(self.root / 'home')}))
 

@@ -16,6 +16,7 @@ from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.lib.process_group import run_process_group
 from scripts.production import investigation, staff
 from scripts.review_links import (console_theme, new_item_dialog, page_frame, reply_tokens, review_page,
@@ -78,25 +79,32 @@ SHELL = '''
 PROBE = r'''
 const failures = [];
 const check = (ok, description) => { if (!ok) failures.push(description); };
-const dialog = document.querySelector('dialog'), body = dialog.querySelector('.new-item-body');
-const textarea = dialog.querySelector('textarea'), error = dialog.querySelector('[role="alert"]');
-const send = dialog.querySelector('[type="submit"]'), recipient = () => dialog.querySelector('[name="recipient_id"]');
+let dialog, body, textarea, error, send;
+const recipient = () => dialog.querySelector('[name="recipient_id"]');
 const launch = document.querySelector('[data-owner-new]'), png = '__PNG__';
 const to = () => [...dialog.querySelectorAll('[name="recipient_id"]')];
 const morty = () => to().find(input => input.nextElementSibling.textContent === 'morty');
 const selectType = kind => dialog.querySelector('[name="kind"][value="'+kind+'"]').click();
-const open = ({kind, page = 'builds'} = {}) => new Promise(resolve => {
- const status = dialog.querySelector('[data-recipients-status]');
- const observer = new MutationObserver(() => {
-  if (!status.hidden) return;
-  observer.disconnect();
-  if (kind) selectType(kind);
-  resolve();
- });
- observer.observe(status, {attributes:true, attributeFilter:['hidden']});
+async function open({kind, page = 'builds'} = {}) {
  launch.closest('[data-page-owner]').dataset.pageOwner = page;
  launch.click();
-}).then(() => dialog.waitForPageSnapshotForTest());
+ dialog = document.querySelector('dialog:modal');
+ body = dialog.querySelector('.new-item-body');
+ textarea = dialog.querySelector('textarea');
+ error = dialog.querySelector('[role="alert"]');
+ send = dialog.querySelector('[type="submit"]');
+ const loading = dialog.querySelector('[data-recipients-loading]');
+ if (!loading.hidden) await new Promise(resolve => {
+  const observer = new MutationObserver(() => {
+   if (!loading.hidden) return;
+   observer.disconnect();
+   resolve();
+  });
+  observer.observe(loading, {attributes:true, attributeFilter:['hidden']});
+ });
+ await dialog.waitForPageSnapshotForTest();
+ if (kind) selectType(kind);
+}
 const closeToLauncher = () => !dialog.open && document.activeElement === launch;
 function type(text) {
  textarea.value = text;
@@ -116,6 +124,30 @@ function untilError() {
    if (!send.disabled && !error.hidden) { observer.disconnect(); resolve(); }
   });
   observer.observe(dialog, {attributes:true, subtree:true});
+ });
+}
+function stageLaterEdit(edit) {
+ const later = dialog.querySelector('[data-later-draft]');
+ later.click();
+ check(!textarea.readOnly && send.disabled && later.textContent === 'Return to Retry',
+       'The separate draft is editable and waits for Retry.');
+ edit();
+ later.click();
+}
+async function confirmEarlierSend() {
+ const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+ send.click();
+ return await saved;
+}
+function whenSendReady() {
+ if (!send.disabled) return Promise.resolve();
+ return new Promise(resolve => {
+  const observer = new MutationObserver(() => {
+   if (send.disabled) return;
+   observer.disconnect();
+   resolve();
+  });
+  observer.observe(send, {attributes:true,attributeFilter:['disabled']});
  });
 }
 async function sendSaved() {
@@ -149,7 +181,7 @@ async function sendSaved() {
    check(dialog.open && dialog.matches(':modal'), 'The dialog opens as a native modal.');
    check(document.activeElement.id === 'new-item-title' &&
          dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug is selected when the dialog opens.');
-   check([...dialog.querySelectorAll('[name="kind"]')].length === 6, 'Six keyboard-selectable types are present.');
+   check(dialog.querySelectorAll('[name="kind"]').length === 7, 'Seven keyboard-selectable types are present.');
    check(!!recipient() && recipient().tabIndex === 0, 'To uses native keyboard-selectable radios.');
    check(send.disabled, 'Send needs words and a recipient.');
    dialog.querySelector('[name="include_page"]').click();
@@ -195,6 +227,7 @@ async function sendSaved() {
          error.textContent === 'Fixture rejected the first send.' && !send.disabled,
          'Reopen keeps the failed draft and its error.');
    check((await sendSaved()).detail.id === 'I1', 'The event reports the saved item ID.');
+   check(error.hidden && !error.textContent, 'A successful Send shows no failure.');
 
    await open({kind:'question'});
    check(!textarea.value && dialog.querySelector('[data-previews]').hidden, 'Reopen clears the sent draft.');
@@ -249,15 +282,15 @@ async function sendSaved() {
    window.fetch = originalFetch;
    check(attempted.length === 4 && attempted[2].request_id === attempted[3].request_id &&
          error.textContent === 'The token expired again.', 'The dialog retries an expired token once.');
-   check(new Set(attempted.map(post => post.request_id)).size === 1 &&
+   check(attempted[0].request_id === attempted[1].request_id && attempted[1].request_id !== attempted[2].request_id &&
          attempted[0].recipient_id !== attempted[1].recipient_id && attempted[1].kind !== attempted[2].kind,
-         'Changing the recipient or type keeps the unsent draft ID.');
+         'Changing the recipient keeps the draft ID. Changing the kind creates a new ID.');
    type('');
    dialog.querySelector('[data-cancel]').click();
    check(closeToLauncher(), 'Cancel restores focus to the launcher.');
 
-   const ownerPosts = [], ownerDiscards = [], ownerEndpoint = '/console/review/new-item?page=builds';
-   let pngAvailable = true, discarded, useLiveSends = false, dropPageReply = true;
+   const ownerPosts = [], ownerEndpoint = '/console/review/new-item?page=builds';
+   let pngAvailable = true, discarded, useLiveSends = false, dropPageReply = true, lostHold;
    let captureKey = 'd34db33fd34db33fd34db33fd34db33f';
    let ownerToken = 'owner-token';
    let releasePreview, expireNextSend = false, failNextSend = false;
@@ -273,9 +306,14 @@ async function sendSaved() {
      return previewGate.then(() => originalFetch('data:image/png;base64,' + png));
     }
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
+    const hold = new Headers(options.headers).get('X-Undo-Request');
+    if (lostHold && hold === lostHold && !options.keepalive) {
+     lostHold = null;
+     return Promise.reject(new Error('The Send response was lost.'));
+    }
     const payload = JSON.parse(options.body);
     if (payload.discard_capture) {
-     ownerDiscards.push(payload.discard_capture);
+     ownerPosts.push(payload);
      discarded?.();
      return json({});
     }
@@ -307,12 +345,33 @@ async function sendSaved() {
      return payload.page && dropPageReply ? response.then(saved => {
       if (!saved.ok) return saved;
       dropPageReply = false;
+      if (options.keepalive) lostHold = hold;
       throw new Error('The Send response was lost.');
      }) : response;
     }
     return json({id:'I2', key:'saved'});
    };
    const checkbox = dialog.querySelector('[name="include_page"]');
+   function requestsSince(start) {
+    return ownerPosts.slice(start).map(post => post.page_capture ? 'capture' :
+     post.discard_capture ? 'discard' : post.request_id ? 'send' : 'unknown').sort().join(',');
+   }
+   const discardsSince = start => ownerPosts.slice(start).filter(post => post.discard_capture);
+   function waitForDiscards(start, count) {
+    return new Promise((resolve, reject) => {
+     const deadline = setTimeout(() => {
+      discarded = undefined;
+      reject(new Error('The page did not discard the expected captures.'));
+     }, 4000);
+     discarded = () => {
+      if (discardsSince(start).length < count) return;
+      clearTimeout(deadline);
+      discarded = undefined;
+      resolve();
+     };
+     discarded();
+    });
+   }
    function whenShown(element) {
     if (!element.hidden) return Promise.resolve();
     return new Promise(resolve => {
@@ -320,8 +379,8 @@ async function sendSaved() {
      observer.observe(element, {attributes:true, attributeFilter:['hidden']});
     });
    }
-   async function openOwner() {
-    await open({kind:'question'});
+   async function openOwner(kind = 'question') {
+    await open({kind});
     if (!pngAvailable) await whenShown(dialog.querySelector('[data-fallback]'));
     check(checkbox.checked && !checkbox.disabled && !checkbox.closest('label').hidden,
           'The page checkbox is checked and available on open.');
@@ -329,15 +388,15 @@ async function sendSaved() {
     check(morty() && !morty().checked, 'The page dialog also offers morty.');
     check(to()[0].nextElementSibling.hasAttribute('data-button-face'), 'The owner chip uses the shared button style.');
     const shown = [...dialog.querySelectorAll('[data-kind]:not([hidden])')].map(chip=>chip.textContent.trim());
-    check(shown.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Enhancement',
-          'The owner dialog has all six types.');
+    check(shown.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Enhancement,Scheduled', 'The dialog has all seven types.');
    }
    async function sendOwner() {
     selectType('feedback');
+    if (checkbox.checked) await whenShown(pngAvailable ? shot : dialog.querySelector('[data-fallback]'));
     type('Show the queue state.');
     return sendSaved();
    }
-   await openOwner();
+   await openOwner('bug');
    check(ownerPosts.length === 1 && ownerPosts[0].page_capture.width === innerWidth,
          'Opening the dialog starts one capture at the requested viewport.');
    const slot = dialog.querySelector('[data-capture-slot]');
@@ -350,28 +409,44 @@ async function sendSaved() {
    releasePreview();
    await whenShown(shot);
    const image = shot.href;
-   dialog.querySelector('[name="kind"][value="bug"]').click();
-   check(!shot.hidden && shot.href === image && ownerPosts.length === 1,
-         'Changing to Bug keeps the original image and capture request.');
+   selectType('question');
+   await whenShown(shot);
+   const captures = ownerPosts.filter(post => post.page_capture);
+   check(shot.href !== image && captures.length === 2 &&
+         captures[0].capture_key.slice(0, 35) !== captures[1].capture_key.slice(0, 35),
+         'Changing the kind starts a capture for the new draft ID.');
+   const beforeCapturedSend = ownerPosts.length;
    await sendOwner();
-   check(ownerPosts.length === 2 && ownerPosts[1].capture_key === captureKey &&
-         ownerPosts[1].images.length === 0 && ownerPosts[1].evidence.kind === 'none',
-         'Send uses the same preview without the fallback rows.');
+   const capturedSend = ownerPosts.at(-1);
+   check(beforeCapturedSend === 3 && requestsSince(beforeCapturedSend) === 'capture,discard,send' &&
+         discardsSince(beforeCapturedSend).every(post => captures.some(capture => capture.capture_key === post.discard_capture)) &&
+         capturedSend.capture_key === captureKey && capturedSend.images.length === 0 &&
+         capturedSend.evidence.kind === 'none',
+         'Send includes the new capture without the fallback rows.' + ' Requests: ' + requestsSince(beforeCapturedSend));
 
+   const beforeSkipped = ownerPosts.length;
    await openOwner();
    checkbox.click();
-   const skippedCapture = new Promise(resolve => { discarded = resolve; });
+   const skippedCapture = waitForDiscards(beforeSkipped, 2);
    await sendOwner();
    await skippedCapture;
-   check(ownerPosts.length === 4 && !ownerPosts[3].capture_key && ownerPosts[3].evidence.kind === 'none' &&
-         ownerDiscards.at(-1) === ownerPosts[2].capture_key, 'Send with the box unchecked discards the capture.');
+   const skipped = ownerPosts.findLast(post => post.request_id);
+   check(requestsSince(beforeSkipped) === 'capture,capture,discard,discard,send' &&
+         !skipped.capture_key && skipped.evidence.kind === 'none' &&
+         discardsSince(beforeSkipped).every(post =>
+          ownerPosts.some(capture => capture.page_capture && capture.capture_key === post.discard_capture)),
+         'Send with the box unchecked discards the capture.' + ' Requests: ' + requestsSince(beforeSkipped));
 
+   const beforeCancel = ownerPosts.length;
    await openOwner();
-   const canceled = new Promise(resolve => { discarded = resolve; });
+   await whenShown(shot);
+   const canceled = waitForDiscards(beforeCancel, 2);
    dialog.querySelector('[data-cancel]').click();
    await canceled;
-   check(ownerPosts.length === 5 && ownerDiscards.at(-1) === ownerPosts[4].capture_key && !dialog.open,
-         'Closing the dialog discards the capture.');
+   check(requestsSince(beforeCancel) === 'capture,capture,discard,discard' &&
+         discardsSince(beforeCancel).every(post =>
+          ownerPosts.some(capture => capture.page_capture && capture.capture_key === post.discard_capture)) && !dialog.open,
+         'Closing the dialog discards the capture.' + ' Requests: ' + requestsSince(beforeCancel));
 
    pngAvailable = false;
    const emoji = 'x'.repeat(239) + '😀';
@@ -380,23 +455,27 @@ async function sendSaved() {
    const paragraph = document.createElement('p');
    paragraph.textContent = emoji + 'overflow';
    main.append(paragraph);
+   const beforeFallback = ownerPosts.length;
    await openOwner();
    await sendOwner();
-   const fallback = ownerPosts[6].evidence;
-   check(ownerPosts.length === 7 && !ownerPosts[6].capture_key && fallback.kind === 'page-data' &&
-         fallback.rows.some(row=>row.includes('hana nextest')), 'No Firefox sends visible rows.');
+   const fallbackSend = ownerPosts.findLast(post => post.request_id);
+   const fallback = fallbackSend.evidence;
+   check(ownerPosts.slice(beforeFallback).filter(post => post.request_id).length === 1 &&
+         !fallbackSend.capture_key && fallback.kind === 'page-data' &&
+         fallback.rows.some(row=>row.includes('hana nextest')), 'No Firefox sends visible rows.' + ' Requests: ' + requestsSince(beforeFallback));
    const running = fallback.sections?.find(section => section.label === 'Running');
    check(running?.columns[0] === 'Step' && running.columns[1] === 'Stage' &&
          running.rows.some(row => row[0] === 'hana nextest' && row[1] === 'testing'),
          'The fallback keeps the displayed build values with their column labels.');
    check(fallback.title === emoji && fallback.rows.some(row=>row.includes(emoji)),
          'The title and rows keep an emoji at the character limit.');
-   check(ownerPosts[6].page === 'builds', 'Send includes the page identity.');
+   check(fallbackSend.page === 'builds', 'Send includes the page identity.');
 
    pngAvailable = true;
    await openOwner();
    await whenShown(shot);
    const oldKey = captureKey, oldImage = shot.href, at = ownerPosts.length;
+   const previousCapture = ownerPosts.findLast(post => post.page_capture).page_capture;
    const expired = dialog.querySelector('[data-capture-expired]');
    type('Keep these Question words after a restart.');
    expireNextSend = true;
@@ -408,7 +487,7 @@ async function sendSaved() {
          ownerPosts.length === at + 2 && ownerPosts[at].kind === 'question' &&
          ownerPosts[at].capture_key === oldKey && ownerPosts[at].token !== ownerToken &&
          ownerPosts[at + 1].token === ownerToken &&
-         ownerPosts[at + 1].page_capture.document_gzip === ownerPosts[at - 1].page_capture.document_gzip,
+         ownerPosts[at + 1].page_capture.document_gzip === previousCapture.document_gzip,
          'The restart keeps the Question words and takes a screenshot with the new token.');
    releasePreview();
    await whenShown(shot);
@@ -434,6 +513,7 @@ async function sendSaved() {
    releasePreview();
    await whenShown(shot);
    dialog.querySelector('[name="kind"][value="bug"]').click();
+   await whenShown(shot);
    await sendSaved();
    const restored = ownerPosts.at(-1);
    check(restored.capture_key === captureKey && restored.capture_key !== beforeRestore &&
@@ -449,45 +529,53 @@ async function sendSaved() {
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('Keep this draft and its image.');
    paste();
-   const preview = dialog.querySelector('[data-previews] img');
+   await whenShown(noScreenshot);
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The page Send files before the response is lost.');
    const ownerRequest = ownerPosts.findLast(post => post.request_id);
+   stageLaterEdit(() => type('Keep this draft and its image after editing.'));
    dialog.querySelector('[data-cancel]').click();
    await open();
    await whenShown(noScreenshot);
+   const preview = dialog.querySelector('[data-previews] img');
    const previewReply = await originalFetch(preview.src).catch(() => null);
-   check(textarea.value === 'Keep this draft and its image.' &&
-         dialog.querySelector('[data-previews] img') === preview && previewReply?.ok,
-         'Reopen keeps the failed page draft and its pasted image.');
-   type('Keep this draft and its image after editing.');
-   await trySend();
-   check(dialog.open && textarea.value === 'Keep this draft and its image after editing.' &&
-         error.textContent === 'This item was already filed as I2. Any change after that Send was not sent.',
-         'A changed Send reports the first ID and keeps the draft open.');
-   const changedRequest = ownerPosts.findLast(post => post.request_id);
-   check(changedRequest.page === 'builds' && changedRequest.images[0].base64_data === png &&
-         changedRequest.request_id === ownerRequest.request_id,
-         'The first retry uses the old request ID and the current evidence.');
+   check(textarea.value === ownerRequest.words && textarea.readOnly && previewReply?.ok &&
+         send.textContent === 'Retry', 'Reopen locks the submitted words and preserves the pasted image.');
+   check((await confirmEarlierSend()).detail.id === 'I2' && dialog.open &&
+         textarea.value === 'Keep this draft and its image after editing.',
+         'Retry confirms the original item and restores the edited draft.');
+   const retried = ownerPosts.findLast(post => post.request_id);
+   check(JSON.stringify(retried) === JSON.stringify(ownerRequest),
+         'Retry sends the original ID, page, and pasted image.');
+   await whenSendReady();
    check((await sendSaved()).detail.id === 'I3' &&
-         ownerPosts.findLast(post => post.request_id).request_id !== ownerRequest.request_id,
-         'The next Send uses a new ID and files the retained draft.');
+         ownerPosts.findLast(post => post.request_id).request_id !== ownerRequest.request_id &&
+         ownerPosts.findLast(post => post.request_id).images[0].base64_data === png,
+         'The next Send uses a new ID and files the retained words and image.');
    await openOwner();
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('The first item before replacement.');
    dropPageReply = true;
+   await whenShown(noScreenshot);
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'The first item files before the response is lost.');
-   const firstDraft = ownerPosts.at(-1);
+   const firstDraft = ownerPosts.findLast(post => post.request_id);
+   stageLaterEdit(() => {
+    type('The replacement item.');
+    to()[1].click();
+   });
    dialog.querySelector('[data-cancel]').click();
    await open();
-   type('The replacement item.');
-   to()[1].click();
-   await trySend();
-   check(dialog.open && textarea.value === 'The replacement item.' && to()[1].checked &&
-         error.textContent === 'This item was already filed as I4. Any change after that Send was not sent.',
-         'The notice shows the saved ID and keeps the changed words.');
-   check(ownerPosts.at(-1).request_id === firstDraft.request_id, 'The retry uses the original draft ID.');
+   check(textarea.value === firstDraft.words && textarea.readOnly && send.textContent === 'Retry' &&
+         to().find(input => input.checked).value === firstDraft.recipient_id,
+         'Reopen locks the submitted recipient and words.');
+   check((await confirmEarlierSend()).detail.id === 'I4' && dialog.open &&
+         textarea.value === 'The replacement item.',
+         'Retry confirms the saved ID and restores the changed recipient and words.');
+   check(JSON.stringify(ownerPosts.findLast(post => post.request_id)) === JSON.stringify(firstDraft),
+         'Retry uses the original payload.');
+   await whenSendReady();
+   check(to()[1].checked, 'The replacement retains the selected recipient.');
    const replacement = (await sendSaved()).detail;
    check(replacement.id === 'I5' && ownerPosts.at(-1).request_id !== firstDraft.request_id,
          'The next Send files the changed words for the selected recipient.');
@@ -498,20 +586,22 @@ async function sendSaved() {
    dropPageReply = true;
    await trySend();
    check(error.textContent === 'The Send response was lost.', 'F013 files before the response is lost.');
-   type('Edit the draft.');
-   type(undoWords);
+   stageLaterEdit(() => {
+    type('Edit the draft.');
+    type(undoWords);
+   });
    check((await sendSaved()).detail.id === 'I6', 'F013 returns the first item after undo.');
 
    const pageTitle = main.querySelector('h1');
    pageTitle.textContent = 'First queue state';
    await openOwner();
    const firstReport = (await sendOwner()).detail;
-   const firstReportRequest = ownerPosts.at(-1);
+   const firstReportRequest = ownerPosts.findLast(post => post.request_id);
    pageTitle.textContent = 'Second queue state';
    await openOwner();
    const secondReport = (await sendOwner()).detail;
    check(firstReport.id !== secondReport.id, 'F015 files a new item after a confirmed Send.');
-   check(firstReportRequest.request_id !== ownerPosts.at(-1).request_id, 'F015 starts a new draft ID after success.');
+   check(firstReportRequest.request_id !== ownerPosts.findLast(post => post.request_id).request_id, 'F015 starts a new draft ID after success.');
    await openOwner();
    morty().click();
    dialog.querySelector('[name="kind"][value="investigation"]').click();
@@ -530,14 +620,22 @@ async function sendSaved() {
     failNextSend = true;
     await trySend();
     const first = ownerPosts.at(-1);
-    check(!checkbox.disabled, 'A failed Send keeps the screenshot choice available.');
-    checkbox.click();
-    dialog.querySelector('[name="kind"][value="bug"]').click();
-    await sendSaved();
+    check(checkbox.disabled && textarea.readOnly && send.textContent === 'Retry',
+          'An uncertain Send locks the submitted screenshot choice.');
+    stageLaterEdit(() => {
+     checkbox.click();
+     dialog.querySelector('[name="kind"][value="bug"]').click();
+    });
+    await confirmEarlierSend();
     const retry = ownerPosts.findLast(post => post.request_id);
-    check(retry.request_id === first.request_id && Boolean(retry.capture_key) === !checked &&
-          retry.kind === 'bug' && retry.evidence.kind === 'page-data',
-          'The retry uses the current kind and evidence for the same draft.');
+    check(JSON.stringify(retry) === JSON.stringify(first), 'Retry sends the submitted screenshot choice and kind.');
+    if (!checked) await whenShown(shot);
+    await whenSendReady();
+    await sendSaved();
+    const next = ownerPosts.findLast(post => post.request_id);
+    check(next.request_id !== first.request_id && Boolean(next.capture_key) === !checked &&
+          next.kind === 'bug' && next.evidence.kind === 'page-data',
+          'The separate draft sends the changed kind and evidence under a new ID.');
    }
    restartScenario = true;
    const alreadyFiled = 'This item was already filed as I9. Any change after that Send was not sent.';
@@ -548,8 +646,8 @@ async function sendSaved() {
     failNextSend = true;
     await trySend();
     const first = ownerPosts.at(-1);
-    if (changed) type('Keep these edited words after a restart.');
-    const wordsBeforeRetry = textarea.value;
+    const wordsBeforeRetry = changed ? 'Keep these edited words after a restart.' : textarea.value;
+    if (changed) stageLaterEdit(() => type(wordsBeforeRetry));
     filedReply = true;
     await trySend();
     const retry = ownerPosts.findLast(post => post.request_id);
@@ -616,6 +714,9 @@ async function sendSaved() {
      return json({token:'', page_owner:'list-staff', recipients:[{id:'list-staff',name:'morty'}],
                   send_disabled:'Sending is off on a practice List.'});
     }
+    if (url === '/console/review/new-item?page=accounts') {
+     return json({error:'The recipient service is unavailable.'}, 503);
+    }
     if (url === '/console/review/new-item' && options?.method === 'POST') {
      ownerPosts.push(JSON.parse(options.body));
      return json({});
@@ -629,9 +730,19 @@ async function sendSaved() {
    type('A practice item.');
    check(!notice.hidden && notice.textContent === 'Sending is off on a practice List.',
          'The practice dialog shows one reason.');
-   check(send.disabled && checkbox.closest('label').hidden, 'The practice dialog disables Send and hides capture.');
+   check(send.disabled && dialog.querySelector('[name="include_page"]').closest('label').hidden,
+         'The practice dialog disables Send and hides capture.');
    send.click();
    check(ownerPosts.length === beforePractice, 'The practice dialog makes no POST.');
+   dialog.querySelector('[data-cancel]').click();
+   await open({page:'accounts',kind:'question'});
+   const nextNotice = dialog.querySelector('[data-send-disabled]');
+   check(nextNotice.hidden && !nextNotice.textContent, 'The next dialog clears the previous refusal.');
+   const recipientFailure = dialog.querySelector('[data-recipients-status]');
+   check(!recipientFailure.hidden && recipientFailure.textContent === 'The recipient service is unavailable.',
+         'The recipient request failure shows its reason.');
+   check(dialog.querySelector('[data-recipients-loading]').hidden && send.disabled,
+         'A failed request clears loading and leaves Send disabled.');
    dialog.querySelector('[data-cancel]').click();
    window.fetch = originalFetch;
   }
@@ -663,7 +774,7 @@ OWNER_OPTIONS_PROBE = r"""
   if (!dialog.open) throw new Error('The owner button must open the dialog.');
   await loaded;
   const types = [...dialog.querySelectorAll('[data-kind-label]')].map(label => label.textContent);
-  check(types.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Enhancement', 'All six types appear in order.');
+  check(types.join(',') === 'Bug,Question,Feedback,Proposal,Investigation,Enhancement,Scheduled', 'All seven types appear in order.');
   check(dialog.querySelector('[name="kind"]:checked').value === 'bug', 'Bug starts selected.');
   const inputs = () => [...recipients.querySelectorAll('input')];
   check(inputs().map(input => input.value).join() === __RECIPIENTS__.map(row => row.id).join(),
@@ -702,7 +813,16 @@ OWNER_OPTIONS_PROBE = r"""
   words.value = 'Check a proposal for this recipient.';
   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
   check(!send.disabled, 'The alternate recipient enables Send.');
+  const scheduledInput = dialog.querySelector('[data-kind="scheduled"] input');
+  scheduledInput.click();
+  const scheduled = dialog.querySelector('[data-scheduled-help]');
+  const hidden = element => getComputedStyle(element).display === 'none';
+  check(!hidden(send) && !send.disabled && !hidden(scheduled) && hidden(dialog.querySelector('[data-sent-details]')) &&
+        hidden(dialog.querySelector('[data-saved-controls]')),
+        'Scheduled keeps Send and shows the schedule fields.');
   dialog.querySelector('[data-kind="proposal"] input').click();
+  check(scheduled.hidden && !send.hidden && !dialog.querySelector('[data-sent-details]').hidden,
+        'The other types can send from the dialog.');
   check(inputs().length === 1 && !selected() && send.disabled && !status.hidden &&
         status.textContent === 'The recipient you chose is not available. Choose a recipient.',
         'Proposal clears the selection and asks for another recipient.');
@@ -712,13 +832,46 @@ OWNER_OPTIONS_PROBE = r"""
   inputs().find(input => input.value === alternate.value).click();
   check(selected() === alternate.value && !send.disabled && status.hidden,
         'An explicit selection enables Send and hides the notice.');
-  dialog.querySelector('[data-kind="enhancement"] input').click();
-  words.value = 'Show the next check in the row.';
-  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
-  const saved = new Promise(resolve => document.addEventListener('review-item-saved', resolve, {once:true}));
-  send.click();
-  check(!dialog.open && document.activeElement === buttons[0], 'Send closes the dialog and restores focus at once.');
-  check((await saved).detail.id === 'I1', 'Send reports the saved Enhancement.');
+  if (__SEND_SCHEDULED__) {
+   scheduledInput.click();
+   words.value = 'Check the queue. Start Fri Jan 15 2027 13:00. Repeat Daily.';
+   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+   const sendResponse = window.fetch;
+   let posted;
+   window.fetch = (path, options) => {
+    if (path === '/console/review/new-item' && options?.body) {
+     const payload = JSON.parse(options.body);
+     if (payload.kind === 'scheduled') {
+      posted = payload;
+      return Promise.resolve(Response.json({id:'L12', receipt:'Scheduled → cargo-liner. Producer: morty. List item 12.', readback:[
+       'Starts: Fri Jan 15 2027 13:00 PST (16:00 EST)', 'Repeats: Daily'
+      ]}));
+     }
+    }
+    return sendResponse(path, options);
+   };
+   const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+   send.click();
+   await saved;
+   check(posted?.recipient_id === alternate.value && posted.words === words.value &&
+         posted.page_recipient === 'selected' && !('capture_key' in posted),
+         'Scheduled sends the selected owner and words without capture fields.');
+   check(/^s1-[0-9a-f]{32}$/.test(posted?.request_id), 'Changing the kind to Scheduled creates a Scheduled draft ID.');
+   check(!hidden(dialog.querySelector('[data-saved-controls]')) && scheduledInput.checked &&
+         dialog.querySelector('#new-item-saved').textContent.includes('Saved List item 12.') &&
+         dialog.querySelector('#new-item-saved').textContent.includes('Repeats: Daily'),
+         'The confirmation shows the saved List number, repeat, and selected type.');
+   check(dialog.querySelector('#new-item-saved').textContent.includes('Producer: morty.'),
+         'The confirmation names the mapped producer.');
+  } else {
+   dialog.querySelector('[data-kind="enhancement"] input').click();
+   words.value = 'Show the next check in the row.';
+   words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+   const saved = new Promise(resolve => document.addEventListener('review-item-saved', resolve, {once:true}));
+   send.click();
+   check(!dialog.open && document.activeElement === buttons[0], 'Send closes the dialog and restores focus at once.');
+   check((await saved).detail.id === 'I1', 'Send reports the saved Enhancement.');
+  }
  } catch (error) { failures.push(String(error)); }
  await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
  parent.postMessage('finished', location.origin);
@@ -730,6 +883,196 @@ SNAPSHOT_READY_HOOK = (
     b" dialog.waitForPageSnapshotForTest = () => pageCapture.status === 'preparing' ? pageCapture.ready : undefined;\n"
     b" return draft;"
 )
+
+
+RESTORED_SEND_PROBE = r"""
+(async () => {
+ const failures = [];
+ const check = (value, description) => { if (!value) failures.push(description); };
+ const dialog = document.querySelector('#review-new-item');
+ const button = document.querySelector('[data-owner-new]');
+ const words = dialog.querySelector('textarea'), send = dialog.querySelector('[type="submit"]');
+ const kind = '__KIND__', scenario = '__SCENARIO__';
+ const selectedKind = dialog.querySelector('[name="kind"][value="' + kind + '"]');
+ const recipient = id => dialog.querySelector('[name="recipient_id"][value="' + id + '"]');
+ let original = JSON.parse(sessionStorage.getItem('test-restored-send') || 'null');
+ const http = window.fetch;
+ let posted, expired = false;
+ const captureChoice = ['renew', 'omit'].includes(scenario);
+ const warning = scenario === 'missing-attachment';
+ const deferred = warning || ['reopen', 'open', 'unconfirmed'].includes(scenario);
+ window.fetch = async (path, options) => {
+  if (path.startsWith('/console/review/new-item?capture_key=')) {
+   return new Response(Uint8Array.from(atob('__PNG__'), c => c.charCodeAt(0)), {headers:{'Content-Type':'image/png'}});
+  }
+  if (path === '/console/review/new-item' && options?.body) {
+   const payload = JSON.parse(options.body);
+   if (payload.page_capture && deferred) return new Promise(() => {});
+   if (payload.page_capture && captureChoice) return Response.json({capture_key:payload.capture_key}, {status:202});
+   if (payload.discard_capture) return Response.json({});
+   if (payload.kind === kind) {
+    posted = payload;
+    if (!original && scenario === 'unconfirmed') {
+     return Response.json({error:'The result is uncertain.'}, {status:503});
+    }
+    if (!original) throw new TypeError('The Send response was lost.');
+    if (captureChoice && !expired) {
+     expired = true;
+     return Response.json({code:'screenshot_expired', error:'The screenshot expired.'}, {status:409});
+    }
+    if (warning && payload.request_id === original.request_id) {
+     return Response.json({id:'I1', attachment_warning:'The saved screenshot is missing or damaged.'});
+    }
+    return Response.json(kind === 'scheduled'
+     ? {id:'L12', receipt:'Scheduled → cargo-liner. Producer: morty. List item 12.'} : {id:'I1'});
+   }
+  }
+  return http(path, options);
+ };
+ function ready(test) {
+  if (test()) return Promise.resolve();
+  return new Promise(resolve => {
+   const observer = new MutationObserver(() => { if (test()) { observer.disconnect(); resolve(); } });
+   observer.observe(dialog, {attributes:true, childList:true, subtree:true});
+  });
+ }
+ function enter(value) {
+  words.value = value;
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+ }
+ try {
+  button.closest('[data-page-owner]').dataset.pageOwner = original && !captureChoice ? 'review' : '__FIRST_PAGE__';
+  button.click();
+  const include = dialog.querySelector('[name="include_page"]');
+  const withCapture = captureChoice || deferred;
+  if (!original && !withCapture && include.checked) include.click();
+  await ready(() => !!recipient('cargo-liner') && (!original || !send.disabled));
+  if (!original) {
+   selectedKind.click();
+   recipient('cargo-liner').click();
+   enter('Check the queue. Start Mon Nov 30 09:00.');
+   if (kind === 'bug') {
+    const clipboard = new DataTransfer();
+    clipboard.items.add(new File([Uint8Array.from(atob('__PNG__'), c => c.charCodeAt(0))], 'queue.png', {type:'image/png'}));
+    const event = new ClipboardEvent('paste', {cancelable:true});
+    Object.defineProperty(event, 'clipboardData', {value: clipboard});
+    words.dispatchEvent(event);
+   }
+   if (captureChoice) await ready(() => !dialog.querySelector('[data-shot]').hidden);
+   if (deferred) await ready(() => !dialog.querySelector('[data-capture-slot]').hidden);
+   send.click();
+   await ready(() => posted && send.form.getAttribute('aria-busy') === 'false');
+   const namespace = kind === 'scheduled' ? /^s1-/ : /^r6-/;
+   check(namespace.test(posted.request_id), 'The first Send uses the namespace for its kind.');
+   check(send.textContent === 'Retry' && !send.disabled && words.readOnly &&
+         recipient('cargo-liner').matches(':disabled'), 'An uncertain Send locks the submitted fields immediately.');
+   if (deferred) {
+    check(Boolean(posted.defer_capture), 'The uncertain Bug Send includes a deferred screenshot.');
+    original = posted;
+    const later = dialog.querySelector('[data-later-draft]');
+    later.click();
+    check(!words.readOnly && send.disabled, 'The separate draft cannot send before Retry.');
+    if (scenario === 'open') {
+     const scheduled = dialog.querySelector('[name="kind"][value="scheduled"]');
+     scheduled.click();
+     check(scheduled.checked && send.disabled, 'The separate draft can select Scheduled before Retry.');
+     selectedKind.click();
+    }
+    enter('Keep my later edit.');
+    recipient('builds-staff').click();
+    if (scenario === 'reopen') {
+     dialog.querySelector('[data-cancel]').click();
+     button.click();
+     await ready(() => !!recipient('cargo-liner') && !send.disabled);
+    } else {
+     later.click();
+    }
+   } else if (!failures.length) {
+    sessionStorage.setItem('test-restored-send', JSON.stringify(posted));
+    location.reload();
+    return;
+   }
+  }
+  if (original) {
+   check(selectedKind.checked && recipient('cargo-liner').checked && words.value === original.words,
+         'New item restores the kind, recipient, and words.');
+   check(words.readOnly && selectedKind.matches(':disabled') && recipient('cargo-liner').matches(':disabled') &&
+         include.disabled && include.checked === withCapture && send.textContent === 'Retry',
+         'The restored draft locks the submitted fields and displays Retry.');
+   if (kind === 'bug') {
+    const attachment = dialog.querySelector('[data-previews] button');
+    check(attachment?.disabled, 'The restored Bug keeps its pasted image and locks its remove button.');
+   }
+   recipient('builds-staff').click();
+   check(recipient('cargo-liner').checked, 'The submitted recipient cannot change during recovery.');
+   if (captureChoice) {
+    send.click();
+    const choices = dialog.querySelector('[data-replace-capture]');
+    await ready(() => !choices.hidden && send.form.getAttribute('aria-busy') === 'false');
+    check(JSON.stringify(posted) === JSON.stringify(original), 'Retry first sends the original payload.');
+    check(send.disabled && words.readOnly && dialog.querySelector('[data-bug-page-state]').textContent.includes(original.page_state.url),
+          'An expired screenshot pauses Retry and keeps the submitted Bug data.');
+    choices.querySelector('[data-' + scenario + '-capture]').click();
+    await ready(() => choices.hidden && !send.disabled);
+   }
+   const saved = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+   send.click();
+   await saved;
+   if (captureChoice) {
+    const {capture_key, defer_capture, page_state, ...sent} = posted;
+    const {capture_key: previousKey, page_state: previousState, ...previous} = original;
+    check(JSON.stringify(sent) === JSON.stringify(previous) &&
+          JSON.stringify(page_state) === JSON.stringify({...previousState, include_screenshot:false}),
+          'Retry preserves the draft ID, words, images, and page data after the screenshot choice.');
+    check(scenario === 'omit' ? !capture_key && !defer_capture
+     : capture_key !== previousKey && capture_key.startsWith(original.request_id) &&
+       defer_capture.place === location.pathname && !!defer_capture.document_gzip,
+     'Retry uses the chosen action with a snapshot of the open page.');
+   } else {
+    const requestFields = ({defer_capture, ...payload}) => {
+     if (!defer_capture) return payload;
+     const {document_gzip, ...request} = defer_capture;
+     return {...payload, defer_capture:request};
+    };
+    check(JSON.stringify(requestFields(posted)) === JSON.stringify(requestFields(original)),
+          'Retry sends the original fields and capture key.');
+    if (original.defer_capture) {
+     check(scenario === 'reopen' ? !posted.defer_capture.document_gzip
+         : posted.defer_capture.document_gzip === original.defer_capture.document_gzip,
+           'Retry keeps the snapshot bytes only until the dialog closes.');
+    }
+   }
+   if (warning) {
+    const done = dialog.querySelector('[data-done]');
+    const confirmation = dialog.querySelector('#new-item-saved');
+    check(confirmation.textContent === 'Saved I1.\nThe saved screenshot is missing or damaged.' &&
+          !confirmation.hidden && document.activeElement === done && send.disabled,
+          'A saved item with a missing screenshot displays a warning and asks for acknowledgment.');
+    const stored = sessionStorage.getItem('console.new-item.submitted');
+    dialog.dispatchEvent(new Event('cancel', {cancelable:true}));
+    check(dialog.open && stored && sessionStorage.getItem('console.new-item.submitted') === stored,
+          'The submitted draft stays until acknowledgment.');
+    done.click();
+   }
+   if (deferred) {
+    await ready(() => !!recipient('builds-staff') && !send.disabled);
+    check(dialog.open && !words.readOnly && words.value === 'Keep my later edit.' && recipient('builds-staff').checked,
+          'The later edits return in a separate draft after the receipt.');
+    const next = new Promise(resolve => dialog.addEventListener('review-item-saved', resolve, {once:true}));
+    send.click();
+    await next;
+    check(posted.request_id !== original.request_id && posted.words === 'Keep my later edit.',
+          'The later edits use a new draft ID.');
+    check(/^r6-/.test(posted.request_id), 'The separate Bug draft uses the native namespace.');
+   }
+   check(!sessionStorage.getItem('console.new-item.submitted'), 'The receipt clears the submitted draft.');
+  }
+ } catch (error) { failures.push(String(error)); }
+ sessionStorage.removeItem('test-restored-send');
+ await http('/results', {method:'POST', body:JSON.stringify(failures)});
+ parent.postMessage('finished', location.origin);
+})();
+"""
 
 
 def fixture_page(width: int, *, photo: bool, script: str = PROBE) -> bytes:
@@ -755,7 +1098,7 @@ ROW_EVIDENCE_PROBE = r"""
   let dialog;
   const field = selector => dialog.querySelector(selector);
   const words = () => field('textarea'), send = () => field('[type="submit"]');
-  const status = () => field('[data-recipients-status]'), error = () => field('.new-item-error');
+  const loading = () => field('[data-recipients-loading]'), error = () => field('.new-item-error');
   const evidence = () => field('[data-evidence]');
   const include = () => field('[name="include_page"]').closest('label');
   const capture = __CAPTURE__, other = {...capture, step_id: 'other-step', title: 'cargo test', tip: []};
@@ -774,7 +1117,7 @@ ROW_EVIDENCE_PROBE = r"""
   const selected = () => dialog.querySelector('[name="recipient_id"]:checked')?.value;
   async function openRow(trigger, data) {
    dialog = window.reviewNewItem.open({trigger, recipientName: 'builds', evidence: data});
-   await until(() => status().textContent !== 'Loading recipients…');
+   await until(() => loading().hidden);
   }
   async function save(id, trigger) {
    const saved = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once: true}));
@@ -817,7 +1160,7 @@ ROW_EVIDENCE_PROBE = r"""
   await save('Q1', second);
   document.querySelector('[data-owner-new]').click();
   dialog = document.querySelector('dialog[open]');
-  await until(() => status().textContent !== 'Loading recipients…');
+  await until(() => loading().hidden);
   check(evidence().hidden && !include().hidden && dialog.querySelector('[name="kind"]:checked').value === 'bug',
         'The page owner button still opens the page dialog without row evidence.');
   dialog.querySelector('[data-cancel]').click();
@@ -853,7 +1196,7 @@ const failures = [];
 const check = (value, description) => { if (!value) failures.push(description); };
 const wire = [], fetchHTTP = window.fetch;
 let holdCapture = __PHOTO__;
-let releaseCapture, loseSend = false, previewPending = false, previewRequests = 0;
+let releaseCapture, loseSend = false, lostHold, previewPending = false, previewRequests = 0;
 const saved = {id:'I1',key:'bug/owner/I1'};
 window.fetch = async (path, options) => {
  if (!String(path).startsWith('/console/review/new-item')) return fetchHTTP(path, options);
@@ -866,6 +1209,11 @@ window.fetch = async (path, options) => {
   return new Response(new Blob(['PNG'], {type:'image/png'}));
  }
  if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]});
+ const hold = new Headers(options.headers).get('X-Undo-Request');
+ if (lostHold && hold === lostHold && !options.keepalive) {
+  lostHold = null;
+  throw new TypeError('The Send response was lost.');
+ }
  const payload = JSON.parse(options.body);
  if (payload.discard_capture) return Response.json({});
  wire.push(payload);
@@ -877,6 +1225,7 @@ window.fetch = async (path, options) => {
  }
  if (loseSend) {
   loseSend = false;
+  if (options.keepalive) lostHold = hold;
   throw new TypeError('The Send response was lost.');
  }
  return Response.json(saved);
@@ -934,7 +1283,7 @@ const send = async () => {
         'The Bug dialog lists the page facts with the evidence it sends.');
   check(dialog.querySelector('[data-kind="proposal"]').getClientRects().length > 0,
         'The owner dialog displays Proposal.');
-  check(state.textContent.includes('Type All · State Open · Owner builds'), 'The dialog shows the selected filters.');
+  check(state.textContent.includes('Type All · Show Open · Owner builds'), 'The dialog shows the selected filters.');
   const address = term('Address');
   check(address?.nextElementSibling.textContent === location.href, 'The Address row shows the full address.');
   check(state.querySelector('[data-visible-text]').textContent === 'Page data and visible text',
@@ -1000,6 +1349,11 @@ const send = async () => {
    dialog.querySelector('[type="submit"]').click();
    await whenVisible(dialog.querySelector('.new-item-error'));
    const first = wire.at(-1);
+   const scheduled = dialog.querySelector('[data-kind="scheduled"] input');
+   scheduled.click();
+   check(scheduled.disabled && !scheduled.checked &&
+         dialog.querySelector('[name="kind"]:checked').value === 'bug',
+         'A pending Bug prevents a change to Scheduled.');
    const beforePreview = previewRequests;
    previewPending = true;
    releaseCapture();
@@ -1012,6 +1366,7 @@ const send = async () => {
 
    trigger.closest('[data-page-owner]').dataset.pageOwner = 'list';
    await open();
+   check(!scheduled.disabled, 'Recovering the earlier Bug enables Scheduled.');
    dialog.querySelector('[name="kind"][value="investigation"]').click();
    type('Keep the pending screenshot after a lost List response.');
    loseSend = true;
@@ -1026,7 +1381,11 @@ const send = async () => {
    });
    const listFirst = wire.at(-1);
    const started = wire.length;
+   const later = dialog.querySelector('[data-later-draft]');
+   check(words.readOnly && listSend.textContent === 'Retry', 'A lost List response locks the submitted fields.');
+   later.click();
    type('Keep these edits for a new Send.');
+   later.click();
    const listSaved = new Promise(resolve =>
     document.addEventListener('review-item-saved', resolve, {once:true}));
    listSend.click();
@@ -1073,14 +1432,242 @@ def bug_fixture_page(*, photo: bool = False, script: str = BUG_PROBE) -> bytes:
             '<main><div class="page-owner" data-page-owner="review"><span>sdlc</span>'
             f'<button data-owner-new aria-label="New item">{page_frame.icon_svg("message-circle-question")}</button></div>'
             '<h1>Review</h1><p data-page-status data-render-seconds="2.40">Live · render 2.40 s</p>'
-            '<div role="group" aria-label="Type"><button data-type-chip="" aria-pressed="true">All <b>2</b></button></div>'
-            '<div role="group" aria-label="Show"><button data-show-chip="open" aria-pressed="true">Open</button></div>'
-            '<div role="group" aria-label="Owner"><button data-owner-chip="builds" aria-pressed="true">builds</button></div>'
+            '<div role="group" aria-label="Type" data-filter-row="type"><button data-filter-value="all" aria-pressed="true">All <b>2</b></button></div>'
+            '<div role="group" aria-label="Show" data-filter-row="show"><button data-filter-value="open" aria-pressed="true">Open</button></div>'
+            '<div role="group" aria-label="Owner" data-filter-row="owner"><button data-filter-value="staff:builds" aria-pressed="true">builds</button></div>'
             '<p class="notice">Could not load …/brain.</p></main>'
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
     if script in (BUG_PROBE, LIVE_VIEW_PROBE):
         page = page.replace(b" return draft;", SNAPSHOT_READY_HOOK, 1)
     return page
+
+
+NEW_ITEM_HOLD_PROBE = r"""
+const nativeFetch = window.fetch;
+const dialog = document.querySelector('#review-new-item');
+const send = dialog.querySelector('[type=submit]'), words = dialog.querySelector('textarea');
+const launch = document.querySelector('[data-owner-new]');
+launch.closest('[data-page-owner]').dataset.pageOwner = __PAGE__;
+const posts = [], results = [];
+const scenario = __SCENARIO__, page = __PAGE__;
+const endpoint = __ENDPOINT__;
+let loseReply = false, attempts = 0;
+const check = (condition, message) => { if (!condition) throw new Error(message); };
+async function until(condition, message) {
+ const limit = performance.now() + 5000;
+ while (!condition()) {
+  check(performance.now() < limit, message);
+  await new Promise(resolve => setTimeout(resolve, 10));
+ }
+}
+const toast = () => document.querySelector('[data-send-undo] button')?.parentElement;
+const busy = () => send.form.getAttribute('aria-busy') !== 'false';
+const errorText = () => dialog.querySelector('.new-item-error').textContent;
+const lastPost = () => posts.at(-1);
+const lastResult = () => results.at(-1);
+const resultPath = id => '/send-hold/' + id;
+
+async function release(id) {
+ const response = await nativeFetch(resultPath(id) + '/send', {method:'POST'});
+ check(response.ok, 'The server did not release the hold.');
+ const limit = performance.now() + 5000;
+ while (performance.now() < limit) {
+  const result = await nativeFetch(resultPath(id), {cache:'no-store'});
+  if (result.headers.get('X-Send-Hold') !== 'pending') return result;
+  await new Promise(resolve => setTimeout(resolve, 10));
+ }
+ throw new Error('The server did not complete the hold.');
+}
+
+window.fetch = async (path, options = {}) => {
+ const payload = options.body && JSON.parse(options.body);
+ if (payload?.page_capture) return new Promise(() => {});
+ if (payload?.discard_capture) return Response.json({});
+ const requestId = new Headers(options.headers).get('X-Undo-Request');
+ if (requestId) attempts++;
+ const response = await nativeFetch(path, options);
+ if (requestId) {
+  const hold = await response.clone().json();
+  check(response.status === 202 && hold.hold === requestId, 'The server must retain the hold.');
+  posts.push({requestId, payload, seconds: hold.seconds});
+  if (loseReply && scenario === 'lost-refusal' && posts.length === 1) {
+   const refused = await release(requestId);
+   check(refused.status === 403 && (await refused.json()).code === 'stale_token',
+         'The server did not save the refusal after the lost reply.');
+  }
+  if (loseReply) throw new TypeError('The held Send response was lost.');
+ } else if (String(path).startsWith('/send-hold/') && !options.method) {
+  if (response.headers.get('X-Send-Hold') !== 'pending') {
+   results.push({status:response.status, body:await response.clone().json()});
+  }
+ }
+ return response;
+};
+
+async function openDraft(capture) {
+ launch.click();
+ words.value = 'Check the Undo period for this Send.';
+ words.dispatchEvent(new Event('input', {bubbles:true}));
+ if (page === 'list') {
+  const recipient = () => dialog.querySelector('[name=recipient_id]');
+  await until(recipient, 'The List producer did not load.');
+  recipient().click();
+ }
+ const include = send.form.elements.include_page;
+ if (include.checked !== capture) include.click();
+ await until(() => !send.disabled, 'The first Send is unavailable.');
+}
+
+async function afterLostReply() {
+ await until(() => posts.length === 2 && dialog.open && !send.disabled && send.textContent === 'Retry',
+             'The lost reply did not restore Retry.');
+ check(posts.every(post => post.requestId === posts[0].requestId),
+       'The automatic network retry changed the Undo ID.');
+}
+
+async function finishUndoPeriod(id) {
+ await until(toast, 'Send did not show Undo.');
+ const response = await release(id);
+ toast().getAnimations()[0].finish();
+ return response;
+}
+
+const restart = async () => {
+ const response = await nativeFetch('/probe-restart', {method:'POST'});
+ check(response.ok, 'The server did not restart its hold store.');
+};
+
+function advanceBrowserClock() {
+ const now = Date.now.bind(Date);
+ Date.now = () => now() + 121_000;
+}
+
+async function checkRetainedHold() {
+ await openDraft(true);
+ loseReply = true;
+ send.click();
+ await afterLostReply();
+ const first = posts[0];
+ check(first.payload.defer_capture?.document_gzip, 'The original hold must contain the screenshot.');
+ dialog.querySelector('[data-cancel]').click();
+ await restart();
+ loseReply = false;
+ launch.click();
+ await until(() => !send.disabled && send.textContent === 'Retry', 'Retry is unavailable after restart.');
+ send.click();
+ await until(() => posts.length === 3, 'Retry did not reach the server.');
+ const retry = lastPost();
+ check(retry.requestId === first.requestId && retry.seconds === first.seconds - 17,
+       'Retry must keep the Undo ID and the original remaining Undo time.');
+ check(retry.payload.token !== first.payload.token && !retry.payload.defer_capture?.document_gzip,
+       'Retry must send the new token without retaining the screenshot bytes.');
+ await finishUndoPeriod(retry.requestId);
+ await until(() => !busy(), 'Retry did not finish.');
+ check(lastResult()?.status === 200, 'Retry did not file the item.');
+}
+
+async function checkLostRefusal() {
+ await openDraft(false);
+ await restart();
+ loseReply = true;
+ send.click();
+ await afterLostReply();
+ loseReply = false;
+ const first = posts[0];
+ send.click();
+ await until(() => !busy() && posts.length === 3, 'Retry of the lost refusal did not finish.');
+ check(lastPost().requestId === first.requestId && lastPost().payload.token !== first.payload.token,
+       'Retry must send the new token with the original Undo ID.');
+ check(lastResult()?.status === 200, 'Retry did not file the item.');
+}
+
+async function checkReceivedRefusal() {
+ await openDraft(false);
+ await restart();
+ send.click();
+ await until(() => posts.length === 1, 'The first Send did not reach the server.');
+ await finishUndoPeriod(lastPost().requestId);
+ await until(() => dialog.open && !busy() && !send.disabled, 'The refusal did not restore Send.');
+ const first = lastPost();
+ check(lastResult()?.status === 403 && lastResult().body.code === 'stale_token' && send.textContent === 'Send',
+       'The browser did not receive and finish the refused Send.');
+ if (scenario === 'received-refusal-after-limit') advanceBrowserClock();
+ send.click();
+ await until(() => posts.length === 2, 'The next Send did not reach the server. ' + errorText());
+ const next = lastPost();
+ check(next.requestId !== first.requestId && next.seconds === 60,
+       'The next Send must have a new Undo ID and the full Undo time.');
+ const {token:oldToken, ...oldDraft} = first.payload;
+ const {token:newToken, ...newDraft} = next.payload;
+ check(newToken !== oldToken && !newDraft.capture_key && JSON.stringify(newDraft) === JSON.stringify(oldDraft),
+       'The next Send must keep the same draft with screenshots disabled.');
+ await until(toast, 'The next Send did not show Undo.');
+ toast().querySelector('button').click();
+ await until(() => dialog.open && !busy(), 'The next Send did not finish Undo.');
+}
+
+async function checkCompletedResults() {
+ const options = await nativeFetch(endpoint + '?page=list', {headers:{'X-New-Item-Route':'producer'}});
+ const {token, recipients} = await options.json();
+ const draft = {request_id:'r6-' + crypto.randomUUID().replaceAll('-', ''),
+                kind:'investigation', recipient_id:recipients[0].id,
+                words:'Check that a result ends the Undo period.', page:'list', page_recipient:'producer',
+                evidence:{kind:'none'}, images:[]};
+ const key = JSON.stringify(draft);
+ for (const outcome of ['success', 'already_filed', 'undone', 'undone']) {
+  const previous = lastPost();
+  const payload = {...draft, token};
+  if (outcome !== 'success') payload.words += ' Edit after filing.';
+  const pending = heldFetch(endpoint, {method:'POST', headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify(payload), retryBody:key}).catch(error => error);
+  await until(() => lastPost() !== previous, 'The next Send did not reach the server.');
+  const current = lastPost();
+  check(current.requestId !== previous?.requestId && current.seconds === 60,
+        'A completed Send must give the next Send a new Undo ID and the full Undo time.');
+  if (outcome === 'undone') {
+   await until(toast, 'Send did not show Undo.');
+   toast().querySelector('button').click();
+   check(await pending instanceof SendUndone, 'The browser did not receive successful Undo.');
+  } else {
+   await finishUndoPeriod(current.requestId);
+   const response = await pending;
+   const body = await response.json();
+   const expected = outcome === 'success' ? response.status === 200 : response.status === 409 && body.code === outcome;
+   check(expected && /^I[1-9][0-9]*$/.test(body.id),
+         'Expected ' + outcome + '. Received ' + response.status + ' ' + JSON.stringify(body));
+  }
+ }
+}
+
+async function checkUnknownResult() {
+ await openDraft(false);
+ loseReply = true;
+ send.click();
+ await afterLostReply();
+ loseReply = false;
+ advanceBrowserClock();
+ send.click();
+ await until(() => dialog.open && !busy() && errorText().includes('The retry time ended'),
+             'Retry did not report the time limit.');
+ check(attempts === 2 && results.length === 0 && send.textContent === 'Retry',
+       'The expired Retry must keep the unknown result without another POST.');
+}
+
+(async () => {
+ const failures = [];
+ try {
+  if (scenario === 'retained') await checkRetainedHold();
+  else if (scenario === 'lost-refusal') await checkLostRefusal();
+  else if (scenario === 'completed-results') await checkCompletedResults();
+  else if (scenario === 'unknown-result') await checkUnknownResult();
+  else await checkReceivedRefusal();
+ } catch (error) {
+  failures.push(String(error));
+ } finally {
+  await nativeFetch('/results', {method:'POST',body:JSON.stringify(failures)});
+ }
+})();
+"""
 
 
 LIVE_VIEW_PROBE = CAPTURE_TEXT + r"""
@@ -1300,29 +1887,50 @@ const words = dialog.querySelector('textarea'), error = dialog.querySelector('.n
 const send = dialog.querySelector('[type="submit"]'), shot = dialog.querySelector('[data-shot]');
 const type = dialog.querySelector('[name="kind"][value="investigation"]');
 const include = dialog.querySelector('[name="include_page"]');
-const reloadAfterSend = __RELOAD_AFTER_SEND__;
+const reloadAfterSend = __RELOAD_AFTER_SEND__, shippedPointer = __SHIPPED_POINTER__;
+const shippedUnsent = __SHIPPED_UNSENT__, later = dialog.querySelector('[data-later-draft]');
+const launch = document.querySelector('[data-owner-new]');
+const scheduled = dialog.querySelector('[name="kind"][value="scheduled"]');
 const firstKey = 'e'.repeat(32), readyKey = 'f'.repeat(32);
 const probeKey = 'test-list-first-send', draftPrefix = 'console.list.pending-send.';
+const draftKey = 'console.list.pending-send';
 const restored = JSON.parse(sessionStorage.getItem(probeKey) || 'null');
+function storeShippedPointer(id, value) {
+ sessionStorage.removeItem(draftPrefix + id);
+ sessionStorage.removeItem(draftPrefix + 'state.' + id);
+ sessionStorage.setItem(draftKey, value);
+}
+history.replaceState(null, '', '/console/list.html' + location.search);
 const posts = [], fetchHTTP = window.fetch;
-let captures = 0;
+let lostHold;
 window.fetch = async (path, options) => {
  if (!reloadAfterSend && path.endsWith('?capture_key=' + firstKey)) {
   return fetchHTTP(path.replace(firstKey, readyKey), options);
  }
  if (path === '/console/review/new-item' && options?.method === 'POST') {
+  const hold = new Headers(options.headers).get('X-Undo-Request');
+  if (lostHold && hold === lostHold && !options.keepalive) {
+   lostHold = null;
+   throw new TypeError('The Send response was lost.');
+  }
   const item = JSON.parse(options.body);
-  if (!reloadAfterSend && item.page_capture && ++captures === 1) {
+  if (!reloadAfterSend && item.page_capture && posts.length < 2) {
    return Response.json({capture_key:firstKey}, {status:202});
   }
+  if (shippedUnsent && item.page_capture) return Response.json({error:'No Firefox.'}, {status:503});
   if (item.discard_capture) return Response.json({});
   if (item.request_id) {
    posts.push(item);
+   if (shippedUnsent && item.kind === 'scheduled') {
+    if (!restored.scheduled) throw new TypeError('The Scheduled reply was lost.');
+    return Response.json({id:'L1'});
+   }
    if (!restored && posts.length === 1) {
     if (reloadAfterSend) {
      const response = await fetchHTTP(path, options);
      if (response.status !== 503) return response;
     }
+    if (options.keepalive) lostHold = hold;
     throw new TypeError('The Send response was lost.');
    }
   }
@@ -1331,8 +1939,17 @@ window.fetch = async (path, options) => {
 };
 function waitFor(test) {
  if (test()) return Promise.resolve();
- return new Promise(resolve => {
-  const observer = new MutationObserver(() => { if (test()) { observer.disconnect(); resolve(); } });
+ return new Promise((resolve, reject) => {
+  const observer = new MutationObserver(() => {
+   if (!test()) return;
+   clearTimeout(deadline);
+   observer.disconnect();
+   resolve();
+  });
+  const deadline = setTimeout(() => {
+   observer.disconnect();
+   reject(new Error('The List draft did not reach the expected state.'));
+  }, 8000);
   observer.observe(dialog, {attributes:true, childList:true, subtree:true});
  });
 }
@@ -1345,35 +1962,147 @@ function enterWords(value) {
  words.value = value;
  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
 }
-(async () => {
- try {
-  document.querySelector('[data-owner-new]').click();
+function pasteListImage() {
+ const clipboard = new DataTransfer();
+ clipboard.items.add(new File([Uint8Array.from(atob('__PNG__'), char => char.charCodeAt(0))], 'pasted.png',
+                              {type:'image/png'}));
+ const event = new ClipboardEvent('paste', {cancelable:true});
+ Object.defineProperty(event, 'clipboardData', {value: clipboard});
+ words.dispatchEvent(event);
+}
+async function checkSeparateScheduledDraft() {
+ const pending = () => {
+  const key = Object.keys(sessionStorage).find(key => key.startsWith(draftPrefix + 'r6-'));
+  return key && {id: key.slice(draftPrefix.length), recipient: sessionStorage.getItem(key)};
+ };
+ const recipientsReady = () => !!dialog.querySelector('[name="recipient_id"]:checked');
+ const waitForStep = (test, step) => Promise.race([
+  waitFor(test), new Promise((resolve, reject) => setTimeout(() => reject(new Error(step)), 2500))
+ ]);
+ const scheduleWords = 'Check the List. Start 2099-11-30T09:00Z.';
+ if (!restored) {
+  await waitForStep(recipientsReady, 'The first List form did not load its recipient.');
+  dialog.querySelector('[name="recipient_id"]:checked').dispatchEvent(new Event('input', {bubbles:true}));
+  const {id, recipient} = pending();
+  check(/^r6-/.test(id) && !posts.length, 'Recipient selection stores a native draft before Send.');
+  storeShippedPointer(id, JSON.stringify({id, recipient}));
+  sessionStorage.setItem(probeKey, JSON.stringify({id, recipient}));
+ } else if (!restored.scheduled) {
+  await waitForStep(recipientsReady, 'The shipped draft did not restore its recipient.');
   type.click();
-  enterWords(restored ? 'The words after reload.' : 'Keep the first List Send.');
-  const evidence = reloadAfterSend ? dialog.querySelector('[data-fallback]') : shot;
-  await waitFor(() => !send.disabled && !evidence.hidden);
+  enterWords('Keep the first List Send.');
+  pasteListImage();
+  check(!later.hidden && scheduled.disabled, 'The shipped pointer offers a separate draft.');
+  later.click();
+  check(scheduled.checked && !words.value, 'The separate Scheduled draft has its own fields.');
+  enterWords(scheduleWords);
+  dialog.querySelector('[data-cancel]').click();
+  launch.click();
+  await waitForStep(recipientsReady, 'The native draft did not reopen.');
+  check(type.checked && words.value === 'Keep the first List Send.' &&
+        dialog.querySelectorAll('[data-previews] img').length === 1, 'Reopen shows the native words and image.');
+  later.click();
+  check(scheduled.checked && words.value === scheduleWords && !send.disabled, 'The separate draft keeps its words.');
+  send.click();
+  await waitForStep(sendFinished, 'The Scheduled Send did not return the lost reply.');
+  check(posts.length === 1 && /^s1-/.test(posts[0].request_id) && posts[0].words === scheduleWords,
+        'The first Scheduled Send uses a fresh ID.');
+  check(pending().id === restored.id, 'The Scheduled Send keeps the shipped pointer.');
+  sessionStorage.setItem(probeKey, JSON.stringify({...restored, scheduled:posts[0]}));
+ } else {
+  await waitForStep(() => send.textContent === 'Retry' && !send.disabled, 'The Scheduled Retry did not recover on reload.');
+  send.click();
+  await waitForStep(() => !dialog.querySelector('#new-item-saved').hidden, 'The Scheduled Retry did not show confirmation.');
+  check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored.scheduled) &&
+        dialog.querySelector('#new-item-saved').textContent.startsWith('Saved List item 1.'),
+        'Scheduled Retry uses the same Send and confirms the saved item.');
+  check(pending().id === restored.id, 'Scheduled confirmation keeps the shipped pointer.');
+  dialog.querySelector('[data-done]').click();
+  launch.click();
+  await waitForStep(recipientsReady, 'The native draft did not open after Scheduled confirmation.');
+  check(type.checked && words.value === 'Keep the first List Send.' &&
+        dialog.querySelectorAll('[data-previews] img').length === 1, 'Scheduled Retry preserves the native words and image.');
+  if (send.disabled) throw new Error('The native Send is disabled.');
+  const saved = new Promise(resolve => dialog.addEventListener('review-item-created', resolve, {once:true}));
+  send.click();
+  await Promise.race([saved, waitForStep(sendFinished, 'The native Send did not finish.').then(() => { throw new Error(error.textContent); })]);
+  check(posts.length === 2 && posts[1].request_id === restored.id && posts[1].recipient_id === restored.recipient,
+        'The native Send still uses the shipped ID and recipient.');
+  check(!pending(), 'The native confirmation clears the shipped pointer.');
+  return true;
+ }
+ if (failures.length) return true;
+ location.reload();
+ return false;
+}
+async function checkListRetry() {
+  if (!restored) {
+   type.click();
+   enterWords('Keep the first List Send.');
+   if (shippedPointer) pasteListImage();
+   const evidence = reloadAfterSend ? dialog.querySelector('[data-fallback]') : shot;
+   await waitFor(() => !send.disabled && !evidence.hidden);
+  } else if (shippedPointer) {
+   await waitFor(() => !!dialog.querySelector('[name="recipient_id"]'));
+   check(scheduled.disabled && !words.readOnly, 'A shipped draft permits native recovery only.');
+   scheduled.click();
+   check(send.form.elements.kind.value === 'bug', 'Scheduled cannot replace the shipped draft.');
+   type.click();
+   check(scheduled.disabled && type.checked, 'The restored draft permits changing the native kind.');
+   if (shippedPointer === 'id') dialog.querySelector('[name="recipient_id"][value="' + restored.recipient_id + '"]').click();
+   enterWords(restored.words);
+  } else {
+   await waitFor(() => !send.disabled);
+   check(words.value === restored.words && words.readOnly && type.matches(':disabled') && send.textContent === 'Retry',
+         'Reload locks the submitted List draft and displays Retry.');
+  }
+  if (send.disabled) throw new Error('Send is disabled.');
+  if (restored && !shippedPointer) {
+   const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+   send.click();
+   const result = await Promise.race([
+    created, waitFor(sendFinished).then(() => { throw new Error(error.textContent); })
+   ]);
+   check(posts.length === 1 && JSON.stringify(posts[0]) === JSON.stringify(restored),
+         'Reload keeps the draft ID and sends the original payload.');
+   check(result.detail.id === 'I1' && !dialog.open, 'The original Send returns the saved item and closes the dialog.');
+   check(sessionStorage.getItem(draftPrefix + posts[0].request_id) === null,
+         'The saved response clears the draft slot.');
+   return true;
+  }
   send.click();
   await waitFor(sendFinished);
-  if (restored) await waitFor(() => dialog.querySelector('[name="recipient_id"]:checked'));
-  check(editable(), 'A failed Send leaves the draft editable.');
   if (restored) {
-   check(posts.length === 1 && posts[0].request_id === restored.request_id && posts[0].words !== restored.words,
-         'Reload keeps the draft ID and sends the edited words.');
+   if (dialog.open) await waitFor(() => dialog.querySelector('[name="recipient_id"]:checked'));
+   check(editable() && !words.readOnly, 'A saved item response unlocks the draft.');
+   check(posts.length === 1 && posts[0].request_id === restored.request_id && posts[0].kind === restored.kind &&
+         posts[0].recipient_id === restored.recipient_id && posts[0].words === restored.words && !posts[0].images.length,
+         'Native recovery uses the shipped ID, kind, recipient, and words.');
+   check(!scheduled.disabled, 'Scheduled is available after native recovery.');
    check(error.textContent === 'This item was already filed as I1. Any change after that Send was not sent.',
          'The retry shows the first saved item ID.');
-   check(sessionStorage.getItem(draftPrefix + posts[0].request_id) === null,
-         'An already filed response clears the draft slot.');
+   check(!sessionStorage.getItem(draftKey) && sessionStorage.getItem(draftPrefix + posts[0].request_id) === null,
+         'An already filed response clears the draft slot and the migrated pointer.');
   } else if (reloadAfterSend && !failures.length) {
+   check(words.readOnly && send.textContent === 'Retry', 'The lost reply locks Retry before reload.');
    sessionStorage.setItem(probeKey, JSON.stringify(posts[0]));
+   if (shippedPointer) {
+    check(posts[0].images.length === 1, 'The first Send includes the pasted image.');
+    sessionStorage.removeItem('console.new-item.submitted');
+    const {request_id, recipient_id} = posts[0];
+    storeShippedPointer(request_id, shippedPointer === 'id' ? request_id :
+                        JSON.stringify({id: request_id, recipient: recipient_id}));
+   }
    location.reload();
-   return;
+   return false;
   } else if (!reloadAfterSend && !failures.length) {
-   const preview = shot.href;
+   check(words.readOnly && send.textContent === 'Retry', 'The lost reply locks Retry before renewal.');
    send.click();
-   await waitFor(sendFinished);
-   check(error.textContent === 'The screenshot expired.' && editable(),
-         'The expired screenshot leaves the draft editable.');
-   await waitFor(() => !shot.hidden && shot.href !== preview && !send.disabled);
+   const renew = dialog.querySelector('[data-renew-capture]');
+   await waitFor(() => !renew.closest('[data-replace-capture]').hidden && !renew.disabled);
+   check(words.readOnly && send.disabled, 'Retry pauses until the user chooses how to handle the expired screenshot.');
+   renew.click();
+   await waitFor(() => !send.disabled);
    const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
    send.click();
    const event = await Promise.race([
@@ -1382,11 +2111,19 @@ function enterWords(value) {
    check(event.detail.id === 'I1' && !dialog.open, 'The replacement screenshot saves one item.');
    check(posts.length === 3 && posts.every(item => item.request_id === posts[0].request_id),
          'Each Send uses the same draft ID.');
-   check(posts[0].capture_key === firstKey && posts[1].capture_key === firstKey && posts[2].capture_key === readyKey,
-         'Send uses the new capture after the first one expires.');
+   check(posts[0].capture_key === firstKey && posts[1].capture_key === firstKey &&
+         posts[2].capture_key.startsWith(posts[0].request_id) && posts[2].capture_key !== firstKey &&
+         posts[2].defer_capture, 'Retry requests a new capture after the first one expires.');
+   check(!sessionStorage.getItem(draftKey), 'A successful Send clears the draft ID.');
    check(sessionStorage.getItem(draftPrefix + posts[0].request_id) === null,
          'A successful Send clears the draft slot.');
   }
+  return true;
+}
+(async () => {
+ try {
+  launch.click();
+  if (!await (shippedUnsent ? checkSeparateScheduledDraft() : checkListRetry())) return;
  } catch (error) {
   failures.push(String(error));
  }
@@ -1423,16 +2160,18 @@ async function waitFor(test) {
   await new Promise(resolve => setTimeout(resolve, 20));
  }
 }
-async function send(words, select = '') {
+async function send(words = '', select = '') {
  document.querySelector('[data-owner-new]').click();
  const dialog = document.querySelector('dialog[open]');
  await waitFor(() => dialog.querySelector('input[name=recipient_id]:checked'));
  const shown = dialog.querySelector('input[name=recipient_id]:checked').value;
  if (select) dialog.querySelector('input[name=recipient_id][value=' + select + ']').click();
- if (dialog.querySelector('[name=include_page]').checked) dialog.querySelector('[name=include_page]').click();
- const field = dialog.querySelector('textarea');
- field.value = words;
- field.dispatchEvent(new InputEvent('input',{bubbles:true}));
+ if (words) {
+  if (dialog.querySelector('[name=include_page]').checked) dialog.querySelector('[name=include_page]').click();
+  const field = dialog.querySelector('textarea');
+  field.value = words;
+  field.dispatchEvent(new InputEvent('input',{bubbles:true}));
+ }
  const host = window.top.document;
  const existing = new Set(host.querySelectorAll('[data-send-undo]'));
  dialog.querySelector('[type=submit]').click();
@@ -1460,11 +2199,15 @@ async function send(words, select = '') {
    const pending = new Map(earlier.map(item => [item.request_id, item]));
    for (const _ of earlier) {
     const created = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
-    const {item, shown, toast} = await send('Recover a draft.', 'other');
-    check(pending.get(item.request_id)?.recipient_id === shown, 'Reload restores the draft ID and its recipient.');
+    const {item, shown, toast} = await send();
+    const original = pending.get(item.request_id);
+    check(original?.recipient_id === shown, 'Reload restores the draft ID and its recipient.');
+    check(JSON.stringify(original) === JSON.stringify(item), 'Retry sends the original payload.');
     check(toast.querySelector('span').textContent === 'Sending.', 'A retry that can recover a filing shows Sending.');
     toast.getAnimations()[0].finish();
-    await created;
+    await Promise.race([created,
+     new Promise((resolve, reject) => setTimeout(() => reject(new Error('Retry did not report a saved item.')), 8000))
+    ]);
     pending.delete(item.request_id);
     check(sessionStorage.getItem(prefix + item.request_id) === null, 'A save removes its own recovery slot.');
     check([...pending.keys()].every(id => sessionStorage.getItem(prefix + id) !== null),
@@ -1485,6 +2228,7 @@ const check = (ok, description) => { if (!ok) failures.push(description); };
 const dialog = document.querySelector('#review-new-item');
 const send = dialog.querySelector('[type="submit"]'), words = dialog.querySelector('textarea');
 const status = dialog.querySelector('[data-recipients-status]');
+const loading = dialog.querySelector('[data-recipients-loading]');
 const launch = document.querySelector('[data-owner-new]');
 const include = dialog.querySelector('[name="include_page"]');
 const selected = () => dialog.querySelector('[name="recipient_id"]:checked')?.value;
@@ -1503,7 +2247,9 @@ if (scenario === 'reload') {
      firstRequest = item.request_id;
      return Promise.reject(new TypeError('Send did not reach the server.'));
     }
-    check(item.request_id === earlier.requestId, 'Send keeps the unfiled draft ID after reload.');
+    check(earlier.cleared ? item.request_id !== earlier.requestId : item.request_id === earlier.requestId,
+          'Retry keeps the ID after reload. A kind change creates a new ID.');
+    if (!earlier.cleared) return Promise.resolve(Response.json({error:'The server refused this Send.'}, {status:409}));
    }
   }
   return fetchHTTP(path, options);
@@ -1518,7 +2264,7 @@ function waitFor(test) {
 }
 async function open() {
  launch.click();
- await waitFor(() => status.textContent !== 'Loading recipients…');
+ await waitFor(() => loading.hidden);
  if (include.checked) include.click();
 }
 function checkEmpty() {
@@ -1546,10 +2292,15 @@ function checkEmpty() {
    }
   } else if (earlier) {
    check(selected() === 'cargo-liner' && !send.disabled, 'Reload restores the selected recipient.');
+   check(words.readOnly && send.textContent === 'Retry', 'Reload requires Retry for the submitted draft.');
+   send.click();
+   await waitFor(() => !words.readOnly && send.form.getAttribute('aria-busy') === 'false');
    selectType('proposal');
    checkEmpty();
    selectType('investigation');
    checkEmpty();
+   const draftKeys = Object.keys(sessionStorage).filter(key => /^console\.list\.pending-send\.r6-/.test(key));
+   check(draftKeys.length === 1, 'Only the current draft can restore its recipient.');
    if (!failures.length) {
     sessionStorage.setItem(probeKey, JSON.stringify({...earlier, cleared:true}));
     location.reload();
@@ -1619,6 +2370,14 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
         pages = {width: fixture_page(width, photo=False) for width in fixtures}
     documents = pages
     finished = threading.Event()
+
+    def fixture_width(url: str) -> int | None:
+        address = urlsplit(url)
+        if address.path.startswith("/case/"):
+            return int(address.path.removeprefix("/case/"))
+        widths = parse_qs(address.query).get("width")
+        return int(widths[0]) if widths else None
+
     outer = f"""<!doctype html><meta charset="utf-8">
     <style>body{{margin:0}}iframe{{display:block;border:0}}</style>
     <iframe title="Dialog probe"></iframe><img src="/complete" alt="" hidden>
@@ -1649,8 +2408,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             self.response(status, "application/json", json.dumps(body).encode())
 
         def fixture(self) -> DialogFixture:
-            width = urlsplit(self.headers["Referer"]).path.removeprefix("/case/")
-            return fixtures[int(width)]
+            width = fixture_width(self.headers["Referer"])
+            assert width is not None
+            return fixtures[width]
 
         def do_GET(self) -> None:
             address = urlsplit(self.path)
@@ -1672,9 +2432,14 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 self.response(204, "image/png", b"")
             elif self.path == "/":
                 self.response(200, "text/html; charset=utf-8", outer)
-            elif address.path.startswith("/case/"):
-                width = int(address.path.removeprefix("/case/"))
-                self.response(200, "text/html; charset=utf-8", documents[width])
+            elif address.path.startswith("/case/") or address.path == "/console/list.html":
+                width = fixture_width(self.path)
+                if width is None:
+                    width = fixture_width(self.headers.get("Referer", ""))
+                if width is not None and width in documents:
+                    self.response(200, "text/html; charset=utf-8", documents[width])
+                else:
+                    self.response(404, "text/plain", b"Unknown fixture")
             else:
                 self.response(404, "text/plain", b"Unknown fixture path")
 
@@ -1717,11 +2482,25 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 request = review_submissions.read_request(fields)
                 fixture.posts.append(request)
                 image = fixture.screenshot if fields.get("capture_key") == CAPTURE_KEY else new_item_dialog.NO_PAGE_SCREENSHOT
+                intent: new_item_dialog.SubmissionCaptureIntent = new_item_dialog.NoDeferredCapture.ABSENT
+                if "defer_capture" in fields:
+                    key = new_item_dialog.read_capture_key(fields["capture_key"])
+                    value = fields["defer_capture"]
+                    capture = (new_item_dialog.read_live_page_capture(cast(object, value)).request
+                               if isinstance(value, dict) and "document_gzip" in value
+                               else new_item_dialog.read_page_capture(cast(object, value)))
+                    intent = new_item_dialog.DeferredCaptureIntent(key, request.request_id, capture)
                 with (patch.dict(os.environ, fixture.environment()),
                       patch.object(Path, "home", return_value=fixture.root),
                       patch.object(reply_tokens, "platform", "linux")):
-                    item = review_submissions.submit(request, screenshot=image,
-                        capture_requested=request.page == "list" and "capture_key" in fields)
+                    item = review_submissions.submit(
+                        request, screenshot=image, capture_intent=intent,
+                        capture_requested=request.page == "list" and "capture_key" in fields and "defer_capture" not in fields)
+                    if (isinstance(intent, new_item_dialog.DeferredCaptureIntent)
+                            and isinstance(intent.request, new_item_dialog.PageCaptureRequest)
+                            and isinstance(fixture.screenshot, new_item_dialog.PageScreenshot)):
+                        _ = review_submissions.attach_submission_screenshot(
+                            new_item_dialog.read_submission_key(item.key), fixture.screenshot)
             except new_item_dialog.SubmissionScreenshotExpired as error:
                 self.send_json(409, {"code": "screenshot_expired", "error": str(error)})
                 return
@@ -1746,7 +2525,7 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+    with accepting_console_text(), ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         try:
@@ -1768,6 +2547,83 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
 
 
 class NewItemDialogTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_producer_route_and_assignee_change_in_the_browser(self) -> None:
+        script = r"""
+const failures = [], check = (ok, message) => { if (!ok) failures.push(message); };
+const list = __LIST__, nativeFetch = window.fetch;
+const dialog = document.querySelector('dialog'), route = dialog.querySelector('[data-route]');
+const trigger = document.querySelector('[data-owner-new]'), send = dialog.querySelector('[type="submit"]');
+const words = dialog.querySelector('textarea'), hint = dialog.querySelector('[data-producer-hint]');
+const change = route.querySelector('[data-route-change]');
+const text = name => route.querySelector('[data-route-' + name + ']').textContent;
+const posts = [];
+if (list) trigger.closest('[data-page-owner]').dataset.pageOwner = 'list';
+window.fetch = (path, options) => {
+ if (!String(path).startsWith('/console/review/new-item')) return nativeFetch(path, options);
+ if (!options.body) {
+  check(options.headers['X-New-Item-Route'] === 'producer', 'The dialog asks for producer routes.');
+  return Promise.resolve(Response.json({
+   token:'fixture', page_owner:list ? '' : 'dwight', page_assignee:list ? '' : 'spacetime',
+   page_owner_reason:list ? '' : 'dwight is the producer of spacetime, the owner of this page.',
+   recipients:[{id:'bob',name:'bob',proposal:true},{id:'dwight',name:'dwight',proposal:true}],
+   assignees:[{id:'spacetime',name:'spacetime'},{id:'fps',name:'fps'}],
+  }));
+ }
+ const payload = JSON.parse(options.body);
+ if (payload.page_capture) return Promise.resolve(Response.json({}, {status:503}));
+ if (payload.discard_capture) return Promise.resolve(Response.json({}));
+ posts.push(payload);
+ return Promise.resolve(Response.json({id:'I1',key:'investigation/dwight/I1'}));
+};
+(async () => {
+ try {
+  const opened = new Promise(resolve => {
+   const observer = new MutationObserver(() => {
+    if (!route.hidden) { observer.disconnect(); resolve(); }
+   });
+   observer.observe(route, {attributes:true});
+  });
+  trigger.click();
+  await opened;
+  words.value = 'Check the rows.';
+  words.dispatchEvent(new Event('input', {bubbles:true}));
+  check([...dialog.querySelectorAll('[data-recipients] input')].map(input => input.value).join() === 'bob,dwight',
+        'To shows only producers.');
+  if (list) {
+   dialog.querySelector('[data-kind="investigation"] input').click();
+   check(text('producer') === 'a producer' && text('assignee') === 'the producer assigns it', 'The List has no default route.');
+   check(send.disabled && !hint.hidden && hint.textContent === 'Pick a producer', 'The List requires a producer.');
+   send.click();
+   check(posts.length === 0, 'A disabled Send makes no request.');
+   dialog.querySelector('[name="recipient_id"][value="dwight"]').click();
+   check(!send.disabled && hint.hidden, 'The producer enables Send.');
+  } else {
+   check(text('copy') === 'dwight tracks this bug and gives it to spacetime.', 'The page sets the producer and assignee.');
+   check(!dialog.querySelector('[data-kind="enhancement"]').hidden, 'The dialog still shows Enhancement.');
+   check(dialog.querySelector('[data-assignees]').closest('fieldset').hidden, 'The assignees start collapsed.');
+   change.click();
+   check(change.getAttribute('aria-expanded') === 'true', 'Change opens the assignee choices.');
+   dialog.querySelector('[name="assignee_id"][value="fps"]').click();
+   check(text('copy') === 'dwight tracks this bug and gives it to fps.', 'The new assignee appears in the route.');
+   check(dialog.querySelector('[name="recipient_id"]:checked').value === 'dwight', 'The producer stays selected.');
+  }
+  const saved = new Promise(resolve => document.addEventListener('review-item-created', resolve, {once:true}));
+  send.click();
+  await saved;
+  check(posts.length === 1 && posts[0].page_recipient === 'producer' && posts[0].recipient_id === 'dwight' &&
+        posts[0].assignee_id === (list ? null : 'fps'), 'Send carries the producer and assignee.');
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await nativeFetch('/results', {method:'POST', body:JSON.stringify(failures)});
+})();
+"""
+        for page in ("review", "list"):
+            with self.subTest(page=page):
+                probe = script.replace("__LIST__", json.dumps(page == "list"))
+                self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
+
     def test_legacy_reply_token_has_the_same_digest_as_the_stored_proof(self) -> None:
         token = "a" * 43
         details = new_item_dialog.ReviewSubmission("fixture", "b" * 64, new_item_dialog.NoEvidence(), (),
@@ -1799,6 +2655,7 @@ class NewItemDialogTests(unittest.TestCase):
   const words = dialog.querySelector('textarea');
   const send = dialog.querySelector('[type="submit"]');
   const status = dialog.querySelector('[data-recipients-status]');
+  const loading = dialog.querySelector('[data-recipients-loading]');
   const waitFor = test => new Promise((resolve, reject) => {
    const deadline = setTimeout(() => {
     observer.disconnect();
@@ -1815,7 +2672,7 @@ class NewItemDialogTests(unittest.TestCase):
    ready();
   });
   document.querySelector('[data-owner-new]').click();
-  await waitFor(() => status.textContent !== 'Loading recipients…');
+  await waitFor(() => loading.hidden);
   dialog.querySelector('[name="include_page"]').click();
   dialog.querySelector('[name="kind"][value="investigation"]').click();
   words.value = 'Check the missing List row.';
@@ -1886,9 +2743,14 @@ class NewItemDialogTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_list_send_after_reload_returns_the_item_from_the_lost_reply(self) -> None:
-        self.check_list_retry(reload_after_send=True)
+        for shipped_pointer, shipped_unsent in (("", False), ("id", False), ("id and recipient", False),
+                                                ("id and recipient", True)):
+            with self.subTest(shipped_pointer=shipped_pointer, shipped_unsent=shipped_unsent):
+                self.check_list_retry(reload_after_send=True, shipped_pointer=shipped_pointer,
+                                      shipped_unsent=shipped_unsent)
 
-    def check_list_retry(self, *, reload_after_send: bool) -> None:
+    def check_list_retry(self, *, reload_after_send: bool, shipped_pointer: str = "",
+                         shipped_unsent: bool = False) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
         configuration = temporary / "config"
@@ -1896,21 +2758,40 @@ class NewItemDialogTests(unittest.TestCase):
         _ = (configuration / "console.conf").write_text(f"page.list.owner={OWNER}\n")
         image = (new_item_dialog.NO_PAGE_SCREENSHOT if reload_after_send else new_item_dialog.PageScreenshot(
             base64.b64decode(PNG), new_item_dialog.PageViewport(1440, 900, True)))
-        fixture = DialogFixture(temporary, screenshot=image, reject_first_send=reload_after_send)
-        probe = LIST_RETRY_PROBE.replace("__RELOAD_AFTER_SEND__", json.dumps(reload_after_send))
+        fixture = DialogFixture(temporary, screenshot=image, reject_first_send=reload_after_send and not shipped_unsent)
+        probe = (LIST_RETRY_PROBE.replace("__RELOAD_AFTER_SEND__", json.dumps(reload_after_send))
+                 .replace("__SHIPPED_POINTER__", json.dumps(shipped_pointer))
+                 .replace("__SHIPPED_UNSENT__", json.dumps(shipped_unsent)))
         page = fixture_page(1440, photo=False, script=probe).replace(
             b'data-page-owner="builds"', b'data-page-owner="list"')
         with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))):
             capture_dialogs(temporary / "list-retry.png", {1440: fixture}, pages={1440: page})
         self.assertEqual(fixture.results, [])
-        self.assertEqual(len(fixture.posts), 2)
-        self.assertEqual(fixture.posts[0].request_id, fixture.posts[1].request_id)
+        if shipped_unsent:
+            self.assertEqual(len(fixture.posts), 1)
+        else:
+            self.assertEqual(len(fixture.posts), 2)
+            self.assertEqual(fixture.posts[0].request_id, fixture.posts[1].request_id)
         with patch.dict(os.environ, fixture.environment()):
             record, = investigation.records(owner.id)
         self.assertEqual((record.id, record.question), ("I1", "Keep the first List Send."))
         submission = record.submission
         assert isinstance(submission, new_item_dialog.ReviewSubmission)
-        self.assertEqual(submission.images, () if reload_after_send else (review_submissions.PAGE_SCREENSHOT,))
+        if shipped_pointer:
+            reference, = submission.images
+            with patch.dict(os.environ, fixture.environment()):
+                attachment = review_submissions.image_folder(submission) / reference.id / reference.file
+            self.assertEqual(attachment.read_bytes(), base64.b64decode(PNG))
+        else:
+            self.assertEqual(submission.images, () if reload_after_send else (review_submissions.PAGE_SCREENSHOT,))
+        if isinstance(image, new_item_dialog.PageScreenshot):
+            intent = submission.capture_intent
+            assert isinstance(intent, new_item_dialog.DeferredCaptureIntent)
+            self.assertEqual(intent.capture_key, fixture.wire_posts[-1]["capture_key"])
+            reference, = submission.images
+            with patch.dict(os.environ, fixture.environment()):
+                attachment = review_submissions.image_folder(submission) / reference.id / reference.file
+            self.assertEqual(attachment.read_bytes(), image.png)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
     def test_capture_keeps_the_live_view_and_falls_back_over_the_limit(self) -> None:
@@ -1922,6 +2803,17 @@ class NewItemDialogTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
     def test_draft_end_paths_release_the_live_page_capture(self) -> None:
+        self._check_capture_lifecycle(
+            "cancel-preparation", "cancel-post", "cancel-poll", "undo-send", "undo-cancel",
+            "lost", "already-filed", "retained", "list-row", "list-no-row", "cancel-reopen", "error-close",
+            "continuation-compression", "continuation-token",
+        )
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
+    def test_a_continued_draft_does_not_capture_another_page(self) -> None:
+        self._check_capture_lifecycle("continuation-other-page")
+
+    def _check_capture_lifecycle(self, *outcomes: str) -> None:
         probe = r"""
 const failures = [], fetchHTTP = window.fetch;
 const outcome = __OUTCOME__;
@@ -1934,7 +2826,7 @@ const hold = 'a'.repeat(24);
 const uploads = [], reads = [], sends = [], discarded = [], revoked = [];
 const tokenReads = [];
 const continuesFiledDraft = ['already-filed','continuation-compression','continuation-token'].includes(outcome);
-let serverToken = 'fixture';
+let serverToken = 'fixture', lostHold;
 const readyImage = () => new Response(new Blob(['fixture PNG'], {type:'image/png'}));
 const lateImage = Promise.withResolvers();
 const releasePreparation = Promise.withResolvers();
@@ -2018,12 +2910,19 @@ window.fetch = async (path, options = {}) => {
   discarded.push(payload.discard_capture);
   return Response.json({});
  }
- sends.push({payload, signal:options.signal});
+ if (lostHold && new Headers(options.headers).get('X-Undo-Request') === lostHold && !options.keepalive) {
+  lostHold = null;
+  throw new TypeError('The Send response was lost.');
+ }
+ sends.push({payload, signal:options.signal, holdId:new Headers(options.headers).get('X-Undo-Request')});
  if (sends.length === 1) {
   if (outcome.startsWith('undo-')) {
    return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
   }
-  if (['lost','retained','error-close'].includes(outcome)) throw new TypeError('The Send response was lost.');
+  if (['lost','retained','error-close'].includes(outcome)) {
+   if (options.keepalive) lostHold = new Headers(options.headers).get('X-Undo-Request');
+   throw new TypeError('The Send response was lost.');
+  }
   if (continuesFiledDraft) {
    heading.textContent = 'Fresh page evidence';
    if (outcome === 'continuation-token') serverToken = 'after-restart';
@@ -2060,8 +2959,37 @@ async function checkContinuation(original, replacement, replacementUpload) {
  check(replacement.defer_capture?.document_gzip === expected && html.includes('<h1>Fresh page evidence</h1>'),
        'Continuation sends the snapshot that matches the fresh page evidence.');
 }
+async function checkOtherPage() {
+ const earlier = {request_id:'r6-' + 'a'.repeat(32), kind:'bug', page:'builds',
+                  page_recipient:'selected', recipient_id:'owner', words:'Report a Builds error.',
+                  evidence:{kind:'none'}, images:[]};
+ sessionStorage.setItem('console.new-item.submitted', JSON.stringify({
+  payload:earlier, mode:'retry', selectedKind:'bug', includeScreenshot:true
+ }));
+ launch.closest('[data-page-owner]').dataset.pageOwner = 'images';
+ heading.textContent = 'Images';
+ launch.click();
+ await until(() => send.textContent === 'Retry' && !send.disabled, 'Retry did not restore the Builds draft.');
+ const later = dialog.querySelector('[data-later-draft]');
+ later.click();
+ type('Keep these Builds edits.');
+ later.click();
+ await sendWords();
+ await until(() => send.textContent === 'Send' && !send.disabled, 'The continued draft did not open.');
+ check(words.value === 'Keep these Builds edits.', 'The continued draft keeps the edits.');
+ await sendWords();
+ const [first, second] = sends.map(request => request.payload);
+ check(first.request_id === earlier.request_id && second.request_id !== first.request_id &&
+       second.page === 'builds', 'Retry preserves the Builds route for the continued draft.');
+ check(!uploads.length && !second.capture_key && !second.defer_capture && !second.page_state,
+       'The Builds draft does not capture Images.');
+}
 (async () => {
  try {
+  if (outcome === 'continuation-other-page') {
+   await checkOtherPage();
+   return;
+  }
   if (['list-row','list-no-row','retained'].includes(outcome)) {
    launch.closest('[data-page-owner]').dataset.pageOwner = 'list';
   }
@@ -2144,7 +3072,8 @@ async function checkContinuation(original, replacement, replacementUpload) {
          'A pending capture is sent with the held request.');
   }
   if (['lost','retained','error-close'].includes(outcome)) {
-   check(dialog.open && !notice.hidden && !upload.signal?.aborted, 'A lost response keeps the editable draft and capture.');
+   check(dialog.open && !notice.hidden && words.readOnly && !upload.signal?.aborted,
+         'A lost response locks Retry and keeps the capture.');
    if (outcome === 'error-close') {
     close.click();
     check(upload.aborted && !discarded.includes(key), 'Closing a failed Send keeps the capture eligible for recovery.');
@@ -2153,14 +3082,21 @@ async function checkContinuation(original, replacement, replacementUpload) {
     await until(() => !send.disabled, 'Reopen did not restore the failed Send.');
     await sendWords();
     const retry = sends[1].payload;
+    check(retry.token === serverToken, 'Retry uses the current token.');
     check(!retry.defer_capture?.document_gzip && retry.defer_capture?.place === first.defer_capture.place &&
           retry.capture_key === key && retry.request_id === first.request_id,
           'Retry after close keeps the draft and viewport without retaining the bytes.');
+    check(sends[0].holdId && sends[1].holdId === sends[0].holdId,
+          'Retry after close uses the original Undo request ID.');
     return;
    }
    if (outcome === 'retained') {
+    const later = dialog.querySelector('[data-later-draft]');
+    later.click();
+    check(!words.readOnly && send.disabled, 'A separate draft allows editing before Retry.');
     type('Keep this edit for a new Send.');
     heading.textContent = 'Fresh page evidence';
+    later.click();
    }
    await sendWords();
    check(JSON.stringify(sends[1].payload) === JSON.stringify(first), 'Retry sends the original request.');
@@ -2211,18 +3147,13 @@ async function checkContinuation(original, replacement, replacementUpload) {
 """
         inspect_owners = b"""
  dialog.captureStateForTest = () => ({
-  owners: [pageContext, typeof pageCapture === 'undefined' ? pageSnapshot : pageCapture, captureSession, pendingItem]
+  owners: [pageContext, pageCapture, captureSession, submittedDraft]
    .filter(value => JSON.stringify(value)?.includes('"document_gzip"')).length,
   activePreview: Boolean(captureSession),
-  pendingBytes: JSON.stringify(pendingItem)?.includes('"document_gzip"')
+  pendingBytes: JSON.stringify(submittedDraft)?.includes('"document_gzip"')
  });
  return draft;
 """
-        outcomes = (
-            "cancel-preparation", "cancel-post", "cancel-poll", "undo-send", "undo-cancel",
-            "lost", "already-filed", "retained", "list-row", "list-no-row", "cancel-reopen", "error-close",
-            "continuation-compression", "continuation-token",
-        )
         for outcome in outcomes:
             with self.subTest(outcome=outcome):
                 page = bug_fixture_page(script=probe.replace("__OUTCOME__", json.dumps(outcome)))
@@ -2281,6 +3212,27 @@ window.fetch = (path, options = {}) => {
         self.assertEqual(fixture.results, [])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_owner_button_opens_seven_types_and_selects_the_owner_from_all_recipients(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        owner_probe = OWNER_OPTIONS_PROBE.replace("__SEND_SCHEDULED__", "true")
+        probes = {1440: owner_probe, 390: owner_probe}
+        for width, kind, page, scenario in ((1280, "scheduled", "builds", "reload"),
+                                           (412, "scheduled", "list", "reload"),
+                                           (1152, "bug", "builds", "reload"),
+                                           (1120, "bug", "builds", "reopen"),
+                                           (1100, "bug", "builds", "open"),
+                                           (1090, "bug", "builds", "unconfirmed"),
+                                           (1080, "bug", "builds", "renew"),
+                                           (1040, "bug", "builds", "omit"),
+                                           (1000, "bug", "builds", "missing-attachment")):
+            probes[width] = (RESTORED_SEND_PROBE.replace("__FIRST_PAGE__", page).replace("__KIND__", kind)
+                             .replace("__SCENARIO__", scenario))
+        fixtures = {width: DialogFixture(temporary / str(width), owner_reason=OWNER_REASON) for width in probes}
+        capture_dialogs(temporary / "options.png", fixtures,
+                        pages={width: fixture_page(width, photo=False, script=probe) for width, probe in probes.items()})
+        self.assertEqual({width: fixture.results for width, fixture in fixtures.items()}, {1440: [], 390: [], 1280: [], 412: [], 1152: [], 1120: [], 1100: [], 1090: [], 1080: [], 1040: [], 1000: []})
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_send_after_undo_posts_the_edited_words(self) -> None:
         self.assert_held_send("undo-resend")
 
@@ -2323,8 +3275,9 @@ window.fetch = (path, options = {}) => {
             configuration.mkdir(parents=True)
             _ = (configuration / "console.conf").write_text(f"page.builds.owner={OWNER}\n")
         with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner, alternate))):
+            probe = OWNER_OPTIONS_PROBE.replace("__SEND_SCHEDULED__", "false")
             capture_dialogs(temporary / "options.png", fixtures,
-                            pages={width: fixture_page(width, photo=False, script=OWNER_OPTIONS_PROBE) for width in fixtures})
+                            pages={width: fixture_page(width, photo=False, script=probe) for width in fixtures})
         for width, fixture in fixtures.items():
             with self.subTest(width=width), patch.dict(os.environ, fixture.environment()):
                 self.assertEqual(fixture.results, [])
@@ -2366,13 +3319,14 @@ window.fetch = (path, options = {}) => {
         self.assertIn("18 GiB free for the next step · Queue cap 28 GiB", legacy)
         self.assertIn("Builds 10 GiB · Free RAM 30 GiB", legacy)
 
-    def test_render_mounts_one_dialog_with_six_types(self) -> None:
+    def test_render_mounts_one_dialog_with_seven_types(self) -> None:
         markup = new_item_dialog.render()
         self.assertEqual(markup.count('<dialog id="review-new-item"'), 1)
         self.assertIn('name="words" rows="4"', markup)
-        self.assertEqual(markup.count('type="radio" name="kind"'), 6)
-        self.assertEqual(markup.count('<span data-button-face>'), 6)
+        self.assertEqual(markup.count('type="radio" name="kind"'), 7)
+        self.assertEqual(markup.count('<span data-button-face>'), 7)
         self.assertIn('data-kind="bug"', markup)
+        self.assertIn('data-kind="scheduled"', markup)
         self.assertIn('data-kind="enhancement"', markup)
         self.assertIn('class="lucide lucide-sparkles"', markup)
         self.assertIn('<svg aria-hidden="true"', markup)
@@ -2454,6 +3408,7 @@ window.fetch = (path, options = {}) => {
                 for report, title in zip(records[-2:], ("First queue state", "Second queue state"), strict=True):
                     self.assertEqual(report.question, "Show the queue state.")
                     assert isinstance(report.submission, new_item_dialog.ReviewSubmission)
+                    self.assertEqual(report.submission.notice, new_item_dialog.SubmissionNotice("feedback"))
                     evidence = report.submission.evidence
                     assert isinstance(evidence, new_item_dialog.PageDataEvidence)
                     self.assertEqual(evidence.title, title)

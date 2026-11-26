@@ -136,7 +136,7 @@ def closed_ask(entry: GoRecord) -> tuple[staff.StaffId, the_list.ListItem, the_l
         item = the_list.load(staff.StaffId(keeper), identity)
     except (OSError, ValueError):
         return None
-    ask = next((ask for ask in item.asks if ask.go_id == entry["go_id"] and not ask.is_open), None)
+    ask = next((ask for ask in item.asks if ask.go_id and ask.go_id == entry["go_id"]), None)
     if ask is None or (ask.ask_id, ask.target, ask.what) != (entry["ask"], entry["target"], entry["what"]):
         return None
     return staff.StaffId(keeper), item, ask

@@ -19,7 +19,7 @@ from typing import TypedDict, cast
 from collections.abc import Mapping
 
 from scripts.agents import pane_record  # noqa: E402
-from scripts.herdr import herdr, herdr_types
+from scripts.herdr import herdr, herdr_types, pane_launch
 from scripts.production import session_staff, staff  # noqa: E402
 from scripts.hooks import staff_session_identity  # noqa: E402
 
@@ -74,6 +74,11 @@ def main() -> None:
     if not arguments:
         print("cannot read Claude arguments; retained launch stays unchanged", file=sys.stderr)
         return
+    fork_name = environment.get(pane_launch.CLAUDE_FORK_NAME_ENV)
+    if fork_name and "--fork-session" in arguments and payload.get("source") != "clear":
+        launch_arguments = pane_launch.parse_claude_arguments(arguments)
+        if launch_arguments.value(pane_launch.NAME_FLAGS) == fork_name:
+            return
     identity = staff_session_identity.handle(cast(Mapping[str, object], payload), environment)
     if identity is staff_session_identity.ClearIdentityResult.STAFFED:
         return

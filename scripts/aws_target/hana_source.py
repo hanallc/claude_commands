@@ -14,7 +14,7 @@ import subprocess
 
 from scripts.aws_target import hana_protocol
 from scripts.aws_target.hana_protocol import MissingBasis as MissingBasis
-from scripts.lib import build_folders, build_slots, conf
+from scripts.lib import build_copies, build_folders, conf
 
 def read_limits(configuration: conf.ConfigRead) -> hana_protocol.SourceLimits:
     return hana_protocol.SourceLimits(configuration.whole('source_git_timeout_s'),
@@ -23,7 +23,7 @@ def read_limits(configuration: conf.ConfigRead) -> hana_protocol.SourceLimits:
 
 @dataclass(frozen=True)
 class LeasedSource:
-    copy: build_slots.LeasedCopy
+    copy: build_copies.LeasedCopy
     identity: hana_protocol.SourceIdentity
 
     @property
@@ -141,9 +141,9 @@ def materialize(manifest: hana_protocol.SourceManifest, limits: hana_protocol.So
             if actual != manifest.commit:
                 raise hana_protocol.SourceRefused('SourceCommitMismatch: fetched commit differs from the manifest')
         _ = source_git('checkout', '--quiet', '--detach', manifest.commit)
-    with build_slots.take_copy(main, manifest.commit, showrunner='hana', unit=hana_protocol.COPY_UNIT, work=work,
-                               purpose='hana-source', selection=build_slots.ExactSlotRequest(number)) as copy:
+    with build_copies.take_copy(main, manifest.commit, showrunner='hana', unit=hana_protocol.COPY_UNIT, work=work,
+                               purpose='hana-source', selection=build_copies.ExactCopyRequest(number)) as copy:
         if toolchain_identity(copy.path) != manifest.toolchain:
             raise hana_protocol.SourceRefused('ToolchainMismatch: copy toolchain differs from the manifest')
-        build_slots.limit_copy_size(copy, size_limit)
+        build_copies.limit_copy_size(copy, size_limit)
         yield LeasedSource(copy, hana_protocol.SourceIdentity(manifest.repository, manifest.commit, manifest.toolchain))

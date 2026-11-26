@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import socket
 import shutil
 import subprocess
 import sys
@@ -18,7 +17,7 @@ from typing import cast, final
 from unittest import mock
 from scripts.build_queue import admission_records
 from scripts.copies import copies
-from scripts.lib import build_folders, cancellation
+from scripts.lib import build_folders, cancellation, conf
 from scripts.lib.process_start import Gone, Started, Unreadable, Zombie
 from scripts.lib.python_startup.sitecustomize import GATE_PARENT_SOURCE_FD
 from scripts.lint.memory_test_support import write_config_fixture
@@ -283,6 +282,51 @@ sys.stdin.read(1)
                     self.assertTrue(recovery.path.is_file())
                 self.assertEqual(list(directory.glob("*.json")), [recovery.path])
 
+    def test_rollback_refusal_only_blocks_the_checkout_it_names(self) -> None:
+        self.supply_jobserver(b"Q")
+        _ = self.git(self.checkout, "merge", "--no-ff", "--no-edit", self.checkpoint)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.write(self.checkout / "concurrent.txt", "concurrent change\n")
+        head = self.commit(self.checkout, "concurrent change")
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            directory = gate.gate_run_directory(self.checkout)
+            directory.mkdir(parents=True)
+            refused = gate.GateRecovery(directory / "a-refused.json", str(self.checkout), os.getpid(),
+                                        "ended-owner", rollback=self.base, rollback_head=merged,
+                                        rollback_source=self.checkpoint)
+            refused.save()
+            resources = gate.GateRecovery(directory / "z-resources.json", str(self.checkout), os.getpid(), "ended-owner")
+            with subprocess.Popen(
+                    [sys.executable, "-c", "import signal; signal.pause()"], env=self.environment,
+                    stdin=subprocess.DEVNULL, start_new_session=True) as child:
+                try:
+                    resources.add_group(child.pid)
+                    descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
+                    try:
+                        resources.tokens.append(resources.token(descriptor, os.read(descriptor, 1)))
+                        resources.save()
+                    finally:
+                        os.close(descriptor)
+                    with mock.patch.object(gate, "run_gate_suites",
+                                           return_value=gate.GateRun((), 0, 0, tests_reused=True)):
+                        other = self.run_gate("--tests-only", "--repo", str(self.unit))
+                    self.assertEqual(other.returncode, 0, other.stdout + other.stderr)
+                    self.assertIn(f"rollback kept HEAD {head}", other.stderr)
+                    self.assert_process_stopped(child.pid)
+                    self.assertEqual(self.jobserver_tokens(), b"Q")
+                    self.assertFalse(resources.path.exists())
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+
+            blocked = self.run_gate("--tests-only")
+            self.assertEqual(blocked.returncode, 1, blocked.stdout + blocked.stderr)
+            self.assertIn(f"rollback kept HEAD {head}", blocked.stderr)
+            self.assertTrue(refused.path.is_file())
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assert_not_pushed()
+
     def test_recovery_drops_a_non_fifo_token_without_writing(self) -> None:
         pool = self.root / "token-pool"
         self.write(pool, "original pool")
@@ -304,7 +348,7 @@ sys.stdin.read(1)
         parent = self.root / "nested-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
                                  f"roots.gate.{host}={parent}\n")
         record = self.state / "nested-folders.json"
@@ -395,17 +439,26 @@ gate.run_suites(Path.cwd(), full=True)
     def test_gate_keeps_its_folder_and_record_when_removal_refuses(self) -> None:
         parent = self.root / "kept-gate"
         parent.mkdir()
+        expected_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, ())
+        self.assertNotIn(signal.SIGTERM, expected_mask)
+        original_report = gate.report_retained_gate_folder
+
+        def report_with_restored_mask(path: str, reason: str) -> None:
+            self.assertEqual(signal.pthread_sigmask(signal.SIG_UNBLOCK, ()), expected_mask)
+            original_report(path, reason)
+
         with mock.patch.dict(os.environ, self.environment, clear=True):
             for scope in ("shared", "private"):
                 with self.subTest(scope=scope):
                     recovery_scope = (gate.gate_recovery(self.checkout) if scope == "shared"
                                       else gate.private_gate_recovery(self.checkout, parent))
                     with (recovery_scope as recovery,
-                          mock.patch.object(build_folders, "remove_build_folder", return_value=False) as remove,
+                          mock.patch.object(build_folders, "may_remove_build_path", return_value=False) as remove,
+                          mock.patch.object(gate, "report_retained_gate_folder", side_effect=report_with_restored_mask),
                           redirect_stderr(io.StringIO()) as report):
                         with gate.gate_temporary(recovery, "merge-gate", parent) as folder:
                             self.assertTrue(folder.is_dir())
-                    remove.assert_called_once()
+                    remove.assert_called_once_with(folder)
                     self.assertTrue(folder.is_dir())
                     saved = cast(dict[str, object], json.loads(recovery.path.read_text()))
                     self.assertEqual(saved["folders"], [str(folder)])
@@ -451,7 +504,7 @@ gate.run_suites(Path.cwd(), full=True)
         parent = self.root / "gate-temporary"
         parent.mkdir()
         self.environment["TMPDIR"] = str(parent)
-        host = socket.gethostname().partition(".")[0]
+        host = conf.local_host_key_name()
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "build_folders.conf",
                                  f"roots.gate.{host}={parent}\n")
         self.write(self.state / "red-hooks", "red")
@@ -488,6 +541,103 @@ gate.start_gate_job = stop_after_start
         self.assert_process_stopped(int(launched.read_text()))
         self.assertEqual(self.jobserver_tokens(), b"Q")
         self.assert_gate_released()
+
+    def test_guest_sigterm_removes_the_suite_folder_and_lease(self) -> None:
+        saved_folder = self.state / "guest-suite-folder"
+        preamble = f"""from contextlib import contextmanager
+from scripts.lib import build_folders
+allocate = gate.gate_temporary
+
+@contextmanager
+def terminate_after_allocation(*args):
+    with allocate(*args) as folder:
+        assert build_folders.lease_path(folder).is_file()
+        Path({str(saved_folder)!r}).write_text(str(folder))
+        signal.raise_signal(signal.SIGTERM)
+        yield folder
+
+gate.gate_temporary = terminate_after_allocation
+gate.run_suites(Path({str(self.checkout)!r}), machine=gate.WholeMachine())
+"""
+        result = subprocess.run(self.gate_command(preamble=preamble), cwd=self.root, env=self.environment,
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        folder = Path(saved_folder.read_text())
+        self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
+
+    def test_sigterm_at_allocation_mask_release_clears_the_recovery_entry(self) -> None:
+        marker = self.state / "allocation"
+        parent = self.root / "gate-allocating"
+        parent.mkdir()
+        preamble = f"""save = gate.GateRecovery.save
+
+def signal_after_folder_save(recovery):
+    save(recovery)
+    if recovery.folders:
+        assert signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        Path({str(marker)!r}).write_text(str(recovery.path) + '\\n' + recovery.folders[0])
+        signal.raise_signal(signal.SIGTERM)
+        assert signal.SIGTERM in signal.sigpending()
+
+gate.GateRecovery.save = signal_after_folder_save
+with gate.unwind_gate_on_sigterm(), gate.gate_recovery(Path({str(self.checkout)!r})) as recovery:
+    recovery.rollback = {self.base!r}
+    with gate.gate_temporary(recovery, "merge-gate", Path({str(parent)!r})):
+        raise AssertionError("the gate entered the suite after SIGTERM")
+"""
+        result = subprocess.run(self.gate_command(preamble=preamble), cwd=self.root, env=self.environment,
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        record_path, folder = map(Path, marker.read_text().splitlines())
+        record = cast(dict[str, object], json.loads(record_path.read_text()))
+        self.assertEqual(record["rollback"], self.base)
+        self.assertEqual(record["folders"], [])
+        self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
+
+    def test_sigterm_after_lease_release_finishes_suite_cleanup(self) -> None:
+        marker = self.state / "suite-cleanup"
+        parent = self.root / "gate-cleanup"
+        parent.mkdir()
+        preamble = f"""from scripts.lib import build_folders
+release = build_folders._release_build_folder
+
+with gate.unwind_gate_on_sigterm(), gate.gate_recovery(Path({str(self.checkout)!r})) as recovery:
+    recovery.rollback = {self.base!r}
+    with gate.gate_temporary(recovery, "merge-gate", Path({str(parent)!r})) as folder:
+        Path({str(marker)!r}).write_text(str(recovery.path) + '\\n' + str(folder))
+
+        def release_then_signal(path, *, descriptor=None):
+            release(path, descriptor=descriptor)
+            if path == folder:
+                assert folder.is_dir()
+                signal.raise_signal(signal.SIGTERM)
+
+        build_folders._release_build_folder = release_then_signal
+"""
+        result = subprocess.run(self.gate_command(preamble=preamble), cwd=self.root, env=self.environment,
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        record_path, folder = map(Path, marker.read_text().splitlines())
+        record = cast(dict[str, object], json.loads(record_path.read_text()))
+        self.assertEqual(record["rollback"], self.base)
+        self.assertEqual(record["folders"], [])
+        self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
+
+    def test_nightly_skips_the_sweep_on_sigterm(self) -> None:
+        sweep_started = self.state / "nightly-sweep"
+        preamble = f"""from contextlib import nullcontext
+
+def terminate_nightly(*args):
+    signal.raise_signal(signal.SIGTERM)
+    raise AssertionError("the nightly continued after SIGTERM")
+
+gate.scratch.copy_lock = lambda checkout: nullcontext()
+gate.nightly = terminate_nightly
+gate._sweep_nightly_build_folders = lambda: Path({str(sweep_started)!r}).touch()
+"""
+        result = self.run_gate("--nightly", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        self.assertFalse(sweep_started.exists())
 
     @gate_suites("hooks", "lib")
     def test_stop_with_pending_modules_returns_owned_slot_and_reservation(self) -> None:
@@ -580,6 +730,15 @@ gate.run_gate_suites = whole_gate
                     fields = Path(f"/proc/{leftover}/stat").read_text().rsplit(")", 1)[1].split()
                     self.assertEqual(fields[2:4], [str(leftover), str(leftover)])
                     self.assertEqual(self.jobserver_tokens(), b"")
+                    records = set(active_runs.glob("*/*.json")) - previous_records
+                    self.assertEqual(len(records), 1)
+                    record_path, = records
+                    live = cast(dict[str, object], json.loads(record_path.read_text()))
+                    folders = [Path(folder) for folder in cast(list[str], live["folders"])]
+                    self.assertTrue(folders)
+                    for folder in folders:
+                        self.assertTrue(folder.is_dir())
+                        self.assertTrue(build_folders.lease_path(folder).is_file())
                     process.send_signal(sig)
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(process.returncode, -sig, output + errors)
@@ -592,9 +751,14 @@ gate.run_gate_suites = whole_gate
                     record = cast(dict[str, object], json.loads(record_path.read_text()))
                     self.assertEqual(record["pid"], process.pid)
                     self.assertEqual(record["rollback"], self.base)
-                    folders = [Path(folder) for folder in cast(list[str], record["folders"])]
-                    self.assertTrue(folders)
-                    self.assertTrue(all(folder.is_dir() for folder in folders))
+                    if sig == signal.SIGTERM:
+                        self.assertEqual(record["folders"], [])
+                        for folder in folders:
+                            self.assertEqual(build_folders.temporary_allocation_entries(folder), ())
+                        self.assertEqual(self.jobserver_tokens(), b"Q")
+                    else:
+                        self.assertEqual(record["folders"], live["folders"])
+                        self.assertTrue(all(folder.is_dir() for folder in folders))
                     (self.state / "hold-module").unlink()
                     (self.state / "leak-child").unlink()
                     if sig == signal.SIGTERM:
@@ -603,7 +767,7 @@ gate.run_gate_suites = whole_gate
                         later = self.commit(self.checkout, "Add an unrelated later commit")
                         refused = self.run_gate("--tests-only", "--full", own_process=True)
                         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
-                        self.assertIn("differs from the recorded merge", refused.stderr)
+                        self.assertIn(f"rollback kept HEAD {later}: it differs from the gate merge", refused.stderr)
                         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), later)
                         self.assertTrue(record_path.is_file())
                         _ = self.git(self.checkout, "reset", "--hard", merged)
@@ -613,10 +777,13 @@ gate.run_gate_suites = whole_gate
                     self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
                     self.assert_process_stopped(child)
                     self.assert_process_stopped(leftover)
-                    self.assertTrue(all(folder.is_dir() for folder in folders))
-                    saved = cast(dict[str, object], json.loads(record_path.read_text()))
-                    self.assertEqual(saved["folders"], record["folders"])
-                    self.assertIs(saved["finished"], True)
+                    if sig == signal.SIGTERM:
+                        self.assertFalse(record_path.exists())
+                    else:
+                        self.assertTrue(all(folder.is_dir() for folder in folders))
+                        saved = cast(dict[str, object], json.loads(record_path.read_text()))
+                        self.assertEqual(saved["folders"], record["folders"])
+                        self.assertIs(saved["finished"], True)
                     self.assertEqual(self.jobserver_tokens(), b"Q")
                     self.assert_not_pushed()
                 finally:

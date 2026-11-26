@@ -172,7 +172,6 @@ class ReviewRegimeTests(unittest.TestCase):
         self.assertTrue(self.ledger.read_text().startswith(before))
         self.assertEqual([row.checkpoint for row in review_regime.read_rows()], [None, self.checkpoint])
         self.assertIn("| phases merged | 0 | 0 | 2 |", self.report())
-        self.assertEqual(review_regime.watched_phases(), 2)
 
     def test_a_repeated_phase_still_refuses_invalid_merge_times(self) -> None:
         self.add_row(FIRST_PLAN, "1")

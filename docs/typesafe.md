@@ -21,16 +21,13 @@ from scripts.issue_score import client, questions, vault
 response = client.system_one(vault.build_state(issue), questions.main_questions())
 ```
 
-Here `issue` is a `vault.Issue`. Run the caller under `with-typesafe`.
-`system_one(state, questions)` validates typed answers, retries transient errors and reserves spend.
-The call reads the configured model and ledger when callers omit those arguments.
-`UseConfiguredValue.CURRENT` names this choice in API defaults.
+Here `issue` is a `vault.Issue`. Run the caller under `with-typesafe`. `system_one(state, questions)` validates typed answers, retries transient errors and reserves spend.
+The call reads the configured model and ledger when callers omit those arguments. `UseConfiguredValue.CURRENT` names this choice in API defaults.
 Catch `client.TypeSafeError` (including `BudgetExceeded`) as an error. A failed call is never an answer.
 Keep exact payloads, probabilities, usage and the returned model, as [score_issues.py](../scripts/issue_score/score_issues.py) does.
 
 [questions.py](../scripts/issue_score/questions.py) owns wording, criteria, option names, policy kinds, `QUESTION_SET_VERSION` and `JEV_FIELDS`.
-[config/issue_score.conf](../config/issue_score.conf) owns tunable numbers, paths and the model.
-Module readers use `scripts/lib/conf.py` at each use.
+[config/issue_score.conf](../config/issue_score.conf) owns tunable numbers, paths and the model. Module readers use `scripts/lib/conf.py` at each use.
 Read `questions.thresholds()` for current policy. Do not copy a threshold or proposal-field list into another tool.
 Bump the question version for adopted wording; retest a model change against the pinned model.
 [records.py](../scripts/issue_score/records.py) owns saved shapes and the `state_dir()` reader.
@@ -60,14 +57,12 @@ Use the live [API](https://docs.typesafe.ai/api/system-one), [confidence guide](
 with-typesafe scripts/lib/py scripts/issue_score/score_issues.py propose --project <short> --title '<title>' --body-file <utf8-file>
 ```
 
-Omit `--body-file` for an empty body. Exit 0 prints one top value per field on the first line.
-Use that line for `Proposed ranking:`. Keep unsure choices on the separate `Alternatives:` line so the user picks in the same reply.
+Omit `--body-file` for an empty body. Exit 0 prints one top value per field on the first line. Use that line for `Proposed ranking:`. Keep unsure choices on the separate `Alternatives:` line so the user picks in the same reply.
 Each unsure goal carries its own alignment. Preserve `split`, `check`, `possible 5` and derived `unfiled` hints; a real Choice of `unfiled` has no hint.
 Use Jev only for `JEV_FIELDS`; the agent proposes the rest. On exit 2, show the stderr error and have the agent propose every field.
 `vault.load_project_names()` reads `~/rust/hanadocs/home-base/issues - <short>.base`, the only shorthand source.
 A new base adds a shorthand with no code change. A new canonical project also needs a `PROJECT_ABOUT` entry in `questions.py`.
-Area definitions currently live in `~/rust/hanadocs/conf/issue-areas.md`: a two-column `area | definition` table.
-This location is temporary. Counts live in `~/rust/hanadocs/home-base/issue areas.base`. Missing or empty definitions stop scoring; a missing area row keeps its name-only criteria.
+Area definitions currently live in `~/rust/hanadocs/conf/issue-areas.md`: a two-column `area | definition` table. This location is temporary. Counts live in `~/rust/hanadocs/home-base/issue areas.base`. Missing or empty definitions stop scoring; a missing area row keeps its name-only criteria.
 
 ## Score, compare and reassess
 

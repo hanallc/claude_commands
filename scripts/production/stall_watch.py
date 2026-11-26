@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bump idle unit directors and notify their showrunners once per stretch.
 
-Notify the owner after PROMPT_ALERT_SECONDS at a permission prompt.
+Notify the owner after prompt_alert_seconds at a permission prompt.
 Send a phone alert after the grace period and open an RCA case.
 Retire the alert when the prompt ends. Staff ids identify files and alert keys.
 """
@@ -652,7 +652,7 @@ def watched_staff_unit(production_name: str, unit: str, row: staff.StaffRow) -> 
 
 
 def prompt_alert_seconds() -> float:
-    return tunables.read("production").number("PROMPT_ALERT_SECONDS")
+    return tunables.read("production").number("prompt_alert_seconds")
 
 
 def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> Mapping[str, str]:
@@ -1121,7 +1121,7 @@ def tool_request(pending: PendingTool) -> str | None:
         return None
     verb, key = FILE_TOOLS[pending.name]
     path = arguments.get(key)
-    return f"{verb} {file_name(path)}" if isinstance(path, str) else None
+    return f"{verb} {' '.join(file_name(path).split())}" if isinstance(path, str) else None
 
 
 def bash_paragraphs(above: list[str]) -> list[list[str]] | None:

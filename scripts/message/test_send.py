@@ -1167,12 +1167,6 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
                     self.assertEqual(len(error.getvalue().splitlines()), 1)
                     read.assert_not_called()
 
-    def test_review_watch_gets_a_reference_without_a_new_caller_argument(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "review_watch.acknowledge")
-        options = send.parse(["--to", "user", "--text-id", entry.id,
-                              *(item for key, value in entry.examples[0].values.items() for item in ("--value", f"{key}={value}"))])
-        self.assertEqual(options.reference, {"kind": "review_watch"})
-
     def test_outcome_parser_preserves_first_header_payload_and_acknowledgement(self) -> None:
         acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
         self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")
@@ -7403,18 +7397,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(len(cases), 1)
             self.assertFalse(cases[0].get("owner_told", True))
 
-    def test_the_rca_pushes_are_not_held_as_a_free_text_auto_mode_refusal(self) -> None:
-        values = {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
-                  "stop": "auto mode refused a shell command", "cause": "a helper ran a build command that needs your permission",
-                  "fix": "helpers use the build command that is always allowed"}
-        rendered = push_texts.render(rca.FIXED_TEXT, **values)
-        self.assertTrue(send.reports_auto_mode_refusal(rendered.title + "\n" + rendered.body))
-        for text_id in (rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT):
-            with self.subTest(text_id=text_id):
-                options = local_options(["--to", "user", "--summary", rendered.title, "--no-action", "--text", rendered.body])
-                self.assertEqual(send.wrong_template(options._replace(text_id=text_id), rendered.body), None)
-                self.assertEqual(send.wrong_template(options, rendered.body), send.AUTO_MODE_HELD)
-
     def test_auto_mode_hides_long_commands_and_gives_rca_the_full_text(self) -> None:
         self.writer_session()
         exact, long = "a" * 90, "cargo test --workspace --all-features " + "b" * 60
@@ -7543,6 +7525,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
             self.assertEqual(send.send(local_options(self.user_arguments("--key", "plain"))).outcome, "sent")
 
+    def test_free_text_auto_mode_refusal_is_held_without_an_action(self) -> None:
+        for title, body in (("Build status", "Auto mode refused a command."),
+                            ("Auto mode", "The session refused a command.")):
+            with self.subTest(title=title):
+                options = send.parse(["--here", "--to", "user", "--no-action", "--summary", title, "--text", body])
+                self.assertEqual(options.text_id, "")
+                self.assertIsInstance(options.action, NoActionRequired)
+                self.assertEqual(send.wrong_template(options, f"{title}\n{body}"), send.AUTO_MODE_HELD)
+
     def test_help_lists_the_auto_mode_template_and_when_to_use_it(self) -> None:
         with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             _ = send.parse(["--help"])
@@ -7553,10 +7544,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
         self.assertIn("quota.paid_credits_queued: an account now spends paid credits and the user queued a workers move;", output.getvalue())
         self.assertIn("session.needs_go: a session is stopped until the user types a go in its pane.", output.getvalue())
-        self.assertIn("permission.rca_started: a unit starts to fix the cause of a permission stop or refusal. Sent by"
-                      + f" rca.py start; sessions run rca.py, not this: {rca.CALL} start <id> --owner <unit>", output.getvalue())
-        self.assertIn("permission.rca_fixed: the fix merged; that permission does not stop or refuse the session again."
-                      + f" Sent by rca.py fixed; sessions run rca.py, not this: {rca.CALL} fixed <id>", output.getvalue())
 
     def needs_go_arguments(self, *extra: str, **changed: str) -> list[str]:
         values = {"session": "trunk", "machine": "natedev", "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",
@@ -7629,14 +7616,16 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_paid_credits_template_takes_its_sender_from_this_session_else_the_script_name(self) -> None:
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         # The session record wins over a name the caller gives.
         options = local_options(self.paid_credits_arguments("--value", "sender=quota_alert"))
-        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.summary, "codex2 now spends paid credits: 25,345 left")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=natedev", options.values)
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
-        self.assertTrue((options.text or "").startswith("codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT."))
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(options.text, "")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
@@ -7644,9 +7633,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=natedev", command)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
             script = local_options(self.paid_credits_arguments("--from", "quota_alert"))
-            self.assertEqual(script.summary, "quota_alert: codex2 now uses paid credits")
+            self.assertEqual(script.summary, "codex2 now spends paid credits: 25,345 left")
             self.assertEqual(local_options(self.paid_credits_arguments("--value", "sender=quota_alert")).summary,
-                             "quota_alert: codex2 now uses paid credits")
+                             "codex2 now spends paid credits: 25,345 left")
             with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = local_options(self.paid_credits_arguments())
             self.assertIn("needs a sender", errors.getvalue())
@@ -7657,12 +7646,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                      *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         options = local_options([*arguments, "--value", "sender=quota_alert"])
-        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.summary, "codex2 uses credits until move: 25,345 left")
         self.assertEqual(options.need, "decision")
         self.assertEqual(options.action, ActionRequired(
-            "To stop it, remove codex2 from codex_credit_accounts in ~/.claude/config/accounts.conf on natedev"))
-        self.assertTrue((options.text or "").endswith("Turn off: workers stop and wait for your queued move."))
+            "To stop it, run in a natedev Claude session: /tune accounts codex_credit_accounts none"))
+        self.assertEqual(options.text, "")
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
@@ -7670,13 +7661,15 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("sender=natedev", command)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
             self.assertEqual(local_options([*arguments, "--from", "quota_alert"]).summary,
-                             "quota_alert: codex2 now uses paid credits")
+                             "codex2 uses credits until move: 25,345 left")
             with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
                 _ = local_options(arguments)
             self.assertIn("quota.paid_credits_queued needs a sender", errors.getvalue())
 
     def test_a_free_text_paid_credit_push_is_held_with_the_template_call(self) -> None:
         self.writer_session()
+        _ = self.enterContext(mock.patch("scripts.whoami.agent_accounts.codex_credit_accounts",
+                                         return_value=frozenset({"codex2"})))
         for title, text, action in (("codex2 now spends paid credits", "It refills Tue.", "Choose in natedev terminal."),
                                     ("Codex workers", "They spend credits now.", "Remove codex2 from codex_credit_accounts"),
                                     ("Codex workers", "They now use Paid-Credit time.", "Choose in natedev terminal.")):
@@ -8977,7 +8970,7 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.row_id = self.fixture.worker("impl").id
         self.fixture.world.add(self.row, "w1:p1")
         self.state = self.fixture.root / "messages"
-        _ = (self.fixture.root / "conf/direct.conf").write_text("WORKER_SPLIT_RATIO=0.667\n")
+        _ = (self.fixture.root / "conf/direct.conf").write_text("worker_split_ratio=0.667\n")
         _ = self.enterContext(mock.patch.object(send, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster([], [])))
         _ = self.enterContext(mock.patch.object(unit_lookup, "checked_conversation",

@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
 from typing import ClassVar, TextIO, cast, override
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from scripts.production import change_review, session_staff, staff, unit_config, unit_phases
 from scripts.production.staff_test_support import (
@@ -48,6 +48,7 @@ from scripts.direct.findings_test_support import STANDARD_CONFIG, invoke_finding
 from scripts.direct.test_phase_reservation import isolate_fixture_git, make_fixture_worktree, model_worktree_environment
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
+from scripts.herdr import worker_panes
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.shell_test_support import shell_functions
@@ -73,11 +74,11 @@ def recorder_parser() -> argparse.ArgumentParser:
     return cast(Callable[[], argparse.ArgumentParser], builder)()
 
 
-def recorder_handler(name: str) -> Callable[[argparse.Namespace], None]:
+def recorder_handler(name: str) -> Callable[[argparse.Namespace], progress_history.InterruptedWorkerPasses | None]:
     handler = vars(progress_history).get(name)
     if not callable(handler):
         raise AssertionError(f"progress recorder handler is unavailable: {name}")
-    return cast(Callable[[argparse.Namespace], None], handler)
+    return cast(Callable[[argparse.Namespace], progress_history.InterruptedWorkerPasses | None], handler)
 
 
 class ProgressHistoryTests(unittest.TestCase):
@@ -246,7 +247,9 @@ class ProgressHistoryTests(unittest.TestCase):
                     "production": "old-production", "unit": "old-unit",
                 })
                 self.assertEqual(identity, progress_history.ProductionUnitIdentity("Example", "unit-a"))
-        parent = recorded_showrunner("Receiving", document)
+        receiving = self.root / "receiving-production.md"
+        _ = receiving.write_text("# Receiving production\n")
+        parent = recorded_showrunner("Receiving", receiving)
         _ = staff.move(member.id, staff.ReportsTo(parent.id))
         self.assertEqual(progress_history.resolve_production_unit({"owner_staff_id": member.id}),
                          progress_history.ProductionUnitIdentity("Receiving", "unit-a"))
@@ -335,7 +338,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
     def write_interval(self, seconds: object) -> None:
         _ = self.config_file.write_text(
-            f"UNIT_PROGRESS_INTERVAL_SECONDS={seconds}\nROUTING_FROM_ROUND=4\nASTRA_AFTER_FAILED_FIXES=2\n",
+            f"unit_progress_interval_seconds={seconds}\nrouting_from_round=4\nastra_after_failed_fixes=2\n",
             encoding="utf-8",
         )
 
@@ -363,7 +366,7 @@ for number in (1, 2):
     config.mkdir(parents=True)
     settings = config / 'direct.conf'
     registry = config / 'models.conf'
-    settings.write_text(f'UNIT_PROGRESS_INTERVAL_SECONDS={number * 60}\n')
+    settings.write_text(f'unit_progress_interval_seconds={number * 60}\n')
     registry.write_text(f'registry-{number}\n')
     environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
                    'UNIT_SYNC_WRITES': '0', 'UNIT_PASS_OWNER': 'launcher',
@@ -500,11 +503,11 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def invoke_handler(
         self,
-        handler: Callable[[argparse.Namespace], None],
+        handler: Callable[[argparse.Namespace], progress_history.InterruptedWorkerPasses | None],
         arguments: argparse.Namespace,
         at: int,
         refresh_result: subprocess.CompletedProcess[str] | BaseException,
-    ) -> tuple[None, str, str]:
+    ) -> tuple[progress_history.InterruptedWorkerPasses | None, str, str]:
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
@@ -2394,7 +2397,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         name = "stopped-phase-publication"
         session = self.start_run(name, 1000)
         arguments = ["start-phase", "--session-dir", str(session), "--phase-id", "13", "--phase-title", "Rerun"]
-        with stop_once(pass_recorder, "append_event", when="before",
+        with stop_once(progress_history, "_append_event", when="before",
                        argument=1, matches=lambda value: isinstance(value, dict)
                        and cast(dict[str, object], value).get("event_type") == "phase_started"):
             with self.assertRaises(InjectedStop):
@@ -3109,15 +3112,14 @@ print('two homes isolated; recorder lock retained; caller restored')
         finish_program = '''import sys
 from unittest.mock import patch
 from scripts.direct import progress_history as recorder
-from scripts.direct import pass_record as pass_recorder
-append = pass_recorder.append_event
+append = recorder._append_event
 def publication(state, event):
     if event.get("event_type") == "phase_finished":
         print("publishing", flush=True)
         sys.stdin.readline()
     append(state, event)
 sys.argv = ["progress_history.py", *sys.argv[1:]]
-with patch.object(pass_recorder, "append_event", publication):
+with patch.object(recorder, "_append_event", publication):
     recorder.main()
 '''
         start_program = '''import fcntl, sys
@@ -3567,7 +3569,7 @@ with patch.object(fcntl, "flock", admission):
         phase = cast(list[dict[str, object]], report["phases"])[0]
         self.assertEqual((phase["state"], phase["wait_n"]), ("Covered", 0))
 
-    def test_slot_waits_follow_the_live_pass_across_reused_servers_and_parallel_phases(self) -> None:
+    def test_waits_follow_the_live_pass_across_reused_servers_and_parallel_phases(self) -> None:
         session = self.covered_wait_phase("wait-slot")
         self.team_slot = "impl"
         _ = self.run_command("start-pass", "--session-dir", str(session), "--phase-id", "6",
@@ -3594,7 +3596,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual((records[first]["phase_id"], records[second]["phase_id"]), ("6", "7"))
         self.assertNotEqual(records[first]["phase_instance_id"], records[second]["phase_instance_id"])
 
-    def test_unresolved_slot_wait_is_counted_without_borrowing_the_current_phase(self) -> None:
+    def test_wait_without_an_open_pass_is_counted_without_borrowing_the_current_phase(self) -> None:
         session = self.covered_wait_phase("wait-missing-slot")
         printed_id = self.run_command("start-wait", "--session-dir", str(session), "--slot", "absent",
                                       "--kind", "WaitingForMemoryOrSlot", "--reason", "admission busy", at=1020)
@@ -4088,8 +4090,17 @@ with patch.object(fcntl, "flock", admission):
                 assert isinstance(owner, staff.StaffRow)
                 if failure == "stale-pointer":
                     _ = staff.set_run(owner.id, staff.OpenRun(session_dir))
+                    before = self.read_state(session_dir)
+                    refused = self.run_failing_command(
+                        "start-phase", "--session-dir", str(session_dir),
+                        "--phase-id", "4", "--phase-title", "Resume the unit", at=20_025)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertIn("complete the pending run end before reopening it", refused.stderr)
+                    self.assertEqual(self.read_state(session_dir), before)
+                    _ = self.run_command("finish-run", "--session-dir", str(session_dir),
+                                         "--status", status, at=20_026)
                 if failure == "state-write":
-                    with patch.object(pass_recorder, "write_state", side_effect=OSError("state write failed")):
+                    with patch.object(progress_history, "_write_state", side_effect=OSError("state write failed")):
                         with self.assertRaisesRegex(OSError, "state write failed"):
                             _ = self.run_command(
                                 "start-phase", "--session-dir", str(session_dir),
@@ -5047,12 +5058,15 @@ with patch.object(fcntl, "flock", admission):
                                        parent=parent.id if kind in ("unit", "worker") else None)
                 run = unit_runs.RUN_ROOT / f"prepared-{kind}"
                 run.mkdir()
-                _ = staff.set_run(owner.id, staff.OpenRun(run))
+                if kind != "worker":
+                    _ = staff.set_run(owner.id, staff.OpenRun(run))
                 _ = self.run_command(
                     "start-run", "--session-dir", str(run), "--working-dir", str(self.working_dir),
                     "--main-family", "codex", "--main-model", "gpt-main", "--main-effort", "xhigh",
                     "--main-session-id", owner.current_session, at=46_000,
                 )
+                if kind == "worker":
+                    _ = staff.clear_run(parent.id, run)
                 for finished_at in (46_200, 46_300):
                     _ = staff.set_run(owner.id, staff.OpenRun(run))
                     _ = self.run_command("finish-run", "--session-dir", str(run),
@@ -5679,7 +5693,7 @@ with patch.object(fcntl, "flock", admission):
 
     def test_findings_refuses_fewer_than_two_stalled_rounds(self) -> None:
         _ = self.config_file.write_text(
-            STANDARD_CONFIG.replace("STALLED_ROUNDS=2", "STALLED_ROUNDS=1"),
+            STANDARD_CONFIG.replace("stalled_rounds=2", "stalled_rounds=1"),
             encoding="utf-8",
         )
         result = invoke_findings(
@@ -5688,7 +5702,7 @@ with patch.object(fcntl, "flock", admission):
             self.working_dir,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("STALLED_ROUNDS", result.stderr)
+        self.assertIn("stalled_rounds", result.stderr)
         self.assertIn("outside range 2..", result.stderr)
 
     def write_full_config(self) -> None:
@@ -5696,17 +5710,17 @@ with patch.object(fcntl, "flock", admission):
         _ = self.config_file.write_text(
             "\n".join(
                 (
-                    "# whole: 1..", "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                    "# whole: 1..", "MIN_REPAIR_BUDGET=3",
-                    "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=0.5",
-                    "# whole: 1..", "RUNAWAY_ROUNDS=5",
-                    "# whole: 1..", "MAX_FIX_ATTEMPTS=2",
-                    "# whole: 1..", "MAX_REOPENS=2",
-                    "# whole: 2..", "STALLED_ROUNDS=2",
-                    "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=3",
-                    "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1",
-                    "# whole: 1..", "ROUTING_FROM_ROUND=4",
-                    "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2",
+                    "# whole: 1..", "unit_progress_interval_seconds=180",
+                    "# whole: 1..", "min_repair_budget=3",
+                    "# range: 5e-324..", "repair_rounds_per_finding=0.5",
+                    "# whole: 1..", "runaway_rounds=5",
+                    "# whole: 1..", "max_fix_attempts=2",
+                    "# whole: 1..", "max_reopens=2",
+                    "# whole: 2..", "stalled_rounds=2",
+                    "# whole: 1..", "max_consecutive_same_kind_passes=3",
+                    "# whole: 0..", "max_review_cancellations=1",
+                    "# whole: 1..", "routing_from_round=4",
+                    "# whole: 1..", "astra_after_failed_fixes=2",
                     "",
                 )
             ),
@@ -8374,7 +8388,7 @@ with patch.object(fcntl, "flock", admission):
         def prepare(
             command: str,
             name: str,
-        ) -> tuple[Callable[[argparse.Namespace], None], argparse.Namespace]:
+        ) -> tuple[Callable[[argparse.Namespace], progress_history.InterruptedWorkerPasses | None], argparse.Namespace]:
             session_dir = self.start_run(name, started_at)
             if command != "start-phase":
                 self.start_phase_and_pass(session_dir, started_at)
@@ -8464,7 +8478,13 @@ with patch.object(fcntl, "flock", admission):
                     refresh_result=refusal,
                 )
 
-                self.assertEqual(refused[:2], successful[:2])
+                self.assertEqual(refused[1], successful[1])
+                if command == "finish-phase":
+                    for returned, arguments in ((successful[0], success_arguments), (refused[0], failure_arguments)):
+                        self.assertEqual(returned,
+                            progress_history.InterruptedWorkerPasses(Path(cast(str, arguments.session_dir))))
+                else:
+                    self.assertEqual(refused[0], successful[0])
                 self.assertEqual(successful[2], "")
                 self.assertEqual(
                     refused[2],
@@ -9062,7 +9082,7 @@ with patch.object(fcntl, "flock", admission):
         self.start_slot_pass(session_dir, "impl", "impl", started_at + 140, "gpt-called", 0,
                              "--worker-id", worker.id, worker_name=worker.name)
         self.team_slot = ""
-        append = pass_recorder.append_event
+        append = cast(Callable[[dict[str, object], dict[str, object]], None], vars(progress_history)["_append_event"])
 
         def fail_drop(state: dict[str, object], event: dict[str, object]) -> None:
             if event.get("event_type") == "phase_dropped":
@@ -9075,7 +9095,7 @@ with patch.object(fcntl, "flock", admission):
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             self.assertEqual(passes.worker_ids, (worker.id,))
 
-        with (patch.object(pass_recorder, "append_event", side_effect=fail_drop),
+        with (patch.object(progress_history, "_append_event", side_effect=fail_drop),
               patch.object(progress_history, "_close_interrupted_workers", side_effect=close_workers) as cleanup):
             with self.assertRaisesRegex(OSError, "The drop append failed"):
                 _ = self.run_command("drop-phase", "--session-dir", str(session_dir), "--phase-id", "9",
@@ -9118,6 +9138,60 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(event["prompt_file"], prompt_file)
         self.assertFalse(any(row["event_type"] == "pass_started" for row in records))
 
+    def test_pass_recorder_refuses_an_enrolled_owner_before_it_creates_the_run(self) -> None:
+        doc = self.root / "production-live.md"
+        _ = doc.write_text("- **Merge checkout:** `/fixture/main`\n", encoding="utf-8")
+        owner = fixture_member("showrunner", name="enrolled-recorder", doc=staff.LiveDoc(remote.local_machine(), doc))
+        run = self.root / "enrolled-run"
+        _ = staff.set_run(owner.id, staff.OpenRun(run))
+        commands = (
+            ("check-launch", "--pass-kind", "review", "--phase-id", "3"),
+            ("start-pass", "--pass-kind", "review", "--phase-id", "3", "--activity", "review",
+             "--called-task", "direct.review", "--called-family", "codex", "--called-model", "fixture"),
+            ("finish-pass", "--status", "completed"),
+        )
+        for command, *arguments in commands:
+            with self.subTest(command=command):
+                result = self.run_failing_command(command, "--session-dir", str(run), *arguments,
+                                                  at=42_530, complete_launch=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("enrolled showrunners must use the assigned review launcher", result.stderr)
+                self.assertFalse(run.exists())
+
+    def test_pass_recorder_checks_run_admission_before_starting_a_pass(self) -> None:
+        cases = (
+            ("ended", {"status": "completed", "finished_at": 42_520}, "the run has ended dispatch admission"),
+            ("helper", {unit_runs.PRIVATE_HELPER_SLOT: "review"}, "only review can dispatch in this private helper run"),
+        )
+        for name, fields, message in cases:
+            with self.subTest(run=name):
+                run = self.start_run(name, 42_500)
+                self.start_phase(run, 42_510)
+                path = pass_recorder.state_path(run)
+                _ = path.write_text(json.dumps({**self.read_state(run), **fields}), encoding="utf-8")
+                before = path.read_bytes()
+                self.team_slot = "impl"
+                result = self.launch_probe(run, "--phase-id", "3")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(self.pass_events(name, "pass_started"), [])
+
+    def test_pass_recorder_retains_replaced_passes_with_pending_completion(self) -> None:
+        run = self.start_run("replaced-pass", 42_500)
+        self.start_phase(run, 42_510)
+        self.start_slot_pass(run, "review", "review", 42_520)
+        first = self.pass_slots(run)["review"]
+        instance = cast(str, first["instance_id"])
+        delivery = progress_history.DispatchDelivery(
+            line="Review the change", completion_id="fixture-completion", reply_file="reply.txt")
+        progress_history.save_dispatch_delivery(run, instance, delivery)
+        self.start_slot_pass(run, "review", "impl", 42_530)
+        self.assertNotEqual(self.pass_slots(run)["review"]["instance_id"], instance)
+        retained = progress_history.pass_for_finalization(run, instance)
+        self.assertEqual(retained["instance_id"], instance)
+        self.assertEqual(progress_history.dispatch_delivery(retained), delivery)
+
     def test_launch_without_an_explicit_phase_records_a_refusal(self) -> None:
         for phase_open in (False, True):
             with self.subTest(phase_open=phase_open):
@@ -9136,6 +9210,49 @@ with patch.object(fcntl, "flock", admission):
         result = self.launch_probe(session, "--phase-id", "13")
         self.assert_launch_refused(session, result, phase_id="13")
         self.assertIn("Phase 13 is not open", result.stderr)
+
+    def test_as_built_launch_does_not_authorize_a_closed_numbered_phase(self) -> None:
+        session = self.start_run("launch-after-plan", 42_500)
+        self.start_numbered_phase(session, "13", 42_510)
+        self.finish_numbered_phase(session, 42_520, "--phase-id", "13")
+
+        closed = self.launch_probe(session, "--phase-id", "13")
+        self.assert_launch_refused(session, closed, phase_id="13")
+        self.assertIn("Phase 13 is not open; open phases: none", closed.stderr)
+        as_built = self.launch_probe(session, "--phase-id", "as-built", at=42_540)
+        self.assertEqual(as_built.returncode, 0, as_built.stderr)
+
+    def test_as_built_recorder_refuses_a_finished_run(self) -> None:
+        session = self.start_run("as-built-finished", 42_500, unit_owned=True)
+        self.start_numbered_phase(session, "13", 42_510)
+        _ = self.run_command("finish-run", "--session-dir", str(session), "--status", "completed", at=42_520)
+        for command in ("check-launch", "start-pass"):
+            with self.subTest(command=command):
+                result = (self.launch_probe(session, "--phase-id", "as-built") if command == "start-pass"
+                          else self.run_failing_command("check-launch", "--session-dir", str(session),
+                                                        "--pass-kind", "impl", "--phase-id", "as-built", at=42_525))
+                self.assert_launch_refused(session, result, phase_id="as-built")
+                self.assertIn("Run as-built requires an open run.", result.stderr)
+
+    def test_start_phase_refuses_while_an_as_built_pass_is_active(self) -> None:
+        session = self.start_run("start-phase-during-as-built", 42_500, unit_owned=True)
+        self.start_numbered_phase(session, "13", 42_510)
+        self.finish_numbered_phase(session, 42_520, "--phase-id", "13")
+        launched = self.launch_probe(session, "--phase-id", "as-built")
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        before = self.read_state(session)
+        events = self.read_events(session.name)
+
+        result = self.run_failing_command("start-phase", "--session-dir", str(session),
+                                          "--phase-id", "16", "--phase-title", "Next phase", at=42_540)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Finish the as-built pass first.", result.stderr)
+        self.assertEqual(self.read_state(session), before)
+        self.assertEqual(self.read_events(session.name), events)
+        _ = self.run_command("finish-pass", "--session-dir", str(session), "--status", "completed", at=42_550)
+        self.start_numbered_phase(session, "16", 42_560)
+        self.assertEqual(self.open_phase_ids(session), ["16"])
 
     def test_launch_refuses_each_stale_prompt_identity(self) -> None:
         for index, line in enumerate((
@@ -9326,6 +9443,28 @@ with patch.object(fcntl, "flock", admission):
         finished = self.phase_events("finish-run-open-phases", "phase_finished")
         self.assertEqual([event.get("phase_id") for event in finished], ["18", "6"])
         self.assertEqual(self.read_state(session_dir)["open_phases"], [])
+
+    def test_finish_run_interrupts_the_active_as_built_pass(self) -> None:
+        session = self.start_run("finish-run-as-built", 45_000, unit_owned=True)
+        self.start_numbered_phase(session, "6", 45_010)
+        self.finish_numbered_phase(session, 45_020, "--phase-id", "6")
+        owner = unit_runs.run_owner(self.read_state(session), staff.initial_snapshot())
+        assert isinstance(owner, staff.StaffRow)
+        worker = fixture_worker("writer", owner.id)
+        _ = self.run_command("start-pass", "--session-dir", str(session), "--pass-kind", "impl",
+                             "--activity", "Write as-built documentation", "--called-task", "direct.implementation",
+                             "--called-family", "codex", "--called-model", "fixture-model",
+                             "--phase-id", "as-built", "--worker-id", worker.id, at=45_030)
+        with (patch.object(worker_panes, "observe_worker", return_value=worker_panes.ClosedWorker(worker)),
+              patch.object(worker_panes, "close", return_value=worker_panes.Closed()) as close):
+            _ = self.run_command("finish-run", "--session-dir", str(session), "--status", "completed", at=45_040)
+
+        close.assert_called_once_with(owner.id, staff.WorkerName.parse(worker.name), lock=ANY)
+        self.assertIsNone(unit_runs.open_run(owner.current_session))
+        finished, = self.pass_events(session.name, "pass_finished")
+        self.assertEqual((finished["phase_id"], finished["status"]), ("as-built", "interrupted"))
+        self.assertEqual([event["phase_id"] for event in self.phase_events(session.name, "phase_finished")], ["6"])
+        self.assertEqual(self.read_events(session.name)[-1]["event_type"], "run_finished")
 
 
 

@@ -150,7 +150,7 @@ HISTORY_APPEND_STOPS: tuple[HistoryAppendStop, ...] = ("before newline", "inside
 def sample_anon_once(sidecar: Path, maximum: Path) -> subprocess.CompletedProcess[str]:
     program = INVOKE.read_text().split("buildlog_sample_anon() {", 1)[1].split("\n}\n", 1)[0]
     return subprocess.run(["bash", "-c", "buildlog_sample_anon() {" + program +
-        '\n}\nsleep() { exit 0; }\nbuildlog_sample_anon "$1" "$2" "$$"',
+        '\n}\nbuildlog_wait_sample_tick() { return 1; }\nbuildlog_sample_anon "$1" "$2" "$$"',
         "sampler-test", str(sidecar), str(maximum)], env=verify_test_environment(), capture_output=True, text=True,
         timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
 

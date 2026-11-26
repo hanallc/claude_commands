@@ -19,8 +19,10 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 def lock_attempt_environment(root: Path, environment: Mapping[str, str]) -> dict[str, str]:
     """Observe the real lock attempt without changing the inherited marker."""
+    # The checkout startup hook runs this hook; chain on so inherited hooks keep their effect.
     _ = (root / "sitecustomize.py").write_text('''import fcntl
 import os
+import sys
 from pathlib import Path
 flock = fcntl.flock
 def observe(file, operation):
@@ -28,6 +30,7 @@ def observe(file, operation):
         Path(os.environ["MAIN_PUSH_TEST_ATTEMPT"]).write_text("attempted")
     return flock(file, operation)
 fcntl.flock = observe
+sys.modules["_devtools_python_startup"].next_sitecustomize(__file__)
 ''')
     return {**environment, "MAIN_PUSH_TEST_ATTEMPT": str(root / "attempted"),
             "PYTHONPATH": str(Path(__file__).resolve().parent / "python_startup") + os.pathsep + str(root)
