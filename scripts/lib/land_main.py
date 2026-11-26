@@ -30,6 +30,7 @@ import tempfile
 
 from scripts.lib import main_push_lock
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import behavior_check
 
 
 HOOK_PATH = ".claude/config/post_push.sh"
@@ -121,6 +122,15 @@ def _git_config_environment(git_config: Sequence[str]) -> dict[str, str] | None:
     return environment
 
 
+def default_branch(origin_head: str) -> str:
+    """Read the advertised HEAD. Use main when the remote has no HEAD branch."""
+    for line in origin_head.splitlines():
+        ref, _, name = line.partition("\t")
+        if name == "HEAD" and ref.startswith("ref: refs/heads/"):
+            return ref.removeprefix("ref: refs/heads/")
+    return "main"
+
+
 def run_git(checkout: Path, *arguments: str,
             time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
             environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -174,14 +184,22 @@ def remote_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBr
     ref = "HEAD" if default else f"refs/heads/{branch}"
     query = run_git(checkout, "ls-remote", "--symref" if default else "--refs", "--", remote, ref,
                     time_limit=time_limit, environment=environment)
+    return _advertised_branch_tip(checkout, remote, branch, ref, git_output(query, "ls-remote"),
+                                  time_limit=time_limit, environment=environment)
+
+
+def _advertised_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBranch,
+                           ref: str, advertisement: str, *, time_limit: CommandTimeLimit | NoTimeLimit,
+                           environment: dict[str, str] | None) -> AdvertisedBranchTip:
     targets: list[str] = []
     matching_shas: list[str] = []
-    for row in git_output(query, "ls-remote").splitlines():
+    for row in advertisement.splitlines():
         value, _, advertised_ref = row.partition("\t")
         if not advertised_ref or "\t" in advertised_ref:
             raise LandError(f"{remote}: malformed ls-remote output for {ref}")
-        if default and advertised_ref == ref and value.startswith("ref: refs/heads/"):
-            targets.append(value.removeprefix("ref: refs/heads/"))
+        if advertised_ref == "HEAD" and value.startswith("ref: "):
+            if value.startswith("ref: refs/heads/"):
+                targets.append(value.removeprefix("ref: refs/heads/"))
             continue
         if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
             raise LandError(f"{remote}: malformed ls-remote output for {ref}")
@@ -223,7 +241,11 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
 
     with main_push_lock.main_push_lock(checkout):
         sha = checked("rev-parse", "--verify", f"{commit}^{{commit}}")
-        origin = remote_branch_commit(checkout, "origin", branch, time_limit=time_limit, environment=environment)
+        ref = f"refs/heads/{branch}"
+        advertisement = checked("ls-remote", "--symref", "--", "origin", "HEAD", ref)
+        origin = _advertised_branch_tip(checkout, "origin", branch, ref, advertisement,
+                                        time_limit=time_limit, environment=environment).commit
+        remote_default = default_branch(advertisement)
         pushed: Pushed | AlreadyLanded
         if origin == sha:
             pushed = AlreadyLanded()
@@ -232,14 +254,18 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         else:
             if git("merge-base", "--is-ancestor", origin, sha).returncode:
                 raise NotFastForward(f"origin/{branch} does not fast-forward to {sha}")
-            _ = checked("push", "origin", f"{sha}:refs/heads/{branch}")
+            if branch == remote_default:
+                git_timeout = time_limit.seconds if isinstance(time_limit, CommandTimeLimit) else None
+                try:
+                    behavior_check.require_review(behavior_check.GitRange(checkout, origin, sha), timeout=git_timeout)
+                except (behavior_check.BehaviorCheckError, OSError) as error:
+                    raise LandError(str(error)) from error
+            _ = checked("push", "origin", f"{sha}:{ref}")
             pushed = Pushed()
-        default = git("symbolic-ref", "refs/remotes/origin/HEAD")
-        default_branch = default.stdout.strip().removeprefix("refs/remotes/origin/") if not default.returncode else "main"
+        if branch != remote_default:
+            return Landed(sha, branch, pushed, HookSkipped())
         root = Path(checked("rev-parse", "--show-toplevel"))
         hook = root / HOOK_PATH
-        if branch != default_branch:
-            return Landed(sha, branch, pushed, HookSkipped())
         if not hook.is_file():
             return Landed(sha, branch, pushed, HookAbsent())
         record = Path(checked("rev-parse", "--path-format=absolute", "--git-common-dir")) / "post-push-completed"
