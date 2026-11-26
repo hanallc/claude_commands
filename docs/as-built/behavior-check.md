@@ -20,7 +20,11 @@ It reads the head and base again before merge and supplies the checked head to G
 
 A clear record names the saved reviewer reply.
 The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
-The gate checks that the reply has a finding of no user decision for each changed test.
+The gate checks each changed test for no user decision or a verified request from Nate.
+The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
+It matches consecutive full sentences or lines and treats each run of whitespace as one space.
+The check reports the date from the source. If the source cannot prove the author or quote, the finding needs a question.
+Status fails if it cannot read or parse the saved proof for a clear record.
 For a Yes record, the gate reads the answer in the original question.
 
 The showrunner state root stores the records in `behavior_checks/`.
@@ -30,8 +34,8 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 
 1. If the range has no changed test, the command exits 0.
 2. If the range has changed tests, the command starts an independent read-only review. Run the same command after the reviewer replies.
-3. If the reviewer finds no decision, the command saves a clear record.
-4. If the reviewer finds a decision, the command prints Nate's words, the source, the date, and the change.
+3. The command saves a clear record when no test needs a question. It lists each verified request with its test, quote, date, and source.
+4. A departure from Nate's newest words, uncertainty, or a request with an unverified quote needs a question. The command prints the evidence for those tests.
 5. Send the finding to the unit named in `Ask UNIT (phase PHASE)`.
 6. Ask the author to write the question and run the same command with `--question FILE`.
 7. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.
