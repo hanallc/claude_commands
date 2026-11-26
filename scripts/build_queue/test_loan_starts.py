@@ -19,7 +19,7 @@ from scripts.buildlog import memory, store
 
 STOP = datetime(2026, 11, 25, 16, tzinfo=UTC)
 GIB = memory.GIB
-POLICY = memory_trace.MemoryTracePolicy(2, 10, 8192, 7, 8, 1024, 1024, 8)
+POLICY = memory_trace.MemoryTracePolicy(2, 10, 8192, 7, 8, 1024, 1024, 8, general_trace_share_percent=50)
 
 
 class LoanStartsTests(unittest.TestCase):

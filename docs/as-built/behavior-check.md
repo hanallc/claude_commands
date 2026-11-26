@@ -3,6 +3,7 @@
 The check finds existing tests that a commit alters or removes. It adds no marks to tests.
 
 Run `scripts/lib/py scripts/production/behavior_check.py find --repo CHECKOUT --base BASE --commit COMMIT` to see the test changes. The command prints the key and each test's old and new text.
+The `find`, `run`, `check`, and `status` commands compare the result of `git merge-base BASE COMMIT` with COMMIT.
 
 The finder reads Python test functions and Rust functions with test attributes. It skips new tests and tests that move with the same text.
 It includes the attributes of enclosing Rust modules in the test text.
@@ -12,10 +13,13 @@ Each changed file contributes its path, its old and new Git modes, and its old a
 
 `land_main.py` and direct checkpoint pushes read the default branch from origin.
 They check default-branch pushes against the fetched tip.
+The legacy direct-main gate checks from the merge base to the checkpoint before it merges.
+Promotion checks behavior once for a new default-branch tip before it moves live main or pushes the commit.
 The PR script checks the range from the merge base to the PR head.
 It reads the head and base again before merge and supplies the checked head to GitHub.
 
 A clear record names the saved reviewer reply.
+The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
 The gate checks that the reply has a finding of no user decision for each changed test.
 For a Yes record, the gate reads the answer in the original question.
 
@@ -32,8 +36,11 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 6. Ask the author to write the question and run the same command with `--question FILE`.
 7. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.
 
+`status` recovers a filed question if `run` stopped before it saved the local record.
+
 The command traces each finding to the commit that last changed the test in the range.
-It names the unit and phase from the first-parent phase merge whose merged side contains that commit.
+If that commit is a phase merge, the command names its unit and phase.
+For other commits, the command looks for a first-parent phase merge that brought in the commit.
 If there is no such merge, it prints the commit hash and subject.
 If the lookup fails, the command prints the range tip's hash and subject.
 If the command cannot read the subject, it prints `Ask the author of COMMIT`.

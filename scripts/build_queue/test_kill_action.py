@@ -850,7 +850,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
             patch.object(worker_panes, "worker_pass", return_value=passed),
             patch.object(worker_panes, "worker_run", return_value=self.root),
             patch.object(worker_panes, "parent_run_index", return_value={}),
-            patch.object(worker_panes, "observe_worker", return_value=worker_panes.WorkerNotObserved.CURRENT),
+            patch.object(worker_panes, "observe_worker", return_value=worker_panes.ClosedWorker(row)),
             # The fixture pane has no herdr pane, so a close never reads the machine's live panes.
             patch.object(worker_panes, "close", return_value=worker_panes.Closed()),
             patch.object(scratch, "end", return_value=()),

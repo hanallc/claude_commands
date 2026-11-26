@@ -15,7 +15,7 @@ except FileNotFoundError:
     pass
 
 import argparse
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -229,8 +229,9 @@ def _advertised_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefa
 
 def land(checkout: Path, commit: str, branch: str = "main", *,
          time_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT,
-         retry_source: Path | None = None, git_config: Sequence[str] = ()) -> Landed:
-    """Push only a fast-forward and run any pending default-branch hook."""
+         retry_source: Path | None = None, git_config: Sequence[str] = (),
+         install_checkout: Callable[[], None] | None = None) -> Landed:
+    """Check the land, install the checkout if requested, and publish a fast-forward."""
     environment = _git_config_environment(git_config)
 
     def git(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -246,12 +247,9 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
         origin = _advertised_branch_tip(checkout, "origin", branch, ref, advertisement,
                                         time_limit=time_limit, environment=environment).commit
         remote_default = default_branch(advertisement)
-        pushed: Pushed | AlreadyLanded
-        if origin == sha:
-            pushed = AlreadyLanded()
-        elif not git("merge-base", "--is-ancestor", sha, origin).returncode:
-            return Landed(sha, branch, AlreadyLanded(), HookSkipped())
-        else:
+        contained = origin != sha and git("merge-base", "--is-ancestor", sha, origin).returncode == 0
+        needs_push = origin != sha and not contained
+        if needs_push:
             if git("merge-base", "--is-ancestor", origin, sha).returncode:
                 raise NotFastForward(f"origin/{branch} does not fast-forward to {sha}")
             if branch == remote_default:
@@ -260,6 +258,12 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
                     behavior_check.require_review(behavior_check.GitRange(checkout, origin, sha), timeout=git_timeout)
                 except (behavior_check.BehaviorCheckError, OSError) as error:
                     raise LandError(str(error)) from error
+        if install_checkout is not None:
+            install_checkout()
+        if contained:
+            return Landed(sha, branch, AlreadyLanded(), HookSkipped())
+        pushed: Pushed | AlreadyLanded = AlreadyLanded()
+        if needs_push:
             _ = checked("push", "origin", f"{sha}:{ref}")
             pushed = Pushed()
         if branch != remote_default:
