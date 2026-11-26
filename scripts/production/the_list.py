@@ -31,6 +31,7 @@ from pathlib import Path
 from tempfile import TemporaryFile
 from time import monotonic
 from typing import IO, Literal, TypedDict, cast
+from unicodedata import category
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from scripts.agents import remote
@@ -147,12 +148,25 @@ class ItemDependency:
 _EMPTY_TAG_LIST_TEXT = "none"
 
 
+def tag_character_error(text: str) -> str:
+    for character in text:
+        kind = category(character)
+        if kind == "Cc":
+            return "a tag cannot contain a control character"
+        if kind == "Cs":
+            return "a tag cannot contain a lone surrogate"
+    return ""
+
+
 @dataclass(frozen=True)
 class Tag:
     text: str
 
     def __post_init__(self) -> None:
         _line(self.text, "tag")
+        error = tag_character_error(self.text)
+        if error:
+            raise ListError(error)
         if "," in self.text:
             raise ListError("a tag cannot contain a comma")
         normalized = " ".join(self.text.lower().split())

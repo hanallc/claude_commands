@@ -21,6 +21,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Literal, Protocol, cast, final, override
 from unittest.mock import Mock, patch
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from scripts.console_text.test_support import accepting_console_text
@@ -212,11 +213,30 @@ class TheListTests(unittest.TestCase):
                     self.assertEqual(saved.log[-1].what, words)
 
     def test_tag_normalizes_one_line_and_refuses_invalid_text(self) -> None:
-        self.assertEqual(the_list.Tag(" Review  Flow \t").text, "review flow")
-        self.assertEqual(the_list.Tag("Review\tFlow"), the_list.Tag("review flow"))
-        for text in ("", "  \t", "review,flow", "review\nflow", "review\r", "review\u2028flow"):
+        self.assertEqual(the_list.Tag(" Review  Flow ").text, "review flow")
+        for text in ("", "  ", "review,flow", "review\nflow", "review\r", "review\u2028flow"):
             with self.subTest(text=text), self.assertRaises(the_list.ListError):
                 _ = the_list.Tag(text)
+
+    def test_tag_and_page_action_refuse_control_characters(self) -> None:
+        error = "^a tag cannot contain a control character$"
+        for text in ("a\u0000b", "a\tb", "a\x7fb", "a\x80b", "a\x9fb"):
+            with self.subTest(text=text), self.assertRaisesRegex(the_list.ListError, error):
+                _ = the_list.Tag(text)
+        for text in ("a\ud800b", "a\udfffb"):
+            with self.subTest(text=text), self.assertRaisesRegex(
+                    the_list.ListError, "^a tag cannot contain a lone surrogate$"):
+                _ = the_list.Tag(text)
+        self.assertEqual(the_list.Tag("a\ufffdb").text, "a\ufffdb")
+        self.assertEqual(the_list.Tag("a\U0001f642b").text, "a\U0001f642b")
+
+        item = self.add()
+        signed = list_page.signed_tag_request(self.root, MORTY.id, item.id)
+        body = urlencode({**signed, "keeper": MORTY.id, "id": item.id,
+                          "action": "add-tag", "words": "a\u0000b", "until": ""})
+        with self.assertRaisesRegex(the_list.ListError, error):
+            _ = list_page.save_action(self.root, body)
+        self.assertEqual(the_list.load(MORTY.id, item.id), item)
 
     def test_tag_refuses_the_reserved_empty_list_text(self) -> None:
         for text in ("none", "None", "  NONE  "):

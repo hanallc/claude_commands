@@ -891,14 +891,17 @@ class TagCountSlot(Enum):
     TEMPLATE = "fill the count in the browser"
 
 
-def tag_chip(text: str, action: TagChipAction, count: int | NoTagCount | TagCountSlot = NoTagCount.HIDDEN) -> str:
+def tag_chip(text: str, action: TagChipAction, count: int | NoTagCount | TagCountSlot = NoTagCount.HIDDEN,
+             *, pressed: bool = False) -> str:
     value = html.escape(text, quote=True)
     attrs = f'data-tag-{action} data-list-tag="{value}"'
     if action in ("all", "filter", "row"):
-        attrs += f' aria-pressed="{str(action == "all").lower()}"'
+        attrs += f' aria-pressed="{str(pressed).lower()}"'
     elif action == "remove":
         attrs += f' aria-label="Remove tag {value}"'
-    label = f'<span data-tag-label>{html.escape(text)}</span>'
+    if action == "filter" and count == 0:
+        attrs += ' data-tag-empty'
+    label = f'<span data-tag-label>{value}</span>'
     if action == "remove":
         label += '<span aria-hidden="true">×</span>'
     if isinstance(count, int):
@@ -927,10 +930,10 @@ def tag_field(label: str, identity: str = "") -> str:
             + '<div data-tag-choices role="group" aria-label="Tag suggestions" hidden></div></div>')
 
 
-def tag_filter(items: list[ListRecord]) -> str:
-    counts = the_list.tag_counts(entry.item for entry in items)
-    chips = tag_chip("All", "all", len(items)) + ''.join(
-        tag_chip(tag.text, "filter", counts[tag]) for tag in sorted(counts, key=lambda tag: tag.text))
+def tag_filter(counts: Counter[str], all_count: int, selected: frozenset[str]) -> str:
+    chips = tag_chip("All", "all", all_count, pressed=not selected) + ''.join(
+        tag_chip(tag, "filter", counts[tag], pressed=tag in selected)
+        for tag in sorted(counts.keys() | selected, key=lambda tag: tag.encode("utf-16-be")))
     return record_table.labelled_chip_row(
         "Tag", '<div data-tag-filter-chips>' + chips + '</div>' + tag_field("Filter by tag", "list-tag-search")
         + '<button type="button" data-tag-chip hidden></button>',
@@ -980,7 +983,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
               reviews: ReviewDisplay, *, owner_cell: str, owner_sort: str, search_text: SearchText, parked: bool,
               open_question: bool, open_ask: bool, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
               unread_answers: frozenset[str],
-              schedule: DisplayedSchedule, mark: TopPriorityMark, hidden: bool = False) -> str:
+              schedule: DisplayedSchedule, mark: TopPriorityMark, selected_tags: frozenset[str],
+              hidden: bool = False) -> str:
     item = entry.item
     producer = owner_name(names.members, item.producer)
     unread = isinstance(item.unread_since, datetime)
@@ -1026,7 +1030,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
         tags = html.escape(json.dumps([tag.text for tag in item.tags], ensure_ascii=False), quote=True)
         attrs += f' data-tags="{tags}"'
         title += '<div class="list-row-tags" data-row-tags>' + ''.join(
-            tag_chip(tag.text, "row") for tag in item.tags) + '</div>'
+            tag_chip(tag.text, "row", pressed=tag.text in selected_tags) for tag in item.tags) + '</div>'
     tone = STATE_TONES.get(item.state, "muted")
     state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
     if open_question:
@@ -1799,9 +1803,26 @@ def staff_chips(members: staff.StaffSnapshot, identities: Iterable[the_list.Item
             *(record_table.Chip(value, html.escape(label), counts[value]) for label, value in choices)]
 
 
+def read_tag_query(value: str) -> frozenset[str]:
+    def reject_constant(token: str) -> None:
+        raise ValueError(f"Invalid JSON value: {token}")
+
+    if not value:
+        return frozenset()
+    try:
+        tags = cast(object, json.loads(value, parse_int=float, parse_constant=reject_constant))
+    except (ValueError, RecursionError):
+        return frozenset()
+    if not isinstance(tags, list):
+        return frozenset()
+    return frozenset(tag for tag in cast(list[object], tags)
+                     if isinstance(tag, str) and not the_list.tag_character_error(tag))
+
+
 @dataclass(frozen=True)
 class ListQuery:
     selected: dict[str, str]
+    tags: frozenset[str]
     words: str
     unread: bool
     keys: frozenset[str]
@@ -1834,7 +1855,8 @@ class ListQuery:
             "show": show if show in ListChip and show != ListChip.ALL else "",
             "owner": owner if owner and any(entry.item.owner == owner for entry in items) else "",
             "producer": producer if producer in producers else "",
-        }, first("q"), first(UNREAD_FIELD) == UNREAD_VALUE, keys, item, first("reveal") == "1")
+        }, read_tag_query(first("tag")), first("q"), first(UNREAD_FIELD) == UNREAD_VALUE, keys,
+                   item, first("reveal") == "1")
 
     def eligible(self, entry: ListRecord, text: SearchText, search: str, *, parked: bool) -> bool:
         item = entry.item
@@ -1982,6 +2004,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     producers = view.producer_ids(members, (entry.item.producer for entry in items))
     selection = ListQuery.read(query, items, producers)
     chip_totals: dict[str, Counter[str]] = {facet.name: Counter() for facet in FILTER_FACETS}
+    tag_totals: Counter[str] = Counter()
+    tag_all_count = 0
     search = normalize_search_text(selection.words.strip(QUERY_WHITESPACE))
     owners: set[the_list.ItemOwner] = set()
     rows: list[str] = []
@@ -2013,9 +2037,15 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
         owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
         search_text = SearchText(owner_search, normalize_search_text(entry.item.title),
                                  normalize_search_text(original_request_words(entry.item)))
-        visible = selection.eligible(entry, search_text, search, parked=parked) and record_table.count_filter_row(
+        tags = {tag.text for tag in entry.item.tags}
+        matches_tags = selection.tags <= tags
+        matches_other_filters = selection.eligible(entry, search_text, search, parked=parked) and record_table.count_filter_row(
             FILTER_FACETS, {"chip": chip, "owner": entry.item.owner, "producer": entry.item.producer},
-            selection.selected, chip_totals, staff_filters=STAFF_FILTERS)
+            selection.selected, chip_totals, staff_filters=STAFF_FILTERS, count_eligible=matches_tags)
+        tag_all_count += matches_other_filters
+        for tag in tags:
+            tag_totals[tag] += matches_other_filters
+        visible = matches_other_filters and matches_tags
         linked = not visible and selection.reveals(entry, open_question)
         shown += visible
         row_reviews = reviews
@@ -2028,7 +2058,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         row = item_rows(entry, names, today, index, secret, row_reviews, owner_cell=owner_cell, owner_sort=owner_sort,
                         search_text=search_text, parked=parked, open_question=open_question, open_ask=open_ask, visibility=visibility,
-                        unread_answers=unread_answers, schedule=schedule, mark=mark, hidden=not (visible or linked))
+                        unread_answers=unread_answers, schedule=schedule, mark=mark, selected_tags=selection.tags,
+                        hidden=not (visible or linked))
         if linked:
             linked_row = row
         else:
@@ -2095,7 +2126,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + (producer_control if view.placement is ProducerPlacement.BESIDE_WORDS else '')
                + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
                + '</div>'
-               + tag_filter(items)
+               + tag_filter(tag_totals, tag_all_count, selection.tags)
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)
                + f'<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="{UNREAD_VALUE}"{check_unread}>'
                + 'Unread only</label></div>'
@@ -2377,12 +2408,13 @@ const tagDrafts=new Map(),tagErrors=new Map(),tagSaves=new Map(),tagUndos=new Ma
 const tagRequests=new Map();
 let tagCatalog=new Set(),tagCounts=new Map(),selectedTags=[],tagFilterText='';
 let savedTagFilter='',savedTagSelection=[];
+const tagControlOrSurrogate=/[\p{Cc}\p{Cs}]/u;
 function listTagSelection(value){
  if(value===savedTagFilter) return savedTagSelection;
  savedTagFilter=value;
  try{
   const tags=JSON.parse(value || '[]');
-  savedTagSelection=Array.isArray(tags) ? tags.filter(tag=>typeof tag==='string') : [];
+  savedTagSelection=Array.isArray(tags) ? tags.filter(tag=>typeof tag==='string' && !tagControlOrSurrogate.test(tag)) : [];
  }catch{savedTagSelection=[];}
  return savedTagSelection;
 }
@@ -2451,7 +2483,8 @@ function bindTagField(field,{currentTags,choose,removeLast,writeText,create=fals
    choice.addEventListener('click',()=>select(tag));
    return choice;
   });
-  if(create && query && query!=='none' && !query.includes(',') && !tagCatalog.has(query)){
+  if(create && query && query!=='none' && !query.includes(',') && !tagCatalog.has(query) &&
+    !tagControlOrSurrogate.test(input.value)){
    const choice=listTagChip(query,'create');
    choice.addEventListener('click',()=>select(input.value));
    options.push(choice);
@@ -2550,7 +2583,7 @@ function pendingTags(key){
  for(const edit of tagSaves.get(key)?.edits ?? []){
   const tag=normalizeListTag(edit.words);
   if(edit.action==='remove-tag') tags.delete(tag);
-  else if(tag && tag!=='none' && !/[,\r\n]/.test(edit.words)) tags.add(tag);
+  else if(tag && tag!=='none' && !edit.words.includes(',') && !tagControlOrSurrogate.test(edit.words)) tags.add(tag);
  }
  return [...tags];
 }

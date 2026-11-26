@@ -1444,6 +1444,7 @@ if(example.filterOn){
  await wait(()=>summary()!==original && tags().join()==='phone layout,review flow');
  check(!input().value && document.activeElement===input(),'Selecting a suggestion keeps the field ready.');
  for(const [text,error] of [['bad,tag','a tag cannot contain a comma'],
+  ['a\u0000b','a tag cannot contain a control character'],
   ['none',"'none' is reserved for an empty tag list"],['','tag must have one nonempty line']]){
   enter(text);
   await wait(()=>editor().querySelector('[data-tag-error]').textContent===error);
@@ -3287,9 +3288,13 @@ document.body.append(result);
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_keeps_the_first_paint_rows_and_chip_counts_for_query_filters(self) -> None:
         upper, lower = "\u1c89", "\u1c8a"
-        for number, character, owner in (
-                (1, upper, OWNER.id), (2, lower, OWNER.id), (3, upper, OTHER.id), (4, upper, OWNER.id)):
+        smile = "\U0001f642"
+        for number, character, owner, tags in (
+                (1, upper, OWNER.id, ("alpha", "shared", "a\ufffdb", smile)), (2, lower, OWNER.id, ("alpha",)),
+                (3, upper, OTHER.id, ("beta", "shared")), (4, upper, OWNER.id, ())):
             item = self.add(f"Check \0 {character}", owner=owner, number=number)
+            for tag in tags:
+                _ = the_list.add_tag(MORTY.id, item.id, the_list.Tag(tag), source="morty")
             if number != 4:
                 _ = the_list.park(MORTY.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
             if number == 3:
@@ -3298,17 +3303,22 @@ document.body.append(result);
         fragment = urlencode({"show": "working", "owner": OTHER.id, "q": "unmatched"})
         key_query = urlencode({"show": "working", "key": f"{MORTY.id}/L4"})
         key_fragment = urlencode({"key": f"{MORTY.id}/L1"})
+        owner_query = urlencode({"owner": OWNER.id})
+        tag_query = urlencode({"tag": json.dumps(["alpha", "shared", smile, "a\u0000b", "a\ud800b"])})
+        tag_fragment = urlencode({"tag": json.dumps(["beta"])})
         numbers = ["1", "2"] if search_fold.fold(upper) == search_fold.fold(lower) else ["1"]
         unread_alias = "show=unread&unread=0"
         all_rows = ["1", "2", "3", "4"]
         unread_rows = ["1", "2", "4"]
         before = r'''<script>
-const [address,firstRows,loadedRows,allCount,firstUnread,loadedUnread]=CASE;
+const [address,firstRows,loadedRows,allCount,firstUnread,loadedUnread,firstTags]=CASE;
 history.replaceState(null,'',address);
 const snapshot=()=>({
  rows:[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).sort(),
  chips:[...document.querySelectorAll('[data-filter-count]')].map(chip=>
   [chip.id,chip.dataset.filterCount,chip.getAttribute('aria-pressed')]),
+ tags:[...document.querySelectorAll('#list-tag [data-list-tag]')].map(chip=>
+  [chip.dataset.listTag,Number(chip.querySelector('b').textContent),chip.getAttribute('aria-pressed')==='true']),
  unread:document.querySelector('#list-unread').checked,
 });
 const firstPaint=snapshot();
@@ -3320,6 +3330,8 @@ const loaded=snapshot();
 check(JSON.stringify(firstPaint.rows)===JSON.stringify(firstRows),'The server shows the matching rows.');
 check(JSON.stringify(loaded.rows)===JSON.stringify(loadedRows),'Script start shows the matching rows.');
 check(firstPaint.unread===firstUnread && loaded.unread===loadedUnread,'Unread has the expected state.');
+if(firstTags)
+ check(JSON.stringify(firstPaint.tags)===JSON.stringify(firstTags),'The server shows the expected tag counts and selection.');
 if(firstUnread===loadedUnread)
  check(JSON.stringify(firstPaint)===JSON.stringify(loaded),'Script start keeps the rows and chip counts.');
 check(document.querySelector('#filter-show-all').dataset.filterCount===String(allCount),'The All chip has the expected count.');
@@ -3338,10 +3350,18 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 ("show=unread", "", unread_rows, unread_rows, 3, True, True),
                 (unread_alias, "unread=0", unread_rows, unread_rows, 3, True, True),
                 (key_query, key_fragment, ["4"], ["4"], 1, False, False),
+                (owner_query, "", ["1", "2", "4"], ["1", "2", "4"], 3, False, False),
+                (tag_query, tag_fragment, ["1"], ["1"], 1, False, False),
         ):
             with self.subTest(query=server_query, fragment=browser_fragment):
                 address = ("?" + server_query if server_query else "") + ("#" + browser_fragment if browser_fragment else "")
-                case = json.dumps((address, first_rows, loaded_rows, all_count, first_unread, loaded_unread))
+                first_tags = {
+                    owner_query: [("All", 3, True), ("alpha", 2, False), ("a\ufffdb", 1, False),
+                                  ("beta", 0, False), ("shared", 1, False), (smile, 1, False)],
+                    tag_query: [("All", 4, False), ("alpha", 2, True), ("a\ufffdb", 1, False),
+                                ("beta", 1, False), ("shared", 2, True), (smile, 1, True)],
+                }.get(server_query)
+                case = json.dumps((address, first_rows, loaded_rows, all_count, first_unread, loaded_unread, first_tags))
                 markup = list_page.render(self.root / "reviews", include_counts=False, query=server_query).decode()
                 page = markup.replace(script, before.replace("CASE", case) + script, 1)
                 page = page.replace("</body>", after + "</body>", 1)

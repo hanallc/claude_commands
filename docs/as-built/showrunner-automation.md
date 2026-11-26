@@ -805,7 +805,9 @@ Use `the_list.py tag --id L<n> --add <tag>` to add a tag.
 Use `--remove <tag>` to remove it.
 Morty supplies `--source`. For other producers, the command uses the caller's staff name.
 The writer checks the assigned producer under the write lock.
-Tags use lowercase text and one space between words. A tag cannot contain a comma or a line break.
+Tags use lowercase text and one space between words.
+A tag cannot contain a comma or a line break.
+A tag cannot contain a Unicode control character (`Cc`) or a lone surrogate (`Cs`).
 The record keeps tags in the order added.
 Each tag change writes a separate note with the full tag list.
 An empty tag list writes `Tags: none`.
