@@ -66,6 +66,7 @@ class ImageAnswer(TypedDict):
     message: str
     words: NotRequired[str]
     signed_answer: NotRequired[SignedImageAnswer]
+    form_request_keys: NotRequired[list[str]]
     answered: list[str]
     recipients: list[str]
     confirmed: list[str]
@@ -192,6 +193,8 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
             saved["words"] = words
         if "signed_answer" in fields:
             saved["signed_answer"] = _signed_image_answer(fields["signed_answer"], identity)
+        if "form_request_keys" in fields:
+            saved["form_request_keys"] = _texts(fields["form_request_keys"])
         answers["attempts"][key] = saved
     return answers
 

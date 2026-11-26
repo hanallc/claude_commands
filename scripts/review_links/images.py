@@ -93,12 +93,19 @@ class _AnswerDraft:
     action: str
     words: str
     round_id: str | None
+    request_id: str = ""
 
     def key(self, folder: Path, saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer | None = None) -> str:
+        purpose = _signed_answer_key(saved, signed) if signed is not None and "previous_answer_key" in signed else "message"
+        return self._key(folder, saved, purpose)
+
+    def request_key(self, folder: Path, saved: image_store.ImageAnswers) -> str:
+        return self._key(folder, saved, f"images-form:{self.request_id}")
+
+    def _key(self, folder: Path, saved: image_store.ImageAnswers, purpose: str) -> str:
         parts = [saved["registered_at"], self.action, self.words]
         if self.round_id is not None:
             parts.append(self.round_id)
-        purpose = _signed_answer_key(saved, signed) if signed is not None and "previous_answer_key" in signed else "message"
         return change_page.review_delivery_key(folder / image_store.RECORD, folder.name, json.dumps(parts), purpose=purpose)
 
 
@@ -446,7 +453,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     # A page loaded before Send feedback existed posts only the image and its token, which means delete.
     if not {"image", "token"} <= set(fields) <= {
-            "image", "token", "feedback", "action", "feedback_round", "retry_key", "draft_action"} or any(
+            "image", "token", "feedback", "action", "feedback_round", "retry_key", "draft_action", "answer_request"} or any(
             len(value) != 1 for value in fields.values()):
         raise question_record.AnswerRefused("use the form on this page")
     identity = fields["image"][0]
@@ -461,6 +468,10 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
         raise question_record.AnswerRefused("Not Approved was removed. Use Send Feedback.")
     if action not in ACTIONS:
         raise question_record.AnswerRefused("use the form on this page")
+    request_id = fields.get("answer_request", [""])[0]
+    if "answer_request" in fields and (action not in (*ANSWERS, "retry")
+                                      or re.fullmatch(r"[0-9a-f]{32}", request_id) is None):
+        raise question_record.AnswerRefused("use the form on this page")
     if action == "retry":
         required = {"image", "token", "action", "retry_key"}
         if not required <= fields.keys() or not fields["retry_key"][0]:
@@ -469,10 +480,11 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
         draft_action = fields.get("draft_action", [""])[0]
         draft = None
         if draft_fields:
-            if (not {"draft_action", "feedback"} <= draft_fields <= {"draft_action", "feedback", "feedback_round"}
+            if (not {"draft_action", "feedback"} <= draft_fields <= {
+                    "draft_action", "feedback", "feedback_round", "answer_request"}
                     or draft_action not in ANSWERS):
                 raise question_record.AnswerRefused("use the Retry button on this page")
-            draft = _AnswerDraft(draft_action, fields["feedback"][0].strip(), fields.get("feedback_round", [None])[0])
+            draft = _AnswerDraft(draft_action, fields["feedback"][0].strip(), fields.get("feedback_round", [None])[0], request_id)
         return _send_answer(root, identity, action, "", retry_key=fields["retry_key"][0], draft=draft,
                             origin=_ImageAnswerOrigin.SIGNED_FORM)
     if "retry_key" in fields or "draft_action" in fields:
@@ -482,7 +494,7 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
     if action in ANSWERS:
         round_id = fields["feedback_round"][0] if "feedback_round" in fields else None
         return _send_answer(root, identity, action, fields.get("feedback", [""])[0].strip(), round_id=round_id,
-                            origin=_ImageAnswerOrigin.SIGNED_FORM)
+                            origin=_ImageAnswerOrigin.SIGNED_FORM, request_id=request_id)
     try:
         delete(root, identity)
     except ValueError as error:
@@ -581,8 +593,8 @@ def _signed_answer_for_submission(attempt: image_store.ImageAnswer, saved: image
     return signed
 
 
-def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, round_id: str | None,
-                    retry_key: str | None, origin: _ImageAnswerOrigin) -> tuple[str, image_store.ImageAnswers]:
+def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_key: str | None,
+                    origin: _ImageAnswerOrigin) -> tuple[str, image_store.ImageAnswers]:
     """Save the words, proof, and List recipient before the first send."""
     folder = directory / identity
     try:
@@ -598,13 +610,25 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
         saved = _image_answers(directory, record)
 
     attempts = saved["attempts"]
-    draft = _AnswerDraft(answer, feedback, round_id)
+    answer, feedback, round_id = draft.action, draft.words, draft.round_id
+    signed_form = origin is _ImageAnswerOrigin.SIGNED_FORM
+    form_key = draft.request_key(folder, saved) if signed_form and draft.request_id else ""
+    form_retry = None
+    if form_key:
+        form_retry = next((key for key, entry in attempts.items() if form_key in entry.get("form_request_keys", [])), None)
     if retry_key is not None:
         if record is not None or retry_key not in attempts:
             raise question_record.AnswerRefused("no saved answer for this removed picture")
         key = retry_key
+    elif form_retry is not None:
+        key = form_retry
     else:
         key = draft.key(folder, saved)
+        if signed_form and round_id is not None:
+            current_round = (feedback_round(answered_question_ids(record)) if record is not None
+                             else saved.get("deleted_feedback_round"))
+            if current_round is not None and round_id != current_round:
+                raise question_record.AnswerRefused("This page is stale. Review the new answer and try again.")
     attempt: image_store.ImageAnswer | None = attempts.get(key)
     stale_round = False
     if attempt is None:
@@ -622,15 +646,15 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
                 previous = set(legacy.read_text(encoding="utf-8").splitlines())
             except FileNotFoundError:
                 previous = answered_question_ids(record)
-                stale_round = round_id is not None and round_id != feedback_round(previous)
+                stale_round = not signed_form and round_id is not None and round_id != feedback_round(previous)
             message = answer_message(record, answer, feedback)
         attempt = {"message": message, "words": _answer_words(identity, answer, feedback), "answered": sorted(previous),
                    "recipients": [], "confirmed": []}
-    signed_form = origin is _ImageAnswerOrigin.SIGNED_FORM
     new_proof = False
-    if signed_form and retry_key is None:
+    if signed_form and retry_key is None and form_retry is None:
         signed = _signed_answer_for_submission(attempt, saved, draft)
-        signed_key = draft.key(folder, saved, signed)
+        signed_key = next((key for key, entry in attempts.items() if entry.get("signed_answer") == signed),
+                          draft.key(folder, saved, signed))
         if signed_key != key:
             key = signed_key
             attempt = attempts.get(key) or {**attempt, "recipients": [], "confirmed": []}
@@ -640,9 +664,14 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
     new_attempt = key not in attempts
     if stale_round and new_attempt:
         raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
+    request_keys = attempt.get("form_request_keys", [])
+    new_request = bool(form_key) and form_key not in request_keys
+    if new_request:
+        attempt["form_request_keys"] = [*request_keys, form_key]
     if new_attempt or new_proof:
         _ = attempts.pop(key, None)
         attempts[key] = attempt
+    if new_attempt or new_proof or new_request:
         image_store.write_answers(directory, saved)
     else:
         atomic_file.sync_folder(directory)
@@ -697,7 +726,7 @@ def send_answer(root: Path, identity: str, answer: str, feedback: str, *, round_
 
 def _send_answer(root: Path, identity: str, answer: str, feedback: str, *, origin: _ImageAnswerOrigin,
                  round_id: str | None = None, retry_key: str | None = None,
-                 draft: _AnswerDraft | None = None) -> ImageAnswerSent:
+                 draft: _AnswerDraft | None = None, request_id: str = "") -> ImageAnswerSent:
     """Send to each recipient that has yet to confirm this answer."""
     if not image_store.IDENTITY.fullmatch(identity):
         raise question_record.AnswerRefused("not an image id")
@@ -710,7 +739,8 @@ def _send_answer(root: Path, identity: str, answer: str, feedback: str, *, origi
         raise question_record.AnswerRefused(f"no image {identity}")
     with file_lock.exclusive(lock):
         try:
-            key, saved = _picture_answer(directory, identity, answer, feedback, round_id, retry_key, origin)
+            submission = _AnswerDraft(answer, feedback, round_id, request_id)
+            key, saved = _picture_answer(directory, identity, submission, retry_key, origin)
         except OSError as error:
             raise AnswerNotSent(f"Could not save the picture answer: {error}. Try again.") from error
     attempt = saved["attempts"][key]
@@ -735,7 +765,12 @@ def _send_answer(root: Path, identity: str, answer: str, feedback: str, *, origi
                 record = image_store.read_record(folder)
             except FileNotFoundError:
                 owner = _recipient_name(staff.snapshot(), saved["owner"])
-                draft_confirmed = draft is not None and draft.key(folder, saved, delivery.get("signed_answer")) == key
+                draft_confirmed = False
+                if draft is not None:
+                    if draft.request_id:
+                        draft_confirmed = draft.request_key(folder, saved) in delivery.get("form_request_keys", [])
+                    else:
+                        draft_confirmed = draft.key(folder, saved, delivery.get("signed_answer")) == key
                 return ImageAnswerSent(f"This picture was removed; your words went to {owner}.",
                                        draft_confirmed=draft_confirmed)
             if (record["registered_at"] == saved["registered_at"] and record["owner"] == saved["owner"]
@@ -960,17 +995,23 @@ async function submit(event) {
     showActionFailure(status, state.draftError);
     return;
   }
-  const {retryAction, retryRound} = draft ?? {};
+  const {retryAction, retryRound, requestId} = draft ?? {};
   const body = new URLSearchParams(new FormData(form, event.submitter));
   if (key) {
     if (draft?.retryAction) {
       body.set('draft_action', draft.retryAction);
       body.set('feedback', draft.words);
       if (draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
+      if (draft.requestId) body.set('answer_request', draft.requestId);
     }
   } else {
     if (!question) {
-      if (draft.retryAction === action && draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
+      const sameDraft = draft.retryAction === action;
+      if (sameDraft && draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
+      if (!sameDraft || !draft.requestId) {
+        draft.requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+      }
+      body.set('answer_request', draft.requestId);
       draft.retryAction = action;
       draft.retryRound = body.get('feedback_round') ?? undefined;
     }
@@ -1032,6 +1073,7 @@ async function submit(event) {
       if ((!retryable || undone) && !question && state.revision === request.revision) {
         state.draft.retryAction = undone ? retryAction : undefined;
         state.draft.retryRound = undone ? retryRound : undefined;
+        state.draft.requestId = undone ? requestId : undefined;
         saveDrafts();
       }
     }
