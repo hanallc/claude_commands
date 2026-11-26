@@ -1766,10 +1766,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except OSError:
             self.json_response(400, {"error": "Could not read the New item request."})
             return
-        self.review_item_post(server, fields, token, valid_token)
+        with ExitStack() as claims:
+            self.review_item_post(server, fields, token, valid_token, claims)
 
     def review_item_post(self, server: ReviewLinksServer, fields: dict[str, object], token: object,
-                         valid_token: bool) -> None:
+                         valid_token: bool, claims: ExitStack) -> None:
         try:
             draft = fields.get("request_id")
             list_draft_id = (draft if fields.get("page") == "list" and isinstance(draft, str)
@@ -1949,6 +1950,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                             saved, saved.words, status, evidence_page=evidence_page, members=created.members)
                     except review_actions.SubmissionDeliveryPending:
                         delivery = change_page.NoMessageDelivery()
+                    if isinstance(delivery, change_page.MessageDelivery):
+                        _ = claims.callback(status.release_owned_claims, (delivery.attempt,))
                     if on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
                             request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
                         number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
@@ -2041,10 +2044,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         response: dict[str, object] = {"id": saved.id, "list_key": f"{claim.keeper}/{saved.id}",
                                        "receipt": new_item.filing_receipt(claim.assignment, saved.id),
                                        "readback": claim.readback, "notice_warning": claim.notice_warning}
-        send = None
-        if saved.pending_notices:
-            response["notices_pending"] = True
-            send = partial(new_item.deliver_scheduled_notices, review_link.review_root(), request.request_id)
+        send = (partial(new_item.deliver_scheduled_notices, review_link.review_root(), request.request_id)
+                if saved.pending_notices else None)
         self.new_item_saved(response, saved.id, False, deliver=send)
 
     def pending_draft_response(self) -> None:
@@ -2255,11 +2256,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             print(f"review-links review delivery retry: {error}", file=sys.stderr)
         finally:
             if isinstance(delivery, change_page.MessageDelivery):
-                try:
-                    with status.locked():
-                        _ = status.request_attempts.pop(delivery.attempt, None)
-                except Exception as error:
-                    print(f"review-links review delivery release: {error}", file=sys.stderr)
+                status.release_owned_claims((delivery.attempt,))
                 server.review_cache.invalidate()
         return change_page.DeliveryUnconfirmed()
 
@@ -2879,23 +2876,23 @@ class ReviewLinksServer(ThreadingHTTPServer):
         self.delivery_status.startup_recovery_pending.set()
 
         def recover_pending() -> None:
+            def recover(name: str, operation: Callable[[], None]) -> None:
+                try:
+                    operation()
+                except Exception as error:
+                    print(f"review-links {name} recovery: {error}", file=sys.stderr)
+
             with reply_tokens.serving(self.store_folder):
                 try:
-                    recover_changes(self.delivery_status)
-                    review_actions.recover_submission_deliveries(self.delivery_status, review_page.PAGE_PATH)
-                except (OSError, ValueError) as error:
-                    print(f"review-links delivery recovery: {error}", file=sys.stderr)
+                    recover("delivery", partial(recover_changes, self.delivery_status))
+                    recover("first message", partial(
+                        review_actions.recover_submission_deliveries, self.delivery_status, review_page.PAGE_PATH))
                 finally:
                     self.delivery_status.startup_recovery_pending.clear()
-                # A Go goes first: its resend carries the producer's next-step notice in the same message.
-                try:
-                    recover_goes(self.store_folder)
-                finally:
-                    recover_list(self.store_folder)
-                try:
-                    new_item.recover_scheduled_notices(self.root)
-                except (OSError, ValueError) as error:
-                    print(f"Review Scheduled notice recovery: {error}", file=sys.stderr)
+                # Recover Go first because its message includes the producer's next-step notice.
+                recover("List Go", partial(recover_goes, self.store_folder))
+                recover("List feedback", partial(recover_list, self.store_folder))
+                recover("Scheduled notice", partial(new_item.recover_scheduled_notices, self.root))
         threading.Thread(target=recover_pending, daemon=True).start()
         self.review_cache.start()
         try:
@@ -2913,20 +2910,18 @@ class ReviewLinksServer(ThreadingHTTPServer):
             except (OSError, ValueError, RuntimeError) as error:
                 print(f"review-links New item notices: {error}", file=sys.stderr)
 
-        thread = threading.Thread(target=send, daemon=True)
         try:
+            thread = threading.Thread(target=send, daemon=True)
             if claim is None:
                 thread.start()
                 return thread
             status = self.delivery_status
             # Keep the claim live while ownership moves to the delivery thread.
             with status.locked():
-                owner = status.request_attempts[claim.attempt]
-                try:
-                    thread.start()
-                except RuntimeError:
-                    del status.request_attempts[claim.attempt]
-                    raise
+                owner = status.request_attempts.get(claim.attempt)
+                if owner is None or owner.request_thread is not threading.current_thread():
+                    return None
+                thread.start()
                 status.request_attempts[claim.attempt] = replace(owner, request_thread=thread)
             return thread
         except (OSError, RuntimeError) as error:
