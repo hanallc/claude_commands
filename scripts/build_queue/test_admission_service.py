@@ -775,6 +775,38 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertNotIn(prior.reservation, fixture.server.slots)
             self.assertNotIn(younger.episode, fixture.server.reservations)
 
+    def test_two_guest_waits_keep_the_continuation_for_local_fallback(self) -> None:
+        from scripts.build_queue.test_placement import (
+            ManualEvidenceWorker, PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture,
+            placement_request, publish_candidate,
+        )
+
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            _ = mac_linux_fixture(fixture)
+            older_since = fixture.clock.now() - 1
+            run = fixture.run_owner()
+            prior = fixture.finish_step(fixture.request(run=run))
+            fixture.hold_starts()
+            guest, local = mac_linux_candidate(), local_candidate(fixture)
+            older = placement_request(fixture, since=older_since)
+            older = replace(older, constraints=replace(older.constraints, candidates=(guest, local)))
+            younger = placement_request(fixture, session=OwningSession("younger-session"))
+            younger = replace(younger, run=run, constraints=replace(younger.constraints, candidates=(guest, local)))
+
+            for request in (older, younger):
+                waiting, = fixture.connect(request).replies()
+                assert isinstance(waiting, wire.PlacementWait), waiting
+                self.assertIsInstance(waiting.eligibility[0].eligibility, placement.EvidenceNeeded)
+            continuation = fixture.server.slots.get(prior.reservation)
+
+            _ = publish_candidate(fixture, younger, placement.TemporaryExclusion(placement.MAC_LINUX_NO_ANSWER))
+            _ = fixture.run_pass()
+            granted, = fixture.connect(younger).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            self.assertEqual(granted.assignment.destination, local.destination)
+            self.assertIsInstance(continuation, records.ContinuationSlot)
+            self.assertNotIn(older.episode, fixture.server.reservations)
+
     def test_mac_linux_placement_probe_shares_one_deadline_across_connect_retries(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, mac_linux_candidate, mac_linux_fixture, placement_request,
