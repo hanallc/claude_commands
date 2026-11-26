@@ -5,6 +5,7 @@ import fcntl
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -28,7 +29,8 @@ from scripts.production import (
 )
 from scripts.production.issues import Issue
 from scripts.review_links import (
-    answer_sources, change_page, image_store, images, new_item_dialog, question_path, question_record, review_items, review_page, staff_names,
+    answer_sources, change_browser, change_page, image_store, images, new_item_dialog, question_path, question_record,
+    review_items, review_page, staff_names,
 )
 from scripts.review_links.review_events import ReviewLog, encode, rows
 
@@ -408,6 +410,81 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertEqual([exchange.answer for exchange in row.filed_exchanges],
                          [answer_sources.QuestionWithoutAnswer.CLOSED])
 
+    def test_migration_studio_ask_and_review_answer_complete_together(self) -> None:
+        # Run the real locks in a child process so a deadlock cannot retain the fixture.
+        test = "scripts.review_links.test_answer_sources.AnswerSourceTests._exercise_filing_lock_order"
+        try:
+            result = subprocess.run([sys.executable, "-B", "-m", "unittest", test], capture_output=True,
+                                    text=True, timeout=8, env={**os.environ, "TMPDIR": str(self.root)})
+        except subprocess.TimeoutExpired:
+            self.fail("Timed out while migration, Studio Ask, and Review Answer held their locks.")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def _exercise_filing_lock_order(self) -> None:
+        key = self.native("lock-order", {"since": FILED, "text": "Choose a plan",
+                                         "question": "Which plan?", "review_id": "Q1"})
+        path = record_store.default_question_folder(OWNER.id) / key.rsplit("/", 1)[-1]
+        record, = update_registration.selected_question_records([path], (), None)
+        question = change_browser.WaitingQuestion(key, OWNER.name, record, OWNER, OWNER.id, ASKER.name)
+        item = the_list.add(KEEPER.id, "Check the result", owner=KEEPER.id, source="test", changes={})
+        request = the_list.PageRequest("lock-order", "question", "Is it ready?")
+        status = change_page.DeliveryStatus(self.review)
+        owner_path = update_registration.outstanding_path_for_owner(OWNER.id)
+        at_list, at_owner, at_delivery, proceed = Event(), Event(), Event(), Event()
+        save_exchanges = the_list.file_exchanges
+        owner_lock = update_registration.outstanding_lock
+        delivery_lock = status.locked
+
+        def pause_before_list(source: the_list.LockedExchangeSource, exchanges: tuple[list_exchange.Exchange, ...],
+                              title: str, *, linked: investigation.ListDestination | the_list.NextNumber,
+                              owner: staff.StaffId, members: staff.StaffSnapshot) -> investigation.ListDestination:
+            at_list.set()
+            self.assertTrue(proceed.wait(timeout=4))
+            return save_exchanges(source, exchanges, title, linked=linked, owner=owner, members=members)
+
+        @contextmanager
+        def pause_before_owner(target: Path) -> Generator[None]:
+            if current_thread().name.startswith("review-answer") and target == owner_path:
+                at_owner.set()
+                self.assertTrue(proceed.wait(timeout=4))
+            with owner_lock(target):
+                yield
+
+        @contextmanager
+        def signal_before_delivery() -> Generator[None]:
+            if current_thread().name.startswith("studio-ask"):
+                at_delivery.set()
+            with delivery_lock():
+                yield
+
+        with (patch.object(the_list, "file_exchanges", side_effect=pause_before_list),
+              patch.object(update_registration, "outstanding_lock", pause_before_owner),
+              patch.object(status, "locked", signal_before_delivery),
+              ThreadPoolExecutor(max_workers=1, thread_name_prefix="migration") as migration,
+              ThreadPoolExecutor(max_workers=1, thread_name_prefix="review-answer") as answer,
+              ThreadPoolExecutor(max_workers=1, thread_name_prefix="studio-ask") as ask):
+            filing = migration.submit(self.migrate, apply=True)
+            try:
+                self.assertTrue(at_list.wait(timeout=3))
+                answering = answer.submit(change_browser.submit_question, question, "answer", "Use plan A.", status,
+                                          save=change_browser.SelectedQuestionSave())
+                self.assertTrue(at_owner.wait(timeout=3))
+                asking = ask.submit(the_list.ask_question, KEEPER.id, item.id, request, status)
+                self.assertTrue(at_delivery.wait(timeout=3))
+            finally:
+                proceed.set()
+            self.assertEqual(filing.result()[0], 0)
+            self.assertEqual(answering.result()[1], "Use plan A.")
+            delivery = asking.result()
+            self.assertIsInstance(delivery, change_page.PageQuestionSend)
+            assert isinstance(delivery, change_page.PageQuestionSend)
+            if isinstance(delivery.job, change_page.QuestionJob):
+                delivery.job.release()
+        saved_question, = the_list.load(KEEPER.id, item.id).questions
+        self.assertEqual(saved_question.words, request.words)
+        self.assertTrue(any(exchange.source_key == key for row in the_list.records(KEEPER.id)
+                            for exchange in row.filed_exchanges))
+
     def test_reservation_recovers_after_counter_advances(self) -> None:
         _ = self.native("interrupted", {"since": FILED, "text": "Choose a plan", "question": "Which plan?"})
         with patch.object(the_list, "_save_exchange_reservation", side_effect=OSError("Reservation write failed.")):
@@ -462,11 +539,15 @@ class AnswerSourceTests(unittest.TestCase):
         log = (ReviewLog(START, "nate", "question: An older question?"),
                ReviewLog(SECOND_ASK, "nate", "question: Which side?", "saved"),
                ReviewLog(SECOND_REPLY, OWNER.id, "Answer: The east side."))
-        item = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
+        item = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Which side?", "The west side."))
+        assert isinstance(item.source, review_items.ChangeSource)
+        item = replace(item, source=replace(item.source, answered_by=OWNER.id, answered_at=SECOND_REPLY))
         with patch.object(review_items, "read", return_value=[item]):
             exchange, = answer_sources.read_exchanges(self.review, members=MEMBERS).exchanges
         self.assertEqual((exchange.exchange_id, exchange.question, exchange.answerer),
                          ("question:saved", "Which side?", OWNER.id))
+        self.assertEqual(exchange.answer, answer_sources.ExchangeAnswer(
+            "The west side.", SECOND_REPLY, answer_sources.AnswerRead.UNREAD))
 
     def test_slot_only_answer_keeps_earlier_untagged_feedback_and_uses_the_saved_author(self) -> None:
         log = (ReviewLog(START, "nate", "feedback: Check the result."),
@@ -493,11 +574,39 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertIn("Yes.", markup)
         self.assertIn('value="read">Mark read', markup)
 
+    def test_slot_answer_keeps_late_untagged_feedback_with_the_same_words(self) -> None:
+        log = (ReviewLog(START, "nate", "feedback: Check the result."),
+               ReviewLog(SECOND_ASK, "nate", "question: Is it ready?", "saved"),
+               ReviewLog(SECOND_REPLY, ASKER.id, "Answer: Yes."))
+        saved_time = SECOND_REPLY + timedelta(minutes=10)
+        item = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Is it ready?", "Yes."))
+        assert isinstance(item.source, review_items.ChangeSource)
+        item = replace(item, source=replace(item.source, answered_by=OWNER.id, answered_at=saved_time),
+                       answer_time=saved_time)
+        with patch.object(review_items, "read_current", return_value=item):
+            answer_sources.file_saved_review(item, MEMBERS)
+        row, = the_list.records(KEEPER.id)
+        exchange, = row.filed_exchanges
+        self.assertEqual((exchange.exchange_id, exchange.answerer, row.owner), ("question:saved", OWNER.id, OWNER.id))
+        self.assertEqual(exchange.answer, answer_sources.ExchangeAnswer(
+            "Yes.", saved_time, answer_sources.AnswerRead.UNREAD))
+        projected, = answer_sources.apply_review_handoffs([item], user_zone())
+        handoff = projected.exchange_handoff
+        assert isinstance(handoff, review_items.FiledReviewExchange)
+        self.assertEqual(handoff.answer_events, frozenset())
+        self.assertTrue(projected.unread_answer)
+        inputs = review_page.ReviewBodyInputs(change_page.ReviewBrowser("test"), MEMBERS, 4, {}, user_zone(),
+                                             staff_names.StaffNames(MEMBERS))
+        markup = review_page.details(projected, inputs)
+        self.assertIn("Yes.", markup)
+        self.assertIn('value="read">Mark read', markup)
+
     def test_migration_keeps_the_legacy_reply_id_after_the_slot_changes(self) -> None:
         for index, (tag, expected_id) in enumerate((("saved", "question:saved"), ("", "log:0")), 1):
             with self.subTest(tag=tag):
+                reply_tag = question_path.answer_log_id(tag) if tag else ""
                 log = (ReviewLog(START, "nate", "question: Which side?", tag),
-                       ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side."),
+                       ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side.", reply_tag),
                        ReviewLog(SECOND_ASK, "nate", "question: How long?", "later"))
                 original = self.change_with_log(log[:2], delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
                 later = self.change_with_log(log, delivery_state.OpenQuestion("later", "How long?", delivery_state.NoDelivery()))
@@ -515,6 +624,37 @@ class AnswerSourceTests(unittest.TestCase):
                     self.assertEqual([exchange.exchange_id for exchange in exchanges], [expected_id])
                     projected, = answer_sources.apply_review_handoffs([item], user_zone())
                     self.assertFalse(projected.unread_answer)
+
+    def test_migration_retains_the_id_already_filed_for_a_legacy_reply(self) -> None:
+        log = (ReviewLog(START, "nate", "question: Which side?"),
+               ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side."))
+        answered = delivery_state.AnsweredQuestion("saved", "Which side?", "The east side.")
+        original = self.change_with_log(log, answered)
+        earlier_filing = list_exchange.Exchange(
+            list_exchange.Source.SCOPED_REPLY, original.key, "question:saved", list_exchange.Direction.ANSWER_TO_NATE,
+            "Which side?", START, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.ExchangeAnswer("The east side.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD))
+        with the_list.lock_exchange_source(original.key) as locked:
+            row = the_list.file_exchanges(locked, (earlier_filing,), "Which side?",
+                                         linked=the_list.NextNumber.AVAILABLE, owner=OWNER.id, members=MEMBERS)
+        read_log = (*log, ReviewLog(READ, "nate", "Marked read"))
+        changed_slot = delivery_state.OpenQuestion("later", "How long?", delivery_state.NoDelivery())
+        for item in (self.change_with_log(read_log, answered),
+                     self.change_with_log((*read_log, ReviewLog(SECOND_ASK, "nate", "question: How long?", "later")),
+                                          changed_slot)):
+            with (patch.object(review_items, "read", return_value=[item]),
+                  patch.object(review_items, "read_current", return_value=item)):
+                result, _ = self.migrate(apply=True)
+            self.assertEqual(result, 0)
+            saved = the_list.load(row.keeper, f"L{row.number}").filed_exchanges
+            self.assertEqual([exchange.exchange_id for exchange in saved], ["question:saved"])
+            self.assertEqual(saved[0].answer, list_exchange.ExchangeAnswer(
+                "The east side.", FIRST_REPLY, list_exchange.AnswerRead.READ))
+            projected, = answer_sources.apply_review_handoffs([item], user_zone())
+            handoff = projected.exchange_handoff
+            assert isinstance(handoff, review_items.FiledReviewExchange)
+            self.assertEqual(handoff.answer_events, frozenset({1}))
+            self.assertIn("question:saved", handoff.exchange_ids)
 
     def test_filed_answer_keeps_an_unread_feedback_reply_with_the_same_text(self) -> None:
         log = (ReviewLog(START, "nate", "question: Which plan?", "first"),

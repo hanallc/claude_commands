@@ -203,9 +203,6 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
         slot_prompt = original or _LoggedQuestion("question:" + slot.question_id, slot.text, item.times.filed)
         legacy_slot = original is None and not source.answered_by and not isinstance(source.answered_at, datetime)
         named[slot.question_id] = slot_prompt
-    tagged_answers = {"question:" + event.feedback_request_id.removeprefix("answer:") for event in log
-                      if event.feedback_request_id and event.who != Nate.USER
-                      and event.words.startswith("Answer: ") and event.words.removeprefix("Answer: ").strip()}
     last_answer_position = -1
     if legacy_slot:
         last_answer_position = max((index for index, event in enumerate(log)
@@ -215,7 +212,7 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
     for index, event in enumerate(log):
         label, _, words = event.words.partition(": ")
         if index in prompts:
-            pending = prompts[index]
+            pending = None if event.feedback_request_id else prompts[index]
             continue
         if event.who == Nate.USER and label.lower() in ("answer", "approve", "decline", "feedback",
                                                         "feedback sent", "marked read", "read"):
@@ -224,12 +221,8 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
             continue
         if event.feedback_request_id:
             prompt = named.get(event.feedback_request_id.removeprefix("answer:"))
-            if pending == prompt:
-                pending = None
         else:
             prompt, pending = pending, None
-            if prompt is not None and prompt.identity in tagged_answers:
-                continue
         if prompt is None or prompt.identity in seen:
             continue
         seen.add(prompt.identity)
@@ -418,10 +411,11 @@ def read_exchanges(root: Path, *, members: staff.StaffSnapshot) -> ExchangeInven
         if candidates:
             reload[candidates[0].source_key] = partial(_reload_picture, root, record["id"], keepers, zone)
             exchanges.extend(candidates)
-    exchanges.sort(key=lambda exchange: (exchange.source, exchange.source_key, exchange.exchange_id))
     filed = tuple((investigation.ListDestination(entry.keeper, entry.item.number), exchange)
                   for entry in entries for exchange in entry.item.filed_exchanges)
-    return ExchangeInventory(tuple(exchanges), frozenset(list_items), filed, reload)
+    identified = list_exchange.retain_legacy_ids(tuple(exchanges), (exchange for _, exchange in filed))
+    ordered = sorted(identified, key=lambda exchange: (exchange.source, exchange.source_key, exchange.exchange_id))
+    return ExchangeInventory(tuple(ordered), frozenset(list_items), filed, reload)
 
 
 def _count(inventory: ExchangeInventory) -> Iterator[str]:
@@ -624,7 +618,8 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
             projected.append(item)
             continue
         destination, saved = filed[0]
-        matched = tuple(exchange for exchange in exchanges
+        identified = list_exchange.retain_legacy_ids(exchanges, saved)
+        matched = tuple(exchange for exchange in identified
                         if _handoff_content(list_exchange.FiledExchange.from_exchange(exchange)) in saved)
         if not matched:
             projected.append(item)
