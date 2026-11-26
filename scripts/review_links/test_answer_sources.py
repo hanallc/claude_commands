@@ -604,15 +604,19 @@ class AnswerSourceTests(unittest.TestCase):
     def test_migration_keeps_the_legacy_reply_id_after_the_slot_changes(self) -> None:
         for index, (tag, expected_id) in enumerate((("saved", "question:saved"), ("", "log:0")), 1):
             with self.subTest(tag=tag):
-                reply_tag = question_path.answer_log_id(tag) if tag else ""
                 log = (ReviewLog(START, "nate", "question: Which side?", tag),
-                       ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side.", reply_tag),
+                       ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side."),
                        ReviewLog(SECOND_ASK, "nate", "question: How long?", "later"))
-                original = self.change_with_log(log[:2], delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
+                original = self.change_with_log(log[:2], delivery_state.AnsweredQuestion(
+                    "saved", "Which side?", "The east side."))
+                if tag:
+                    assert isinstance(original.source, review_items.ChangeSource)
+                    original = replace(original, source=replace(
+                        original.source, answered_by=OWNER.id, answered_at=FIRST_REPLY))
                 later = self.change_with_log(log, delivery_state.OpenQuestion("later", "How long?", delivery_state.NoDelivery()))
                 key = f"fixture/C{index}"
-                for item in (replace(original, key=key, answer_time=FIRST_REPLY),
-                             replace(later, key=key, answer_time=FIRST_REPLY)):
+                for current in (original, later):
+                    item = replace(current, key=key, answer_time=FIRST_REPLY)
                     with (patch.object(review_items, "read", return_value=[item]),
                           patch.object(review_items, "read_current", return_value=item)):
                         inventory = answer_sources.read_exchanges(self.review, members=MEMBERS)
@@ -623,7 +627,25 @@ class AnswerSourceTests(unittest.TestCase):
                                  for exchange in row.filed_exchanges if exchange.source_key == key]
                     self.assertEqual([exchange.exchange_id for exchange in exchanges], [expected_id])
                     projected, = answer_sources.apply_review_handoffs([item], user_zone())
-                    self.assertFalse(projected.unread_answer)
+                    handoff = projected.exchange_handoff
+                    assert isinstance(handoff, review_items.FiledReviewExchange)
+                    slot_has_answer = bool(tag) and current is original
+                    self.assertEqual(handoff.answer_events, frozenset() if slot_has_answer else frozenset({1}))
+                    self.assertEqual(projected.unread_answer, slot_has_answer)
+
+    def test_older_tagged_question_uses_its_first_untagged_reply(self) -> None:
+        log = (ReviewLog(START, "nate", "question: Which side?", "saved"),
+               ReviewLog(START + timedelta(minutes=1), "nate", "Marked read"),
+               ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side."),
+               ReviewLog(READ, ASKER.id, "Answer: The layout looks good."),
+               ReviewLog(SECOND_ASK, "nate", "question: How long?", "later"),
+               ReviewLog(SECOND_REPLY, ASKER.id, "Answer: Ten minutes."))
+        item = self.change_with_log(log, delivery_state.OpenQuestion("later", "How long?", delivery_state.NoDelivery()))
+        with patch.object(review_items, "read", return_value=[item]):
+            exchange, = answer_sources.read_exchanges(self.review, members=MEMBERS).exchanges
+        self.assertEqual((exchange.exchange_id, exchange.answerer), ("question:saved", OWNER.id))
+        self.assertEqual(exchange.answer, answer_sources.ExchangeAnswer(
+            "The east side.", FIRST_REPLY, answer_sources.AnswerRead.UNREAD))
 
     def test_migration_retains_the_id_already_filed_for_a_legacy_reply(self) -> None:
         log = (ReviewLog(START, "nate", "question: Which side?"),
@@ -655,6 +677,41 @@ class AnswerSourceTests(unittest.TestCase):
             assert isinstance(handoff, review_items.FiledReviewExchange)
             self.assertEqual(handoff.answer_events, frozenset({1}))
             self.assertIn("question:saved", handoff.exchange_ids)
+
+    def test_migration_retains_the_filed_id_when_a_legacy_slot_has_author_and_time(self) -> None:
+        asked_at = START + timedelta(minutes=25)
+        log = (ReviewLog(asked_at, "nate", "question: Which side?"),
+               ReviewLog(FIRST_REPLY, OWNER.name, "Answer: The east side."),
+               ReviewLog(READ, "nate", "Marked read"))
+        original = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
+        assert isinstance(original.source, review_items.ChangeSource)
+        original = replace(original, source=replace(original.source, answered_by=OWNER.id, answered_at=FIRST_REPLY))
+        earlier_filing = list_exchange.Exchange(
+            list_exchange.Source.SCOPED_REPLY, original.key, "question:saved", list_exchange.Direction.ANSWER_TO_NATE,
+            "Which side?", START, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.ExchangeAnswer("The east side.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD))
+        with the_list.lock_exchange_source(original.key) as locked:
+            row = the_list.file_exchanges(locked, (earlier_filing,), "Which side?",
+                                         linked=the_list.NextNumber.AVAILABLE, owner=OWNER.id, members=MEMBERS)
+        later = self.change_with_log((*log, ReviewLog(SECOND_ASK, "nate", "question: How long?", "later")),
+                                     delivery_state.OpenQuestion("later", "How long?", delivery_state.NoDelivery()))
+        for item in (original, later):
+            with (patch.object(review_items, "read", return_value=[item]),
+                  patch.object(review_items, "read_current", return_value=item)):
+                inventory = answer_sources.read_exchanges(self.review, members=MEMBERS)
+                with redirect_stdout(io.StringIO()):
+                    result = answer_sources.migrate(inventory, MEMBERS, apply=True)
+            self.assertEqual(result, 0)
+            self.assertEqual([exchange.exchange_id for exchange in inventory.exchanges], ["question:saved"])
+            saved, = the_list.load(row.keeper, f"L{row.number}").filed_exchanges
+            self.assertEqual((saved.exchange_id, saved.asked_at, saved.answerer), ("question:saved", asked_at, OWNER.id))
+            self.assertEqual(saved.answer, list_exchange.ExchangeAnswer(
+                "The east side.", FIRST_REPLY, list_exchange.AnswerRead.READ))
+            projected, = answer_sources.apply_review_handoffs([item], user_zone())
+            handoff = projected.exchange_handoff
+            assert isinstance(handoff, review_items.FiledReviewExchange)
+            self.assertEqual(handoff.answer_events, frozenset({1}))
+            self.assertEqual(handoff.exchange_ids, frozenset({"question:saved"}))
 
     def test_filed_answer_keeps_an_unread_feedback_reply_with_the_same_text(self) -> None:
         log = (ReviewLog(START, "nate", "question: Which plan?", "first"),

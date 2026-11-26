@@ -2351,7 +2351,7 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
         return chosen
 
 
-def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
+def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.Exchange, ...]) -> ListItem:
     saved = {(exchange.source_key, exchange.exchange_id): exchange for exchange in item.filed_exchanges}
     for exchange in list_exchange.retain_legacy_ids(exchanges, item.filed_exchanges):
         key = (exchange.source_key, exchange.exchange_id)
@@ -2359,7 +2359,7 @@ def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledEx
         if (previous is not None and isinstance(previous.answer, list_exchange.ExchangeAnswer)
                 and isinstance(exchange.answer, list_exchange.QuestionWithoutAnswer)):
             continue
-        saved[key] = exchange
+        saved[key] = list_exchange.FiledExchange.from_exchange(exchange)
     return replace(item, filed_exchanges=tuple(saved.values()))
 
 
@@ -2502,7 +2502,7 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
             item = load(destination.keeper, identity)
             if reserved.reserved_new_item and not any(exchange.source_key == key for exchange in item.filed_exchanges):
                 raise ListError(f"{identity} holds a different source.")
-            item = _save_linked_exchanges(store, item, filed)
+            item = _save_linked_exchanges(store, item, exchanges)
         saved = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
         if frozenset(saved) != confirmed_exchanges(key, destination, saved):
             receipt = "".join(_exchange_receipt_line(destination, exchange) + "\n" for exchange in saved)
@@ -2511,7 +2511,7 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
 
 
 def _save_linked_exchanges(store: record_store.NumberedRecords, item: ListItem,
-                           exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
+                           exchanges: tuple[list_exchange.Exchange, ...]) -> ListItem:
     changed = _with_filed_exchanges(item, exchanges)
     if changed != item:
         with record_store.keep_file_on_error(store.path(item.id)):
