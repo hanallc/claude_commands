@@ -1306,6 +1306,7 @@ class ImagesTests(ImagesFixture):
         request = "&answer_request=" + "a" * 32
         original = self.feedback_body(record, words) + request
         conflict = self.feedback_body(record, "Remove the red row.") + request
+        directory = images.images_root(self.root)
         online = False
         deliveries: list[tuple[str, str]] = []
 
@@ -1318,13 +1319,19 @@ class ImagesTests(ImagesFixture):
         with patch.object(change_page, "send_message", side_effect=send):
             with self.assertRaisesRegex(images.AnswerNotSent, "has not confirmed"):
                 self.submit(original)
-            with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
-                self.submit(conflict)
+            with patch.object(image_store, "write_answers", wraps=image_store.write_answers) as write:
+                with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
+                    self.submit(conflict)
+                write.assert_not_called()
+            saved = image_store.read_answers(directory, record["id"])
+            key, = saved["attempts"]
+            saved["stale_form_request_keys"] = [key]
+            image_store.write_answers(directory, saved)
             online = True
             self.submit(original)
         self.assertEqual([recipient for recipient, _ in deliveries], [self.owner_id(), *([producer.id] * 4)])
         self.assertEqual(len({key for _, key in deliveries}), 1)
-        saved = image_store.read_answers(images.images_root(self.root), record["id"])
+        saved = image_store.read_answers(directory, record["id"])
         attempt, = saved["attempts"].values()
         self.assertCountEqual(attempt["confirmed"], [self.owner_id(), producer.id])
         entry, = (entry for entry in the_list.load(keeper.id, item.id).log
@@ -1842,7 +1849,7 @@ class ImageQuestionTests(ImagesFixture):
         paths = images.decision_root(self.root).glob(f"{identity}-*.json")
         self.assertEqual(len(list(paths)), 3)
 
-    def test_refusing_a_stale_post_does_not_bind_a_new_request_id(self) -> None:
+    def test_stale_request_id_keeps_its_refusal_without_a_round(self) -> None:
         record = self.register()
         self.ask(record)
         identity = record["id"]
@@ -1852,14 +1859,18 @@ class ImageQuestionTests(ImagesFixture):
         post = {"image": identity, "token": token, "action": "feedback", "feedback": "Keep the red row.",
                 "answer_request": "a" * 32}
         stale = {**post, "feedback_round": images.feedback_round(set())}
+        with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
+            self.submit(urlencode(stale))
+
+        current = {**post, "feedback_round": images.feedback_round({"Q1"})}
         with patch.object(image_store, "write_answers", wraps=image_store.write_answers) as write:
-            for _ in range(2):
+            for repeat in (post, current, stale):
                 with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
-                    self.submit(urlencode(stale))
+                    self.submit(urlencode(repeat))
             write.assert_not_called()
         self.assertEqual(self.sent, [])
         self.assertFalse(images.decision_root(self.root).exists())
-        self.submit(urlencode({**post, "feedback_round": images.feedback_round({"Q1"})}))
+        self.submit(urlencode({**current, "answer_request": "b" * 32}))
         self.assertEqual(len(self.sent), 1)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")

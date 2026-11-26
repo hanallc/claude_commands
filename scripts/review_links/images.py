@@ -661,12 +661,21 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         if record is not None or retry_key not in attempts:
             raise question_record.AnswerRefused("no saved answer for this removed picture")
         key = retry_key
-    else:
-        stale = (not draft.matches_answer(attempts[form_retry]) if form_retry is not None else
-                 signed_form and round_id is not None and current_round is not None and round_id != current_round)
-        if stale:
+    elif form_retry is not None:
+        # An accepted attempt takes priority over old refusal records.
+        if not draft.matches_answer(attempts[form_retry]):
             raise question_record.AnswerRefused(STALE_ANSWER)
-        key = form_retry or form_key or draft.key(folder, saved)
+        key = form_retry
+    else:
+        stale_requests = saved.get("stale_form_request_keys", [])
+        if form_key and form_key in stale_requests:
+            raise question_record.AnswerRefused(STALE_ANSWER)
+        if signed_form and round_id is not None and current_round is not None and round_id != current_round:
+            if form_key:
+                saved["stale_form_request_keys"] = [*stale_requests, form_key]
+                image_store.write_answers(directory, saved)
+            raise question_record.AnswerRefused(STALE_ANSWER)
+        key = form_key or draft.key(folder, saved)
     attempt: image_store.ImageAnswer | None = attempts.get(key)
     stale_round = False
     if attempt is None:
