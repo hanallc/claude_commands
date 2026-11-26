@@ -404,7 +404,7 @@ def recover_submission_deliveries(status: change_page.DeliveryStatus, review_pat
                 change_page.deliver(delivery, status)
             finally:
                 if isinstance(delivery, change_page.MessageDelivery):
-                    status.release_recovery_claims((delivery.attempt,))
+                    status.release_owned_claims((delivery.attempt,))
         except (OSError, ValueError, RuntimeError, staff.StaffRefused) as error:
             print(f"Review first message {pending.address.request_id}: {error}", file=sys.stderr)
 

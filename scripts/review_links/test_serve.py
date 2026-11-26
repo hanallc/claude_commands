@@ -3649,6 +3649,56 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(investigation.records(request.recipient_id), [first])
         retry.assert_called_once_with(*send.call_args.args, **send.call_args.kwargs)
 
+    def test_new_item_releases_the_claim_when_screenshot_save_fails(self) -> None:
+        _, _, request = self.page_bug_fixture(screenshot=True)
+        server = self.server
+        status = server.delivery_status
+        key = server.page_captures.start(FIXTURE_CAPTURE)
+        body = json.dumps({**asdict(request), "token": server.new_item_token, "capture_key": key}).encode()
+
+        def fail_save(*_args: object, **_kwargs: object) -> None:
+            self.assertEqual(len(status.request_attempts), 1)
+            raise OSError("The screenshot save failed.")
+
+        with (patch.object(server, "resume_page_capture"), patch.object(server, "finish_bug_evidence"),
+              patch.object(change_page, "send_to_staff") as send):
+            with patch.object(server.page_captures, "file", side_effect=fail_save) as save:
+                failed = self.new_item_http(body, finished=True)
+            self.assertEqual(failed.status, 503, failed.body)
+            save.assert_called_once()
+            self.assertEqual(status.request_attempts, {})
+            send.assert_not_called()
+            retry = self.new_item_http(body, finished=True)
+            self.assertEqual(retry.status, 200, retry.body)
+            send.assert_called_once()
+        self.assertEqual(len(investigation.records(request.recipient_id)), 1)
+
+    def test_new_item_releases_the_claim_when_the_handover_lock_fails(self) -> None:
+        _, _, request = self.page_bug_fixture()
+        request = replace(request, request_id="r6-" + uuid4().hex)
+        server = self.server
+        status = server.delivery_status
+        locked = status.locked
+        body = self.new_item_body(request)
+
+        @contextmanager
+        def without_handover_lock() -> Generator[None]:
+            if status.request_attempts:
+                raise OSError("The handover lock failed.")
+            with locked():
+                yield
+
+        with patch.object(change_page, "send_to_staff") as send:
+            with patch.object(status, "locked", side_effect=without_handover_lock):
+                saved = self.new_item_http(body, finished=True)
+            self.assertEqual(saved.status, 200, saved.body)
+            self.assertEqual(status.request_attempts, {})
+            send.assert_not_called()
+            retry = self.new_item_http(body, finished=True)
+            self.assertEqual(retry.status, 200, retry.body)
+            self.assertEqual(json.loads(retry.body)["id"], json.loads(saved.body)["id"])
+            send.assert_called_once()
+
     def test_new_item_retry_recovers_a_confirmed_delivery_without_sending_again(self) -> None:
         _folder, _cache, request = self.page_bug_fixture()
         request = replace(request, request_id="r6-" + uuid4().hex)
@@ -4293,7 +4343,6 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual((item.producer, item.owner, item.unit), (producer.id, case.fixture.unit.id, case.fixture.unit.name))
             repeated = cast(dict[str, str], json.loads(self.new_item_http(body, finished=True).body))
             self.assertEqual(repeated["id"], saved["id"])
-            self.assertNotIn("notices_pending", repeated)
             changed = json.dumps({**request, "assignee_id": None}).encode()
             self.assertEqual(self.new_item_http(changed, finished=True).status, 409)
             self.assertEqual(notify.call_count, 2)
@@ -4328,7 +4377,6 @@ class ReviewLinksServerTests(unittest.TestCase):
             try:
                 reply = self.new_item_http(body)
                 self.assertEqual(reply.status, 200, reply.body)
-                self.assertTrue(json.loads(reply.body)["notices_pending"])
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
                 saved = cast(dict[str, object], json.loads(receipt.read_text()))
                 self.assertEqual(saved["confirmed"], [])
@@ -4382,7 +4430,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                         repeated = self.new_item_http(body, finished=True)
                         self.assertEqual(repeated.body, saved.body)
                     else:
-                        new_item.recover_scheduled_notices(review_link.review_root())
+                        with (patch.object(list_page, "recover_pending",
+                                           side_effect=OSError("The List feedback store failed.")) as recover_list,
+                              started_review_server(("127.0.0.1", 0), review_link.review_root()) as restarted):
+                            recover_list.assert_called_once_with(restarted.store_folder)
                     retry.assert_called_once_with(*first.call_args.args)
                     self.assertEqual(retry.call_args.args[0], producer)
                 self.assertEqual(cast(dict[str, object], json.loads(receipt.read_text()))["confirmed"],
@@ -4468,7 +4519,6 @@ class ReviewLinksServerTests(unittest.TestCase):
                                 count = len(the_list.records(morty.id))
                                 repeat = self.new_item_http(encoded, finished=True)
                                 self.assertEqual(repeat.status, 200)
-                                _ = result.pop("notices_pending", None)
                                 self.assertEqual(json.loads(repeat.body), result)
                                 changed = self.new_item_http(json.dumps({**scheduled, "words": "Changed words"}).encode(),
                                                              finished=True)
