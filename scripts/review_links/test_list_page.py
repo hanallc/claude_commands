@@ -1308,30 +1308,43 @@ if(example.filterOn){
         closed = self.add("Close this check", number=210)
         missing = self.add("Remove this fixture record", number=406)
         _ = self.add("Check <this> & that", number=413)
+        _ = self.add("Check the dependency", the_list.ItemState.BLOCKED, number=414)
+        _ = self.add("Ask for a decision", the_list.ItemState.WAITING_FOR_NATE, number=464)
+        _ = self.add("Publish the result", the_list.ItemState.DELIVERED, number=467)
         umbrella = self.add("The workflow is consistent and simple", number=494)
-        _ = the_list.update(MORTY.id, umbrella.id, {"related_to": (413, 406, 210)}, source="morty")
+        _ = the_list.update(MORTY.id, umbrella.id, {"related_to": (467, 413, 406, 210, 464, 414)}, source="morty")
         _ = the_list.close(MORTY.id, closed.id, "The check passed.", source="morty")
         (the_list.folder(MORTY.id) / f"{missing.id}.md").unlink()
         root = self.root / "reviews"
         with patch.object(list_page, "records", wraps=list_page.records) as read_records:
             markup = list_page.render(root, include_counts=False).decode()
         read_records.assert_called_once_with(include_closed=True)
-        self.assertEqual(markup.count('<h3>Linked items</h3>'), 1)
+        self.assertEqual(markup.count(' data-linked-items>'), 1)
         panel = markup.split('data-number="494"', 1)[1].split('</tbody>', 1)[0]
         section = panel.split('<section class="item-links" data-linked-items>', 1)[1].split('</section>', 1)[0]
         parsed = ElementTree.fromstring('<section>' + section.replace(' data-record-jump ', ' data-record-jump="" ')
                                         + '</section>')
+        self.assertEqual(parsed.findtext('h3'), 'Linked items · 1 of 6 closed')
         rows = parsed.findall('ul/li')
         self.assertEqual([(row.findtext('a') or row.text, row.findtext('span')) for row in rows], [
             ('#210 Close this check', 'Closed'), ('#406 not found', None), ('#413 Check <this> & that', 'Working'),
+            ('#414 Check the dependency', 'Blocked'), ('#464 Ask for a decision', 'Waiting for nate'),
+            ('#467 Publish the result', 'Delivered'),
         ])
         self.assertIsNone(rows[1].find('a'))
-        self.assertEqual([anchor.attrib['href'] for anchor in parsed.findall('ul/li/a')],
-                         [list_page.item_link(MORTY.id, 210) + '&reveal=1', list_page.item_link(MORTY.id, 413)])
+        anchors = parsed.findall('ul/li/a')
+        numbers = (210, 413, 414, 464, 467)
+        self.assertEqual([anchor.attrib['href'] for anchor in anchors], [
+            list_page.item_link(MORTY.id, number) + ('&reveal=1' if number == 210 else '') for number in numbers
+        ])
+        for number, badge in zip(numbers, parsed.findall('ul/li/span'), strict=True):
+            row = markup.split(f'data-number="{number}"', 1)[1].split('</tr>', 1)[0]
+            self.assertIn(ElementTree.tostring(badge, encoding='unicode'), row)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_linked_items_open_and_refresh_with_the_page(self) -> None:
-        closed = self.add("Close a linked item", number=210)
+        closed = self.add("Close a linked item after the page shows the full title across several lines "
+                          + "and keeps its state in the same column as every other linked item", number=210)
         open_item = self.add("Keep a linked item open", number=413)
         umbrella = self.add("The workflow is consistent and simple", number=494)
         _ = the_list.update(MORTY.id, umbrella.id, {"related_to": (413, 210)}, source="morty")
@@ -1343,15 +1356,27 @@ if(example.filterOn){
  const item=number=>document.querySelector('[data-number="'+number+'"]');
  const links=()=>recordDetails(item(494)).querySelector('[data-linked-items]');
  const states=()=>[...links().querySelectorAll('.list-state')].map(badge=>badge.textContent).join(',');
+ const heading=()=>links().querySelector('h3').textContent;
  const back=async()=>{
   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   history.back();await changed;
  };
  check(states()==='Working,Working','The section shows the states from the first page.');
+ check(heading()==='Linked items · 0 of 2 closed','The heading counts all links and no Closed items.');
+ const [longTitle,shortTitle]=links().querySelectorAll('a');
+ check(longTitle.offsetHeight>shortTitle.offsetHeight,'The long title wraps.');
+ const titleStyle=getComputedStyle(longTitle);
+ const rowStyle=getComputedStyle(item(494).querySelector('.list-row [data-label="Item"] strong'));
+ check(titleStyle.color===rowStyle.color && titleStyle.fontWeight==='400' && titleStyle.textDecorationLine==='none',
+  'The link uses the row text color and regular weight without an underline at rest.');
  refreshMarkup=FRESH_PAGE;
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await flush();
  check(states()==='Closed,Working' && pageReads===1,'One page refresh updates the state badges.');
+ check(heading()==='Linked items · 1 of 2 closed','The heading counts the Closed item after refresh.');
+ const [closedBadge,workingBadge]=links().querySelectorAll('.list-state');
+ check(closedBadge.getBoundingClientRect().left===workingBadge.getBoundingClientRect().left,
+  'Badges with different widths start in the same column.');
  const count=document.querySelector('[data-list-count]').textContent;
  links().querySelectorAll('a')[0].click();
  const closed=item(210);
@@ -1367,7 +1392,8 @@ if(example.filterOn){
  check(recordIsOpen(target) && !target.hidden && !recordIsOpen(item(494)) &&
   new URLSearchParams(location.hash.slice(1)).get('item')===target.dataset.key,'The open item link opens its item.');
 '''.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/')).replace('OPEN_NUMBER', str(open_item.number)),
-                                     reduced_motion=True, add_item=False, markup=initial, open_number=494)
+                                     reduced_motion=True, add_item=False, markup=initial, open_number=494,
+                                     window_size=(1440, 900))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_tab_filters_the_rows_to_its_producer(self) -> None:
