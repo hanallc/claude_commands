@@ -767,12 +767,14 @@ def staff_unit(identity: unit_labels.UnitLabels, *, missing: Literal["", "—"] 
 
 def page_owner_labels(identity: unit_labels.UnitLabels, *, ci_label: str = "",
                       unit: UnitCell = "", caller: str = "") -> PageOwnerLabels:
-    """Show the resolved owner and unit, or the CI label."""
+    """Show the resolved owner and unit. Keep the CI label for the tooltip."""
     runner = unit_labels.Runner.UNKNOWN if ci_label else identity.runner
     showrunner = "—" if identity.owner_text == "—" else public_queue_text(identity.owner_text)
-    fields: PageOwnerLabels = {"showrunner": "" if ci_label else showrunner,
+    if ci_label:
+        showrunner = codec.ci_showrunner(conf.read_or_repository("build_admission").text("ci_label"))
+    fields: PageOwnerLabels = {"showrunner": showrunner,
             "unit": "" if ci_label else unit, "ci_label": ci_label, "runner": runner,
-            "owner_text": codec.select_queue_name(caller, ci_label, showrunner),
+            "owner_text": codec.select_queue_name(caller, showrunner),
             "worker": public_queue_text(identity.session) if runner is unit_labels.Runner.WORKER else ""}
     if caller:
         fields["caller"] = caller
@@ -1639,7 +1641,7 @@ def step_page_owner(step: admission_records.RunningStep | admission_records.Wait
     """Use the caller name and current staff labels."""
     if ci_label:
         identity = feed_step_labels(step, labels, runners)
-        return StepPageOwner(replace(identity, showrunner="", unit=""), ci_label)
+        return StepPageOwner(identity)
     machine = admission_records.execution_host(step, local_host) if isinstance(step, admission_records.RunningStep) else local_host
     member = members.labels_for(step.session_id, machine, Path(step.folder))
     caller = codec.resolve_queue_caller(

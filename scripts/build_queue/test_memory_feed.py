@@ -2369,6 +2369,7 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(row["name"], "hana: run 6 installs")
 
     def test_ci_runner_records_name_the_owner_in_running_and_waiting(self) -> None:
+        _ = (self.root / "build_admission.conf").write_text("ci_label=Fixture CI · {runner} · {job}\n")
         base = with_wait_reason(reservation_reading(), admission_records.ReadyForAdmission())
         memory = admission_records.UnownedSliceMemory(admission_records.GIB // 8,
             cgroup=str(self.root / "ci"), owner="hana-ci.slice", pid=701, job_state=IdleService())
@@ -2379,18 +2380,23 @@ process.stdout.write(JSON.stringify({
         original = inputs.running[0]
         for runner in ("hana-linux-1", "hana-linux-2"):
             with self.subTest(runner=runner):
-                running = replace(original, unit=runner, session_id="", session_name="unrelated display name")
+                label = f"Fixture CI · {runner} · compile"
+                running = replace(original, unit=runner, session_id="", session_name=label)
                 reading = gate.queue_read_from(replace(inputs, running=(running, service)), admission_policy_fixture())
-                waiting = replace(base.view.waiting[0], unit=runner, session_id="", session_name="unrelated display name")
+                waiting = replace(base.view.waiting[0], unit=runner, session_id="", session_name=label)
                 reading = replace(reading, view=replace(reading.view, waiting=(waiting,)))
                 with mock.patch.object(queue_snapshot, "read_view_snapshot", return_value=fixture_published_view(reading)):
                     page = memory_feed.reading()
                 run = next(row for row in page["walk"] if row.get("queued"))
-                self.assertEqual(run.get("showrunner"), "")
-                self.assertEqual(run.get("ci_label"), "unrelated display name")
+                self.assertEqual(run.get("showrunner"), "Fixture")
+                self.assertEqual(run.get("owner_text"), "Fixture")
+                self.assertEqual(run["title"]["step"], label)
+                self.assertEqual(run.get("ci_label"), label)
                 self.assertEqual(run["name"], "hana CI: nextest")
-                self.assertEqual(page["waiters"][0]["showrunner"], "")
-                self.assertEqual(page["waiters"][0].get("ci_label"), "unrelated display name")
+                self.assertEqual(page["waiters"][0]["showrunner"], "Fixture")
+                self.assertEqual(page["waiters"][0].get("owner_text"), "Fixture")
+                self.assertEqual(page["waiters"][0]["title"]["step"], label)
+                self.assertEqual(page["waiters"][0].get("ci_label"), label)
                 self.assertEqual(run["unit"], "")
                 self.assertEqual(len(page["walk"]), 1)
                 for row in (run, page["waiters"][0]):
@@ -4790,7 +4796,8 @@ const refresh = createPageRefresh(tick);
         self.assertEqual(mac["name"], "hana CI: nextest")
         self.assertEqual(mac.get("ci_label"), "hana CI · hana-mac-1 · test-hana")
         self.assertEqual(mac["title"]["step"], "hana CI · hana-mac-1 · test-hana")
-        self.assertEqual(mac.get("showrunner"), "")
+        self.assertEqual(mac.get("showrunner"), "hana")
+        self.assertEqual(mac.get("owner_text"), "hana")
         self.assertEqual(mac["unit"], "")
         for runner, job, label in (("", "", "hana CI"), ("hana-mac-1", "", "hana CI"),
                                    ("", "test-hana", "hana CI")):

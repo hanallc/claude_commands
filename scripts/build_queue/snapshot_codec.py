@@ -217,6 +217,12 @@ def ci_label(template: str, runner: str, job: str) -> str:
     return select_queue_name(format_queue_name(template, runner=runner, job=job), "hana CI")
 
 
+def ci_showrunner(template: str) -> str:
+    """Read the showrunner before CI in the configured label."""
+    owner, separator, detail = template.partition(" CI")
+    return public_queue_text(owner) if separator and (not detail or detail[0].isspace()) else ""
+
+
 def resolve_queue_caller(*, stored_caller: object, reservation_caller: object = "", staff_caller: object = "") -> str:
     """Select the recorded caller, the reservation caller, or the staff member."""
     return select_queue_name(stored_caller, reservation_caller, staff_caller)

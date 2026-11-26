@@ -467,7 +467,9 @@ On the Builds page, `queueRowLabels` in `memory_live.html` gives the row start a
 A unit at the row start always shows in the unit color, by its role, also when it has no staff entry. `StaffNames.unit_open` makes the opening tag of that span with `role_span_open`, the same code as `StaffNames.html`. The feed sends it as `unit_open`, and `staffNames.unit(text)` in the shared script adds the name.
 A row with no unit starts with its owner. Mac rows carry the owner and step in separate fields.
 For other rows with no unit, the text before `: ` gives the owner. The text after `: ` goes in Step.
-An owner with a staff entry, such as a showrunner, shows in its staff color. Another owner, such as hana CI, shows in plain ink.
+An owner with a staff entry shows in its staff color. An owner without a staff entry shows in plain ink.
+For natedev and Mac CI, the feed sends the showrunner from the text before ` CI` in the `ci_label` setting.
+The current setting gives `hana`. The runner and job go in the tooltip title.
 A row with no unit has no small line, because the line would repeat the owner.
 The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
 `snapshot_codec.owner_name` gives the owner of local, remote, and cloud rows in this order.
@@ -1260,6 +1262,12 @@ The service, snapshot decoder, and Builds page use `resolve_queue_caller`.
 The resolver uses the first usable name from the record, the reservation, and the staff snapshot.
 It returns `unregistered session` when no candidate is usable.
 A later read can replace this fallback with a usable name.
+The service refuses new admissions and placements that resolve to this fallback.
+A terminal, CI runner, named timer, or named session can still submit work.
+A showrunner needs no unit.
+The service sends bob one alert per repository and folder through the outage alert ledger.
+The sender runs outside the admission pass.
+A named admission from that repository and folder clears the alert.
 The shared name check rejects blank text, dashes, raw IDs, text with `$`, and the fallback label.
 A staff unit uses its own name for priority. A worker uses its parent unit.
 A showrunner keeps its caller name and has an empty unit.

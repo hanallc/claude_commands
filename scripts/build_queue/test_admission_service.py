@@ -4576,7 +4576,7 @@ class WaitHolderServiceTests(unittest.TestCase):
             run = fixture.run_owner()
             fixture.allow_next_start()
             request = fixture.request(need=12 * GIB, run=run)
-            request = replace(request, identity=replace(request.identity, session_id="", name="", unit="gap-unit"))
+            request = replace(request, identity=replace(request.identity, session_id="", name="named caller", unit="gap-unit"))
             with fixture.loop_turn():
                 granted = only_admitted(fixture.server.handle_request(request))
             fixture.restart()
@@ -4600,7 +4600,7 @@ class WaitHolderServiceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.allow_next_start()
             request = fixture.request(need=12 * GIB)
-            request = replace(request, identity=replace(request.identity, session_id="", name="", unit="compile-unit"))
+            request = replace(request, identity=replace(request.identity, session_id="", name="named caller", unit="compile-unit"))
             with fixture.loop_turn():
                 _ = only_admitted(fixture.server.handle_request(request))
             fixture.allow_next_start()
@@ -7094,14 +7094,78 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(saved.queue_waiter.get("session_name"), expected)
 
     def test_service_names_an_empty_admission(self) -> None:
-        with AdmissionFixture() as fixture:
+        with AdmissionFixture() as fixture, mock.patch.object(service, "deliver_source_refusal"):
             request = fixture.request(need=GIB)
-            request = replace(request, identity=replace(request.identity, name=""))
+            request = replace(request, identity=replace(request.identity, session_id="", name=""))
+            self.assertEqual(fixture.connect(request).replies(), [
+                wire.Refused("Refused: this request names no source. It gives no session id, staff id or name.")])
+            self.assertNotIn(request.episode, fixture.server.waiters)
+
+    def test_service_refuses_and_reports_an_unresolved_source_until_admitted(self) -> None:
+        with AdmissionFixture() as fixture, \
+                mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())):
+            fixture.clock.epoch = time.time()
+            threads: list[threading.Thread] = []
+            messages: list[tuple[str, str]] = []
+
+            def send(recipient: str, message: str) -> bool:
+                messages.append((recipient, message))
+                return True
+
+            def record_thread(*, target: Callable[..., None], args: tuple[object, ...],
+                              name: str, daemon: bool) -> threading.Thread:
+                thread = threading.Thread(target=target, args=args, name=name, daemon=daemon)
+                threads.append(thread)
+                return thread
+
+            def refuse(request: wire.AdmitRequest, given: str) -> None:
+                request = replace(request, identity=replace(request.identity, session_id=given, name=""))
+                self.assertEqual(fixture.connect(request).replies(), [wire.Refused(
+                    f"Refused: this request names no source. The session id '{given}' resolves to no staff row "
+                    + "and no session name. Run it from a named session, or set CLAUDE_SESSION_NAME.")])
+                for thread in threads:
+                    thread.join(timeout=3)
+                    self.assertFalse(thread.is_alive())
+
+            with mock.patch.object(service, "threading", mock.Mock(wraps=threading, Thread=record_thread)), \
+                    mock.patch.object(service, "send_admission_alert", side_effect=send):
+                request = fixture.request(need=GIB)
+                refuse(request, "missing-session")
+                refuse(fixture.request(need=GIB), "another-session")
+                (recipient, message), = messages
+                self.assertEqual(recipient, "bob")
+                self.assertIn("Given: session id 'missing-session' (resolves to nothing).", message)
+                self.assertIn(f"Repository: fixture. Folder: {fixture.root}.", message)
+
+                fixture.clock.advance(5)
+                _ = only_admitted(fixture.connect(fixture.request(need=GIB)).replies())
+                refuse(fixture.request(need=GIB), "missing-session")
+                self.assertEqual(len(messages), 2)
+
+    def test_service_admits_a_showrunner_without_a_unit(self) -> None:
+        member = staff.StaffRow(staff.StaffId("showrunner"), "showrunner", "cargo-liner", staff.StaffRoot(),
+                                current_session=staff.StaffId("4dbdb78e-a83b-4248-b8f9-ff278dcbc60c"))
+        with AdmissionFixture() as fixture, \
+                mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((member,))), \
+                mock.patch.object(service, "send_admission_alert") as send:
+            request = fixture.request(need=GIB)
+            request = replace(request, identity=replace(request.identity, session_id=member.current_session, name=""))
             _ = only_admitted(fixture.connect(request).replies())
-            reply, = fixture.connect(wire.ViewRequest()).replies()
-            assert isinstance(reply, wire.ViewReply)
-            row, = [step for step in reply.reading.view.running if step.pid == request.owner.pid]
-            self.assertEqual(row.session_name, "unregistered session")
+            row = fixture.server.reservations[request.episode].queue_waiter
+            self.assertEqual((row.get("session_name"), row.get("unit")), ("cargo-liner", ""))
+            send.assert_not_called()
+
+    def test_service_admits_named_sources_without_a_staff_row(self) -> None:
+        for name, session in (("terminal", ""), ("nightly", ""), ("manual session", "missing-session")):
+            with self.subTest(name=name), AdmissionFixture() as fixture, \
+                    mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())), \
+                    mock.patch.object(service, "send_admission_alert") as send:
+                request = fixture.request(need=GIB)
+                request = replace(request, identity=replace(request.identity, session_id=session, name=name))
+                _ = only_admitted(fixture.connect(request).replies())
+                row = fixture.server.reservations[request.episode].queue_waiter
+                self.assertEqual(row.get("session_name"), name)
+                send.assert_not_called()
 
     def test_service_restores_an_empty_saved_name(self) -> None:
         with AdmissionFixture() as fixture:
@@ -7140,14 +7204,15 @@ class ServiceTests(unittest.TestCase):
                              ["fixture unit", "fixture unit"])
 
     def test_service_names_placement_without_an_identity(self) -> None:
+        from scripts.build_hold.owning_session import NoOwningSession
         from scripts.build_queue.test_placement import placement_request
 
-        with AdmissionFixture() as fixture:
-            request = replace(placement_request(fixture), identity=wire.Identity("", "", "", ""))
-            _ = fixture.server.handle_request(request)
-            saved = fixture.server.placement_requests[request.episode]
-            self.assertEqual(saved.identity.name, "unregistered session")
-            self.assertEqual(saved.identity.step, request.profile.step)
+        with AdmissionFixture() as fixture, mock.patch.object(service, "deliver_source_refusal"):
+            request = replace(placement_request(fixture, session=NoOwningSession()),
+                              identity=wire.Identity("", "", "", ""))
+            self.assertEqual(fixture.server.handle_request(request), [
+                wire.Refused("Refused: this request names no source. It gives no session id, staff id or name.")])
+            self.assertNotIn(request.episode, fixture.server.placement_requests)
 
     def assert_reload_hash_journal(self, journal: str, next_check: float) -> str:
         provision, schedule, ready, revision = journal.splitlines()
@@ -8159,7 +8224,7 @@ class ServiceTests(unittest.TestCase):
                     self.assertEqual(service.wait_line_name(waiting), f"{expected}: nextest")
 
     def test_wait_lines_then_ranked_admissions_and_release_frees_charge(self) -> None:
-        for owner_name in ("session", "CI", "unit", "folder", "pid", "continuation"):
+        for owner_name in ("session", "CI", "unit", "continuation"):
             with self.subTest(owner=owner_name), AdmissionFixture() as fixture:
                 run: wire.RunIdentity | wire.NoRun = wire.NO_RUN
                 if owner_name == "continuation":
@@ -8177,10 +8242,6 @@ class ServiceTests(unittest.TestCase):
                 elif owner_name == "unit":
                     head = replace(request, identity=replace(request.identity, unit="compiler"))
                     label = "compiler: nextest"
-                elif owner_name in ("folder", "pid"):
-                    head = replace(request, identity=replace(request.identity, session_id="", name="",
-                        folder="/builds/hana" if owner_name == "folder" else "/"))
-                    label = "hana: nextest" if owner_name == "folder" else "unregistered session: nextest"
                 if owner_name == "continuation":
                     head = replace(request, identity=replace(request.identity, name="continuation"))
                     label = "ordinary: nextest"

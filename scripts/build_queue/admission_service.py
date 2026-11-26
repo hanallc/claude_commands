@@ -21,6 +21,7 @@ from functools import cache
 from importlib import import_module
 import os
 from pathlib import Path
+import re
 import select
 import shlex
 import socket
@@ -32,6 +33,7 @@ import time
 import uuid
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Literal, Protocol, cast, override
+from zoneinfo import ZoneInfo
 
 from scripts.build_queue import execution_identity
 from scripts.build_hold.owning_session import NoOwningSession, OwningSession
@@ -338,6 +340,66 @@ def deliver_reading_alert(claimed: outage_alerts.AlertClaim, hold: UnreadableRea
     finally:
         if not delivered:
             outage_alerts.release(claimed)
+
+
+def deliver_source_refusal(claimed: outage_alerts.AlertClaim, message: str) -> None:
+    """Send the source refusal and release any unfinished claim."""
+    try:
+        if send_admission_alert("bob", message):
+            outage_alerts.delivered(claimed)
+    except (OSError, ValueError) as error:
+        print(f"memory admission: source refusal alert failed: {error}", file=sys.stderr)
+    finally:
+        outage_alerts.release(claimed)
+
+
+@dataclass(frozen=True)
+class SourceLocation:
+    repository: str
+    folder: str
+
+    @property
+    def alert_key(self) -> str:
+        source = json.dumps((self.repository, self.folder))
+        return "source-refused:" + hashlib.sha256(source.encode()).hexdigest()
+
+
+def source_location(request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest) -> SourceLocation:
+    profile = request.profile
+    identity = profile.repository
+    repo = (identity.key if isinstance(identity, records.RepositoryIdentity)
+            else gate_repository_name(profile.step, profile.repo, profile.worktree))
+    folder = request.identity.folder
+    if isinstance(request, wire.AdmitRequest):
+        folder = folder or request.cwd
+    elif isinstance(request, wire.PlacementRequest):
+        repo = repo or request.constraints.repository
+        if isinstance(request.local, wire.LocalAdmissionContext) and not Path(folder).is_absolute():
+            folder = request.local.cwd or folder
+    folder = folder or profile.worktree
+    return SourceLocation(repo, os.path.normpath(folder) if folder else "")
+
+
+_SOURCE_CREDENTIAL = re.compile(
+    r"\b(?:token|password|secret|credential|authorization)\b|"
+    + r"(?:gh[pousr]_|github_pat_|sk-|AKIA|ASIA)[A-Za-z0-9_]{8,}|://[^ /]+:[^ /]+@", re.IGNORECASE)
+
+
+def source_command_text(args: list[str] | tuple[str, ...]) -> str:
+    """Omit arguments that can carry credentials."""
+    for index, arg in enumerate(args):
+        if _SOURCE_CREDENTIAL.search(arg):
+            return shlex.join([*args[:index], "[redacted]"])
+    return shlex.join(args)
+
+
+def source_process_text(proc: Path, pid: int) -> str:
+    """Show the process ID and the command reported by procfs."""
+    try:
+        args = read_proc_text(proc / str(pid) / "cmdline").rstrip("\0").split("\0")
+    except OSError:
+        args = []
+    return f"{pid} {source_command_text(args) if any(args) else 'unavailable'}"
 
 
 @contextmanager
@@ -4490,6 +4552,7 @@ class AdmissionServer:
             print(line, file=sys.stderr, flush=True)
         for waiting, reply in zip(waiters, replies, strict=True):
             request = waiting.request
+            self._clear_source_refusal(request, now)
             if isinstance(reply, wire.Admitted) and isinstance(request, wire.AdmitRequest) and isinstance(
                     self.system_reader, OperatingSystemReader):
                 self.system_reader.register_trace(self.reservations[request.episode], request.argv, self.host, now)
@@ -6433,7 +6496,8 @@ done
                        and claim.session == assignment.session and claim.host == destination.host
                        and claim.generation == evidence.generation for claim in evidence.claims):
                 return self._placement_status(assignment, "the exact claim is not adopted")
-        saved = replace(saved, permission=placement.PermissionConsumed(self.clock.now()), provider=reference,
+        observed_at = self.clock.now()
+        saved = replace(saved, permission=placement.PermissionConsumed(observed_at), provider=reference,
                         holder=request.holder, guest_proof_required=is_mac_linux_guest(destination) and request.guest_proof_required)
         self.assignments[key] = saved
         # A speculative copy repeats a step of the run, so it is not a step of its own.
@@ -6446,6 +6510,8 @@ done
         self.persist()
         if destination.target == mac_linux.TARGET:
             self.pass_stale = True
+        if destination.provider != "local":
+            self._clear_source_refusal(submitted, observed_at)
         return wire.FirstAuthorization(assignment, reference)
 
     def _guest_took_no_run(self, saved: records.SavedPlacementAssignment, request: wire.ClaimFailure) -> bool:
@@ -6881,9 +6947,6 @@ done
             if self._replaced(request.run):
                 return [wire.Refused(status_wire.REPLACED_REASON)]
             previous = self.placement_requests.get(request.episode)
-            identity = self._placement_identity(request)
-            members = records.queue_staff() if identity.session_id else records.NO_STAFF_LOOKUP
-            request = replace(request, identity=self._named_identity(identity, members=members))
             if not self._placement_owner_live(request.owner):
                 if request.owner.host == self.host and not isinstance(self.system_reader, NoSystemReader):
                     pending = self.pending_coordinators.get(request.owner)
@@ -6901,6 +6964,10 @@ done
             if previous is not None and (previous.owner != request.owner or previous.since != request.since
                     or previous.run != request.run or previous.purpose != request.purpose):
                 return [wire.Refused("placement episode changed its owner, start, run or purpose")]
+            identity = self._source_identity(replace(request, identity=self._placement_identity(request)))
+            if isinstance(identity, wire.Refused):
+                return [identity]
+            request = replace(request, identity=identity)
             if previous is not None:
                 request = replace(request, constraints=episode_constraints(previous.constraints, request.constraints))
             elif (isinstance(folder := request.constraints.cargo_folder, placement.CargoFolder)
@@ -7170,6 +7237,93 @@ done
         caller = self._stored_caller(identity.session_id, identity.name, identity.unit, members=members)
         return replace(identity, name=caller.name, unit=caller.unit)
 
+    def _source_environment(self, owner: wire.Owner | placement.SubmittingOwner) -> dict[str, str]:
+        """Read only the source fields of the live submitting process."""
+        if isinstance(owner, placement.SubmittingOwner) and owner.host != self.host:
+            return {}
+        process = self.proc.owner_process(owner.pid)
+        if not isinstance(process, gate.ProcessIdentity) or process.start != owner.start_time:
+            return {}
+        try:
+            parts = read_proc_text(self.proc.path / str(owner.pid) / "environ").split("\0")
+        except OSError:
+            return {}
+        return {key: value for part in parts for key, _, value in (part.partition("="),)
+                if key in ("BUILDLOG_OWNER_STAFF_ID", "CLAUDE_SESSION_NAME") and value}
+
+    def _source_identity(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest
+                         ) -> wire.Identity | wire.Refused:
+        supplied = request.identity
+        members = records.queue_staff() if supplied.session_id else records.NO_STAFF_LOOKUP
+        identity = self._named_identity(supplied, members=members)
+        if identity.name != codec.UNKNOWN_CALLER:
+            return identity
+        environment = self._source_environment(request.owner)
+        staff_id = environment.get("BUILDLOG_OWNER_STAFF_ID", "")
+        exported_name = environment.get("CLAUDE_SESSION_NAME", "")
+        caller = records.queue_caller("", staff_id, exported_name, "",
+                                      members=records.queue_staff() if staff_id else records.NO_STAFF_LOOKUP,
+                                      unit=identity.unit)
+        if codec.public_queue_text(caller.name):
+            return replace(identity, session_id=caller.session_id or identity.session_id, name=caller.name, unit=caller.unit)
+        name = exported_name or supplied.name
+        if identity.session_id:
+            given = f"session id {identity.session_id!r}"
+        elif staff_id:
+            given = f"staff id {staff_id!r}"
+        elif name and name != codec.UNKNOWN_CALLER:
+            given = f"name {name!r}"
+        else:
+            given = ""
+        reason = "Refused: this request names no source. "
+        reason += (f"The {given} resolves to no staff row and no session name. "
+                   + "Run it from a named session, or set CLAUDE_SESSION_NAME." if given
+                   else "It gives no session id, staff id or name.")
+        source = source_location(request)
+        try:
+            claimed = outage_alerts.claim(source.alert_key)
+            if isinstance(claimed, outage_alerts.AlertClaim):
+                try:
+                    message = self._source_refusal_message(request, source, given)
+                    threading.Thread(target=deliver_source_refusal, args=(claimed, message),
+                                     name="admission-source-refusal", daemon=True).start()
+                except (OSError, ValueError, RuntimeError):
+                    outage_alerts.release(claimed)
+                    raise
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"memory admission: cannot start source refusal alert: {error}", file=sys.stderr)
+        return wire.Refused(reason)
+
+    def _source_refusal_message(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest,
+                                source: SourceLocation, given: str) -> str:
+        owner = request.owner
+        machine = owner.host if isinstance(owner, placement.SubmittingOwner) else self.host
+        process, parent = f"{owner.pid} unavailable", "unavailable"
+        if machine == self.host:
+            reading = self.proc.owner_process(owner.pid)
+            if isinstance(reading, gate.ProcessIdentity) and reading.start == owner.start_time:
+                process = source_process_text(self.proc.path, owner.pid)
+                parent = source_process_text(self.proc.path, reading.parent)
+        command = (source_command_text(request.argv) if isinstance(request, wire.AdmitRequest)
+                   else source_command_text(request.constraints.command) if isinstance(request, wire.PlacementRequest)
+                   else request.profile.step)
+        at = datetime.fromtimestamp(self.clock.now(), ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z")
+        return ("Build queue refused a run with no named source.\n"
+                f"Time: {at}. Machine: {machine}.\n"
+                f"Given: {given or 'no session id, staff id or name'} (resolves to nothing).\n"
+                f"Repository: {source.repository}. Folder: {source.folder}.\n"
+                f"Command: {command}.\nProcess: {process}. Parent: {parent}.\n"
+                "Later refusals of this cause send no message until a run from this folder starts with a named source.")
+
+    def _clear_source_refusal(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest,
+                              observed_at: float) -> None:
+        if not codec.public_queue_text(request.identity.name):
+            return
+        try:
+            _ = outage_alerts.clear(source_location(request).alert_key, observed_at)
+        except (OSError, ValueError) as error:
+            print(f"memory admission: cannot clear source refusal alert: {error}", file=sys.stderr)
+
     @staticmethod
     def _placement_identity(request: wire.PlacementRequest) -> wire.Identity:
         identity = request.identity
@@ -7289,8 +7443,13 @@ done
             if isinstance(request, wire.AdmitRequest) and self._replaced(request.run):
                 return self._mutation_reply(key, wire.Refused(status_wire.REPLACED_REASON))
             if not isinstance(request, ServiceEstimatedAdmission):
-                members = records.queue_staff() if request.identity.session_id else records.NO_STAFF_LOOKUP
-                request = replace(request, identity=self._named_identity(request.identity, members=members))
+                identity = request.identity
+                if isinstance(request, wire.AdmitRequest) and not identity.session_id and isinstance(request.session, OwningSession):
+                    identity = replace(identity, session_id=request.session.session_id)
+                identity = self._source_identity(replace(request, identity=identity))
+                if isinstance(identity, wire.Refused):
+                    return self._mutation_reply(key, identity)
+                request = replace(request, identity=identity)
             if (isinstance(request, wire.AdmitRequest) and isinstance(request.place, wire.CloudPlace)
                     and isinstance(group := request.place.group, status_wire.CloudGroup)):
                 if (refused := self._register_cloud_group(request.place, group, request.identity)) is not None:
