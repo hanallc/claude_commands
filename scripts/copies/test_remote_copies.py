@@ -326,10 +326,13 @@ class RemoteCopiesTests(unittest.TestCase):
             fixture.wait_for_path(fixture.stub_directory / "run-started")
             with mock.patch.dict(os.environ, fixture.environment):
                 mirror, = copies.owned_remote_mirrors("verify")
+                fixed_path = (fixture.stub_directory / "fixed-checkout").read_text().strip()
+                self.assertEqual(mirror.path, fixed_path)
                 record = cast(dict[str, object], json.loads(copies.remote_record_path(mirror).read_text()))
                 self.assertEqual(record["holder_pid"], process.pid)
                 row, = self.list_rows()
                 self.assertEqual(row["owner"], "verify")
+                self.assertEqual(row["path"], fixed_path)
                 self.assertEqual((row["state"], row["session"], row["holder_pid"]),
                                  expected_remote_lease_columns("held", "live-holder", str(process.pid)))
             _ = (fixture.stub_directory / "finish-run").write_text("continue\n")

@@ -1875,6 +1875,8 @@ def fixed_folder_record(identity: claim_state.ClaimIdentity, target: str, scope_
 def remote_fixed_folder(controller: ProcessController, config: OffloadConfig, request: OffloadRequest,
                         repository: KnownRepository) -> Generator[None]:
     """Hold the remote folder from source transfer through result transfer."""
+    from scripts.copies import copies
+
     identity = controller.claim_identity
     if not isinstance(identity, claim_state.ClaimIdentity):
         raise ValueError("a fixed build folder needs an exact claim")
@@ -1882,8 +1884,11 @@ def remote_fixed_folder(controller: ProcessController, config: OffloadConfig, re
     state = fixed_folder_record(identity, target, controller.claim_scope_key)
     command = ("~/.claude/scripts/lib/py ~/.claude/scripts/mac_test/mac_queue_run.py "
                + shlex.join(["hold-offload-folder", target, repository.policy_name, request.owner, str(state.path)]))
-    with subprocess.Popen([*ssh_prefix(config), command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          text=False) as holder:
+    with (
+        ExitStack() as inventory,
+        subprocess.Popen([*ssh_prefix(config), command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         text=False) as holder,
+    ):
         assert holder.stdin is not None and holder.stdout is not None
         deadline = time.monotonic() + config.probe_timeout_s
         armed = False
@@ -1901,6 +1906,8 @@ def remote_fixed_folder(controller: ProcessController, config: OffloadConfig, re
                 if not isinstance(value, str) or not Path(value).is_absolute() or "\n" in value:
                     raise ValueError("the remote host reported an invalid build folder")
                 path = Path(value)
+                mirror = replace(request_mirror(config, request, repository), path=value)
+                _ = inventory.enter_context(copies.remote_lease(mirror))
                 pending = pending_start_path(target, identity, scope_key=controller.claim_scope_key)
                 pending.parent.mkdir(parents=True, exist_ok=True)
                 write_text_atomic(pending, pending_start_key(identity))
@@ -1909,6 +1916,8 @@ def remote_fixed_folder(controller: ProcessController, config: OffloadConfig, re
                 holder.stdin.flush()
                 if next(replies, b"") != b"build_folder_confirmed\n":
                     raise ValueError("the remote host did not confirm the build folder lease")
+            copies.record_remote_holder(mirror)
+            _ = inventory.callback(copies.unregister_remote, mirror.host, mirror.path)
             token = offload_fixed_folder.set(HeldOffloadFolder(path))
             try:
                 yield
@@ -2818,12 +2827,11 @@ def remote_test_command(
         f"cd {shlex.quote(folder)} && {target_check}"
         f"{abandoned_sessions}{remove_folder}{clear_environment}{capture}{environment}"
         f'PATH="{MAC_CARGO_GATE_BIN}:$HOME/.cargo/bin:$PATH" '
-        f"{mac_placement}"
+        f"{mac_placement}{run_id}{cargo_output}"
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_PINNED_TARGET={shlex.quote(os.environ.get('BUILDLOG_PINNED_TARGET', ''))} "
         f"{repo_identity}"
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
-        f"{run_id}{cargo_output}"
         f"{sent_tree}"
         "BUILDLOG_SYNC=1 "
         "LINT_SKIP_SWEEP=1 "
@@ -3585,10 +3593,12 @@ def claimed_run(
 
                 time.sleep(records.read_memory_config().waiting_pass_seconds)
             if not evidence.launch_authorized:
+                if fixed_folder:
+                    release_allowed = False
+                    detail = "launch authorization has no confirmed reply"
+                    evidence.execution = execution_identity.ExecutionEvidenceUnavailable(detail, time.time())
+                    return MacCleanupUnconfirmed(elapsed_seconds(started), detail)
                 evidence.execution = execution_identity.ExecutionNotStarted()
-                if isinstance(offload_fixed_folder.get(), HeldOffloadFolder):
-                    release_allowed = isinstance(controller.pending, SettledDispatchOperations)
-                    return declined("state", started)
                 released = release_claim(controller, request.target,
                                          deadline=CommandTimeLimit(config.leftover_timeout_s))
                 release_allowed = isinstance(released, ClaimReleaseConfirmed)
@@ -4410,12 +4420,12 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
                         scripts_ready = True
                     _ = remote_folder.enter_context(remote_fixed_folder(controller, config, selected, repository))
                     fixed = True
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
+            except (OSError, ValueError, subprocess.SubprocessError, copies.CopyError) as error:
                 if isinstance(controller.pending, SettledDispatchOperations):
                     _ = release_claim(controller, request.target)
                 if not isinstance(controller.pending, SettledDispatchOperations):
                     return LostMacRun(elapsed_seconds(started), str(error))
-                if isinstance(error, BlockingIOError):
+                if isinstance(error, (BlockingIOError, copies.BusyRemoteMirror)):
                     return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
                 return DeclinedMacRun("state", elapsed_seconds(started), str(error))
             result = claimed_run(controller, config, selected, repository, started, scripts_ready=scripts_ready)
@@ -4426,6 +4436,8 @@ def leased_offload(controller: ProcessController, config: OffloadConfig, request
                 deadline=CommandTimeLimit(config.leftover_timeout_s))
     if fixed:
         if controller.attempt_evidence.cleanup != "confirmed":
+            if isinstance(result, MacCleanupUnconfirmed) and not controller.attempt_evidence.launch_authorized:
+                return result
             if not linux and isinstance(result, (PassedOnMac, FailedOnMac)):
                 print("mac_test: the fixed build folder clearance is unconfirmed", file=sys.stderr, flush=True)
                 return result

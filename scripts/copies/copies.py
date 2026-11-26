@@ -2049,7 +2049,7 @@ def held_remote_mirrors() -> tuple[floor_claims.HeldMirror, ...]:
     return tuple(held)
 
 
-def register_remote(mirror: RemoteMirror) -> None:
+def record_remote_holder(mirror: RemoteMirror) -> None:
     """Publish ownership while the caller holds the mirror lease."""
     _ = checked_owner(mirror.owner)
     _ = repository_scope(mirror.repository)
@@ -2063,6 +2063,11 @@ def register_remote(mirror: RemoteMirror) -> None:
         fields["task"] = mirror.task
     with file_lock.exclusive(remote_registry() / "records.lock"):
         write_text_atomic(remote_record_path(mirror), json.dumps(fields) + "\n")
+
+
+def register_remote(mirror: RemoteMirror) -> None:
+    """Record a mirror owner and retry deferred removals on the host."""
+    record_remote_holder(mirror)
     remove_deferred_mirrors(mirror.host)
 
 

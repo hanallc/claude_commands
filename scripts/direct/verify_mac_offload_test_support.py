@@ -52,7 +52,27 @@ from scripts.lib.shell_test_support import shell_functions
 VERIFY = Path(__file__).with_name("verify.sh")
 
 
-_REACHABLE_SSH_STUB = b'#!/bin/sh\nprintf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"\n'
+_REACHABLE_SSH_STUB = b'''#!/bin/sh
+for command do :; done
+case "$command" in
+    *'mac_queue_run.py hold-offload-folder '*) exec "${0%/*}/fixed-folder-holder" "$command" ;;
+esac
+printf "free_gib=1000\\nhost=test-mac\\nrc=0\\n"
+'''
+
+FIXED_FOLDER_HOLDER = '''
+from pathlib import Path
+import shlex
+import sys
+from unittest.mock import patch
+
+from scripts.agents import remote
+from scripts.mac_test import mac_queue_run
+
+_, _, _, machine, repository, unit, record = shlex.split(sys.argv[1])
+with patch.object(remote, "this_machine", return_value="mac"):
+    sys.exit(mac_queue_run.hold_offload_folder(machine, repository, unit, Path(record)))
+'''
 
 
 def drop_released_mac_claim(reader: service.HostEvidenceReader, claim: placement.ProviderClaimReference) -> None:
@@ -1206,6 +1226,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             self.write_executable(self.bin_directory / name, blocker)
         write_unconfigured_berth(self.bin_directory)
         self.write_executable(self.bin_directory / "ssh", _REACHABLE_SSH_STUB.decode("utf-8"))
+        self.write_executable(self.bin_directory / "fixed-folder-holder", FIXED_FOLDER_HOLDER)
         reader = self.root / "lint-config.sh"
         _ = reader.write_text(
             "lint_config_enabled() { return 1; }\n"

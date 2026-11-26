@@ -16,7 +16,7 @@ from scripts.lib import build_folders
 from scripts.mac_test import claim_state, eligibility, offload
 from scripts.lint.memory_test_support import UNREACHABLE_WAIT_FIXTURE_SECONDS, write_config_fixture
 from scripts.mac_test.offload_test_commands import SELECTOR_STUB, write_shell
-from scripts.mac_test.offload_test_support import HANA_COMMAND_PATTERN, SelectorEvent, write_mac_target_registry
+from scripts.mac_test.offload_test_support import SelectorEvent, write_mac_target_registry
 from scripts.mac_test.offload_cleanup_test_support import SeededCleanupFixture
 
 
@@ -257,9 +257,10 @@ class OffloadCommandTests(SeededCleanupFixture):
                     self.assertIn("pgrep", names)
                     if pgrep_status == 1:
                         self.assertIn("lsof", names)
+                    command_pattern, _ = self.fixed_selector_patterns()
                     for call in calls:
                         if call["command"] == "pgrep":
-                            self.assertEqual(call["args"], ["-u", str(os.getuid()), "-f", HANA_COMMAND_PATTERN])
+                            self.assertEqual(call["args"], ["-u", str(os.getuid()), "-f", command_pattern])
                         if call["command"] == "lsof":
                             self.assertEqual(call["args"], ["-a", "-u", str(os.getuid()), "-d", "cwd", "-Fpn"])
                     answer = (self.stub_directory / "selector-answer").read_text()

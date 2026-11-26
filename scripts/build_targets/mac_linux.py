@@ -32,7 +32,6 @@ import stat
 import subprocess
 import sys
 import tarfile
-import tempfile
 from threading import Thread
 from time import monotonic, sleep, time
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final
@@ -2908,20 +2907,7 @@ def prepare_guest_folder(source: Path, checkout: Path, commit: str, attempt: str
     except git_files.NotACheckout:
         if not build_folders.may_remove_folder_tree(checkout):
             raise GuestUnavailable(f'{checkout}: the guest build folder contains a mount.')
-        if not any(checkout.iterdir()):
-            _ = git(source, 'worktree', 'add', '--detach', str(checkout), commit)
-        else:
-            # Register the checkout without moving the existing Cargo output.
-            with tempfile.TemporaryDirectory(prefix='mac-linux-worktree-', dir=source / '.git') as temporary:
-                staging = Path(temporary) / 'checkout'
-                _ = git(source, 'worktree', 'add', '--detach', '--no-checkout', str(staging), commit)
-                directory = build_folders.linked_build_checkout(staging, source).git_dir
-                pointer = checkout.resolve() / '.git'
-                atomic_file.write_text_atomic(directory / 'gitdir', str(pointer) + '\n')
-                atomic_file.write_text_atomic(pointer, f'gitdir: {directory}\n')
-            _ = build_folders.linked_build_checkout(checkout, source)
-            _ = git(checkout, 'reset', '--hard', commit)
-        _ = build_folders.linked_build_checkout(checkout, source)
+        build_folders.create_fixed_build_checkout(source, checkout, commit, timeout=timeout)
     else:
         if not build_folders.may_remove_folder_tree(checkout, worktree.git_dir):
             raise GuestUnavailable(f'{checkout}: the guest build folder contains a mount.')

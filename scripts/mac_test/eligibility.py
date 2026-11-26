@@ -68,7 +68,7 @@ class KnownRepository:
 
     @property
     def policy_name(self) -> RepositoryPolicyName:
-        if self.key and not self.key.startswith("git-root:"):
+        if self.key and not self.key.startswith(("git-root:", "git-dir:")):
             return RepositoryPolicyName(self.key.rsplit("/", 1)[-1])
         return RepositoryPolicyName(self.name)
 

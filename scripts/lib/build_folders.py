@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast, final, overload, over
 
 from urllib.parse import urlsplit
 
-from scripts.lib import build_folder_lock, git_files, process_start
+from scripts.lib import atomic_file, build_folder_lock, git_files, process_start
 from scripts.lib.boot_identity import boot_identity
 from scripts.lib.conf import HostOverride, Unusable, UseConfiguredValue
 
@@ -2896,6 +2896,30 @@ def fixed_repository_build_folder(repo: str, *, machine: str, unit: str) -> Gene
     request = _FixedRepositoryFolder(form, build_root(settings=settings), _form_name(repo), _unit_name(unit))
     with leased_build_folder(request) as path:
         yield path
+
+
+def create_fixed_build_checkout(source: Path, checkout: Path, commit: str, *, timeout: float) -> None:
+    """Create a linked checkout under the caller's fixed folder lease."""
+    locks = held_build_folder_descriptors()
+
+    def git(path: Path, *words: str) -> None:
+        _ = subprocess.run(["git", "-C", str(path), *words], check=True, capture_output=True,
+                           text=True, stdin=subprocess.DEVNULL, pass_fds=locks, timeout=timeout)
+
+    if not any(checkout.iterdir()):
+        git(source, "worktree", "add", "--detach", str(checkout), commit)
+    else:
+        # Register the checkout without moving the existing Cargo output.
+        with tempfile.TemporaryDirectory(prefix="mac-linux-worktree-", dir=source / ".git") as temporary:
+            staging = Path(temporary) / "checkout"
+            git(source, "worktree", "add", "--detach", "--no-checkout", str(staging), commit)
+            directory = linked_build_checkout(staging, source).git_dir
+            pointer = checkout.resolve() / ".git"
+            atomic_file.write_text_atomic(directory / "gitdir", str(pointer) + "\n")
+            atomic_file.write_text_atomic(pointer, f"gitdir: {directory}\n")
+        _ = linked_build_checkout(checkout, source)
+        git(checkout, "reset", "--hard", commit)
+    _ = linked_build_checkout(checkout, source)
 
 
 def cargo_target_argument(words: Sequence[str]) -> str:

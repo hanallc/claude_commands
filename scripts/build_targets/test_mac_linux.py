@@ -1095,6 +1095,10 @@ fi
         return reason
 
     def assert_guest_clean(self, *events: str) -> None:
+        self.assert_guest_files(records=(), markers=())
+        self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), list(events))
+
+    def assert_guest_files(self, *, records: tuple[Path, ...], markers: tuple[Path, ...]) -> None:
         main = self.guest_home / '.claude'
         build = self.guest_home / 'build'
         self.assertLessEqual(set(self.guest_home.iterdir()), {main, build})
@@ -1104,9 +1108,8 @@ fi
         persistent = {checkout, checkout.with_suffix('.lock'), build_folders.lease_path(checkout),
                       claim_locks / 'claude/mac-linux'}
         self.assertEqual([path for path in build.rglob('mac-linux*') if path not in persistent
-                          and not (path.name == 'mac-linux.lock' and path.is_relative_to(claim_locks))], [])
-        self.assertEqual(list((main / '.git').glob('mac-linux-folder.*')), [])
-        self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), list(events))
+                          and not (path.name == 'mac-linux.lock' and path.is_relative_to(claim_locks))], list(markers))
+        self.assertEqual(list((main / '.git').glob('mac-linux-folder.*')), list(records))
 
     def assert_bundle(self, run: mac_linux.MacLinuxGateRun, form: mac_linux.BundleForm,
                       reason: mac_linux.BundleReason, *forms: str) -> None:
@@ -3386,11 +3389,17 @@ with (patch.object(conf, 'read', read_config),
 
         with (patch.object(Path, 'read_text', read_with_delay),
               patch.object(mac_linux, 'monotonic', lambda: now),
-              self.assertRaisesRegex(mac_linux.GuestEndUnproven, 'guest unreachable: fixture-guest')):
+              self.assertRaisesRegex(mac_linux.GuestEndUnproven, 'guest unreachable: fixture-guest') as expired):
             _ = self.route()
-        # The cleanup command reads the helper after the run command. The cleanup read passes the deadline.
         self.assertEqual(now, 2.5)
-        self.assert_guest_clean('probe', 'arm', 'run')
+        self.assertEqual(self.trace.read_text(encoding='utf-8').splitlines(), ['probe', 'arm', 'run'])
+        checkout = self.guest_home / 'build/claude/mac-linux'
+        attempt = expired.exception.armed.attempt
+        record = self.guest_home / '.claude/.git' / f'{mac_linux.GUEST_FOLDER_RECORD_PREFIX}.{attempt}'
+        marker = build_folders.copy_keep_file(checkout)
+        self.assert_guest_files(records=(record,), markers=(marker,))
+        self.assertEqual(record.read_text(encoding='utf-8'), f'{checkout}\n')
+        self.assertEqual(marker.read_text(encoding='utf-8'), f'{record}\n')
 
     def test_proof_received_at_the_deadline_refuses(self) -> None:
         now = 0.0
