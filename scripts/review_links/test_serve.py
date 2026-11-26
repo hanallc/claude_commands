@@ -7740,6 +7740,54 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual((reply.status, json.loads(reply.body)), (400, {"ok": False, "text": "give one go id and one caller."}))
         self.assertIs(go_ledger.read(self.root, go_id)["used"], True)
 
+    def test_signed_list_tag_actions_use_the_record_writers(self) -> None:
+        morty, item = self.list_keeper_item("Tag this item")
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))),
+              patch.object(the_list, "add_tag", wraps=the_list.add_tag) as add,
+              patch.object(the_list, "remove_tag", wraps=the_list.remove_tag) as remove):
+            query = urlencode({"keeper": morty.id, "tag-fields": item.id})
+            reply = self.request(f"{list_page.PAGE_PATH}?{query}")
+            self.assertEqual(reply.status, 200)
+            signed = cast(list_page.SignedTagRequest, json.loads(reply.body))
+            fields = {"keeper": morty.id, "id": item.id, "until": "", **signed}
+            addition = {**fields, "action": "add-tag", "words": "  Review   Flow "}
+            self.assertEqual(self.post(list_page.PAGE_PATH, urlencode({**addition, "token": "wrong"}))[0], 400)
+            for name, value in (("keeper", str(uuid4())), ("id", f"L{item.number + 1}")):
+                with self.subTest(name=name):
+                    self.assertEqual(self.post(list_page.PAGE_PATH, urlencode({**addition, name: value}))[0], 400)
+            for text, reason in (("x,y", "a tag cannot contain a comma"),
+                                 ("none", "'none' is reserved for an empty tag list"),
+                                 ("", "tag must have one nonempty line"),
+                                 ("one\ntwo", "tag must have one nonempty line")):
+                with self.subTest(text=text):
+                    code, response = self.post(list_page.PAGE_PATH, urlencode({**addition, "words": text}))
+                    self.assertEqual((code, json.loads(response)["reason"]), (400, reason))
+            self.assertEqual(the_list.load(morty.id, item.id).tags, ())
+            code, response = self.post(list_page.PAGE_PATH, urlencode(addition))
+            saved_tags = cast(dict[str, object], json.loads(response))
+            self.assertEqual((code, saved_tags["state"], saved_tags["delivery_pending"], saved_tags["tags"]),
+                             (200, "saved", False, ["review flow"]))
+            tag = the_list.Tag("review flow")
+            add.assert_called_once_with(morty.id, item.id, tag, source=the_list.PAGE_SOURCE)
+            self.assertEqual(the_list.load(morty.id, item.id).tags, (tag,))
+            removal = urlencode({**fields, "action": "remove-tag", "words": "review flow"})
+            code, response = self.post(list_page.PAGE_PATH, removal)
+            saved_tags = cast(dict[str, object], json.loads(response))
+            self.assertEqual((code, saved_tags["state"], saved_tags["delivery_pending"], saved_tags["tags"]),
+                             (200, "saved", False, []))
+            self.assertEqual(saved_tags["removed_tags"], ["review flow"])
+            saved = the_list.load(morty.id, item.id)
+            self.assertTrue(saved.log[-1].source.startswith(the_list.PAGE_SOURCE + " tag removal "))
+            remove.assert_called_once_with(morty.id, item.id, tag, source=saved.log[-1].source)
+            self.assertEqual(saved.tags, ())
+            self.assertEqual([entry.what for entry in saved.log[-2:]],
+                             [the_list.TagsChanged((tag,)), the_list.TagsChanged(())])
+            code, response = self.post(list_page.PAGE_PATH, removal)
+            unchanged = cast(dict[str, object], json.loads(response))
+            self.assertEqual((code, unchanged["tags"], unchanged["removed_tags"]), (200, [], []))
+            self.assertEqual(the_list.load(morty.id, item.id), saved)
+
     def test_list_unpark_retry_after_expiry_preserves_new_parking(self) -> None:
         start = datetime(2026, 11, 18, tzinfo=timezone.utc)
         expiry = start + timedelta(hours=1)
