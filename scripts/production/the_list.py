@@ -2362,7 +2362,7 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
 
 def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
     saved = {(exchange.source_key, exchange.exchange_id): exchange for exchange in item.filed_exchanges}
-    for exchange in exchanges:
+    for exchange in list_exchange.retain_legacy_ids(exchanges, item.filed_exchanges):
         key = (exchange.source_key, exchange.exchange_id)
         previous = saved.get(key)
         if (previous is not None and isinstance(previous.answer, list_exchange.ExchangeAnswer)
@@ -4406,7 +4406,7 @@ def ask_question(keeper: staff.StaffId, identity: str, request: PageRequest,
         raise question_record.AnswerRefused("Enter a question first.")
     request = replace(request, words=request.words.strip())
     store = _store(keeper)
-    with store.locked():
+    with status.locked(), store.locked():
         item = load(keeper, identity)
         previous = _previous_page_request(item, request)
         if item.state == ItemState.CLOSED:

@@ -7831,11 +7831,14 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIn(change.key, snapshot.records)
                 self.assertEqual(the_list.load(keeper, item.id), parked)
                 with change_review.review_delivery_lock(case.root, wait=False) as lock:
-                    self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+                    self.assertIs(lock, file_lock.LockResult.BUSY)
                 self.assertFalse(asked.done(), "Ask must still be paused.")
             finally:
                 finish_ask.set()
-            change_page.deliver(asked.result(timeout=TEST_HANG_GUARD_SECS), status)
+            delivery = asked.result(timeout=TEST_HANG_GUARD_SECS)
+            with change_review.review_delivery_lock(case.root, wait=False) as lock:
+                self.assertIs(lock, file_lock.LockResult.ACQUIRED)
+            change_page.deliver(delivery, status)
             pending = the_list.load(keeper, item.id)
             self.assertEqual([saved.words for saved in pending.questions], [question.words])
             self.assertIs(pending.parked_until, the_list.ParkUntilDelivered.DELIVERED)

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from collections import defaultdict
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import cast
@@ -77,6 +79,40 @@ class FiledExchange(Exchange):
     def from_exchange(cls, value: Exchange) -> FiledExchange:
         return cls(value.source, value.source_key, value.exchange_id, value.direction, value.question,
                    value.asked_at, value.asker, value.answerer, value.answer)
+
+
+def _legacy_content(exchange: Exchange, answer: ExchangeAnswer) -> FiledExchange:
+    return replace(FiledExchange.from_exchange(exchange), exchange_id="", answer=replace(answer, read=AnswerRead.UNKNOWN))
+
+
+def retain_legacy_ids[Entry: Exchange](exchanges: tuple[Entry, ...], saved: Iterable[FiledExchange]) -> tuple[Entry, ...]:
+    """Keep the filed ID when one anonymous log exchange matches one old slot exchange."""
+    current_ids = {(exchange.source_key, exchange.exchange_id) for exchange in exchanges}
+    saved_ids: set[tuple[str, str]] = set()
+    old_slots: dict[FiledExchange, list[str]] = defaultdict(list)
+    for exchange in saved:
+        key = exchange.source_key, exchange.exchange_id
+        saved_ids.add(key)
+        if (exchange.source is Source.SCOPED_REPLY and exchange.exchange_id.startswith("question:")
+                and key not in current_ids and isinstance(exchange.answer, ExchangeAnswer)):
+            old_slots[_legacy_content(exchange, exchange.answer)].append(exchange.exchange_id)
+    if not old_slots:
+        return exchanges
+    log_entries: dict[FiledExchange, list[int]] = defaultdict(list)
+    for index, exchange in enumerate(exchanges):
+        if (exchange.source is Source.SCOPED_REPLY and exchange.exchange_id.startswith("log:")
+                and (exchange.source_key, exchange.exchange_id) not in saved_ids
+                and isinstance(exchange.answer, ExchangeAnswer)):
+            content = _legacy_content(exchange, exchange.answer)
+            if content in old_slots:
+                log_entries[content].append(index)
+    identified = list(exchanges)
+    for content, positions in log_entries.items():
+        identities = old_slots[content]
+        if len(positions) == len(identities) == 1:
+            index = positions[0]
+            identified[index] = replace(exchanges[index], exchange_id=identities[0])
+    return tuple(identified)
 
 
 def _time_text(time: datetime | TimeNotRecorded) -> str:

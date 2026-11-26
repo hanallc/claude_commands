@@ -947,7 +947,7 @@ def _verify_open_question(record: QuestionAttempt, questions: tuple[question_rec
 
 def _authorize_question_send(status: DeliveryStatus, path: Path, record: QuestionAttempt,
                              sending: QuestionAttempt) -> None:
-    with _lock_open_question_source(status, record), status.locked():
+    with status.locked(), _lock_open_question_source(status, record):
         if record.state is QuestionSendState.CLAIMED:
             advance_question_attempt(path, record, sending)
         else:
@@ -1206,7 +1206,7 @@ def _claim_recovered_page_question(status: DeliveryStatus, record: QuestionAttem
             return _recover_saved_question(status, saved, record, lock)
     elif source.row == f"List item {source.item_id.removeprefix('L')}/{source.question_id}":
         listing = _list_question_store(record)
-        with listing.locked(), status.locked():
+        with status.locked(), listing.locked():
             fields, question = _open_list_question(listing, record)
             number = int(fields["number"])
             alert_owner = staff.StaffId(fields["owner"])
@@ -1285,6 +1285,7 @@ class DeliveryStatus:
 
     @contextmanager
     def locked(self) -> Generator[None, None, None]:
+        # Acquire the delivery lock before the question owner lock, then the Studio List lock.
         self.root.mkdir(parents=True, exist_ok=True)
         with change_review.review_delivery_lock(self.root), self._attempt_lock:
             yield
