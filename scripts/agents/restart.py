@@ -844,7 +844,7 @@ def _error_reason(error: object) -> str:
 
 
 def _launch_failure_reason(error: Exception) -> str:
-    if isinstance(error, subprocess.TimeoutExpired):
+    if isinstance(error, subprocess.TimeoutExpired) or isinstance(error.__cause__, subprocess.TimeoutExpired):
         return "The launcher timed out before the detached process claimed the log"
     if isinstance(error, FileNotFoundError) and cast(object, error.filename) == "systemd-run":
         return "The systemd-run command is missing"
@@ -915,19 +915,28 @@ def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str, *,
     if "staff_id" not in projected:
         projected["session_id"] = identity
         projected["name"] = name
-    arguments = pane_record.resume_arguments(projected)
     kind = pane_launch.saved_kind(projected)
+    configuration = models_registry.optional_launch_snapshot() if kind == "claude" else None
+    arguments = pane_record.resume_arguments(projected, record=record, configuration=configuration)
+    environment = configuration.environment({}) if configuration is not None else {}
     home = pane_launch.config_home(projected, record=record)
     if isinstance(home, staff.HomeUnknown):
         print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
-        return kind, {}, arguments
-    environment = {"CODEX_HOME": str(home.path)} if kind == "codex" else named_account_environment(home.path)
+        return kind, environment, arguments
+    environment.update({"CODEX_HOME": str(home.path)} if kind == "codex" else named_account_environment(home.path))
     return kind, environment, arguments
 
 
 def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], list[str]]:
-    """Select the configured producer settings without a resume identity."""
-    settings = models_registry.launch_settings("producers", name)
+    """Select the configured producer settings and compact window without a resume identity."""
+    configuration = models_registry.launch_snapshot()
+    settings = models_registry.launch_settings("producers", name, configuration=configuration)
+    return settings.kind, producer_arguments(name, settings, configuration)
+
+
+def producer_arguments(name: str, settings: models_registry.LaunchSettings,
+                       configuration: models_registry.LaunchModelConfiguration) -> list[str]:
+    """Build arguments for a producer from one launch configuration."""
     if settings.kind == "codex":
         arguments = ["--model", settings.model,
                      "-c", f'model_reasoning_effort="{settings.effort}"']
@@ -936,24 +945,33 @@ def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], lis
     else:
         arguments = ["--name", name, "--remote-control", name,
                      "--model", settings.model, "--effort", settings.effort,
+                     *models_registry.compact_window_arguments("producer", configuration=configuration),
                      "--settings", '{"disableAgentView": true}']
-    return settings.kind, arguments
+    return arguments
 
 
-def producer_launch(row: staff.StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+def producer_launch(row: staff.StaffRow, *, configuration: models_registry.LaunchModelConfiguration | None = None
+                    ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     """Resume the producer's current conversation with its configured settings."""
-    kind, arguments = producer_first_arguments(row.name)
-    return kind, {}, ["resume" if kind == "codex" else "--resume", str(row.current_session), *arguments]
+    configuration = models_registry.launch_snapshot() if configuration is None else configuration
+    settings = models_registry.launch_settings("producers", row.name, configuration=configuration)
+    arguments = producer_arguments(row.name, settings, configuration)
+    environment = configuration.environment({}) if settings.kind == "claude" else {}
+    return settings.kind, environment, ["resume" if settings.kind == "codex" else "--resume", str(row.current_session), *arguments]
 
 
-def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch
+def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch, *,
+                    configuration: models_registry.LaunchModelConfiguration | None = None
                     ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     """Keep saved launch options with the producer's current model settings; a Claude producer runs with Remote Control."""
-    settings = models_registry.launch_settings("producers", row.name)
+    configuration = models_registry.launch_snapshot() if configuration is None else configuration
+    settings = models_registry.launch_settings("producers", row.name, configuration=configuration)
     if settings.kind == "claude":
         entry = entry.copy()
         entry["remote_control"] = True
-    return settings.kind, {}, pane_record.configured_resume_arguments(entry, str(row.current_session), row.name, settings)
+    environment = configuration.environment({}) if settings.kind == "claude" else {}
+    return settings.kind, environment, pane_record.configured_resume_arguments(
+        entry, str(row.current_session), row.name, settings, configuration=configuration)
 
 
 def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
@@ -1098,7 +1116,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE,
               resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT,
               live_worker_recovery: LiveWorkerRecovery = LiveWorkerRecovery.LEAVE_RUNNING,
-              success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> str:
+              success_report: RestartSuccessReport = RestartSuccessReport.START_ROW,
+              configuration: models_registry.LaunchModelConfiguration | None = None) -> str:
     restore_workers = (partial(_restore_workers, reports=resume_checks.worker_restores)
                        if isinstance(resume_checks, DirectorResumeChecks) else _restore_workers)
     with operation_deadline.within(deadline):
@@ -1129,17 +1148,27 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         original = publication.entry if publication is not None else None
         projected = names.resume(original) if original is not None else None
         if row.kind == "producer":
-            kind, environment, arguments = producer_resume(row, original) if original is not None else producer_launch(row)
+            kind, environment, arguments = (producer_resume(row, original, configuration=configuration)
+                if original is not None else producer_launch(row, configuration=configuration))
         else:
             kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name, record=record)
                 if original is not None else session_launch(str(row.current_session), row.name))
+            if original is None and kind == "claude":
+                configuration = models_registry.optional_launch_snapshot()
+                environment = configuration.environment(environment)
+                if row.kind != "session":
+                    arguments = [*arguments, *models_registry.compact_window_arguments(
+                        row.kind, session_id=row.current_session, configuration=configuration)]
         selected = member_account.resume_account(kind, row, to=target_account)
         implicit = (member_account.implicit_claude_resume(row, projected, target_account)
                     if projected is not None else pane_launch.SelectedClaudeAccount.USE_SELECTION)
+        configuration_environment = {key: environment[key] for key in models_registry.OPERATION_ENVIRONMENT[:1]
+                                     if key in environment}
         if isinstance(implicit, pane_launch.ImplicitClaudeHome):
-            environment = {}
+            environment = configuration_environment
         elif isinstance(selected, accounts.NamedAccount):
             environment = named_account_environment(selected.dir)
+            environment.update(configuration_environment)
         else:
             environment = {"CODEX_HOME": str(selected.home)}
         if projected is not None:
@@ -1753,13 +1782,14 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             why: str = DEFAULT_RESTART_CAUSE) -> int:
     activity = (nullcontext() if dry_run else shutdown_record.active_operation(
         record_lock_seconds=shutdown_record.record_lock_seconds()))
-    with activity, ExitStack() as pane_evidence:
+    with activity as operation, ExitStack() as pane_evidence:
         _ = pane_evidence.enter_context(herdr.pane_evidence_run())
-        return _restart(pane_evidence, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
+        return _restart(pane_evidence, operation, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
                         after_stop=after_stop, why=why)
 
 
-def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: tuple[str, ...],
+def _restart(pane_evidence: ExitStack, operation: shutdown_record.RestartActivity | None, *,
+             stop_all: bool, dry_run: bool, only: tuple[str, ...],
              account: AllRestartAccounts | accounts.AccountSelection, after_stop: AfterStop, why: str) -> int:
     report = _BULK_REPORT.get()
     command = BulkCommand("stop" if after_stop is AfterStop.KEEP_STOPPED else "restart",
@@ -2059,6 +2089,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                 if identity not in report.issues and identity in failures:
                                     report.failure(identity, row.name, failures[identity])
                 stopped = stop_row(holder, client, codex=observed.codex)
+                if stopped and operation is not None and after_stop is AfterStop.RESTART:
+                    operation.claim_rows([member for member in saved_by_holder[holder.id]
+                                          if staff.StaffId(member) not in changed and staff.StaffId(member) not in workers])
                 if not stopped and holder.kind != "worker":
                     if previous_hold is not None:
                         _ = staff.set_hold(str(holder.id), previous_hold)
@@ -2202,13 +2235,18 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
 
     def start_holder(holder: staff.StaffRow, focus: bool,
                      success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> RestartDisposition | None:
-        if stop_requested():
-            return None
         with ExitStack() as locks, use_checked_resume_policies(resume_policies), staff.upkeep_lock_wait(lock_wait):
+            members = members_by_holder[holder.id]
+            if operation is not None:
+                _ = locks.callback(operation.release_rows, members)
+            if stop_requested():
+                return None
             _ = locks.enter_context(staff.row_operation(str(holder.id)))
-            for member in members_by_holder[holder.id]:
+            for member in members:
                 if member != str(holder.id):
                     _ = locks.enter_context(staff.row_operation(member))
+            if operation is not None:
+                operation.release_rows(members)
             if stop_requested():
                 return None
             shutdown_record.update(started=[], pending=saved_by_holder[holder.id])

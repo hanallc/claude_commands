@@ -27,7 +27,7 @@ from scripts.production import showrunners
 from scripts.production.staff_test_support import fixture_member, recorded_showrunner
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
-from scripts.accounts import accounts, refusals
+from scripts.accounts import accounts, moves, refusals
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall, write_claude_move_credentials
 from scripts.agents import stop_resume
@@ -172,6 +172,15 @@ class AccountMoveTests(ShutdownTestCase):
                 path.read_bytes() if path.is_file() else "directory"
                 for path in self.root.rglob("*")}
 
+    def disk_state_outside_moves(self) -> dict[str, bytes | str]:
+        """Give the disk state without the Moves card records and the empty move lock files."""
+        state = moves.store_file().parent.relative_to(self.root)
+        records = str(state / "move-progress")
+        return {path: value for path, value in self.disk_state().items()
+                if not (path == records or path.startswith(records + "/")
+                        or (value == "directory" and records.startswith(path + "/"))
+                        or (path.startswith(f"{state}/move-") and path.endswith(".lock") and value == b""))}
+
 
     def cli(self, session: str = "move-id", target: str = "claude3") -> tuple[int, str, str]:
         output, error = io.StringIO(), io.StringIO()
@@ -181,7 +190,7 @@ class AccountMoveTests(ShutdownTestCase):
 
 
     def refuses_without_change(self, cause: str, *, session: str = "move-id", target: str = "claude3") -> None:
-        before = self.disk_state()
+        before = self.disk_state_outside_moves()
         environment = dict(os.environ)
         with (
             patch.object(subprocess, "run") as process,
@@ -193,7 +202,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(output, "")
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn(cause, error)
-        self.assertEqual(self.disk_state(), before)
+        self.assertEqual(self.disk_state_outside_moves(), before)
         self.assertEqual(dict(os.environ), environment)
         process.assert_not_called()
         launch.assert_not_called()
@@ -495,7 +504,7 @@ class AccountMoveTests(ShutdownTestCase):
                         return refusals.FreshReading(refusals.ReadingWindow(50,
                             refusals.KnownReset(at + timedelta(days=days)), at), refusals.NoWindow(), "")
 
-                    before = self.disk_state()
+                    before = self.disk_state_outside_moves()
                     with (patch.object(refusals, "stored_reading", side_effect=reading),
                           patch.object(refusals, "stored_reading_with_age", side_effect=reading),
                           patch.object(subprocess, "run") as process):
@@ -509,7 +518,8 @@ class AccountMoveTests(ShutdownTestCase):
                     else:
                         self.assertIn("; no claude account has room; the earliest reset is", output + error)
                     self.assertNotIn("pick", output + error)
-                    self.assertEqual(self.disk_state(), before)
+                    self.assertEqual(self.disk_state_outside_moves(), before)
+                    self.assertIn("claude3", [progress.target for progress in moves.read_move_progress()])
                     process.assert_not_called()
 
 

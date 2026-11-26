@@ -15,34 +15,39 @@ except FileNotFoundError:
 import os
 import sys
 from datetime import datetime, tzinfo
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from scripts.lib import conf_reads
-
-DEFAULT_ZONE = "America/New_York"
-CONF = os.environ.get("USER_ZONE_CONF") or os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "config", "user_zone.conf")
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
-def stored_zone(path: str) -> str:
-    """The file's `zone=` value. Empty when the file or the line is missing."""
+def _check_zone_name(name: str) -> str:
     try:
-        lines = conf_reads.read_text(path).splitlines()
-    except FileNotFoundError:
-        return ""
-    return next((line.split("=", 1)[1].strip() for line in lines if line.startswith("zone=")), "")
+        _ = ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        from scripts.lib import conf
+
+        raise conf.Unusable(f"{name!r} is not a zone name") from error
+    return name
+
+
+def configured_zone_name(path: str | Path = "user_zone") -> str:
+    """Read the zone from a config file at use."""
+    from scripts.lib import conf
+
+    return conf.read(path).value("zone", _check_zone_name)
 
 
 def user_zone_name() -> str:
     """The user's zone as an IANA name. Raises ValueError naming where an unknown one came from."""
     pinned = os.environ.get("USER_ZONE", "")
-    name = pinned or stored_zone(CONF) or DEFAULT_ZONE
-    try:
-        _ = ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError) as error:
-        source = "USER_ZONE" if pinned else str(CONF)
-        raise ValueError(f"{source}: {name!r} is not a zone name; use one like {DEFAULT_ZONE}") from error
-    return name
+    if pinned:
+        try:
+            return _check_zone_name(pinned)
+        except ValueError as error:
+            raise ValueError(f"USER_ZONE: {error}") from error
+    return configured_zone_name()
 
 
 def user_zone() -> ZoneInfo:

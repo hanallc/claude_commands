@@ -27,8 +27,8 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, delivery_state, footer_counts, record_store, repeat_rule, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, question_path
-from scripts.review_links import record_table, review_actions, review_items, review_legacy, review_link, review_page
+from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, page_version
+from scripts.review_links import question_path, record_table, review_actions, review_items, review_legacy, review_link, review_page
 from scripts.review_links import search_fold, staff_names, studio_page
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
@@ -2249,7 +2249,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     settings = conf.read("review_links")
     seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")
-    undo_enabled = settings.whole("undo_seconds") > 0
+    undo_seconds = settings.whole("undo_seconds")
     delivery_window = record_table.delivery_window_seconds(settings)
     park_retry = settings.number("frame_retry_seconds")
     card_motion = page_frame.CardMotion.read(settings)
@@ -2263,13 +2263,13 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{studio_page.PAGE_PATH}?{html.escape(counts_query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    content = (STYLE + studio_page.STYLE + page_frame.title(studio_page.TITLE, "list")
+    content = (STYLE + studio_page.STYLE + page_frame.title(studio_page.TITLE, "list", SCRIPT_VERSION)
                + '<p data-review-refresh-error role="status" hidden></p>'
                + f'<div data-list data-list-path="{studio_page.PAGE_PATH}" data-refresh-seconds="{seconds}"'
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' data-park-retry-seconds="{park_retry}"' + deadline_attr
-               + f' data-undo-enabled="{str(undo_enabled).lower()}"'
+               + f' data-undo-seconds="{undo_seconds}"'
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
@@ -2294,14 +2294,14 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f'<section data-linked-item{hide_link}><h2 id="list-linked-heading">Linked item outside filters</h2>'
                + '<div class="list-table"><table aria-labelledby="list-linked-heading">' + columns
                + '<thead><tr>' + linked_headers + '</tr></thead>' + linked_row + '</table></div></section>'
-               + counts + '</div>'
-               + page_frame.CONSOLE_DIALOG_ASSETS
-               + '<dialog data-list-review-dialog aria-label="Review card">'
-               + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
-               + record_table.render_inline_detail()
-               + SCHEDULE_TEMPLATES + '<script>' + SCRIPT + '</script>')
+               + counts + '</div>' + DIALOGS + SCHEDULE_TEMPLATES + '<script>' + SCRIPT + '</script>')
     return page_frame.rendered(change_page.document(content, studio_page.TITLE), started, read_at)
 
+
+DIALOGS = (page_frame.CONSOLE_DIALOG_ASSETS
+           + '<dialog data-list-review-dialog aria-label="Review card">'
+           + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
+           + record_table.render_inline_detail())
 
 SCHEDULE_TEMPLATES = """
 <template id="list-custom-repeat">
@@ -2579,8 +2579,11 @@ decodeListKeys(content);
 const actionPath=content.dataset.listPath || location.pathname;
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0,listSaveVersion=0,refreshNeeded=false;
+function listRequestSeconds(){
+ return Number(content.dataset.requestTimeoutSeconds);
+}
 function listRequestSignal(){
- return AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
+ return AbortSignal.timeout(listRequestSeconds()*1000);
 }
 function startListSave(){
  saving++;listSaveVersion++;pageRefresh.abandon();
@@ -2714,7 +2717,8 @@ const repairRequests=(()=>{
     let missing=false;
     if(!accepted){
      try{
-      const previous=await heldFetch.resume(holdId);
+      const previous=await heldFetch.resume(holdId,{
+       requestTimeoutSeconds:listRequestSeconds(),configuredUndoSeconds:Number(content.dataset.undoSeconds)});
       const outcome=await reply(previous);
       if(outcome.delivered || outcome.refusal) return outcome;
       missing=previous.status===404 && previous.headers.get('X-Send-Hold-Outcome')==='missing';
@@ -2723,7 +2727,7 @@ const repairRequests=(()=>{
      }
     }
     const query=new URLSearchParams({'item-state':body.get('id'),keeper:body.get('keeper'),'not-fixed-request':id});
-    const current=await fetch(url+'?'+query,{cache:'no-store',signal:AbortSignal.timeout(30000)})
+    const current=await fetch(url+'?'+query,{cache:'no-store',signal:listRequestSignal()})
      .then(response=>response.ok ? response.json() : null).catch(()=>null);
     const state=receiptState(current);
     if(state==='delivered'){
@@ -2737,8 +2741,9 @@ const repairRequests=(()=>{
      update(key,id,{hold:holdId,undoEndsRequest});
     }
    }
-   const options={method:'POST',body,signal:AbortSignal.timeout(30000)};
-   const response=await (accepted ? fetch(url,options) : hold.post(url,options,record.payload.receiver,holdId));
+   const options={method:'POST',body};
+   const response=await (accepted ? fetch(url,{...options,signal:listRequestSignal()})
+    : hold.post(url,{...options,requestTimeoutSeconds:listRequestSeconds()},record.payload.receiver,holdId));
    return await reply(response);
   }catch(error){
    if(error instanceof SendUndone){
@@ -3429,7 +3434,7 @@ function bindFeedbackForm(form){
    const rejectsRepair=action==='not works';
    const usesWords=action==='tell' || action==='question' || rejectsRepair;
    const saveAction=changesParking || action==='read' || action==='remove' || action==='works';
-   const heldSave=saveAction && content.dataset.undoEnabled==='true';
+   const heldSave=saveAction && Number(content.dataset.undoSeconds)>0;
    const asksQuestion=action==='question';
    const retryRepair=rejectsRepair && Boolean(repairRequests.get(key));
    if(rejectsRepair && repairRequests.sending(key)) return;
@@ -3537,12 +3542,13 @@ function bindFeedbackForm(form){
       words.value='';
      return outcome.result;
     }
-    const options={method:'POST',body:data,signal:parkingReceipt ? listRequestSignal() : undefined};
+    const options={method:'POST',body:data};
     const receiver=action==='works' ? sendActionReceiver(form,data)
      : action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
+    const requestTimeoutSeconds=listRequestSeconds();
     const response=await (action==='works' || usesWords || heldSave
-     ? hold.post(actionPath,options,saveAction ? null : receiver)
-     : fetch(actionPath,options));
+     ? hold.post(actionPath,{...options,requestTimeoutSeconds},saveAction ? null : receiver)
+     : fetch(actionPath,{...options,signal:listRequestSignal()}));
     refused=!response.ok && (response.status<500 || (!asksQuestion && !parkingReceipt && action!=='remove'));
     if(!parkingReceipt) saved=response.ok;
     if(saved && tableView.currentItemRequest(request) && usesWords &&
@@ -3750,7 +3756,7 @@ function bindFeedbackForm(form){
     }
     if(!stale && hadFocus && !item.hidden && document.activeElement===document.body)
      await tableView.rowSettled(item);
-    saving--;
+    saving--;pageRefresh.changed();
     if(hadFocus){
      document.removeEventListener('focusin',trackFocus);
      if(!stale && listOwnsFocus()){
@@ -3875,7 +3881,6 @@ function updateLinkedRows(rows,updates){
  }
 }
 async function refresh(_supersede=false,current=()=>true){
- if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh()) return;
  const signal=listRequestSignal();
  const delivery=tableView.deliveryRequest();
  const query=delivery ? '?'+new URLSearchParams({delivery:delivery.delivery}) : '';
@@ -3884,10 +3889,12 @@ async function refresh(_supersede=false,current=()=>true){
  if(!response.ok) throw new Error('HTTP '+response.status);
  const page=new DOMParser().parseFromString(await response.text(),'text/html');
  const fresh=page.querySelector('[data-list]');
+ await tableView.settled();
+ if(!current()) return;
+ const newer=reloadForNewScript(page,()=>saving>0);
+ if(newer || saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh()) return newer;
  if(!fresh) throw new Error('The page has no list.');
  decodeListKeys(fresh);
- await tableView.settled();
- if(saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh() || !current()) return;
  refreshNeeded=false;
  tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
  reviewRefreshError.textContent='';
@@ -4102,3 +4109,5 @@ document.addEventListener('review-item-created',refreshAfterNewItem);
 scheduleParkExpiry(pageRefreshFacts(),performance.getEntriesByType('navigation')[0]?.requestStart ?? 0);
 void loadListCounts();
 })();''')
+VERSION_PARTS = (change_page.DOCUMENT_ASSETS, STYLE, studio_page.STYLE, DIALOGS, SCHEDULE_TEMPLATES, SCRIPT)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)

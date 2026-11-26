@@ -22,7 +22,7 @@ from scripts.message import sessions
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr import herdr_types
 from scripts.lib.probe_session import PROBE_ENV
-from scripts.lib import atomic_file, legacy_identity
+from scripts.lib import atomic_file, legacy_identity, models_registry
 from scripts.production import staff
 
 # The launch environment a resume must give back. Credentials never enter the record.
@@ -181,6 +181,21 @@ def producer_launch_request(request: ProducerLaunchRequest) -> Generator[None]:
             del os.environ[request.environment_key]
         else:
             os.environ[request.environment_key] = previous
+
+
+_producer_publication_configuration = ContextVar[models_registry.LaunchModelConfiguration | models_registry.FreshLaunchConfiguration](
+    "producer_publication_model", default=models_registry.FreshLaunchConfiguration()
+)
+
+
+@contextmanager
+def producer_publication_configuration(configuration: models_registry.LaunchModelConfiguration) -> Generator[None]:
+    """Use the launch configuration when publishing a producer pane."""
+    scope = _producer_publication_configuration.set(configuration)
+    try:
+        yield
+    finally:
+        _producer_publication_configuration.reset(scope)
 
 
 @dataclass(frozen=True)
@@ -788,8 +803,6 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         records[path.absolute()][launch["pane_id"]] = launch
         save(path, records[path.absolute()], record=membership)
         return
-    from scripts.lib import models_registry
-
     process_reader = cast(NativeProcessReader, cast(object, import_module("scripts.herdr.herdr")))
     observed_launch = (current_launch(launch, membership) if "session_id" not in launch
                        else cast(CurrentLaunch, launch))
@@ -800,7 +813,11 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         raise ValueError("producer publication does not match the current process")
     expected = observed_launch.copy()
     expected["session_id"] = owner.id
-    expected["kind"] = models_registry.launch_settings("producers", owner.name).kind
+    configuration = _producer_publication_configuration.get()
+    expected["kind"] = models_registry.launch_settings(
+        "producers", owner.name,
+        configuration=configuration if isinstance(configuration, models_registry.LaunchModelConfiguration) else None,
+    ).kind
     if isinstance(request, ProducerLaunchRequest):
         if request.member != owner.id or request.session != owner.current_session:
             raise ValueError("producer start expectation names another conversation")
@@ -1088,7 +1105,7 @@ class ClaudeArguments:
 
 # Claude options used by launch commands; all consumers share this parse.
 CLAUDE_VALUE_FLAGS = frozenset({"--resume", "-r", "--remote-control", "--settings",
-    "--model", "--name", "-n", "--effort", "--permission-mode", "--session-id", "--plugin-dir"})
+    "--model", "--name", "-n", "--effort", "--autocompact", "--permission-mode", "--session-id", "--plugin-dir"})
 RESUME_FLAGS = frozenset({"--resume", "-r"})
 
 

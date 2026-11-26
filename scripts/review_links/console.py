@@ -296,7 +296,11 @@ def _unavailable_owner_controls(pages: tuple[str, ...]) -> str:
         show_dialog |= recipient is not page_frame.OwnerNewItem.UNAVAILABLE
     if not controls:
         return ""
-    dialog = new_item_dialog.render() if show_dialog else ""
+    try:
+        dialog = new_item_dialog.render() if show_dialog else ""
+    except conf.Unusable as error:
+        print(f"review-links New item limits: {error}", file=sys.stderr)
+        return ""
     return '<div class="unavailable-owners">' + "".join(controls) + "</div>" + dialog
 
 

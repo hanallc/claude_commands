@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import redirect_stderr
 from dataclasses import replace
+from io import StringIO
 import threading
 import json
 import os
@@ -189,6 +191,15 @@ class ConsoleTests(unittest.TestCase):
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>""".replace(b"__PAGE_OPTIONS__", json.dumps(options).encode())
         self.assertEqual(firefox_probe_results(source.replace(b"</body>", probe + b"</body>")), [[]])
+        _ = write_config_fixture(self.configuration / "review_links.conf",
+                                 "# whole: 1..4\nnew_item.max_images=0\n")
+        errors = StringIO()
+        with patch.object(staff, "local_snapshot", return_value=members), redirect_stderr(errors):
+            unavailable = console.render(pages, console.UnavailablePage())
+        self.assertIn(b"<title>Hana console</title>", unavailable)
+        self.assertNotIn(b'class="unavailable-owners"', unavailable)
+        self.assertNotIn(b'id="review-new-item"', unavailable)
+        self.assertIn("new_item.max_images", errors.getvalue())
 
     def test_publication_reuses_the_changes_link_and_inlines_only_local_icons(self) -> None:
         output = self.root / "snapshots/aws"

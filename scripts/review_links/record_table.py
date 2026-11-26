@@ -138,7 +138,7 @@ def words_box(element_id: str, placeholder: str, *, value: str = '') -> str:
     identity = html.escape(element_id, quote=True)
     words = html.escape(placeholder, quote=True)
     initial = f' value="{html.escape(value, quote=True)}"' if value else ''
-    return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words'
+    return (f'<div class="record-filter-words"><input type="search" id="{identity}" data-filter-words data-reload-safe'
             + f' autocomplete="off" aria-label="{words}" placeholder="{words}"{initial}>'
             + f'<button type="button" id="{identity}-clear" data-clear-filter-words aria-label="Clear filter">×</button></div>')
 

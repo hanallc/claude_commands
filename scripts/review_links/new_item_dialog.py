@@ -3,30 +3,96 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import Enum, StrEnum
 from typing import Literal, cast
 
+from scripts.lib import conf
 from scripts.production import staff
 from scripts.review_links import page_frame, reply_tokens
 
 
-MAX_WORDS_LENGTH = 40_000
 MAX_REQUEST_ID_LENGTH = 210
-MAX_IMAGES = 4
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
-MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024
-MAX_PAGE_DATA_BYTES = 64 * 1024
-MAX_PAGE_ROWS = 48
-MAX_PAGE_SECTIONS = 16
-MAX_PAGE_SECTION_ROWS = 128
-MAX_BUG_PAGE_STATE_BYTES = 512 * 1024
-MAX_PAGE_URL_LENGTH = 8192
 BUILD_EVIDENCE_LIMITS = {"title": 300, "label": 200, "text": 4_000, "tipEntries": 64}
 IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpeg", "image/gif": "gif", "image/webp": "webp"}
+
+
+@dataclass(frozen=True)
+class PageDataLimits:
+    bytes: int
+    rows: int
+    sections: int
+    section_rows: int
+
+
+@dataclass(frozen=True)
+class NewItemLimits:
+    words_chars: int
+    images: int
+    image_bytes: int
+    total_image_bytes: int
+    page_data: PageDataLimits
+    page_url_chars: int
+    active_captures: int
+    body_bytes: int
+    body_read_bytes: int
+
+    @property
+    def base64_image_chars(self) -> int:
+        return 4 * ((self.image_bytes + 2) // 3)
+
+
+def _page_data_limits(read: Callable[[str], int]) -> PageDataLimits:
+    return PageDataLimits(read("new_item.max_page_data_bytes"), read("new_item.max_page_rows"),
+                          read("new_item.max_page_sections"), read("new_item.max_page_section_rows"))
+
+
+def _body_budget(total_image_bytes: int, page_data_bytes: int, bug_state_bytes: int) -> int:
+    """Allow encoded images, page evidence, and the remaining request fields."""
+    return 4 * ((total_image_bytes + 2) // 3) + 256 * 1024 + page_data_bytes + bug_state_bytes
+
+
+def read_new_item_limits() -> NewItemLimits:
+    """Read the intake values and keep them within the base bounds."""
+    settings = conf.read("review_links")
+
+    def limit(key: str) -> int:
+        return min(settings.value(key, conf.positive_whole), settings.whole_upper_bound(key))
+
+    return _new_item_limits(limit, settings.whole_upper_bound)
+
+
+def read_saved_item_limits() -> NewItemLimits:
+    """Read the base upper bounds for checks against a saved item."""
+    upper_bound = conf.read("review_links").whole_upper_bound
+    return _new_item_limits(upper_bound, upper_bound)
+
+
+def _new_item_limits(read: Callable[[str], int], upper_bound: Callable[[str], int]) -> NewItemLimits:
+    total_image_key = "new_item.max_total_image_bytes"
+    bug_state_key = "new_item.max_bug_page_state_bytes"
+    total_image_bytes = read(total_image_key)
+    page_data = _page_data_limits(read)
+    body_bytes = _body_budget(total_image_bytes, page_data.bytes, read(bug_state_key))
+    body_read_bytes = _body_budget(upper_bound(total_image_key), upper_bound("new_item.max_page_data_bytes"),
+                                   upper_bound(bug_state_key))
+    return NewItemLimits(
+        read("new_item.max_words_chars"), read("new_item.max_images"), read("new_item.max_image_bytes"),
+        total_image_bytes, page_data, read("new_item.max_page_url_chars"), read("page_capture.max_active"),
+        body_bytes, body_read_bytes)
+
+
+def read_stored_image_byte_limit() -> int:
+    """Bound saved image reads by the base limit line."""
+    settings = conf.read("review_links")
+    key = "new_item.max_image_bytes"
+    bound = settings.whole_upper_bound(key)
+    if bound <= 0:
+        raise conf.Unusable(f"{settings.source}: {key}: expected a positive upper bound")
+    return bound
 
 
 class SubmissionError(ValueError):
@@ -282,6 +348,11 @@ class BugPageState:
 
 
 @dataclass(frozen=True)
+class NoBugPageState:
+    """The saved item has no Bug page state."""
+
+
+@dataclass(frozen=True)
 class PastedImage:
     media_type: str
     base64_data: str
@@ -359,7 +430,7 @@ class ReviewSubmission:
     images: tuple[ImageReference, ...]
     reply_token_sha256: str
     page: str = ""
-    page_state: BugPageState | None = None
+    page_state: BugPageState | NoBugPageState = NoBugPageState()
     page_state_data: PageDataEvidence | None = None
     capture_intent: SubmissionCaptureIntent = NoDeferredCapture.ABSENT
     reply_token_nonce: str = ""
@@ -387,7 +458,7 @@ class ReviewSubmission:
 
     @property
     def bug_page_data(self) -> PageDataEvidence | None:
-        if self.page_state is None:
+        if isinstance(self.page_state, NoBugPageState):
             return None
         if self.page_state_data is not None:
             return self.page_state_data
@@ -532,23 +603,24 @@ def _page_cells(value: object) -> tuple[str, ...]:
                  for cell in _entries(value, "Page cells", 16))
 
 
-def read_evidence(value: object) -> Evidence:
+def read_evidence(value: object, limits: PageDataLimits | None = None) -> Evidence:
     """Decode the structured evidence supplied by the dialog."""
     data = _mapping(value, "Evidence")
     match data.get("kind"):
         case "none":
             return NoEvidence()
         case "page-data":
-            rows = tuple(_page_cells(row) for row in _entries(data.get("rows"), "Page rows", MAX_PAGE_ROWS))
+            limits = limits if limits is not None else _page_data_limits(conf.read("review_links").whole_upper_bound)
+            rows = tuple(_page_cells(row) for row in _entries(data.get("rows"), "Page rows", limits.rows))
             sections = tuple(
                 PageDataSection(_text(section.get("label"), "Page section", 240), _page_cells(section.get("columns")),
                                 tuple(_page_cells(row) for row in _entries(
-                                    section.get("rows"), "Section rows", MAX_PAGE_SECTION_ROWS)))
-                for value in _entries(data.get("sections", ()), "Page sections", MAX_PAGE_SECTIONS)
+                                    section.get("rows"), "Section rows", limits.section_rows)))
+                for value in _entries(data.get("sections", ()), "Page sections", limits.sections)
                 for section in (_mapping(value, "Page section"),))
             evidence = PageDataEvidence(_text(data.get("title"), "Page title", 240), rows, sections)
             if sections and len(json.dumps(
-                    evidence_fields(evidence), ensure_ascii=False, separators=(",", ":")).encode()) > MAX_PAGE_DATA_BYTES:
+                    evidence_fields(evidence), ensure_ascii=False, separators=(",", ":")).encode()) > limits.bytes:
                 raise SubmissionError("The page data exceeds its size limit.")
             return evidence
         case "build-step":
@@ -638,13 +710,13 @@ def _script_error(value: object) -> PageScriptError:
         _page_integer(row.get("line"), "error line", 0), _page_integer(row.get("column"), "error column", 0), at)
 
 
-def read_bug_page_state(value: object) -> BugPageState | None:
+def read_bug_page_state(value: object, url_chars: int) -> BugPageState | None:
     """Check the page state supplied by the Bug dialog."""
     if value is None:
         return None
     row = _mapping(value, "Page state")
     reported_url = row.get("url")
-    url = reported_url[:MAX_PAGE_URL_LENGTH] if isinstance(reported_url, str) else ""
+    url = reported_url[:url_chars] if isinstance(reported_url, str) else ""
     url = url.encode("utf-8", errors="replace").decode("utf-8")
     viewport = None
     if row.get("viewport") is not None:
@@ -683,8 +755,9 @@ def _read_notice(value: object) -> Notice:
     return SubmissionNotice(read_kind(kind), from_command)
 
 
-def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
+def read_request(value: object, *, has_capture: bool = False, limits: NewItemLimits | None = None) -> NewItemRequest:
     """Decode the JSON fields for Send."""
+    limits = limits if limits is not None else read_new_item_limits()
     data = _mapping(value, "New item")
     page = _text(data.get("page", ""), "Console page", 32, allow_empty=True)
     kind_value = data.get("kind")
@@ -706,28 +779,28 @@ def read_request(value: object, *, has_capture: bool = False) -> NewItemRequest:
     if isinstance(assignment, ChosenAssignee) and page_recipient != PageRecipient.PRODUCER:
         raise SubmissionError("Select a producer for the assignee.")
     try:
-        evidence = read_evidence(data.get("evidence"))
+        evidence = read_evidence(data.get("evidence"), limits.page_data)
     except SubmissionError:
         if not (page and has_capture):
             raise
         evidence = NoEvidence()
-    page_state = read_bug_page_state(data.get("page_state"))
+    page_state = read_bug_page_state(data.get("page_state"), limits.page_url_chars)
     if page_state is not None and (
             not page or kind != SubmissionKind.BUG or
             not (isinstance(evidence, PageDataEvidence) or isinstance(evidence, NoEvidence) and page_state.title)):
         raise SubmissionError("Send page state from a console Bug dialog.")
     if page_state is not None and len(json.dumps(
-            evidence_fields(evidence), ensure_ascii=False, separators=(",", ":")).encode()) > MAX_PAGE_DATA_BYTES:
+            evidence_fields(evidence), ensure_ascii=False, separators=(",", ":")).encode()) > limits.page_data.bytes:
         raise SubmissionError("The Bug page data exceeds its size limit.")
     images = tuple(
         PastedImage(_text(image.get("media_type"), "Image type", 32),
-                    _text(image.get("base64_data"), "Image data", max_base64_size()))
-        for entry in _entries(data.get("images"), "Images", MAX_IMAGES)
+                    _text(image.get("base64_data"), "Image data", limits.base64_image_chars))
+        for entry in _entries(data.get("images"), "Images", limits.images)
         for image in (_mapping(entry, "Image"),))
     return NewItemRequest(
         read_request_id(data.get("request_id")), kind,
         staff.StaffId(_text(data.get("recipient_id"), "Recipient ID", 128)),
-        _text(data.get("words"), "Your words", MAX_WORDS_LENGTH),
+        _text(data.get("words"), "Your words", limits.words_chars),
         evidence, images, page, page_state, page_recipient, notice, assignment)
 
 
@@ -758,7 +831,7 @@ def stored_submission(details: ReviewSubmission) -> dict[str, object]:
         fields["assignee_id"] = details.assignment.id
     if not details.reply_token_nonce:
         _ = fields.pop("reply_token_nonce")
-    if details.page_state is None:
+    if isinstance(details.page_state, NoBugPageState):
         _ = fields.pop("page_state")
     if details.page_state_data is None:
         _ = fields.pop("page_state_data")
@@ -787,7 +860,10 @@ def _read_capture_intent(value: object) -> DeferredCaptureIntent:
 
 def read_submission(value: object) -> ReviewSubmission:
     row = _mapping(value, "Review submission")
-    images = tuple(read_image_reference(image) for image in _entries(row.get("images"), "Image references", MAX_IMAGES))
+    image_rows = row.get("images")
+    image_entries = () if image_rows in ((), []) else _entries(
+        image_rows, "Image references", conf.read("review_links").whole_upper_bound("new_item.max_images"))
+    images = tuple(read_image_reference(image) for image in image_entries)
     image_ids = {image.id for image in images}
     image_digests: list[tuple[str, str]] = []
     for identity, digest in _mapping(row.get("image_digests", {}), "Image digests").items():
@@ -809,10 +885,12 @@ def read_submission(value: object) -> ReviewSubmission:
     nonce = row.get("reply_token_nonce", "")
     if not isinstance(nonce, str) or nonce and not reply_tokens.valid_nonce(nonce):
         raise SubmissionError("Invalid reply token nonce.")
+    page_state = NoBugPageState() if row.get("page_state") is None else read_bug_page_state(
+        row["page_state"], conf.read("review_links").whole_upper_bound("new_item.max_page_url_chars")) or NoBugPageState()
     return ReviewSubmission(
         read_request_id(row.get("request_id")), _text(row.get("request_digest"), "Request digest", 64),
         read_evidence(row.get("evidence")), images,
-        digest, page, read_bug_page_state(row.get("page_state")), data,
+        digest, page, page_state, data,
         capture_intent=_read_capture_intent(row["capture_intent"]) if "capture_intent" in row else NoDeferredCapture.ABSENT,
         reply_token_nonce=nonce,
         image_digests=tuple(image_digests),
@@ -849,10 +927,6 @@ def require_reply_token(details: SubmissionOrigin, token: str) -> None:
         raise SubmissionError("The reply token does not match this item.")
 
 
-def max_base64_size() -> int:
-    return 4 * math.ceil(MAX_IMAGE_BYTES / 3)
-
-
 def read_request_id(value: object) -> str:
     identity = _text(value, "Request ID", MAX_REQUEST_ID_LENGTH)
     if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", identity):
@@ -860,9 +934,12 @@ def read_request_id(value: object) -> str:
     return identity
 
 
-def read_words(value: object, label: str, *, kind: SubmissionKind | Literal["enhancement"] | None = None) -> str:
+def read_words(value: object, label: str, maximum: int | None = None, *,
+               kind: SubmissionKind | Literal["enhancement"] | None = None) -> str:
     """Check the user's words before adding the Enhancement prefix."""
-    words = _text(value, label, MAX_WORDS_LENGTH)
+    if maximum is None:
+        maximum = conf.read("review_links").whole_upper_bound("new_item.max_words_chars")
+    words = _text(value, label, maximum)
     return f"Enhancement: {words.lstrip()}" if kind == "enhancement" else words
 
 
@@ -944,17 +1021,20 @@ KINDS = ((SubmissionKind.BUG, "Bug", "bug"),
 
 def render() -> str:
     """Render the dialog for the page owner and Builds row buttons."""
+    settings = read_new_item_limits()
     chips = "".join(
         f'<label class="new-item-chip" data-kind="{kind}"><input type="radio" name="kind" value="{kind}">'
         + f'<span data-button-face>{_SPARKLES if icon == "sparkles" else page_frame.icon_svg(icon)}'
         + f'<span data-kind-label>{label}</span></span></label>'
         for kind, label, icon in KINDS)
-    limits = json.dumps({"types": list(IMAGE_FORMATS), "images": MAX_IMAGES,
-                         "imageBytes": MAX_IMAGE_BYTES,
-                         "totalImageBytes": MAX_TOTAL_IMAGE_BYTES, "pageDataBytes": MAX_PAGE_DATA_BYTES,
-                         "pageRows": MAX_PAGE_ROWS, "pageSections": MAX_PAGE_SECTIONS,
-                         "sectionRows": MAX_PAGE_SECTION_ROWS,
-                         "pageUrlLength": MAX_PAGE_URL_LENGTH, "buildEvidence": BUILD_EVIDENCE_LIMITS})
+    limits = json.dumps({"types": list(IMAGE_FORMATS), "images": settings.images,
+                         "imageBytes": settings.image_bytes,
+                         "totalImageBytes": settings.total_image_bytes, "pageDataBytes": settings.page_data.bytes,
+                         "pageRows": settings.page_data.rows, "pageSections": settings.page_data.sections,
+                         "sectionRows": settings.page_data.section_rows,
+                         "pageUrlLength": settings.page_url_chars, "buildEvidence": BUILD_EVIDENCE_LIMITS,
+                         "requestTimeoutSeconds": conf.read_or_repository("review_links").whole(
+                             "page_request_timeout_seconds")})
     body = f'''
    <fieldset><legend>Type</legend><div class="new-item-chips">{chips}</div></fieldset>
    <fieldset data-recipient-group><legend>To</legend>
@@ -982,7 +1062,7 @@ def render() -> str:
      </fieldset>
     </div>
    </section>
-   <textarea name="words" rows="4" maxlength="{MAX_WORDS_LENGTH}" aria-label="Your words"
+   <textarea name="words" rows="4" maxlength="{settings.words_chars}" aria-label="Your words"
     placeholder="Type your words. You can paste an image." required></textarea>
    <p data-scheduled-help hidden>Enter the instruction. Then add <code>Start Mon Nov 30 09:00.</code>
     You can add <code>Repeat every 2 weeks on Monday and Thursday.</code></p>
@@ -1579,7 +1659,8 @@ function bindDraft(dialog, fresh = false) {
   }
   if (images.length + files.length > limits.images || total > limits.totalImageBytes ||
       files.some(file => !file.size || file.size > limits.imageBytes)) {
-   showActionFailure(error, 'Paste up to four images, at most 5 MiB each and 12 MiB total.'); return;
+   setError(`Paste up to ${limits.images} images, at most ${limits.imageBytes} bytes each and ${limits.totalImageBytes} bytes total.`);
+   return;
   }
   addImagePreviews(files);
   editDraft();
@@ -1661,10 +1742,10 @@ function bindDraft(dialog, fresh = false) {
   updateSend();
  }
 
- async function post(payload, {keepalive = false, hold = false, receiver} = {}) {
+ async function post(payload, {keepalive = false, hold = false, receiver, signal} = {}) {
   const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify(payload), keepalive};
-  const response = await (hold ? heldFetch(endpoint, options, receiver) : fetch(endpoint, options));
+                   body: JSON.stringify(payload), keepalive, signal};
+  const response = await (hold ? heldFetch(endpoint, {...options, requestTimeoutSeconds: limits.requestTimeoutSeconds}, receiver) : fetch(endpoint, options));
   return responseData(response, 'Could not send this item.');
  }
 
@@ -2431,7 +2512,8 @@ function bindDraft(dialog, fresh = false) {
     posted = true;
     if (usedPreview && captureSession?.image?.key === item.capture_key) captureSession.sent = true;
     const receiver = !hadEarlierSend && recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
-    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver: receiver || undefined});
+    const signal = AbortSignal.timeout(limits.requestTimeoutSeconds * 1000);
+    return post({...item, token}, {hold: item.kind !== 'scheduled', receiver: receiver || undefined, signal});
    };
    let result;
    try {
