@@ -2821,11 +2821,12 @@ class TurnEndTests(unittest.TestCase):
         config = self.case.fixture.root / "conf"
         for name in ("detached_runs.conf", "postmaster.conf", "codex_daemon.conf"):
             _ = shutil.copyfile(source / name, config / name)
-        cases = ((True, False, False), (False, False, False), (True, True, False), (True, True, True))
-        for finishes_during_turn, self_stop, transcript_unavailable in cases:
-            with self.subTest(finishes_during_turn=finishes_during_turn, self_stop=self_stop,
+        cases = (("during turn", False, False), ("after idle", False, False), ("after Stop", False, False),
+                 ("during turn", True, False), ("during turn", True, True))
+        for index, (order, self_stop, transcript_unavailable) in enumerate(cases):
+            with self.subTest(order=order, self_stop=self_stop,
                               transcript_unavailable=transcript_unavailable):
-                name = f"impl-result-{int(finishes_during_turn)}-{int(self_stop)}-{int(transcript_unavailable)}"
+                name = f"impl-result-{index}"
                 self.case.reply = self.case.run_dir / f"{name}.md"
                 self.case.agent.finish_after = 1
                 self.assertIs(worker.dispatch(self.case.fixture.parent.id, staff.WorkerName.parse(name), "impl",
@@ -2862,7 +2863,7 @@ class TurnEndTests(unittest.TestCase):
                     self.case.agent.without_done = True
                     self.case.agent.complete(pane)
                     self.case.agent.without_done = False
-                    if finishes_during_turn:
+                    if order == "during turn":
                         self.case.fixture.world.locations[pane]["agent_status"] = "working"
                     return self.case.finish(name)
 
@@ -2877,9 +2878,17 @@ class TurnEndTests(unittest.TestCase):
                       patch.object(detached_runs, "_stopped_group_has_ended", return_value=True),
                       patch.object(detached_runs, "_run", return_value=143 if self_stop else 0),
                       patch.object(detached_runs, "deliver_in_fresh_process", side_effect=deliver)):
-                    if not finishes_during_turn:
+                    if order == "after idle":
                         with patch.object(detached_run_process, "supervises", return_value=True):
                             self.assertEqual(finish_turn(), turn_end.TurnOutcome.WAITING_ON_RUNS)
+                    elif order == "after Stop":
+                        reply = "The check is running."
+                        self.case.agent.append(pane, "assistant", reply)
+                        self.case.fixture.world.locations[pane]["agent_status"] = "working"
+                        with patch.object(detached_run_process, "supervises", return_value=True):
+                            self.native_stop(row, reply)
+                        self.assertIn("waiting on runs", self.case.agent.notices[-1])
+                        self.assertEqual(submitted, [])
                     if transcript_unavailable:
                         with patch.object(detached_runs, "_result_received", side_effect=OSError("fixture read failure")):
                             self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
@@ -2897,7 +2906,7 @@ class TurnEndTests(unittest.TestCase):
                         self.assertEqual(len(self.case.agent.notices), notices)
                     else:
                         self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
-                    if finishes_during_turn:
+                    if order == "during turn":
                         saved = cast(detached_runs.RunRecord, json.loads(path.read_text()))
                         self.assertTrue(saved.get("completion_pending"))
                         self.assertEqual(submitted, [])

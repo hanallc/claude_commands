@@ -1592,8 +1592,12 @@ def _handle_locked(event: WorkerEvent,
         if needs_verification and isinstance(receipt, (worker.DispatchEvidenceUnknown, worker.DispatchNotSubmitted)):
             return TurnOutcome.RETRY_EVIDENCE
         if not verified_done and event.kind in (EventKind.TURN_END, EventKind.RUN_FINISHED):
-            worker_input = (detached_runs.WorkerResultInput.TURN_ENDED if event.kind == EventKind.TURN_END
-                            else detached_runs.WorkerResultInput.TYPE)
+            if event.kind == EventKind.TURN_END:
+                worker_input = detached_runs.WorkerResultInput.TURN_ENDED
+            elif needs_verification:
+                worker_input = detached_runs.WorkerResultInput.AFTER_SAVED_STOP
+            else:
+                worker_input = detached_runs.WorkerResultInput.TYPE
             parked = progress_history.parked_worker_pass(passed)
             resume = (lambda: worker.restore_parked_worker(row, parent.id, hold)) if parked else detached_runs.ParkedWorkerDelivery.DEFER
             replay = detached_runs.submit_finished_worker_result(

@@ -29,7 +29,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
-from threading import Event, current_thread
+from threading import Barrier, Event, current_thread
 from types import SimpleNamespace
 from typing import IO, Literal, cast, override
 from unittest.mock import ANY, MagicMock, call, patch
@@ -7426,7 +7426,16 @@ class PaneRunDeliveryTests(unittest.TestCase):
 
         self.fixture.world.locations[pane]["agent_status"] = "idle"
         event = turn_end.WorkerEvent(str(row.current_session))
-        self.assertEqual(turn_end.handle(event), turn_end.TurnOutcome.SUBMITTED)
+        start = Barrier(2, timeout=TEST_HANG_GUARD_SECS)
+
+        def finish_turn() -> turn_end.TurnOutcome:
+            _ = start.wait()
+            return turn_end.handle(event)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            hooks = (pool.submit(finish_turn), pool.submit(finish_turn))
+            outcomes = [hook.result(timeout=TEST_HANG_GUARD_SECS) for hook in hooks]
+        self.assertEqual(outcomes.count(turn_end.TurnOutcome.SUBMITTED), 1)
         self.assertEqual(len(self.inputs), 1)
         self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
         self.assertEqual(self.pending_transcripts, [])

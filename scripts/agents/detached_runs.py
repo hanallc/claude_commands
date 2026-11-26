@@ -2463,6 +2463,7 @@ def _keep_send_error(path: Path) -> Generator[None]:
 class WorkerResultInput(Enum):
     TYPE = "submit the result to an idle worker"
     TURN_ENDED = "wait for the pane to become idle after the turn ends"
+    AFTER_SAVED_STOP = "wait for a busy pane after the hook has recorded a Stop"
 
 
 class WorkerResultTarget(Enum):
@@ -2733,7 +2734,10 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             _ = validate_transport()
             _ = _save_delivery(path, checkpoint)
 
-        request = send.WorkerResultSubmission(wait_for_idle=worker_input == WorkerResultInput.TURN_ENDED,
+        wait_for_idle = (worker_input is WorkerResultInput.TURN_ENDED
+                         or worker_input is WorkerResultInput.AFTER_SAVED_STOP
+                         and saved == DEFERRED_WORKER_RESULT + "worker is working")
+        request = send.WorkerResultSubmission(wait_for_idle=wait_for_idle,
             worker_only=self_stop, before_input=before_input, before_holder=before_holder)
         reason = ""
         try:
