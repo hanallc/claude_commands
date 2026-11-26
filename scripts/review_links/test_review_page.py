@@ -13,6 +13,7 @@ import json
 import re
 import os
 import selectors
+import signal
 import socket
 import subprocess
 import tempfile
@@ -4579,6 +4580,7 @@ window.fetch=async(url,options)=>{
                                 self.assertTrue(complete.wait(30), 'Firefox did not report the Show probe result.')
                             finally:
                                 stop_process_group(firefox)
+                            self.assertIn(firefox.returncode, (0, -signal.SIGTERM), 'Firefox exited with an error.')
                     finally:
                         server.shutdown()
                         thread.join(TEST_HANG_GUARD_SECS)

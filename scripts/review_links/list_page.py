@@ -2628,8 +2628,11 @@ decodeListKeys(content);
 const actionPath=content.dataset.listPath || location.pathname;
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0,listSaveVersion=0,refreshNeeded=false;
+function listRequestSeconds(){
+ return Number(content.dataset.requestTimeoutSeconds);
+}
 function listRequestSignal(){
- return AbortSignal.timeout(Number(content.dataset.requestTimeoutSeconds)*1000);
+ return AbortSignal.timeout(listRequestSeconds()*1000);
 }
 function startListSave(){
  saving++;listSaveVersion++;pageRefresh.abandon();
@@ -2772,7 +2775,7 @@ const repairRequests=(()=>{
      }
     }
     const query=new URLSearchParams({'item-state':body.get('id'),keeper:body.get('keeper'),'not-fixed-request':id});
-    const current=await fetch(url+'?'+query,{cache:'no-store',signal:AbortSignal.timeout(30000)})
+    const current=await fetch(url+'?'+query,{cache:'no-store',signal:listRequestSignal()})
      .then(response=>response.ok ? response.json() : null).catch(()=>null);
     const state=receiptState(current);
     if(state==='delivered'){
@@ -2787,8 +2790,8 @@ const repairRequests=(()=>{
     }
    }
    const options={method:'POST',body};
-   const response=await (accepted ? fetch(url,{...options,signal:AbortSignal.timeout(30000)})
-    : hold.post(url,{...options,requestTimeoutSeconds:30},record.payload.receiver,holdId));
+   const response=await (accepted ? fetch(url,{...options,signal:listRequestSignal()})
+    : hold.post(url,{...options,requestTimeoutSeconds:listRequestSeconds()},record.payload.receiver,holdId));
    return await reply(response);
   }catch(error){
    if(error instanceof SendUndone){
@@ -3590,7 +3593,7 @@ function bindFeedbackForm(form){
     const options={method:'POST',body:data};
     const receiver=action==='works' ? sendActionReceiver(form,data)
      : action==='tell' ? attempt.recipientName : current.dataset.sendReceiver;
-    const requestTimeoutSeconds=Number(content.dataset.requestTimeoutSeconds);
+    const requestTimeoutSeconds=listRequestSeconds();
     const response=await (action==='works' || usesWords || heldSave
      ? hold.post(actionPath,{...options,requestTimeoutSeconds},saveAction ? null : receiver)
      : fetch(actionPath,{...options,signal:listRequestSignal()}));

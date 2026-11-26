@@ -9069,6 +9069,66 @@ window.fetch=async(_url,options)=>{
                                              add_item=False, reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
+    def test_list_not_fixed_uses_the_configured_request_timeout(self) -> None:
+        _ = write_config_fixture(conf.path("review_links"), "page_request_timeout_seconds=4\n")
+        _ = self.file_repaired_report("Fix the menu")
+        steps = r"""
+ const originalFetch=window.fetch,deadlines=new Map();
+ const configured=Number(document.querySelector('[data-list]').dataset.requestTimeoutSeconds)*1000;
+ AbortSignal.timeout=milliseconds=>{
+  const {signal}=new AbortController();
+  deadlines.set(signal,milliseconds);
+  return signal;
+ };
+ let heldPost,resultRead,receiptRead,retryPost,holdReads=0;
+ const button=form.querySelector('[value="not works"]');
+ const until=async(condition,message)=>{
+  const end=performance.now()+4000;
+  while(!condition()){
+   if(performance.now()>end) throw new Error(message);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ window.fetch=async(path,options={})=>{
+  const timeout=deadlines.get(options.signal);
+  if(String(path).startsWith('/send-hold/')){
+   if(++holdReads===1){
+    resultRead=timeout;
+    return Response.json({reason:'The fixture lost the result.'},{status:503});
+   }
+   return Response.json({}, {status:404,headers:{'X-Send-Hold-Outcome':'missing'}});
+  }
+  if(new URL(path,location.href).searchParams.has('not-fixed-request')){
+   receiptRead=timeout;
+   return Response.json({not_fixed_receipt:{request:requests[0].get('request'),state:'accepted'}});
+  }
+  if(options.method!=='POST') return originalFetch(path,options);
+  requests.push(new URLSearchParams(options.body));
+  if(requests.length===1){
+   heldPost=timeout;
+   const hold=new Headers(options.headers).get('X-Undo-Request');
+   return Response.json({hold,seconds:0},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  retryPost=timeout;
+  check(!new Headers(options.headers).has('X-Undo-Hold'),'An accepted send retries without a new hold.');
+  return Response.json({reason:'The fixture did not confirm delivery.'},{status:503});
+ };
+ form.elements.words.value='The last menu choice still disappears.';
+ form.elements.words.dispatchEvent(new Event('input'));
+ submit('not works');
+ await until(()=>!form.dataset.sending && !button.disabled,'The first send did not finish.');
+ button.click();
+ await until(()=>requests.length===2 && !form.dataset.sending,'The accepted retry did not finish.');
+ check(heldPost===configured,'The held POST uses the configured timeout.');
+ check(resultRead>configured && resultRead<=configured+RELEASE_GRACE_MS,
+  'The held result uses the configured timeout plus the remaining Undo grace.');
+ check(receiptRead===configured,'The receipt read uses the configured timeout.');
+ check(retryPost===configured,'The accepted retry POST uses the configured timeout.');
+"""
+        self.browser_action_sequence(steps.replace("RELEASE_GRACE_MS", str(send_hold.RELEASE_GRACE_SECONDS * 1000)),
+                                     add_item=False, reduced_motion=True)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_not_fixed_undo_times_out_while_reading_the_body(self) -> None:
         _ = self.file_repaired_report("Fix the menu")
         self.browser_action_sequence(r"""
