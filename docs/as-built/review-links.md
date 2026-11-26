@@ -1957,6 +1957,13 @@ A signed Unpark request from an earlier page can clear parking while the item wa
 That request moves the item to Producer answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
+The Studio shows **Linked items** in the detail of an open item with `related_to` entries.
+It lists the numbers, titles, and current state badges in number order.
+The page uses the records it already reads for the snapshot.
+A missing record shows `#N not found`.
+The titled link opens the item.
+A Closed item opens outside the results with its log and no actions.
+A Closed item does not affect filter counts.
 Opening a row leaves its unread state and status chip unchanged.
 This rule also applies to direct links, refreshes, and reloads.
 A newer update stays unread if it arrives before the read saves.

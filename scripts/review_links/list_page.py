@@ -577,6 +577,19 @@ def item_link(keeper: staff.StaffId, number: int) -> str:
     return page_frame.list_item_fragment(keeper, number)
 
 
+def state_badge(state: the_list.ItemState) -> str:
+    return f'<span class="list-state {STATE_TONES.get(state, "muted")}">{html.escape(state.value)}</span>'
+
+
+def titled_item_link(entry: ListRecord, style: str) -> str:
+    item = entry.item
+    link = item_link(entry.keeper, item.number)
+    if item.state is the_list.ItemState.CLOSED:
+        link += "&reveal=1"
+    return (f'<a class="{style}" data-record-jump href="{html.escape(link)}">'
+            f'#{item.number} {html.escape(item.title)}</a>')
+
+
 @dataclass(frozen=True)
 class ListFormRequestPrefix:
     """Identify the form, its unread update, and its feedback recipient."""
@@ -1062,9 +1075,20 @@ def item_links_html(entry: ListRecord, log: ItemLog, displayed_next_step: str) -
     return '<section class="item-links"><h3>Links</h3><ul>' + ''.join(related) + ''.join(links.values()) + '</ul></section>'
 
 
+def linked_items_html(entry: ListRecord, linked_records: Mapping[tuple[staff.StaffId, int], ListRecord]) -> str:
+    rows: list[str] = []
+    for number in sorted(entry.item.related_to):
+        linked = linked_records.get((entry.keeper, number))
+        text = (f'#{number} not found' if linked is None
+                else titled_item_link(linked, "item-link-label") + ' ' + state_badge(linked.item.state))
+        rows.append(f'<li>{text}</li>')
+    return ('<section class="item-links" data-linked-items><h3>Linked items</h3><ul>'
+            + ''.join(rows) + '</ul></section>') if rows else ''
+
+
 def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff_names.StaffNames,
                  unread_answers: frozenset[str], progress: ListProgress, asks: str = "",
-                 *, schedule: DisplayedSchedule = the_list.NoSchedule.UNSET) -> str:
+                 *, schedule: DisplayedSchedule = the_list.NoSchedule.UNSET, linked_items: str = "") -> str:
     log = item_log(entry, today, names, unread_answers)
     log_id = html.escape('log-' + entry.key.replace('/', '-'), quote=True)
     item = entry.item
@@ -1086,7 +1110,7 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
     report = review_page.list_report_details(item.report) if isinstance(item.report, the_list.ListReport) else ''
     links = item_links_html(entry, log, progress.next_step)
     return ('<div class="list-panel"><div>' + report + asks + '<div class="list-item-fields">' + fields
-            + '</div>' + links + '<div data-list-item-content>' + sections + '</div>'
+            + '</div>' + linked_items + links + '<div data-list-item-content>' + sections + '</div>'
             + '</div>' + record_table.log_panel(log_id, log.markup) + '</div>')
 
 
@@ -1172,29 +1196,35 @@ def waiting_feedback_form(entry: ListRecord, secret: str, parking_label: str, *,
 
 def waiting_details(entry: ListRecord, today: datetime, names: staff_names.StaffNames,
                     unread_answers: frozenset[str], secret: str,
-                    reviews: ReviewDisplay, parking_label: str, mark: TopPriorityMark, progress: ListProgress) -> str:
+                    reviews: ReviewDisplay, parking_label: str, mark: TopPriorityMark, progress: ListProgress,
+                    *, linked_items: str) -> str:
     sections = (waiting_note(entry, names) + '<div data-waiting-questions>'
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
                     entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item),
                     mark=mark))
-    return detail_panel(entry, sections, today, names, unread_answers, progress, ask_boxes(entry, secret, names))
+    return detail_panel(entry, sections, today, names, unread_answers, progress, ask_boxes(entry, secret, names),
+                        linked_items=linked_items)
 
 
 def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisplay,
             names: staff_names.StaffNames, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
             unread_answers: frozenset[str], *, parking_label: str,
-            schedule: DisplayedSchedule, mark: TopPriorityMark, progress: ListProgress) -> str:
+            schedule: DisplayedSchedule, mark: TopPriorityMark, progress: ListProgress, linked_items: str = "") -> str:
     item = entry.item
+    if item.state is the_list.ItemState.CLOSED:
+        return detail_panel(entry, '', today, names, unread_answers, progress)
     if isinstance(visibility, the_list.WaitingForAnswer) and item.state != the_list.ItemState.REPAIRED:
-        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark, progress)
+        return waiting_details(entry, today, names, unread_answers, secret, reviews, parking_label, mark, progress,
+                               linked_items=linked_items)
     sections = review_links(item, reviews, today)
     failed: frozenset[str] = visibility.failed if isinstance(visibility, the_list.QuestionAttention) else frozenset()
     questions = panel_questions(item, today, unread_answers, failed) if isinstance(schedule, the_list.NoSchedule) else ''
     form = feedback_form(entry, secret, members=names.members, parking_label=parking_label,
                          schedule=schedule, today=today, mark=mark)
     return waiting_note(entry, names, hidden=True) + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers, progress, ask_boxes(entry, secret, names), schedule=schedule)
+        entry, sections + questions + form, today, names, unread_answers, progress, ask_boxes(entry, secret, names),
+        schedule=schedule, linked_items=linked_items)
 
 
 def original_request_words(item: the_list.ListItem) -> str:
@@ -1209,7 +1239,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
               reviews: ReviewDisplay, *, owner_cell: str, owner_sort: str, search_text: SearchText, parked: bool,
               open_question: bool, open_ask: bool, visibility: the_list.WaitingForAnswer | the_list.QuestionAttention,
               unread_answers: frozenset[str],
-              schedule: DisplayedSchedule, mark: TopPriorityMark, hidden: bool = False) -> str:
+              schedule: DisplayedSchedule, mark: TopPriorityMark, hidden: bool = False, linked_items: str = "") -> str:
     item = entry.item
     producer = owner_name(names.members, item.producer)
     unread = isinstance(item.unread_since, datetime)
@@ -1235,6 +1265,8 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
     }
     if isinstance(item.report, the_list.ListReport):
         attributes["report"] = item.report.kind.value
+    if item.state is the_list.ItemState.CLOSED:
+        attributes["linked-closed-item"] = ""
     keeper = names.members.by_id(entry.keeper)
     if keeper is not None:
         attributes["send-receiver"] = keeper.name
@@ -1254,8 +1286,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                  + TOP_FLAG + '</span>' + title)
     if item.unit:
         title += '<small>' + field_html("unit", item.unit, today, names) + '</small>'
-    tone = STATE_TONES.get(item.state, "muted")
-    state = f'<span class="list-state {tone}">' + field_html("state", item.state, today, names) + '</span>'
+    state = state_badge(item.state)
     if stamp := report_state_time(item, today):
         state += '<small data-list-state-time>' + stamp + '</small>'
     if open_question:
@@ -1297,7 +1328,7 @@ def item_rows(entry: ListRecord, names: staff_names.StaffNames, today: datetime,
                   + f' data-label="{label}">{cell}</td>' for label, cell in zip(HEADERS, cells))
     hidden_attr = ' hidden' if hidden else ''
     body = details(entry, today, secret, reviews, names, visibility, unread_answers, parking_label=parking_label,
-                   schedule=schedule, mark=mark, progress=progress)
+                   schedule=schedule, mark=mark, progress=progress, linked_items=linked_items)
     revision = detail_revision(item, body)
     return (f'<tbody data-list-item{attrs} data-detail-revision="{revision}"{hidden_attr}><tr class="list-row">' + row
             + f'</tr><tr data-detail id="{panel}" hidden><td colspan="{len(HEADERS)}">'
@@ -2127,14 +2158,11 @@ def top_bands(top_items: Iterable[ListRecord], today: datetime, names: staff_nam
         item = entry.item
         value = f"staff:{item.producer}"
         values.append(css_string(value))
-        link = html.escape(item_link(entry.keeper, item.number))
         bands.append(top_band(value, '<div class="list-top-what">'
-                              + f'<a class="list-top-link" data-record-jump href="{link}">'
-                              + f'#{item.number} {html.escape(item.title)}</a>'
+                              + titled_item_link(entry, "list-top-link")
                               + '<div class="list-top-next">' + field_html("next_step", item.next_step, today, names)
                               + '</div></div>'
-                              + f'<div class="list-top-meta"><span class="list-state {STATE_TONES.get(item.state, "muted")}">'
-                              + html.escape(item.state.value) + '</span>'
+                              + '<div class="list-top-meta">' + state_badge(item.state)
                               + '<small>ETA ' + html.escape(eta_cell_text(item.eta, today)) + '</small></div>'))
     chip = '[data-list]:has([data-filter-row="producer"] [aria-pressed="true"]'
     rules = ['.list-top-band{display:none}',
@@ -2151,13 +2179,12 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
-    items: list[ListRecord] = []
-    closed_keys: list[str] = []
-    for entry in records(include_closed=True):
-        if entry.item.state == the_list.ItemState.CLOSED:
-            closed_keys.append(entry.key)
-        else:
-            items.append(entry)
+    snapshot = records(include_closed=True)
+    items = [entry for entry in snapshot if entry.item.state is not the_list.ItemState.CLOSED]
+    closed = [entry for entry in snapshot if entry.item.state is the_list.ItemState.CLOSED]
+    targets = {(entry.keeper, number) for entry in items for number in entry.item.related_to}
+    linked_records = {(entry.keeper, entry.item.number): entry for entry in snapshot
+                      if (entry.keeper, entry.item.number) in targets}
     if status == "standalone":
         status = change_page.DeliveryStatus(root)
     reviews: ReviewDisplay = {}
@@ -2231,11 +2258,20 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             deferred_links = True
         row = item_rows(entry, names, today, index, secret, row_reviews, owner_cell=owner_cell, owner_sort=owner_sort,
                         search_text=search_text, parked=parked, open_question=open_question, open_ask=open_ask, visibility=visibility,
-                        unread_answers=unread_answers, schedule=schedule, mark=mark, hidden=not (visible or linked))
+                        unread_answers=unread_answers, schedule=schedule, mark=mark, hidden=not (visible or linked),
+                        linked_items=linked_items_html(entry, linked_records))
         if linked:
             linked_row = row
         else:
             rows.append(row)
+    for index, entry in enumerate(closed, start=len(items)):
+        if (entry.keeper, entry.item.number) in linked_records:
+            owner_cell, owner_sort, owner_search = owner_display(entry.item.owner)
+            rows.append(item_rows(
+                entry, names, today, index, secret, {}, owner_cell=owner_cell, owner_sort=owner_sort,
+                search_text=SearchText(owner_search, normalize_search_text(entry.item.title), ""), parked=False,
+                open_question=False, open_ask=False, visibility=the_list.QuestionAttention(), unread_answers=frozenset(),
+                schedule=the_list.NoSchedule.UNSET, mark=TopPriorityMark.HIDDEN, hidden=True))
     shows = [record_table.Chip(chip.value, chip.label, chip_totals["show"][chip])
              for chip in ListChip]
     owner_chips = staff_chips(members, owners, chip_totals["owner"])
@@ -2284,7 +2320,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' data-park-retry-seconds="{park_retry}"' + deadline_attr
                + f' data-undo-seconds="{undo_seconds}"'
                + f' {card_motion.attributes()}'
-               + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
+               + f' data-closed-keys="{html.escape(json.dumps([entry.key for entry in closed]), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
                + '<div class="studio-tab-row">'
                + studio_page.tabs(producer_chips, producer_selected)
@@ -2832,11 +2868,16 @@ function installListDetail(item){
   if(form && !form.retainDraft) bindFeedbackForm(form);
   tableView.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
 }
+function replaceListDetail(detail,text){
+ const linked=detail.querySelector('[data-linked-items]');
+ detail.innerHTML=text;
+ if(linked && !detail.querySelector('[data-linked-items]')) detail.querySelector('.list-item-fields')?.after(linked);
+}
 function renderListDetail(revision,text,{retainLinks=false}={}){
  return (row,detail)=>{
   const links=retainLinks ? detail.querySelector('[data-list-review-links]') : null;
   row.dataset.detailRevision=revision;
-  detail.innerHTML=text;
+  replaceListDetail(detail,text);
   if(links) detail.querySelector('[data-list-review-links]')?.replaceWith(links);
   installListDetail(row);
  };
@@ -2885,7 +2926,13 @@ const tableView=createRecordTable({content:()=>content,
  itemRevision:item=>item.dataset.detailRevision,
  retainedDetailSlot:'[data-list-review-links]',
  detailInstalled:installListDetail,
- hasKey:key=>!closedKeys.has(key) && !!rowIn(content,key),
+ hasKey:key=>{
+  const row=rowIn(content,key);
+  if(!closedKeys.has(key)) return Boolean(row);
+  if(!row?.hasAttribute('data-linked-closed-item')) return false;
+  const place=recordPlaceParams();
+  return place.get('item')===key && place.get('reveal')==='1';
+ },
  revealLinked:(data,{filters})=>linkRevealFields.some(([field,value,filter])=>
   (!filter || filters[filter]) && (data[field] || 'false')===value),
  missingItem:key=>{
@@ -2949,6 +2996,19 @@ function bindListControls(){
  }
  sizeListColumns();
 }
+document.addEventListener('click',event=>{
+ const link=event.target.closest('[data-linked-items] a[data-record-jump]');
+ if(!link || event.defaultPrevented || event.button!==0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+ const place=new URLSearchParams(link.hash.slice(1));
+ const key=place.get('item');
+ if(!key || place.get('reveal')!=='1') return;
+ // The shared item jump reads the explicit request to show a closed item.
+ event.preventDefault();
+ tableView.saveDeparturePlace();
+ place.set('jump',key);
+ history.pushState(null,'','#'+place);
+ tableView.followItemLink({inheritFilters:true});
+},true);
 function listPickerSummary(zone){
  const format=new Intl.DateTimeFormat('en-US',{timeZone:zone,month:'short',day:'numeric',
   hour:'2-digit',minute:'2-digit',hourCycle:'h23',timeZoneName:'short'});
@@ -3352,7 +3412,7 @@ function bindFeedbackForm(form){
      const field=keepDetailFocus && listOwnsFocus() && detail.contains(document.activeElement)
       ? document.activeElement : null;
      const reviewLink=field?.matches('[data-list-review-card]') ? reviewLinkPlace(field) : null;
-     tableView.updateItemDetail(item,detail=>{detail.innerHTML=result.waiting_details_html;});
+     tableView.updateItemDetail(item,detail=>replaceListDetail(detail,result.waiting_details_html));
      if(reviewLink) restoreReviewLink(reviewLink);
      else if(field?.id && field!==unpark) document.getElementById(field.id)?.focus({preventScroll:true});
      return detail.querySelector('[data-feedback-form]');
