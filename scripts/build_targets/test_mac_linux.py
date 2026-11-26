@@ -376,9 +376,12 @@ def run_suites(repo, *, type_dirs, full, mode, machine, selected, module_time_li
                                cpu_seconds=1.0, times=dict(timing, skipped=int(path.name == 'test_second.py')),
                                peak_mib=22) for suite, path in paths)
     if scenario == 'sequential':
-        first, second = jobs
-        return GateRun((replace(first, wall_clock=WallClockSpan(1000, 1001.3)),
-                        replace(second, wall_clock=WallClockSpan(1001.3, 1002.6))), 2.6, 30)
+        first, second, other = jobs
+        assert [job.suite for job in jobs] == ['fixture', 'fixture', 'other']
+        jobs = (replace(first, seconds=1, wall_clock=WallClockSpan(1000, 1001)),
+                replace(second, seconds=1, wall_clock=WallClockSpan(1001, 1002)),
+                replace(other, seconds=4, wall_clock=WallClockSpan(1005, 1009)))
+        return GateRun(jobs, 9, 30)
     if type_dirs:
         result = subprocess.run([os.environ['GATE_BASEDPYRIGHT'], *type_dirs], cwd=repo,
                                 capture_output=True, text=True)
@@ -3837,24 +3840,18 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(row['step'], 'test-affected')
         self.assertEqual(row['selection'], 'full')
 
-    def test_guest_suite_records_stream_wall_time_for_sequential_jobs(self) -> None:
-        sample = mac_linux.sample_guest_gate
-        clock = iter((10.0, 14.0))
-
-        def sample_with_clock() -> mac_linux.GuestGateSample:
-            with patch.object(mac_linux, 'monotonic', return_value=next(clock)):
-                return sample()
-
-        with patch.object(mac_linux, 'sample_guest_gate', side_effect=sample_with_clock) as samples:
-            result = self.route('sequential')
+    def test_guest_records_each_suite_wall_time(self) -> None:
+        other = self.repo / 'scripts/other'
+        other.mkdir()
+        (other / 'test_other.py').touch()
+        result = self.route('sequential')
         assert isinstance(result, GateRun) and result.passed, result
-        self.assertEqual(samples.call_count, 2)
-        self.assertEqual([job.seconds for job in result.jobs], [1.3, 1.3])
         self.assertEqual([job.wall_clock for job in result.jobs],
-                         [WallClockSpan(1000, 1001.3), WallClockSpan(1001.3, 1002.6)])
+                         [WallClockSpan(1000, 1001), WallClockSpan(1001, 1002), WallClockSpan(1005, 1009)])
         row = self.recorded_guest_gate()
-        self.assertEqual(row['wall_s'], 2.6)
-        self.assertEqual(row['suites'], [{'suite': 'fixture', 'wall_s': 4.0, 'status': 0}])
+        self.assertEqual(row['wall_s'], 9)
+        self.assertEqual(row['suites'], [{'suite': 'fixture', 'wall_s': 2, 'status': 0},
+                                         {'suite': 'other', 'wall_s': 4, 'status': 0}])
 
     def test_named_guest_run_writes_no_gate_record(self) -> None:
         with patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'pass',

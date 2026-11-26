@@ -293,7 +293,6 @@ class MacLoadAbsent(TypedDict):
 @dataclass(frozen=True)
 class GuestGateSample:
     at: float
-    monotonic_at: float
     mac_load: MacLoadReading | MacLoadAbsent
 
 
@@ -1923,7 +1922,7 @@ def read_mac_gate_load(at: float) -> MacLoadReading | MacLoadAbsent:
 
 def sample_guest_gate() -> GuestGateSample:
     at = time()
-    return GuestGateSample(at, monotonic(), read_mac_gate_load(at))
+    return GuestGateSample(at, read_mac_gate_load(at))
 
 
 def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, timeout: int,
@@ -2448,11 +2447,24 @@ def record_guest_gate(repo: Path, source: CandidateSource, request: GuestRequest
                    reason='time limit' if run.time_limit_report else 'Mac Linux guest gate',
                    max_jobs=request['jobs'], mac_load_start=samples.start.mac_load,
                    mac_load_end=samples.end.mac_load)
-        stream_wall_s = samples.end.monotonic_at - samples.start.monotonic_at
+        executions = gate_box.execution_records(run)
+        suite_spans: dict[str, gate_record.WallClockSpan] = {}
+        for execution in executions:
+            span = execution.wall_clock
+            if not isinstance(span, gate_record.WallClockSpan) or span.ended_at < span.started_at:
+                continue
+            previous = suite_spans.get(execution.suite, span)
+            suite_spans[execution.suite] = gate_record.WallClockSpan(
+                min(previous.started_at, span.started_at), max(previous.ended_at, span.ended_at))
+        suites: list[gate_record.SuiteRun] = []
         for suite in cast(list[gate_record.SuiteRun], row['suites']):
-            suite['wall_s'] = stream_wall_s
+            if suite['suite'] in suite_spans:
+                span = suite_spans[suite['suite']]
+                suite['wall_s'] = span.ended_at - span.started_at
+                suites.append(suite)
+        row['suites'] = suites
         gate_record.keep_failure_logs(ledger.text(row, 'id'), TARGET, at,
-                                      cast(list[gate_record.ModuleRun], row['modules']), gate_box.execution_records(run))
+                                      cast(list[gate_record.ModuleRun], row['modules']), executions)
         store.append_line(store.host_file(TARGET, at), row)
     except Exception as error:
         gate_record.report_not_written(error)
