@@ -41,14 +41,14 @@ from scripts.production.proposals_folder import issues_folder
 from scripts.production.store_owner import showrunner_id
 from scripts.production import record_store
 from scripts.production.record_store import has_line_break, state_root
-from scripts.production.issues import Issue, frontmatter
+from scripts.production.issues import Issue, frontmatter, issue_text_header
 from scripts.lib import urgency
 from scripts.lib.urgency import Urgency, UrgencyError
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.atomic_file import existing_writer_lock, write_locked_atomic, write_text_atomic
 from scripts.lib.git_exclude import require_untracked_ignored
 from scripts.lib.user_zone import user_zone
 
-from scripts.review_links import new_item_dialog, question_path, reply_tokens, review_events
+from scripts.review_links import new_item_dialog, question_path, reply_proofs, reply_tokens, review_events
 from scripts.usage import agents_log
 
 from scripts.lib import conf, names
@@ -302,10 +302,6 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
                             "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log", "waiting_why",
                             "review_submission", "reply_log_positions", "answered_at", "request_key"}, where)
-        if "request_key" in fields:
-            request_key = fields["request_key"]
-            if not isinstance(request_key, str) or not request_key.strip() or "question" not in fields:
-                raise InputError(f"{where}.request_key: expected a nonempty question request key")
         details: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
         if "review_submission" in fields:
             try:
@@ -419,7 +415,6 @@ class FollowupExchange(TypedDict):
 
 
 class OutstandingItem(TypedDict):
-    request_key: NotRequired[str]
     waiting_why: NotRequired[str]
     review_id: NotRequired[str]
     review_log: NotRequired[str]
@@ -1265,12 +1260,12 @@ def pending_review_reply(record: QuestionRecord) -> bool:
 
 
 @contextmanager
-def wrap_question_locks(*owners: staff.StaffId) -> Generator[None]:
+def wrap_question_locks(*owners: staff.StaffId, existing_only: bool = False) -> Generator[None]:
     """Lock Question stores in staff ID order."""
     with ExitStack() as locks:
         for owner in sorted(set(owners)):
-            _ = locks.enter_context(outstanding_lock(outstanding_path_for_owner(owner)))
-            _ = locks.enter_context(_question_number_lock(owner))
+            _ = locks.enter_context(outstanding_lock(outstanding_path_for_owner(owner), existing_only=existing_only))
+            _ = locks.enter_context(_question_number_lock(owner, existing_only=existing_only))
         yield
 
 
@@ -1322,8 +1317,9 @@ def _known_question_paths(owner: staff.StaffId, *folders: Path, document: Path |
     return record_store.stored_paths(roots, strict=strict)
 
 
-def _question_number_lock(owner: staff.StaffId) -> AbstractContextManager[None]:
-    return outstanding_lock(state_root() / "review-folders" / owner / "question-numbers")
+def _question_number_lock(owner: staff.StaffId, *, existing_only: bool = False) -> AbstractContextManager[None]:
+    return outstanding_lock(state_root() / "review-folders" / owner / "question-numbers",
+                            existing_only=existing_only)
 
 
 def _seed_question_id(path: Path) -> str:
@@ -1331,8 +1327,9 @@ def _seed_question_id(path: Path) -> str:
     return _stored_question_id(fields) if fields.value("record_type") == "question" else ""
 
 
-def question_numbers() -> AbstractContextManager[record_store.LockedRecordNumbers]:
-    return record_store.record_numbers(record_store.RecordKind.QUESTION, _seed_question_id)
+def question_numbers(*, existing_only: bool = False) -> AbstractContextManager[record_store.LockedRecordNumbers]:
+    return record_store.record_numbers(record_store.RecordKind.QUESTION, _seed_question_id,
+                                       existing_only=existing_only)
 
 
 def _publish_question(record: QuestionRecord, *, record_history: Callable[[], None] | None = None) -> str:
@@ -1369,7 +1366,8 @@ def _current_legacy_question(record: QuestionRecord) -> QuestionRecord:
 
 
 def _file_question(record: QuestionRecord,
-                   before_write: Callable[[str, Path], None] = lambda _id, _path: None
+                   before_write: Callable[[str, Path], None] = lambda _id, _path: None, *,
+                   reply_proof: reply_tokens.ReplyProof = reply_tokens.MISSING_REPLY_PROOF
                    ) -> QuestionRecord:
     with _question_number_lock(record.owner), question_numbers() as numbers:
         folder = record.path.parent
@@ -1384,7 +1382,10 @@ def _file_question(record: QuestionRecord,
                 with numbers.write(path, identity, record.owner, new_record=True,
                                    before_write=lambda: before_write(identity, path)):
                     try:
-                        record_store.create_record_text(path, text)
+                        details = new_item_dialog.read_submission(filed.item.get("review_submission"))
+                        proof_id = details.proof_identity(identity)
+                        with reply_proofs.publishing(proof_id, reply_proofs.NoteProof(reply=reply_proof)):
+                            record_store.create_record_text(path, text)
                     except record_store.ReusedReviewRecord:
                         filed = read_review_question(path, record.owner)
                         if filed.owner != record.owner or not (saved_id := _numbered_question_id(filed)):
@@ -1410,16 +1411,19 @@ def write_question_record(record: QuestionRecord, *, assign_id: bool = False,
 
 
 def _write_question_text(record: QuestionRecord, text: str | None,
-                         numbers: record_store.LockedRecordNumbers | None = None) -> None:
+                         numbers: record_store.LockedRecordNumbers | None = None, *,
+                         write: Callable[[Path, str], None] = write_text_atomic, preview: bool = False) -> None:
     if text is None:
         return
     identity = _numbered_question_id(record)
     if not identity:
-        write_text_atomic(record.path, text)
+        if not preview:
+            write(record.path, text)
         return
-    sequence = nullcontext(numbers) if numbers is not None else question_numbers()
-    with sequence as locked, locked.write(record.path, identity, record.owner):
-        write_text_atomic(record.path, text)
+    sequence = nullcontext(numbers) if numbers is not None else question_numbers(existing_only=preview)
+    with sequence as locked, locked.write(record.path, identity, record.owner, preview=preview):
+        if not preview:
+            write(record.path, text)
 
 
 def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str | None:
@@ -1453,11 +1457,10 @@ def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str |
             item["review_log"] = stored[0].item.get("review_log", "")
     if "question" not in item:
         raise RegistrationFailure("questions", f"{record.path}: the question text is missing")
-    value = item.get("review_submission")
-    if value is not None and "reply_token" in value:
-        details = new_item_dialog.read_submission(value)
-        item = item.copy()
-        item["review_submission"] = new_item_dialog.hashed_submission_fields(value, details)
+    for fields in (item, old):
+        if fields is not None and (
+                "request_key" in fields or reply_proofs.has_legacy_submission(fields.get("review_submission", {}))):
+            raise RegistrationFailure("questions", "Move the question proof before editing this note.")
     if stored and replace(record, item=item) == stored[0]:
         return None
     return "\n".join([
@@ -1471,34 +1474,71 @@ def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str |
 def write_review_submission(record: QuestionRecord, fields: dict[str, object]) -> QuestionRecord:
     """Replace submission fields under the Question locks."""
     item = record.item.copy()
+    if reply_proofs.has_legacy_submission(item.get("review_submission", {})):
+        raise RegistrationFailure("questions", "Move the question proof before editing this note.")
     item["review_submission"] = fields
-    path = record.path
-    with path.open(encoding="utf-8", newline="") as stream:
-        text = stream.read()
-    end = text.index("\n") + 1
-    lines = record_store.lines_with_endings(text[end:])
-    for index, line in enumerate(lines):
-        if line.rstrip("\r\n") == "---":
-            break
-        if line.startswith("registration:"):
-            newline = line[len(line.rstrip("\r\n")):]
-            lines[index] = "registration: " + json.dumps(item, ensure_ascii=False) + newline
-            _write_question_text(record, text[:end] + "".join(lines))
-            return replace(record, item=item)
-    raise RegistrationFailure("questions", f"{path}: the registration field is missing")
+    return _write_registration(record, item)
 
 
-def scrub_reply_token(path: Path, owner: staff.StaffId) -> bool:
-    with wrap_question_locks(owner):
-        record = read_review_question(path, owner)
+def _write_registration(record: QuestionRecord, item: OutstandingItem) -> QuestionRecord:
+    text = record.path.read_text(encoding="utf-8", newline="")
+    _write_question_text(record, _registration_text(record, item, text), write=write_locked_atomic)
+    return replace(record, item=item)
+
+
+def _registration_text(record: QuestionRecord, item: OutstandingItem, text: str) -> str:
+    header = issue_text_header(text)
+    fields = header.located_fields(frozenset(("registration",))).get("registration", [])
+    if header.closing and fields and fields[-1].values:
+        value = fields[-1].values[0]
+        return text[:value.start] + json.dumps(item, ensure_ascii=False) + text[value.start + len(value.text):]
+    raise RegistrationFailure("questions", f"{record.path}: the registration field is missing")
+
+
+def review_submission(record: QuestionRecord) -> new_item_dialog.ReviewSubmission:
+    details = new_item_dialog.read_submission(record.item.get("review_submission"))
+    identity = details.proof_identity(record.item.get("review_id", ""))
+    return details.with_reply_proof(reply_proofs.read(identity).reply)
+
+
+def _staff_question_identity(record: QuestionRecord) -> reply_proofs.StaffQuestionIdentity:
+    return reply_proofs.StaffQuestionIdentity(record.owner, _numbered_question_id(record) or record.path.name)
+
+
+def question_request(record: QuestionRecord) -> reply_proofs.StaffQuestionRequestKey | reply_proofs.NoStaffQuestionRequest:
+    return reply_proofs.read(_staff_question_identity(record)).request
+
+
+def move_reply_proof(path: Path, *, run: reply_proofs.ProofMoveRun, legacy_owner: str = "") -> int:
+    owner = staff.StaffId(legacy_owner)
+    if not owner:
+        try:
+            fields = frontmatter(path, sources=[], keys=frozenset(("production_id",)))
+        except FileNotFoundError:
+            return 0
+        owner = record_store.record_owner(record_store.RecordKind.QUESTION, Issue(path, fields), legacy_owner)
+    with wrap_question_locks(owner, existing_only=run.dry_run):
+        text = record_store.read_note_for_proof_move(path)
+        if isinstance(text, record_store.VanishedReviewNote):
+            return 0
+        records = _question_records([record_store.record_text_fields(path, text)], legacy_owner=legacy_owner)
+        if len(records) != 1:
+            raise RegistrationFailure("questions", f"{path}: cannot read a saved Question")
+        record = records[0]
         if record.owner != owner:
             raise RegistrationFailure("questions", f"{path}: the question owner changed")
-        value = record.item.get("review_submission")
-        if value is None or "reply_token" not in value:
-            return False
-        details = new_item_dialog.read_submission(value)
-        _ = write_review_submission(record, new_item_dialog.hashed_submission_fields(value, details))
-        return True
+        removal = reply_proofs.prepare_note_removal(text, reply_proofs.ProofNoteLayout.QUESTION)
+        proofs: list[tuple[reply_proofs.NoteIdentity, reply_proofs.NoteProof]] = []
+        if not isinstance(removal.proof.reply, reply_tokens.MissingReplyProof):
+            details = new_item_dialog.read_submission(removal.submission)
+            identity = details.proof_identity(record.item.get("review_id", ""))
+            proofs.append((identity, reply_proofs.NoteProof(reply=removal.proof.reply)))
+        if not isinstance(removal.proof.request, reply_proofs.NoStaffQuestionRequest):
+            proofs.append((_staff_question_identity(record), reply_proofs.NoteProof(request=removal.proof.request)))
+        return run.apply(path, text, removal, proofs,
+                         lambda changed: _write_question_text(record, changed, write=write_locked_atomic,
+                                                              preview=run.dry_run),
+                         open_item=record.status == "open")
 
 
 def record_review_log(source: Path | QuestionRecord, words: str, who: str = "nate", *,
@@ -1522,7 +1562,9 @@ def record_review_log(source: Path | QuestionRecord, words: str, who: str = "nat
 
 
 def store_questions(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff, *,
-                    write_list: Callable[[], None] = lambda: None, last: tuple[OutstandingItem, ...] = ()) -> None:
+                    write_list: Callable[[], None] = lambda: None, last: tuple[OutstandingItem, ...] = (),
+                    request: reply_proofs.StaffQuestionRequestKey | reply_proofs.NoStaffQuestionRequest
+                    = reply_proofs.NO_STAFF_REQUEST) -> None:
     """Check all record changes. Save the new Ask after its list and legacy records."""
     final_items = {id(entry) for entry in last}
     questions = [entry for entry in entries if "question" in entry and id(entry) not in final_items]
@@ -1561,7 +1603,7 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
             row = question_member(production, item, identities)
             item["asked_by"] = row.id
             selected = current.get(item.get("review_id", ""))
-            if selected is None and "request_key" not in item:
+            if selected is None and (id(entry) not in final_items or isinstance(request, reply_proofs.NoStaffQuestionRequest)):
                 selected = legacy.get((row.id, item["text"]))
             if selected is None:
                 digest = hashlib.sha256(f"{owner}:{row.id}:{item['text']}".encode()).hexdigest()
@@ -1591,7 +1633,11 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
             write(record, text)
         write_list()
         for record, text in final:
-            write(record, text)
+            if isinstance(request, reply_proofs.NoStaffQuestionRequest):
+                write(record, text)
+            else:
+                with reply_proofs.publishing(_staff_question_identity(record), reply_proofs.NoteProof(request=request)):
+                    write(record, text)
 
 
 def question_member(production: QuestionScope, item: OutstandingItem, identities: QuestionStaff) -> staff.StaffRow:
@@ -1609,15 +1655,20 @@ def migrate_questions(production: Production, *, identities: QuestionStaff | Non
     with outstanding_lock(path):
         legacy = legacy_entries(path)
         existing = open_entries(production, identities)
-        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities, strict=True)
-                    if "request_key" not in record.item}
-        questions = {(question_member(production, entry, identities).id, entry["text"], entry.get("request_key", "")): entry
+        native = native_question_records(production, identities, strict=True)
+        requests = {record.item.get("review_id", ""): question_request(record)
+                    for record in native if _numbered_question_id(record)}
+        recorded = {(record.asker, record.item["text"]) for record in native
+                    if isinstance(requests.get(record.item.get("review_id", ""), reply_proofs.NO_STAFF_REQUEST),
+                                  reply_proofs.NoStaffQuestionRequest)}
+        questions = {(question_member(production, entry, identities).id, entry["text"],
+                      requests.get(entry.get("review_id", ""), reply_proofs.NO_STAFF_REQUEST)): entry
                      for entry in existing if "question" in entry}
         for entry in legacy:
             if "question" in entry:
                 key = (question_member(production, entry, identities).id, entry["text"])
                 if key not in recorded:
-                    _ = questions.setdefault((*key, ""), entry)
+                    _ = questions.setdefault((*key, reply_proofs.NO_STAFF_REQUEST), entry)
         reminders = [entry for entry in legacy if "question" not in entry]
         def write_list() -> None:
             if any("question" in entry for entry in legacy):
@@ -1660,12 +1711,16 @@ _held_outstanding_locks: ContextVar[frozenset[Path]] = ContextVar("held_outstand
 
 
 @contextmanager
-def outstanding_lock(outstanding: Path) -> Generator[None]:
+def outstanding_lock(outstanding: Path, *, existing_only: bool = False) -> Generator[None]:
     """Lock the owner's records. Reuse the lock in the same call context."""
     path = outstanding.with_suffix(".lock").resolve()
     held = _held_outstanding_locks.get()
     if path in held:
         yield
+        return
+    if existing_only:
+        with existing_writer_lock(path):
+            yield
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as lock:
@@ -1773,15 +1828,23 @@ def read_all_open_fields() -> list[OutstandingItem]:
 
 
 def write_open_entries(production: QuestionScope, entries: list[OutstandingItem], identities: QuestionStaff, *,
-                       last: tuple[OutstandingItem, ...] = (), before_list: Callable[[], None] = lambda: None) -> None:
+                       last: tuple[OutstandingItem, ...] = (), before_list: Callable[[], None] = lambda: None,
+                       request: reply_proofs.StaffQuestionRequestKey | reply_proofs.NoStaffQuestionRequest
+                       = reply_proofs.NO_STAFF_REQUEST) -> None:
     """Keep unrecorded legacy questions before replacing their JSON list."""
     path = outstanding_path(production)
     legacy = [entry for entry in legacy_entries(path) if "question" in entry]
     if legacy:
-        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities)
-                    if "request_key" not in record.item}
-        supplied = {(question_member(production, entry, identities).id, entry["text"])
-                    for entry in entries if "question" in entry and "request_key" not in entry}
+        recorded: set[tuple[staff.StaffId, str]] = set()
+        keyed: set[str] = set()
+        for record in native_question_records(production, identities):
+            if isinstance(question_request(record), reply_proofs.NoStaffQuestionRequest):
+                recorded.add((record.asker, record.item["text"]))
+            elif number := _numbered_question_id(record):
+                keyed.add(number)
+        supplied = {(question_member(production, entry, identities).id, entry["text"]) for entry in entries
+                    if "question" in entry and entry.get("review_id", "") not in keyed
+                    and (isinstance(request, reply_proofs.NoStaffQuestionRequest) or all(entry is not item for item in last))}
         entries = list(entries)
         for entry in legacy:
             key = (question_member(production, entry, identities).id, entry["text"])
@@ -1800,7 +1863,7 @@ def write_open_entries(production: QuestionScope, entries: list[OutstandingItem]
             write_text_atomic(path, text)
 
     with record_store.keep_file_on_error(path) if change_list else nullcontext():
-        store_questions(production, entries, identities, write_list=write_list, last=last)
+        store_questions(production, entries, identities, write_list=write_list, last=last, request=request)
 
 
 # An item can wait longer than a week, so the day is named in full.
@@ -1958,17 +2021,19 @@ class QuestionFromStaff:
 class KeyedStaffQuestion:
     """A caller can retry this question with the same request key."""
 
-    request_key: str
+    request_key: reply_proofs.StaffQuestionRequestKey = field(repr=False)
 
 
 _QUESTION_FROM_STAFF = QuestionFromStaff()
 
 
-def keyed_question(production: QuestionScope, identities: QuestionStaff, key: str) -> QuestionRecord | None:
-    matches = [record for record in native_question_records(production, identities, strict=True)
-               if record.item.get("request_key") == key]
+def keyed_question(production: QuestionScope, identities: QuestionStaff, key: reply_proofs.StaffQuestionRequestKey) -> QuestionRecord | None:
+    records = native_question_records(production, identities, strict=True)
+    if any("request_key" in record.item for record in records):
+        raise RegistrationFailure("ask", "Move the question proofs before retrying a staff question.")
+    matches = [record for record in records if question_request(record) == key]
     if len(matches) > 1:
-        raise RegistrationFailure("ask", f"{key}: more than one question for this request")
+        raise RegistrationFailure("ask", "More than one question for this request.")
     return matches[0] if matches else None
 
 
@@ -1991,7 +2056,7 @@ def _ask_recipient(production: QuestionScope, text: str, parts: QuestionParts,
     path = review_question_path(folder, outgoing.details.request_id)
     record = QuestionRecord(path, folder.owner, folder.owner, item, "open")
     with outstanding_lock(outstanding_path(production)):
-        return _file_question(record, outgoing.before_write)
+        return _file_question(record, outgoing.before_write, reply_proof=outgoing.details.reply_proof)
 
 
 @overload
@@ -2050,7 +2115,6 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
             saved = keyed_question(production, identities, outgoing.request_key)
             if saved is not None:
                 return saved
-            entry["request_key"] = outgoing.request_key
         entries = open_entries(production, identities)
         if not isinstance(outgoing, KeyedStaffQuestion):
             if any(stored["text"] == text for stored in entries):
@@ -2062,7 +2126,9 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
         entries.append(entry)
         with record_store.keep_file_on_error(outstanding.with_suffix(".history.jsonl")):
             write_open_entries(production, entries, identities, last=(entry,),
-                               before_list=lambda: record_question_history(outstanding, [entry], now))
+                               before_list=lambda: record_question_history(outstanding, [entry], now),
+                               request=outgoing.request_key if isinstance(outgoing, KeyedStaffQuestion)
+                               else reply_proofs.NO_STAFF_REQUEST)
         if isinstance(outgoing, KeyedStaffQuestion):
             saved = keyed_question(production, identities, outgoing.request_key)
             if saved is None:
@@ -2439,7 +2505,6 @@ def review_sent_question(record: QuestionRecord, scope: QuestionScope,
     """Apply the user's action to the exact sent question under its locks."""
     with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
         current = current_open_question(record, "mark-important" if action == "mark-important" else "answer")
-        fields = current.item.get("review_submission", {})
         if action == "read" and "followup" in current.item:
             raise RegistrationFailure(action, "The recipient still needs to reply.")
         now = datetime.now(scope.zone)
@@ -2454,20 +2519,24 @@ def review_sent_question(record: QuestionRecord, scope: QuestionScope,
         if action == "question":
             current.item["followup"] = PendingFollowup(text=words, sent=now.strftime("%Y-%m-%dT%H:%M"))
             current.item["waiting_why"] = review_events.require_waiting_why(words)
-            proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
-            current.item["review_submission"] = new_item_dialog.renewed_submission_fields(fields, proof)
         else:
             current = replace(current, status="closed")
         label = "feedback sent" if action == "feedback" else action
         event = review_events.ReviewLog(now, "nate", "Marked read" if action == "read" else label + ": " + words)
         current.item["review_log"] = review_events.encode(review_events.append(events, event))
+        if action == "question":
+            proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
+            fields = current.item.get("review_submission", {})
+            details = new_item_dialog.read_submission(fields)
+            wait = details.next_reply_wait(current.item.get("review_id", ""), proof)
+            current.item["review_submission"] = {**fields, "reply_wait_revision": wait.reply_wait_revision}
         write_question_record(current)
 
 
 def _submission_reply_target(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str,
                              owner: staff.StaffId) -> tuple[QuestionRecord, bool]:
     current = read_review_question(path, owner)
-    details = new_item_dialog.read_submission(current.item.get("review_submission"))
+    details = review_submission(current)
     if current.owner != owner or current.item.get("review_id") != key.item_id or details.request_id != key.request_id:
         raise new_item_dialog.SubmissionError("The selected Question changed.")
     new_item_dialog.require_reply_token(details, token)
@@ -2676,8 +2745,6 @@ def keep_layout_fields(entry: OutstandingItem, stored: OutstandingItem) -> None:
         entry["waiting_why"] = stored["waiting_why"]
     if "review_id" in stored:
         entry["review_id"] = stored["review_id"]
-    if "request_key" in stored:
-        entry["request_key"] = stored["request_key"]
 
 
 class HeldRegistrationQuestion(NamedTuple):

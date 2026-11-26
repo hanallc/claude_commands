@@ -179,7 +179,12 @@ class NoImageQuestionDispatch:
 
 class ScopedReplyCommand(TypedDict):
     key: str
-    token_sha256: str
+    exchange: NotRequired[str]
+    token_sha256: NotRequired[str]
+
+
+def scoped_reply_exchange(command: ScopedReplyCommand) -> str:
+    return command.get("exchange", command.get("token_sha256", ""))
 
 
 class StoredReviewMessage(TypedDict):
@@ -2740,15 +2745,15 @@ def check_review_question_source(page: ReviewPage, row: str, question: OpenQuest
                 if followup is not None and followup['text'] == question.text:
                     if 'review_submission' not in current.item:
                         return
-                    submission = new_item_dialog.read_submission(current.item['review_submission'])
-                    if reply_tokens.matches_reference(submission.reply_token_sha256, question.question_id):
+                    submission = update_registration.review_submission(current)
+                    if new_item_dialog.matches_reply_reference(submission, question.question_id):
                         return
         elif isinstance(page, ReviewMessagePage):
             if path.parent.name in ('investigations', 'archive') and re.fullmatch(r"I\d+", row):
                 item = investigation.read_review_record(path)
                 if item.id == row and item.state == investigation.InvestigationState.OPEN:
                     if (not isinstance(item.submission, new_item_dialog.ReviewSubmission)
-                            or reply_tokens.matches_reference(item.submission.reply_token_sha256, question.question_id)):
+                            or new_item_dialog.matches_reply_reference(item.submission, question.question_id)):
                         return
             elif path.name.endswith('.review.json'):
                 reviews = delivery_state.read_fields(path)
@@ -2761,7 +2766,7 @@ def check_review_question_source(page: ReviewPage, row: str, question: OpenQuest
                 if proposal_issue.pending_review_reply(issue):
                     submission = proposal_issue.review_submission(issue)
                     if (not isinstance(submission, new_item_dialog.ReviewSubmission)
-                            or reply_tokens.matches_reference(submission.reply_token_sha256, question.question_id)):
+                            or new_item_dialog.matches_reply_reference(submission, question.question_id)):
                         return
         elif any(record["#"] == row and not record.get("Verdict") for record in change_review.review_rows(path)):
             return
@@ -2780,7 +2785,7 @@ class OutboundReviewMessage:
 
 
 def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
-    """Derive the scoped reply token from its current native note."""
+    """Derive the token from the current reply proof."""
     from scripts.review_links import review_submissions
 
     page = delivery.page
@@ -2791,8 +2796,8 @@ def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
     if command != reply_command(scoped["key"]):
         raise ValueError("The saved Review reply command does not match its key.")
     proof = review_submissions.current_reply_proof(scoped["key"])
-    if proof.sha256 != scoped["token_sha256"]:
-        raise reply_tokens.UnavailableReplyToken("The note has a different reply token.")
+    if not reply_tokens.matches_reference(proof.sha256, reply_tokens.read_reference(scoped_reply_exchange(scoped))):
+        raise reply_tokens.UnavailableReplyToken("The reply proof changed.")
     token = reply_tokens.derive(proof)
     return OutboundReviewMessage(prefix + separator + reply_command(scoped["key"], token), token)
 

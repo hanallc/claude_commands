@@ -257,20 +257,20 @@ class InvestigationTests(unittest.TestCase):
         finally:
             case.doCleanups()
 
-    def test_answering_a_sent_investigation_uses_only_the_note_hash(self) -> None:
+    def test_answering_a_sent_investigation_uses_the_private_hash(self) -> None:
         kind = new_item_dialog.SubmissionKind.INVESTIGATION
         request = f"r1-{'0' * 32}-{kind}-{OWNER.id}"
         proof = reply_tokens.mint()
         token = reply_tokens.derive(proof)
         details = new_item_dialog.ReviewSubmission(request, "b" * 64, new_item_dialog.NoEvidence(), (),
-                                                   proof.sha256, reply_token_nonce=proof.nonce)
+                                                   reply_proof=proof)
         report = investigation.file(OWNER.id, "Find the cause", "Which check failed?",
                                     waiting_why="The owner answers.", submission=details)
         path = investigation.folder(OWNER.id) / f"{report.id}.md"
         key = new_item_dialog.submission_key(kind, OWNER.id, report.id, request)
         note = path.read_text(encoding="utf-8")
-        self.assertNotIn(token, note)
-        self.assertIn(proof.nonce, note)
+        self.assertFalse(token in note)
+        self.assertFalse("reply_token_nonce" in note)
         reply_tokens.path().unlink()
         answer = "The first check failed."
 

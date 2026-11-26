@@ -28,7 +28,7 @@ from scripts.production.record_store import FileStamp, state_root
 from scripts.rebuild import need
 from scripts.lib import urgency
 from scripts.review_links import change_browser, change_page, console, for_you, page_frame, record_table, review_items, review_link
-from scripts.review_links import new_item_dialog, reply_tokens, review_submissions
+from scripts.review_links import new_item_dialog, review_submissions
 from scripts.review_links import question_path, question_record, review_actions, review_events, staff_names
 from scripts.review_links.review_items import ReviewItem, ReviewSourceStamps, ReviewState, ReviewType, guard_source
 from scripts.review_links.review_items import source_stamp as source_stamp
@@ -595,7 +595,14 @@ class ReviewSnapshotCache:
     _thread: threading.Thread = field(init=False)
 
     def __post_init__(self) -> None:
-        if not self.initialize_on_start and (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
+        if self.initialize_on_start:
+            try:
+                _ = review_submissions.move_reply_proofs(review_submissions.LocalProofMove(self.root), dry_run=False)
+            except review_submissions.ProofMoveNoteFailure as error:
+                raise OSError(f"Cannot start Review links because the reply proof move failed. {error}") from None
+            except (OSError, ValueError, update_registration.RegistrationFailure):
+                raise OSError("Cannot start Review links because the reply proof move failed.") from None
+        elif (self.root/change_page.CONSOLE_FOLDER/change_browser.MANIFEST).exists():
             self._initialization_requested = True
             try:
                 with self.staff_scope():
@@ -1260,11 +1267,11 @@ def repeats_response_followup(item: ReviewItem, outcome: str, words: str, status
         return False
     if 'review_submission' not in fields:
         return False
-    reply = new_item_dialog.read_submission(fields['review_submission'])
+    reply = update_registration.review_submission(source.record)
     path = source.record.path
     page = status.metadata_page(change_page.ReviewPage(path, path.parent, (path.stem,), ''))
     return (isinstance(page, change_page.UserQuestionPage) and page.saved.get('kind') == 'question'
-            and reply_tokens.matches_reference(reply.reply_token_sha256, page.saved.get('question_id', ''))
+            and new_item_dialog.matches_reply_reference(reply, page.saved.get('question_id', ''))
             and page.saved.get('question_text') == pending['text'])
 
 
