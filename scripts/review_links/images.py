@@ -863,6 +863,7 @@ const notice = document.querySelector('[data-image-notice]');
 let list = document.querySelector('[data-images]');
 const motion = createCardMotion(() => list);
 let refreshRequest = 0;
+const staleAnswerReason = __STALE_ANSWER__;
 let staleAnswerNotice = '';
 const refreshSeconds = () => list.dataset.refreshSeconds;
 const imageLink = () => new URLSearchParams(location.hash.slice(1));
@@ -917,6 +918,7 @@ function pictureState(image) {
 try {
   for (const [image, draft] of JSON.parse(sessionStorage.getItem(draftStorageKey) || '[]')) {
     pictureState(image).draft = draft;
+    if (draft.needsCurrentForm) staleAnswerNotice = 'Not sent: ' + staleAnswerReason;
   }
 } catch { /* The browser may block storage. */ }
 function preventDraftLoss(event) {
@@ -946,7 +948,8 @@ function readEdit(form, state, edited = false) {
   const {feedback, token, feedback_round: round} = form.elements;
   const changed = feedback.value !== (state.draft?.words ?? '');
   if (edited || changed) state.revision++;
-  state.draft = {...(changed ? null : state.draft), words: feedback.value, token: token.value, round: round.value};
+  const prior = changed || state.draft?.needsCurrentForm ? null : state.draft;
+  state.draft = {...prior, words: feedback.value, token: token.value, round: round.value};
 }
 function restoreForms(root, previous = []) {
   const editable = new Map(), attempts = new Set();
@@ -969,7 +972,7 @@ function restoreForms(root, previous = []) {
     }
     const draft = state.draft;
     let form = editable.get(image);
-    if (draft && !form && (draft.words || draft.retryAction || state.draftError)) {
+    if (draft && !draft.needsCurrentForm && !form && (draft.words || draft.retryAction || state.draftError)) {
       const template = document.querySelector('[data-image-draft-template]').content;
       const original = previousEdits.get(image)?.closest('article') ?? template.firstElementChild;
       const card = original.cloneNode(true);
@@ -986,7 +989,7 @@ function restoreForms(root, previous = []) {
     if (form) {
       if (draft) form.elements.feedback.value = draft.words;
       showActionFailure(formStatus(form), state.draftError);
-    } else if (!state.attempts.size) {
+    } else if (!state.attempts.size && !draft?.needsCurrentForm) {
       pictureStates.delete(image);
     }
   }
@@ -1066,7 +1069,7 @@ async function submit(event) {
     if (!response.ok) {
       retryable = response.status >= 500;
       const reason = await response.json().then(body => body.reason, () => '');
-      staleAnswer = response.status === 400 && reason === __STALE_ANSWER__;
+      staleAnswer = response.status === 400 && reason === staleAnswerReason;
       throw new Error(reason || 'HTTP ' + response.status);
     }
     const result = question ? {} : await response.json().catch(() => ({}));
@@ -1102,7 +1105,8 @@ async function submit(event) {
     const undone = error instanceof SendUndone;
     const message = undone ? error.message : 'Not sent: ' + error.message;
     if (staleAnswer && !request.key) {
-      clearDraft(state, edit);
+      state.draft = {words: field.value, needsCurrentForm: true};
+      saveDrafts();
       card.remove();
       staleAnswerNotice = message;
       showActionFailure(actionFailure, message);
@@ -1186,6 +1190,7 @@ addEventListener('hashchange', () => {
   scrollToLinkedImage(true);
 });
 const pageRefresh = createPageRefresh(refresh, refreshSeconds);
+showActionFailure(actionFailure, staleAnswerNotice);
 restoreForms(list);
 bind(list);
 // An image link opens its image at once.

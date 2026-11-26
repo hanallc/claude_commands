@@ -1782,48 +1782,74 @@ class ImageQuestionTests(ImagesFixture):
         self.assertEqual(len(list(paths)), 3)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
-    def test_browser_discards_a_stale_draft_when_the_image_is_already_answered(self) -> None:
+    def test_browser_keeps_a_stale_draft_for_the_current_round(self) -> None:
         record = self.register("Stale fixture")
         _ = self.register("Other fixture")
         page = images.render(self.status)
         self.ask(record)
         identity = record["id"]
         images.answer_question(self.root, identity, "Q1", "The gate passed.")
+        current = images.render(self.status)
         token = images.request_token(images.console_token(self.root), identity)
+        current_round = images.feedback_round({"Q1"})
         body = {"image": identity, "token": token, "action": "feedback", "feedback": "Remove the red row.",
-                "feedback_round": images.feedback_round({"Q1"})}
+                "feedback_round": current_round}
         self.submit(urlencode(body))
         stale = {**body, "feedback": "Keep the red row.", "feedback_round": images.feedback_round(set())}
         with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale") as refusal:
             self.submit(urlencode(stale))
-        fresh = json.dumps(images.render(self.status).decode()).replace("<", r"\u003c")
+        answered = images.render(self.status)
         error = json.dumps({"reason": str(refusal.exception)})
         probe = r'''
 async (find, whenPageShows, check) => {
  const realFetch = window.fetch.bind(window);
+ const posts = [];
  window.fetch = (url, options) => {
   if (url !== location.pathname) return realFetch(url, options);
-  if (options?.method === 'POST') return Promise.resolve(new Response(ERROR_BODY, {status: 400}));
-  return Promise.resolve(new Response(FRESH_PAGE));
+  if (options?.method === 'POST') {
+   posts.push(new URLSearchParams(options.body));
+   return Promise.resolve(posts.length === 1 ? new Response(ERROR_BODY, {status: 400}) : new Response('{}'));
+  }
+  return Promise.resolve(new Response(posts.length === 1 ? FRESH_PAGE : ANSWERED_PAGE));
  };
  const oldList = document.querySelector('[data-images]');
  const stale = find('Stale fixture');
  const form = stale.querySelector('form');
- form.elements.feedback.value = 'Keep the red row.';
+ const words = 'Keep the red row.';
+ form.elements.feedback.value = words;
  find('Other fixture').querySelector('textarea').value = 'Keep this draft.';
  form.requestSubmit(form.querySelector('button[value=feedback]'));
  await whenPageShows('the refreshed list', () => !oldList.isConnected);
- check(!document.getElementById(stale.id), 'The refresh removes the stale form.');
- check(![...document.querySelectorAll('textarea')].some(field => field.value === 'Keep the red row.'),
-       'The refresh discards the stale words.');
  const drafts = sessionStorage.getItem('images.answer-drafts:' + location.pathname) ?? '';
- check(!drafts.includes('Keep the red row.'), 'The browser clears the stale draft from storage.');
+ check(drafts.includes(words), 'Storage keeps the draft words.');
  const status = document.getElementById('image-action-failure');
  check(!status.hidden && status.textContent.includes('This page is stale'), 'The page shows the refusal.');
  check(find('Other fixture').querySelector('textarea').value === 'Keep this draft.', 'The other draft remains.');
-}'''.replace("ERROR_BODY", json.dumps(error)).replace("FRESH_PAGE", fresh)
-        script = f"<script>{self.question_probe(probe)}</script>".encode()
-        self.assertEqual(firefox_probe_results(page.replace(b"</body>", script + b"</body>")), [[]])
+ if (ALREADY_ANSWERED) {
+  check(!document.getElementById(stale.id), 'An answered image has no stale form.');
+  return;
+ }
+ const fresh = find('Stale fixture').querySelector('form');
+ check(fresh !== form && fresh.elements.feedback.value === words, 'The current form keeps the draft words.');
+ check(fresh.elements.feedback_round.value === CURRENT_ROUND, 'The form uses the current round.');
+ if (!fresh.elements.feedback.value) return;
+ fresh.requestSubmit(fresh.querySelector('button[value=feedback]'));
+ await whenPageShows('the sent form removed', () => !fresh.isConnected);
+ check(posts.length === 2 && posts[1].get('feedback') === words && posts[1].get('feedback_round') === CURRENT_ROUND,
+       'One click sends the preserved words in the current round.');
+ check(posts[1].get('answer_request') && posts[1].get('answer_request') !== posts[0].get('answer_request'),
+       'The send uses a fresh request ID.');
+}'''
+        for already_answered in (False, True):
+            with self.subTest(already_answered=already_answered):
+                fresh = answered if already_answered else current
+                browser_probe = (probe.replace("ERROR_BODY", json.dumps(error))
+                                 .replace("ALREADY_ANSWERED", json.dumps(already_answered))
+                                 .replace("CURRENT_ROUND", json.dumps(current_round))
+                                 .replace("FRESH_PAGE", json.dumps(fresh.decode()).replace("<", r"\u003c"))
+                                 .replace("ANSWERED_PAGE", json.dumps(answered.decode()).replace("<", r"\u003c")))
+                script = f"<script>{self.question_probe(browser_probe)}</script>".encode()
+                self.assertEqual(firefox_probe_results(page.replace(b"</body>", script + b"</body>")), [[]])
 
     def test_confirmed_feedback_retry_hides_the_image_after_a_failed_write(self) -> None:
         record = self.register()
