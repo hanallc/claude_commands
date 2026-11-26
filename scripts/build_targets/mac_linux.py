@@ -2440,7 +2440,7 @@ def record_guest_gate(repo: Path, source: CandidateSource, request: GuestRequest
     try:
         at = samples.start.at
         row = gate_box.completion_record(run, request['attempt'], source.commit, source.tree, TARGET, at,
-                                         samples.end.at, request['mode'], split=source.coverage is ModuleCoverage.SUBSET)
+                                         samples.end.at, request['mode'])
         # The guest uses a fixed time limit. Keep its rows out of the shared time limit history.
         _ = row.pop('vcpus')
         row.update(checkout=str(repo), source=TARGET, dirty=source.commit != source.head,
@@ -2570,7 +2570,7 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         completion = placement.AttemptCompleted((status or 1) if checkout_changed else status)
         if checkout_changed:
             return GuestGateBlocked('the checkout changed during the guest run')
-        if isinstance(dispatch.samples, GuestGateSamples):
+        if isinstance(selected, AllModules) and isinstance(dispatch.samples, GuestGateSamples):
             record_guest_gate(repo, source, request, run, dispatch.samples)
         return run
     except mac_run.MacRunRefused as error:

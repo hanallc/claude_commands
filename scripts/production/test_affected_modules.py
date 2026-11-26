@@ -382,6 +382,22 @@ class AffectedModulesTests(unittest.TestCase):
             self.assertEqual({module.name for module in self.selection().modules},
                              {"test_config.py", "test_folder.py", "test_unrecorded.py"})
 
+    def test_newer_guest_gate_does_not_supply_module_reads(self) -> None:
+        module = {"suite": "checks", "module": "test_reader.py", "attempt": 1}
+        run = {**gate_run(), "kind": "gate_run", "v": 1, "id": "full", "host": "mac",
+               "selection": "full", "aborted": False, "started_at": "2026-01-01T00:00:00Z",
+               "modules": [{**module, "config_reads": ["limits"], "folder_scans": ["assets"],
+                            "content_reads": ["docs/index.md"]}]}
+        self.write(".git/buildlog/mac/fixture.jsonl", json.dumps(run) + "\n")
+        expected = affected.latest_module_reads()
+        self.assertEqual(set(expected), {"scripts/checks/test_reader.py"})
+
+        guest_module: dict[str, object] = {**module, "config_reads": [], "folder_scans": [], "content_reads": []}
+        guest: dict[str, object] = {**run, "id": "guest-full", "host": "mac-linux", "source": "mac-linux",
+                                    "started_at": "2026-01-02T00:00:00Z", "modules": [guest_module]}
+        self.write(".git/buildlog/mac-linux/2026-01.jsonl", json.dumps(guest) + "\n")
+        self.assertEqual(affected.latest_module_reads(), expected)
+
     def test_landing_bases_exclude_changes_that_already_passed_the_gate(self) -> None:
         self.write("scripts/landed/subject.py", "VALUE = 1\n")
         self.write("scripts/own/subject.py", "VALUE = 1\n")

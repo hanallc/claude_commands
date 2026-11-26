@@ -3823,6 +3823,16 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual([(module['suite'], module['module'], module['wall_s'], module['cpu_s']) for module in modules],
                          [('fixture', 'test_first.py', 1.3, 1.0), ('fixture', 'test_second.py', 1.3, 1.0)])
 
+    def test_named_guest_run_writes_no_gate_record(self) -> None:
+        with patch.dict(os.environ, {'FIXTURE_GUEST_RESULT': 'pass',
+                                     'FIXTURE_MODULE_SECONDS': '7',
+                                     'FIXTURE_EXPECTED_MAIN': self.git('rev-parse', 'origin/main')}):
+            result = gate.run_gate_suites(self.repo, mode=SuiteMode.TARGETED, target=gate.MacLinuxAssignment(self.placed),
+                                          named=('fixture/test_first.py', 'fixture/test_second.py'))
+        self.assertTrue(result.passed)
+        self.assertEqual([job.module for job in result.jobs], ['test_first.py', 'test_second.py'])
+        self.assertEqual(list((store.root() / mac_linux.TARGET).glob('*.jsonl')), [])
+
     def test_guest_saves_distinct_start_and_end_mac_load(self) -> None:
         start = time.time() - 2
         end = start + 1

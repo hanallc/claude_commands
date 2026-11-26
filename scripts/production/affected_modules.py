@@ -23,6 +23,7 @@ import tempfile
 from typing import cast
 
 from scripts.lib import conf
+from scripts.mac_test.eligibility import MAC_LINUX_TARGET
 from scripts.test_times.gate_record import (
     ListedDirectory, ModuleReadRecord, NoConfigReadRecord, NoContentReadRecord,
     NoFolderScanRecord, RecordedConfigReads, RecordedContentReads, RecordedFolderScans,
@@ -719,26 +720,28 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
 
 
 def latest_module_reads() -> dict[str, ModuleReadRecord]:
-    """Read each field from its newest full, non-aborted gate."""
+    """Read each field from its newest eligible full gate."""
     from scripts.buildlog import index
 
     _ = index.update()
     with closing(index.read_only()) as connection:
         rows = cast(list[tuple[str, str, str | None, str | None, str | None]], connection.execute(
-            "WITH latest AS (SELECT "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            "WITH eligible AS NOT MATERIALIZED (SELECT id, started_at FROM gate_runs "
+            + "WHERE selection = 'full' AND aborted = 0 AND host IS NOT ?), latest AS (SELECT "
+            + "(SELECT id FROM eligible WHERE "
+            + "EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = eligible.id "
             + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "(SELECT id FROM eligible WHERE "
+            + "EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = eligible.id "
             + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "(SELECT id FROM eligible WHERE "
+            + "EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = eligible.id "
             + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
             + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
             + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
             + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
-            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
+            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt",
+            (MAC_LINUX_TARGET,),
         ).fetchall())
     recorded: dict[str, ModuleReadRecord] = {}
     for suite, module, config_json, folder_json, content_json in rows:
