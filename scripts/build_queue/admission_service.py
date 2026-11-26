@@ -17,7 +17,7 @@ import json
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum, auto
-from functools import cache
+from functools import cache, partial
 from importlib import import_module
 import os
 from pathlib import Path
@@ -66,7 +66,7 @@ from scripts.buildlog import repository, store
 from scripts.lib import test_phase
 from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNotRecorded, StepJob
 from scripts.build_queue.placement import MAC_LINUX_NO_ANSWER, MAC_LINUX_START_UNCONFIRMED
-from scripts.lib.build_steps import INTERPRETER, command_script, gate_job_from_process
+from scripts.lib.build_steps import gate_job_from_process
 
 from scripts.build_queue.scope_activity import (
     IdleService, LiveBuildRun, NoLiveBuildRun, NotServiceSlice, RunningServiceJob, WaitingServiceJob, UnmatchedServiceJob,
@@ -299,6 +299,16 @@ class UnreadableReadingHold:
 
 
 @dataclass(frozen=True)
+class NoReadingAlertDelivery:
+    """No reading alert sender has started."""
+
+
+@dataclass(frozen=True)
+class ReadingAlertDelivery:
+    thread: threading.Thread
+
+
+@dataclass(frozen=True)
 class SourceAlert:
     key: str
     message: str
@@ -322,31 +332,29 @@ def send_admission_alert(recipient: str, message: str) -> bool:
     return False
 
 
-def deliver_reading_alert(hold: UnreadableReadingHold, elapsed: float, recovered: threading.Event) -> None:
-    """Claim and send the reading alert."""
+def deliver_reading_alert(claimed: outage_alerts.AlertClaim, hold: UnreadableReadingHold, elapsed: float) -> None:
+    """Send the claimed alert outside the admission pass."""
     message = (f"Build admission: {hold.path} is unreadable.\nReason: {hold.reason}\n"
                f"This reading has held build starts for {elapsed:g} seconds.\n"
                "Restore the reading on natedev. Admission holds starts until the reading works.")
+    delivered = False
     try:
-        if recovered.is_set():
-            return
-        with outage_alerts.reserve((READING_ALERT_KEY,)) as claims:
-            if ((claimed := claims.get(READING_ALERT_KEY)) is not None and not recovered.is_set()
-                    and send_admission_alert("natedev", message)):
-                outage_alerts.delivered(claimed)
-    except (OSError, ValueError) as error:
+        if send_admission_alert("natedev", message):
+            outage_alerts.delivered(claimed)
+            delivered = True
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print(f"memory admission: reading alert failed: {error}", file=sys.stderr)
+    finally:
+        if not delivered:
+            outage_alerts.release(claimed)
 
 
-def deliver_source_refusal(alert: SourceAlert, cleared: threading.Event | None = None) -> None:
-    """Claim and send the source alert unless a grant clears it."""
+def deliver_source_refusal(alert: SourceAlert, *, now: Callable[[], float] = time.time) -> None:
+    """Claim and send the source alert."""
     try:
-        if cleared is not None and cleared.is_set():
-            return
         with outage_alerts.reserve((alert.key,)) as claims:
-            if ((claimed := claims.get(alert.key)) is not None and (cleared is None or not cleared.is_set())
-                    and send_admission_alert("bob", alert.message)):
-                outage_alerts.delivered(claimed)
+            if (claimed := claims.get(alert.key)) is not None and send_admission_alert("bob", alert.message):
+                outage_alerts.delivered(claimed, sent_at=now())
     except (OSError, ValueError) as error:
         print(f"memory admission: source refusal alert failed: {error}", file=sys.stderr)
 
@@ -384,22 +392,13 @@ class AdmissionAlertSender:
         self.pending.put(None)
 
 
-def clear_admission_alert(key: str, observed_at: float, name: str) -> bool:
-    """Clear an older alert and report a failure for retry."""
+def clear_source_refusal(prefix: str, observed_at: float) -> bool:
     try:
-        if outage_alerts.clear(key, observed_at):
-            return True
-        print(f"memory admission: cannot clear {name} alert; will retry", file=sys.stderr)
-    except (OSError, ValueError) as error:
-        print(f"memory admission: cannot clear {name} alert: {error}", file=sys.stderr)
-    return False
-
-
-def clear_source_refusal(prefix: str, observed_at: float) -> None:
-    try:
-        _ = outage_alerts.clear_prefix(prefix, observed_at)
+        _ = outage_alerts.clear_prefix(prefix, observed_at, delivered_only=True)
+        return True
     except (OSError, ValueError) as error:
         print(f"memory admission: cannot clear source refusal alert: {error}", file=sys.stderr)
+        return False
 
 
 @dataclass(frozen=True)
@@ -464,23 +463,10 @@ def source_program(argv0: str) -> str:
 
 
 def source_command_text(args: tuple[str, ...] | str) -> str:
-    """Show the program and an explicit script path."""
+    """Show only the program name."""
     if isinstance(args, str):
-        try:
-            args = tuple(shlex.split(args))
-        except ValueError:
-            return "unavailable"
-    if not args:
-        return "unavailable"
-    program = source_program(args[0])
-    end = 1
-    if INTERPRETER.fullmatch(program):
-        while end < len(args) and re.fullmatch(r"-[bBdEefHiInOPqRsStuvVx]+", args[end]):
-            end += 1
-        if end < len(args) and not args[end].startswith("-"):
-            end += 1
-    script = command_script(args[:end])
-    return f"{program} {script}" if script and script != program else program
+        return source_observed_program(args)
+    return source_program(args[0]) if args else "unavailable"
 
 
 def source_observed_program(command: str) -> str:
@@ -2416,13 +2402,11 @@ class AdmissionServer:
         # The natedev hold of each held local waiter at the last pass.
         self.local_holds: dict[str, records.NatedevHeld | records.ReadingUnavailable] = {}
         self.alerts: AdmissionAlertSender = AdmissionAlertSender()
-        self.source_refusals: dict[SourceLocation, threading.Event] = {}
+        # A saved replay entry holds each clear until the sender completes it.
+        self.source_clear_jobs: dict[str, Future[bool] | None] = {}
         self.reading_hold: UnreadableReadingHold | NoReadingHold = NoReadingHold()
-        self.reading_alert_recovered: threading.Event = threading.Event()
-        self.reading_alert_delivery: Future[None] | None = None
-        self.reading_alert_clear: Future[bool] | None = None
+        self.reading_alert_delivery: ReadingAlertDelivery | NoReadingAlertDelivery = NoReadingAlertDelivery()
         self.reading_alert_needs_clear: bool = True
-        self.outage_alert_clear: Future[bool] | None = None
         self.outage_alert_needs_clear: bool = True
         self.listener_started_at: float = float("inf")
         self.configuration: gate.UsableAdmissionConfiguration | gate.UnusableAdmissionConfiguration = gate.UnusableAdmissionConfiguration("configuration not read")
@@ -2544,6 +2528,9 @@ class AdmissionServer:
             self.reservations, self.places = state.reservations, state.places
             self.queue_pins = state.queue_pins
             self.ledger = ReplayLedger(state.ledger)
+            self.source_clear_jobs = {key: None for key, entry in self.ledger.items()
+                                      if key.startswith("source-refused:") and isinstance(entry.reply, wire.Ok)
+                                      and isinstance(entry.ended_at, float)}
             self.placement_replacements = ReplayLedger(state.placement_replacements)
             self.spacing, self.priority = state.spacing, state.priority
             self.bumps = state.bumps
@@ -2650,6 +2637,13 @@ class AdmissionServer:
         return self._inputs_with_current_slots(inputs, ordered)
 
     def persist(self) -> None:
+        for key, job in tuple(self.source_clear_jobs.items()):
+            if job is not None and job.done():
+                if job.exception() is None and job.result():
+                    del self.ledger[key]
+                    del self.source_clear_jobs[key]
+                else:
+                    self.source_clear_jobs[key] = None
         now = self.clock.now()
         live_callers: dict[str, str] = {}
         for key, version in self.caller_versions.items():
@@ -2660,7 +2654,7 @@ class AdmissionServer:
         live_reservations = self._live_reservation_ids()
         live_dispatches = {"dispatch:" + key for key, saved in self.assignments.items()
                            if isinstance(saved.state, placement.CurrentAssignment)}
-        protected_keys = self.reservations.keys() | live_dispatches
+        protected_keys = self.reservations.keys() | live_dispatches | self.source_clear_jobs.keys()
         for key in tuple(self.ledger.live):
             entry = self.ledger[key]
             if key not in protected_keys and entry.reservation not in live_reservations:
@@ -2718,6 +2712,10 @@ class AdmissionServer:
                 self._persisted = encoded
                 self.fault("after_state_write")
         self.durable_encodings = encodings
+        for key, job in self.source_clear_jobs.items():
+            entry = self.ledger[key]
+            if job is None and isinstance(entry.ended_at, float):
+                self.source_clear_jobs[key] = self.alerts.submit(partial(clear_source_refusal, key, entry.ended_at))
         self._drain_lifecycle()
 
     def _unwatch(self, descriptor: int) -> None:
@@ -3727,17 +3725,13 @@ class AdmissionServer:
             reason = inputs.pressure.reason
         else:
             self.reading_hold = NoReadingHold()
-            self.reading_alert_recovered.set()
-            if self.reading_alert_clear is not None and self.reading_alert_clear.done():
-                self.reading_alert_needs_clear = not self.reading_alert_clear.result()
-                self.reading_alert_clear = None
-            if self.reading_alert_needs_clear and self.reading_alert_clear is None:
-                observed_at = self.clock.now()
-                self.reading_alert_clear = self.alerts.submit(
-                    lambda: clear_admission_alert(READING_ALERT_KEY, observed_at, "reading"))
+            if self.reading_alert_needs_clear:
+                try:
+                    self.reading_alert_needs_clear = not outage_alerts.clear(READING_ALERT_KEY, self.clock.now())
+                except (OSError, ValueError) as error:
+                    print(f"memory admission: cannot clear reading alert: {error}", file=sys.stderr)
             return
         self.reading_alert_needs_clear = True
-        self.reading_alert_clear = None
         held = any(row.decision.state == "hold" and not isinstance(row.reason, records.TokenWaitingWaiter)
                    and not isinstance(row.decision.room.basis, records.WithinSlot)
                    for row in result.rows)
@@ -3749,13 +3743,22 @@ class AdmissionServer:
         elapsed = self.clock.monotonic() - since
         if elapsed < config.reading_alert_seconds:
             return
-        if self.reading_alert_delivery is not None and not self.reading_alert_delivery.done():
+        if isinstance(self.reading_alert_delivery, ReadingAlertDelivery) and self.reading_alert_delivery.thread.is_alive():
             return
-        hold = self.reading_hold
-        if self.reading_alert_recovered.is_set():
-            self.reading_alert_recovered = threading.Event()
-        recovered = self.reading_alert_recovered
-        self.reading_alert_delivery = self.alerts.submit(lambda: deliver_reading_alert(hold, elapsed, recovered))
+        try:
+            claimed = outage_alerts.claim(READING_ALERT_KEY)
+            if not isinstance(claimed, outage_alerts.AlertClaim):
+                return
+            thread = threading.Thread(target=deliver_reading_alert, args=(claimed, self.reading_hold, elapsed),
+                                      name="admission-reading-alert", daemon=True)
+            try:
+                thread.start()
+            except RuntimeError:
+                outage_alerts.release(claimed)
+                raise
+            self.reading_alert_delivery = ReadingAlertDelivery(thread)
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"memory admission: cannot start reading alert: {error}", file=sys.stderr)
 
     def _pass_allowed_at(self) -> float:
         """Passes start at least min_pass_gap_seconds apart, so a burst of requests shares one pass."""
@@ -4636,6 +4639,7 @@ class AdmissionServer:
                 self.ledger[request.episode] = ReplayEntry(reply, LiveGrant())
                 self._watch_owner(request.owner)
             self._save_place(request, waiting.row)
+            self._stage_source_refusal_clear(request, now)
             if isinstance(admission, wire.LaunchAdmitted):
                 self._end_move(waiting)
             replies.append(reply)
@@ -4650,7 +4654,6 @@ class AdmissionServer:
             print(line, file=sys.stderr, flush=True)
         for waiting, reply in zip(waiters, replies, strict=True):
             request = waiting.request
-            self._clear_source_refusal(request)
             if isinstance(reply, wire.Admitted) and isinstance(request, wire.AdmitRequest) and isinstance(
                     self.system_reader, OperatingSystemReader):
                 self.system_reader.register_trace(self.reservations[request.episode], request.argv, self.host, now)
@@ -6604,12 +6607,12 @@ done
         self._watch_owner(wire.Owner(request.holder.pid, request.holder.start_time))
         status = wire.DispatchStatus(assignment, saved.state, saved.permission)
         self.ledger["dispatch:" + key] = ReplayEntry(status, LiveGrant())
+        if destination.provider != "local":
+            self._stage_source_refusal_clear(submitted, observed_at)
         self._schedule_pass()
         self.persist()
         if destination.target == mac_linux.TARGET:
             self.pass_stale = True
-        if destination.provider != "local":
-            self._clear_source_refusal(submitted)
         return wire.FirstAuthorization(assignment, reference)
 
     def _guest_took_no_run(self, saved: records.SavedPlacementAssignment, request: wire.ClaimFailure) -> bool:
@@ -7383,8 +7386,7 @@ done
                    else (request.profile.step,))
         alert = SourceAlert(source.alert_key(value, command[0] if command else ""),
                             self._source_refusal_message(request, source, given, source_command_text(command)))
-        cleared = self.source_refusals.setdefault(source, threading.Event())
-        _ = self.alerts.submit(lambda: deliver_source_refusal(alert, cleared))
+        _ = self.alerts.submit(partial(deliver_source_refusal, alert, now=self.clock.now))
         return wire.Refused(reason)
 
     def _source_refusal_message(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest,
@@ -7400,15 +7402,14 @@ done
         return source_refusal_message(source, observed_at=self.clock.now(), machine=machine, given=given,
                                       command=command, process=process, parent=parent)
 
-    def _clear_source_refusal(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest) -> None:
+    def _stage_source_refusal_clear(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest,
+                                    observed_at: float) -> None:
+        """Save the clear with the grant before the sender can run it."""
         if not codec.public_queue_text(request.identity.name):
             return
-        source = source_location(request)
-        observed_at = self.clock.now()
-        # A lock can delay a pending claim until after the grant.
-        if (cleared := self.source_refusals.pop(source, None)) is not None:
-            cleared.set()
-        _ = self.alerts.submit(lambda: clear_source_refusal(source.alert_prefix, observed_at))
+        key = source_location(request).alert_prefix
+        self.ledger[key] = ReplayEntry(wire.Ok(), observed_at)
+        self.source_clear_jobs[key] = None
 
     @staticmethod
     def _placement_identity(request: wire.PlacementRequest) -> wire.Identity:
@@ -8237,13 +8238,12 @@ done
         if (not self.outage_alert_needs_clear or not isinstance(configuration, records.MemoryConfig)
                 or self.clock.monotonic() - self.listener_started_at < configuration.silence_seconds):
             return
-        if self.outage_alert_clear is not None and self.outage_alert_clear.done():
-            self.outage_alert_needs_clear = not self.outage_alert_clear.result()
-            self.outage_alert_clear = None
-        if self.outage_alert_needs_clear and self.outage_alert_clear is None:
-            observed_at = self.clock.now()
-            self.outage_alert_clear = self.alerts.submit(
-                lambda: clear_admission_alert("build-admission", observed_at, "outage"))
+        try:
+            self.outage_alert_needs_clear = not outage_alerts.clear("build-admission", self.clock.now())
+            if self.outage_alert_needs_clear:
+                print("memory admission: cannot clear outage alert; will retry", file=sys.stderr)
+        except (OSError, ValueError) as error:
+            print(f"memory admission: cannot clear outage alert: {error}", file=sys.stderr)
 
     def run_once(self, timeout: float = 0) -> None:
         self.start()

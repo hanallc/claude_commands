@@ -1271,10 +1271,11 @@ The service sends bob one alert per cause through the outage alert ledger.
 The first hash in the key uses the repository and the resolved absolute working folder.
 The second hash uses the given ID or name and the command program.
 The key has no process ID or time.
-The sender claims and clears ledger entries outside the admission pass.
-The alert shows the command program and its script path when available.
-The alert shows only the process ID and program for each process.
-A named admission clears all older alerts for that repository and folder.
+The source alert sender claims and clears ledger entries outside the admission pass.
+The alert shows the command, process, and parent program names.
+A named admission clears alerts sent before the admission for that repository and folder.
+The admission saves the pending clear in the replay ledger.
+The service resumes pending clears after a reload.
 The shared name check rejects blank text, dashes, raw IDs, text with `$`, and the fallback label.
 A staff unit uses its own name for priority. A worker uses its parent unit.
 A showrunner keeps its caller name and has an empty unit.

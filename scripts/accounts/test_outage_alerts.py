@@ -35,3 +35,22 @@ class OutageAlertsTests(unittest.TestCase):
                 self.assertIsInstance(outage_alerts.claim(key), outage_alerts.AlertClaim)
             for key in ("source:equal", "source:new", "source-other:old"):
                 self.assertIsInstance(outage_alerts.claim(key), outage_alerts.AlertDelivered)
+
+    def test_clear_prefix_can_use_delivery_time_and_keep_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "scripts.accounts.outage_alerts._path", return_value=Path(directory) / "alerts.json"
+        ):
+            with patch.object(time, "time", return_value=10.0):
+                pending = outage_alerts.claim("source:pending")
+                delivered_early = outage_alerts.claim("source:early")
+                delivered_late = outage_alerts.claim("source:late")
+            assert isinstance(pending, outage_alerts.AlertClaim)
+            assert isinstance(delivered_early, outage_alerts.AlertClaim)
+            assert isinstance(delivered_late, outage_alerts.AlertClaim)
+            outage_alerts.delivered(delivered_early, sent_at=11.0)
+            outage_alerts.delivered(delivered_late, sent_at=13.0)
+            self.assertEqual(outage_alerts.clear_prefix("source:", 12.0, delivered_only=True), 1)
+            with patch.object(time, "time", return_value=12.0):
+                self.assertIsInstance(outage_alerts.claim(pending.session_id), outage_alerts.AlertInFlight)
+                self.assertIsInstance(outage_alerts.claim(delivered_early.session_id), outage_alerts.AlertClaim)
+                self.assertIsInstance(outage_alerts.claim(delivered_late.session_id), outage_alerts.AlertDelivered)

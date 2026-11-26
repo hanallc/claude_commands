@@ -110,11 +110,14 @@ def claim(session_id: str) -> AlertClaim | AlertInFlight | AlertDelivered:
         return AlertClaim(session_id, token)
 
 
-def delivered(claimed: AlertClaim) -> None:
+def delivered(claimed: AlertClaim, *, sent_at: float | None = None) -> None:
     with _locked_entries() as entries:
         existing = entries.get(claimed.session_id)
         if existing is not None and existing["state"] == "claimed" and existing["token"] == claimed.token:
-            entries[claimed.session_id] = {**existing, "state": "delivered"}
+            entry: AlertLedgerEntry = {**existing, "state": "delivered"}
+            if sent_at is not None:
+                entry["at"] = sent_at
+            entries[claimed.session_id] = entry
 
 
 def release(claimed: AlertClaim) -> None:
@@ -134,11 +137,12 @@ def clear(session_id: str, observed_at: float) -> bool:
         return True
 
 
-def clear_prefix(prefix: str, observed_at: float) -> int:
+def clear_prefix(prefix: str, observed_at: float, *, delivered_only: bool = False) -> int:
     """Remove matching entries that predate the observation."""
     with _locked_entries() as entries:
         keys = [key for key, entry in entries.items()
-                if key.startswith(prefix) and entry.get("at", 0) < observed_at]
+                if key.startswith(prefix) and entry.get("at", 0) < observed_at
+                and (not delivered_only or entry["state"] == "delivered")]
         for key in keys:
             del entries[key]
         return len(keys)
