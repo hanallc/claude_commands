@@ -3330,6 +3330,19 @@ class ReviewLinksServerTests(unittest.TestCase):
         reply = self.request(review_page.ATTACHMENT_PATH + "?" + urlencode({"key": key, "id": attachment.id}))
         self.assertEqual(reply, HttpReply(200, "image/png", image))
 
+    def test_new_item_reports_the_warning_for_a_truncated_jpeg(self) -> None:
+        _, cache, request = self.page_bug_fixture()
+        jpeg = subprocess.check_output(["magick", "-size", "64x64", "gradient:", "jpeg:-"], timeout=4)
+        image = base64.b64encode(jpeg[:-40]).decode()
+        request = replace(request, images=(new_item_dialog.PastedImage("image/jpeg", image),))
+
+        with patch.object(change_page, "send_to_staff") as send:
+            reply = self.new_item_http(self.new_item_body(request), finished=True)
+        self.assertEqual((reply.status, json.loads(reply.body)),
+                         (400, {"error": "The pasted image could not be read: Premature end of JPEG file."}))
+        self.assertEqual(cache.get().records, {})
+        send.assert_not_called()
+
     def test_new_item_reports_the_image_error_for_an_oversized_png(self) -> None:
         _, cache, request = self.page_bug_fixture()
         width = 9000
