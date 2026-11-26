@@ -3338,12 +3338,14 @@ class ReviewLinksServerTests(unittest.TestCase):
         identified = subprocess.CompletedProcess(
             ["identify"], 1, stdout=b"PNG\n",
             stderr=(b"identify: iCCP: extra compressed data @ warning/png.c/MagickPNGWarningHandler/1534.\n"
-                    + b"libpng: Read Error\n"))
+                    + b"libpng: Read Error\n"
+                    + b"identify: corrupt image @ error/png.c/ReadPNGImage/4200.\n"))
 
         with (patch.object(review_submissions, "_identify_image", return_value=identified),
               patch.object(change_page, "send_to_staff") as send):
             reply = self.new_item_http(self.new_item_body(request), finished=True)
-        self.assertEqual(reply.status, 400, reply.body)
+        self.assertEqual((reply.status, json.loads(reply.body)),
+                         (400, {"error": "The pasted image could not be read: Read Error."}))
         self.assertEqual(cache.get().records, {})
         send.assert_not_called()
 
@@ -3352,16 +3354,25 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         _, cache, request = self.page_bug_fixture()
         request = replace(request, images=(new_item_dialog.PastedImage("image/png", PNG),))
-        identified = subprocess.CompletedProcess(
-            ["identify"], 1, stdout=b"",
-            stderr=(b"identify: unable to write blob '/tmp/magick-output': No space left on device "
-                    + b"`/private/tmp/magick-input' @ error/blob.c/WriteBlob/1400.\n"))
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="review-image's-")))
 
-        with (patch.object(review_submissions, "_identify_image", return_value=identified),
+        def identify(extension: str, path: Path) -> subprocess.CompletedProcess[bytes]:
+            self.assertEqual(path.parent, directory)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.read_bytes(), base64.b64decode(PNG))
+            stderr = f"identify: unable to write blob '{path}': No space left on device `{path}'"
+            return subprocess.CompletedProcess(
+                ["identify", f"{extension}:{path}"], 1, stdout=b"",
+                stderr=stderr.encode() + b" @ error/blob.c/WriteBlob/1400.\n")
+
+        create_source = partial(tempfile.NamedTemporaryFile, dir=directory)
+        with (patch.object(tempfile, "NamedTemporaryFile", side_effect=create_source),
+              patch.object(review_submissions, "_identify_image", side_effect=identify),
               patch.object(change_page, "send_to_staff") as send):
             reply = self.new_item_http(self.new_item_body(request), finished=True)
         error = "The pasted image could not be read: unable to write blob: No space left on device."
         self.assertEqual((reply.status, json.loads(reply.body)), (400, {"error": error}))
+        self.assertEqual(list(directory.iterdir()), [])
         self.assertEqual(cache.get().records, {})
         send.assert_not_called()
 
@@ -3387,8 +3398,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         with patch.object(change_page, "send_to_staff") as send:
             reply = self.new_item_http(self.new_item_body(request), finished=True)
-        self.assertEqual((reply.status, json.loads(reply.body)),
-                         (400, {"error": "The pasted image could not be read: Invalid IHDR data."}))
+        error = "The pasted image could not be read: Image width exceeds user limit in IHDR."
+        self.assertEqual((reply.status, json.loads(reply.body)), (400, {"error": error}))
         self.assertEqual(cache.get().records, {})
         send.assert_not_called()
 
