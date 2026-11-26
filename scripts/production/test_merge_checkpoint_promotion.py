@@ -56,6 +56,40 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_standard_promotion_publishes_a_tip_without_a_workflow_or_ci_record(self) -> None:
+        self.write(self.checkout, "README.md", "candidate\n")
+        _ = self.git("commit", "-am", "candidate", cwd=self.checkout)
+        tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+        _ = self.git("push", "origin", "production", cwd=self.checkout)
+        self.write(self.checkout, ".github/workflows/ci.yml", "name: Untracked CI\n")
+
+        destinations = production_doc.PromoteTo((self.promote,), production_doc.NoMac())
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            result = merge_checkpoint.promote_targets(
+                destinations, "production", tip, source=self.checkout,
+                approval=promotion.CollectedCi(self.doc), label="fixture", local_only=True)
+        self.assertEqual(result, promotion.PublishedMain(tip))
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), tip)
+
+    def test_standard_promotion_holds_a_tip_with_a_workflow_and_no_ci_record(self) -> None:
+        workflow = ".github/workflows/ci.yml"
+        self.write(self.checkout, workflow, "name: CI\n")
+        _ = self.git("add", workflow, cwd=self.checkout)
+        _ = self.git("commit", "-m", "add CI workflow", cwd=self.checkout)
+        tip = self.git("rev-parse", "HEAD", cwd=self.checkout)
+        _ = self.git("push", "origin", "production", cwd=self.checkout)
+        (self.checkout / workflow).unlink()
+
+        main = self.git("rev-parse", "refs/heads/main", cwd=self.origin)
+        destinations = production_doc.PromoteTo((self.promote,), production_doc.NoMac())
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            with self.assertRaisesRegex(checkpoint_gate.Stop, f"collect example CI on {tip}"):
+                _ = merge_checkpoint.promote_targets(
+                    destinations, "production", tip, source=self.checkout,
+                    approval=promotion.CollectedCi(self.doc), label="fixture", local_only=True)
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), main)
+
     def test_hook_failure_warns_without_stopping_either_promotion_path(self) -> None:
         for advances in (False, True):
             with self.subTest(advances=advances):
@@ -793,6 +827,10 @@ with lock.open("a") as held:
                 owner = showrunners.owner_for("example")
                 owner = staff.rename(owner.id, name)
                 _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), doc))
+        else:
+            workflow = ".github/workflows/ci.yaml"
+            self.write(source, workflow, "name: CI\n")
+            _ = self.git("add", workflow, cwd=source)
 
         def next_tip(label: str) -> str:
             self.write(source, "secondary.txt", label)
