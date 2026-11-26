@@ -150,10 +150,13 @@ def check(text: str, kind: Kind, *, key: review.QuestionKey | None = None,
     return replace(result, question=text) if separate_title else result
 
 
-def require(text: str | Sequence[str], kind: Kind, *, identity: str = "", title: str = "",
+def require(text: str | Sequence[str], kind: Kind, *, identity: str | review.QuestionKey = "", title: str = "",
             refusal: type[Exception] = ValueError, caption_layout: review.CaptionLayout | None = None) -> None:
     """Refuse a failed draft. Use a sequence for separate fields that need only the fast check."""
-    key = review.QuestionKey(f"{kind}/{identity}", "") if identity else None
+    if isinstance(identity, str):
+        key = review.QuestionKey(f"{kind}/{identity}", "") if identity else None
+    else:
+        key = identity
     drafts = (text,) if isinstance(text, str) else text
     reasons: list[str] = []
     for draft in drafts:
@@ -175,10 +178,12 @@ def main(arguments: Sequence[str]) -> int:
     _ = parser.add_argument("--file", type=Path, required=True)
     args = parser.parse_args(arguments)
     try:
-        draft = cast(Path, args.file).read_text(encoding="utf-8")
+        path = cast(Path, args.file).resolve()
+        draft = path.read_text(encoding="utf-8")
         if not draft.strip():
             raise ValueError("The draft is empty.")
-        require(draft, cast(Kind, args.kind))
+        kind = cast(Kind, args.kind)
+        require(draft, kind, identity=review.QuestionKey(kind, str(path)))
     except (OSError, ValueError) as error:
         print(f"Console text: {error}", file=sys.stderr)
         return 1

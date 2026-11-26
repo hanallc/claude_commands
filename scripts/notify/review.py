@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 import threading
+from collections import Counter
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -699,8 +700,9 @@ def supported_failures(value: object, draft: Draft, *, reply: bool = False,
             raise UnmatchedConsoleQuote(rule, quote, scope)
         if rule in CODE_RULES:
             continue
-        if rule and matched and all(item.rule != rule for item in failures):
-            failures.append(RuleFailure(rule, quote))
+        failure = RuleFailure(rule, quote)
+        if rule and matched and (failure not in failures if console else all(item.rule != rule for item in failures)):
+            failures.append(failure)
     if not reply:
         failures.extend(code_failures(draft))
     return failures
@@ -750,7 +752,7 @@ def validate(value: object, draft: Draft, revision: bool,
         questions = _strings(record.get("questions"), "questions")
         if not console:
             failures = supported_failures(record.get("failed_rules"), draft, reply=content_only)
-        failed = [failure.rule for failure in failures]
+        failed = list(dict.fromkeys(failure.rule for failure in failures))
         if len(questions) > 3:
             raise ValueError("questions exceeds 3")
         if verdict != "ask" and questions:
@@ -843,6 +845,12 @@ class QuestionPartVerdict:
 
 
 PART_RULES = ("console-standard-5", "times-carry-zone")
+# Rule 10 can fail the wording of a single title or point.
+CROSS_LINE_RULES = frozenset({
+    "console-standard-2", "console-standard-3", "console-standard-4",
+    "console-standard-6", "console-standard-7", "console-standard-9", "console-standard-12",
+    "before-and-after", "every-choice-says-what-it-does", "what-happened-why-what-you-do",
+})
 QUESTION_VERDICT_MAX_AGE = timedelta(days=7)
 QUESTION_VERDICT_SCHEMA: dict[str, object] = {
     "questions": SCHEMA["properties"]["questions"], "failed_rules": SCHEMA["properties"]["failed_rules"],
@@ -933,6 +941,76 @@ def read_part_verdicts(rows: object, pending: dict[int, QuestionPart], draft: Dr
     return verdicts
 
 
+@dataclass(frozen=True)
+class ConsoleDraftLine:
+    text: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class ConsoleLineReview:
+    lines: tuple[str, ...] = ()
+    passed: frozenset[int] = frozenset()
+
+    @classmethod
+    def from_record(cls, value: object, rules: str) -> ConsoleLineReview:
+        record = _object(value)
+        if record.get("rules") != rules:
+            return cls()
+        lines = tuple(_strings(record.get("lines"), "lines"))
+        passed = record.get("passed")
+        if not isinstance(passed, list):
+            raise ValueError("The Console record needs a list of passed line indexes.")
+        indexes = cast(list[object], passed)
+        if any(type(index) is not int or not 0 <= index < len(lines) for index in indexes):
+            raise ValueError("The Console record has an invalid passed line index.")
+        return cls(lines, frozenset(cast(list[int], indexes)))
+
+    def record(self, rules: str) -> dict[str, object]:
+        return {"rules": rules, "lines": self.lines, "passed": sorted(self.passed)}
+
+    def apply(self, body: str, failures: Sequence[RuleFailure]) -> tuple[tuple[RuleFailure, ...], ConsoleLineReview]:
+        lines: list[ConsoleDraftLine] = []
+        offset = 0
+        for raw in body.splitlines(keepends=True):
+            if stripped := raw.strip():
+                start = offset + len(raw) - len(raw.lstrip())
+                lines.append(ConsoleDraftLine(stripped, start, start + len(stripped)))
+            offset += len(raw)
+        text = tuple(line.text for line in lines)
+        changed = text != self.lines
+        previous = {line for index, line in enumerate(line_occurrences(self.lines)) if index in self.passed}
+        passed_before = {index for index, line in enumerate(line_occurrences(text)) if line in previous}
+        passed_now = set(range(len(lines)))
+        kept: list[RuleFailure] = []
+        for failure in failures:
+            overlap = quoted_lines(body, lines, failure.quote)
+            if (failure.rule not in CODE_RULES and overlap and overlap <= passed_before
+                    and not (changed and failure.rule in CROSS_LINE_RULES)):
+                continue
+            kept.append(failure)
+            passed_now.difference_update(overlap)
+        return tuple(kept), ConsoleLineReview(text, frozenset(passed_now))
+
+
+def line_occurrences(lines: Sequence[str]) -> Generator[tuple[str, int]]:
+    count: Counter[str] = Counter()
+    for line in lines:
+        count[line] += 1
+        yield line, count[line]
+
+
+def quoted_lines(body: str, lines: Sequence[ConsoleDraftLine], quote: str) -> set[int]:
+    overlap: set[int] = set()
+    start = body.find(quote)
+    while start >= 0:
+        end = start + len(quote)
+        overlap.update(index for index, line in enumerate(lines) if line.start < end and start < line.end)
+        start = body.find(quote, start + 1)
+    return overlap
+
+
 def expire_question_verdicts(folder: Path, deadline: float) -> None:
     """Remove old records while the folder lock controls access to draft locks."""
     cutoff = time.time() - QUESTION_VERDICT_MAX_AGE.total_seconds()
@@ -1006,20 +1084,27 @@ def lock_question_verdicts(path: Path, deadline: float) -> Generator[None]:
         lock.release()
 
 
-def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, part_system_prompt: str,
-                            draft_prompt: str, ask: Callable[[Mapping[str, object], str, str], StructuredOutcome],
-                            metadata: Callable[[], ReviewMetadata], *, revision: bool,
-                            review_date_and_zone: str, deadline: float) -> ReviewOutcome:
-    parts = question_parts(draft.body)
+def review_console(draft: Draft, context: QuestionReview, system_prompt: str, part_system_prompt: str,
+                   draft_prompt: str, ask: Callable[[Mapping[str, object], str, str], StructuredOutcome],
+                   metadata: Callable[[], ReviewMetadata], *, revision: bool,
+                   review_date_and_zone: str, deadline: float) -> ReviewOutcome:
+    question = context.console_kind == "question"
+    parts = question_parts(draft.body) if question else [QuestionPart(role="draft", text=draft.body)]
     whole = len(parts) == 1
     prompt = system_prompt if whole else part_system_prompt
     schema = SCHEMA if whole else PART_REVIEW_SCHEMA
+    key = context.key
     scope = (key.name, "request", key.request_key) if key.request_key else (key.name, "title", key.text)
+    if not question:
+        scope = (*scope, context.console_kind)
     folder = state_path() / "question-verdicts"
     path = folder / f"{question_part_digest(scope)}.json"
     rules = question_part_digest((prompt, schema, CODE_RULES, PART_RULES, review_date_and_zone))
-    fingerprints = {number: question_part_digest((rules, part, parts[:number - 1].count(part)))
-                    for number, part in enumerate(parts, 1)}
+    line_rules = question_part_digest((system_prompt, part_system_prompt, SCHEMA, PART_REVIEW_SCHEMA,
+                                      CODE_RULES, PART_RULES, review_date_and_zone, context.caption_layout,
+                                      sorted(CROSS_LINE_RULES)))
+    fingerprints = ({number: question_part_digest((rules, part, parts[:number - 1].count(part)))
+                     for number, part in enumerate(parts, 1)} if question else {})
 
     try:
         with lock_question_verdicts(path, deadline):
@@ -1027,6 +1112,7 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
                 saved = _object(cast(object, json.loads(path.read_text(encoding="utf-8"))))
             except FileNotFoundError:
                 saved = {}
+            line_review = ConsoleLineReview.from_record(saved.get("line_review", {}), line_rules)
             read_verdict = part_verdict if whole else independent_verdict
             reused = {
                 number: read_verdict(_object(saved[digest]), replace(draft, body=parts[number - 1]["text"]),
@@ -1034,7 +1120,8 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
                 for number, digest in fingerprints.items() if digest in saved
             }
             if whole and reused:
-                return combine_question_verdicts(draft, list(reused.values()), metadata())
+                cached, _ = combine_question_verdicts(draft, list(reused.values()), metadata(), line_review)
+                return cached
             pending = {number: part for number, part in enumerate(parts, 1) if number not in reused}
             if not whole:
                 fields = json.dumps({"draft": draft.body, "parts": pending}, ensure_ascii=False)
@@ -1042,8 +1129,10 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
             answer = ask(schema, prompt, draft_prompt)
             if not isinstance(answer, StructuredAnswer):
                 result = model_failure(answer, draft, metadata(), console=True)
-                if isinstance(result, Unreviewed) and any(row.questions or row.failures for row in reused.values()):
-                    return combine_question_verdicts(draft, list(reused.values()), metadata())
+                if isinstance(result, Unreviewed) and reused:
+                    cached, _ = combine_question_verdicts(draft, list(reused.values()), metadata(), line_review)
+                    if not isinstance(cached, Approved):
+                        return cached
                 return result
             if whole:
                 result = validate(answer.value, draft, revision, metadata(), question=True, console=True)
@@ -1063,34 +1152,46 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
                 draft_verdict = part_verdict(record, draft)
                 reported = read_part_verdicts(response["parts"], pending, draft)
             latest = reused | reported
-            combined = combine_question_verdicts(draft, [draft_verdict, *(latest[n] for n in sorted(latest))], metadata())
+            combined, line_review = combine_question_verdicts(
+                draft, [draft_verdict, *(latest[n] for n in sorted(latest))], metadata(), line_review,
+                deduplicate_questions=question)
             if isinstance(combined, Failed):
                 return combined
+            kept: set[RuleFailure] = set(combined.failures) if isinstance(combined, (Questions, Rewritten)) else set()
             saved = {
                 fingerprints[number]: {
                     "questions": verdict.questions,
-                    "failed_rules": [{"rule": failure.rule, "quote": failure.quote} for failure in verdict.failures],
+                    "failed_rules": [
+                        {"rule": failure.rule, "quote": failure.quote}
+                        for failure in verdict.failures if failure in kept
+                    ],
                 }
-                for number, verdict in latest.items()
+                for number, verdict in latest.items() if number in fingerprints
             }
-            write_text_atomic(path, json.dumps(saved) + "\n", new_file_mode=0o600)
+            record = {"line_review": line_review.record(line_rules), **saved}
+            write_text_atomic(path, json.dumps(record) + "\n", new_file_mode=0o600)
             return combined
     except (OSError, ValueError) as error:
         return Failed(draft, [str(error)], metadata())
 
 
 def combine_question_verdicts(draft: Draft, verdicts: Sequence[QuestionPartVerdict],
-                              metadata: ReviewMetadata) -> Approved | Questions | Rewritten | Failed:
-    questions = list(dict.fromkeys(question for verdict in verdicts for question in verdict.questions))
-    failures = tuple(dict.fromkeys(failure for verdict in verdicts for failure in verdict.failures))
+                              metadata: ReviewMetadata, line_review: ConsoleLineReview, *,
+                              deduplicate_questions: bool = True,
+                              ) -> tuple[Approved | Questions | Rewritten | Failed, ConsoleLineReview]:
+    questions = [question for verdict in verdicts for question in verdict.questions]
+    if deduplicate_questions:
+        questions = list(dict.fromkeys(questions))
+    reported = tuple(dict.fromkeys(failure for verdict in verdicts for failure in verdict.failures))
+    failures, line_review = line_review.apply(draft.body, reported)
     if len(questions) > 3:
-        return Failed(draft, ["questions exceeds 3"], metadata, failures)
+        return Failed(draft, ["questions exceeds 3"], metadata, failures), line_review
     rules = list(dict.fromkeys(failure.rule for failure in failures))
     if questions:
-        return Questions(draft, questions, rules, metadata, failures)
+        return Questions(draft, questions, rules, metadata, failures), line_review
     if failures:
-        return Rewritten(draft, rules, metadata, failures)
-    return Approved(draft, metadata)
+        return Rewritten(draft, rules, metadata, failures), line_review
+    return Approved(draft, metadata), line_review
 
 
 def model_failure(outcome: ModelTimeout | ModelExit | ModelError | BadJson | ShellRefused | ModelUnavailable,
@@ -1202,10 +1303,10 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
             return call.outcome
 
         system_prompt = f"{guide.stdout}\n{prompt}"
-        if isinstance(context, QuestionReview) and context.console_kind == "question":
-            return review_console_question(draft, context.key, system_prompt, f"{guide.stdout}\n{part_prompt}",
-                                           draft_prompt, ask, details, revision=revision,
-                                           review_date_and_zone=review_date_and_zone, deadline=started + timeout)
+        if isinstance(context, QuestionReview) and context.console_kind:
+            return review_console(draft, context, system_prompt, f"{guide.stdout}\n{part_prompt}",
+                                  draft_prompt, ask, details, revision=revision,
+                                  review_date_and_zone=review_date_and_zone, deadline=started + timeout)
         result = ask(SCHEMA, system_prompt, draft_prompt)
         if isinstance(result, StructuredAnswer):
             return validate(result.value, draft, revision, details(), reply=isinstance(context, ReplyContext),

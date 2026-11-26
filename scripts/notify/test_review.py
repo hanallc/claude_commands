@@ -486,6 +486,71 @@ class LocalReviewTests(unittest.TestCase):
                          [["1", "2", "3", "4", "5"], ["1", "2"], ["1", "2"], ["3"]])
         self.assertIn("- No, keep the partial file.", requests[1]["draft"])
 
+    def test_console_question_keeps_the_passed_title_after_two_other_lines_change(self) -> None:
+        title = "## The change for your 07:15 PST Yes is ready: may it go in?"
+        question = (
+            f"{title}\n\nThe change is ready. You get this question before it goes in.\n\n"
+            "- Yes (the change goes in)\n- No (the change stays out)\n\n"
+            "Recommended: Yes, because you get fewer questions."
+        )
+        revised = question.replace("- No (the change stays out)", "- No (you keep getting these questions)")
+        revised = revised.replace("you get fewer questions", "it is the change you approved at 07:15 PST")
+        key = review.QuestionKey("question", "draft.md")
+        earlier = review.RuleFailure("console-standard-2", "you get fewer questions")
+        changed = review.RuleFailure("console-standard-4", "it is the change you approved at 07:15 PST")
+
+        def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
+            request = question_request(prompt)
+            failures = [earlier] if request["draft"] == question else [
+                changed, review.RuleFailure("console-standard-10", title),
+            ]
+            return question_batch(request, failures=[
+                review.RuleFailureRecord(rule=failure.rule, quote=failure.quote) for failure in failures
+            ])
+
+        runner = FakeReviewer(verdict(self.draft))
+        with mock.patch.object(review, "structured_call", side_effect=judge):
+            self.assertEqual(review.review_question(key, question, runner=runner, console_kind="question"),
+                             review.QuestionReviewFailed(question, (), (earlier,)))
+            self.assertEqual(review.review_question(key, revised, runner=runner, console_kind="question"),
+                             review.QuestionReviewFailed(revised, (), (changed,)))
+        hold = review.state_path() / "questions" / f"{key.digest}.json"
+        self.assertNotIn("console-standard-10", hold.read_text())
+
+    def test_console_revision_keeps_failures_on_changed_and_previously_failed_lines(self) -> None:
+        title = "Retry the download?"
+        point = "The file is in phase 1."
+        draft = replace(self.draft, title="", action=NoActionRequired(), body=f"{title}\n{point}\nThe file is ready.")
+        revised = replace(draft, body=f"  {title}  \n{point}\nThe file is in phase 2.")
+        key = review.QuestionKey("demo", title)
+        existing = review.RuleFailureRecord(rule="console-standard-5", quote="phase 1")
+        added = review.RuleFailureRecord(rule="console-standard-5", quote="phase 2")
+        runner = FakeReviewer(verdict(draft, "rewrite", failed_rules=[existing]))
+        self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind="reply"),
+                         review.QuestionReviewFailed(draft.body, (), (review.RuleFailure(**existing),)))
+        runner.value = verdict(revised, "rewrite", failed_rules=[
+            {"rule": "console-standard-10", "quote": title}, existing, added,
+        ])
+        self.assertEqual(review.review_question(key, revised.body, runner=runner, console_kind="reply"),
+                         review.QuestionReviewFailed(revised.body, (), (
+                             review.RuleFailure(**existing), review.RuleFailure(**added),
+                         )))
+
+    def test_console_revision_keeps_a_quote_that_spans_a_changed_line(self) -> None:
+        title = "Retry the download?"
+        draft = replace(self.draft, title="", action=NoActionRequired(), body=f"{title}\nThe file is ready.")
+        key = review.QuestionKey("demo", title)
+        runner = FakeReviewer(verdict(draft))
+        self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind="question"),
+                         review.QuestionAccepted(draft.body))
+
+        revised = replace(draft, body=f"{title}\nThe file is partial.")
+        failure = review.RuleFailureRecord(rule="console-standard-10", quote=revised.body)
+        runner.value = verdict(revised, "ask", failed_rules=[failure], questions=["How much of the file is ready?"])
+        self.assertEqual(review.review_question(key, revised.body, runner=runner, console_kind="question"),
+                         review.QuestionAwaitingFacts(revised.body, ("How much of the file is ready?",),
+                                                      (review.RuleFailure(**failure),)))
+
     def test_console_question_checks_an_unchanged_recommendation_against_a_revised_fact(self) -> None:
         title = "Retry the download?"
         recommendation = "Recommended: Yes. You get the full file."
@@ -493,7 +558,7 @@ class LocalReviewTests(unittest.TestCase):
         revised = draft.replace("A partial file is on disk.", "You get the full file.")
         key = review.QuestionKey("demo", title)
         runner = FakeReviewer(verdict(self.draft))
-        failure = review.RuleFailure("console-standard-2", "You get the full file.")
+        failure = review.RuleFailure("console-standard-2", recommendation)
         requests: list[QuestionReviewRequest] = []
 
         def judge(*_args: object, prompt: str, **_options: object) -> review.StructuredCall:
