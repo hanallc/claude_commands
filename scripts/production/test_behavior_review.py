@@ -183,15 +183,20 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             self.assertEqual(code, 1, output)
             self.assertIn("missing findings", output)
             self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+            self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": "Move at once.",
+                                    "source": str(self.root / "decision.md"), "date": "2026-11-23",
+                                    "change": "The test now expects the move to wait."}]))
+            code, output = self.cli("run", *args)
+            self.assertEqual(code, 1, output)
+            self.assertIn("the reply has no behavior name. Run the check again for a new review.", output)
+            self.assertFalse(behavior_check.record_path(key).with_suffix(".run").exists())
             self.reply('[{"test":"test_fixture.py::test_move","finding":"none"}]')
             self.assertEqual(self.cli("run", *args), (0, f"{key} clear\n"))
-        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(runner.call_count, 3)
 
     def filed_question(self) -> tuple[list[str], str, behavior_check.Waiting, update_registration.QuestionRecord]:
         args, key = self.changed_range()
-        source = self.write(self.root / "decision.md", "Move at once.")
-        self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": "Move at once.",
-                                "source": str(source), "date": "2026-11-23", "change": "The move waits for the current step."}]))
+        self.specified_move_reply()
 
         def accept(_key: review.QuestionKey, question: str, *, console_kind: str) -> review.QuestionAccepted:
             self.assertEqual(console_kind, "question")
@@ -208,22 +213,54 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             behavior_check.record_path(key).unlink()
             self.assertEqual(self.cli("run", *args, "--production", self.producer.name), (1, output))
         runner.assert_called_once()
+        prompt = cast(str, runner.call_args.args[1])
+        self.assertIn("write one sentence about what Nate would see change", prompt)
+        self.assertIn("Omit test names, file names, and function names", prompt)
         text_check.assert_called_once()
         self.assertEqual(behavior_check.read_record(key), waiting)
         records = update_registration.question_records_for_owner(self.producer.id, strict=True)
         self.assertEqual(len(records), 1)
         question = records[0]
-        shown = question.item.get("question", "")
-        for words in ("Move at once.", "The move waits for the current step.", "Yes. Land", "No. Keep"):
-            self.assertIn(words, shown)
-
+        self.assertEqual(question.item.get("parts"), {
+            "ask": "Allow a change to immediate moves? (2026-11-23)",
+            "context": ('On 2026-11-23 you said, "Move at once." If you say Yes, the move waits for the current step. '
+                        + 'The merge waits for your answer.'),
+            "items": [],
+            "recommend": "No, because you keep immediate moves.",
+            "choices": ["Yes (the move waits for the current step)", "No (the change stays out and you keep immediate moves)"],
+        })
+        self.assertNotIn("test_move", question.item.get("question", ""))
+        self.assertNotIn("test_fixture.py", question.item.get("question", ""))
         return args, key, waiting, question
+
+    def specified_move_reply(self) -> None:
+        source = self.write(self.root / "decision.md", "Move at once.")
+        self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": "Move at once.",
+                                "source": str(source), "date": "2026-11-23", "behavior": "immediate moves",
+                                "change": "If you say Yes, the move waits for the current step."}]))
+
+    def test_a_console_hold_reports_that_nate_was_not_asked_and_refuses_land(self) -> None:
+        args, key = self.changed_range()
+        self.specified_move_reply()
+        hold = review.QuestionAwaitingFacts("draft", ("Explain the wait.",))
+        with (mock.patch.object(astra_review, "run_review", return_value=0),
+              mock.patch.object(review, "review_question", return_value=hold) as text_check):
+            code, output = self.cli("run", *args, "--production", self.producer.name)
+        text_check.assert_called_once()
+        self.assertEqual(code, 1)
+        self.assertIn("question held for review", output)
+        self.assertIn("Explain the wait.\nNate was not asked.\n", output)
+        self.assertEqual(update_registration.question_records_for_owner(self.producer.id, strict=True), [])
+        self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+        self.assertEqual(self.cli("check", *args)[0], 1)
 
     def test_review_choice_text_maps_to_yes_and_no(self) -> None:
         _, key, waiting, question = self.filed_question()
         update_registration.write_question_record(replace(question, status="closed"))
-        for words, approval in ((behavior_review.YES_CHOICE, behavior_check.Approval.YES),
-                                (behavior_review.NO_CHOICE, behavior_check.Approval.NO)):
+        parts = question.item.get("parts")
+        assert parts is not None
+        yes, no = parts["choices"]
+        for words, approval in ((yes, behavior_check.Approval.YES), (no, behavior_check.Approval.NO)):
             with self.subTest(answer=words):
                 update_registration.record_review_log(question, f"answer: {words}")
                 saved = update_registration.numbered_question(question.owner, waiting.question_id, question.path.parent)
@@ -262,13 +299,15 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                     self.assertIn("answered No", output)
                 behavior_check.write_record(key, waiting)
 
-    def test_questions_with_the_same_test_title_keep_distinct_request_keys(self) -> None:
+    def test_questions_with_the_same_behavior_title_keep_distinct_request_keys(self) -> None:
         _, key, first, question = self.filed_question()
         title = question.item["text"]
-        self.assertIn("test_move", title)
         evidence = behavior_review.SpecifiedBehavior("test_fixture.py::test_move", "Move at once.",
                                                       self.root / "decision.md", date(2026, 11, 23),
-                                                      "The move waits for the current step.")
+                                                      "If you say Yes, the move waits for the current step.",
+                                                      "immediate moves")
+        extra = replace(evidence, test="other.py::test_stop", quote="Restart the work", day=date(2026, 11, 24),
+                        change="If you say Yes, the work stays stopped.", behavior="work restarts")
         second_key = "e" * 64
         keys: list[review.QuestionKey] = []
 
@@ -281,7 +320,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             second = behavior_review.ask(second_key, [evidence], self.producer.name)
             self.assertEqual(behavior_review.ask(second_key, [evidence], self.producer.name), second)
             third_key = "d" * 64
-            third = behavior_review.ask(third_key, [evidence, replace(evidence, test="other.py::test_stop")],
+            third = behavior_review.ask(third_key, [evidence, extra, replace(extra, test="more.py::test_restart")],
                                         self.producer.name)
         self.assertEqual(len(keys), 2)
         self.assertIn(second_key, keys[0].text)
@@ -293,20 +332,29 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertEqual(by_id[first.question_id].item.get("request_key"), key)
         self.assertEqual(by_id[second.question_id].item.get("request_key"), second_key)
         self.assertEqual(by_id[second.question_id].item["text"], title)
-        self.assertIn("test_move and 1 more test", by_id[third.question_id].item["text"])
+        third_item = by_id[third.question_id].item
+        self.assertEqual(third_item["text"], title)
+        parts = third_item.get("parts")
+        assert parts is not None
+        self.assertEqual(parts["items"], [
+            'On 2026-11-24 you said, "Restart the work". If you say Yes, the work stays stopped.',
+        ])
+        self.assertEqual(parts["choices"], ["Yes (all the changes go in)",
+                                            "No (the changes stay out and the behaviors you set stay)"])
+        self.assertNotIn("test_stop", third_item.get("question", ""))
         self.assertTrue(all(record.status == "open" for record in records))
 
 
     def test_yes_requires_the_original_closed_question_and_the_users_yes(self) -> None:
         args, key, waiting, question = self.filed_question()
         forged = behavior_check.Answered(waiting.question_id, waiting.owner, behavior_check.Approval.YES,
-                                         behavior_review.YES_CHOICE, datetime.now(timezone.utc))
+                                         "Yes", datetime.now(timezone.utc))
         behavior_check.write_record(key, forged)
         self.assertIn("no valid proof", self.cli("check", *args)[1])
         update_registration.write_question_record(replace(question, status="closed"))
-        update_registration.record_review_log(question, f"answer: {behavior_review.YES_CHOICE}", who="producer")
+        update_registration.record_review_log(question, "answer: Yes", who="producer")
         self.assertIn("no valid proof", self.cli("check", *args)[1])
-        update_registration.record_review_log(question, f"answer: {behavior_review.YES_CHOICE}")
+        update_registration.record_review_log(question, "answer: Yes")
         self.assertEqual(self.cli("check", *args), (0, ""))
-        update_registration.record_review_log(question, f"answer: {behavior_review.NO_CHOICE}")
+        update_registration.record_review_log(question, "answer: No")
         self.assertIn("no valid proof", self.cli("check", *args)[1])

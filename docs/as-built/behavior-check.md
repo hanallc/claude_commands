@@ -27,10 +27,16 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 1. If the range has no changed test, the command exits 0.
 2. If the range has changed tests, the command starts an independent read-only review. Run the same command after the reviewer replies.
 3. If the reviewer finds no decision, the command saves a clear record.
-4. If the reviewer finds a decision, the command files one question on Review. The question gives the user's words, the change, and the Yes and No choices.
+4. If the reviewer finds a decision, the command drafts one question for Review.
 5. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.
 
+The question title names the behavior and the date of the decision.
+The point quotes the user's words and says what the change does.
+Each additional finding gives one fact line. The recommendation and choices give the result of each answer.
+
 A retry starts a new review if the prior reviewer process ended before it saved a valid reply.
+Run the check again if the saved reply has no name for the behavior.
 The collector reads the first word of the answer. It ignores letter case and punctuation at the end of that word.
+If the Console review holds the question, the command reports the hold and says Nate was not asked. The land stays refused.
 If the first word is neither Yes nor No, `behavior_check.py run` quotes the answer and the land stays refused.
 A missing review, an incomplete review, a question without an answer, and a No answer stop the land. Review errors also stop the land.

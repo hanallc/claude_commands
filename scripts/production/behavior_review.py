@@ -12,7 +12,7 @@ from unicodedata import category
 
 from scripts.astra import astra_review, astra_roles, astra_work
 from scripts.direct import pass_record, progress_history, recorder_state
-from scripts.lib import conf, file_lock, unit_runs, urgency
+from scripts.lib import file_lock, unit_runs, urgency
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
 from scripts.production import behavior_check, staff, update_registration, worker
@@ -20,8 +20,7 @@ from scripts.production.production_doc import Refusal
 from scripts.review_links import review_events
 
 
-YES_CHOICE = "Yes. Land the change."
-NO_CHOICE = "No. Keep the current behavior."
+CHANGE_INTRO = "If you say Yes, "
 
 
 @dataclass(frozen=True)
@@ -31,6 +30,7 @@ class SpecifiedBehavior:
     source: Path
     day: date
     change: str
+    behavior: str
 
 
 @dataclass(frozen=True)
@@ -59,12 +59,17 @@ def parse_reply(text: str, tests: behavior_check.ChangedTests) -> list[Specified
             match row:
                 case {"test": str(test), "finding": "none"} if len(row) == 2:
                     pass
-                case {"test": str(test), "finding": "specified", "quote": str(quote),
-                      "source": str(source), "date": str(day), "change": str(change)} if len(row) == 6:
+                case {"test": str(test), "finding": "specified", "quote": str(quote), "source": str(source),
+                      "date": str(day), "change": str(change), "behavior": str(behavior)} if len(row) == 7:
                     path = Path(source)
                     if not path.is_absolute() or not quote.strip() or not change.strip() or len(change.splitlines()) != 1:
                         raise ValueError(f"{test}: expected a quote, an absolute source path and one line about the change")
-                    evidence.append(SpecifiedBehavior(test, quote, path, date.fromisoformat(day), change.strip()))
+                    behavior = behavior.strip()
+                    if not behavior or len(behavior.splitlines()) != 1:
+                        raise ValueError(f"{test}: expected a one-line behavior name")
+                    evidence.append(SpecifiedBehavior(test, quote, path, date.fromisoformat(day), change.strip(), behavior))
+                case {"test": str(test), "finding": "specified"} if "behavior" not in row:
+                    raise ValueError(f"{test}: the reply has no behavior name. Run the check again for a new review.")
                 case _:
                     raise ValueError("invalid finding")
             if test not in missing:
@@ -106,12 +111,16 @@ Use these sources:
 
 Count only words that Nate used to set the affected behavior. Check who wrote the words.
 Quote only the words that apply to the changed behavior.
+In `behavior`, name the behavior Nate set. Use a short phrase that fits after "Keep".
+In `change`, write one sentence about what Nate would see change. Use his words for the behavior.
+Begin the sentence with "{CHANGE_INTRO.strip()}".
+Omit test names, file names, and function names. Describe what the change does without referring to the test.
 If you cannot complete the review, report the blocker instead of a finding.
 
 Return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Otherwise use {{"test":"ID","finding":"specified","quote":"exact words","source":"/absolute/path",
-"date":"YYYY-MM-DD","change":"One plain sentence about what the change does."}}
+"date":"YYYY-MM-DD","behavior":"behavior Nate set","change":"If you say Yes, describe what changes."}}
 
 Read only. Do not edit files, run builds or tests, send messages, or file a question.
 """
@@ -202,6 +211,26 @@ def asking_staff(reference: str, identities: update_registration.QuestionStaff) 
     raise behavior_check.BehaviorCheckError("Pass --production to name the owner of the Review question.")
 
 
+def question_parts(evidence: list[SpecifiedBehavior]) -> update_registration.QuestionParts:
+    """Describe the change with the user's words and the result of each choice."""
+    facts: dict[str, None] = {}
+    for finding in evidence:
+        words = " ".join(finding.quote.splitlines()).strip()
+        end = "" if words.endswith((".", "?", "!")) else "."
+        facts[f'On {finding.day} you said, "{words}"{end} {finding.change}'] = None
+    point, *items = facts
+    first = evidence[0]
+    choices = (["Yes (all the changes go in)", "No (the changes stay out and the behaviors you set stay)"]
+               if items else [f"Yes ({first.change.removeprefix(CHANGE_INTRO).removesuffix('.')})",
+                              f"No (the change stays out and you keep {first.behavior})"])
+    return update_registration.QuestionParts(
+        ask=f"Allow a change to {first.behavior}? ({first.day})",
+        context=f"{point} The merge waits for your answer.", items=items,
+        choices=choices,
+        recommend=f"No, because you keep {first.behavior}.",
+    )
+
+
 def ask(key: str, evidence: list[SpecifiedBehavior], reference: str) -> behavior_check.Waiting:
     identities = update_registration.QuestionStaff.read()
     route = behavior_check.record_path(key).with_suffix(".owner")
@@ -213,26 +242,8 @@ def ask(key: str, evidence: list[SpecifiedBehavior], reference: str) -> behavior
     else:
         owner, _, unit = owner.partition("\n")
         scope = update_registration.question_scope(owner, identities.record)
-    name = " ".join(evidence[0].test.rsplit("::", 1)[-1].split())
-    prefix = "Allow changes to "
-    remaining = len(evidence) - 1
-    suffix = "?"
-    if remaining:
-        suffix = f" and {remaining} more {'test' if remaining == 1 else 'tests'}?"
-    limit = conf.read_or_repository("production").whole("question_title_max_chars")
-    title = prefix + name[:max(0, limit - len(prefix) - len(suffix))] + suffix
-    items: list[str] = []
-    for finding in evidence:
-        words = " ".join(finding.quote.splitlines())
-        for item in (f'You said on {finding.day}, "{words}"', finding.change):
-            if item not in items:
-                items.append(item)
-    parts = update_registration.QuestionParts(
-        ask="Allow this change?", context="The change waits for your answer.", items=items,
-        choices=[YES_CHOICE, NO_CHOICE],
-        recommend="No. Keep the behavior you set.",
-    )
-    record = update_registration.ask(scope, title, parts, unit,
+    parts = question_parts(evidence)
+    record = update_registration.ask(scope, parts["ask"], parts, unit,
                                      update_registration.Ranking(urgency.Urgency(urgency.BLOCKS)),
                                      identities=identities, outgoing=update_registration.KeyedStaffQuestion(key))
     question = record.item.get("review_id", "")
@@ -360,4 +371,7 @@ def execute(action: str, change: behavior_check.GitRange, tests: behavior_check.
     except (behavior_check.BehaviorCheckError, update_registration.InputError, update_registration.RegistrationFailure,
             Refusal, staff.StaffRefused, recorder_state.OldRecorderState, OSError, ValueError) as error:
         print(f"behavior_check: {error}", file=sys.stderr)
+        if (isinstance(error, update_registration.RegistrationFailure) and error.step == "ask"
+                and str(error).startswith("question held for review:")):
+            print("Nate was not asked.", file=sys.stderr)
         return 1
