@@ -403,10 +403,11 @@ MOVE_DIALOG_PROBE = '''<script>
   percent.value='9.25';save.click();
   check(JSON.stringify(fields(0))===JSON.stringify({group:'units',to:'claude3',percent:'9.25',measure:'fable'}),
    'Save sends the target, percent, and measure');
-  reply(0,false,{reason:'next: cannot set entry: busy'});await flush();
+  const saveReason='The queue is busy.';
+  reply(0,false,{reason:saveReason});await flush();
   const moveFailure='The move did not start. Try again.';
-  check(dialog.open && !error.hidden && error.textContent===saveFailure && percent.value==='9.25',
-   'Save failure keeps the dialog and edits and shows the form message');
+  check(dialog.open && !error.hidden && error.textContent===saveReason && percent.value==='9.25',
+   'Save failure keeps the dialog and edits and shows the server reason');
   save.click();reply(1,true,{state:'saved'});await flush();await flush();
   check(!dialog.open && document.activeElement===button('units'),'Save closes the dialog and keeps focus across a refresh');
   starts('units');
@@ -427,15 +428,19 @@ MOVE_DIALOG_PROBE = '''<script>
   target('').click();check(now.disabled && saves.length===6,'No next move disables Move now and sends no request');
   percent.value='';save.click();
   check(JSON.stringify(fields(6))===JSON.stringify({group:'units',clear:'first'}),'Save clears the first entry without percent validation');
-  saves[6].resolve({ok:true,json:async()=>{throw new SyntaxError('fixture bad JSON');}});await flush();
+  const clearReason='The group has no next move.';
+  reply(6,false,{reason:clearReason});await flush();
+  check(dialog.open && !error.hidden && error.textContent===clearReason && target('').checked,
+   'Clear failure keeps the dialog and selection and shows the server reason');
+  save.click();saves[7].resolve({ok:true,json:async()=>{throw new SyntaxError('fixture bad JSON');}});await flush();
   check(dialog.open && error.textContent===saveFailure,'a bad Clear reply shows the save message');
-  save.click();saves[7].reject(new TypeError('fixture network error'));await flush();
+  save.click();saves[8].reject(new TypeError('fixture network error'));await flush();
   check(dialog.open && error.textContent===saveFailure,'a Clear network error shows the save message');
   save.click();
   freshPage=EMPTY_PAGE;
-  reply(8,true,{state:'saved'});await flush();await flush();
+  reply(9,true,{state:'saved'});await flush();await flush();
   starts('units');
-  check(percent.value==='1' && measure('all-models').checked && target('').checked && now.disabled,
+  check(percent.value==='3' && measure('all-models').checked && target('').checked && now.disabled,
    'an empty group uses the configured percent and all models');
   const edge=dialog.getBoundingClientRect();
   check(edge.left>=7.5 && edge.top>=7.5 && edge.right<=innerWidth-7.5 && edge.bottom<=innerHeight-7.5,
@@ -450,7 +455,7 @@ MOVE_DIALOG_PROBE = '''<script>
   check(save.disabled && now.disabled && percent.matches(':disabled') && document.activeElement===cancel,
    'an unavailable queue disables both actions and focuses Cancel');
   key('Tab');check(document.activeElement===cancel,'focus stays in the unavailable dialog');
-  now.click();save.click();check(saves.length===9,'an unavailable queue sends no POST');
+  now.click();save.click();check(saves.length===10,'an unavailable queue sends no POST');
   cancel.click();
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -1962,7 +1967,8 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
         self.assertEqual(order["used / hour"], [5, 0, 1, 4, 2, 3])
         self.assertEqual(order["empty at"], [4, 0, 1, 2, 3, 5])
 
-    def test_weekly_forecast_excludes_history_before_a_scheduled_reset_or_refill(self) -> None:
+    def test_weekly_forecast_excludes_history_before_a_reset_and_skips_the_refill_span(self) -> None:
+        _ = write_config_fixture(conf.path("accounts"), "rate.lookback_minutes=50\n")
         rows = (
             replace(status_row("claude1"), weekly_left_percent=98,
                     resets_at=AT + timedelta(days=7, minutes=-1)),
@@ -1975,8 +1981,11 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
             markup = accounts_page.board(reading)
 
         table = markup.split('aria-label="Accounts"', 1)[1].split("</table>", 1)[0]
-        self.assertNotIn("<time", table)
-        self.assertEqual(table.count('title="No usage rate is available."'), 4)
+        lines = table.split("<tbody>", 1)[1].split("</tr>")[:-1]
+        self.assertEqual(lines[0].count('title="No usage rate is available."'), 2)
+        self.assertNotIn("<time", lines[0])
+        self.assertIn(">6.0%</td>", lines[1])
+        self.assertIn("Mon 11-16 07:20 UTC", lines[1])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
@@ -2898,6 +2907,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_dialog_edits_each_role_and_contains_the_keyboard_focus(self) -> None:
+        _ = write_config_fixture(conf.path("accounts"), "next_move_percent=3\n")
         rows = (replace(status_row("claude1"), selected_roles=("units",)),
                 replace(status_row("claude2"), roles=("showrunners",), selected_roles=("showrunners",)),
                 replace(status_row("claude3"), weekly_left_percent=accounts.StatusUnavailable("unavailable")),

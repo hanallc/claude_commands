@@ -695,10 +695,10 @@ An omitted duration or zero moves the group immediately.
 The hold uses the same hourly rate as the Accounts page and the Claude expiry push.
 The rate includes usage from all groups on the account.
 The key `rate.lookback_minutes` in `config/accounts.conf` sets the window to 60 minutes by default.
-The rate measures the rise and elapsed time from the window start to the latest reading.
-The latest reading must be at most 15 minutes old.
-The observed span must reach the window start without a refill, a gap over 15 minutes, or an interval that starts at 100%.
-The hold uses the 40-minute default when these conditions fail or the readings show no rise.
+The window ends at the current time.
+The rate divides the total usage rise by the observed hours in the window.
+It skips refills, gaps over 15 minutes, time at 100% used, and time at 0% used before usage starts.
+The hold uses the 40-minute default when the counted spans show no rise.
 One point per hour gives a 30-minute hold. The estimate rounds up to whole minutes.
 The list shows “showrunners 1: at 1% → claude2, hold half a point (≈30 min)” or “hold half a point (40 min default: no pace history)”.
 The Mac uses the list that natedev renders from its selection and readings.

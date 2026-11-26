@@ -118,13 +118,13 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
 
         self.assertEqual(self.expiry_accounts(), ["claude2"])
 
-    def test_a_short_rise_after_refill_sends_no_expiry_push(self) -> None:
+    def test_a_short_rise_after_refill_can_send_an_expiry_push(self) -> None:
         readings = [run_out.Reading(self.now - timedelta(minutes=10), 98),
                     run_out.Reading(self.now - timedelta(minutes=5), 19),
                     run_out.Reading(self.now, 20)]
         with mock.patch.object(run_out, "read_readings", return_value={"claude2": readings}):
             _ = self.alert([self.recorded_note(self.now, 80)])
-        self.assertEqual(self.expiry_accounts(), [])
+        self.assertEqual(self.expiry_accounts(), ["claude2"])
 
     def test_forecast_after_reset_or_outside_the_window_stays_silent(self) -> None:
         self.check(self.now)
