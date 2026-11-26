@@ -288,6 +288,9 @@ class AdmittedEvent(QueueLifeIdentity):
     # The step was the first queued row in queue order.
     is_head: bool
     passed: NotRequired[PassedRows]
+    room: NotRequired[int]
+    loan: NotRequired[int]
+    fit: NotRequired[Literal["free", "loan"]]
 
 
 class LeftEvent(QueueLifeIdentity):

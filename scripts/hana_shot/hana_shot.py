@@ -23,6 +23,7 @@ import json
 import math
 import os
 from pathlib import Path
+import plistlib
 import re
 import shlex
 import secrets
@@ -33,13 +34,18 @@ import statistics
 import subprocess
 import sys
 import tempfile
+from threading import current_thread, main_thread
 import time
 import tomllib
+from types import FrameType
 from typing import IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
+from xml.parsers.expat import ExpatError
 
 from scripts.lib import build_folders
-from scripts.lib import conf, process_group, scratch
+from scripts.lib import conf, process_group, process_start, scratch
 from scripts.lib.conf import UseConfiguredValue
+from scripts.lib.process_failure import failure_detail
+from scripts.notify import push_texts
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Wakes the remote display and holds it until the run closes this shell's stdin; -t ends it if that never comes.
@@ -105,6 +111,19 @@ def next_step(action: str) -> str:
 
 class CaptureTimeout(Exception):
     """A screenshot that never answered; exit 3, and never resend it."""
+
+
+class CaptureTerminated(SystemExit):
+    """End a capture after SIGTERM and run its cleanup."""
+
+    def __init__(self, signum: int) -> None:
+        self.status: int = 128 + signum
+        super().__init__(self.status)
+
+
+def terminate_capture(signum: int, _frame: FrameType | None) -> NoReturn:
+    _ = signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
+    raise CaptureTerminated(signum)
 
 
 class BrpCallError(Failure):
@@ -825,6 +844,74 @@ def camera_state(components: dict[str, object]) -> CameraState:
     )
 
 
+class MacConsole(StrEnum):
+    UNLOCKED = "unlocked"
+    LOCKED = "locked"
+    UNAVAILABLE = "unavailable"
+
+
+MAC_LOCK_TEXT = "hana_shot.mac_locked"
+SSH_PROBE = ("ssh", "-T", "-o", "BatchMode=yes", "--")
+
+
+def mac_console_state(output: bytes) -> MacConsole:
+    """Read the lock state of the logged-in console session."""
+    try:
+        roots = cast(object, plistlib.loads(output))
+    except (ValueError, ExpatError, OverflowError, AttributeError, IndexError):
+        return MacConsole.UNAVAILABLE
+    if not isinstance(roots, list):
+        return MacConsole.UNAVAILABLE
+    rows = cast(list[object], roots)
+    if len(rows) != 1 or not isinstance(rows[0], dict):
+        return MacConsole.UNAVAILABLE
+    properties = cast(dict[str, object], rows[0])
+    users = properties.get("IOConsoleUsers")
+    if not isinstance(users, list):
+        return MacConsole.UNAVAILABLE
+    console: list[dict[str, object]] = []
+    for user in cast(list[object], users):
+        if not isinstance(user, dict):
+            return MacConsole.UNAVAILABLE
+        session = cast(dict[str, object], user)
+        if session.get("CGSSessionOnConsoleKey") is True and session.get("CGSSessionLoginDoneKey") is True:
+            console.append(session)
+    if len(console) != 1:
+        return MacConsole.UNAVAILABLE
+    locked = properties.get("IOConsoleLocked")
+    screen_locked = console[0].get("CGSSessionScreenIsLocked", False)
+    if locked is True or screen_locked is True:
+        return MacConsole.LOCKED
+    if locked is False and screen_locked is False:
+        return MacConsole.UNLOCKED
+    return MacConsole.UNAVAILABLE
+
+
+def probe_mac_console(remote: str | None, timeout: float) -> MacConsole:
+    """Run ioreg on the Mac without an interactive SSH prompt."""
+    command = ["/usr/sbin/ioreg", "-a", "-n", "Root", "-d1"]
+    if remote is not None:
+        command = [*SSH_PROBE, remote, *command]
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return MacConsole.UNAVAILABLE
+    if result.returncode != 0:
+        return MacConsole.UNAVAILABLE
+    return mac_console_state(result.stdout)
+
+
+def mac_lock_cleared(pid: int, start: str, remote: str | None) -> bool:
+    """Check whether the capture process ended or the Mac unlocked."""
+    identity = process_start.process_start(pid)
+    if isinstance(identity, (process_start.Gone, process_start.Zombie)):
+        return True
+    if isinstance(identity, process_start.Started) and identity.start != start:
+        return True
+    timeout = conf.read("hana_shot").number("call_timeout_seconds")
+    return probe_mac_console(remote, timeout) is MacConsole.UNLOCKED
+
+
 class Session:
     """One script run against one Hana: the camera, caches, and run-wide settings."""
 
@@ -833,8 +920,10 @@ class Session:
         self.settings: conf.ConfigRead = brp.settings
         self.remote: str | None = remote
         self.remote_shots: int = 0
-        # True when Hana runs on macOS; start() asks a remote host.
+        # For a remote host, start_capture() checks the system.
         self.macos: bool = remote is None and sys.platform == "darwin"
+        self.mac_lock_alert_sent: bool = False
+        self.mac_lock_alert_key: str | None = None
         self.keep_awake: subprocess.Popen[bytes] | None = None
         self.camera: int = 0
         self.frame_ms: float | None = None
@@ -847,8 +936,14 @@ class Session:
     def registered_components(self) -> list[str]:
         return cast(list[str], self.brp.call("world.list_components"))
 
+    def start_capture(self) -> CameraState:
+        """Check the Mac before the first camera read for a capture."""
+        if self.remote is not None:
+            self.macos = self.wait_for_remote_system(self.remote) == "Darwin"
+        self.wait_for_mac()
+        return self.start()
+
     def start(self) -> CameraState:
-        system = None if self.remote is None else worker_pool().submit(remote_system, self.remote, hana_shot_settings=self.settings)
         camera_rows = worker_pool().submit(
             self.brp.query,
             {"data": {"components": [ORBIT_CAM, GLOBAL_TRANSFORM, CAMERA]}, "filter": {"with": [EDITOR_CAMERA]}},
@@ -859,13 +954,79 @@ class Session:
             raise Failure(f"expected one editor camera, found {len(rows)}")
         self.camera = rows[0]["entity"]
         self.frame_ms = diagnostics.result()["frame_time_ms"]["current"]
-        if system is not None:
-            self.macos = system.result() == "Darwin"
         return camera_state(rows[0]["components"])
 
+    def wait_for_remote_system(self, host: str) -> str:
+        """Wait until SSH identifies the remote system."""
+        reported = False
+        while True:
+            try:
+                return remote_system(host, hana_shot_settings=self.settings)
+            except Failure as error:
+                if not reported:
+                    print(f"hana_shot: waiting for {host}: {error}", file=sys.stderr)
+                    reported = True
+            time.sleep(self.settings.number("resend_seconds"))
+
+    def wait_for_mac(self) -> None:
+        """Wait for the Mac to unlock before using the camera."""
+        if not self.macos:
+            return
+        timeout = self.settings.number("call_timeout_seconds")
+        state = probe_mac_console(self.remote, timeout)
+        if state is not MacConsole.UNLOCKED:
+            print(f"hana_shot: waiting for {self.remote or 'the Mac'} ({state})", file=sys.stderr)
+        while state is not MacConsole.UNLOCKED:
+            if state is MacConsole.LOCKED and not self.mac_lock_alert_sent:
+                self.send_mac_lock_alert()
+            time.sleep(self.settings.number("resend_seconds"))
+            state = probe_mac_console(self.remote, timeout)
+        self.retire_mac_lock_alert()
+
+    def send_mac_lock_alert(self) -> None:
+        """Send the first confirmed lock alert for this run."""
+        from scripts.notify import review
+
+        pid = os.getpid()
+        identity = process_start.process_start(pid)
+        if not isinstance(identity, process_start.Started):
+            print("hana_shot: cannot read the process start time. The alert will retry.", file=sys.stderr)
+            return
+        self.mac_lock_alert_sent = True
+        key = f"{MAC_LOCK_TEXT}:{pid}:{secrets.token_hex(8)}"
+        self.mac_lock_alert_key = key
+        probe = [sys.executable, str(Path(__file__).resolve()), "--mac-lock-cleared", str(pid), identity.start]
+        if self.remote is not None:
+            probe.append(self.remote)
+        rendered = push_texts.render(MAC_LOCK_TEXT)
+        timeout = review.user_send_seconds() + self.settings.number("call_timeout_seconds")
+        _ = push_texts.send_user_push(rendered, sender=rendered.sender, key=key, clears_when=shlex.join(probe),
+                                      send_timeout_s=timeout)
+
+    def retire_mac_lock_alert(self) -> None:
+        """Retire the alert when the Mac unlocks or the run ends."""
+        if self.mac_lock_alert_key is None:
+            return
+        sender = push_texts.render(MAC_LOCK_TEXT).sender
+        command = push_texts.user_retire_argv(sender, self.mac_lock_alert_key)
+        try:
+            timeout = conf.read("send").number("user_cancel_timeout") + self.settings.number("call_timeout_seconds")
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+                                    timeout=timeout)
+            if result.returncode == 0:
+                self.mac_lock_alert_key = None
+                return
+            detail = failure_detail(result)
+        except (conf.Unusable, OSError, subprocess.SubprocessError) as error:
+            detail = str(error)
+        print(f"hana_shot: could not retire the Mac lock alert: {detail}", file=sys.stderr)
+
     def close(self) -> None:
-        """Restore the window and end the keep-awake."""
-        self.restore_window_and_end_keep_awake()
+        """Retire the alert and restore the window."""
+        try:
+            self.restore_window_and_end_keep_awake()
+        finally:
+            self.retire_mac_lock_alert()
 
     def restore_window_and_end_keep_awake(self) -> None:
         """Undo window preparation without changing the active outcome."""
@@ -1645,6 +1806,7 @@ def hover_for_shot(session: Session, hover: HoverTarget, state: CameraState) -> 
 def capture(session: Session, params: dict[str, object]) -> ShotReply:
     """Take one screenshot, resending only when extras refuses because one is in flight."""
     hana_shot_settings = session.settings
+    session.wait_for_mac()
     deadline = time.monotonic() + hana_shot_settings.number("resend_seconds")
     capture_timeout = hana_shot_settings.number("capture_timeout_seconds")
     while True:
@@ -1654,6 +1816,7 @@ def capture(session: Session, params: dict[str, object]) -> ShotReply:
             if "already in progress" not in exc.message or time.monotonic() > deadline:
                 raise
             time.sleep(session.frame_seconds())
+            session.wait_for_mac()
 
 
 def png_size(path: Path) -> tuple[int, int]:
@@ -1717,20 +1880,21 @@ def remove_remote(remote: RemoteFile, *,
 def remote_system(host: str, *,
     hana_shot_settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
 ) -> str:
-    """The remote kernel name; an empty answer fails, since Tailscale SSH can report exit 0 after a failure."""
+    """Read the supported kernel name from non-interactive SSH."""
     if isinstance(hana_shot_settings, UseConfiguredValue):
         hana_shot_settings = conf.read("hana_shot")
     try:
         answer = subprocess.run(
-            ["ssh", host, "uname", "-s"],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=hana_shot_settings.number("call_timeout_seconds"),
+            [*SSH_PROBE, host, "uname", "-s"],
+            stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", errors="replace",
+            check=False, timeout=hana_shot_settings.number("call_timeout_seconds"),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Failure(f"could not ask {host} for its system over ssh: {exc}") from exc
     system = answer.stdout.strip()
-    if answer.returncode != 0 or not system:
+    if answer.returncode != 0 or system not in ("Darwin", "Linux"):
         detail = answer.stderr.strip() or f"ssh exited {answer.returncode}"
-        raise Failure(f"ssh {host} uname -s gave no answer ({detail})")
+        raise Failure(f"ssh {host} uname -s gave no supported system ({detail})")
     return system
 
 
@@ -2902,7 +3066,7 @@ def run_shots(
     if shots:
         invocation.shot = shots[0]
     with closing(Session(brp, remote)) as session:
-        _ = session.start()
+        _ = session.start_capture()
         sha = git_sha(Path.cwd(), hana_shot_settings=hana_shot_settings)
         results: list[Result] = []
         for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots], hana_shot_settings=hana_shot_settings), strict=True):
@@ -3249,7 +3413,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
             instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner, hana_shot_settings=hana_shot_settings) as brp,
             closing(Session(brp, args.remote)) as session,
         ):
-            _ = session.start()
+            _ = session.start_capture()
             sha = git_sha(path.parent, hana_shot_settings=hana_shot_settings)
             today = datetime.now().strftime("%Y-%m-%d")
             for name, final in zip(names, output_paths(str(out), names, hana_shot_settings=hana_shot_settings), strict=True):
@@ -3438,6 +3602,13 @@ def arguments(argv: list[str], *,
 
 
 def main(argv: list[str]) -> int:
+    if argv[:1] == ["--mac-lock-cleared"] and len(argv) in (3, 4):
+        try:
+            pid = int(argv[1])
+        except ValueError:
+            return 2
+        remote = argv[3] if len(argv) == 4 else None
+        return int(not mac_lock_cleared(pid, argv[2], remote))
     hana_shot_settings = conf.read("hana_shot")
     try:
         args = arguments(argv, hana_shot_settings=hana_shot_settings)
@@ -3470,8 +3641,12 @@ def main(argv: list[str]) -> int:
                   if args.command == "shot" or args.command == "views" and args.action == "check" else None)
     if invocation is not None and args.face is not None:
         invocation.orientation = TargetFace(args.face)
+    previous_term_handler = None
     exit_code = 1
     try:
+        if invocation is not None and current_thread() is main_thread():
+            previous_term_handler = signal.getsignal(signal.SIGTERM)
+            _ = signal.signal(signal.SIGTERM, terminate_capture)
         if args.command == "views" and args.action in ("check", "add") and args.from_current or (
             args.command == "views" and args.action == "check"
         ):
@@ -3499,6 +3674,10 @@ def main(argv: list[str]) -> int:
         exit_code = 1
         if invocation is not None and not invocation.failures:
             invocation.failures.append(CaptureFailure(failure_reason(exc), str(exc)))
+    except CaptureTerminated as exc:
+        exit_code = exc.status
+        if invocation is not None and not invocation.failures:
+            invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, "stopped by SIGTERM"))
     except KeyboardInterrupt:
         exit_code = 130
         if invocation is not None and not invocation.failures:
@@ -3509,8 +3688,12 @@ def main(argv: list[str]) -> int:
             invocation.failures.append(CaptureFailure(FailureReason.SHOT_FAILED, f"{type(exc).__name__}: {exc}"))
         raise
     finally:
-        if invocation is not None:
-            write_invocation(invocation, args.port, args.remote, exit_code)
+        try:
+            if invocation is not None:
+                write_invocation(invocation, args.port, args.remote, exit_code)
+        finally:
+            if previous_term_handler is not None:
+                _ = signal.signal(signal.SIGTERM, previous_term_handler)
     return exit_code
 
 

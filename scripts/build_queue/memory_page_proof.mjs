@@ -13,12 +13,13 @@
 // Use --verify-call as the third argument for the Verify column proof.
 // Use --headcount to compare the Running and Queued headers.
 // Use --build-tools as the third argument for the Build tools proof.
+// Use --ci-services with a private memory.json copy for the CI service proof.
 // Use --outside-queue after the output folder to check the outside command table.
 // Add a published page from main to save the before image.
 // Use --queue-rows to capture the dark queue card, its tooltips, and its right edge.
 // Use the fourth argument to select the older page.
 // Use --guest-tip after the output folder for the guest row tooltip screenshot.
-// Use --standing-orders as the third argument for nate's standing orders on real-shape rows; a fourth argument names a rendered page to check.
+// Use --standing-orders to check the current page with real-shape rows. A fourth argument adds a rendered baseline.
 
 // Use --rowask to capture the rows and the New item dialog.
 // Use <output-folder> --tip-design for the six dark tooltip captures.
@@ -73,6 +74,7 @@ const [previousPage, comparison] = tipDesignComparison || awsCostShots ? [] : co
 const requestedShot = gateMode ? undefined : process.env.MEMORY_PAGE_SHOT;
 const verifyCallProof = previousPage === '--verify-call';
 const buildToolsProof = previousPage === '--build-tools';
+const ciServicesProof = previousPage === '--ci-services';
 const outsideQueueProof = previousPage === '--outside-queue';
 const queueDragProof = previousPage === '--queue-drag';
 const queueRowsProof = previousPage === '--queue-rows';
@@ -82,7 +84,7 @@ const killShot = previousPage === '--kill-shot';
 const killControlProof = previousPage === '--kill-control';
 const killBothShot = previousPage === '--kill-both-shot';
 const killProof = killShot || killControlProof || killBothShot;
-const focusedProof = verifyCallProof || buildToolsProof || queueDragProof || queueRowsProof || guestTipProof
+const focusedProof = verifyCallProof || buildToolsProof || ciServicesProof || queueDragProof || queueRowsProof || guestTipProof
   || standingProof || outsideQueueProof || killProof;
 const themes = gateMode ? ['dark'] : ['light','dark'];
 const widths = gateMode ? [1400] : [1400,900,390];
@@ -185,7 +187,8 @@ async function checkStandingOrders(navigate, evaluate, call, path, shotFolder) {
       await writeFile(join(shotFolder, `real-${width}.png`), Buffer.from(shot.data,'base64'));
     }
     const kinds = new Set(shown.rows.map(row => row.kind));
-    assert.ok(kinds.has('tools') && kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
+    assert.ok(kinds.has('row') && kinds.has('wait'), `The real-shape rows did not all show at ${width} px.`);
+    if (path !== 'before.html') assert.ok(!kinds.has('tools'), `Running shows a Build tools row at ${width} px.`);
     assert.deepEqual(shown.headers.filter(header => ['Unit', 'Slot'].includes(header)), [],
       `Orders 2 and 4: the table has a Unit or Slot column at ${width} px.`);
     const word = name => new RegExp('(^|[^a-z-])' + name.toLowerCase() + '([^a-z-]|$)');
@@ -1003,10 +1006,91 @@ try {
             break browserProof;
           }
         }
+        if (ciServicesProof) {
+          const live = JSON.parse(await readFile(comparison, 'utf8'));
+          const service = live.walk.find(row => row.ci);
+          const names = service?.ci_runners?.map(runner => runner.name) ?? live.ram.ci_services?.map(runner => runner.name);
+          assert.deepEqual(names, ['hana-linux-1', 'hana-linux-2']);
+          const gib = 1024**3;
+          const ciServices = [{name:names[0], bytes:704*1024**2}, {name:names[1], bytes:16*1024**2}];
+          const overhead = ciServices.reduce((total, runner) => total + runner.bytes, 0);
+          const oldOverhead = live.ram.ci_bytes ?? live.ram.ci_services.reduce((total, runner) => total + runner.bytes, 0);
+          const delta = overhead - oldOverhead;
+          const cargo = {...structuredClone(base.walk.find(row => row.queued)),
+            key:'ci-cargo-proof', name:'hana CI: nextest', queued:true, verify:null, pid:701002,
+            ci_label:'hana CI · hana-linux-1', title:{unit:'', step:'hana CI · hana-linux-1'},
+            unit:'', showrunner:'', caller:'', owner_text:'', name_parts:[], machine:'natedev',
+            used:0.5, counted:0.5, reserved:0, started_at:live.read_at-45,
+            progress:{kind:'RowProgress', phase:'testing', unit:'tests', done:17, total:22, percent:77.3}};
+          const ram = {...live.ram, ci_bytes:0, ci_services:ciServices,
+            build_tools_bytes:live.ram.build_tools_bytes + overhead - (live.ram.ci_bytes === undefined ? oldOverhead : 0),
+            queued_builds_bytes:live.ram.queued_builds_bytes + gib/2,
+            available_bytes:live.ram.available_bytes - delta - gib/2};
+          const freeAfterSystem = Math.max(0, ram.available_bytes - ram.safety_covered_bytes - ram.swap_covered_bytes);
+          ram.build_covered_bytes = Math.min(ram.build_target_bytes, freeAfterSystem);
+          ram.build_missing_bytes = ram.build_target_bytes - ram.build_covered_bytes;
+          ram.room_bytes = freeAfterSystem - ram.build_covered_bytes;
+          ram.shortfall_bytes = ram.build_missing_bytes + ram.swap_missing_bytes + ram.safety_missing_bytes;
+          ram.cap_bytes = ram.build_tools_bytes + ram.queued_builds_bytes + ram.build_covered_bytes + ram.room_bytes;
+          servedReading = {...live, read_at:base.read_at, report_version:base.report_version, ram,
+            cap:ram.cap_bytes/gib, room:ram.room_bytes/gib, shortfall:ram.shortfall_bytes/gib,
+            walk:[...live.walk.filter(row => !row.ci && !row.ci_label), {...cargo, started_at:base.read_at-45}]};
+          await call('Emulation.setEmulatedMedia', {features:[{name:'prefers-color-scheme',value:'dark'}]});
+          await call('Emulation.setDeviceMetricsOverride', {width:1600,height:1100,deviceScaleFactor:1,mobile:false});
+          await navigate('memory_live.html');
+          const {cssContentSize} = await call('Page.getLayoutMetrics');
+          await call('Emulation.setDeviceMetricsOverride', {width:1600,
+            height:Math.ceil(cssContentSize.height),deviceScaleFactor:1,mobile:false});
+          const proof = await evaluate(`(async () => {
+            window.scrollTo(0, 0);
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            const tools = document.querySelector('#s-tools');
+            const box = tools.getBoundingClientRect();
+            showTip('tools', box.left+box.width/2, box.top+box.height/2);
+            const header = document.querySelector('#walk-title').getBoundingClientRect();
+            const tipBox = document.querySelector('#tip').getBoundingClientRect();
+            const serviceLines = [...document.querySelectorAll('#tip dt')].filter(cell =>
+              cell.textContent.startsWith('+ hana CI service ')).map(cell => {
+                const range = document.createRange();
+                range.selectNodeContents(cell);
+                return range.getClientRects().length;
+              });
+            return {tooltip:tipText('tools', latest), barWidth:box.width, serviceLines,
+              headerClear:tipBox.bottom <= header.top || tipBox.right <= header.left || tipBox.left >= header.right,
+              toolsRow:!!document.querySelector('#walk [data-tip="tools"]'),
+              title:document.querySelector('#walk-title').textContent,
+              rows:[...document.querySelectorAll('#walk .wrow[data-run]')].map(row => row.dataset.run),
+              taken:document.querySelector('#walk-sum').textContent,
+              totals:Object.fromEntries(tooltipRows('walksum', latest).map(({label,value}) => [label,value])),
+              serviceRow:!!document.querySelector('#walk td.pid') && Array.from(
+                document.querySelectorAll('#walk td.pid')).some(cell => cell.textContent === ${JSON.stringify(String(service?.pid))}),
+              cargo:document.querySelector('tr[data-tip="row:ci-cargo-proof"] td.pid')?.textContent,
+              legend:!!document.querySelector('.legend [data-tip="ci"]')};
+          })()`);
+          assert.ok(proof.barWidth > 0);
+          assert.deepEqual(proof.serviceLines, [1, 1]);
+          assert.equal(proof.headerClear, true);
+          assert.equal(proof.toolsRow, false);
+          const statusRows = servedReading.walk.filter(row => row.kind === 'mac-unavailable');
+          assert.equal(proof.title, `Running, in start order (${proof.rows.length-statusRows.length})`);
+          const taken = memoryTenths(proof.totals.Builds)
+            + memoryTenths(proof.totals['+ Build reserved'] ?? proof.totals['+ Full reserve']);
+          assert.equal(memoryTenths(proof.totals.Taken), taken);
+          assert.ok(proof.taken.startsWith(`${(taken/10).toFixed(1)} of `));
+          assert.equal(proof.cargo, '701002');
+          assert.equal(proof.serviceRow, false);
+          assert.equal(proof.legend, false);
+          assert.match(proof.tooltip[1], /hana CI service hana-linux-1  0\.7 GiB/);
+          assert.match(proof.tooltip[1], /hana CI service hana-linux-2  <0\.1 GiB/);
+          const shot = await call('Page.captureScreenshot', {format:'png'});
+          await writeFile(join(folder, 'cisvc-dark.png'), Buffer.from(shot.data, 'base64'));
+          console.log(JSON.stringify({pass:true, ...proof}));
+          break browserProof;
+        }
         if (buildToolsProof) {
           const ram = JSON.parse(await readFile(join(folder, 'legend_ram.json'), 'utf8'));
           const gib = 1024**3;
-          Object.assign(ram, {python_tests_bytes: 0.25*gib, waiting_runs_bytes: 0.125*gib,
+          Object.assign(ram, {ci_bytes: 0, python_tests_bytes: 0.25*gib, waiting_runs_bytes: 0.125*gib,
             other_build_tools_bytes: 0.125*gib});
           servedReading = {...base, ram};
           const views = [];
@@ -1169,8 +1253,8 @@ try {
           // admin-console is longer than every running label, so its widest word sets the label column.
           Object.assign(waiting, {unit:'admin-console',showrunner:'builds',caller:'impl3',
             title:{unit:'admin-console',step:'test affected'},targets:['natedev','hana-aws']});
-          const ci = {key:'shot-ci',name:'hana CI',ci:true,admitted:true,started_at:reading.read_at-120,
-            machine:'natedev',used:0.5,reserved:0,counted:0.5,ci_runners:[{state:'busy',job:'doctests'}]};
+          const ci = {key:'shot-ci',name:'hana CI',ci_label:'hana CI',queued:true,started_at:reading.read_at-120,
+            machine:'natedev',used:0.5,reserved:0,counted:0.5};
           reading.walk = [rust, guest, mac, ci];
           reading.waiters = [waiting];
           const runAgeMinutes = 3;
@@ -1552,11 +1636,11 @@ try {
           servedReading.ram = {...servedReading.ram, build_tools_bytes:real.build_tools_bytes};
           // The queue-move stub gives the page a token, so the reorder handles draw.
           queueFixture = servedReading;
-          await checkStandingOrders(navigate, evaluate, call, standingProof && beforePage ? 'before.html' : 'memory_live.html',
-            standingProof ? folder : '');
+          if (standingProof && beforePage) await checkStandingOrders(navigate, evaluate, call, 'before.html', folder);
+          await checkStandingOrders(navigate, evaluate, call, 'memory_live.html', standingProof && !beforePage ? folder : '');
           queueFixture = null;
           if (standingProof) {
-            console.log(JSON.stringify({pass:true}));
+            console.log(JSON.stringify({pass:true, pages:beforePage ? ['baseline', 'current'] : ['current'], widths:[1440, 900]}));
             break browserProof;
           }
           await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
@@ -1792,7 +1876,7 @@ try {
         const headerState = `({
           running:document.querySelector('[data-tip="walkhead"]').textContent,
           queued:document.querySelector('#walk .queue-title')?.textContent ?? '',
-          tools:document.querySelector('#walk .wrow.tools .name')?.textContent,
+          tools:document.querySelector('#walk .wrow.tools .name')?.textContent ?? '',
           free:document.querySelector('#walk .wrow.room .name')?.textContent
         })`;
         const captureHeadings = async name => {
@@ -1817,7 +1901,7 @@ try {
         }
         await navigate('memory_live.html');
         assert.deepEqual(await evaluate(headerState), {running:'Running, in start order (3)',
-          queued:'Queued, in order of submission (4)',tools:'Build tools',free:'Free'});
+          queued:'Queued, in order of submission (4)',tools:'',free:'Free'});
         if (headcountComparison) await captureHeadings('after');
         await evaluate('window.render = window.renderReading');
         const longUnit = 'research-with-a-long-unit-name'.repeat(8);
@@ -1831,7 +1915,7 @@ try {
           await evaluate('pageRefresh.refresh(true)');
           assert.deepEqual(await evaluate(headerState), {
             running:`Running, in start order (${walk.filter(row=>row.kind!=='mac-unavailable').length})`,
-            queued,tools:'Build tools',free:'Free'});
+            queued,tools:'',free:'Free'});
           assert.deepEqual(await evaluate(`[
             document.querySelectorAll('#walk .wrow.wait').length,
             document.querySelectorAll('#walk tr.wait').length
@@ -2902,7 +2986,6 @@ try {
               const line=document.querySelector('#walk .walk-bud');
               const track=document.querySelector('#walk .wrow[data-run] .track').getBoundingClientRect();
               const room=document.querySelector('#walk .wrow.room .roomb')?.getBoundingClientRect();
-              const tools=document.querySelector('#walk .wrow.tools .seg-tools').getBoundingClientRect();
               const memoryTools=document.querySelector('#s-tools').getBoundingClientRect();
               const memoryBar=document.querySelector('#barwrap .bar').getBoundingClientRect();
               const memoryCap=document.querySelector('#b-cap').getBoundingClientRect();
@@ -2914,16 +2997,13 @@ try {
                 .sort((a,b)=>b.box.height-a.box.height)[0];
               return {layout:document.querySelector('#walk').classList.contains('beside')?'beside':'stacked',present:!!line&&getComputedStyle(line).display!=='none'&&box.width>0&&box.height>0,
                 left:box?box.left+1:null,top:part?.box.top,bottom:part?.box.bottom,roomRight:room?room.right:null,
-                tools:{left:tools.left,right:tools.right,width:tools.width,trackLeft:track.left},
                 memoryTools:{left:memoryTools.left,right:memoryTools.right,width:memoryTools.width,
                   barLeft:memoryBar.left,capRight:memoryCap.right},
                 expected:track.left+track.width*latest.cap*${gib}/latest.ram.total_bytes,color:part?getComputedStyle(part.element).borderLeftColor:'',
                 scrollY,card:card ? {x:Math.floor(card.left),y:Math.floor(card.top+scrollY),width:Math.ceil(card.width)+1,height:Math.ceil(card.height)+1} : undefined};
             })()`);
             assert.ok(capLine.present,'The Running chart has no cap line.');
-            assert.ok(capLine.tools.width>0 && capLine.memoryTools.width>0);
-            assert.ok(Math.abs(capLine.tools.left-capLine.tools.trackLeft)<=1,'Build tools do not start at the chart left edge.');
-            assert.ok(capLine.tools.right<capLine.left,'Build tools extend beyond the chart cap mark.');
+            assert.ok(capLine.memoryTools.width>0);
             assert.ok(Math.abs(capLine.memoryTools.left-capLine.memoryTools.barLeft)<=1,'Build tools do not start at the memory bar left edge.');
             assert.ok(capLine.memoryTools.right<capLine.memoryTools.capRight,'Build tools extend beyond the memory bar cap mark.');
             if(width===1400) assert.equal(capLine.layout,'beside','The Running chart stays stacked after a narrow page.');
@@ -3020,8 +3100,7 @@ try {
             assert.deepEqual(overBar.old,[],'The old over-cap drawing is still on the page.');
             assert.match(overBar.alert,/Free RAM is short by 4\.0 GiB\. Build reserved holds [0-9.]+ of [0-9.]+ GiB\./);
             assert.equal(overBar.tip['Not covered'],'4.0 GiB');
-            // A small hana CI part stays visible, so the builds parts add up on screen.
-            assert.equal(await evaluate(`getComputedStyle(document.getElementById('s-ci')).minWidth`),'3px');
+            assert.equal(await evaluate(`document.getElementById('s-ci') === null`),true);
             proof.overBar=overBar;
             const overHeader=await evaluate(`(() => ({sum:document.querySelector('#walk-sum').textContent,
               sumColor:getComputedStyle(document.querySelector('#walk-sum')).color,hover:tipText('walksum',latest)[1],rows:tooltipRows('walksum',latest),
@@ -3171,9 +3250,8 @@ try {
                   builds:document.querySelector('#v-g-builds').textContent,
                   reserved:document.querySelector('#v-reserved').textContent,cap:document.querySelector('#v-cap').textContent};
               })()`);
-              assert.equal(ciProof.table,state==='busy');
-              assert.equal(ciProof.chart,state==='busy');
-              if(state==='busy') assert.equal(ciProof.stage,'—');
+              assert.equal(ciProof.table,false);
+              assert.equal(ciProof.chart,false);
               assert.equal(ciProof.ci,0.125);
               const takenTenths=memoryTenths(ciProof.builds)+memoryTenths(ciProof.reserved);
               assert.equal(ciProof.taken,(takenTenths/10).toFixed(1)+' of '+ciProof.cap.replace(' GiB','')+' GiB taken');
@@ -3609,7 +3687,7 @@ try {
             word:part('word').textContent,
             icons:[...line.querySelectorAll('[data-status-icon]')].filter(icon=>!icon.hidden).map(icon=>icon.dataset.statusIcon),
             timingsHidden:part('trip').hidden&&part('render').hidden,
-            position:getComputedStyle(line).position});
+            position:getComputedStyle(line.closest('.page-top')).position});
           const good=async()=>{
             reading.read_at=now/1000;
             reading.fresh_until=reading.read_at+ageLimit;
@@ -4192,7 +4270,7 @@ try {
           Object.assign(aws, {machine:'aws',used:1.5});
           const ci = {name:'hana CI',ci:true,admitted:false,queued:false,used:0.125,reserved:0,counted:0,
             started_at:fixtureTime-60,unit:'hana CI',machine:'natedev',pid:701,vcpus:32,
-            progress:{kind:'NoProgress',reason:'no counter'},ci_runners:[{state:'busy',job:'doctests'}]};
+            progress:{kind:'NoProgress',reason:'no counter'}};
           review.walk = [local, mac, aws, ci];
           review.waiters = [{...review.waiters[0],name:'CI doctests',unit:'',showrunner:'',
             ci_label:'hana CI · fixture-runner · doctests',detail:'',reason:'free memory',place:1,
@@ -4376,7 +4454,7 @@ try {
             const builds=review['g-builds'].filter(row=>row.kind!=='caption');
             const [buildsTotal, ...buildsParts] = builds.map(row=>memoryTenths(row.value));
             assert.equal(buildsTotal,31);
-            assert.deepEqual(buildsParts.sort(),[10,10,11]);
+            assert.deepEqual(buildsParts.sort(),[10,21]);
             const wait=amounts(review['wait:fractional-wait']);
             assert.equal(wait['Short by'],'<0.1 GiB');
             const cap=amounts(review.cap);

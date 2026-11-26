@@ -7,7 +7,7 @@ import sys
 import subprocess
 import time
 from dataclasses import replace
-from functools import cached_property
+from functools import cached_property, partial
 from contextlib import redirect_stdout
 from typing import Literal, cast, final, override
 from unittest import mock
@@ -312,6 +312,22 @@ class PauseExitTests(StaffTestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(events, ["task", "task", "stop"])
 
+    def resume_on_peer(self, arguments: list[str], *, row: staff.StaffRow, target: tuple[str, ...]) -> tuple[int, str]:
+        expected = ["resume", "--here", "--why=resumed by name"]
+        if target:
+            expected.append(f"--to={target[1]}")
+        self.assertEqual(arguments, [*expected, "--", str(row.id)])
+        peer = stop_resume.member_machine(row)
+        live = stop_resume.ClaudeUp(row.current_session, "w1:p1", "claude2",
+                                   start_state=ClaudeStartState.ALREADY_RUNNING)
+        with (mock.patch.object(shutdown, "local_machine", return_value=peer),
+              mock.patch.object(shutdown, "other_machine", return_value=remote.local_machine()),
+              mock.patch.object(stop_resume, "running_on_account", return_value=live) as probe):
+            result = self.agents(*arguments)
+        probe.assert_called_once_with(str(row.current_session), "", kind="claude")
+        self.assertEqual(result.stderr, "")
+        return result.returncode, result.stdout
+
     def test_resume_of_a_paused_unit_removes_the_pause_and_sends_one_continuation(self) -> None:
         for original, observed in (
                 (self.unit, stop_resume.ClaudeUp(self.unit.current_session, "w1:p1", "claude2",
@@ -335,7 +351,11 @@ class PauseExitTests(StaffTestCase):
                         self.assertEqual(staff.by_id(original.id), original)
                         return stop_resume.ClaudeUp(original.current_session, "w1:p1", to or "claude2")
                     self.start.side_effect = start
-                    with mock.patch.object(stop_resume, "running_on_account", return_value=observed) as running:
+                    with (mock.patch.object(shutdown, "local_machine", return_value=remote.local_machine()),
+                          mock.patch.object(shutdown, "other_machine", return_value=remote.other_machine()),
+                          mock.patch.object(shutdown, "run_remote", side_effect=partial(
+                              self.resume_on_peer, row=original, target=target)) as ssh,
+                          mock.patch.object(stop_resume, "running_on_account", return_value=observed) as running):
                         result = self.agents("resume", str(original.id), *target)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(staff.by_id(original.id), original)
@@ -349,6 +369,9 @@ class PauseExitTests(StaffTestCase):
                         self.assertIn("Continue", cast(str, self.send.call_args.args[2]))
                     if original != self.unit:
                         running.assert_not_called()
+                        ssh.assert_called_once()
+                    else:
+                        ssh.assert_not_called()
 
     def test_resume_of_an_exited_unit_uses_the_shared_resume_and_removes_the_exit(self) -> None:
         self.save_exit()

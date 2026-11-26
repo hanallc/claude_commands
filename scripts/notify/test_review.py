@@ -172,7 +172,7 @@ class LocalReviewTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(pushover, "http_post", side_effect=AssertionError("real post")))
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", self.root / "pushes.jsonl"))
         config = self.root / "notify.conf"
-        _ = config.write_text("REVIEW_TIMEOUT_SECONDS=60\n")
+        _ = config.write_text("review_timeout_seconds=60\n")
         _ = self.enterContext(mock.patch.object(review, "NOTIFY_CONFIG", config))
         binary = self.root / "bin/claude"
         binary.parent.mkdir()
@@ -291,6 +291,100 @@ class LocalReviewTests(unittest.TestCase):
                 else:
                     self.assertIsInstance(outcome, (review.QuestionAwaitingFacts, review.QuestionReviewFailed))
                     self.assertTrue((review.state_path() / "questions" / (key.digest + ".json")).exists())
+
+    def test_console_rewrite_with_an_unmatched_quote_holds_the_draft(self) -> None:
+        key = review.QuestionKey("demo", "Open the page")
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Step B opens the page.", False)
+        reason = "The reviewer gave a quote that does not match the draft."
+        runner = FakeReviewer(verdict(draft, "rewrite", body="The page opens.",
+                                      failed_rules=[{"rule": "omit-team-words", "quote": "Step C"}]))
+
+        result = review.review_question(key, draft.body, runner=runner, console_kind="reply")
+
+        self.assertEqual(result, review.QuestionReviewFailed(draft.body, (reason,)))
+        hold = review.state_path() / "questions" / f"{key.digest}.json"
+        self.assertEqual(json.loads(hold.read_text(encoding="utf-8")), {
+            "slug": key.name, "text": key.text, "question": draft.body, "details": [reason],
+        })
+
+    def test_console_rewrite_without_failed_rules_holds_the_draft(self) -> None:
+        key = review.QuestionKey("demo", "Open the page")
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Open the page.", False)
+        held = review.QuestionReviewFailed(draft.body, ("The reviewer requested a rewrite without a failed rule.",))
+        for body in ("Open the window.", ""):
+            with self.subTest(body=body):
+                runner = FakeReviewer(verdict(draft, "rewrite", body=body, failed_rules=[]))
+                self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind="reply"), held)
+                self.assertTrue((review.state_path() / "questions" / f"{key.digest}.json").is_file())
+        approved = FakeReviewer(verdict(draft))
+        self.assertEqual(review.review_question(key, draft.body, runner=approved, console_kind="reply"),
+                         review.QuestionAccepted(draft.body))
+
+    def test_console_send_with_changed_text_accepts_the_original_draft(self) -> None:
+        from scripts.console_text import check as console_text
+
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Use the new layout.", False)
+        runner = FakeReviewer(verdict(draft, body="Use the old layout."))
+        key = review.QuestionKey("reply/layout", "")
+
+        self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind="reply"),
+                         review.QuestionAccepted(draft.body))
+        real_review = review.review_question
+
+        def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+            return real_review(key, text, runner=runner, console_kind=console_kind)
+
+        with mock.patch.object(review, "review_question", side_effect=run):
+            console_text.require(draft.body, "reply", identity="layout")
+        self.assertFalse((review.state_path() / "questions" / f"{key.digest}.json").exists())
+
+    def test_console_filing_holds_invalid_verdicts_and_allows_a_reviewer_outage(self) -> None:
+        from scripts.console_text import check as console_text
+
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Use the new layout.", False)
+        real_review = review.review_question
+        for runner, reason in (
+            (FakeReviewer(verdict(draft), failure="json"), "bad JSON"),
+            (FakeReviewer(verdict(draft), failure="timeout"), ""),
+        ):
+            with self.subTest(reason=reason):
+                def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+                    return real_review(key, text, runner=runner, console_kind=console_kind)
+
+                with mock.patch.object(review, "review_question", side_effect=run):
+                    if reason:
+                        with self.assertRaisesRegex(ValueError, reason):
+                            console_text.require(draft.body, "reply", identity="layout")
+                        key = review.QuestionKey("reply/layout", "")
+                        hold = review.state_path() / "questions" / f"{key.digest}.json"
+                        self.assertIn(draft.body, hold.read_text())
+                    else:
+                        console_text.require(draft.body, "reply", identity="layout")
+                        self.assertEqual(self.entries()[-1]["verdict"], "unreviewed: timeout")
+
+    def test_console_filing_holds_send_with_extra_fields_or_blank_rule_names(self) -> None:
+        from scripts.console_text import check as console_text
+
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Use the new layout.", False)
+        real_review = review.review_question
+        for value, reason in (
+            (verdict(draft, extra=True), "verdict fields"),
+            (verdict(draft, failed_rules=[{"rule": "reader", "quote": draft.body, "extra": True}]), "failed rule fields"),
+            (verdict(draft, failed_rules=[{"rule": "", "quote": draft.body}]), "failed rule needs a name"),
+            (verdict(draft, failed_rules=[{"rule": " \t", "quote": draft.body}]), "failed rule needs a name"),
+        ):
+            with self.subTest(value=value):
+                runner = FakeReviewer(value)
+
+                def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+                    return real_review(key, text, runner=runner, console_kind=console_kind)
+
+                with (mock.patch.object(review, "review_question", side_effect=run),
+                      self.assertRaisesRegex(ValueError, reason)):
+                    console_text.require(draft.body, "reply", identity="layout")
+                key = review.QuestionKey("reply/layout", "")
+                hold = review.state_path() / "questions" / f"{key.digest}.json"
+                self.assertIn(draft.body, hold.read_text())
 
     def test_unavailable_question_review_preserves_original_and_logs_reason(self) -> None:
         draft = review.Draft("demo", "0", "", NoActionRequired(), "Retry build 42?", False)
@@ -423,30 +517,30 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertEqual([call.args[0] for call in access.call_args_list], list(candidates[:index + 1]))
 
     def test_review_config_accepts_positive_finite_seconds_and_logs_fallbacks(self) -> None:
-        for contents, expected in (("# local limit\nREVIEW_TIMEOUT_SECONDS=90 # seconds\n", 90),
-                                   ("REVIEW_TIMEOUT_SECONDS=0.5\n", 0.5)):
+        for contents, expected in (("# local limit\nreview_timeout_seconds=90 # seconds\n", 90),
+                                   ("review_timeout_seconds=0.5\n", 0.5)):
             _ = review.NOTIFY_CONFIG.write_text(contents)
             with redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(review.review_timeout_seconds(), expected)
             self.assertEqual(errors.getvalue(), "")
-        for contents, reason in (("OTHER=90\n", "missing REVIEW_TIMEOUT_SECONDS"),
-                                 ("REVIEW_TIMEOUT_SECONDS=oops", "could not convert"),
-                                 ("REVIEW_TIMEOUT_SECONDS=0", "positive and finite"),
-                                 ("REVIEW_TIMEOUT_SECONDS=-1", "positive and finite"),
-                                 ("REVIEW_TIMEOUT_SECONDS=nan", "positive and finite"),
-                                 ("REVIEW_TIMEOUT_SECONDS=inf", "positive and finite")):
+        for contents, reason in (("OTHER=90\n", "missing review_timeout_seconds"),
+                                 ("review_timeout_seconds=oops", "could not convert"),
+                                 ("review_timeout_seconds=0", "positive and finite"),
+                                 ("review_timeout_seconds=-1", "positive and finite"),
+                                 ("review_timeout_seconds=nan", "positive and finite"),
+                                 ("review_timeout_seconds=inf", "positive and finite")):
             _ = review.NOTIFY_CONFIG.write_text(contents)
             with redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(review.review_timeout_seconds(), 60)
             self.assertIn(reason, errors.getvalue())
-            self.assertIn("using REVIEW_TIMEOUT_SECONDS=60", errors.getvalue())
+            self.assertIn("using review_timeout_seconds=60", errors.getvalue())
         review.NOTIFY_CONFIG.unlink()
         with redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(review.review_timeout_seconds(), 60)
         self.assertIn("No such file", errors.getvalue())
 
     def test_all_delivery_waits_derive_from_the_configured_review_and_post_limits(self) -> None:
-        _ = review.NOTIFY_CONFIG.write_text("REVIEW_TIMEOUT_SECONDS=90\n")
+        _ = review.NOTIFY_CONFIG.write_text("review_timeout_seconds=90\n")
         self.assertEqual(review.revision_seconds(), 195)
         self.assertEqual(review.user_send_seconds(), 205)
         self.assertEqual(review.claim_stale_seconds(), 205)
@@ -456,12 +550,12 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.user_send_seconds(), 220)
             self.assertEqual(review.claim_stale_seconds(), 220)
             self.assertEqual(review.posting_wait_seconds(), 110)
-        _ = review.NOTIFY_CONFIG.write_text("REVIEW_TIMEOUT_SECONDS=60\n")
+        _ = review.NOTIFY_CONFIG.write_text("review_timeout_seconds=60\n")
         self.assertEqual(review.user_send_seconds(), 145)
         self.assertEqual(review.posting_wait_seconds(), 110)
 
     def test_stale_claim_recovery_respects_a_longer_configured_revision_budget(self) -> None:
-        _ = review.NOTIFY_CONFIG.write_text("REVIEW_TIMEOUT_SECONDS=150\n")
+        _ = review.NOTIFY_CONFIG.write_text("review_timeout_seconds=150\n")
         held = self.held()
         review.hold(held)
         with mock.patch.object(time, "time", return_value=1301):
@@ -1141,7 +1235,7 @@ class LocalReviewTests(unittest.TestCase):
         digest = push_texts.fingerprint(entry)
         config = self.root / "ask-config"
         config.mkdir()
-        _ = (config / "notify.conf").write_text("# range: 1..60\nTEXT_ASK_MINUTES=7\n", encoding="utf-8")
+        _ = (config / "notify.conf").write_text("# range: 1..60\ntext_ask_minutes=7\n", encoding="utf-8")
         with (mock.patch.dict(os.environ, {"CONF_DIR": str(config),
                                          "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pause")}),
               mock.patch.object(text_asks, "read_pane",
@@ -1263,6 +1357,10 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIn("Title: {sender}: {session} waits for your go\nSession: {session}\n", shown)
         self.assertIn("Example (typical):\nTitle: natedev: trunk waits for your go\nSession: trunk\n", shown)
         self.assertNotIn("{", shown.split("Example (typical):")[1])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["show", "shutdown.restart_failed"]), 0)
+        self.assertTrue(output.getvalue().endswith("Example (typical):\nTitle: trunk did not start on claude4\n"
+            + "Action: In the natedev session, run: /agents resume trunk --to claude4\n"))
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(review.main(["show", "no.such"]), 1)
         self.assertEqual(output.getvalue(), f"No template named no.such.\n\n{listing}\n")

@@ -171,7 +171,8 @@ class ShutdownStatusTests(ShutdownTestCase):
         self.assertEqual(shutdown_record.read(), ["earlier", str(row.id)])
 
     def test_named_resume_cleanup_precedes_a_stop_after_the_row_lock_releases(self) -> None:
-        row = fixture_member("producer", name="resume-race")
+        row = fixture_member("producer", name="resume-race",
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root / "producer"))
         shutdown_record.save([str(row.id)])
         operation = staff.row_operation
         stopped_again: list[str] = []
@@ -228,7 +229,8 @@ class ShutdownStatusTests(ShutdownTestCase):
         from scripts.whoami import quota_state
 
         owner = fixture_member("showrunner", name="resume-owner")
-        row = fixture_member("unit", name="resume-unit", parent=owner.id)
+        row = fixture_member("unit", name="resume-unit", parent=owner.id,
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root / "unit"))
         notice = "Codex workers have no capacity. Send no assign."
         for delivered, held in ((True, False), (False, False), (True, True)):
             with self.subTest(delivered=delivered, held=held):

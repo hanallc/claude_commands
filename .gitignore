@@ -26,6 +26,7 @@
 !docs/
 !docs/**
 docs/plans/*-log.md
+docs/plans/*-production-live.md
 !scripts/
 !scripts/**
 !shared/

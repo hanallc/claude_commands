@@ -27,10 +27,13 @@ from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import Literal, NamedTuple, NotRequired, TypedDict, cast, overload
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast, overload
 from zoneinfo import ZoneInfo
 
-from scripts.production.production_doc import Production, Refusal, read_production
+from scripts.production.production_doc import (
+    EnrolledPaths, Production, Refusal, read_production, resolve_production_paths,
+)
+from scripts.production.production_admission import require_admission
 from scripts.production.checkpoint_gate import report
 
 from scripts.production import change_routing, delivery_state, showrunners, session_staff, showrunner_tree, staff, unit_lookup
@@ -42,6 +45,7 @@ from scripts.production.issues import Issue, frontmatter
 from scripts.lib import urgency
 from scripts.lib.urgency import Urgency, UrgencyError
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.git_exclude import require_untracked_ignored
 from scripts.lib.user_zone import user_zone
 
 from scripts.review_links import new_item_dialog, question_path, reply_tokens, review_events
@@ -51,6 +55,9 @@ from scripts.lib import conf, names
 from scripts.lib.process_failure import failure_detail
 from scripts.agents.remote import local_machine
 
+if TYPE_CHECKING:
+    from scripts.notify import review
+
 
 class InputError(Exception):
     pass
@@ -58,7 +65,6 @@ class InputError(Exception):
 
 STARTED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")
 UNREADABLE_LIST = "needs-user list unreadable"
-PLUMBING = re.compile(r"\b(?:berth|reservations?|incursions?|holders?|file holds?|file clash\w*|writers?|testers?|retak\w*|re-?shoot\w*)\b", re.IGNORECASE)
 
 @dataclass(frozen=True)
 class DueNow:
@@ -218,15 +224,6 @@ def check_question_title(text: str) -> ValidQuestionTitle | RefusedQuestionTitle
     return ValidQuestionTitle(text)
 
 
-def plumbing(line: str) -> str | None:
-    """Why the line fails the plumbing check, or None when it passes."""
-    found = PLUMBING.search(line)
-    if found is None:
-        return None
-    return (f"{found.group(0)!r} is the production's own plumbing or shorthand, which the user never sees; "
-            + "say what changes in the app, or leave it out")
-
-
 def read_ranking(fields: dict[str, object], where: str) -> Ranking:
     """An item's `urgency`, `due`, `marked` and `follows`; none of them is a normal item."""
     follows = fields.get("follows", "")
@@ -261,12 +258,15 @@ def read_followups(value: object, where: str) -> tuple[Followup, ...]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}.followups[{index}]: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"followup", "reply", "question_id", "replied_at"}, f"{where}.followups[{index}]")
+        location = f"{where}.followups[{index}]"
+        check_keys(fields, {"followup", "reply", "question_id", "replied_at", "review_unavailable"}, location)
         followup, reply = fields.get("followup"), fields.get("reply")
         if not isinstance(followup, str) or not isinstance(reply, str) or not followup.strip() or not reply.strip():
             raise InputError(f"{where}.followups[{index}]: expected the follow-up and its reply")
         if "question_id" in fields and (not isinstance(fields["question_id"], str) or not fields["question_id"]):
             raise InputError(f"{where}.followups[{index}].question_id: expected an ID")
+        if "review_unavailable" in fields and not isinstance(fields["review_unavailable"], str):
+            raise InputError(f"{location}.review_unavailable: expected reason text")
         if "replied_at" in fields:
             try:
                 stamp = fields["replied_at"]
@@ -301,7 +301,11 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
                             "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log", "waiting_why",
-                            "review_submission", "reply_log_positions", "answered_at"}, where)
+                            "review_submission", "reply_log_positions", "answered_at", "request_key"}, where)
+        if "request_key" in fields:
+            request_key = fields["request_key"]
+            if not isinstance(request_key, str) or not request_key.strip() or "question" not in fields:
+                raise InputError(f"{where}.request_key: expected a nonempty question request key")
         details: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
         if "review_submission" in fields:
             try:
@@ -411,9 +415,11 @@ class FollowupExchange(TypedDict):
     reply: str
     question_id: NotRequired[str]
     replied_at: NotRequired[str]
+    review_unavailable: NotRequired[str]
 
 
 class OutstandingItem(TypedDict):
+    request_key: NotRequired[str]
     waiting_why: NotRequired[str]
     review_id: NotRequired[str]
     review_log: NotRequired[str]
@@ -856,19 +862,32 @@ def adopt_moved_state(production: Production, *, record: staff.StaffSnapshot | N
     return done
 
 
+def status_line(lines: list[str]) -> re.Match[str] | None:
+    return next((re.search(r"^> \*\*Status: PRODUCTION — (planned|running|wrapped)\.\*\*", line)
+                 for line in lines if line.startswith("> **Status:")), None)
+
+
 def register(production: Production) -> None:
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         raise RegistrationFailure("register", "CLAUDE_CODE_SESSION_ID is required")
+    require_admission(production)
     try:
         agents_log.append(session_id, "showrunner", None, datetime.now(timezone.utc))
     except Exception as exc:
         # Recording must never interrupt registration.
         print("agents_log: " + " ".join(str(exc).splitlines()), file=sys.stderr)
-    relative = production.doc.relative_to(production.checkout)
-    dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
-    if dirty:
-        raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
+    paths = resolve_production_paths(production.doc)
+    if isinstance(paths, EnrolledPaths):
+        for path in (paths.live_doc, paths.log):
+            require_untracked_ignored(paths.main, path.relative_to(paths.main).as_posix())
+    else:
+        relative = production.doc.relative_to(production.checkout)
+        dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
+        if dirty:
+            raise RegistrationFailure("register", "the production doc has uncommitted edits; commit or discard them first")
+    for line in adopt_moved_state(production):
+        report("state-dir", "ok", line)
     # The staff row owns the timer.
     owner = production.owner
     updates = f"showrunner-{owner.id}"
@@ -1533,7 +1552,9 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
             item = entry.copy()
             row = question_member(production, item, identities)
             item["asked_by"] = row.id
-            selected = current.get(item.get("review_id", "")) or legacy.get((row.id, item["text"]))
+            selected = current.get(item.get("review_id", ""))
+            if selected is None and "request_key" not in item:
+                selected = legacy.get((row.id, item["text"]))
             if selected is None:
                 digest = hashlib.sha256(f"{owner}:{row.id}:{item['text']}".encode()).hexdigest()
                 path = record_store.free_record_path(folder.path / f"question-{row.id}-{digest[:16]}.md", names)
@@ -1580,14 +1601,15 @@ def migrate_questions(production: Production, *, identities: QuestionStaff | Non
     with outstanding_lock(path):
         legacy = legacy_entries(path)
         existing = open_entries(production, identities)
-        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities, strict=True)}
-        questions = {(question_member(production, entry, identities).id, entry["text"]): entry
+        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities, strict=True)
+                    if "request_key" not in record.item}
+        questions = {(question_member(production, entry, identities).id, entry["text"], entry.get("request_key", "")): entry
                      for entry in existing if "question" in entry}
         for entry in legacy:
             if "question" in entry:
                 key = (question_member(production, entry, identities).id, entry["text"])
-                if key not in questions and key not in recorded:
-                    questions[key] = entry
+                if key not in recorded:
+                    _ = questions.setdefault((*key, ""), entry)
         reminders = [entry for entry in legacy if "question" not in entry]
         def write_list() -> None:
             if any("question" in entry for entry in legacy):
@@ -1748,9 +1770,10 @@ def write_open_entries(production: QuestionScope, entries: list[OutstandingItem]
     path = outstanding_path(production)
     legacy = [entry for entry in legacy_entries(path) if "question" in entry]
     if legacy:
-        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities)}
+        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities)
+                    if "request_key" not in record.item}
         supplied = {(question_member(production, entry, identities).id, entry["text"])
-                    for entry in entries if "question" in entry}
+                    for entry in entries if "question" in entry and "request_key" not in entry}
         entries = list(entries)
         for entry in legacy:
             key = (question_member(production, entry, identities).id, entry["text"])
@@ -1923,7 +1946,27 @@ class QuestionFromStaff:
     pass
 
 
+@dataclass(frozen=True)
+class KeyedStaffQuestion:
+    """A caller can retry this question with the same request key."""
+
+    request_key: str
+
+
 _QUESTION_FROM_STAFF = QuestionFromStaff()
+
+
+def keyed_question(production: QuestionScope, identities: QuestionStaff, key: str) -> QuestionRecord | None:
+    matches = [record for record in native_question_records(production, identities, strict=True)
+               if record.item.get("request_key") == key]
+    if len(matches) > 1:
+        raise RegistrationFailure("ask", f"{key}: more than one question for this request")
+    return matches[0] if matches else None
+
+
+def numbered_question(owner: staff.StaffId, identity: str, *folders: Path) -> QuestionRecord | None:
+    """Read one staff question by its fixed owner and number."""
+    return _find_question(owner, identity, "questions", *folders)
 
 def _ask_recipient(production: QuestionScope, text: str, parts: QuestionParts,
                    identities: QuestionStaff, outgoing: QuestionFromReview) -> QuestionRecord:
@@ -1951,18 +1994,24 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
 
 @overload
 def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
-        identities: QuestionStaff | None = None, outgoing: QuestionFromReview) -> QuestionRecord: ...
+        identities: QuestionStaff | None = None, outgoing: QuestionFromReview | KeyedStaffQuestion) -> QuestionRecord: ...
 
 
 def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
         identities: QuestionStaff | None = None,
-        outgoing: QuestionFromReview | QuestionFromStaff = _QUESTION_FROM_STAFF) -> QuestionRecord | None:
+        outgoing: QuestionFromReview | QuestionFromStaff | KeyedStaffQuestion = _QUESTION_FROM_STAFF) -> QuestionRecord | None:
     """Review and file a question with its asker's fixed staff id; its parts keep their layout on the Questions page."""
     identities = identities if identities is not None else QuestionStaff.read()
     if isinstance(outgoing, QuestionFromReview):
         limit = conf.read_or_repository("production").whole("question_title_max_chars")
         title = text[:limit].rstrip()
         return _ask_recipient(production, title, {**parts, "ask": title}, identities, outgoing)
+    if isinstance(outgoing, KeyedStaffQuestion):
+        if not outgoing.request_key.strip():
+            raise RegistrationFailure("ask", "the request key is empty")
+        saved = keyed_question(production, identities, outgoing.request_key)
+        if saved is not None:
+            return saved
     asker = identities.asker(production, unit)
     for option, title in (("--text", text), ("--ask", parts["ask"])):
         checked = check_question_title(title)
@@ -1972,14 +2021,12 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
     if parts["choices"] and (len(parts["choices"]) < 2 or not parts["recommend"].strip()):
         raise RegistrationFailure("ask", "a question with choices needs at least two --choice and one --recommend")
     question = question_text(parts)
-    problem = plumbing(text)
-    if problem is not None:
-        raise RegistrationFailure("ask", f"{text}: {problem}")
     outstanding = outstanding_path(production)
-    if any(entry["text"] == text for entry in open_entries(production, identities)):
+    if not isinstance(outgoing, KeyedStaffQuestion) and any(
+            entry["text"] == text for entry in open_entries(production, identities)):
         raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
     # The review can take a minute, so it runs before the lock: `questions` is not held up by it.
-    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank))
+    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank), outgoing=outgoing)
     if isinstance(accepted, HeldRegistrationQuestion):
         raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}")
     now = datetime.now(production.zone)
@@ -1991,17 +2038,28 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
         entry["review_unavailable"] = accepted.reason
     store_ranking(entry, rank)
     with outstanding_lock(outstanding):
+        if isinstance(outgoing, KeyedStaffQuestion):
+            saved = keyed_question(production, identities, outgoing.request_key)
+            if saved is not None:
+                return saved
+            entry["request_key"] = outgoing.request_key
         entries = open_entries(production, identities)
-        if any(stored["text"] == text for stored in entries):
-            raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
-        if any("question" in stored and stored["text"] == text
-               and question_member(production, stored, identities).id == asker.id
-               for stored in legacy_entries(outstanding)):
-            raise RegistrationFailure("ask", f"{text}: a legacy question from this asker is already open")
+        if not isinstance(outgoing, KeyedStaffQuestion):
+            if any(stored["text"] == text for stored in entries):
+                raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
+            if any("question" in stored and stored["text"] == text
+                   and question_member(production, stored, identities).id == asker.id
+                   for stored in legacy_entries(outstanding)):
+                raise RegistrationFailure("ask", f"{text}: a legacy question from this asker is already open")
         entries.append(entry)
         with record_store.keep_file_on_error(outstanding.with_suffix(".history.jsonl")):
             write_open_entries(production, entries, identities, last=(entry,),
                                before_list=lambda: record_question_history(outstanding, [entry], now))
+        if isinstance(outgoing, KeyedStaffQuestion):
+            saved = keyed_question(production, identities, outgoing.request_key)
+            if saved is None:
+                raise RegistrationFailure("ask", f"{text}: cannot read the filed question")
+            return saved
     filed = accepted.reviewed if isinstance(accepted, ReviewedQuestion) else question
     print("filed question: " + filed)
     report("ask", "ok", f"{text}: on the open-questions list of {production.name}, not shown to the user")
@@ -2343,19 +2401,23 @@ def set_waiting_why(record: QuestionRecord, text: str) -> None:
         write_question_record(current)
 
 
-def answer_followup(entry: OutstandingItem, text: str) -> None:
+def answer_followup(entry: OutstandingItem, text: str, *, review_unavailable: str | None = None) -> None:
     """Move one pending follow-up into its answered exchanges."""
     pending = entry.pop("followup", None)
     if pending is None:
         raise RegistrationFailure("reply", f"{entry['text']}: no follow-up waits for a reply")
-    entry["followups"] = [*entry.get("followups", []), FollowupExchange(followup=pending["text"], reply=text.strip())]
+    exchange = FollowupExchange(followup=pending["text"], reply=text.strip())
+    if review_unavailable is not None:
+        exchange["review_unavailable"] = review_unavailable
+    entry["followups"] = [*entry.get("followups", []), exchange]
 
 
-def record_followup_reply(entry: OutstandingItem, words: str, who: str) -> None:
+def record_followup_reply(entry: OutstandingItem, words: str, who: str, *,
+                          review_unavailable: str | None = None) -> None:
     """Save the reply and its log position together."""
     events = review_events.decode(entry.get("review_log", ""))
     exchange = len(entry.get("followups", []))
-    answer_followup(entry, words)
+    answer_followup(entry, words, review_unavailable=review_unavailable)
     entry.setdefault("reply_log_positions", {})[str(exchange)] = len(events)
     event = review_events.ReviewLog(datetime.now().astimezone(user_zone()), who, "Answer: " + words)
     entry["answered_at"] = event.time.isoformat()
@@ -2394,46 +2456,86 @@ def review_sent_question(record: QuestionRecord, scope: QuestionScope,
         write_question_record(current)
 
 
+def _submission_reply_target(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str,
+                             owner: staff.StaffId) -> tuple[QuestionRecord, bool]:
+    current = read_review_question(path, owner)
+    details = new_item_dialog.read_submission(current.item.get("review_submission"))
+    if current.owner != owner or current.item.get("review_id") != key.item_id or details.request_id != key.request_id:
+        raise new_item_dialog.SubmissionError("The selected Question changed.")
+    new_item_dialog.require_reply_token(details, token)
+    exchanges = current.item.get("followups", [])
+    repeated = current.status == "open" and "followup" not in current.item and bool(
+        exchanges and exchanges[-1]["reply"] == words)
+    if not repeated and not pending_review_reply(current):
+        raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
+    return current, repeated
+
+
 def reply_to_submission(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str, *,
                         owner: staff.StaffId) -> bool:
-    """Apply a reply to the current wait on a question sent by the user."""
-    with (outstanding_lock(state_root() / "outstanding" / (owner + ".json")),
-          _question_number_lock(owner)):
-        current = read_review_question(path, owner)
-        details = new_item_dialog.read_submission(current.item.get("review_submission"))
-        if current.owner != owner or current.item.get("review_id") != key.item_id or details.request_id != key.request_id:
-            raise new_item_dialog.SubmissionError("The selected Question changed.")
-        new_item_dialog.require_reply_token(details, token)
-        exchanges = current.item.get("followups", [])
-        repeated = current.status == "open" and "followup" not in current.item and bool(
-            exchanges and exchanges[-1]["reply"] == words)
-        if not repeated and not pending_review_reply(current):
-            raise new_item_dialog.SubmissionError("This item no longer accepts this reply.")
-        if repeated:
-            return False
-        record_followup_reply(current.item, words, current.owner)
-        write_question_record(current)
-        return True
+    """Review and save a reply to a question sent by the user."""
+    return prepare_submission_reply(path, key, words, token, owner=owner)()
+
+
+def prepare_submission_reply(path: Path, key: new_item_dialog.ScopedSubmissionKey, words: str, token: str, *,
+                             owner: staff.StaffId) -> Callable[[], bool]:
+    """Review the reply and return a function that checks and saves it."""
+    selected, repeated = _submission_reply_target(path, key, words, token, owner)
+    unavailable = None if repeated else review_console_reply(selected, words, key.request_id)
+
+    def save() -> bool:
+        with (outstanding_lock(state_root() / "outstanding" / (owner + ".json")),
+              _question_number_lock(owner)):
+            current, same_answer = _submission_reply_target(path, key, words, token, owner)
+            if same_answer:
+                return False
+            if current != selected:
+                raise new_item_dialog.SubmissionError("The selected Question changed.")
+            record_followup_reply(current.item, words, current.owner, review_unavailable=unavailable)
+            write_question_record(current)
+            return True
+
+    return save
+
+
+def _native_reply_target(record: QuestionRecord, text: str, question_id: str
+                         ) -> tuple[QuestionRecord, delivery_state.NoQuestion | delivery_state.OpenQuestion |
+                                    delivery_state.AnsweredQuestion]:
+    current = current_open_question(record, "reply")
+    delivery = change_routing.delivery_path(change_routing.review_root(), current.path, current.path.stem)
+    if "review_submission" in current.item:
+        raise RegistrationFailure("reply", "Use the scoped reply from the Review item.")
+    exchange = change_routing.delivery_slots(delivery).question
+    if question_id or isinstance(exchange, delivery_state.OpenQuestion):
+        _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
+    if "followup" not in current.item:
+        raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
+    return current, exchange
 
 
 def reply_record(record: QuestionRecord, text: str, who: str, *, identities: QuestionStaff, question_id: str = '') -> None:
-    """Answer the exact record under its owner's lock and keep the answer in its log."""
+    """Review and save the reply to the selected question."""
+    prepare_reply_record(record, text, who, identities=identities, question_id=question_id)()
+
+
+def prepare_reply_record(record: QuestionRecord, text: str, who: str, *,
+                         identities: QuestionStaff, question_id: str = '') -> Callable[[], None]:
+    """Review the reply and return a function that checks and saves it."""
     if not text.strip():
         raise RegistrationFailure("reply", "the reply is empty")
     scope = question_scope(record.owner, identities.record)
-    with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
-        current = current_open_question(record, "reply")
-        delivery = change_routing.delivery_path(change_routing.review_root(), current.path, current.path.stem)
-        if "review_submission" in current.item:
-            raise RegistrationFailure("reply", "Use the scoped reply from the Review item.")
-        exchange = change_routing.delivery_slots(delivery).question
-        if question_id or isinstance(exchange, delivery_state.OpenQuestion):
-            _ = delivery_state.question_exchange_for_reply(exchange, question_id, text.strip())
-        if "followup" not in current.item:
-            raise RegistrationFailure("reply", f"{current.item['text']}: no open follow-up waits for a reply")
-        record_followup_reply(current.item, text, who)
-        _ = _publish_question(current)
-    report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
+    selected, exchange = _native_reply_target(record, text, question_id)
+    unavailable = review_console_reply(selected, text, question_id)
+    def save() -> None:
+        with outstanding_lock(outstanding_path(scope)), _question_number_lock(record.owner):
+            current, current_exchange = _native_reply_target(record, text, question_id)
+            if (current, current_exchange) != (selected, exchange):
+                raise RegistrationFailure("reply", "The selected Question changed.")
+            record_followup_reply(current.item, text, who, review_unavailable=unavailable)
+            _ = _publish_question(current)
+        report("reply", "ok", f"{scope.name}: {current.item['text']}: back on the open-questions list with the reply")
+
+    return save
 
 
 def reply(production: QuestionScope, words: str | ByQuestionKey, text: str, *,
@@ -2566,6 +2668,8 @@ def keep_layout_fields(entry: OutstandingItem, stored: OutstandingItem) -> None:
         entry["waiting_why"] = stored["waiting_why"]
     if "review_id" in stored:
         entry["review_id"] = stored["review_id"]
+    if "request_key" in stored:
+        entry["request_key"] = stored["request_key"]
 
 
 class HeldRegistrationQuestion(NamedTuple):
@@ -2586,16 +2690,40 @@ class ReviewUnavailableQuestion(NamedTuple):
 AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
 
 
-def review_open_question(name: str, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
-    # Copied registration trees can run reminder-only commands without notify installed.
+def review_open_question(name: str, item: QuestionForReview, *,
+                         outgoing: QuestionFromStaff | KeyedStaffQuestion = _QUESTION_FROM_STAFF
+                         ) -> AcceptedQuestion | HeldRegistrationQuestion:
+    # Import the reviewer only when the command files a full question.
+    from scripts.console_text import check as console_text
     from scripts.notify import review
-    outcome = review.review_question(review.QuestionKey(name, item.text), item.question)
+
+    identity = f"{item.text} [{outgoing.request_key}]" if isinstance(outgoing, KeyedStaffQuestion) else item.text
+    key = review.QuestionKey(name, identity)
+    outcome = console_text.check(item.question, "question", key=key, title=item.text)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)
     if isinstance(outcome, review.QuestionReviewUnavailable):
         return ReviewUnavailableQuestion(item.text, outcome.question, outcome.reason)
+    return HeldRegistrationQuestion(question_review_details(outcome))
+
+
+def question_review_details(outcome: review.QuestionAwaitingFacts | review.QuestionReviewFailed) -> str:
+    from scripts.notify import review
     details = outcome.questions if isinstance(outcome, review.QuestionAwaitingFacts) else outcome.details
-    return HeldRegistrationQuestion("; ".join(details + tuple(f"{failure.rule}: {failure.quote}" for failure in outcome.failures)))
+    return "; ".join((*details, *(f"{failure.rule}: {failure.quote}" for failure in outcome.failures)))
+
+
+def review_console_reply(record: QuestionRecord, text: str, exchange: str) -> str | None:
+    """Hold a failed draft or return the reason the reviewer was unavailable."""
+    from scripts.console_text import check as console_text
+    from scripts.notify import review
+
+    item = open_item_key(record) or record.item["text"]
+    key = review.QuestionKey("reply", f"{record.owner}/{item}/{exchange}")
+    outcome = console_text.check(text, "reply", key=key)
+    if isinstance(outcome, (review.QuestionAwaitingFacts, review.QuestionReviewFailed)):
+        raise RegistrationFailure("reply", "reply held for review: " + question_review_details(outcome))
+    return outcome.reason if isinstance(outcome, review.QuestionReviewUnavailable) else None
 
 
 def questions(production: Production, path: Path | None, *, identities: QuestionStaff | None = None) -> None:
@@ -2640,11 +2768,11 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
     refused: list[str] = []
     for text in items_by_text:
         checked = check_question_title(text)
-        problem = checked.reason if isinstance(checked, RefusedQuestionTitle) else plumbing(text)
-        if problem is not None and text in previous:
-            report("questions", "reword", f"{text}: {problem}")
-        elif problem is not None:
-            refused.append(f"{text}: {problem}")
+        if isinstance(checked, RefusedQuestionTitle):
+            if text in previous:
+                report("questions", "reword", f"{text}: {checked.reason}")
+            else:
+                refused.append(f"{text}: {checked.reason}")
     if refused:
         raise RegistrationFailure("questions", "; ".join(refused))
     for item in items_by_text.values():
@@ -2722,9 +2850,9 @@ def main() -> int:
                                         help="the one-line item the count and lists name, at most question_title_max_chars characters (config/production.conf); the default is --ask")
             _ = subcommand.add_argument("--ask", required=True,
                                         help="the question in one line, at most question_title_max_chars characters (config/production.conf); the parts below give the page its layout")
-            _ = subcommand.add_argument("--context", default="", help="two sentences at most: why it is asked now and what waits on it")
+            _ = subcommand.add_argument("--context", default="", help="the point of the question")
             _ = subcommand.add_argument("--item", dest="items", action="append", default=[],
-                                        help="one fact, step or command; a command in backticks; repeat it")
+                                        help="one fact line; repeat for each fact")
             _ = subcommand.add_argument("--recommend", default="",
                                         help="one choice and the reason, in one sentence; required with --choice")
             _ = subcommand.add_argument("--choice", dest="choices", action="append", default=[],
@@ -2796,6 +2924,9 @@ def main() -> int:
             questions_table(scope, identities=identities)
             return 0
         production = read_production(name, identities.record if identities else None)
+        if action == "register":
+            register(production)
+            return 0
         if action == "questions":
             questions(production, cast(Path | None, args.state), identities=identities)
             for line in adopt_moved_state(production):
@@ -2803,9 +2934,7 @@ def main() -> int:
             return 0
         for line in adopt_moved_state(production, record=identities.record if identities is not None else None):
             report("state-dir", "ok", line)
-        if action == "register":
-            register(production)
-        elif action == "time":
+        if action == "time":
             report("time", "ok", production_time(production, cast(str, args.stamp)))
         elif action == "log":
             append_log(production, cast(str, args.event), cast(Path | None, args.state), cast(bool, args.before_compaction))

@@ -8,6 +8,7 @@ import json
 import os
 import pwd
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,7 @@ from typing import cast, override
 from unittest import mock
 
 from scripts.disks import cleanup_old_folders
-from scripts.lib import build_folders, git_files, git_rescue, process_start, removal_guard, session_move
+from scripts.lib import build_folders, git_files, git_rescue, inotify, process_start, removal_guard, session_move
 from scripts.lib.git_test_support import commit_repository, fixture_git_environment
 from scripts.lint import tmp_sweep
 from scripts.production import staff
@@ -938,18 +939,350 @@ assert not loaded, sorted(loaded)
         self.write_settings(str(path))
         return path
 
-    def test_gate_move_keeps_linked_worktrees_at_any_depth(self) -> None:
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_copies_links_without_following_them(self) -> None:
         cleanup = cleanup_old_folders
-        linked = self.candidate("t-linked", home=self.gate)
-        nested = self.gate_checkout_to_move("t-nested-linked")
-        (nested / "child").mkdir()
-        for metadata in (linked / ".git", nested / "child/.git"):
-            _ = metadata.write_text("gitdir: /fixture/git/worktrees/linked\n")
-        self.write_settings(f"{linked} {nested}")
-        review, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=cleanup.CleanupMode.MOVE_GATE_GIT)
+        scripts = self.home / "checkout/scripts"
+        shim = self.home / "worker/scripts/lib/py"
+        runtime = self.home / "run/current-system/sw/bin/python3"
+        scripts.mkdir(parents=True)
+        for referent in (scripts / "helper", shim, runtime):
+            referent.parent.mkdir(parents=True, exist_ok=True)
+            _ = referent.write_text("keep outside the gate\n")
+        for referent in (scripts, scripts / "helper", shim, runtime):
+            os.utime(referent, ns=(1, 1))
+        external_stamps = {path: path.stat() for path in (scripts, scripts / "helper", shim, runtime)}
+
+        directory_link = self.gate_checkout_to_move("fc-scripts") / ".claude/scripts"
+        shim_link = self.gate_checkout_to_move("merge-gate-shim") / "case/.claude/scripts/lib/py"
+        internal_link = self.gate_checkout_to_move("targeted-test-stub") / "case/bin/ssh"
+        relative_link = self.candidate("targeted-test-relative", home=self.gate) / "session/.id/c-movable"
+        runtime_link = self.gate_checkout_to_move("t-runtime") / "case/bin/uv"
+        link_targets = {directory_link: str(scripts), shim_link: str(shim),
+                        internal_link: str(internal_link.with_name("command-stub")),
+                        relative_link: "demo", runtime_link: str(runtime)}
+        for link, target_text in link_targets.items():
+            link.parent.mkdir(parents=True)
+            link.symlink_to(target_text)
+            os.utime(link, ns=(1_700_000_000_000_000_000, 1_700_000_001_000_000_000), follow_symlinks=False)
+        _ = internal_link.with_name("command-stub").write_text("stub\n")
+        link_stamps = {link: link.lstat() for link in link_targets}
+        self.write_settings(str(self.gate / "*"))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        standard, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV)
+        self.assertTrue(all(isinstance(row.outcome, removal_guard.Kept) for row in standard.rows))
+
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        self.assertEqual(len(review.rows), len(link_targets))
+        destinations: dict[Path, Path] = {}
+        for row in review.rows:
+            self.assertIsInstance(row.outcome, cleanup.WouldMove, row)
+            assert isinstance(row.outcome, cleanup.WouldMove)
+            destinations[row.path] = row.outcome.target
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
+        for link, target_text in link_targets.items():
+            relative = link.relative_to(self.gate)
+            source = self.gate / relative.parts[0]
+            self.assertFalse(source.exists())
+            moved = destinations[source] / link.relative_to(source)
+            self.assertTrue(moved.is_symlink())
+            self.assertEqual(os.readlink(moved), target_text)
+            before, after = link_stamps[link], moved.lstat()
+            self.assertEqual((after.st_mode, after.st_mtime_ns), (before.st_mode, before.st_mtime_ns))
+        for referent, before in external_stamps.items():
+            after = referent.stat()
+            self.assertEqual((after.st_atime_ns, after.st_mtime_ns, after.st_ctime_ns),
+                             (before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_source_when_the_copy_changes_link_text(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        link = path / "alias"
+        link.symlink_to("old-target")
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        row, = review.rows
+        self.assertIsInstance(row.outcome, cleanup.WouldMove)
+        assert isinstance(row.outcome, cleanup.WouldMove)
+        copy = cleanup.copy_gate_tree
+
+        def change_link(source: int, destination: int) -> None:
+            copy(source, destination)
+            folder = os.fstat(destination)
+            before = os.stat("alias", dir_fd=destination, follow_symlinks=False)
+            os.unlink("alias", dir_fd=destination)
+            os.symlink("new-target", "alias", dir_fd=destination)
+            os.utime("alias", ns=(before.st_atime_ns, before.st_mtime_ns), dir_fd=destination, follow_symlinks=False)
+            os.utime(destination, ns=(folder.st_atime_ns, folder.st_mtime_ns))
+
+        with (mock.patch.object(cleanup, "copy_gate_tree", side_effect=change_link),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+        self.assertIn("copy differs from the checked source: alias", output.getvalue())
+        self.assertEqual(os.readlink(link), "old-target")
+        self.assertFalse(row.outcome.target.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_list_keeps_directories_without_owner_write_or_search(self) -> None:
+        cleanup = cleanup_old_folders
+        blocked: dict[Path, Path] = {}
+        for name, permissions in (("t-no-write", 0o500), ("t-no-search", 0o600)):
+            folder = self.gate_checkout_to_move(name)
+            directory = folder / "child/nested"
+            directory.mkdir(parents=True)
+            (directory / "payload").touch()
+            directory.chmod(permissions)
+            self.addCleanup(directory.chmod, 0o700)
+            blocked[folder] = directory
+        self.write_settings(str(self.gate / "*"))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        self.assertEqual({row.path: row.outcome for row in review.rows}, {
+            path: removal_guard.Kept(f"{directory}: directory needs write and search permission")
+            for path, directory in blocked.items()
+        })
+        with mock.patch.object(cleanup, "copy_gate_tree") as copy:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0)
+        copy.assert_not_called()
+        for path, directory in blocked.items():
+            self.assertTrue(directory.is_dir())
+            self.assertFalse(os.path.lexists(cleanup.gate_move_target(path, bounds)))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_copies_a_fifo_without_opening_it_for_io(self) -> None:
+        cleanup = cleanup_old_folders
+        folder = self.gate_checkout_to_move("merge-gate-with-pipe")
+        pipe = folder / "jobserver"
+        os.mkfifo(pipe)
+        watcher = inotify.open_watch()
+        self.addCleanup(os.close, watcher)
+        opened = 0x00000020  # IN_OPEN from linux/inotify.h.
+        _ = inotify.add_watch(watcher, pipe, opened)
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        row, = review.rows
+        self.assertIsInstance(row.outcome, cleanup.WouldMove)
+        assert isinstance(row.outcome, cleanup.WouldMove)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
+        self.assertFalse(any(event.mask & opened for event in inotify.events(watcher)))
+        self.assertFalse(folder.exists())
+        self.assertTrue((row.outcome.target / pipe.name).is_fifo())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_sockets_and_recovery_records(self) -> None:
+        cleanup = cleanup_old_folders
+        folder = self.gate_checkout_to_move("merge-gate-with-socket")
+        endpoint = folder / "listener"
+        listener = self.enterContext(socket.socket(socket.AF_UNIX))
+        parent = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            listener.bind(f"/proc/self/fd/{parent}/{endpoint.name}")
+        finally:
+            os.close(parent)
+        recovery = self.gate_checkout_to_move("t-with-recovery")
+        plain = self.candidate("fc-without-git", home=self.gate)
+        (recovery / "run.json").touch()
+        self.write_settings(str(self.gate / "*"))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
         rows = {row.path: row.outcome for row in review.rows}
-        for path in (linked, nested):
-            self.assertEqual(rows[path], removal_guard.Kept("linked worktree; its registration is elsewhere"))
+        self.assertEqual(rows[folder], removal_guard.Kept(f"contains a socket or device: {endpoint}"))
+        self.assertEqual(rows[recovery], removal_guard.Kept("gate recovery record"))
+        self.assertIsInstance(rows[plain], cleanup.WouldMove)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
+        self.assertTrue(endpoint.is_socket())
+        self.assertFalse(os.path.lexists(cleanup.gate_move_target(folder, bounds)))
+        self.assertTrue((recovery / "run.json").is_file())
+        self.assertFalse(plain.exists())
+
+    def test_gate_move_list_reports_progress_only_on_a_terminal(self) -> None:
+        cleanup = cleanup_old_folders
+        _ = self.candidate("fc-first", home=self.gate)
+        _ = self.candidate("t-second", home=self.gate)
+        other = self.candidate()
+        self.write_settings(str(other))
+        for terminal, expected in ((True, "\rChecking folder 1 of 2\rChecking folder 2 of 2\r\x1b[K"), (False, "")):
+            with (self.subTest(terminal=terminal), redirect_stderr(io.StringIO()) as errors,
+                  mock.patch.object(errors, "isatty", return_value=terminal)):
+                _ = cleanup.review_local(cleanup.Machine.NATEDEV, mode=cleanup.CleanupMode.MOVE_GATE_GIT)
+            self.assertEqual(errors.getvalue(), expected)
+
+    def test_move_list_uses_standard_only_for_a_non_gate_checkout(self) -> None:
+        cleanup = cleanup_old_folders
+        _source, path = self.git_fixture(linked=False)
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        with (mock.patch.object(cleanup, "cleanup_git", side_effect=AssertionError("move list ran Git")) as git,
+              mock.patch.object(cleanup, "inspect_cleanup_tree", wraps=cleanup.inspect_cleanup_tree) as inspect):
+            review, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        git.assert_not_called()
+        inspect.assert_not_called()
+        self.assertEqual(review.rows, (cleanup.Row(path, None, cleanup.STANDARD_CLEANUP_ONLY),))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_copies_git_files_with_internal_or_missing_registrations(self) -> None:
+        cleanup = cleanup_old_folders
+        inside = self.candidate("t-inside", home=self.gate)
+        registration = inside / "checkout/store/worktrees/linked"
+        registration.mkdir(parents=True)
+        _ = (registration / "HEAD").write_text("ref: refs/heads/main\n")
+        missing = self.candidate("t-missing", home=self.gate)
+        missing_registration = self.home / "missing/worktrees/linked"
+        markers = {
+            inside / "checkout/.git": "gitdir: store/worktrees/linked\n",
+            missing / ".git": f"gitdir: {missing_registration}\n",
+        }
+        for marker, text in markers.items():
+            _ = marker.write_text(text)
+        self.write_settings(str(self.gate / "*"))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        with mock.patch.object(cleanup, "cleanup_git") as run_git:
+            review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            self.assertEqual({row.path for row in review.rows}, {inside, missing})
+            for row in review.rows:
+                self.assertIsInstance(row.outcome, cleanup.WouldMove)
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
+        run_git.assert_not_called()
+        for folder in (inside, missing):
+            self.assertFalse(folder.exists())
+            target = cleanup.gate_move_target(folder, bounds)
+            for marker, text in markers.items():
+                if marker.is_relative_to(folder):
+                    self.assertEqual((target / marker.relative_to(folder)).read_text(), text)
+        self.assertFalse(missing_registration.exists())
+
+    def test_gate_move_keeps_gitdirs_with_dot_parts_or_links(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.candidate("t-aliased", home=self.gate)
+        nested = self.home / "shared/nested"
+        nested.mkdir(parents=True)
+        registration = nested.with_name("registration")
+        registration.mkdir()
+        alias = path / "alias"
+        alias.symlink_to(nested)
+        marker = path / ".git"
+        self.write_settings(str(path))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        for target in ("alias/../registration", "./registration", "alias/registration", "alias"):
+            with self.subTest(target=target):
+                text = f"gitdir: {target}\n"
+                _ = marker.write_text(text)
+                review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+                row, = review.rows
+                expected = f"a Git checkout here has a gitdir path that cannot be checked: {target}"
+                self.assertEqual(row.outcome, removal_guard.Kept(expected))
+                with mock.patch.object(cleanup, "copy_gate_tree") as copy:
+                    self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0)
+                copy.assert_not_called()
+                self.assertFalse(cleanup.gate_move_target(path, bounds).exists())
+                self.assertEqual(marker.read_text(), text)
+        self.assertTrue(alias.is_symlink())
+        self.assertTrue(registration.is_dir())
+
+    def test_gate_move_keeps_a_missing_gitdir_relative_to_the_outside(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.candidate("t-relative", home=self.gate)
+        marker = path / ".git"
+        target = "../registration"
+        _ = marker.write_text(f"gitdir: {target}\n")
+        self.assertFalse((self.gate / "registration").exists())
+        self.write_settings(str(path))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        row, = review.rows
+        expected = f"a Git checkout here has a gitdir path that cannot be checked: {target}"
+        self.assertEqual(row.outcome, removal_guard.Kept(expected))
+        with mock.patch.object(cleanup, "copy_gate_tree") as copy:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0)
+        copy.assert_not_called()
+        self.assertFalse(cleanup.gate_move_target(path, bounds).exists())
+        self.assertTrue(marker.is_file())
+
+    def test_gate_move_keeps_a_git_file_with_an_external_registration(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.candidate("t-external", home=self.gate)
+        marker = path / "checkout/.git"
+        marker.parent.mkdir()
+        registration = self.home / "store/.git/worktrees/linked"
+        registration.mkdir(parents=True)
+        head = registration / "HEAD"
+        _ = head.write_text("ref: refs/heads/main\n")
+        text = f"gitdir: {registration}\n"
+        _ = marker.write_text(text)
+        self.write_settings(str(path))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        row, = review.rows
+        expected = f"a Git checkout here belongs to a repository outside this folder: {registration}"
+        self.assertEqual(row.outcome, removal_guard.Kept(expected))
+        with mock.patch.object(cleanup, "copy_gate_tree") as copy:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0)
+        copy.assert_not_called()
+        self.assertEqual(marker.read_text(), text)
+        self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
+        self.assertFalse(cleanup.gate_move_target(path, bounds).exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux metadata-only open")
+    def test_gate_move_keeps_unreadable_invalid_and_symlink_git_files(self) -> None:
+        cleanup = cleanup_old_folders
+        invalid = self.candidate("t-invalid", home=self.gate) / ".git"
+        unreadable = self.candidate("t-unreadable", home=self.gate) / ".git"
+        link = self.candidate("t-link", home=self.gate) / ".git"
+        _ = invalid.write_text("missing pointer\n")
+        _ = unreadable.write_text("gitdir: missing\n")
+        link.symlink_to(invalid)
+        self.write_settings(str(self.gate / "*"))
+        open_entry = os.open
+
+        def refuse_read(path: str | bytes | os.PathLike[str] | os.PathLike[bytes], flags: int, mode: int = 0o777,
+                        *, dir_fd: int | None = None) -> int:
+            if path == unreadable.name and dir_fd is not None and not flags & os.O_PATH:
+                info = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+                if os.path.samestat(info, unreadable.stat()):
+                    raise PermissionError("fixture refuses reads")
+            return open_entry(path, flags, mode, dir_fd=dir_fd)
+
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        with mock.patch.object(os, "open", side_effect=refuse_read):
+            review, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        self.assertEqual({row.path: row.outcome for row in review.rows}, {
+            invalid.parent: removal_guard.Kept(f"{invalid}: .git file has no valid gitdir: line"),
+            unreadable.parent: removal_guard.Kept(f"{unreadable}: cannot read the .git file: fixture refuses reads"),
+            link.parent: removal_guard.Kept("linked worktree; its registration is elsewhere"),
+        })
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_source_if_external_registration_appears_after_copy(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.candidate("t-registration", home=self.gate)
+        registration = self.home / "new-registration"
+        text = f"gitdir: {registration}\n"
+        marker = path / ".git"
+        _ = marker.write_text(text)
+        self.write_settings(str(path))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        copy_tree = cleanup.copy_gate_tree
+
+        def create_registration(source: int, destination: int) -> None:
+            copy_tree(source, destination)
+            registration.mkdir()
+
+        with (mock.patch.object(cleanup, "copy_gate_tree", side_effect=create_registration),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+        self.assertIn(f"a Git checkout here belongs to a repository outside this folder: {registration}",
+                      output.getvalue())
+        self.assertEqual(marker.read_text(), text)
+        self.assertTrue(registration.is_dir())
 
     def test_gate_move_keeps_a_nested_clone_with_alternates(self) -> None:
         cleanup = cleanup_old_folders
@@ -1046,10 +1379,12 @@ assert not loaded, sorted(loaded)
         def change_after_verification(
                 checked: cleanup_old_folders.CheckedCleanup, source: int, destination: int, target_parent: int,
                 entries: dict[Path, cleanup_old_folders.CleanupEntry],
-                sidecars: cleanup_old_folders.WorktreeSidecars, *, target_path: Path
+                sidecars: cleanup_old_folders.WorktreeSidecars, *, target_path: Path,
+                checked_git_files: frozenset[removal_guard.CheckedGitFile],
                 ) -> cleanup_old_folders.VerifiedGateCopy:
             publication_states.append(target.exists())
-            verified = verify(checked, source, destination, target_parent, entries, sidecars, target_path=target_path)
+            verified = verify(checked, source, destination, target_parent, entries, sidecars, target_path=target_path,
+                              checked_git_files=checked_git_files)
             if len(publication_states) == 1:
                 self.assertEqual(os.fstat(target_parent).st_mode & 0o777, 0o700)
                 fd = os.open("payload", os.O_WRONLY | os.O_TRUNC, dir_fd=destination)
@@ -1088,6 +1423,68 @@ assert not loaded, sorted(loaded)
         self.assertIn("the published copy changed", output.getvalue())
         self.assertEqual((path / "payload").read_text(), "old content\n")
         self.assertEqual((target / "payload").read_text(), "")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_source_when_final_scan_removes_copied_lease(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        path.with_name(path.name + ".lock").touch()
+        source_lease = build_folders.lease_path(path)
+        copied_lease = build_folders.lease_path(target)
+        lease_contents = '{"pid": 42, "process_start": "123"}'
+        _ = source_lease.write_text(lease_contents)
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        scan = cleanup.require_no_process_use
+
+        def remove_copied_lease(
+                scanned_path: Path, fds: Sequence[int], *, sidecars: tuple[Path, ...],
+                gate_root: Path | cleanup_old_folders.GateRootNotSelected = cleanup.GateRootNotSelected.NOT_SELECTED,
+        ) -> None:
+            if scanned_path == path and gate_root == self.gate and target.is_dir():
+                copied_lease.unlink()
+            scan(scanned_path, fds, sidecars=sidecars, gate_root=gate_root)
+
+        with (mock.patch.object(process_start, "process_start", return_value=process_start.Gone()),
+              mock.patch.object(cleanup, "require_no_process_use", side_effect=remove_copied_lease),
+              redirect_stdout(io.StringIO()) as output):
+            review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+        self.assertIn("the published copy changed during verification", output.getvalue())
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertEqual(source_lease.read_text(), lease_contents)
+        self.assertFalse(copied_lease.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_source_when_final_copy_check_removes_copied_lease(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        target = self.build / "claude/resources/shm-moved" / path.name
+        path.with_name(path.name + ".lock").touch()
+        source_lease = build_folders.lease_path(path)
+        copied_lease = build_folders.lease_path(target)
+        lease_contents = '{"pid": 42, "process_start": "123"}'
+        _ = source_lease.write_text(lease_contents)
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        check_destination = removal_guard.ProvedCopyCleanup.require_unchanged_destination
+        destination_checks = 0
+
+        def remove_copied_lease(proof: removal_guard.ProvedCopyCleanup, approved_target: Path) -> None:
+            nonlocal destination_checks
+            destination_checks += 1
+            if destination_checks == 2:
+                copied_lease.unlink()
+            check_destination(proof, approved_target)
+
+        with (mock.patch.object(process_start, "process_start", return_value=process_start.Gone()),
+              mock.patch.object(removal_guard.ProvedCopyCleanup, "require_unchanged_destination", remove_copied_lease),
+              redirect_stdout(io.StringIO()) as output):
+            review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+        self.assertIn("the published copy changed during verification", output.getvalue())
+        self.assertEqual((path / "payload").read_text(), "old content\n")
+        self.assertEqual(source_lease.read_text(), lease_contents)
+        self.assertFalse(copied_lease.exists())
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
     def test_gate_move_rolls_back_published_paths_when_a_sidecar_rename_fails(self) -> None:
@@ -1323,9 +1720,11 @@ assert not loaded, sorted(loaded)
         def change_source_after_verification(
                 checked: cleanup_old_folders.CheckedCleanup, source: int, destination: int, target_parent: int,
                 entries: dict[Path, cleanup_old_folders.CleanupEntry],
-                sidecars: cleanup_old_folders.WorktreeSidecars, *, target_path: Path
+                sidecars: cleanup_old_folders.WorktreeSidecars, *, target_path: Path,
+                checked_git_files: frozenset[removal_guard.CheckedGitFile],
                 ) -> cleanup_old_folders.VerifiedGateCopy:
-            verified = verify(checked, source, destination, target_parent, entries, sidecars, target_path=target_path)
+            verified = verify(checked, source, destination, target_parent, entries, sidecars, target_path=target_path,
+                              checked_git_files=checked_git_files)
             info = head.stat()
             _ = head.write_text("ref: refs/heads/next\n")
             os.utime(head, ns=(info.st_atime_ns, info.st_mtime_ns))
