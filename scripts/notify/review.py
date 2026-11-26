@@ -736,7 +736,8 @@ def validate(value: object, draft: Draft, revision: bool,
                 raise ValueError("withhold needs a supported failure")
             return Withheld(draft, "; ".join(f"{failure.rule}: {failure.quote}" for failure in failures), metadata, tuple(failures))
         if verdict == "send":
-            if message_record(version) != message_record(draft):
+            # A Console send judges the original draft, so the echoed text is not used.
+            if not console and message_record(version) != message_record(draft):
                 raise ValueError("send changed draft")
             if not failed:
                 return Approved(draft, metadata)

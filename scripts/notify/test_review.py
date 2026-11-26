@@ -322,13 +322,30 @@ class LocalReviewTests(unittest.TestCase):
         self.assertEqual(review.review_question(key, draft.body, runner=approved, console_kind="reply"),
                          review.QuestionAccepted(draft.body))
 
+    def test_console_send_with_changed_text_accepts_the_original_draft(self) -> None:
+        from scripts.console_text import check as console_text
+
+        draft = review.Draft("demo", "0", "", NoActionRequired(), "Use the new layout.", False)
+        runner = FakeReviewer(verdict(draft, body="Use the old layout."))
+        key = review.QuestionKey("reply/layout", "")
+
+        self.assertEqual(review.review_question(key, draft.body, runner=runner, console_kind="reply"),
+                         review.QuestionAccepted(draft.body))
+        real_review = review.review_question
+
+        def run(key: review.QuestionKey, text: str, *, console_kind: str) -> review.QuestionOutcome:
+            return real_review(key, text, runner=runner, console_kind=console_kind)
+
+        with mock.patch.object(review, "review_question", side_effect=run):
+            console_text.require(draft.body, "reply", identity="layout")
+        self.assertFalse((review.state_path() / "questions" / f"{key.digest}.json").exists())
+
     def test_console_filing_holds_invalid_verdicts_and_allows_a_reviewer_outage(self) -> None:
         from scripts.console_text import check as console_text
 
         draft = review.Draft("demo", "0", "", NoActionRequired(), "Use the new layout.", False)
         real_review = review.review_question
         for runner, reason in (
-            (FakeReviewer(verdict(draft, body="Use the old layout.")), "send changed draft"),
             (FakeReviewer(verdict(draft), failure="json"), "bad JSON"),
             (FakeReviewer(verdict(draft), failure="timeout"), ""),
         ):

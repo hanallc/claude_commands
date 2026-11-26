@@ -432,6 +432,13 @@ class SharedCPUPool:
 
 @contextmanager
 def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
+    """Return owned slots before a standalone caller exits on SIGTERM."""
+    with unwind_gate_on_sigterm(), _shared_cpu_pool() as pool:
+        yield pool
+
+
+@contextmanager
+def _shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
     path = cpu_pool_path()
     try:
         descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -1000,31 +1007,60 @@ def private_gate_recovery(repo: Path, parent: Path) -> Generator[GateRecovery]:
 
 @contextmanager
 def gate_temporary(recovery: GateRecovery, tool: str, parent: Path) -> Generator[Path]:
+    request = build_folders.GateSuiteFolder(f"{tool}-", build_folders.ExplicitBuildParent(parent))
     with ExitStack() as cleanup:
-        with cancellation.defer_cleanup_signals():
-            request = build_folders.UniqueBuildFolder(f"{tool}-", build_folders.ExplicitBuildParent(parent))
-            folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
-            recovery.folders.append(str(folder))
-            recovery.save()
+        folder: Path | None = None
         try:
+            with cancellation.defer_cleanup_signals():
+                folder = cleanup.enter_context(build_folders.temporary_build_folder(request))
+                recovery.folders.append(str(folder))
+                recovery.save()
+                journal = _ACTIVE_GATE_FOLDER_JOURNAL.get()
+                if journal is not None:
+                    owner = request.owner
+                    start: gate_record.GateFolderStart = {
+                        "folder": str(folder), "pid": owner.pid, "sha": journal.sha,
+                        "branch": journal.branch, "step": journal.step,
+                    }
+                    if isinstance(owner.start, Started):
+                        start["process_start"] = owner.start.start
+                    if isinstance(owner.boot, str):
+                        start["boot_id"] = owner.boot
+                    try:
+                        start["folder"] = str(folder.resolve())
+                    except (OSError, RuntimeError):
+                        pass
+                    journal.start = start
+                    gate_record.write_gate_folder_event(start)
             yield folder
         finally:
+            previous_signals = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            report_retention: Callable[[], None] | None = None
             try:
-                cleanup.close()
-            finally:
                 try:
-                    remaining = build_folders.temporary_allocation_entries(folder)
-                except OSError:
-                    report_retained_gate_folder(str(folder), "the gate could not confirm removal")
-                else:
-                    if folder in remaining:
-                        report_retained_gate_folder(str(folder), "the gate could not remove its folder")
-                    elif remaining:
-                        paths = ", ".join(map(str, remaining))
-                        report_retained_gate_folder(paths, "the gate could not remove its lease files")
-                    else:
-                        recovery.folders.remove(str(folder))
-                        recovery.save()
+                    cleanup.close()
+                finally:
+                    if folder is not None:
+                        try:
+                            remaining = build_folders.temporary_allocation_entries(folder)
+                        except OSError:
+                            report_retention = partial(
+                                report_retained_gate_folder, str(folder), "the gate could not confirm removal")
+                        else:
+                            if folder in remaining:
+                                report_retention = partial(
+                                    report_retained_gate_folder, str(folder), "the gate could not remove its folder")
+                            elif remaining:
+                                report_retention = partial(
+                                    report_retained_gate_folder, ", ".join(map(str, remaining)),
+                                    "the gate could not remove its lease files")
+                            else:
+                                recovery.folders.remove(str(folder))
+                                recovery.save()
+            finally:
+                _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous_signals)
+                if report_retention is not None:
+                    report_retention()
 
 
 def typecheck_venv_path() -> Path:
@@ -1623,13 +1659,46 @@ def select_targeted_modules(repo: Path, tested_tree: CleanTestTree | Unrecordabl
     return selection, ledger
 
 
+class GateFolderAllocation(Enum):
+    NOT_ALLOCATED = auto()
+
+
+@dataclass
+class GateFolderJournal:
+    sha: str
+    branch: str
+    step: str
+    start: gate_record.GateFolderStart | GateFolderAllocation = GateFolderAllocation.NOT_ALLOCATED
+    end_write_finished: bool = False
+
+
+_ACTIVE_GATE_FOLDER_JOURNAL: ContextVar[GateFolderJournal | None] = ContextVar(
+    "active_gate_folder_journal", default=None)
+
+
+def gate_folder_end(start: gate_record.GateFolderStart, end: gate_record.GateEnd) -> gate_record.GateFolderEnd:
+    fields: gate_record.GateFolderEnd = {"pid": start["pid"], "suite_folders": [start["folder"]], "end": end}
+    if "process_start" in start:
+        fields["process_start"] = start["process_start"]
+    if "boot_id" in start:
+        fields["boot_id"] = start["boot_id"]
+    return fields
+
+
+def gate_run_end(status: int) -> gate_record.GateEnd:
+    return "sigterm" if _GATE_RECEIVED_SIGTERM.get() else "red" if status else "normal"
+
+
 def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult],
                     results: Sequence[GateJobResult], suite_started: dict[str, float],
                     suite_finished: dict[str, float], *, started_at: float, wall_s: float,
                     hold_wait_s: float, selection: AffectedSelection | FullSuite | SelectedModules, reused: bool,
                     reason: str, status: int, max_jobs: int, peak_mib: float, cap_mib: float,
-                    aborted: bool, mode: SuiteMode) -> None:
+                    aborted: bool, mode: SuiteMode,
+                    folder_start: gate_record.GateFolderStart | GateFolderAllocation = GateFolderAllocation.NOT_ALLOCATED
+                    ) -> None:
     """Build one gate record without changing the gate verdict."""
+    end = gate_run_end(status)
     try:
         slow_test_s = gate_record.slow_test_s()
         recorded_executions = [
@@ -1646,7 +1715,9 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             for suite, began in suite_started.items()
         ]
         tested = ledger.tree
-        if isinstance(tested, CleanTestTree):
+        if not isinstance(folder_start, GateFolderAllocation):
+            sha, branch = folder_start["sha"], folder_start["branch"]
+        elif isinstance(tested, CleanTestTree):
             sha, branch = tested.commit, tested.branch
         else:
             sha, branch = checked_git(ledger.repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
@@ -1661,13 +1732,22 @@ def record_gate_run(ledger: PassedTreeLedger, executions: Sequence[GateJobResult
             "checkout": str(ledger.repo), "branch": branch, "sha": sha,
             "tree": tested.tree if isinstance(tested, CleanTestTree) else "",
             "source": ledger.source, "step": mode.value, "aborted": aborted,
+            "end": end, "suite_folders": [],
             "dirty": isinstance(tested, UnrecordableTestTree),
             "dirty_paths": list(tested.dirty_paths[:50]) if isinstance(tested, UnrecordableTestTree) else [],
             "dirty_path_count": len(tested.dirty_paths) if isinstance(tested, UnrecordableTestTree) else 0,
             "suites": suites, "modules": modules, "slow_test_s": slow_test_s,
         }
+        if not isinstance(folder_start, GateFolderAllocation):
+            run.update(pid=folder_start["pid"], suite_folders=[folder_start["folder"]])
+            if "process_start" in folder_start:
+                run["process_start"] = folder_start["process_start"]
+            if "boot_id" in folder_start:
+                run["boot_id"] = folder_start["boot_id"]
     except Exception as error:
         gate_record.report_not_written(error)
+        if not isinstance(folder_start, GateFolderAllocation):
+            gate_record.write_gate_folder_event(gate_folder_end(folder_start, end), report_failure=False)
         return
     gate_record.write_gate_run(run, recorded_executions)
 
@@ -1713,6 +1793,73 @@ def report_retained_gate_test_folders(tmpfs: Path) -> None:
             report_retained_gate_folder(str(folder), "an earlier test fixture created this folder")
 
 
+_GATE_RECEIVED_SIGTERM: ContextVar[bool] = ContextVar("gate_received_sigterm", default=False)
+
+
+@contextmanager
+def unwind_gate_on_sigterm() -> Generator[None]:
+    """Finish test cleanup before the default action for a stop signal."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    handlers = {
+        signum: handler
+        for signum in cancellation.CANCELLATION_SIGNALS
+        if (handler := signal.getsignal(signum)) is signal.SIG_DFL
+        or (signum is signal.SIGINT and handler is signal.default_int_handler)
+    }
+    if not handlers:
+        yield
+        return
+    token = _GATE_RECEIVED_SIGTERM.set(False)
+    stopped_by: signal.Signals | None = None
+    interrupted_journal: GateFolderJournal | None = None
+
+    def terminate(number: int, _frame: object) -> None:
+        nonlocal stopped_by, interrupted_journal
+        if stopped_by is not None:
+            return
+        stopped_by = signal.Signals(number)
+        _ = _GATE_RECEIVED_SIGTERM.set(stopped_by is signal.SIGTERM)
+        interrupted_journal = _ACTIVE_GATE_FOLDER_JOURNAL.get()
+        if handlers[stopped_by] is signal.default_int_handler:
+            raise KeyboardInterrupt
+        if stopped_by is not signal.SIGTERM:
+            # Preserve the operating system's immediate exit for these signals.
+            try:
+                write_interrupted_end()
+            finally:
+                _ = signal.signal(stopped_by, signal.SIG_DFL)
+                signal.raise_signal(stopped_by)
+        raise SystemExit(128 + number)
+
+    def write_interrupted_end() -> None:
+        if interrupted_journal is not None and not interrupted_journal.end_write_finished:
+            start = interrupted_journal.start
+            if not isinstance(start, GateFolderAllocation):
+                with cancellation.defer_cleanup_signals():
+                    gate_record.write_gate_folder_event(gate_folder_end(start, gate_run_end(1)))
+                    interrupted_journal.end_write_finished = True
+
+    def restore_handlers() -> None:
+        for signum, handler in handlers.items():
+            _ = signal.signal(signum, handler)
+        _GATE_RECEIVED_SIGTERM.reset(token)
+        if stopped_by is not None and handlers[stopped_by] is signal.SIG_DFL:
+            signal.raise_signal(stopped_by)
+
+    try:
+        for signum in handlers:
+            _ = signal.signal(signum, terminate)
+        yield
+    finally:
+        # The handler ignores later stop signals until the fallback ends.
+        try:
+            write_interrupted_end()
+        finally:
+            restore_handlers()
+
+
 def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -1722,6 +1869,16 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
                local_grant: LocalGateAssignment | NoLocalGateGrant = NO_LOCAL_GATE_GRANT,
                selected: AllModules | SelectedModules | NamedModules = ALL_MODULES,
                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit = gate_record.READ_GATE_TIME_LIMIT) -> GateRun:
+    with unwind_gate_on_sigterm() if source != "checkpoint" else nullcontext():
+        return _run_suites(repo, type_dirs, module_time_limit_s, max_running_jobs, source=source, full=full,
+                           mode=mode, machine=machine, local_grant=local_grant, selected=selected, time_limit=time_limit)
+
+
+def _run_suites(repo: Path, type_dirs: Sequence[str], module_time_limit_s: float, max_running_jobs: int, *,
+                source: Literal["tests-only", "checkpoint"], full: bool, mode: SuiteMode,
+                machine: SharedMachine | HoldExemptNamedModuleMachine | WholeMachine,
+                local_grant: LocalGateAssignment | NoLocalGateGrant, selected: AllModules | SelectedModules | NamedModules,
+                time_limit: gate_record.GateTimeLimit | gate_record.NoGateTimeLimit | gate_record.ReadGateTimeLimit) -> GateRun:
     shared = not isinstance(machine, WholeMachine)
     rerun_failed_modules = shared or isinstance(selected, (SelectedModules, NamedModules)) or machine.rerun_failed_modules
     named = isinstance(selected, NamedModules)
@@ -1856,40 +2013,73 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
     reason = selection.reason if isinstance(selection, FullSuite) and not reused else ""
     elapsed = 0.0
     time_limit_report = ""
+    if isinstance(tested_tree, CleanTestTree):
+        sha, branch = tested_tree.commit, tested_tree.branch
+    else:
+        try:
+            sha, branch = checked_git(repo, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
+        except Exception as error:
+            gate_record.report_not_written(error)
+            sha = branch = ""
+    journal = GateFolderJournal(sha, branch, mode.value)
+    began = time.monotonic()
+    started_at = time.time()
+    initial_hold_seconds = hold.seconds if hold is not None else 0.0
 
     def can_retry_memory_stop(result: GateJobResult) -> bool:
         return (result.memory_stopped and result.returncode != 0 and not result.tripwire_tripped
                 and memory_reruns.get((result.suite, result.module), 0) < memory_stop_reruns)
 
     def record(status: int, aborted: bool) -> None:
-        if ledger is None or admission is None or isinstance(selection, NamedModules):
-            return
-        waited = hold.waited_s() if hold is not None else 0.0
-        wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
-        record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
-                        wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
-                        reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
-                        cap_mib=admission.governor_mib, aborted=aborted, mode=mode)
+        with cancellation.defer_cleanup_signals():
+            end = gate_run_end(status)
+            if ledger is None or admission is None or isinstance(selection, NamedModules) or (
+                    aborted and not job_started and end != "sigterm"):
+                if not isinstance(journal.start, GateFolderAllocation):
+                    gate_record.write_gate_folder_event(gate_folder_end(journal.start, end))
+            else:
+                waited = hold.waited_s() if hold is not None else 0.0
+                wall_s = time.monotonic() - began - (waited - initial_hold_seconds) if aborted else elapsed
+                record_gate_run(ledger, executions, results, suite_started, suite_finished, started_at=started_at,
+                                wall_s=wall_s, hold_wait_s=waited, selection=selection, reused=reused,
+                                reason=reason, status=status, max_jobs=max_running_jobs, peak_mib=admission.peak_mib,
+                                cap_mib=admission.governor_mib, aborted=aborted, mode=mode, folder_start=journal.start)
+            journal.end_write_finished = True
+
+    def suite_result() -> GateRun:
+        coverage = ModuleCoverage.COMPLETE if len(modules) == module_count else ModuleCoverage.SUBSET
+        return GateRun(tuple(results), elapsed, admission.peak_mib if admission is not None else 0.0, reused,
+                       isinstance(selection, (AffectedSelection, SelectedModules)), tuple(executions),
+                       time_limit_report, coverage=coverage)
 
     @contextmanager
-    def record_on_abort() -> Generator[None, None, None]:
+    def record_suite() -> Generator[None, None, None]:
+        nonlocal elapsed
+        token = _ACTIVE_GATE_FOLDER_JOURNAL.set(journal)
         try:
             yield
+            waited = hold.seconds if hold is not None else 0.0
+            elapsed = time.monotonic() - began - (waited - initial_hold_seconds)
+            status = int(not suite_result().passed)
+            record(status, aborted=False)
         except BaseException:
-            if job_started:
+            if not journal.end_write_finished and not isinstance(journal.start, GateFolderAllocation):
                 record(1, aborted=True)
             raise
+        finally:
+            _ACTIVE_GATE_FOLDER_JOURNAL.reset(token)
 
     folder_tool = "g" if mode is SuiteMode.GATE else "t"
     module_number = 0
     hold_check = hold if hold is not None else NoBuildHoldCheck()
-    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_on_abort(),
+    cpu_pool_scope = _shared_cpu_pool if source == "checkpoint" else shared_cpu_pool
+    with ((gate_recovery(repo) if shared else private_gate_recovery(repo, gate_parent)) as recovery, record_suite(),
           gate_temporary(recovery, folder_tool, gate_parent) as temporary,
           ExitStack() as module_folders,
           (nullcontext(local_grant.suite_place()) if placed else
            gate_reservation(repo, temporary, hold_check, type_dirs=type_dirs, mode=mode) if needs_shared_slots
            else nullcontext(None)) as reservation,
-          (shared_cpu_pool() if needs_shared_slots else nullcontext(NoSharedCPU())) as cpu_pool):
+          (cpu_pool_scope() if needs_shared_slots else nullcontext(NoSharedCPU())) as cpu_pool):
         # The wall time and the time limit start here, after the queue admits the gate.
         began = time.monotonic()
         started_at = datetime.now(UTC).timestamp()
@@ -2120,13 +2310,8 @@ def run_suites(repo: Path, type_dirs: Sequence[str] = (),
         if reservation is not None:
             reservation.status = int(any(result.returncode for result in results))
     hold_seconds = hold.seconds if hold is not None else 0.0
-    peak_mib = admission.peak_mib if admission is not None else 0.0
-    elapsed = time.monotonic() - began - (hold_seconds - initial_hold_seconds)
-    coverage = ModuleCoverage.COMPLETE if len(modules) == module_count else ModuleCoverage.SUBSET
-    run = GateRun(tuple(results), elapsed, peak_mib, reused,
-                  isinstance(selection, (AffectedSelection, SelectedModules)), tuple(executions), time_limit_report,
-                  coverage=coverage)
-    record(0 if run.passed else 1, aborted=False)
+    run = suite_result()
+    peak_mib = run.peak_memory_mib
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
     for suite in suites:
@@ -3874,30 +4059,6 @@ def run_named_modules(repo: Path, names: Sequence[str], mode: SuiteMode, *,
                       time_limit=gate_record.NoGateTimeLimit("named modules"))
 
 
-@contextmanager
-def unwind_gate_on_sigterm() -> Generator[None]:
-    """Finish test cleanup before the default SIGTERM action."""
-    if (threading.current_thread() is not threading.main_thread()
-            or signal.getsignal(signal.SIGTERM) != signal.SIG_DFL):
-        yield
-        return
-    terminated = False
-
-    def terminate(number: int, _frame: object) -> None:
-        nonlocal terminated
-        if not terminated:
-            terminated = True
-            raise SystemExit(128 + number)
-
-    try:
-        _ = signal.signal(signal.SIGTERM, terminate)
-        yield
-    finally:
-        _ = signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        if terminated:
-            signal.raise_signal(signal.SIGTERM)
-
-
 def run_tests_only(args: GateArguments, mode: SuiteMode, target: GateTarget) -> int:
     try:
         repo = Path(args.repo).expanduser().resolve()
@@ -4089,7 +4250,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if isinstance(target, NoGateAssignment) and (args.promote_only or args.modules
                 and isinstance(outer_reservation(match_cpu_pool=True), OuterReservation)):
             target = "natedev"
-        with (unwind_gate_on_sigterm() if args.tests_only else nullcontext()):
+        checkpoint = not (args.affected or args.tests_only or args.nightly or args.promote_only)
+        with unwind_gate_on_sigterm() if not checkpoint else nullcontext():
             return run_gate_command(args, target)
     except GatePlacementIncomplete as error:
         print(error, file=sys.stderr, flush=True)
@@ -4116,9 +4278,12 @@ def run_gate_command(args: GateArguments, target: GateTarget) -> int:
             with gate_cleanup_scope(scratch.copy_lock(checkout), gate_recovery(checkout)):
                 return merge_checkpoint(args, target)
         if args.nightly:
-            with gate_cleanup_scope(scratch.copy_lock(checkout), admission_records.default_owner(args.unit)) as cleanup:
-                _ = cleanup.callback(_sweep_nightly_build_folders)
-                return nightly(args, target)
+            with gate_cleanup_scope(scratch.copy_lock(checkout), admission_records.default_owner(args.unit)):
+                try:
+                    return nightly(args, target)
+                finally:
+                    if not _GATE_RECEIVED_SIGTERM.get():
+                        _sweep_nightly_build_folders()
         with scratch.copy_lock(checkout):
             promote(args)
             production, review_list = change_review_list(args, document)
