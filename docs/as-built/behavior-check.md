@@ -21,7 +21,8 @@ It reads the head and base again before merge and supplies the checked head to G
 A clear record names the saved reviewer reply.
 The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
 The gate checks each changed test for no user decision or a verified request from Nate.
-The check accepts a full sentence or line from a typed Claude turn or Nate's answer in a List or Question record.
+The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
+It matches consecutive full sentences or lines and treats each run of whitespace as one space.
 The check reports the date from the source. If the source cannot prove the author or quote, the finding needs a question.
 Status fails if it cannot read or parse the saved proof for a clear record.
 For a Yes record, the gate reads the answer in the original question.

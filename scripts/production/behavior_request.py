@@ -1,4 +1,4 @@
-"""Read Nate's words from typed turns and saved answers."""
+"""Read Nate's words from typed turns and saved records."""
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -23,21 +23,29 @@ class NateWords:
     time: datetime
 
 
-# Treat short words and abbreviations before a period as ambiguous boundaries.
+# Keep initials, common abbreviations, and ellipses within a sentence.
 SENTENCE_END = re.compile(
-    r"(?:(?<!\b[A-Za-z])(?<!\b[A-Za-z]{2})(?<!\b[A-Za-z]{3})(?<!\.)\.|[!?])(?=\s+[A-Z])"
+    r"(?:(?<=[!?])|(?<=\.)(?<!\.\.)(?<!\b[a-z]\.)(?<!\b(?:mr|ms|dr|st|vs)\.)(?<!\b(?:mrs|etc)\.))\s+",
+    re.IGNORECASE,
 )
 
 
-def quoted_words(text: str) -> Iterator[str]:
-    for line in text.splitlines():
-        yield line.strip()
-        start = 0
-        for end in SENTENCE_END.finditer(line):
-            yield line[start:end.end()].strip()
-            start = end.end()
-        if start and line.rstrip().endswith((".", "!", "?")):
-            yield line[start:].strip()
+def complete_quotes(text: str, normalized_quotes: dict[str, str]) -> Iterator[str]:
+    """Match quotes across consecutive lines or sentences."""
+    segments = [segment for line in text.splitlines() for part in SENTENCE_END.split(line)
+                if (segment := " ".join(part.split()))]
+    starts: list[int] = []
+    ends: set[int] = set()
+    start = 0
+    for segment in segments:
+        starts.append(start)
+        end = start + len(segment)
+        ends.add(end)
+        start = end + 1
+    words = " ".join(segments)
+    for original, quote in normalized_quotes.items():
+        if any(start + len(quote) in ends and words.startswith(quote, start) for start in starts):
+            yield original
 
 
 def typed_turn(row: object) -> Iterator[NateWords]:
@@ -45,7 +53,7 @@ def typed_turn(row: object) -> Iterator[NateWords]:
         return
     fields = cast(dict[str, object], row)
     if (fields.get("type") != "user" or fields.get("origin") != {"kind": "human"}
-            or fields.get("turnOrigin") != "human" or fields.get("promptSource") != "typed"
+            or fields.get("turnOrigin") != "human" or fields.get("promptSource") not in ("typed", "queued")
             or any(fields.get(key) for key in ("isSidechain", "isMeta", "isCompactSummary",
                                                "isSynthetic", "isVisibleInTranscriptOnly"))
             or fields.keys() & {"source", "sourceToolAssistantUUID", "sourceToolUseID", "toolUseResult",
@@ -101,8 +109,13 @@ def transcript_words(path: Path) -> Iterator[NateWords]:
             yield from typed_turn(row)
 
 
-def list_answers(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
+def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
     item = the_list.load(keeper, path.stem)
+    for event in item.log:
+        feedback = event.what
+        if (event.source == the_list.PAGE_SOURCE and isinstance(feedback, the_list.PageFeedback)
+                and feedback.action == "tell" and feedback.state == "sent"):
+            yield NateWords(feedback.words, event.time)
     for question in item.questions:
         answer = question.answer
         if answer is None:
@@ -139,7 +152,7 @@ def source_words(path: Path) -> Iterator[NateWords]:
     if source.is_relative_to(root):
         parts = source.relative_to(root).parts
         if len(parts) == 3 and parts[1] == "list" and re.fullmatch(r"L[1-9][0-9]*", source.stem):
-            yield from list_answers(source, staff.StaffId(parts[0]))
+            yield from list_words(source, staff.StaffId(parts[0]))
             return
     if source.name.startswith("question-"):
         owner = source.parent.parent.name if source.parent.parent.parent == root else ""
@@ -148,12 +161,13 @@ def source_words(path: Path) -> Iterator[NateWords]:
 
 def verified_dates(path: Path, quotes: set[str]) -> dict[str, date]:
     """Return the source date of the latest match for each complete quote."""
+    normalized = {quote: " ".join(quote.split()) for quote in quotes}
     found: dict[str, datetime] = {}
     try:
         for words in source_words(path):
             if words.time.utcoffset() is None:
                 continue
-            for quote in quotes.intersection(quoted_words(words.text)):
+            for quote in complete_quotes(words.text, normalized):
                 if quote not in found or words.time > found[quote]:
                     found[quote] = words.time
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.CalledProcessError,

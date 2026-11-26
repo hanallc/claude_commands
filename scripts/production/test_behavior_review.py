@@ -18,7 +18,9 @@ from scripts.lib import process_start, unit_runs
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.notify import review
-from scripts.production import behavior_check, behavior_review, session_staff, staff, the_list, update_registration, worker
+from scripts.production import (
+    behavior_check, behavior_review, record_store, session_staff, staff, the_list, update_registration, worker,
+)
 from scripts.review_links import list_draft, question_record, review_events
 
 
@@ -110,6 +112,17 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         return {"test": f"test_fixture.py::{test}", "finding": "requested", "quote": quote, "source": str(source),
                 "date": "2000-01-01", "change": "Change the timing."}
 
+    def verify_requested(self, source: Path, quote: str) -> behavior_review.BehaviorFinding:
+        findings = behavior_review.read_findings(json.dumps([self.requested(source, quote)]))
+        finding, = behavior_review.verify_requests(findings.values())
+        return finding
+
+    def new_list_record(self) -> tuple[record_store.NumberedRecords, str]:
+        keeper = replace(self.producer, name="morty")
+        with staff.supplied_snapshot(staff.StaffSnapshot((keeper,))):
+            item = the_list.add(keeper.id, "Set the move timing", owner=keeper.id, source="nate", changes={})
+        return list_draft.list_records(keeper.id), item.id
+
     def question_file(self, parts: update_registration.QuestionParts) -> Path:
         return self.write(self.root / "question.json", json.dumps(parts))
 
@@ -166,17 +179,14 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def test_verified_requests_clear_the_range_and_list_each_quote(self) -> None:
         args, key = self.two_changed_tests()
         move_quote = MOVE_REQUEST
-        keeper = replace(self.producer, name="morty")
-        with staff.supplied_snapshot(staff.StaffSnapshot((keeper,))):
-            item = the_list.add(keeper.id, "Set the move timing", owner=keeper.id, source="nate", changes={})
-        store = list_draft.list_records(keeper.id)
-        move_source = store.path(item.id)
-        fields, body = store.read(item.id)
+        store, item = self.new_list_record()
+        move_source = store.path(item)
+        fields, body = store.read(item)
         question = question_record.Question("Q1", "2026-11-23T07:00:00Z", "When should the move start?",
                                            question_record.Answer(move_quote, "2026-11-24T10:00:00Z"))
         fields["questions"] = json.dumps([question_record.stored(question)])
         event = {"time": "2026-11-24T10:00:01+00:00", "source": "nate", "action": "Answered", "question_id": "Q1"}
-        store.write(item.id, fields, body.rstrip() + "\n- " + json.dumps(event) + "\n")
+        store.write(item, fields, body.rstrip() + "\n- " + json.dumps(event) + "\n")
         refresh_quote = 'Refresh "now" when an item opens.'
         refresh_source = self.transcript(self.typed_turn(f"Use the current title. {refresh_quote} Keep the item open."))
         compressed = compressed_copy(refresh_source)
@@ -195,12 +205,57 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         ask.assert_not_called()
         self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
         self.assertEqual(self.cli("check", *args), (0, ""))
-        store.write(item.id, fields, body.rstrip() + "\n- " + json.dumps({**event, "source": "producer"}) + "\n")
+        store.write(item, fields, body.rstrip() + "\n- " + json.dumps({**event, "source": "producer"}) + "\n")
         self.assertIn("no valid proof", self.cli("check", *args)[1])
-        store.write(item.id, fields, body.rstrip() + "\n- " + json.dumps(event) + "\n")
+        store.write(item, fields, body.rstrip() + "\n- " + json.dumps(event) + "\n")
         compressed.unlink()
         self.assertIn("no valid proof", self.cli("check", *args)[1])
         self.assertEqual(self.cli("status", "--key", key), (1, f"{key}: the saved approval has no valid proof.\n"))
+
+    def test_transcript_requests_match_complete_words_from_human_turns(self) -> None:
+        queued_words = "Yes on the waiting and validating as items piece"
+        queued = {**self.typed_turn(queued_words), "promptSource": "queued"}
+        sentences = "read the roles on the mac.  show the unassigned count. check the next item."
+        lines = "move @ 1% default - plus the % can be changed\nmove based on all models (default)"
+        for case, turn, quote, expected in (
+            ("queued human", queued, queued_words, behavior_review.NateRequest),
+            ("queued peer", {**queued, "origin": {"kind": "peer"}}, queued_words, behavior_review.NateSpecified),
+            ("lowercase after a period", self.typed_turn(sentences), "show the unassigned count.", behavior_review.NateRequest),
+            ("lowercase after a question", self.typed_turn("is this clear? keep the row. next item."),
+             "keep the row.", behavior_review.NateRequest),
+            ("sentence fragment", self.typed_turn("do not approve"), "approve", behavior_review.NateSpecified),
+            ("trailing space", self.typed_turn("okay - fine"), "okay - fine ", behavior_review.NateRequest),
+            ("consecutive lines", self.typed_turn(f"move now\n{lines}\ncheck the item"),
+             lines.replace("\n", "\n\n  "), behavior_review.NateRequest),
+            ("consecutive sentences", self.typed_turn(sentences),
+             "read the roles on the mac. show the unassigned count.", behavior_review.NateRequest),
+            ("partial last sentence", self.typed_turn(sentences),
+             "show the unassigned count. check the next", behavior_review.NateSpecified),
+        ):
+            with self.subTest(case=case):
+                finding = self.verify_requested(self.transcript(turn), quote)
+                self.assertIsInstance(finding, expected)
+
+    def test_only_sent_list_tell_feedback_from_nate_verifies(self) -> None:
+        store, item = self.new_list_record()
+        fields, body = store.read(item)
+        path = store.path(item)
+        sent = "2026-11-23T23:05:31.462624+00:00"
+        quote = "i want white space between config sections"
+        for source, action, state, expected in (
+            ("nate via List", "tell", "sent", behavior_review.NateRequest),
+            ("producer", "tell", "sent", behavior_review.NateSpecified),
+            ("nate via List", "tell", "pending", behavior_review.NateSpecified),
+            ("nate via List", "read", "sent", behavior_review.NateSpecified),
+        ):
+            with self.subTest(source=source, action=action, state=state):
+                event = {"time": sent, "source": source,
+                         "feedback": {"request": "fixture", "action": action, "words": quote, "state": state}}
+                store.write(item, fields, body.rstrip() + "\n- " + json.dumps(event) + "\n")
+                finding = self.verify_requested(path, quote)
+                self.assertIsInstance(finding, expected)
+                if isinstance(finding, behavior_review.NateRequest):
+                    self.assertEqual(finding.day.isoformat(), "2026-11-23")
 
     def test_an_unverified_request_requires_a_question(self) -> None:
         args, key = self.changed_range()

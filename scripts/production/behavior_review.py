@@ -168,8 +168,8 @@ Return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
 Use "specified" when the change departs from those words or you cannot tell whether it follows them.
-For "requested", cite a typed Claude turn or an answer by Nate in a List or Question record.
-Quote a complete sentence or line. Use its source date.
+For "requested", cite a typed Claude turn, a sent List Tell from Nate, or Nate's saved answer.
+Quote one or more complete sentences or lines in order. Use the source date.
 Use "specified" when you cannot cite one of these sources.
 Use {{"test":"ID","finding":"requested","quote":"exact words","source":"/absolute/path",
 "date":"YYYY-MM-DD","change":"how the behavior changes"}}
