@@ -1204,6 +1204,39 @@ FILES = collect(Path(__file__).parent)
         _ = self.commit()
         self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_reader.py",))
 
+    def test_deep_imported_binding_chain_preserves_the_full_suite_fallback(self) -> None:
+        source = "scripts/component/subject.py"
+        invalid_path = str(self.repo / "bad") + "\0"
+        for index in range(982):
+            self.write(f"scripts/component/hop_{index}.py",
+                       f"from scripts.component.hop_{index + 1} import ROOT as NEXT\n" + "ROOT = NEXT\n")
+        self.write("scripts/component/hop_982.py", "from pathlib import Path\n" + f"ROOT = Path({invalid_path!r})\n")
+        self.write(source, "from scripts.component.hop_0 import ROOT\n" + "FILES = ROOT.glob('*.txt')\n")
+        _ = self.commit()
+        for historical in (False, True):
+            with self.subTest(historical=historical):
+                if historical:
+                    self.certify()
+                    (self.repo / source).unlink()
+                    _ = self.commit()
+                result = affected.select_affected(self.repo, self.base, self.modules, set())
+                self.assertIsInstance(result, affected.FullSuite)
+                assert isinstance(result, affected.FullSuite)
+                self.assertIn("embedded null", result.reason)
+
+    def test_imported_binding_cycle_preserves_candidate_order(self) -> None:
+        reader = "scripts/component/subject.py"
+        sources = {
+            reader: "from scripts.component.roots import ROOT\n" + "FILES = ROOT.glob('*.txt')\n",
+            "scripts/component/roots.py": "from scripts.component.roots import ROOT as NEXT\n"
+            + "ROOT = NEXT / 'nested'\n",
+            "scripts/component/roots/__init__.py": "from pathlib import Path\n"
+            + "ROOT = Path(__file__).parents[3] / 'assets'\n",
+        }
+        facts = {path: affected.extract_facts(text, path) for path, text in sources.items()}
+        scans = affected.repository_scan_graph(self.repo, facts, {})
+        self.assertEqual(scans[reader], frozenset({affected.RepositoryScan("assets/nested", "*.txt", False)}))
+
     def test_cached_duplicate_scope_names_keep_every_scan_root(self) -> None:
         self.write("assets/subject.md", "before\n")
         self.add_test("checks/test_reader.py", "from pathlib import Path\n"

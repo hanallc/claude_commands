@@ -664,6 +664,7 @@ class RepositoryDirectory:
 
 type ScanScopeKey = tuple[str, str]
 type ResolvedDirectory = RepositoryDirectory | UnrootedPath | OutsideRepository
+type ImportedBinding = tuple[ScanScopeKey, ScanPath | UnrootedPath]
 type ScanBindings = frozenset[tuple[str, ResolvedDirectory]]
 type ScanRequest = tuple[ScanScopeKey, ScanBindings, bool, frozenset[ScanScopeKey]]
 type ScanTarget = tuple[str, ScanScope, dict[str, ResolvedDirectory], bool]
@@ -753,45 +754,69 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
     def symbols(source: str, target: str) -> tuple[ScanScopeKey, ...]:
         return tuple(find_symbols(source, target))
 
-    def directory(source: str, value: ScanPath | UnrootedPath | OutsideRepository,
-                  parameters: dict[str, ResolvedDirectory], seen: frozenset[ScanScopeKey]) -> ResolvedDirectory:
-        if isinstance(value, (UnrootedPath, OutsideRepository)):
+    def imported_bindings(source: str, target: str, seen: set[ScanScopeKey]) -> Iterator[ImportedBinding]:
+        for key in symbols(source, target):
+            if key in seen:
+                continue
+            path, name = key
+            parent, _, member = name.rpartition(".")
+            scope = scopes[path].get(parent)
+            if scope is not None and (binding := dict(scope.bindings).get(member)) is not None:
+                yield key, binding
+
+    def directory(source: str, value: ScanPath | UnrootedPath,
+                  parameters: dict[str, ResolvedDirectory]) -> ResolvedDirectory:
+        if isinstance(value, UnrootedPath):
             return value
-        origin: ResolvedDirectory = UnrootedPath()
-        match value.root:
-            case SourceFileRoot():
-                origin = RepositoryDirectory(source)
-            case AbsolutePathRoot(path):
-                absolute = Path(path).joinpath(*value.parts).resolve()
-                try:
-                    return RepositoryDirectory(absolute.relative_to(repository_root).as_posix())
-                except ValueError:
-                    return OutsideRepository()
-            case ParameterRoot(name):
-                origin = parameters.get(name, OutsideRepository())
-            case ImportedRoot(target):
-                for path, name in symbols(source, target):
-                    key = path, name
-                    if key in seen:
-                        continue
-                    parent, separator, member = name.rpartition(".")
-                    scope = scopes[path].get(parent if separator else "")
-                    if scope is not None:
-                        binding = dict(scope.bindings).get(member)
-                        if binding is not None:
-                            origin = directory(path, binding, {}, seen | {key})
-                            if isinstance(origin, RepositoryDirectory):
-                                break
-        if isinstance(origin, RepositoryDirectory):
-            path = posixpath.normpath(posixpath.join(origin.path, *value.parts))
-            if path != ".." and not path.startswith("../") and not path.startswith("/"):
-                return RepositoryDirectory(path)
-            return OutsideRepository()
-        return origin
+        seen: set[ScanScopeKey] = set()
+        stack: list[tuple[ScanScopeKey, tuple[str, ...], Iterator[ImportedBinding]]] = []
+        while True:
+            parts: tuple[str, ...] | None = None
+            candidates: Iterator[ImportedBinding] | None = None
+            origin: ResolvedDirectory = UnrootedPath()
+            if isinstance(value, ScanPath):
+                parts = value.parts
+                match value.root:
+                    case SourceFileRoot():
+                        origin = RepositoryDirectory(source)
+                    case AbsolutePathRoot(path):
+                        absolute = Path(path).joinpath(*parts).resolve()
+                        try:
+                            origin = RepositoryDirectory(absolute.relative_to(repository_root).as_posix())
+                        except ValueError:
+                            origin = OutsideRepository()
+                        parts = None
+                    case ParameterRoot(name):
+                        origin = parameters.get(name, OutsideRepository())
+                    case ImportedRoot(target):
+                        candidates = imported_bindings(source, target, seen)
+
+            while True:
+                if candidates is not None and not isinstance(origin, RepositoryDirectory):
+                    candidate = next(candidates, None)
+                    if candidate is not None:
+                        key, value = candidate
+                        assert parts is not None
+                        stack.append((key, parts, candidates))
+                        seen.add(key)
+                        source = key[0]
+                        parameters = {}
+                        break
+                if isinstance(origin, RepositoryDirectory) and parts is not None:
+                    # Check each suffix before the parent uses this directory.
+                    path = posixpath.normpath(posixpath.join(origin.path, *parts))
+                    if path == ".." or path.startswith(("../", "/")):
+                        origin = OutsideRepository()
+                    else:
+                        origin = RepositoryDirectory(path)
+                if not stack:
+                    return origin
+                key, parts, candidates = stack.pop()
+                seen.remove(key)
 
     def direct_scans(source: str, scope: ScanScope, parameters: dict[str, ResolvedDirectory]) -> Iterator[RepositoryScan]:
         for scan in scope.scans:
-            root = directory(source, scan.directory, parameters, frozenset())
+            root = directory(source, scan.directory, parameters)
             if isinstance(root, UnrootedPath):
                 yield RepositoryScan(".", scan.pattern, True)
             elif isinstance(root, RepositoryDirectory):
@@ -799,8 +824,8 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
 
     def scan_arguments(source: str, call: ScanCall, parameters: dict[str, ResolvedDirectory]
                        ) -> tuple[list[ResolvedDirectory], dict[str, ResolvedDirectory]]:
-        arguments = [directory(source, value, parameters, frozenset()) for value in call.arguments]
-        keywords = {name: directory(source, value, parameters, frozenset()) for name, value in call.keywords}
+        arguments = [directory(source, value, parameters) for value in call.arguments]
+        keywords = {name: directory(source, value, parameters) for name, value in call.keywords}
         return arguments, keywords
 
     if (unresolved_scan_paths(facts)
