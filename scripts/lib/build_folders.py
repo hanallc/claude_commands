@@ -6,7 +6,6 @@ try:
 except FileNotFoundError:
     pass
 
-from collections import deque
 from collections.abc import Callable, Collection, Container, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from contextvars import ContextVar
@@ -553,22 +552,6 @@ class InvalidFixedBuildRoot(InvalidFolderForm):
     """The configured root cannot hold fixed checkouts."""
 
 
-class CargoPlacementCheckout(Enum):
-    """Read Cargo settings from the current checkout."""
-
-    CURRENT = auto()
-
-
-@final
-@dataclass(frozen=True)
-class IncomingCargoCheckout:
-    """Describe staged Cargo files and paths that Git reset will change."""
-
-    directory: Path
-    reset_paths: frozenset[Path]
-    incoming_symbolic_links: frozenset[Path]
-
-
 _CI_ADMISSION_DIRECTORY = re.compile(r"build-admission-ci-[0-9]+-")
 
 
@@ -613,101 +596,7 @@ def _fixed_linked_checkout(path: Path) -> bool:
         return False
 
 
-def _resolve_incoming_cargo_output(path: Path, checkout: IncomingCargoCheckout) -> Path:
-    """Refuse Git links and resolve paths that Git reset will leave in place."""
-    resolved = Path(path.anchor).resolve()
-    remaining = deque(path.parts[1:])
-    replaced_links: set[Path] = set()
-    links_followed = 0
-    while remaining:
-        part = remaining.popleft()
-        if part == "..":
-            resolved = resolved.parent
-            continue
-        candidate = resolved / part
-        if candidate in checkout.incoming_symbolic_links:
-            raise InvalidFixedBuildRoot(f"{candidate}: the incoming Cargo output path contains a symbolic link")
-        # Ignore old files that lie behind a symbolic link that Git will replace.
-        if (any(candidate.is_relative_to(link) for link in replaced_links)
-                or not candidate.is_symlink()):
-            resolved = candidate
-            continue
-        if candidate in checkout.reset_paths:
-            replaced_links.add(candidate)
-            resolved = candidate
-            continue
-        links_followed += 1
-        if links_followed > 40:
-            raise InvalidFixedBuildRoot(f"{path}: too many symbolic links in the Cargo output path")
-        link = candidate.readlink()
-        if link.is_absolute():
-            resolved = Path(link.anchor).resolve()
-            link = link.relative_to(link.anchor)
-        remaining.extendleft(reversed(link.parts))
-    return resolved
-
-
-def _incoming_cargo_build_path(output: cargo_target_config.CargoFolderSetting, main: Path,
-                               checkout: IncomingCargoCheckout, cargo_home: str) -> Path:
-    """Expand an incoming build-dir before checking its path components."""
-    value = output.value
-    if "{workspace-root}" in value or "{workspace-path-hash}" in value:
-        if (checkout.directory / "Cargo.toml").is_file():
-            staged = cargo_target_config.cargo_workspace_manifest([], str(checkout.directory))
-            manifest = main / staged.relative_to(checkout.directory)
-        else:
-            manifest = cargo_target_config.cargo_workspace_manifest([], str(main.parent), cargo_home)
-        value = value.replace("{workspace-root}", str(manifest.parent))
-        if "{workspace-path-hash}" in value:
-            future_manifest = _resolve_incoming_cargo_output(manifest, checkout)
-            if manifest.resolve() != future_manifest:
-                raise InvalidFixedBuildRoot(f"{manifest}: cannot verify the incoming Cargo workspace path hash")
-            value = value.replace("{workspace-path-hash}", cargo_target_config.cargo_workspace_path_hash(manifest))
-    if cargo_home and "{cargo-cache-home}" in value:
-        configured_home = os.environ.get("CARGO_HOME") or str(Path.home() / ".cargo")
-        future_home = _resolve_incoming_cargo_output(main / configured_home, checkout)
-        value = value.replace("{cargo-cache-home}", str(future_home))
-    if "{" in value or "}" in value:
-        raise ValueError("Cargo build folder template cannot be resolved")
-    return output.base / value
-
-
-def _placement_cargo_outputs(checkout: CargoPlacementCheckout | IncomingCargoCheckout) -> Iterator[Path]:
-    cwd = Path.cwd()
-    cargo_home = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
-    if isinstance(checkout, IncomingCargoCheckout):
-        overrides = (("target-dir", "CARGO_BUILD_TARGET_DIR"), ("build-dir", "CARGO_BUILD_BUILD_DIR"),
-                     ("target-dir", "CARGO_TARGET_DIR"))
-        cargo_home = cargo_target_config.cargo_home_folder(str(cwd), os.environ)
-        environment = {**os.environ, "CARGO_HOME": cargo_home}
-        for _, variable in overrides:
-            _ = environment.pop(variable, None)
-        cargo = cargo_target_config.cargo_folder_settings([], str(cwd.parent), environment)
-        incoming = cargo_target_config.cargo_folder_settings([], str(checkout.directory), {})
-        cargo.update({key: replace(output, base=cwd) for key, output in incoming.items()
-                      if output.base == checkout.directory})
-        for key, variable in overrides:
-            if value := os.environ.get(variable):
-                cargo[key] = cargo_target_config.CargoFolderSetting(value, cwd)
-    else:
-        cargo = cargo_target_config.cargo_folder_settings([], str(cwd), os.environ)
-    for key, output in cargo.items():
-        try:
-            if isinstance(checkout, IncomingCargoCheckout):
-                path = (output.base / output.value if key == "target-dir"
-                        else _incoming_cargo_build_path(output, cwd, checkout, cargo_home))
-                yield _resolve_incoming_cargo_output(path, checkout)
-            elif key == "target-dir":
-                yield (output.base / output.value).resolve()
-            else:
-                yield Path(cargo_target_config.cargo_build_folder(output, [], str(cwd), cargo_home))
-        except cargo_target_config.NoCargoManifest:
-            continue
-
-
-def _check_fixed_build_root(root: Path, settings: ConfigRead, *, allow_managed_checkout: bool = False,
-                            cargo_checkout: CargoPlacementCheckout | IncomingCargoCheckout
-                            = CargoPlacementCheckout.CURRENT) -> Path:
+def _check_fixed_build_root(root: Path, settings: ConfigRead, *, allow_managed_checkout: bool = False) -> Path:
     """Check the placement before fixed checkouts can use the root."""
     from scripts.lib import session_folder
     from scripts.build_targets import target_config
@@ -717,7 +606,14 @@ def _check_fixed_build_root(root: Path, settings: ConfigRead, *, allow_managed_c
         raise InvalidFixedBuildRoot(f"{root}: the fixed build root must be absolute")
     try:
         canonical = root.resolve()
-        for target in _placement_cargo_outputs(cargo_checkout):
+        cwd = os.getcwd()
+        cargo_home = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
+        for key, output in cargo_target_config.cargo_folder_settings([], cwd, os.environ).items():
+            try:
+                target = (Path(cargo_target_config.cargo_build_folder(output, [], cwd, cargo_home))
+                          if key == "build-dir" else (output.base / output.value).resolve())
+            except cargo_target_config.NoCargoManifest:
+                continue
             if _fixed_path_is_within(canonical, target):
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a Cargo target directory ({target})")
         for ancestor in (canonical, *canonical.parents):
@@ -763,8 +659,7 @@ def _check_fixed_build_root(root: Path, settings: ConfigRead, *, allow_managed_c
 
 
 def build_root(*, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
-               form: PerUnitBuildFolders | FixedRepositoryBuildFolders = _PER_UNIT_BUILD_FOLDERS,
-               cargo_checkout: CargoPlacementCheckout | IncomingCargoCheckout = CargoPlacementCheckout.CURRENT) -> Path:
+               form: PerUnitBuildFolders | FixedRepositoryBuildFolders = _PER_UNIT_BUILD_FOLDERS) -> Path:
     """Read the build root. Check placement for the fixed layout."""
     if isinstance(settings, UseConfiguredValue):
         settings = _settings()
@@ -774,7 +669,7 @@ def build_root(*, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue
         root = Path(settings.text("roots.build", recover_invalid=False)).expanduser()
     except (RuntimeError, Unusable) as error:
         raise InvalidFixedBuildRoot(f"roots.build: {error}") from error
-    return _check_fixed_build_root(root, settings, cargo_checkout=cargo_checkout)
+    return _check_fixed_build_root(root, settings)
 
 
 def build_folder_form(machine: str, *, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
@@ -3248,24 +3143,21 @@ def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | MainOutput |
         _release_build_folder(path)
 
 
-def check_fixed_repository_placement(
-    repo: str, *, machine: str, cargo_checkout: CargoPlacementCheckout | IncomingCargoCheckout
-    = CargoPlacementCheckout.CURRENT,
-) -> Path:
+def check_fixed_repository_placement(repo: str, *, machine: str) -> Path:
     """Check the configured location of a fixed repository folder."""
     settings = _settings()
     form = build_folder_form(machine, settings=settings)
     if not isinstance(form, FixedRepositoryBuildFolders):
         raise InvalidFolderForm(f"forms.build.{machine}: the build folder form must be per-repository")
-    root = build_root(settings=settings, form=form, cargo_checkout=cargo_checkout)
+    root = build_root(settings=settings, form=form)
     repository = _form_name(repo)
     parent = root / repository
-    if _check_fixed_build_root(parent, settings, cargo_checkout=cargo_checkout) != parent:
+    if _check_fixed_build_root(parent, settings) != parent:
         raise InvalidFixedBuildRoot(f"{parent}: the fixed checkout parent must not be a symbolic link")
     if _CI_ADMISSION_DIRECTORY.match(machine) or machine == "typecheck-venv":
         raise InvalidFixedBuildRoot(f"{parent / machine}: the fixed checkout cannot use a scratch directory name")
     checkout = parent / machine
-    if _check_fixed_build_root(checkout, settings, allow_managed_checkout=True, cargo_checkout=cargo_checkout) != checkout:
+    if _check_fixed_build_root(checkout, settings, allow_managed_checkout=True) != checkout:
         raise InvalidFixedBuildRoot(f"{checkout}: the fixed checkout must not be a symbolic link")
     return checkout
 

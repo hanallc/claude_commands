@@ -243,6 +243,10 @@ from pathlib import Path
 import subprocess
 import sys
 
+if sys.argv[1:3] == ['--die-with-parent', '--ro-bind']:
+    real = os.environ['FIXTURE_PLACEMENT_BWRAP']
+    os.execv(real, [real, *sys.argv[1:]])
+
 if sys.argv[1] == '--json-status-fd':
     # The read limit of a hand made run: run the argv after the limit words, and write its exit status.
     words = sys.argv[1:]
@@ -984,6 +988,7 @@ class MacLinuxRouteTests(unittest.TestCase):
             'FIXTURE_SOURCE_BYTES': str(self.root / 'source.bytes'),
             'FIXTURE_BUNDLE_FORMS': str(self.root / 'bundle.forms'),
             'FIXTURE_GUEST_USER': account, 'FIXTURE_GUEST_RESULT': 'pass',
+            'FIXTURE_PLACEMENT_BWRAP': shutil.which('bwrap') or '',
             'FIXTURE_RUN_SECONDS': '7', 'FIXTURE_RUN_GROUP': str(self.root / 'run.group'),
             'FIXTURE_TRANSFER_SECONDS': str(mac_linux.TRANSFER_ALLOWANCE_SECONDS),
             'BUILDLOG_UNIT': 'caller', 'FIXTURE_EXPECTED_UNIT': 'caller',
@@ -4048,7 +4053,67 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD'), old_head)
         self.assertFalse(os.path.lexists(main / 'output'))
         self.assertFalse((main / '.cargo/config.toml').exists())
-        self.assertIn('incoming Cargo output path contains a symbolic link', self.not_started(result))
+        self.assertIn('inside a Cargo target directory', self.not_started(result))
+
+    def test_rows_23_27_guest_checks_staged_placement_before_publishing(self) -> None:
+        main = self.guest_home / '.claude'
+        settings = self.repo / 'cargo-settings.toml'
+        safe = '[build]\njobs = 2\n'
+        unsafe = '[build]\ntarget-dir = "../build"\n'
+        _ = settings.write_text(safe)
+        _ = self.git('add', settings.name)
+        _ = self.git('commit', '-qm', 'add guest Cargo settings')
+        old_head = self.git('rev-parse', 'HEAD')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', old_head)
+        cargo_environment = {name: '' for name in
+                             ('CARGO_HOME', 'CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET_DIR', 'CARGO_BUILD_BUILD_DIR')}
+        with patch.dict(os.environ, cargo_environment):
+            self.assertIsInstance(self.route(), GateRun)
+
+        old_bootstrap = main / mac_linux.BOOTSTRAP_DIR / 'old-data'
+        old_bootstrap.parent.mkdir()
+        _ = old_bootstrap.write_text('Keep the earlier bootstrap.')
+        cargo_link = main / '.cargo/config.toml'
+        cargo_link.parent.mkdir()
+        cargo_link.symlink_to('../cargo-settings.toml')
+        output = main / 'output'
+        output.symlink_to('../build', target_is_directory=True)
+
+        for case in ('retained config link', 'relative Cargo home', 'build root link'):
+            with self.subTest(case=case):
+                environment = cargo_environment.copy()
+                reason = 'inside a Cargo target directory'
+                if case == 'retained config link':
+                    _ = settings.write_text(unsafe)
+                    _ = self.git('add', settings.name)
+                elif case == 'relative Cargo home':
+                    _ = settings.write_text(safe)
+                    cargo_home = self.repo / 'cargo-home'
+                    cargo_home.mkdir()
+                    _ = (cargo_home / 'config.toml').write_text(unsafe)
+                    _ = self.git('add', settings.name, cargo_home.name)
+                    environment['CARGO_HOME'] = cargo_home.name
+                else:
+                    config = self.repo / 'config/build_folders.conf'
+                    _ = write_config_fixture(config, 'roots.build=~/.claude/output\n')
+                    (self.repo / 'output').mkdir()
+                    _ = (self.repo / 'output/proof').write_text('The incoming directory.')
+                    _ = self.git('add', 'config/build_folders.conf', 'output/proof')
+                    reason = 'inside a Git checkout'
+                _ = self.git('commit', '-qm', case)
+                _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+                with patch.dict(os.environ, environment):
+                    result = self.route()
+
+                self.assertEqual(old_bootstrap.read_text(), 'Keep the earlier bootstrap.')
+                self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD'), old_head)
+                self.assertEqual(self.git_at(main, 'rev-parse', 'origin/main'), old_head)
+                self.assertEqual(cargo_link.readlink(), Path('../cargo-settings.toml'))
+                self.assertEqual(cargo_link.read_text(), safe)
+                self.assertEqual(output.readlink(), Path('../build'))
+                self.assertFalse((main / 'cargo-home').exists())
+                self.assertIn(reason, self.not_started(result))
 
     def test_run_guest_keeps_output_in_a_folder_without_a_worktree(self) -> None:
         checkout = self.guest_home / 'build/claude/mac-linux'

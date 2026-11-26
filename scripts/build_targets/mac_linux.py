@@ -62,6 +62,7 @@ ORIGIN_MAIN = 'refs/remotes/origin/main'
 RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
 BOOTSTRAP_DIR = '.git/mac-linux'
 BOOTSTRAP_PLACEMENT_PENDING = '.git/mac-linux-placement-pending'
+PLACEMENT_OLD_GIT = 'placement-old-git'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 CONNECT_ATTEMPTS = 3
 # Give the guest port forward time to accept a new connection.
@@ -1024,6 +1025,12 @@ def guest_group_signal_command() -> str:
 
 def run_shell(settings: GuestSettings, source: CheckoutSource, bootstrap_bytes: int, armed: ArmedGuestAttempt) -> str:
     object_format = 'sha256' if len(source.commit) == 64 else 'sha1'
+    reset_main = f'''git config remote.origin.url {shlex.quote(source.origin_url)}
+git symbolic-ref HEAD refs/heads/main
+git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
+printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$1" "$1" | git update-ref --stdin
+git reset --hard -q "$1"'''
+    check_placement = reset_main + f'\nexec "$2/scripts/lib/py" "$2/{RUNNER_PATH}" "$2/request.json" --check-placement'
     checkout = f'''set -euo pipefail
 if [ ! -f .git/mac-linux-owned ]; then
     if [ -n "$(find . -mindepth 1 -maxdepth 1 ! -name .git -print -quit)" ] ||
@@ -1076,21 +1083,26 @@ if [ "$tree" != {shlex.quote(source.tree)} ]; then
     exit 1
 fi
 git cat-file -e "$origin_main^{{commit}}"
-git config remote.origin.url {shlex.quote(source.origin_url)}
 git archive {shlex.quote(source.runner_commit)} scripts config | tar -xf - -C "$stage"
-mkdir -- "$stage/next-config"
-git show "$origin_main:config/build_folders.conf" > "$stage/next-config/build_folders.conf"
-CONF_DIR="$stage/next-config" "$stage/scripts/lib/py" "$stage/{RUNNER_PATH}" "$stage/request.json" --check-placement "$origin_main"
+incoming="$stage/checkout"
+mkdir -p -- "$incoming/.git/objects" "$incoming/.git/worktrees" "$incoming/{BOOTSTRAP_DIR}" "$stage/{PLACEMENT_OLD_GIT}"
+find . -mindepth 1 -maxdepth 1 ! -name .git \\
+    -exec cp -a --reflink=auto --target-directory="$incoming" -- {{}} +
+find .git -mindepth 1 -maxdepth 1 ! -name objects ! -name worktrees ! -name mac-linux \\
+    ! -name 'mac-linux-stage.*' -exec cp -a --reflink=auto --target-directory="$incoming/.git" -- {{}} +
+export TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache"
+umask 022
+# Mount the private checkout at the live path so Cargo and config use their final paths.
+bwrap --die-with-parent --ro-bind / / --unshare-pid --dev /dev --proc /proc \\
+    --bind "$incoming" "$PWD" --bind "$stage" "$bootstrap" \\
+    --ro-bind "$PWD/.git/objects" "$PWD/.git/objects" --ro-bind-try "$PWD/.git/worktrees" "$PWD/.git/worktrees" \\
+    --ro-bind "$PWD/.git" "$bootstrap/{PLACEMENT_OLD_GIT}" --chdir "$PWD" \\
+    -- bash -euo pipefail -c {shlex.quote(check_placement)} placement "$origin_main" "$bootstrap"
 rm -f -- "$placement_pending"
 rm -rf -- "$bootstrap"
 mv -T -- "$stage" "$bootstrap"
 trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$bootstrap"' EXIT
-export TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache"
-git symbolic-ref HEAD refs/heads/main
-git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
-printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "$origin_main" | git update-ref --stdin
-git reset --hard -q "$origin_main"
-umask 022
+bash -euo pipefail -c {shlex.quote(reset_main)} publish "$origin_main"
 "$bootstrap/scripts/lib/py" "$bootstrap/{RUNNER_PATH}" "$bootstrap/request.json"'''
     lock = guest_attempt_command('lock', armed, RUN_LOCK_FD)
     start = guest_attempt_command('start', armed, RUN_LOCK_FD)
@@ -2928,64 +2940,22 @@ def save_guest_build_folder(source: Path, checkout: Path, attempt: str) -> None:
     atomic_file.write_text_atomic(marker, str(record) + '\n', new_file_mode=0o600)
 
 
-def stage_incoming_cargo(commit: str, staging: Path) -> build_folders.IncomingCargoCheckout:
-    """Read Cargo files and symbolic links for the guest checkout after reset."""
-    main = Path.cwd()
-    paths = ('.cargo/config', '.cargo/config.toml', 'Cargo.toml')
-
-    def git(*words: str) -> bytes:
-        return subprocess.check_output(('git', *words), stdin=subprocess.DEVNULL,
-                                       timeout=GUEST_REF_TIMEOUT_SECONDS)
-
-    entries: dict[str, tuple[str, str]] = {}
-    reset_paths: set[Path] = set()
-    symbolic_links: set[Path] = set()
-    for entry in os.fsdecode(git('ls-tree', '-rtz', commit)).split('\0'):
-        if not entry:
-            continue
-        fields, name = entry.split('\t', 1)
-        mode, _, object_id = fields.split()
-        path = main / name
-        reset_paths.add(path)
-        if mode == '120000':
-            symbolic_links.add(path)
-        if name in paths or name == '.cargo':
-            entries[name] = mode, object_id
-    if '.cargo' in entries and entries['.cargo'][0] != '040000':
-        raise ValueError('The incoming .cargo path is not a directory.')
-    tracked = set(os.fsdecode(git('ls-files', '-z')).split('\0')) - {''}
-    reset_paths.update(main / name for name in tracked)
-    for name in paths:
-        if name in entries:
-            mode, object_id = entries[name]
-            if mode not in FILE_MODES:
-                raise ValueError(f'{name}: the incoming Cargo file is not a regular file.')
-            contents = git('cat-file', 'blob', object_id)
-        elif name not in tracked and not (name.startswith('.cargo/') and '.cargo' in tracked):
-            try:
-                retained = Path(name)
-                if not stat.S_ISREG(retained.stat().st_mode):
-                    raise ValueError(f'{name}: the retained Cargo file is not a regular file.')
-                contents = retained.read_bytes()
-            except (FileNotFoundError, NotADirectoryError):
-                continue
-        else:
-            continue
-        destination = staging / name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        _ = destination.write_bytes(contents)
-    return build_folders.IncomingCargoCheckout(staging, frozenset(reset_paths), frozenset(symbolic_links))
-
-
-def check_guest_placement(request_path: Path, origin_main: str) -> int:
-    """Check the incoming build configuration before removing the bootstrap."""
+def check_guest_placement(request_path: Path) -> int:
+    """Check placement in the staged checkout before publishing it."""
     request = guest_request(request_path)
+    main = Path.cwd()
     try:
-        repository = build_folders.repo_word(Path.cwd())
-        cargo = stage_incoming_cargo(origin_main, request_path.parent / 'incoming-cargo')
-        _ = build_folders.check_fixed_repository_placement(repository, machine=TARGET, cargo_checkout=cargo)
-        build_folders.require_no_fixed_build_folders(Path(BOOTSTRAP_DIR))
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        repository = build_folders.repo_word(main)
+        _ = build_folders.check_fixed_repository_placement(repository, machine=TARGET)
+        original = main / BOOTSTRAP_DIR
+        old_git = request_path.parent / PLACEMENT_OLD_GIT
+        descriptor = os.open(old_git, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            build_folders.require_no_fixed_build_folders(old_git / original.name, dir_fd=descriptor,
+                                                        original_path=original)
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError) as error:
         return refuse_run(str(error), request['attempt'])
     return 0
 
@@ -3139,6 +3109,6 @@ if __name__ == '__main__':
     elif sys.argv[2:3] == [RUN_COPY]:
         run_copy(Path(sys.argv[1]), int(sys.argv[3]))
     elif sys.argv[2:3] == ['--check-placement']:
-        raise SystemExit(check_guest_placement(Path(sys.argv[1]), sys.argv[3]))
+        raise SystemExit(check_guest_placement(Path(sys.argv[1])))
     else:
         raise SystemExit(run_guest(Path(sys.argv[1])))
