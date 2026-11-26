@@ -23,11 +23,12 @@ from scripts.review_links import review_events
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
 REVIEWER = "fixture-reviewer"
+MOVE_QUOTE = "Move at once. Use scripts/direct/assign.py to restart the work."
 MOVE_QUESTION = update_registration.QuestionParts(
     ask="Allow a wait before an account move? (2026-11-23)",
-    context='You said, "Move at once." A wait lets the running build finish.',
+    context="You set a rule for immediate moves and restarts. A wait lets the running build finish.",
     items=["A build can take 90 minutes."],
-    choices=["Yes (wait for the build)", "No (move at once)"],
+    choices=["Yes (the change goes in: wait for the build)", "No (the change stays out: move at once)"],
     recommend="Yes, because the unit can finish the build.",
 )
 
@@ -244,13 +245,15 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertEqual(len(records), 1)
         question = records[0]
         self.assertEqual(question.item.get("parts"), MOVE_QUESTION)
+        self.assertIn(MOVE_QUOTE, (self.folder / "completed-reply.txt").read_text())
+        self.assertNotIn("scripts/direct/assign.py", question.item.get("question", ""))
         self.assertNotIn("test_move", question.item.get("question", ""))
         self.assertNotIn("test_fixture.py", question.item.get("question", ""))
         return args, key, waiting, question
 
     def specified_move_reply(self) -> None:
-        source = self.write(self.root / "decision.md", "Move at once.")
-        self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": "Move at once.",
+        source = self.write(self.root / "decision.md", MOVE_QUOTE)
+        self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": MOVE_QUOTE,
                                 "source": str(source), "date": "2026-11-23",
                                 "change": "The move waits for the current step."}]))
 
@@ -261,20 +264,43 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
               mock.patch.object(update_registration, "ask") as ask):
             code, output = self.cli("run", *args)
         self.assertEqual(code, 1)
-        self.assertIn(f"Nate's words (2026-11-23, {self.root / 'decision.md'}): Move at once.", output)
+        self.assertIn(f"Nate's words (2026-11-23, {self.root / 'decision.md'}): {MOVE_QUOTE}", output)
         self.assertIn("Change: The move waits for the current step.\nAsk moves (phase 7)\n", output)
         self.assertIn("Nate was not asked. Write the question for nate in the question template as JSON, "
                       + "then run again with --question FILE.\n", output)
         ask.assert_not_called()
         self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
 
-    def test_a_question_requires_both_choices_and_the_quote_and_date(self) -> None:
+    def test_failed_history_lookup_keeps_the_finding_and_names_the_tip(self) -> None:
+        path = "test_fixture.py"
+        base = self.commit(path, "def test_move():\n    assert 'move now'\n")
+        updated = "def test_move():\n    assert 'wait first'\n"
+        _ = self.commit(path, updated + "\n" + updated, "Duplicate the test.")
+        head = self.commit(path, updated, "Keep one test definition.")
+        args = ["--repo", str(self.repo), "--base", base, "--commit", head]
+        self.specified_move_reply()
+        with mock.patch.object(astra_review, "run_review", return_value=0) as runner:
+            code, output = self.cli("run", *args)
+            self.assertEqual(code, 1)
+            self.assertIn(f"{MOVE_QUOTE}\nChange: The move waits for the current step.\n"
+                          + f"{head} Keep one test definition.\nNate was not asked.", output)
+            with mock.patch.object(behavior_check, "describe_tip", side_effect=OSError("Cannot read the subject.")):
+                code, output = self.cli("run", *args)
+            self.assertEqual(code, 1)
+            self.assertIn(f"{MOVE_QUOTE}\nChange: The move waits for the current step.\n"
+                          + f"Ask the author of {head}\nNate was not asked.", output)
+        runner.assert_called_once()
+
+    def test_a_question_requires_both_choice_starts_and_the_date(self) -> None:
         args, key = self.changed_range()
         self.specified_move_reply()
+        yes, no = MOVE_QUESTION["choices"]
+        choice_error = 'start one choice with "Yes (the change goes in" and one with "No (the change stays out".'
         cases: list[tuple[update_registration.QuestionParts, str]] = [
-            ({**MOVE_QUESTION, "choices": ["Yesterday was too soon.", "No"]}, "start with Yes and No"),
-            ({**MOVE_QUESTION, "choices": ["Yes", "No", "Later"]}, "give two choices"),
-            ({**MOVE_QUESTION, "context": "The move waits.", "items": ["Move at once."]}, "omit Nate's quote"),
+            ({**MOVE_QUESTION, "choices": ["Yes. Keep moving at once.", no]}, choice_error),
+            ({**MOVE_QUESTION, "choices": [yes, "No (wait for the build)"]}, choice_error),
+            ({**MOVE_QUESTION, "choices": ["Yes (the change goes inside)", no]}, choice_error),
+            ({**MOVE_QUESTION, "choices": [yes, no, "Later"]}, choice_error),
             ({**MOVE_QUESTION, "ask": "Allow a wait before an account move?"}, "omit 2026-11-23"),
         ]
         with (mock.patch.object(astra_review, "run_review", return_value=0) as runner,

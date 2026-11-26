@@ -381,6 +381,11 @@ class TestHistoryCommit(NamedTuple):
     subject: str
 
 
+def describe_tip(change: GitRange) -> str:
+    subject = change.git("show", "-s", "--format=%s", "--no-notes", "--no-show-signature", change.commit, "--")
+    return f"{change.commit} {subject.decode('utf-8', errors='replace')}".rstrip()
+
+
 def question_authors(change: GitRange, tests: ChangedTests, findings: set[str]) -> dict[str, str]:
     """Trace each finding to the commit that supplied the final test text."""
     rows = change.git("log", "--format=%H%x00%P%x00%s", "-z", "--no-notes", "--no-show-signature",
@@ -388,8 +393,7 @@ def question_authors(change: GitRange, tests: ChangedTests, findings: set[str]) 
     fields = iter(rows.decode("utf-8", errors="replace").removesuffix("\0").split("\0")) if rows else iter(())
     history = {commit: TestHistoryCommit(next(fields).split(), next(fields)) for commit in fields}
     if change.commit not in history:
-        subject = change.git("show", "-s", "--format=%s", "--no-notes", "--no-show-signature", change.commit, "--")
-        return dict.fromkeys(findings, f"{change.commit} {subject.decode('utf-8', errors='replace').rstrip()}")
+        return dict.fromkeys(findings, describe_tip(change))
     pairs = test_paths(change, [file.path for file in tests.files if is_test_file(file.path)], None)
     pairs.sort(key=lambda pair: -len(pair.before))
 

@@ -35,10 +35,14 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 The command traces each finding to the commit that last changed the test in the range.
 It names the unit and phase from the first-parent phase merge whose merged side contains that commit.
 If there is no such merge, it prints the commit hash and subject.
+If the lookup fails, the command prints the range tip's hash and subject.
+If the command cannot read the subject, it prints `Ask the author of COMMIT`.
 
 Use the question template to write `ask`, `context`, `items`, `choices`, and `recommend` in the JSON file.
-Include each finding's full quote and ISO date in the title or point.
-Start one choice with `Yes` and the other with `No`.
+Include each finding's ISO date in the title or point.
+Paraphrase Nate's words when needed. The review record and refusal output keep the exact quote.
+Start one choice with `Yes (the change goes in` and the other with `No (the change stays out`.
+Describe the result of each choice after its required start.
 The command files one question per key with `blocks` urgency.
 Once the command files the question, later runs track the answer without the file.
 

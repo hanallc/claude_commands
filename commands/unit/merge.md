@@ -153,6 +153,7 @@ If the review starts, collect its reply with the same command when it completes.
 On "Nate was not asked", send the printed finding to the unit named in `Ask UNIT (phase PHASE)`.
 If the check prints a commit instead, send the finding to its author.
 The unit writes the question template JSON and runs the same check with `--question FILE`.
+Start one choice with `Yes (the change goes in` and the other with `No (the change stays out`.
 Wait for exit 0 before the land.
 </BehaviorCheck>
 

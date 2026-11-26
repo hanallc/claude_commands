@@ -211,13 +211,14 @@ def first_word(text: str) -> str:
 def read_question(path: Path, evidence: list[SpecifiedBehavior]) -> update_registration.QuestionParts:
     parts = update_registration.read_parts(cast(object, json.loads(path.read_text(encoding="utf-8"))), str(path))
     choices = parts["choices"]
-    if len(choices) != 2 or {first_word(choice) for choice in choices} != {"Yes", "No"}:
-        raise behavior_check.BehaviorCheckError(f"{path}: give two choices that start with Yes and No.")
+    yes_start = "Yes (the change goes in"
+    no_start = "No (the change stays out"
+    if len(choices) != 2 or not all(
+        any(re.match(re.escape(start) + r"\b", choice) for choice in choices) for start in (yes_start, no_start)
+    ):
+        raise behavior_check.BehaviorCheckError(f'{path}: start one choice with "{yes_start}" and one with "{no_start}".')
     title_and_point = tuple(" ".join(parts[key].split()) for key in ("ask", "context"))
     for finding in evidence:
-        quote = " ".join(finding.quote.split())
-        if not any(quote in text for text in title_and_point):
-            raise behavior_check.BehaviorCheckError(f"{path}: the title and point omit Nate's quote for {finding.test}.")
         if not any(re.search(rf"\b{finding.day.isoformat()}\b", text) for text in title_and_point):
             raise behavior_check.BehaviorCheckError(f"{path}: the title and point omit {finding.day} for {finding.test}.")
     return parts
@@ -322,10 +323,22 @@ def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoRev
 
 def print_findings(change: behavior_check.GitRange, tests: behavior_check.ChangedTests,
                    evidence: list[SpecifiedBehavior]) -> None:
-    authors = behavior_check.question_authors(change, tests, {finding.test for finding in evidence})
     for finding in evidence:
         print(finding.test, f"Nate's words ({finding.day}, {finding.source}): {finding.quote}",
-              f"Change: {finding.change}", authors[finding.test], sep="\n", file=sys.stderr)
+              f"Change: {finding.change}", sep="\n", file=sys.stderr)
+    names = {finding.test for finding in evidence}
+    try:
+        authors = behavior_check.question_authors(change, tests, names)
+        routes = [authors[finding.test] for finding in evidence]
+    except Exception:
+        # The refusal must include a route even when Git history cannot supply one.
+        try:
+            fallback = behavior_check.describe_tip(change)
+        except Exception:
+            fallback = f"Ask the author of {change.commit}"
+        routes = [fallback] * len(evidence)
+    for finding, route in zip(evidence, routes, strict=True):
+        print(route if len(evidence) == 1 else f"{finding.test}: {route}", file=sys.stderr)
 
 
 def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key: str, reference: str,
