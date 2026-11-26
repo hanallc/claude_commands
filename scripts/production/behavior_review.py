@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from hashlib import sha256
@@ -9,12 +10,13 @@ from pathlib import Path
 import json
 import re
 import sys
+from textwrap import indent
 from typing import cast
 from unicodedata import category
 
 from scripts.astra import astra_review, astra_roles, astra_work
 from scripts.direct import pass_record, progress_history, recorder_state
-from scripts.lib import file_lock, unit_runs, urgency
+from scripts.lib import conf, file_lock, unit_runs, urgency
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
 from scripts.production import behavior_check, behavior_request, staff, update_registration, worker
@@ -60,14 +62,18 @@ class ReviewPending:
     run: Path
 
 
+class ReviewerBlocker(behavior_check.BehaviorCheckError):
+    """The reviewer returned a blocker in prose."""
+
+
 def read_findings(text: str) -> dict[str, ReviewFinding]:
+    lines = text.strip().splitlines()
+    if lines and re.fullmatch(r"DONE \S+", lines[-1]):
+        _ = lines.pop()
+    payload = "\n".join(lines).strip()
+    if payload.startswith("```json\n") and payload.endswith("\n```"):
+        payload = payload[len("```json\n"):-len("\n```")]
     try:
-        lines = text.strip().splitlines()
-        if lines and re.fullmatch(r"DONE \S+", lines[-1]):
-            _ = lines.pop()
-        payload = "\n".join(lines).strip()
-        if payload.startswith("```json\n") and payload.endswith("\n```"):
-            payload = payload[len("```json\n"):-len("\n```")]
         result = cast(object, json.loads(payload))
         if not isinstance(result, list):
             raise ValueError("expected a list of findings")
@@ -91,6 +97,10 @@ def read_findings(text: str) -> dict[str, ReviewFinding]:
             if test in findings:
                 raise ValueError(f"repeated finding for {test}")
             findings[test] = finding
+    except json.JSONDecodeError as error:
+        if payload and not payload.startswith(("[", "{")):
+            raise ReviewerBlocker(payload.splitlines()[0]) from error
+        raise behavior_check.BehaviorCheckError(f"Invalid reviewer reply. {error}") from error
     except ValueError as error:
         raise behavior_check.BehaviorCheckError(f"Invalid reviewer reply. {error}") from error
     return findings
@@ -114,15 +124,19 @@ def verify_requests(findings: Iterable[ReviewFinding]) -> list[BehaviorFinding]:
     return results
 
 
-def parse_reply(text: str, tests: behavior_check.ChangedTests) -> list[BehaviorFinding]:
+def require_findings(findings: dict[str, ReviewFinding], tests: Iterable[behavior_check.TestChange]) -> None:
     """Require exactly one finding for each existing test."""
-    findings = read_findings(text)
-    expected = {change.test for change in tests.tests}
+    expected = {change.test for change in tests}
     if unexpected := findings.keys() - expected:
         raise behavior_check.BehaviorCheckError(f"Invalid reviewer reply. unexpected finding for {min(unexpected)}")
     if missing := expected - findings.keys():
         raise behavior_check.BehaviorCheckError(f"Invalid reviewer reply. missing findings for {', '.join(sorted(missing))}")
-    return verify_requests(findings.values())
+
+
+def parse_reply(text: str, tests: Iterable[behavior_check.TestChange]) -> dict[str, ReviewFinding]:
+    findings = read_findings(text)
+    require_findings(findings, tests)
+    return findings
 
 
 REVIEW_INSTRUCTIONS = """
@@ -170,17 +184,127 @@ Read only. Do not edit files, run builds or tests, send messages, or file a ques
 """
 
 
-def prepare_review(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, folder: Path) -> str:
-    test_file = folder / "tests.json"
-    diff_file = folder / "code.diff"
-    write_text_atomic(test_file, json.dumps([asdict(test) for test in tests.tests], indent=2), new_file_mode=0o600)
+INLINE_DIFF_INSTRUCTION = "Read the code diff in {diff_file}."
+INDEXED_DIFF_INSTRUCTION = """Read the diff index in {diff_file}.
+Read the diffs for the listed tests and the files those tests exercise.
+Use line ranges when a file is large."""
+
+
+@dataclass(frozen=True)
+class IndexedDiff:
+    files: dict[str, bytes]
+
+
+@dataclass(frozen=True)
+class ReviewPart:
+    tests: tuple[behavior_check.TestChange, ...]
+    test_text: str
+    diff: bytes | IndexedDiff
+
+    @property
+    def instructions(self) -> str:
+        if isinstance(self.diff, IndexedDiff):
+            return REVIEW_INSTRUCTIONS.replace(INLINE_DIFF_INSTRUCTION, INDEXED_DIFF_INSTRUCTION)
+        return REVIEW_INSTRUCTIONS
+
+
+def review_plan(change: behavior_check.GitRange, tests: behavior_check.ChangedTests) -> ReviewPart | tuple[ReviewPart, ...]:
+    limit = conf.read_or_repository("production").value("review_part_bytes", conf.positive_whole)
+    test_text = json.dumps([asdict(test) for test in tests.tests], indent=2)
     diff = change.git("diff", "--no-ext-diff", "--no-textconv", change.base, change.commit, "--")
-    write_text_atomic(diff_file, diff.decode("utf-8", errors="replace"), new_file_mode=0o600)
+    if len(test_text) + len(diff) <= limit:
+        return ReviewPart(tests.tests, test_text, diff)
+    return split_review(change, tests, limit)
+
+
+def split_review(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, limit: int) -> tuple[ReviewPart, ...]:
+    options = ("--no-renames", "--no-ext-diff", "--no-textconv", "--no-relative", "--no-color",
+               "--ignore-submodules=none", "--submodule=short", "--output-indicator-context= ",
+               "--output-indicator-new=+", "--output-indicator-old=-")
+    diff = change.git("diff", *options, change.base, change.commit, "--")
+    sections = re.split(rb"(?m)(?=^diff --git )", diff)[1:]
+    files = dict(zip((file.path for file in tests.files), sections, strict=True))
+    groups: dict[str, list[behavior_check.TestChange]] = {}
+    for test in tests.tests:
+        path = test.test.split("::", 1)[0]
+        groups.setdefault(path, []).append(test)
+    group_paths = {path: {path} for path in groups}
+    for before, after in behavior_check.test_paths(change, list(groups), None):
+        if before in group_paths:
+            group_paths[before].add(after)
+    test_paths = {name for names in group_paths.values() for name in names}
+    shared = {path: patch for path, patch in files.items()
+              if path not in test_paths and (not behavior_check.is_test_file(path)
+                                             or path.endswith(".rs") and "tests" not in Path(path).parts[:-1])}
+    return pack_review_parts(groups, group_paths, files, shared, limit)
+
+
+def pack_review_parts(groups: dict[str, list[behavior_check.TestChange]], group_paths: dict[str, set[str]],
+                      files: dict[str, bytes], shared: dict[str, bytes], limit: int) -> tuple[ReviewPart, ...]:
+    rows = {path: [indent(json.dumps(asdict(test), indent=2), "  ") for test in group]
+            for path, group in groups.items()}
+    test_bytes = {path: sum(len(row) + 2 for row in group) for path, group in rows.items()}
+    diff_bytes = {path: sum(len(files[name]) for name in names) for path, names in group_paths.items()}
+    shared_bytes = sum(map(len, shared.values()))
+    indexed = any(2 + size + diff_bytes[path] + shared_bytes > limit for path, size in test_bytes.items())
+    parts: list[ReviewPart] = []
+    part_tests: list[behavior_check.TestChange] = []
+    part_rows: list[str] = []
+    part_paths: set[str] = set()
+    overhead = 2 if indexed else 2 + shared_bytes
+    size = overhead
+
+    def finish_part() -> None:
+        selected = {path: patch for path, patch in files.items() if path in shared or path in part_paths}
+        part_diff = IndexedDiff(selected) if indexed else b"".join(selected.values())
+        parts.append(ReviewPart(tuple(part_tests), "[\n" + ",\n".join(part_rows) + "\n]", part_diff))
+        part_tests.clear()
+        part_rows.clear()
+        part_paths.clear()
+
+    for path, group in groups.items():
+        names = group_paths[path]
+        if 2 + test_bytes[path] > limit:
+            batches = [([test], [row], len(row) + 2) for test, row in zip(group, rows[path], strict=True)]
+        else:
+            batches = [(group, rows[path], test_bytes[path])]
+        for batch, batch_rows, batch_bytes in batches:
+            if 2 + batch_bytes > limit:
+                raise behavior_check.BehaviorCheckError(f"{batch[0].test} exceeds review_part_bytes.")
+            new_diff_bytes = 0 if indexed else sum(len(files[name]) for name in names - part_paths)
+            if part_tests and size + batch_bytes + new_diff_bytes > limit:
+                finish_part()
+                size = overhead
+                new_diff_bytes = 0 if indexed else diff_bytes[path]
+            part_tests.extend(batch)
+            part_rows.extend(batch_rows)
+            part_paths.update(names)
+            size += batch_bytes + new_diff_bytes
+    finish_part()
+    return tuple(parts)
+
+
+def prepare_review(change: behavior_check.GitRange, part: ReviewPart, folder: Path) -> str:
+    test_file = folder / "tests.json"
+    write_text_atomic(test_file, part.test_text, new_file_mode=0o600)
+    if isinstance(part.diff, IndexedDiff):
+        diff_folder = folder / "diffs"
+        diff_folder.mkdir(mode=0o700)
+        index = {}
+        for number, (path, patch) in enumerate(part.diff.files.items(), start=1):
+            name = f"{number}.diff"
+            index[name] = path
+            write_text_atomic(diff_folder / name, patch.decode("utf-8", errors="replace"), new_file_mode=0o600)
+        diff_file = diff_folder / "index.json"
+        write_text_atomic(diff_file, json.dumps(index, indent=2), new_file_mode=0o600)
+    else:
+        diff_file = folder / "code.diff"
+        write_text_atomic(diff_file, part.diff.decode("utf-8", errors="replace"), new_file_mode=0o600)
     reply = folder / "review.md"
     assignment = astra_work.AstraWork("astra-reviewer", str(folder), str(test_file),
                                      datetime.now(timezone.utc).isoformat(),
                                      str(reply), astra_work.StandaloneWork())
-    return astra_work.header_line(assignment) + REVIEW_INSTRUCTIONS.format(
+    return astra_work.header_line(assignment) + part.instructions.format(
         test_file=test_file, diff_file=diff_file, state_root=state_root(), repo=change.repo)
 
 
@@ -226,10 +350,10 @@ def recover_reply(folder: Path) -> Path | ReviewPending | ReviewNeedsDispatch:
     return ReviewNeedsDispatch()
 
 
-def reviewer_reply(change: behavior_check.GitRange, tests: behavior_check.ChangedTests,
+def reviewer_reply(change: behavior_check.GitRange, key: str, part: ReviewPart,
                    pointer: Path, lock: file_lock.ExclusiveLock) -> Path | ReviewPending:
     """Recover the prior reply or start one review while the lock is held."""
-    instructions_digest = sha256(REVIEW_INSTRUCTIONS.encode("utf-8")).hexdigest()
+    instructions_digest = sha256(part.instructions.encode("utf-8")).hexdigest()
     try:
         folder = review_folder(pointer)
     except FileNotFoundError:
@@ -240,14 +364,15 @@ def reviewer_reply(change: behavior_check.GitRange, tests: behavior_check.Change
             return prior
         if isinstance(prior, Path):
             try:
-                if ((folder / "review-key").read_text(encoding="ascii").strip() == tests.key
-                        and (folder / "review-instructions").read_text(encoding="ascii").strip() == instructions_digest):
+                if ((folder / "review-key").read_text(encoding="ascii").strip() == key
+                        and (folder / "review-instructions").read_text(encoding="ascii").strip() == instructions_digest
+                        and (folder / "tests.json").read_text(encoding="utf-8") == part.test_text):
                     return prior
             except FileNotFoundError:
                 pass
     folder = astra_review.review_attempt_folder()
-    prompt = prepare_review(change, tests, folder)
-    write_text_atomic(folder / "review-key", tests.key + "\n", new_file_mode=0o600)
+    prompt = prepare_review(change, part, folder)
+    write_text_atomic(folder / "review-key", key + "\n", new_file_mode=0o600)
     write_text_atomic(folder / "review-instructions", instructions_digest + "\n", new_file_mode=0o600)
     reply = folder / "review.md"
     log = folder / "codex.log"
@@ -258,6 +383,51 @@ def reviewer_reply(change: behavior_check.GitRange, tests: behavior_check.Change
     if result != 0:
         raise behavior_check.BehaviorCheckError(f"The reviewer exited with status {result}. See {log}.")
     return save_reply(folder, reply.read_text(encoding="utf-8"))
+
+
+@dataclass(frozen=True)
+class ReviewedPart:
+    reply: Path
+    digest: str
+    findings: dict[str, ReviewFinding]
+
+
+@dataclass(frozen=True)
+class ReviewFailure:
+    error: str
+
+
+def collect_part(change: behavior_check.GitRange, key: str, part: ReviewPart,
+                 pointer: Path, lock: file_lock.ExclusiveLock, number: int) -> ReviewedPart | ReviewPending | ReviewFailure:
+    try:
+        reply = reviewer_reply(change, key, part, pointer, lock)
+        if isinstance(reply, ReviewPending):
+            return reply
+        data = reply.read_bytes()
+        try:
+            findings = parse_reply(data.decode("utf-8"), part.tests)
+        except (behavior_check.BehaviorCheckError, UnicodeError):
+            pointer.unlink()
+            raise
+        return ReviewedPart(reply, sha256(data).hexdigest(), findings)
+    except ReviewerBlocker as error:
+        return ReviewFailure(f"The reviewer could not complete part {number}: {error}")
+    except (behavior_check.BehaviorCheckError, OSError, ValueError) as error:
+        return ReviewFailure(str(error))
+
+
+def part_pointer(record: Path, number: int) -> Path:
+    return record.with_suffix(f".part-{number}.run")
+
+
+def collect_reviews(change: behavior_check.GitRange, key: str, plan: ReviewPart | tuple[ReviewPart, ...],
+                    path: Path, lock: file_lock.ExclusiveLock) -> tuple[ReviewedPart | ReviewPending | ReviewFailure, ...]:
+    if isinstance(plan, ReviewPart):
+        return (collect_part(change, key, plan, path.with_suffix(".run"), lock, 1),)
+    with ThreadPoolExecutor() as pool:
+        reviews = [pool.submit(collect_part, change, key, part, part_pointer(path, number), lock, number)
+                   for number, part in enumerate(plan, start=1)]
+        return tuple(review.result() for review in reviews)
 
 
 def asking_staff(reference: str, identities: update_registration.QuestionStaff) -> tuple[update_registration.QuestionScope, str]:
@@ -378,18 +548,54 @@ class InvalidClearProof:
     """The saved reply does not prove the range is clear."""
 
 
-def read_clear_reply(key: str, record: behavior_check.Clear) -> str:
-    folder = review_folder(behavior_check.record_path(key).with_suffix(".run"))
+def clear_reply_bytes(key: str, pointer: Path, saved: Path) -> bytes:
+    folder = review_folder(pointer)
     reply = folder / "completed-reply.txt"
-    if (record.reply != reply or reply.resolve() != reply
+    if (saved != reply or reply.resolve() != reply
             or (folder / "review-key").read_text(encoding="ascii").strip() != key):
         raise behavior_check.BehaviorCheckError("The saved approval has no valid proof.")
-    return reply.read_text(encoding="utf-8")
+    return reply.read_bytes()
+
+
+def save_split_proof(record: Path, parts: list[ReviewedPart]) -> Path:
+    manifest = record.with_suffix(".parts.json")
+    entries = [{"reply": str(part.reply), "sha256": part.digest} for part in parts]
+    write_text_atomic(manifest, json.dumps(entries, indent=2) + "\n", new_file_mode=0o600)
+    return manifest
+
+
+def read_clear_findings(key: str, record: behavior_check.Clear) -> dict[str, ReviewFinding]:
+    path = behavior_check.record_path(key)
+    manifest = path.with_suffix(".parts.json")
+    if record.reply != manifest:
+        data = clear_reply_bytes(key, path.with_suffix(".run"), record.reply)
+        return read_findings(data.decode("utf-8"))
+    if manifest.is_symlink():
+        raise behavior_check.BehaviorCheckError("The saved approval has no valid proof.")
+    entries = cast(object, json.loads(manifest.read_text(encoding="utf-8")))
+    if not isinstance(entries, list) or not entries:
+        raise behavior_check.BehaviorCheckError("The saved approval has no valid proof.")
+    findings: dict[str, ReviewFinding] = {}
+    for number, entry in enumerate(cast(list[object], entries), start=1):
+        match entry:
+            case {"reply": str(reply), "sha256": str(digest)}:
+                data = clear_reply_bytes(key, part_pointer(path, number), Path(reply))
+                if sha256(data).hexdigest() == digest:
+                    part = read_findings(data.decode("utf-8"))
+                    if part and findings.keys().isdisjoint(part):
+                        findings.update(part)
+                        continue
+            case _:
+                pass
+        raise behavior_check.BehaviorCheckError(f"Part {number} has no valid proof.")
+    return findings
 
 
 def clear_proof(tests: behavior_check.ChangedTests, record: behavior_check.Clear) -> tuple[NateRequest, ...] | InvalidClearProof:
     try:
-        findings = parse_reply(read_clear_reply(tests.key, record), tests)
+        saved = read_clear_findings(tests.key, record)
+        require_findings(saved, tests.tests)
+        findings = verify_requests(saved.values())
     except (behavior_check.BehaviorCheckError, OSError, ValueError):
         return InvalidClearProof()
     if any(isinstance(finding, NateSpecified) for finding in findings):
@@ -469,19 +675,23 @@ def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key
         saved = recover_question(key)
         if saved is not behavior_check.NoReview.MISSING:
             return report(key, saved)
-        pointer = path.with_suffix(".run")
-        reply = reviewer_reply(change, tests, pointer, lock)
-        if isinstance(reply, ReviewPending):
-            print(f"The land waits for the independent review in {reply.run}.")
+        plan = review_plan(change, tests)
+        results = collect_reviews(change, key, plan, path, lock)
+        failed = [result for result in results if isinstance(result, ReviewFailure)]
+        for failure in failed:
+            print(f"behavior_check: {failure.error}", file=sys.stderr)
+        pending = [result for result in results if isinstance(result, ReviewPending)]
+        for review in pending:
+            print(f"The land waits for the independent review in {review.run}.")
+        if pending:
             print(f"After the reply arrives, run {change.command('run', production=reference, question=question)}")
+        if failed or pending:
             return 1
-        try:
-            findings = parse_reply(reply.read_text(encoding="utf-8"), tests)
-        except behavior_check.BehaviorCheckError:
-            pointer.unlink()
-            raise
+        parts = [result for result in results if isinstance(result, ReviewedPart)]
+        findings = verify_requests(finding for part in parts for finding in part.findings.values())
         evidence = [finding for finding in findings if isinstance(finding, NateSpecified)]
         if not evidence:
+            reply = parts[0].reply if isinstance(plan, ReviewPart) else save_split_proof(path, parts)
             record = behavior_check.Clear(reply)
         elif question is behavior_check.NoQuestionDraft.OMITTED:
             print_findings(change, tests, evidence)
@@ -519,7 +729,7 @@ def status(key: str) -> int:
             record = refresh_answer(key, record)
         elif isinstance(record, behavior_check.Clear):
             try:
-                evidence = verify_requests(read_findings(read_clear_reply(key, record)).values())
+                evidence = verify_requests(read_clear_findings(key, record).values())
             except (behavior_check.BehaviorCheckError, OSError, ValueError):
                 evidence = []
             if not evidence or any(isinstance(finding, NateSpecified) for finding in evidence):
