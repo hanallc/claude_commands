@@ -1587,7 +1587,7 @@ By default, the List starts with All selected in the Owner, Producer, and Show r
 Owner and Producer list staff in name order after All and omit every trailing `-unit` from names.
 If the resulting name is empty, the chip shows the original staff ID.
 The address keeps the original staff IDs, including `all` when it identifies a staff member.
-The words box sits beside the Producer chips and wraps below them when space is limited.
+The words box is below the Producer tabs and aligns with the right edge of the Top priority band.
 When the box contains text, it uses the same accent as a selected chip.
 The box also shows the Clear filter button.
 Click Clear filter or press Escape in the box to remove the words.
@@ -2284,8 +2284,8 @@ The page title is The Studio.
 `list_page.render` provides the rows, filters, script and status line.
 The Studio menu entry uses `list_page.waiting_updates` for its New badge.
 The first news request moves the saved List seen set to Studio and keeps any unread updates.
-The Studio shows the Producer row as picture tabs above the filters.
-The Owner and Show rows and the words box stay below the tabs.
+The Studio shows the Producer picture tabs first, then the words box and the Top priority band.
+The Owner and Show rows follow the band.
 A render failure gives a 503 page with **The Studio page is not available.** and logs `review-links studio:`.
 
 The tabs are the List Producer filter: `record_table.chip_row('Producer', ...)` with `data-filter-row="producer"`.
@@ -2334,7 +2334,7 @@ Each other open item of an active producer has the button **Make top priority** 
 The button posts the action `top`. `the_list.make_top_priority` names the item as the top item of its producer, so it takes the place of the old one.
 The List path refuses `top`. The refresh after the save moves the flag and the band.
 
-The band is above the filters on a producer tab and hidden on All.
+The band appears on a producer tab and stays hidden on All.
 It shows the Top priority label with the flag, the item number and title in bold, the next step below, and the state and the short ETA on the right.
 A producer with no top item shows **No top priority item** and **Open an item and click "Make top priority".**
 The page renders one band for each top item and one band for no top item.
