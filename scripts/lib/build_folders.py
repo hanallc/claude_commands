@@ -6,6 +6,7 @@ try:
 except FileNotFoundError:
     pass
 
+from collections import deque
 from collections.abc import Callable, Collection, Container, Generator, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from contextvars import ContextVar
@@ -561,9 +562,11 @@ class CargoPlacementCheckout(Enum):
 @final
 @dataclass(frozen=True)
 class IncomingCargoCheckout:
-    """Cargo files staged for the checkout that will replace the current checkout."""
+    """Describe staged Cargo files and paths that Git reset will change."""
 
     directory: Path
+    reset_paths: frozenset[Path]
+    incoming_symbolic_links: frozenset[Path]
 
 
 _CI_ADMISSION_DIRECTORY = re.compile(r"build-admission-ci-[0-9]+-")
@@ -610,6 +613,65 @@ def _fixed_linked_checkout(path: Path) -> bool:
         return False
 
 
+def _resolve_incoming_cargo_output(path: Path, checkout: IncomingCargoCheckout) -> Path:
+    """Refuse Git links and resolve paths that Git reset will leave in place."""
+    resolved = Path(path.anchor).resolve()
+    remaining = deque(path.parts[1:])
+    replaced_links: set[Path] = set()
+    links_followed = 0
+    while remaining:
+        part = remaining.popleft()
+        if part == "..":
+            resolved = resolved.parent
+            continue
+        candidate = resolved / part
+        if candidate in checkout.incoming_symbolic_links:
+            raise InvalidFixedBuildRoot(f"{candidate}: the incoming Cargo output path contains a symbolic link")
+        # Ignore old files that lie behind a symbolic link that Git will replace.
+        if (any(candidate.is_relative_to(link) for link in replaced_links)
+                or not candidate.is_symlink()):
+            resolved = candidate
+            continue
+        if candidate in checkout.reset_paths:
+            replaced_links.add(candidate)
+            resolved = candidate
+            continue
+        links_followed += 1
+        if links_followed > 40:
+            raise InvalidFixedBuildRoot(f"{path}: too many symbolic links in the Cargo output path")
+        link = candidate.readlink()
+        if link.is_absolute():
+            resolved = Path(link.anchor).resolve()
+            link = link.relative_to(link.anchor)
+        remaining.extendleft(reversed(link.parts))
+    return resolved
+
+
+def _incoming_cargo_build_path(output: cargo_target_config.CargoFolderSetting, main: Path,
+                               checkout: IncomingCargoCheckout, cargo_home: str) -> Path:
+    """Expand an incoming build-dir before checking its path components."""
+    value = output.value
+    if "{workspace-root}" in value or "{workspace-path-hash}" in value:
+        if (checkout.directory / "Cargo.toml").is_file():
+            staged = cargo_target_config.cargo_workspace_manifest([], str(checkout.directory))
+            manifest = main / staged.relative_to(checkout.directory)
+        else:
+            manifest = cargo_target_config.cargo_workspace_manifest([], str(main.parent), cargo_home)
+        value = value.replace("{workspace-root}", str(manifest.parent))
+        if "{workspace-path-hash}" in value:
+            future_manifest = _resolve_incoming_cargo_output(manifest, checkout)
+            if manifest.resolve() != future_manifest:
+                raise InvalidFixedBuildRoot(f"{manifest}: cannot verify the incoming Cargo workspace path hash")
+            value = value.replace("{workspace-path-hash}", cargo_target_config.cargo_workspace_path_hash(manifest))
+    if cargo_home and "{cargo-cache-home}" in value:
+        configured_home = os.environ.get("CARGO_HOME") or str(Path.home() / ".cargo")
+        future_home = _resolve_incoming_cargo_output(main / configured_home, checkout)
+        value = value.replace("{cargo-cache-home}", str(future_home))
+    if "{" in value or "}" in value:
+        raise ValueError("Cargo build folder template cannot be resolved")
+    return output.base / value
+
+
 def _placement_cargo_outputs(checkout: CargoPlacementCheckout | IncomingCargoCheckout) -> Iterator[Path]:
     cwd = Path.cwd()
     cargo_home = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
@@ -630,23 +692,15 @@ def _placement_cargo_outputs(checkout: CargoPlacementCheckout | IncomingCargoChe
     else:
         cargo = cargo_target_config.cargo_folder_settings([], str(cwd), os.environ)
     for key, output in cargo.items():
-        if key == "target-dir":
-            yield (output.base / output.value).resolve()
-            continue
         try:
-            workspace_search = cwd
             if isinstance(checkout, IncomingCargoCheckout):
-                workspace_search = cwd.parent
-                if (checkout.directory / "Cargo.toml").is_file() and any(
-                        token in output.value for token in ("{workspace-root}", "{workspace-path-hash}")):
-                    manifest = cargo_target_config.cargo_workspace_manifest([], str(checkout.directory))
-                    future_manifest = cwd / manifest.relative_to(checkout.directory)
-                    value = output.value.replace("{workspace-root}", str(future_manifest.parent))
-                    if "{workspace-path-hash}" in value:
-                        value = value.replace("{workspace-path-hash}",
-                                              cargo_target_config.cargo_workspace_path_hash(future_manifest))
-                    output = replace(output, value=value)
-            yield Path(cargo_target_config.cargo_build_folder(output, [], str(workspace_search), cargo_home))
+                path = (output.base / output.value if key == "target-dir"
+                        else _incoming_cargo_build_path(output, cwd, checkout, cargo_home))
+                yield _resolve_incoming_cargo_output(path, checkout)
+            elif key == "target-dir":
+                yield (output.base / output.value).resolve()
+            else:
+                yield Path(cargo_target_config.cargo_build_folder(output, [], str(cwd), cargo_home))
         except cargo_target_config.NoCargoManifest:
             continue
 

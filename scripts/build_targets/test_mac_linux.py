@@ -4028,6 +4028,28 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual((main / 'history.txt').read_text(), 'old source\n')
         self.assertFalse((main / '.cargo/config.toml').exists())
 
+    def test_rows_23_27_guest_refuses_incoming_cargo_output_symlink_before_reset(self) -> None:
+        self.assertIsInstance(self.route(), GateRun)
+        main = self.guest_home / '.claude'
+        old_head = self.git_at(main, 'rev-parse', 'HEAD')
+        old_bootstrap = main / mac_linux.BOOTSTRAP_DIR / 'old-data'
+        old_bootstrap.parent.mkdir()
+        _ = old_bootstrap.write_text('Keep the earlier bootstrap.')
+        (self.repo / '.cargo').mkdir()
+        _ = (self.repo / '.cargo/config.toml').write_text('[build]\ntarget-dir = "output"\n')
+        (self.repo / 'output').symlink_to('../build', target_is_directory=True)
+        _ = self.git('add', '.cargo/config.toml', 'output')
+        _ = self.git('commit', '-qm', 'add a Cargo output link to the fixed build root')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+        result = self.route()
+
+        self.assertEqual(old_bootstrap.read_text(), 'Keep the earlier bootstrap.')
+        self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD'), old_head)
+        self.assertFalse(os.path.lexists(main / 'output'))
+        self.assertFalse((main / '.cargo/config.toml').exists())
+        self.assertIn('incoming Cargo output path contains a symbolic link', self.not_started(result))
+
     def test_run_guest_keeps_output_in_a_folder_without_a_worktree(self) -> None:
         checkout = self.guest_home / 'build/claude/mac-linux'
         output = checkout / 'target/fixture-output'

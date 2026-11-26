@@ -2929,7 +2929,8 @@ def save_guest_build_folder(source: Path, checkout: Path, attempt: str) -> None:
 
 
 def stage_incoming_cargo(commit: str, staging: Path) -> build_folders.IncomingCargoCheckout:
-    """Read the Cargo files that the guest main checkout will use after reset."""
+    """Read Cargo files and symbolic links for the guest checkout after reset."""
+    main = Path.cwd()
     paths = ('.cargo/config', '.cargo/config.toml', 'Cargo.toml')
 
     def git(*words: str) -> bytes:
@@ -2937,15 +2938,23 @@ def stage_incoming_cargo(commit: str, staging: Path) -> build_folders.IncomingCa
                                        timeout=GUEST_REF_TIMEOUT_SECONDS)
 
     entries: dict[str, tuple[str, str]] = {}
-    for entry in os.fsdecode(git('ls-tree', '-rtz', commit, '--', '.cargo', 'Cargo.toml')).split('\0'):
-        if entry:
-            fields, name = entry.split('\t', 1)
-            if name in paths or name == '.cargo':
-                mode, _, object_id = fields.split()
-                entries[name] = mode, object_id
+    reset_paths: set[Path] = set()
+    symbolic_links: set[Path] = set()
+    for entry in os.fsdecode(git('ls-tree', '-rtz', commit)).split('\0'):
+        if not entry:
+            continue
+        fields, name = entry.split('\t', 1)
+        mode, _, object_id = fields.split()
+        path = main / name
+        reset_paths.add(path)
+        if mode == '120000':
+            symbolic_links.add(path)
+        if name in paths or name == '.cargo':
+            entries[name] = mode, object_id
     if '.cargo' in entries and entries['.cargo'][0] != '040000':
         raise ValueError('The incoming .cargo path is not a directory.')
-    tracked = set(os.fsdecode(git('ls-files', '-z', '--', '.cargo', 'Cargo.toml')).split('\0'))
+    tracked = set(os.fsdecode(git('ls-files', '-z')).split('\0')) - {''}
+    reset_paths.update(main / name for name in tracked)
     for name in paths:
         if name in entries:
             mode, object_id = entries[name]
@@ -2965,7 +2974,7 @@ def stage_incoming_cargo(commit: str, staging: Path) -> build_folders.IncomingCa
         destination = staging / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         _ = destination.write_bytes(contents)
-    return build_folders.IncomingCargoCheckout(staging)
+    return build_folders.IncomingCargoCheckout(staging, frozenset(reset_paths), frozenset(symbolic_links))
 
 
 def check_guest_placement(request_path: Path, origin_main: str) -> int:
