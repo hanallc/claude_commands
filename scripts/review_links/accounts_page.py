@@ -740,7 +740,11 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
             values[-1][key] = count
         color = accounts.account_color(role_span[0].get("color", ""))
         line_color = color.css if isinstance(color, accounts.AccountColor) else ""
-        rows.append("<tr>" + _cell(_spans(role_span)) + _cell(_swatch(role_span))
+        role_text = _spans(role_span)
+        if role == accounts.CODEX_ROLE:
+            role_text += "".join(f"<br>{html.escape(worker['name'])}: {worker['state']}"
+                                 for worker in reading.starting_workers)
+        rows.append("<tr>" + _cell(role_text) + _cell(_swatch(role_span))
                     + _cell(_busy_line(role, line_color, samples, reading.checked_at, reading.zone), "left busy-cell")
                     + _cell(name) + _cell(next_text, "left next-cell") + "".join(count_cells) + "</tr>")
     cells = total["cells"]

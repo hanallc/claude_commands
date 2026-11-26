@@ -4519,6 +4519,12 @@ class AccountSessionDocument(TypedDict):
     state: session_state.SessionState
 
 
+class StartingWorkerDocument(TypedDict):
+    session: str
+    name: str
+    state: Literal["starting"]
+
+
 @dataclass(frozen=True)
 class NamedSession:
     """One local session of a role by its staff name; the Accounts page names paused and exited ones."""
@@ -4661,6 +4667,7 @@ class StatusReading:
     upcoming_moves: tuple[str, ...] = ()
     first_next_moves: FirstNextMoveTargets | NextMovesUnavailable = field(default_factory=NextMovesUnavailable)
     claude_registry_unreadable: bool = False
+    starting_workers: tuple[StartingWorkerDocument, ...] = ()
 
 
 class StatusAccountDocument(TypedDict):
@@ -4726,6 +4733,7 @@ class StatusDocument(TypedDict):
     accounts: list[StatusAccountDocument]
     board: Board
     problems: list[str]
+    starting_workers: NotRequired[list[StartingWorkerDocument]]
 
 
 def _reading_is_old(read_at: datetime, now: datetime, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> bool:
@@ -5277,8 +5285,11 @@ def render_status_json(reading: StatusReading, *, account_config: conf.ConfigRea
         if (key := f"account.{row.label}") in colors:
             item["color"] = colors[key]
         accounts.append(item)
-    return json.dumps(StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts,
-                                     board=_status_board(reading, account_config=account_config, colors=colors), problems=[note.removeprefix("* ") for note in reading.notes]))
+    document = StatusDocument(upcoming_moves=list(reading.upcoming_moves), session_inputs=list(reading.session_inputs), accounts=accounts,
+                              board=_status_board(reading, account_config=account_config, colors=colors), problems=[note.removeprefix("* ") for note in reading.notes])
+    if reading.starting_workers:
+        document["starting_workers"] = list(reading.starting_workers)
+    return json.dumps(document)
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -5920,15 +5931,16 @@ def _read_status(source: UsageSource, *, detail: bool, include_models: bool = Fa
     notes = [render_status_problem(problem) for problem in merge_status_problems(problems)]
     notes.extend(counts.problems)
     notes.extend(counts.peer_count_notes)
-    detail_lines: tuple[str, ...] = ()
+    detail_lines = tuple(f"worker {worker['name']}: {worker['state']}" for worker in local_sessions.starting_workers)
     if detail:
         journal = moves.read_journal()
         live_lines = ((*local_sessions.session_lines, *_workers_status_lines(now, selected_workers, local_sessions.continuation_lines, account_config=account_config))
                       if isinstance(source, RefreshStaleUsage) else ())
-        detail_lines = (*(f"{row.label}: {_role_count_text(row, role)}" for row in rows for role in row.roles if role != "spare"), *live_lines,
+        detail_lines = (*detail_lines, *(f"{row.label}: {_role_count_text(row, role)}" for row in rows for role in row.roles if role != "spare"), *live_lines,
             *_move_status_lines(moves.account_moves(journal), zone, account_config=account_config), *_routing_status_lines(journal, zone))
     return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr), session_inputs,
-                         claude_registry_unreadable=counts.claude_registry_unreadable)
+                         claude_registry_unreadable=counts.claude_registry_unreadable,
+                         starting_workers=local_sessions.starting_workers)
 
 
 @dataclass
@@ -6050,7 +6062,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     tty = sys.stderr.isatty()
     held = DiagnosticStream(sys.stderr)
     try:
-        with (redirect_stderr(held), herdr.starting_pane_notes() as starting,
+        with (redirect_stderr(held), herdr.quiet_starting_panes(),
               role_map.observe_map_reads(_observe_map_provenance),
               role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext()):
             reading = _with_upcoming_moves(_read_status(
@@ -6068,7 +6080,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented = set(reading.represented_stderr) | diagnostics.recovered
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
-    notes = [*reading.notes, *starting]
+    notes = list(reading.notes)
     warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
@@ -6141,6 +6153,7 @@ class LocalRoleSessions:
     running_claude_sessions: frozenset[str]
     models: dict[tuple[Path, str], ObservedSessionModel] = field(default_factory=dict)
     model_session_names: dict[tuple[Path, str], str] = field(default_factory=dict)
+    starting_workers: tuple[StartingWorkerDocument, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -6888,6 +6901,7 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
         record_claude_model(directory, member.current_session)
         session_lines.append(f"session {member.current_session} ({member.name}): {selected}; {state}")
     observed_workers = set(live)
+    starting_workers: list[StartingWorkerDocument] = []
     open_codex_workers: dict[str, Path] = {}
     if include_workers and (parents := session_staff.pane_parents(membership)):
         worker_panes = cast(AccountPaneReader, cast(object, import_module("scripts.herdr.worker_panes")))
@@ -6897,7 +6911,8 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
                 opening = (isinstance(state, worker_panes.StartingWorker)
                            or isinstance(state, worker_panes.OpenWorker) and state.status == "starting")
                 if opening:
-                    session_lines.append(f"worker {state.row.name}: starting")
+                    starting_workers.append(StartingWorkerDocument(
+                        session=state.row.current_session, name=state.row.name, state="starting"))
                 evidence = session_staff.worker_backend(membership, state.row.id)
                 if not isinstance(evidence, session_staff.RecordedWorker):
                     if not opening:
@@ -6956,7 +6971,8 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
             record_name(directory, member.current_session, member.name)
             record_codex_model(directory, member.current_session, process.pid if process else 0)
     return LocalRoleSessions(counts, members, tuple(str(path) for path in sorted(inputs)),
-                             tuple(session_lines), (), bool(registry.unreadable), frozenset(live), models, names)
+                             tuple(session_lines), (), bool(registry.unreadable), frozenset(live), models, names,
+                             starting_workers=tuple(starting_workers))
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...], observed: LocalRoleSessions) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
