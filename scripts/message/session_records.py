@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 import time
@@ -127,27 +128,36 @@ def registry_unreadable_reason(paths: tuple[Path, ...]) -> str:
     return "session registry unreadable: " + ", ".join(map(str, paths))
 
 
+def _check_registry_deadline(deadline: float, delay: float = 0) -> None:
+    if deadline != math.inf and time.monotonic() + delay >= deadline:
+        raise TimeoutError("session registry read deadline passed")
+
+
 def read_registry(*, directory: Path | ConfiguredRegistryDirectory = CONFIGURED_REGISTRY_DIRECTORY,
                   dependencies: Callable[[Path], None] | None = None,
-                  for_session: str | None = None) -> RegistryRead:
+                  for_session: str | None = None, deadline: float = math.inf) -> RegistryRead:
     """Report unreadable records unless their identity excludes the selected session."""
     if isinstance(directory, ConfiguredRegistryDirectory):
         directory = sessions_dir()
+    _check_registry_deadline(deadline)
     try:
         paths = [path for path in directory.iterdir() if path.suffix == ".json"]
     except OSError:
+        _check_registry_deadline(deadline)
         return RegistryRead((), (directory,))
+    _check_registry_deadline(deadline)
     entries: list[RegistryObservation] = []
     unreadable: list[Path] = []
     policy = retry_policy()
     for path in paths:
-        observation = _read_observation(path, policy, dependencies=dependencies, for_session=for_session)
+        observation = _read_observation(path, policy, dependencies=dependencies, for_session=for_session, deadline=deadline)
         if observation is None or isinstance(observation, RegistryRecordGone):
             continue
         if isinstance(observation, UnreadableSessionRecord):
             unreadable.append(path)
         else:
             entries.append(observation)
+    _check_registry_deadline(deadline)
     return RegistryRead(tuple(entries), tuple(unreadable))
 
 
@@ -209,9 +219,11 @@ def _other_session(path: Path, raw: object, session_id: str) -> bool:
 
 def _read_observation(path: Path, policy: SessionRetryPolicy, *,
                       dependencies: Callable[[Path], None] | None = None, for_session: str | None = None,
+                      deadline: float = math.inf,
                       ) -> RegistryObservation | UnreadableSessionRecord | RegistryRecordGone | None:
     """Reread a concurrent write; only a live unreadable record remains uncertain."""
     for attempt in range(policy.registry_reads):
+        _check_registry_deadline(deadline)
         try:
             if dependencies is not None:
                 dependencies(path)
@@ -226,6 +238,7 @@ def _read_observation(path: Path, policy: SessionRetryPolicy, *,
         except (OSError, ValueError, TypeError):
             pass
         if attempt + 1 < policy.registry_reads:
+            _check_registry_deadline(deadline, policy.registry_delay_seconds)
             time.sleep(policy.registry_delay_seconds)
     if path.stem.isdigit():
         try:
