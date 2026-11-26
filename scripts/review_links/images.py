@@ -100,7 +100,26 @@ class _AnswerDraft:
         return self._key(folder, saved, purpose)
 
     def request_key(self, folder: Path, saved: image_store.ImageAnswers) -> str:
-        return self._key(folder, saved, f"images-form:{self.request_id}")
+        return change_page.review_delivery_key(folder / image_store.RECORD, folder.name,
+                                               saved["registered_at"], purpose=f"images-form-id:{self.request_id}")
+
+    def form_attempt_key(self, folder: Path, saved: image_store.ImageAnswers) -> str | None:
+        request_key = self.request_key(folder, saved)
+        for key, attempt in saved["attempts"].items():
+            keys = attempt.get("form_request_keys", [])
+            if request_key in keys:
+                return key
+            if keys and (signed := attempt.get("signed_answer")) is not None:
+                # Old keys include the saved words and the round if the form sent it.
+                for round_id in (None, signed["round_id"]):
+                    original = _AnswerDraft(signed["answer"], signed["feedback"], round_id)
+                    if original._key(folder, saved, f"images-form:{self.request_id}") in keys:
+                        return key
+        return None
+
+    def matches_answer(self, attempt: image_store.ImageAnswer) -> bool:
+        signed = attempt.get("signed_answer")
+        return signed is not None and (self.action, self.words) == (signed["answer"], signed["feedback"])
 
     def _key(self, folder: Path, saved: image_store.ImageAnswers, purpose: str) -> str:
         parts = [saved["registered_at"], self.action, self.words]
@@ -612,15 +631,15 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
     attempts = saved["attempts"]
     answer, feedback, round_id = draft.action, draft.words, draft.round_id
     signed_form = origin is _ImageAnswerOrigin.SIGNED_FORM
-    form_key = draft.request_key(folder, saved) if signed_form and draft.request_id else ""
-    form_retry = None
-    if form_key:
-        form_retry = next((key for key, entry in attempts.items() if form_key in entry.get("form_request_keys", [])), None)
+    has_request = signed_form and bool(draft.request_id)
+    form_retry = draft.form_attempt_key(folder, saved) if has_request else None
     if retry_key is not None:
         if record is not None or retry_key not in attempts:
             raise question_record.AnswerRefused("no saved answer for this removed picture")
         key = retry_key
     elif form_retry is not None:
+        if not draft.matches_answer(attempts[form_retry]):
+            raise question_record.AnswerRefused("This page is stale. Review the new answer and try again.")
         key = form_retry
     else:
         key = draft.key(folder, saved)
@@ -657,7 +676,8 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
                           draft.key(folder, saved, signed))
         if signed_key != key:
             key = signed_key
-            attempt = attempts.get(key) or {**attempt, "recipients": [], "confirmed": []}
+            attempt = attempts.get(key) or {"message": attempt["message"], "words": _answer_words(identity, answer, feedback),
+                                            "answered": attempt["answered"], "recipients": [], "confirmed": []}
         new_proof = attempt.get("signed_answer") != signed
         if new_proof:
             attempt["signed_answer"] = signed
@@ -665,6 +685,7 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
     if stale_round and new_attempt:
         raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
     request_keys = attempt.get("form_request_keys", [])
+    form_key = draft.request_key(folder, saved) if has_request else ""
     new_request = bool(form_key) and form_key not in request_keys
     if new_request:
         attempt["form_request_keys"] = [*request_keys, form_key]
@@ -768,7 +789,7 @@ def _send_answer(root: Path, identity: str, answer: str, feedback: str, *, origi
                 draft_confirmed = False
                 if draft is not None:
                     if draft.request_id:
-                        draft_confirmed = draft.request_key(folder, saved) in delivery.get("form_request_keys", [])
+                        draft_confirmed = draft.form_attempt_key(folder, current) == key and draft.matches_answer(delivery)
                     else:
                         draft_confirmed = draft.key(folder, saved, delivery.get("signed_answer")) == key
                 return ImageAnswerSent(f"This picture was removed; your words went to {owner}.",

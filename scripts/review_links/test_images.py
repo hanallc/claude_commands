@@ -980,6 +980,64 @@ class ImagesTests(ImagesFixture):
                               [images.ImageDecision(identity, "feedback", keep, first_time),
                                images.ImageDecision(identity, "feedback", remove, other_time)])
 
+    def test_retry_without_a_round_uses_the_original_form_request(self) -> None:
+        keep, remove = "Keep the red row.", "Remove the red row."
+        round_id = images.feedback_round(set())
+        request_id = "a" * 32
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                record = self.register()
+                identity = record["id"]
+                directory = images.images_root(self.root)
+                keep_form = self.feedback_body(record, keep) + f"&answer_request={request_id}"
+                self.submit(keep_form + f"&feedback_round={round_id}")
+                if legacy:
+                    saved = image_store.read_answers(directory, identity)
+                    attempt, = saved["attempts"].values()
+                    attempt["form_request_keys"] = [change_page.review_delivery_key(
+                        directory / identity / image_store.RECORD, identity,
+                        json.dumps([record["registered_at"], "feedback", keep, round_id]),
+                        purpose=f"images-form:{request_id}")]
+                    image_store.write_answers(directory, saved)
+                self.submit(self.feedback_body(record, remove) + f"&feedback_round={round_id}&answer_request=" + "b" * 32)
+                sends = len(self.sent)
+                paths = set(images.decision_root(self.root).glob(f"{identity}-*.json"))
+                self.submit(keep_form)
+                self.assertEqual(len(self.sent), sends)
+                self.assertEqual(set(images.decision_root(self.root).glob(f"{identity}-*.json")), paths)
+
+    def test_retry_of_a_newer_removed_answer_keeps_the_older_draft(self) -> None:
+        record = self.register()
+        identity = record["id"]
+        keep, remove = "Keep the red row.", "Remove the red row."
+        round_id = images.feedback_round(set())
+        request_id = "a" * 32
+        keep_form = self.feedback_body(record, keep) + f"&feedback_round={round_id}&answer_request="
+        directory = images.images_root(self.root)
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")):
+            with self.assertRaisesRegex(images.AnswerNotSent, "owner offline"):
+                self.submit(keep_form + request_id)
+        original_key, = image_store.read_answers(directory, identity)["attempts"]
+        self.submit(self.feedback_body(record, remove) + f"&feedback_round={round_id}&answer_request=" + "b" * 32)
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")):
+            with self.assertRaisesRegex(images.AnswerNotSent, "owner offline"):
+                self.submit(keep_form + "c" * 32)
+        images.delete(self.root, identity)
+        attempts = image_store.read_answers(directory, identity)["attempts"]
+        new_key, = (key for key, attempt in attempts.items() if key != original_key and not attempt["confirmed"])
+        token = images.request_token(images.console_token(self.root), identity)
+        retry = {"image": identity, "token": token, "action": "retry", "retry_key": new_key,
+                 "draft_action": "feedback", "feedback_round": round_id, "feedback": keep}
+        result = images.submit(self.root, urlencode({**retry, "answer_request": request_id}), self.status)
+        assert isinstance(result, images.ImageAnswerSent)
+        self.assertFalse(result.draft_confirmed)
+        attempts = image_store.read_answers(directory, identity)["attempts"]
+        self.assertEqual(attempts[original_key]["confirmed"], [])
+        self.assertEqual(attempts[new_key]["confirmed"], [self.owner_id()])
+        result = images.submit(self.root, urlencode({**retry, "answer_request": "c" * 32}), self.status)
+        assert isinstance(result, images.ImageAnswerSent)
+        self.assertTrue(result.draft_confirmed)
+
     def test_three_tabs_can_restore_an_earlier_answer_in_the_same_round(self) -> None:
         keep = "Keep the red row."
         remove = "Remove the red row."
