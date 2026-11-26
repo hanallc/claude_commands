@@ -2297,12 +2297,10 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
                + studio_page.tabs(producer_chips, producer_selected)
+               + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
                + top_bands(top_items, today, names)
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
-               + '<div class="list-producer-filter">'
-               + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
-               + '</div>'
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)
                + f'<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="{UNREAD_VALUE}"{check_unread}>'
                + 'Unread only</label></div>'
@@ -2398,8 +2396,6 @@ max-height:calc(100dvh - 98px - var(--page-window-top,0px));border:0}
 border-radius:0;margin:var(--page-window-top,0px) 0 0}
 [data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
-.list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}
-.list-producer-filter .record-filter-words{flex:0 1 300px;min-width:0;margin:0 0 0 auto}
 .list-show-controls{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;margin-bottom:8px}
 .list-show-controls .record-filter-row{min-width:0;margin-bottom:0}
 .list-unread-switch{display:inline-flex;align-items:center;gap:7px;min-height:34px;color:var(--ink-2);

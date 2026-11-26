@@ -1220,7 +1220,10 @@ if(example.filterOn){
         row = '<div class="record-filter-row" role="group" aria-label="Producer" data-filter-row="producer">'
         self.assertEqual(studio.count(row), 1)
         self.assertIn('<div class="studio-tabs">' + row, studio)
-        self.assertIn('<div class="list-producer-filter"><div class="record-filter-words">', studio)
+        controls = ('<div class="studio-tabs">', '<div class="record-filter-words">',
+                    '<div class="list-top-bands">', '<div data-record-filters>')
+        positions = [studio.index(control) for control in controls]
+        self.assertEqual(positions, sorted(positions))
         self.assertIn('<h1 class="page-title">The Studio</h1>', studio)
         self.assertIn('<title>The Studio</title>', studio)
         self.assertEqual(studio.count('<tbody data-list-item'), len(items) - 1)
@@ -3457,7 +3460,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
             self.assertIn(label + '<span data-sort-mark', body)
         controls = body.split('data-record-filters>', 1)[1].split('<p data-missing-item', 1)[0]
         self.assertNotIn('<select', controls)
-        self.assertEqual(controls.count('type="search"'), 1)
+        self.assertEqual(body.count('type="search"'), 1)
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
                          ['owner', 'show'])
         shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
@@ -11564,6 +11567,10 @@ check(ownerChips[2].textContent==='builds 1' && ownerChips[3].textContent==='bui
  'The owner chips omit the suffix and sort by the displayed name.');
 const matchesAllStaff=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).join()==='13';
 staffChips.forEach(chip=>chip.click());
+const band=document.querySelector('[data-top-band="none"]').getBoundingClientRect();
+const search=document.getElementById('list-search').getBoundingClientRect();
+check(band.height>0 && search.bottom<=band.top,'The words box stays above the visible Top priority band.');
+check(Math.abs(search.right-band.right)<=1,'The words box and the Top priority band align at the right edge.');
 const selectedPlace=new URLSearchParams(location.hash.slice(1));
 check(matchesAllStaff() && selectedPlace.get('owner')==='all' && selectedPlace.get('producer')==='all',
  'Selecting the staff ID all filters the items and stores the raw IDs.');
