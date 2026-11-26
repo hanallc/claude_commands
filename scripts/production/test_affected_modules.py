@@ -429,10 +429,22 @@ FILES = collect(Path(__file__).parent)
 
     def test_module_history_uses_run_id_lookups(self) -> None:
         query = affected.MODULE_HISTORY_SQL
-        old_query = query.replace("FROM latest CROSS JOIN gate_modules "
-                                  + "WHERE run_id IN (config_gate, folder_gate, content_gate)",
-                                  "FROM gate_modules CROSS JOIN latest "
-                                  + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate")
+        old_query = (
+            "WITH latest AS (SELECT "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
+            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+            + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
+            + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
+            + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
+            + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
+            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
+        )
         with closing(sqlite3.connect(":memory:")) as connection:
             for statement in buildlog_index.schema_statements():
                 _ = connection.execute(statement)
