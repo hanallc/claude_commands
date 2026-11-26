@@ -2259,6 +2259,9 @@ An unanswered exchange records that it has no answer.
 A slot question uses its source key and question ID.
 An anonymous log question needs independent evidence to share that ID.
 A native Question keeps its saved pairs even when a reply cannot claim a log event.
+A unique request interval can supply reply metadata when stronger evidence permits the match.
+A legacy Bug can use its original question when one owner reply matches the saved answer before a later request.
+Earlier replies can use their own request intervals when the saved answer contains a later reply.
 The preview reports each unresolved source key and its reply count.
 Review keeps an Investigation or native Question visible while an outgoing question waits or a reply remains unresolved.
 A later slot change leaves the filed reply binding and answer text intact.
@@ -2272,6 +2275,8 @@ Old bindings keep their encoded form for receipt checks.
 Migration rewrites verified bindings in place and issues receipts after the new List data is durable.
 An unverified Investigation binding remains visible in Review and requires a separate repair.
 Review checks a save receipt before it hands off each exchange.
+A unique reply digest can verify a moved log event without a change to the receipt.
+Review locates a moved log question in the verified reply's request interval.
 The handoff hides only the recorded reply event.
 Review keeps separate decisions and unread replies that remain in Review.
 Old links to a filed Review answer open its Studio item.
