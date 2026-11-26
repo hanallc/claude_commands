@@ -681,10 +681,12 @@ class Snapshot(Enum):
 
 
 def inspect_cleanup_tree(checked: CheckedCleanup,
-                         entries: dict[Path, CleanupEntry] | Snapshot = Snapshot.PREVIEW) -> CleanupTree:
+                         entries: dict[Path, CleanupEntry] | Snapshot = Snapshot.PREVIEW, *,
+                         mode: CleanupMode = CleanupMode.STANDARD) -> CleanupTree:
     """Measure the tree and record each entry without following links."""
     fingerprint = hashlib.sha256()
     gate = checked.bounds.is_gate_child(checked.path)
+    moving = mode is CleanupMode.MOVE_GATE_GIT
     source_fingerprint = NoSourceFingerprint.GATE_FOLDER if gate else hashlib.sha256()
     inodes: set[removal_guard.Identity] = set()
     lease_owners: list[Path] = []
@@ -706,9 +708,12 @@ def inspect_cleanup_tree(checked: CheckedCleanup,
                 gate_issue = GATE_RECOVERY
             elif not gate_issue and stamp.uid != uid:
                 gate_issue = GATE_OTHER_OWNER
-            elif not gate_issue and not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
-                gate_issue = f"contains a link or an unknown entry type: {path}"
-            elif not gate_issue and stat.S_ISREG(info.st_mode) and path.parts[-3:] == ("objects", "info", "alternates"):
+            elif not gate_issue and not (stat.S_ISDIR(stamp.mode) or stat.S_ISREG(stamp.mode)
+                                         or (moving and (stat.S_ISLNK(stamp.mode) or stat.S_ISFIFO(stamp.mode)))):
+                issue = "contains a socket or device" if moving else "contains a link or an unknown entry type"
+                gate_issue = f"{issue}: {path}"
+            elif (not gate_issue and not stat.S_ISDIR(stamp.mode)
+                  and path.parts[-3:] == ("objects", "info", "alternates")):
                 gate_issue = GATE_ALTERNATES
         evidence = json.dumps((str(path.relative_to(checked.path)), stamp)).encode()
         fingerprint.update(evidence)
@@ -727,6 +732,8 @@ def inspect_cleanup_tree(checked: CheckedCleanup,
         if stat.S_ISDIR(info.st_mode):
             if checked.bounds.is_model_folder(path):
                 raise removal_guard.ChangedEntry(f"contains a model folder: {path}")
+            if gate and moving and stamp.mode & 0o300 != 0o300:
+                raise removal_guard.ChangedEntry(f"{path}: directory needs write and search permission")
             descriptor = os.open(name, removal_guard.DIRECTORY_FLAGS, dir_fd=parent)
             try:
                 if info.st_dev != checked.info.st_dev or removal_guard.mount_id(descriptor) != checked.mount:
@@ -745,7 +752,8 @@ def inspect_cleanup_tree(checked: CheckedCleanup,
             finally:
                 os.close(descriptor)
         elif gate and isinstance(entries, dict) and sys.platform == "linux":
-            flags = os.O_RDONLY | os.O_NONBLOCK if stat.S_ISREG(info.st_mode) else os.O_PATH
+            regular_payload = stat.S_ISREG(info.st_mode) and not (moving and path.name.casefold() == ".git")
+            flags = os.O_RDONLY | os.O_NONBLOCK if regular_payload else os.O_PATH
             descriptor = os.open(name, flags | os.O_NOFOLLOW, dir_fd=parent)
             try:
                 if info.st_dev != checked.info.st_dev or removal_guard.mount_id(descriptor) != checked.mount:
@@ -2466,16 +2474,71 @@ def require_vacant_move_target(target: Path, directory: int) -> None:
         raise removal_guard.ChangedEntry(f"move target already exists: {target.with_name(name)}")
 
 
-def require_movable_git(kind: str, tree: CleanupTree, entries: dict[Path, CleanupEntry]) -> None:
+@dataclass(frozen=True)
+class GateGitFile:
+    checked: removal_guard.CheckedGitFile
+    registration: Path
+
+
+def check_gate_git_file(path: Path, expected: EntryStamp, mount: str) -> GateGitFile:
+    try:
+        with build_folder_lock.folder_parent(path, Path("/"), create=False) as parent:
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+            with os.fdopen(descriptor, "rb") as marker:
+                info = os.fstat(descriptor)
+                if entry_stamp(info) != expected or removal_guard.mount_id(descriptor) != mount:
+                    raise removal_guard.ChangedEntry(f"{path}: .git file changed during the check")
+                data = marker.read(65536)
+                if entry_stamp(os.fstat(descriptor)) != expected:
+                    raise removal_guard.ChangedEntry(f"{path}: .git file changed during the check")
+    except removal_guard.ChangedEntry:
+        raise
+    except OSError as error:
+        detail = removal_guard.single_line(error)
+        raise removal_guard.ChangedEntry(f"{path}: cannot read the .git file: {detail}") from error
+    if len(data) >= 65536:
+        raise removal_guard.ChangedEntry(f"{path}: .git file is too large to check")
+    value = os.fsdecode(data).rstrip("\r\n")
+    prefix = "gitdir: "
+    target = value.removeprefix(prefix)
+    if not value.startswith(prefix) or not target or any(character in target for character in "\r\n\0"):
+        raise removal_guard.ChangedEntry(f"{path}: .git file has no valid gitdir: line")
+    registration = Path("/") / os.path.normpath(path.parent / target).lstrip("/")
+    return GateGitFile(removal_guard.CheckedGitFile.from_stat(path, info), registration)
+
+
+def require_movable_git_registration(checked: CheckedCleanup, path: Path) -> None:
+    if path.is_relative_to(checked.path):
+        return
+    checked.bounds.require_walk(path)
+    if path != Path("/"):
+        try:
+            with build_folder_lock.folder_parent(path, Path("/"), create=False) as parent:
+                _ = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            detail = removal_guard.single_line(error)
+            raise removal_guard.ChangedEntry(f"cannot check the Git path {path}: {detail}") from error
+    raise removal_guard.ChangedEntry(f"a Git checkout here belongs to a repository outside this folder: {path}")
+
+
+def require_movable_gate(checked: CheckedCleanup, kind: str, tree: CleanupTree,
+                         entries: dict[Path, CleanupEntry]) -> tuple[GateGitFile, ...]:
     if kind in ("gate-recovery", "merge-gate-recovery"):
         raise removal_guard.ChangedEntry(GATE_RECOVERY)
     if tree.gate_issue or kind == UNKNOWN_GATE_KIND:
         raise removal_guard.ChangedEntry(tree.gate_issue or "unknown gate entry type")
-    if any(entry_path.name.casefold() == ".git" and stat.S_ISREG(entry.stamp.mode)
-           for entry_path, entry in entries.items()):
-        raise removal_guard.ChangedEntry("linked worktree; its registration is elsewhere")
-    if tree.git is CleanupGit.NONE:
-        raise removal_guard.ChangedEntry("no Git repository to move")
+    git_files: list[GateGitFile] = []
+    for path, entry in entries.items():
+        if path.name.casefold() != ".git" or stat.S_ISDIR(entry.stamp.mode):
+            continue
+        if not stat.S_ISREG(entry.stamp.mode):
+            raise removal_guard.ChangedEntry("linked worktree; its registration is elsewhere")
+        git_file = check_gate_git_file(path, entry.stamp, checked.mount)
+        require_movable_git_registration(checked, git_file.registration)
+        git_files.append(git_file)
+    return tuple(git_files)
 
 
 def gate_move_leases(path: Path, tree: CleanupTree) -> tuple[FolderLeaseReview, ...]:
@@ -2527,14 +2590,14 @@ def assess_gate(candidate: Candidate, guard: CleanupGuard, uses: CleanupProcessR
             size, newest = None, GateEvidenceUnavailable.UNKNOWN
             with guard.check(path) as checked:
                 entries: dict[Path, CleanupEntry] = {}
-                tree = inspect_cleanup_tree(checked, entries if mode is CleanupMode.MOVE_GATE_GIT else Snapshot.PREVIEW)
+                moving = mode is CleanupMode.MOVE_GATE_GIT
+                tree = inspect_cleanup_tree(checked, entries if moving else Snapshot.PREVIEW, mode=mode)
                 size = tree.size + sidecars.size
                 newest = sidecars.newest_with(tree.newest_ns)
                 leases = (base_lease, *(review_lease(owner, check) for owner in tree.lease_owners))
                 lease_statuses = tuple(lease.status for lease in leases if lease.status.state is not LeaseState.ABSENT)
-                moving = mode is CleanupMode.MOVE_GATE_GIT and tree.git is not CleanupGit.NONE
                 if moving:
-                    require_movable_git(kind, tree, entries)
+                    _ = require_movable_gate(checked, kind, tree, entries)
                 elif reason := gate_tree_refusal(kind, tree):
                     raise removal_guard.ChangedEntry(reason)
                 if use_notes:
@@ -2595,6 +2658,9 @@ def assess(candidates: Sequence[Candidate], guard: CleanupGuard, machine: Machin
     membership = (worktree_staff()
                   if any(candidate.place in (CleanupPlace.LINK, CleanupPlace.REVIEW_FOLDER) for candidate in candidates)
                   else staff.StaffSnapshot(()))
+    gate_total = (sum(candidate.place is CleanupPlace.GATE_FOLDER for candidate in candidates)
+                  if mode is CleanupMode.MOVE_GATE_GIT and sys.stderr.isatty() else 0)
+    gate_number = 0
     rows: list[Row] = []
     for candidate in candidates:
         path = candidate.path
@@ -2604,6 +2670,9 @@ def assess(candidates: Sequence[Candidate], guard: CleanupGuard, machine: Machin
             continue
         related = related_sidecars(path, machine, guard.bounds)
         if candidate.place in (CleanupPlace.GATE_FOLDER, CleanupPlace.GATE_SIDECARS):
+            if gate_total and candidate.place is CleanupPlace.GATE_FOLDER:
+                gate_number += 1
+                print(f"\rChecking folder {gate_number} of {gate_total}", end="", file=sys.stderr, flush=True)
             rows.append(assess_gate(candidate, guard, uses, related, mode))
             continue
         pid_check = LeasePidCheck.ANY_LIVE_PID if related else LeasePidCheck.MATCH_START
@@ -2676,6 +2745,8 @@ def assess(candidates: Sequence[Candidate], guard: CleanupGuard, machine: Machin
                 outcome = list_only(candidate.decision, outcome)
         summary = git.summary(eligible=isinstance(outcome, WouldRemove)) if isinstance(git, GitCleanupReview) else ""
         rows.append(Row(path, size, outcome, summary, names, candidate.place))
+    if gate_total:
+        print("\r\x1b[K", end="", file=sys.stderr, flush=True)
     return HostList(machine, tuple(rows), uses.unreadable_processes)
 
 
@@ -2974,10 +3045,11 @@ class VerifiedGateCopy:
 
 def verify_gate_copy(checked: CheckedCleanup, source: int, target: int, target_parent: int,
                      entries: dict[Path, CleanupEntry], sidecars: WorktreeSidecars, *,
-                     target_path: Path) -> VerifiedGateCopy:
+                     target_path: Path, checked_git_files: frozenset[removal_guard.CheckedGitFile]) -> VerifiedGateCopy:
     from scripts.lib import session_move
 
-    proof = removal_guard.ProvedCopyCleanup(checked, source, removal_guard.CopyDestination(target_path, target), entries)
+    proof = removal_guard.ProvedCopyCleanup(checked, source, removal_guard.CopyDestination(target_path, target), entries,
+                                          checked_git_files=checked_git_files)
     copied_sidecars: dict[str, EntryStamp] = {}
     for name in worktree_sidecar_names(checked.path):
         expected = sidecars.stamps.get(name)
@@ -3072,8 +3144,9 @@ def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, detai
             if existing != sidecars.stamps or (lease.created and lock_name in sidecars.stamps):
                 raise removal_guard.ChangedEntry("worktree sidecars changed")
             entries: dict[Path, CleanupEntry] = {}
-            tree = inspect_cleanup_tree(checked, entries)
-            require_movable_git(details.kind, tree, entries)
+            tree = inspect_cleanup_tree(checked, entries, mode=CleanupMode.MOVE_GATE_GIT)
+            git_files = require_movable_gate(checked, details.kind, tree, entries)
+            checked_git_files = frozenset(git_file.checked for git_file in git_files)
             if sidecars.bind(tree.fingerprint) != approval.fingerprint:
                 raise removal_guard.ChangedEntry("identity or contents changed since the list was checked")
 
@@ -3104,18 +3177,21 @@ def move_gate_folder(path: Path, guard: CleanupGuard, approval: WouldMove, detai
                         copy_gate_sidecar(checked.parent, stage, name, expected)
                     sync_gate_copy(destination, stage)
                     _ = verify_gate_copy(checked, source, destination, stage, entries, sidecars,
-                                         target_path=target.parent / stage_name / target.name)
+                                         target_path=target.parent / stage_name / target.name,
+                                         checked_git_files=checked_git_files)
                     publish_gate_copy(target, target_parent, stage_name, stage, sidecars)
 
                     check_protected_masks()
                     verified = verify_gate_copy(checked, source, destination, target_parent, entries, sidecars,
-                                                target_path=target)
+                                                target_path=target, checked_git_files=checked_git_files)
 
                     def before_delete() -> None:
                         require_gate_move_parent_owner(target_parent)
                         session_move.require_parent_path(target.parent, target_parent)
                         check_protected_masks()
                         recheck_move_source((*fds, source))
+                        for git_file in git_files:
+                            require_movable_git_registration(checked, git_file.registration)
 
                     removal_guard.remove_proved_copy(
                         checked, verified.source, approval.target, before_delete=before_delete,
