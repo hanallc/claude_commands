@@ -21,7 +21,9 @@ from uuid import uuid4
 
 from scripts.build_queue import admission_records as records, progress_profile as progress
 from scripts.build_queue.admission_records import RequestedTestWidth, UnspecifiedTestWidth
-from scripts.build_queue.admission_wire import CLEANUP_STATUS_MAX as _MAX_INTEGER, CLEANUP_STATUS_MIN
+from scripts.build_queue.admission_wire import (
+    CLEANUP_STATUS_MAX as _MAX_INTEGER, CLEANUP_STATUS_MIN, ProcessTreeTraceSampling, ScopeTraceSampling, TraceSampling,
+)
 from scripts.build_queue.progress_profile import CompilingCrateUnavailable as CompilingCrateUnavailable
 from scripts.buildlog import record as buildlog_record
 from scripts.lib import conf, test_phase
@@ -40,11 +42,11 @@ _POLICY_SETTINGS = {
     "scope_loss_grace_seconds": ("seal.scope_loss_grace_seconds", 1, 60),
     "seal_retry_count": ("seal.retry_count", 0, 10),
     "max_pending_commands": ("worker.max_pending_commands", 2, 4096),
+    "general_trace_share_percent": ("worker.general_trace_share_percent", 0, 100),
     "shutdown_timeout_seconds": ("worker.shutdown_timeout_seconds", 1, 60),
 }
 
-# Each general trace can use two slots. Allow general traces to use at most half of all slots.
-_GENERAL_TRACE_LIMIT_DIVISOR = 4
+_COMMAND_SLOTS_PER_TRACE = 2
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,7 @@ class MemoryTracePolicy:
     feed_bytes_per_refresh: int
     final_replay_bytes: int
     max_pending_commands: int
+    general_trace_share_percent: int
     scope_loss_grace_seconds: int = _POLICY_SETTINGS["scope_loss_grace_seconds"][1]
     seal_retry_count: int = _POLICY_SETTINGS["seal_retry_count"][1]
     shutdown_timeout_seconds: int = _POLICY_SETTINGS["shutdown_timeout_seconds"][1]
@@ -967,7 +970,7 @@ class TraceGrant:
     row: records.Reservation
     wall: float
     monotonic: float
-    process_tree: bool = False
+    trace_sampling: TraceSampling = ScopeTraceSampling()
 
 
 @dataclass(frozen=True)
@@ -1161,8 +1164,11 @@ class TraceCapture:
     def sample_due(self, release_time: Callable[[str], float],
                    claim_expiry: Callable[[TraceRelease], TraceRelease | None]) -> None:
         @cache
-        def processes() -> dict[int, gate.ProcessIdentity]:
-            return gate.process_table(self.proc)
+        def processes() -> dict[int, gate.ProcessIdentity] | Exception:
+            try:
+                return gate.process_table(self.proc)
+            except Exception as error:
+                return error
 
         now = self.clock.monotonic()
         for identifier, seal in tuple(self._pending_seals.items()):
@@ -1176,8 +1182,11 @@ class TraceCapture:
                     self._release(release)
                 continue
             try:
-                if reservation.grant.process_tree:
-                    self._sample_tree(reservation, processes(), release_time)
+                if isinstance(reservation.grant.trace_sampling, ProcessTreeTraceSampling):
+                    table = processes()
+                    if isinstance(table, Exception):
+                        raise table.with_traceback(None)
+                    self._sample_tree(reservation, table, release_time)
                 else:
                     self._sample_scope(reservation, release_time)
             except Exception as error:
@@ -1471,11 +1480,13 @@ class TraceWorker:
             if identifier in self._tracked or identifier in self._general:
                 return
             general = isinstance(command.shape, GeneralTraceShape)
-            limit = self.capture.store.policy.max_pending_commands
-            if general and len(self._general) >= limit // _GENERAL_TRACE_LIMIT_DIVISOR:
+            policy = self.capture.store.policy
+            limit = policy.max_pending_commands
+            general_limit = limit * policy.general_trace_share_percent // (100 * _COMMAND_SLOTS_PER_TRACE)
+            if general and len(self._general) >= general_limit:
                 return
             # Each grant needs a command slot and a slot for its release.
-            if len(self._commands) + len(self._tracked) + 2 > limit:
+            if len(self._commands) + len(self._tracked) + _COMMAND_SLOTS_PER_TRACE > limit:
                 self._queue_full = True
             else:
                 self._tracked[identifier] = TestReserveUnavailable()

@@ -74,7 +74,7 @@ from scripts.build_queue.admission_test_support import (
 
 TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 100, 8192, 7, 16, 1024,
                                             final_replay_bytes=131072,
-                                            max_pending_commands=8,
+                                            max_pending_commands=8, general_trace_share_percent=50,
                                             scope_loss_grace_seconds=5, seal_retry_count=4, shutdown_timeout_seconds=3)
 
 
@@ -1485,6 +1485,19 @@ class ImportTests(unittest.TestCase):
 
 
 class StateCheckTests(unittest.TestCase):
+    def test_stored_reservation_without_trace_sampling_uses_the_scope(self) -> None:
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            _ = only_admitted(fixture.server.handle_request(request))
+            state_path = fixture.state_dir / "state.json"
+            stored = cast(dict[str, object], json.loads(state_path.read_text()))
+            reservations = cast(dict[str, dict[str, object]], stored["reservations"])
+            del reservations[request.episode]["trace_sampling"]
+            write_text_atomic(state_path, json.dumps(stored))
+            record = service.read_state(fixture.state_dir).reservations[request.episode]
+            self.assertEqual(record.trace_sampling, wire.ScopeTraceSampling())
+            self.assertEqual(record, fixture.server.reservations[request.episode])
+
     def test_state_check_reads_current_state_and_refuses_an_old_placement_shape(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -11461,13 +11474,15 @@ class MemoryTraceCaptureTests(unittest.TestCase):
                 request = replace(request, profile=replace(request.profile, repo=repo, step=step),
                                   constraints=replace(request.constraints, command=argv,
                                                       candidates=(local_candidate(fixture),)),
-                                  local=replace(request.local, argv=argv, sidecar=str(sidecar)))
+                                  local=replace(request.local, argv=argv, sidecar=str(sidecar),
+                                                trace_sampling=wire.ProcessTreeTraceSampling()))
                 reader = self.start_trace_reader(fixture, TRACE_POLICY)
-                reply, = fixture.server.handle_request(request)
+                reply, = fixture.connect(request).replies()
                 assert isinstance(reply, wire.LocalPlacementGranted), reply
                 record = fixture.server.reservations[request.episode]
                 self.assertEqual(record.sidecar, str(sidecar))
                 self.assertIsInstance(record.place, wire.LocalPlace)
+                self.assertEqual(record.trace_sampling, wire.ProcessTreeTraceSampling())
                 child_request = fixture.request(owner=wire.Owner(request.owner.pid, request.owner.start_time), step=step)
                 trace_store = memory_trace.TraceStore(fixture.state_dir / "memory_traces", TRACE_POLICY)
                 run = ScopedMemoryTrace(reader, child_request, reply.grant, sidecar,
@@ -11492,6 +11507,80 @@ class MemoryTraceCaptureTests(unittest.TestCase):
                 self.assertEqual(trace.test_samples, ())
                 assert isinstance(trace.state, memory_trace.TraceEnd)
                 self.assertEqual(trace.state.coverage, memory_trace.WholeRun())
+
+    def test_queue_place_gate_without_trace_sampling_uses_the_published_scope(self) -> None:
+        from scripts.build_queue import queue_place
+
+        with AdmissionFixture() as fixture:
+            write_memory_config(fixture.root / "build_admission.conf", **{"program_first_peak_gib.gate": "4"})
+            owner = fixture.proc.spawn()
+            reader = self.start_trace_reader(fixture, TRACE_POLICY)
+            trace_store = memory_trace.TraceStore(fixture.state_dir / "memory_traces", TRACE_POLICY)
+            scope = fixture.root / "gate.scope"
+
+            def admit(request: queue_place.RefreshedRequest, _output: client.WaitOutput, *,
+                      before_check: Callable[[], None]) -> wire.Admitted:
+                before_check()
+                submitted = request.refresh()
+                self.assertEqual(submitted.argv, ("gate",))
+                self.assertEqual(submitted.trace_sampling, wire.ScopeTraceSampling())
+                encoded = wire.encode_request(submitted)
+                envelope = cast(dict[str, object], json.loads(encoded))
+                data = cast(dict[str, object], envelope["data"])
+                self.assertNotIn("trace_sampling", data)
+                return only_admitted(fixture.connect(encoded).replies())
+
+            def start(place: queue_place.QueuePlace, _argv: Sequence[str], *,
+                      pass_fds: tuple[int, ...]) -> object:
+                self.assertEqual(pass_fds, ())
+                self.assertIsInstance(place.reservation, queue_place.HeldReservation)
+                assert isinstance(place.reservation, queue_place.HeldReservation)
+                grant = place.reservation.grant
+                record, = fixture.server.reservations.values()
+                self.assertEqual(record.trace_sampling, wire.ScopeTraceSampling())
+                child = fixture.proc.spawn()
+                write_scope(scope, members=(child.pid,), current=4 * GIB, anonymous=4 * GIB)
+                _ = place.sidecar.write_text(str(scope))
+                stamp = round(fixture.clock.now() * 1_000_000_000)
+                os.utime(place.sidecar, ns=(stamp, stamp))
+                run = ScopedMemoryTrace(reader, fixture.request(owner=owner, step="gate"), grant,
+                                        place.sidecar, scope, place.sidecar.with_suffix(".log"), trace_store)
+                self.drive(fixture, run, 3, ((2.5, lambda: fixture.release(grant)),))
+                self.assertEqual([sample.program_bytes for sample in self.sealed(run).compile_samples],
+                                 [4 * GIB, 4 * GIB])
+                return mock.Mock(wait=lambda: 0)
+
+            with (mock.patch.object(os, "getpid", return_value=owner.pid),
+                  mock.patch.object(records, "process_start_time", return_value=owner.start_time),
+                  mock.patch.object(queue_place, "request_place", side_effect=admit),
+                  mock.patch.object(queue_place, "release_place", return_value=wire.Ok()),
+                  mock.patch.object(queue_place.QueuePlace, "popen", new=start)):
+                self.assertEqual(queue_place.main(["--", "gate"]), 0)
+
+    def test_failed_process_table_read_is_shared_for_one_trace_round(self) -> None:
+        with AdmissionFixture() as fixture:
+            run = self.grant(fixture, repository="fixture", step="lint")
+            worker = self.trace_worker(run)
+            scoped, = worker._commands  # pyright: ignore[reportPrivateUsage]
+            assert isinstance(scoped, memory_trace.TraceGrant)
+            capture = worker.capture
+            capture.process(scoped)
+            with (redirect_stderr(io.StringIO()) as errors,
+                  mock.patch.object(gate, "process_table", side_effect=OSError("fixture process read failed")) as read):
+                capture.sample_due(lambda _identifier: float("inf"), lambda _release: None)
+                read.assert_not_called()
+                for identifier in ("tree-one", "tree-two"):
+                    capture.process(replace(scoped, reservation_id=identifier,
+                                           trace_sampling=wire.ProcessTreeTraceSampling()))
+                fixture.clock.advance(TRACE_POLICY.sample_seconds)
+                capture.sample_due(lambda _identifier: float("inf"), lambda _release: None)
+                read.assert_called_once_with(fixture.proc.path)
+                self.assertIn("bind tree-one", errors.getvalue())
+                self.assertIn("bind tree-two", errors.getvalue())
+                fixture.clock.advance(TRACE_POLICY.sample_seconds)
+                capture.sample_due(lambda _identifier: float("inf"), lambda _release: None)
+                self.assertEqual(read.call_count, 2)
+            capture.close()
 
     def test_general_trace_binds_a_scope_published_after_the_first_sample(self) -> None:
         with AdmissionFixture() as fixture:
@@ -11777,6 +11866,19 @@ class MemoryTraceCaptureTests(unittest.TestCase):
             worker.submit(replace(general, reservation_id="hana", shape=hana))
             self.assertEqual([entry.reservation_id for entry in commands if isinstance(entry, memory_trace.TraceGrant)],
                              [run.grant.reservation, "general-2", "hana"])
+
+    def test_general_trace_share_at_64_command_slots(self) -> None:
+        for share, expected in ((50, 16), (25, 8)):
+            with self.subTest(share=share), AdmissionFixture() as fixture:
+                policy = replace(TRACE_POLICY, max_pending_commands=64, general_trace_share_percent=share)
+                run = self.grant(fixture, repository="fixture", step="lint", policy=policy)
+                worker = self.trace_worker(run)
+                commands = worker._commands  # pyright: ignore[reportPrivateUsage]
+                general, = commands
+                assert isinstance(general, memory_trace.TraceGrant)
+                for number in range(1, 33):
+                    worker.submit(replace(general, reservation_id=f"general-{number}"))
+                self.assertEqual(len(commands), expected)
 
     def test_full_queue_keeps_the_first_test_reserve(self) -> None:
         with AdmissionFixture() as fixture:
