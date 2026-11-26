@@ -1264,6 +1264,11 @@ def dispatch_delivery(passed: dict[str, object]) -> DispatchDelivery:
     )
 
 
+def assignment_status_file(passed: dict[str, object]) -> str:
+    """Read the status file path recorded for the assignment."""
+    return string(passed.get("assign_status_file")) or dispatch_delivery(passed).actions.status_file
+
+
 def worker_artifact(path: Path, slot: str, worker: str) -> Path:
     """Keep artifacts with the worker selected for the recorded slot."""
     return path.with_name(worker + path.name.removeprefix(slot)) if path.name.startswith(slot + "_") else path

@@ -4613,9 +4613,15 @@ with patch.object(fcntl, "flock", admission):
         self.start_phase(session, 41_010)
         self.start_slot_pass(session, "impl", "impl", 41_020, worker_name="implementer")
         self.start_slot_pass(session, "review", "review", 41_030, worker_name="review2")
+        status = session / "impl_status"
+        atomic_file.write_text_atomic(status, "running\n")
+        instance = str(self.pass_slots(session)["impl"]["instance_id"])
         with patch.dict(os.environ, {"HOME": str(self.root)}):
+            progress_history.save_dispatch_delivery(session, instance, pass_recorder.DispatchDelivery(
+                "", "", "", actions=pass_recorder.CompletionActions(status_file=str(status))))
             self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id), 1)
             self.assertEqual(progress_history.cancel_worker_passes(session, stopped.id), 0)
+        self.assertEqual(status.read_text(), "error\n")
         self.assertEqual(self.pass_slots(session)["impl"]["status"], "canceled")
         self.assertEqual(self.pass_slots(session)["review"]["status"], "active")
         finished = self.pass_events("canceled-pass", "pass_finished")
