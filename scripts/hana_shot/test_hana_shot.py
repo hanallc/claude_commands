@@ -46,6 +46,7 @@ from scripts.production.staff_test_support import fixture_member, fixture_runtim
 LAUNCH_RECORDING_PURPOSE = "launch recovery"
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
+MAC_IOREG_UNLOCKED = SCRIPT.parent / "testdata" / "mac_ioreg_unlocked.plist"
 CAMERA_ENTITY = 5
 WINDOW_ENTITY = 3
 NAME = "bevy_ecs::name::Name"
@@ -2847,47 +2848,47 @@ class ShotTests(HanaShotTest):
         self.assertEqual(self.timing_lines()[0]["failure_reason"], "no_app")
 
 
-def console_plist(locked: bool = False, **session_fields: object) -> bytes:
-    session: dict[str, object] = {"CGSSessionOnConsoleKey": True, "CGSSessionLoginDoneKey": True}
-    return plistlib.dumps([{"IOConsoleLocked": locked, "IOConsoleUsers": [session | session_fields]}])
-
-
 class MacConsoleTests(BuildLogIsolatedTest):
-    def test_mac_console_requires_explicit_unlock_from_the_logged_in_session(self) -> None:
-        ready = hana_shot.MacConsole.UNLOCKED
-        locked = hana_shot.MacConsole.LOCKED
-        unavailable = hana_shot.MacConsole.UNAVAILABLE
-        for output, expected in (
-            (console_plist(), ready),
-            (console_plist(True), locked),
-            (console_plist(CGSSessionScreenIsLocked=True), locked),
-            (console_plist(CGSSessionOnConsoleKey=False), unavailable),
-            (console_plist(CGSSessionLoginDoneKey=False), unavailable),
-            (console_plist(CGSSessionScreenIsLocked="false"), unavailable),
-            (plistlib.dumps([{"IOConsoleUsers": [{"CGSSessionOnConsoleKey": True, "CGSSessionLoginDoneKey": True}]}]),
-             unavailable),
-            (b"<?xml broken", unavailable),
-            (b'<?xml version="1.0"?><plist><date>invalid</date></plist>', unavailable),
-            (b"Permission denied", unavailable),
-        ):
-            with self.subTest(expected=expected, output=output):
-                self.assertIs(hana_shot.mac_console_state(output), expected)
+    def test_mac_console_reads_the_unlocked_sample_and_derived_locked_state(self) -> None:
+        output = MAC_IOREG_UNLOCKED.read_bytes()
+        self.assertIs(hana_shot.mac_console_state(output), hana_shot.MacConsole.UNLOCKED)
+        properties = cast(dict[str, object], plistlib.loads(output))
+        # Derive the locked state until a locked Mac provides a sample.
+        locked = plistlib.dumps(properties | {"IOConsoleLocked": True})
+        self.assertIs(hana_shot.mac_console_state(locked), hana_shot.MacConsole.LOCKED)
 
-    def test_mac_console_does_not_treat_display_sleep_as_a_lock(self) -> None:
-        self.assertIs(hana_shot.mac_console_state(console_plist(DisplayAsleep=True)), hana_shot.MacConsole.UNLOCKED)
+    def test_mac_console_uses_only_ioconsolelocked_for_the_lock_state(self) -> None:
+        properties = cast(dict[str, object], plistlib.loads(MAC_IOREG_UNLOCKED.read_bytes()))
+        user, = cast(list[dict[str, object]], properties["IOConsoleUsers"])
+        extra_fields = user | {"DisplayAsleep": True, "CGSSessionScreenIsLocked": True}
+        output = plistlib.dumps(properties | {"IOConsoleUsers": [extra_fields]})
+        self.assertIs(hana_shot.mac_console_state(output), hana_shot.MacConsole.UNLOCKED)
 
-    def test_mac_probe_rejects_failed_ssh_and_checks_ioreg_locally(self) -> None:
-        unavailable = hana_shot.MacConsole.UNAVAILABLE
-        with mock.patch.object(subprocess, "run",
-                               return_value=subprocess.CompletedProcess([], 255, console_plist(), b"no connection")) as run:
-            self.assertIs(hana_shot.probe_mac_console(REMOTE_HOST, 0.5), unavailable)
-        run.assert_called_once_with([*REMOTE_PROBE, *IOREG], stdin=subprocess.DEVNULL,
-                                    capture_output=True, check=False, timeout=0.5)
-        for error in (OSError("ssh failed"), subprocess.TimeoutExpired("ssh", 0.5)):
-            with self.subTest(error=error), mock.patch.object(subprocess, "run", side_effect=error):
-                self.assertIs(hana_shot.probe_mac_console(REMOTE_HOST, 0.5), unavailable)
-        with mock.patch.object(subprocess, "run",
-                               return_value=subprocess.CompletedProcess([], 0, console_plist(), b"")) as run:
+    def test_mac_console_waits_after_a_failed_ssh_probe(self) -> None:
+        output = MAC_IOREG_UNLOCKED.read_bytes()
+        session = hana_shot.Session(hana_shot.Brp(15703), REMOTE_HOST)
+        session.macos = True
+        timeout = session.settings.number("call_timeout_seconds")
+        unlocked = subprocess.CompletedProcess([], 0, output, b"")
+        failed = subprocess.CompletedProcess([], 255, output, b"no connection")
+        probe = mock.call([*REMOTE_PROBE, *IOREG], stdin=subprocess.DEVNULL,
+                          capture_output=True, check=False, timeout=timeout)
+        for failure in (failed, OSError("ssh failed"), subprocess.TimeoutExpired("ssh", timeout)):
+            sleep = mock.Mock()
+            with (
+                self.subTest(failure=type(failure)),
+                mock.patch.object(subprocess, "run", side_effect=[failure, unlocked]) as run,
+                mock.patch.object(hana_shot, "time", mock.Mock(sleep=sleep)),
+                redirect_stderr(io.StringIO()) as stderr,
+            ):
+                session.wait_for_mac()
+                self.assertEqual(run.call_args_list, [probe, probe])
+                sleep.assert_called_once_with(session.settings.number("resend_seconds"))
+                self.assertEqual(stderr.getvalue(), f"hana_shot: waiting for {REMOTE_HOST} (unavailable)\n")
+
+    def test_mac_console_checks_ioreg_locally(self) -> None:
+        unlocked = subprocess.CompletedProcess([], 0, MAC_IOREG_UNLOCKED.read_bytes(), b"")
+        with mock.patch.object(subprocess, "run", return_value=unlocked) as run:
             self.assertIs(hana_shot.probe_mac_console(None, 0.5), hana_shot.MacConsole.UNLOCKED)
         run.assert_called_once_with(IOREG, stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=0.5)
 
@@ -2917,6 +2918,16 @@ class MacConsoleTests(BuildLogIsolatedTest):
                 else:
                     probe.assert_not_called()
 
+    def test_mac_alert_clear_command_reports_invalid_ioreg_output(self) -> None:
+        with (
+            mock.patch.object(process_start, "process_start", return_value=process_start.Started("100")),
+            mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")),
+            redirect_stderr(io.StringIO()) as stderr,
+        ):
+            status = hana_shot.main(["--mac-lock-cleared", "123", "100", REMOTE_HOST])
+        self.assertEqual(status, 1)
+        self.assertEqual(stderr.getvalue(), "hana_shot: cannot read the Mac lock state: invalid ioreg property list\n")
+
 
 class RemoteTests(HanaShotTest):
     def fake_remote(self, copies: bool, system: str = "Linux") -> Path:
@@ -2927,7 +2938,7 @@ class RemoteTests(HanaShotTest):
         bin_directory = self.scratch / "bin"
         bin_directory.mkdir()
         console = self.scratch / "mac-console.plist"
-        _ = console.write_bytes(console_plist())
+        _ = console.write_bytes(MAC_IOREG_UNLOCKED.read_bytes())
         source = FAKE_REMOTE.format(
             python=sys.executable, remote=str(remote), log=str(self.ssh_log), copies=copies, system=system,
             ioreg=IOREG, console=str(console),
@@ -3002,6 +3013,62 @@ class RemoteTests(HanaShotTest):
         self.assertTrue(awake[2].startswith("caffeinate -u "), awake)
         self.assertEqual(copy[0], "scp", "the display is awake before the shot")
         self.assertIn(["ended"], calls, "the keep-awake ends before the run exits")
+
+    def test_invalid_mac_console_stops_before_waiting_or_capture(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        console = self.scratch / "mac-console.plist"
+        properties = cast(dict[str, object], plistlib.loads(console.read_bytes()))
+        user, = cast(list[dict[str, object]], properties["IOConsoleUsers"])
+        no_console_user = "expected one logged-in console user in IOConsoleUsers, found 0"
+        for output, cause in (
+            (b"<?xml broken", "invalid ioreg property list"),
+            (b'<?xml version="1.0"?><plist><date>invalid</date></plist>', "invalid ioreg property list"),
+            (b"Permission denied", "invalid ioreg property list"),
+            (plistlib.dumps([properties]), "the ioreg property list must have a top-level dictionary"),
+            (plistlib.dumps({"IOConsoleUsers": [user]}), "IOConsoleLocked is missing"),
+            (plistlib.dumps(properties | {"IOConsoleLocked": 1}), "IOConsoleLocked must be a boolean"),
+            (plistlib.dumps({"IOConsoleLocked": False}), "IOConsoleUsers must be an array"),
+            (plistlib.dumps(properties | {"IOConsoleUsers": {}}), "IOConsoleUsers must be an array"),
+            (plistlib.dumps(properties | {"IOConsoleUsers": ["user"]}), "IOConsoleUsers must contain dictionaries"),
+            (plistlib.dumps(properties | {"IOConsoleUsers": []}), no_console_user),
+            (plistlib.dumps(properties | {"IOConsoleUsers": [user | {"kCGSSessionOnConsoleKey": False}]}), no_console_user),
+            (plistlib.dumps(properties | {"IOConsoleUsers": [user | {"kCGSessionLoginDoneKey": False}]}), no_console_user),
+            (plistlib.dumps(properties | {"IOConsoleUsers": [user, user]}),
+             "expected one logged-in console user in IOConsoleUsers, found 2"),
+        ):
+            with self.subTest(cause=cause):
+                _ = console.write_bytes(output)
+                probes = len(self.ssh_calls())
+                sleep = mock.Mock(side_effect=AssertionError("invalid ioreg output must not wait"))
+                with mock.patch.object(hana_shot, "time", mock.Mock(wraps=time, sleep=sleep)):
+                    result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr, f"hana_shot: cannot read the Mac lock state: {cause}\n")
+                self.assertEqual(self.ssh_calls()[probes:], [[*REMOTE_PROBE, "uname", "-s"], [*REMOTE_PROBE, *IOREG]])
+                self.assertEqual(self.fake.calls, [])
+                self.assertFalse((self.scratch / "shot.png").exists())
+                sleep.assert_not_called()
+
+    def test_views_check_stops_after_invalid_mac_console_output(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        _ = (self.scratch / "views.toml").write_text('[views.first]\nmode = "home"\n[views.second]\nmode = "home"\n')
+        read_console = hana_shot.probe_mac_console
+
+        def probe(remote: str | None, timeout: float) -> hana_shot.MacConsole:
+            state = read_console(remote, timeout)
+            _ = (self.scratch / "mac-console.plist").write_bytes(b"")
+            return state
+
+        sleep = mock.Mock(side_effect=AssertionError("invalid ioreg output must not wait"))
+        with (
+            mock.patch.object(hana_shot, "probe_mac_console", side_effect=probe) as checked,
+            mock.patch.object(hana_shot, "time", mock.Mock(wraps=time, sleep=sleep)),
+        ):
+            result = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"), "--remote", REMOTE_HOST)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "hana_shot: cannot read the Mac lock state: invalid ioreg property list\n")
+        self.assertEqual(checked.call_count, 2)
+        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
 
     def test_shot_waits_before_the_camera_read_and_each_capture_retry(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")

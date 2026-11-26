@@ -850,6 +850,13 @@ class MacConsole(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class MacConsoleReadFailure(Failure):
+    """The ioreg output has no valid lock state."""
+
+    def __init__(self, cause: str) -> None:
+        super().__init__(f"cannot read the Mac lock state: {cause}")
+
+
 MAC_LOCK_TEXT = "hana_shot.mac_locked"
 SSH_PROBE = ("ssh", "-T", "-o", "BatchMode=yes", "--")
 
@@ -857,34 +864,30 @@ SSH_PROBE = ("ssh", "-T", "-o", "BatchMode=yes", "--")
 def mac_console_state(output: bytes) -> MacConsole:
     """Read the lock state of the logged-in console session."""
     try:
-        roots = cast(object, plistlib.loads(output))
-    except (ValueError, ExpatError, OverflowError, AttributeError, IndexError):
-        return MacConsole.UNAVAILABLE
-    if not isinstance(roots, list):
-        return MacConsole.UNAVAILABLE
-    rows = cast(list[object], roots)
-    if len(rows) != 1 or not isinstance(rows[0], dict):
-        return MacConsole.UNAVAILABLE
-    properties = cast(dict[str, object], rows[0])
+        root = cast(object, plistlib.loads(output))
+    except (ValueError, ExpatError, OverflowError, AttributeError, IndexError) as exc:
+        raise MacConsoleReadFailure("invalid ioreg property list") from exc
+    if not isinstance(root, dict):
+        raise MacConsoleReadFailure("the ioreg property list must have a top-level dictionary")
+    properties = cast(dict[str, object], root)
+    if "IOConsoleLocked" not in properties:
+        raise MacConsoleReadFailure("IOConsoleLocked is missing")
+    locked = properties["IOConsoleLocked"]
+    if not isinstance(locked, bool):
+        raise MacConsoleReadFailure("IOConsoleLocked must be a boolean")
     users = properties.get("IOConsoleUsers")
     if not isinstance(users, list):
-        return MacConsole.UNAVAILABLE
-    console: list[dict[str, object]] = []
+        raise MacConsoleReadFailure("IOConsoleUsers must be an array")
+    console_users = 0
     for user in cast(list[object], users):
         if not isinstance(user, dict):
-            return MacConsole.UNAVAILABLE
+            raise MacConsoleReadFailure("IOConsoleUsers must contain dictionaries")
         session = cast(dict[str, object], user)
-        if session.get("CGSSessionOnConsoleKey") is True and session.get("CGSSessionLoginDoneKey") is True:
-            console.append(session)
-    if len(console) != 1:
-        return MacConsole.UNAVAILABLE
-    locked = properties.get("IOConsoleLocked")
-    screen_locked = console[0].get("CGSSessionScreenIsLocked", False)
-    if locked is True or screen_locked is True:
-        return MacConsole.LOCKED
-    if locked is False and screen_locked is False:
-        return MacConsole.UNLOCKED
-    return MacConsole.UNAVAILABLE
+        if session.get("kCGSSessionOnConsoleKey") is True and session.get("kCGSessionLoginDoneKey") is True:
+            console_users += 1
+    if console_users != 1:
+        raise MacConsoleReadFailure(f"expected one logged-in console user in IOConsoleUsers, found {console_users}")
+    return MacConsole.LOCKED if locked else MacConsole.UNLOCKED
 
 
 def probe_mac_console(remote: str | None, timeout: float) -> MacConsole:
@@ -3427,6 +3430,8 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
                     reason = failure_reason(exc)
                     invocation.attempts.append(failed_attempt(shot, final, reason, started_ns, str(exc)))
                     invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
+                    if isinstance(exc, MacConsoleReadFailure):
+                        raise
                     failures.append(f"FAIL {name}: {exc}")
                     print(failures[-1], file=sys.stderr)
                     continue
@@ -3608,7 +3613,11 @@ def main(argv: list[str]) -> int:
         except ValueError:
             return 2
         remote = argv[3] if len(argv) == 4 else None
-        return int(not mac_lock_cleared(pid, argv[2], remote))
+        try:
+            return int(not mac_lock_cleared(pid, argv[2], remote))
+        except MacConsoleReadFailure as exc:
+            print(f"hana_shot: {exc}", file=sys.stderr)
+            return 1
     hana_shot_settings = conf.read("hana_shot")
     try:
         args = arguments(argv, hana_shot_settings=hana_shot_settings)
