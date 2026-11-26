@@ -2095,7 +2095,10 @@ def top_bands(top_items: Iterable[ListRecord], today: datetime, names: staff_nam
         item = entry.item
         value = f"staff:{item.producer}"
         values.append(css_string(value))
-        bands.append(top_band(value, f'<div class="list-top-what"><b>#{item.number} {html.escape(item.title)}</b>'
+        link = html.escape(item_link(entry.keeper, item.number))
+        bands.append(top_band(value, '<div class="list-top-what">'
+                              + f'<a class="list-top-link" data-record-jump href="{link}">'
+                              + f'#{item.number} {html.escape(item.title)}</a>'
                               + '<div class="list-top-next">' + field_html("next_step", item.next_step, today, names)
                               + '</div></div>'
                               + f'<div class="list-top-meta"><span class="list-state {STATE_TONES.get(item.state, "muted")}">'
