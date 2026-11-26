@@ -1346,14 +1346,16 @@ if(example.filterOn){
         closed = self.add("Close a linked item after the page shows the full title across several lines "
                           + "and keeps its state in the same column as every other linked item", number=210)
         open_item = self.add("Keep a linked item open", number=413)
+        waiting = self.add("Ask for a decision", the_list.ItemState.WAITING_FOR_NATE, number=464)
         umbrella = self.add("The workflow is consistent and simple", number=494)
-        _ = the_list.update(MORTY.id, umbrella.id, {"related_to": (413, 210)}, source="morty")
+        _ = the_list.update(MORTY.id, umbrella.id, {"related_to": (open_item.number, closed.number, waiting.number)},
+                            source="morty")
         root = self.root / "reviews"
         initial = list_page.render(root, include_counts=False).decode()
         _ = the_list.close(MORTY.id, closed.id, "The check passed.", source="morty")
         fresh = list_page.render(root, include_counts=False).decode()
         closed_detail = list_page.saved_action_state(MORTY.id, closed.id, include_detail=True)
-        self.browser_action_sequence(r'''
+        steps = r'''
  const item=number=>document.querySelector('[data-number="'+number+'"]');
  const links=()=>recordDetails(item(494)).querySelector('[data-linked-items]');
  const states=()=>[...links().querySelectorAll('.list-state')].map(badge=>badge.textContent).join(',');
@@ -1362,8 +1364,8 @@ if(example.filterOn){
   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   history.back();await changed;
  };
- check(states()==='Working,Working','The section shows the states from the first page.');
- check(heading()==='Linked items · 0 of 2 closed','The heading counts all links and no Closed items.');
+ check(states()==='Working,Working,Waiting for nate','The section shows the states from the first page.');
+ check(heading()==='Linked items · 0 of 3 closed','The heading counts all links and no Closed items.');
  const [longTitle,shortTitle]=links().querySelectorAll('a');
  check(longTitle.offsetHeight>shortTitle.offsetHeight,'The long title wraps.');
  const titleStyle=getComputedStyle(longTitle);
@@ -1373,11 +1375,15 @@ if(example.filterOn){
  refreshMarkup=FRESH_PAGE;
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await flush();
- check(states()==='Closed,Working' && pageReads===1,'One page refresh updates the state badges.');
- check(heading()==='Linked items · 1 of 2 closed','The heading counts the Closed item after refresh.');
- const [closedBadge,workingBadge]=links().querySelectorAll('.list-state');
- check(closedBadge.getBoundingClientRect().left===workingBadge.getBoundingClientRect().left,
+ check(states()==='Closed,Working,Waiting for nate' && pageReads===1,'One page refresh updates the state badges.');
+ check(heading()==='Linked items · 1 of 3 closed','The heading counts the Closed item after refresh.');
+ const sectionRight=links().getBoundingClientRect().right;
+ const badges=[...links().querySelectorAll('.list-state')].map(badge=>badge.getBoundingClientRect());
+ check(badges.every(badge=>badge.left===badges[0].left),
   'Badges with different widths start in the same column.');
+ check(badges.every(badge=>sectionRight-badge.right>=8),'Each badge has at least 8 px to the section edge.');
+ check([...links().querySelectorAll('li')].every(row=>row.getBoundingClientRect().right===sectionRight),
+  'The row dividers reach the section edge.');
  const count=document.querySelector('[data-list-count]').textContent;
  itemSnapshots.set(item(210).dataset.key,CLOSED_DETAIL);
  links().querySelectorAll('a')[0].click();
@@ -1394,11 +1400,14 @@ if(example.filterOn){
  const target=item(OPEN_NUMBER);
  check(recordIsOpen(target) && !target.hidden && !recordIsOpen(item(494)) &&
   new URLSearchParams(location.hash.slice(1)).get('item')===target.dataset.key,'The open item link opens its item.');
-'''.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
-           .replace('CLOSED_DETAIL', json.dumps(closed_detail).replace('</', '<\\/'))
-           .replace('OPEN_NUMBER', str(open_item.number)),
-                                     reduced_motion=True, add_item=False, markup=initial, open_number=494,
-                                     window_size=(1440, 900))
+'''
+        steps = (steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+                 .replace('CLOSED_DETAIL', json.dumps(closed_detail).replace('</', '<\\/'))
+                 .replace('OPEN_NUMBER', str(open_item.number)))
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial,
+                                             open_number=494, window_size=(width, 900))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_snapshot_removes_the_last_link_after_an_action(self) -> None:
