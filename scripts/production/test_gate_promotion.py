@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import change_review, gate, promotion, showrunners
+from scripts.production import behavior_check, change_review, gate, promotion, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_test_support import MergeGateFixture, wait_for_file
@@ -207,16 +207,34 @@ sys.meta_path.insert(0, NoRepositoryModules())
 
     def test_promotion_retries_its_recorded_fast_forward_after_push_failure(self) -> None:
         args = self.publish_for_promotion()
-        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
-                land_main, "land", side_effect=land_main.LandError("injected push failure")):
+        hook = self.origin / "hooks/pre-receive"
+        self.write(hook, "#!/bin/sh\necho 'injected push failure' >&2\nexit 1\n")
+        hook.chmod(0o755)
+        with mock.patch.dict(os.environ, self.environment):
             with self.assertRaisesRegex(GateRefused, "injected push failure"):
                 gate.promote(args)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        hook.unlink()
         result = self.run_promote_only()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 1)
+
+    def test_behavior_refusal_keeps_live_main_at_its_current_tip(self) -> None:
+        args = self.publish_for_promotion()
+        path = self.main / "subject.txt"
+        original = path.read_bytes() if path.exists() else b""
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(behavior_check, "require_review",
+                                side_effect=behavior_check.BehaviorCheckError("no review is on record")) as check):
+            with self.assertRaisesRegex(GateRefused, "no review is on record"):
+                gate.promote(args)
+        check.assert_called_once_with(behavior_check.GitRange(self.main, self.base, self.checkpoint), timeout=None)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertEqual(path.read_bytes() if path.exists() else b"", original)
+        self.assertFalse(self.calls())
 
     def test_promotion_refuses_missing_or_stale_ci_for_the_exact_tip(self) -> None:
         self.write(self.unit / ".github/workflows/ci.yml", "name: CI\n")
@@ -338,8 +356,17 @@ sys.meta_path.insert(0, NoRepositoryModules())
 
     def test_promotion_rejects_an_unrecorded_commit_with_the_same_tree(self) -> None:
         args = self.publish_for_promotion()
+        actual = land_main.run_git
+
+        def interrupt_push(checkout: Path, *args: str,
+                           time_limit: land_main.CommandTimeLimit | land_main.NoTimeLimit = land_main.UNLIMITED_GIT,
+                           environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if args[0] == "push":
+                raise KeyboardInterrupt()
+            return actual(checkout, *args, time_limit=time_limit, environment=environment)
+
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
-                land_main, "land", side_effect=KeyboardInterrupt()):
+                land_main, "run_git", side_effect=interrupt_push):
             with self.assertRaises(KeyboardInterrupt):
                 gate.promote(args)
         _ = self.git(self.main, "commit", "--allow-empty", "-m", "unrelated local commit")

@@ -2570,17 +2570,19 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
             raise GateRefused(refusal)
 
         def install(approved: promotion.ApprovedPromotion) -> None:
-            # Save the receipt before the ref update. A retry can verify the local tip.
-            path = promotion_record_path(source, args.merge_branch, approved.sha)
-            if not create_text_atomic(path, json.dumps({"base": origin, "commit": approved.sha, "source_commit": approved.sha})):
-                existing = read_push_record(path)
-                if not isinstance(existing, RecordedPush) or existing.commit != approved.sha or existing.source_commit != approved.sha:
-                    raise GateRefused(f"promotion receipt changed: {path}")
-            try:
-                approved.install(main_repo, head)
-            except (OSError, UnicodeError) as error:
-                raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
-            landed = approved.land(source)
+            def advance() -> None:
+                # Save the receipt before the ref update. A retry can verify the local tip.
+                path = promotion_record_path(source, args.merge_branch, approved.sha)
+                if not create_text_atomic(path, json.dumps({"base": origin, "commit": approved.sha, "source_commit": approved.sha})):
+                    existing = read_push_record(path)
+                    if not isinstance(existing, RecordedPush) or existing.commit != approved.sha or existing.source_commit != approved.sha:
+                        raise GateRefused(f"promotion receipt changed: {path}")
+                try:
+                    approved.install(main_repo, head)
+                except (OSError, UnicodeError) as error:
+                    raise GateRefused(f"promotion refused: {' '.join(str(error).split())}") from error
+
+            landed = approved.land(source, installation=promotion.MainInstallation(main_repo, advance))
             print(land_main.hook_report(landed.hook), flush=True)
 
         try:
