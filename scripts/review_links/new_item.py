@@ -562,13 +562,14 @@ class ScheduledFiling:
         return " ".join(run.words.split())
 
     def save(self, *, new_item_draft_id: review_submissions.ListDraftOrigin = review_submissions.NoNewItemDraft.ABSENT,
+             assignee_copy: the_list.ScheduledAssigneeCopy | the_list.NoScheduledAssigneeCopy = the_list.NoScheduledAssigneeCopy.ABSENT,
              before_save: Callable[[int], None] | None = None) -> the_list.ListItem:
         changes: the_list.ItemChanges = {
             "state": the_list.ItemState.SCHEDULED, "schedule": self.schedule, "producer": self.producer,
             "unit": self.member.name if self.member.kind == "unit" else "",
         }
         return the_list.add(self.keeper, self.title, owner=self.member.id, source=SOURCE, changes=changes,
-                            new_item_draft_id=new_item_draft_id, before_save=before_save)
+                            new_item_draft_id=new_item_draft_id, assignee_copy=assignee_copy, before_save=before_save)
 
 
 def prepare_scheduled(assignee: str | staff.StaffRow, words: str, members: staff.StaffSnapshot, *,
@@ -677,9 +678,12 @@ def submit_scheduled(request: new_item_dialog.ScheduledSubmission, *,
             notices, warning = _assignment_notices(filing.title, filing.producer, filing.keeper, owner, members)
             claim = review_submissions.ListDraftClaim(digest, filing.keeper, filing.assignment, filing.readback, notices, warning)
             draft = review_submissions.NewItemDraft(request.request_id, claim)
+            copy = (the_list.ScheduledAssigneeCopy(request.request_id, owner.id, words)
+                    if isinstance(request.assignment, new_item_dialog.ChosenAssignee) and owner.id != recipient.id
+                    else the_list.NoScheduledAssigneeCopy.ABSENT)
 
             def save(claim_number: Callable[[int], None]) -> str:
-                return filing.save(new_item_draft_id=draft, before_save=claim_number).id
+                return filing.save(new_item_draft_id=draft, assignee_copy=copy, before_save=claim_number).id
 
             yield claim, save
 

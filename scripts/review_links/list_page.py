@@ -27,7 +27,7 @@ from scripts.lib.user_zone import user_zone
 from scripts.production import change_review, delivery_state, footer_counts, record_store, repeat_rule, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
-from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, page_version
+from scripts.review_links import change_browser, change_page, console, go_ledger, new_item_dialog, page_frame, page_version
 from scripts.review_links import question_path, record_table, review_actions, review_items, review_legacy, review_link, review_page
 from scripts.review_links import search_fold, staff_names, studio_page
 from scripts.review_links import question_record
@@ -479,6 +479,8 @@ def log_entry_html(change: the_list.ItemChange, index: int, today: datetime, nam
                 for field, value in visible_fields) + '</dl>'
     elif isinstance(content, the_list.PageFeedback):
         label = {"pending": "Feedback for", "sent": "Feedback sent to", "alerted": "Feedback could not reach"}[content.state]
+        if content.action_words_unconfirmed:
+            label = "Feedback delivery unconfirmed to"
         recipients = " and ".join(names.html(identity, owner_name(names.members, identity))
                                   for identity in content.recipient_ids(keeper))
         body = label + " " + recipients + by
@@ -652,6 +654,24 @@ def signed_form_fields(entry: ListRecord, secret: str) -> str:
     fields = {"keeper": entry.keeper, "id": entry.item.id, "request": request, "token": token}
     return ''.join(f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
                    for name, value in fields.items())
+
+
+def unconfirmed_list_words(item: the_list.ListItem) -> Iterable[tuple[str, the_list.PageFeedback]]:
+    """Find each action request and its words that still need confirmation."""
+    for notice in the_list.feedback_requests(item).values():
+        if notice.state == "sent" and not notice.action_words_unconfirmed:
+            continue
+        if notice.action == "action-words":
+            yield notice.request.removesuffix("-words"), notice
+        elif notice.carries_action_words:
+            yield notice.request, notice
+
+
+def saved_words_retry_source(entry: ListRecord, secret: str) -> str:
+    """Allow an open card to look for saved words without reading Go records for every row."""
+    if any(ask.go_id for ask in entry.item.asks) or any(unconfirmed_list_words(entry.item)):
+        return '<template data-saved-words-retries>' + signed_form_fields(entry, secret) + '</template>'
+    return ''
 
 
 REPEAT_CHOICES = (
@@ -1177,7 +1197,7 @@ def waiting_details(entry: ListRecord, today: datetime, names: staff_names.Staff
                 + panel_questions(entry.item, today, unread_answers) + '</div>'
                 + review_links(entry.item, reviews, today) + waiting_feedback_form(
                     entry, secret, parking_label, unread=bool(unread_answers) or the_list.unread_delivery(entry.item),
-                    mark=mark))
+                    mark=mark) + saved_words_retry_source(entry, secret))
     return detail_panel(entry, sections, today, names, unread_answers, progress, ask_boxes(entry, secret, names))
 
 
@@ -1194,7 +1214,8 @@ def details(entry: ListRecord, today: datetime, secret: str, reviews: ReviewDisp
     form = feedback_form(entry, secret, members=names.members, parking_label=parking_label,
                          schedule=schedule, today=today, mark=mark)
     return waiting_note(entry, names, hidden=True) + detail_panel(
-        entry, sections + questions + form, today, names, unread_answers, progress, ask_boxes(entry, secret, names), schedule=schedule)
+        entry, sections + questions + form + saved_words_retry_source(entry, secret), today,
+        names, unread_answers, progress, ask_boxes(entry, secret, names), schedule=schedule)
 
 
 def original_request_words(item: the_list.ListItem) -> str:
@@ -1344,7 +1365,17 @@ class ListUnparkSubmission:
         return self.outcome
 
 
-ListActionSubmission = ListFeedbackDelivery | ListQuestionDelivery | ListUnparkSubmission | change_page.NoMessageDelivery
+ListActionNotice = ListFeedbackDelivery | ListQuestionDelivery | ListUnparkSubmission | change_page.NoMessageDelivery
+
+
+@dataclass(frozen=True)
+class ListActionWithWords:
+    action: ListActionNotice
+    words: ListFeedbackDelivery
+    action_result_unknown: bool = False
+
+
+ListActionSubmission = ListActionNotice | ListActionWithWords
 
 
 class NotFixedReceiptState(StrEnum):
@@ -1575,14 +1606,17 @@ class SchedulePageAction:
         return cls(scope, int(number), words, fields["repeat"][0] if "repeat" in fields else KeepRepeat.UNCHANGED,
                    revision)
 
-    def receipt_words(self, action: str, until: str) -> str:
+    def receipt_words(self, action: str, until: str, feedback: str = "") -> str:
         rule = self.repeat if isinstance(self.repeat, str) else None
         fields = (action, self.scope, self.run_number, self.words, rule, until)
-        return json.dumps((*fields, self.revision) if self.revision else fields)
+        if self.revision or feedback:
+            fields = (*fields, self.revision)
+        return json.dumps((*fields, feedback) if feedback else fields)
 
 
 def save_schedule(keeper: staff.StaffId, identity: str, request: str, operation: the_list.ScheduleOperation,
-                  until: str, submitted: SchedulePageAction, expected: the_list.ScheduleExpectation) -> None:
+                  until: str, submitted: SchedulePageAction, expected: the_list.ScheduleExpectation,
+                  feedback: str = "") -> the_list.ListEdit:
     zone = user_zone()
     edits: the_list.ScheduleChanges = {}
     if until:
@@ -1596,9 +1630,127 @@ def save_schedule(keeper: staff.StaffId, identity: str, request: str, operation:
         edits["words"] = submitted.words
     if isinstance(submitted.repeat, str):
         edits["repeat"] = repeat_rule.parse(submitted.repeat) if submitted.repeat else the_list.RemoveRepeat.KEEP_ONE_RUN
-    receipt = the_list.PageRequest(request, "park", submitted.receipt_words(operation, until))
-    _ = the_list.save_page_schedule(keeper, identity, operation, edits, scope=submitted.scope, expected=expected,
-                                    repeat_zone=zone, receipt=receipt)
+    receipt_words = submitted.receipt_words(operation, until, feedback)
+    receipt = the_list.PageRequest(request, "park", receipt_words)
+    if feedback and operation is the_list.ScheduleOperation.START_NOW:
+        edits["start_feedback"] = feedback
+    return the_list.save_page_schedule(keeper, identity, operation, edits, scope=submitted.scope, expected=expected,
+                                       repeat_zone=zone, receipt=receipt,
+                                       action_words=feedback if operation is the_list.ScheduleOperation.REMOVE else "")
+
+
+def _signed_list_request(root: Path, fields: dict[str, list[str]]) -> tuple[staff.StaffId, str, str, ListFormRequestPrefix]:
+    keeper, identity = staff.StaffId(fields["keeper"][0]), fields["id"][0]
+    if re.fullmatch(r"L[1-9]\d*", identity) is None:
+        raise question_record.AnswerRefused("the List request does not match this page")
+    prefix, retry = ListFormRequestPrefix.parse(fields["request"][0])
+    signed_prefix = prefix.format()
+    request = signed_prefix + retry
+    expected = signed_token(form_secret(root), keeper, identity, signed_prefix)
+    token = fields["token"][0].encode()
+    if not secrets.compare_digest(token, expected.encode()):
+        bootstrap = signed_token(bootstrap_form_secret(root), keeper, identity, signed_prefix)
+        if not secrets.compare_digest(token, bootstrap.encode()):
+            raise question_record.AnswerRefused("the List token does not match this page")
+    return keeper, identity, request, prefix
+
+
+def action_words_request(root: Path, fields: dict[str, list[str]]) -> ListFeedbackDelivery | change_page.NoMessageDelivery:
+    """Read the delivery saved for a signed List action."""
+    if not {"keeper", "id", "request", "token"} <= fields.keys() or any(len(values) != 1 for values in fields.values()):
+        raise question_record.AnswerRefused("use the form on this page")
+    keeper, identity, request, _ = _signed_list_request(root, fields)
+    notice = the_list.action_words_notice(the_list.load(keeper, identity), request)
+    if isinstance(notice, the_list.PageFeedback):
+        return ListFeedbackDelivery(keeper, identity, notice.request)
+    return change_page.NoMessageDelivery()
+
+
+class WordsRetryPreview(TypedDict):
+    words: str
+    recipients: tuple[str, ...]
+
+
+class GoWordsRetryPreview(WordsRetryPreview):
+    what: str
+
+
+class SavedWordsRetry(TypedDict):
+    kind: Literal["list", "go"]
+    fields: dict[str, str]
+    preview: WordsRetryPreview
+
+
+def words_preview_members() -> staff.StaffSnapshot:
+    """Use recipient IDs if the staff names are unavailable."""
+    try:
+        return staff.snapshot()
+    except staff.StaffUnreadable:
+        return staff.StaffSnapshot(())
+
+
+def list_words_preview(keeper: staff.StaffId, notice: the_list.PageFeedback,
+                       members: staff.StaffSnapshot) -> WordsRetryPreview:
+    words = notice.words.partition(new_item_dialog.ACTION_WORDS_HEADING)[2]
+    recipients = tuple(owner_name(members, recipient) for recipient in notice.recipient_ids(keeper))
+    return WordsRetryPreview(words=words, recipients=recipients)
+
+
+def go_words_preview(entry: go_ledger.GoRecord, members: staff.StaffSnapshot) -> GoWordsRetryPreview:
+    unconfirmed = entry.get("words_unconfirmed", ())
+    recipients = tuple(owner_name(members, staff.StaffId(recipient)) for recipient, sent in entry["sent"].items()
+                       if not sent or recipient in unconfirmed)
+    return GoWordsRetryPreview(words=entry.get("feedback", ""), recipients=recipients, what=entry["what"])
+
+
+def saved_words_retries(root: Path, ledger: Path, fields: dict[str, list[str]]) -> list[SavedWordsRetry]:
+    """Return signed retries for the saved words on one List item."""
+    if not {"keeper", "id", "request", "token"} <= fields.keys() or any(len(values) != 1 for values in fields.values()):
+        raise question_record.AnswerRefused("use the form on this page")
+    keeper, identity, _, _ = _signed_list_request(root, fields)
+    item = the_list.load(keeper, identity)
+    secret = form_secret(root)
+    members = words_preview_members()
+    retries: list[SavedWordsRetry] = []
+    for request, notice in dict(unconfirmed_list_words(item)).items():
+        try:
+            prefix, _ = ListFormRequestPrefix.parse(request)
+        except question_record.AnswerRefused:
+            continue
+        token = signed_token(secret, keeper, identity, prefix.format())
+        retries.append(SavedWordsRetry(kind="list", fields=dict(keeper=keeper, id=identity, request=request, token=token),
+                                      preview=list_words_preview(keeper, notice, members)))
+    for ask in item.asks:
+        if not ask.go_id:
+            continue
+        try:
+            entry = go_ledger.read(ledger, ask.go_id)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            print(f"review-links List Go {ask.go_id}: {error}", file=sys.stderr)
+            continue
+        preview = go_words_preview(entry, members)
+        if not preview["words"] or not preview["recipients"]:
+            continue
+        if (entry["item"], entry["ask"], entry["target"], entry["what"]) != (
+                f"{keeper}/{identity}", ask.ask_id, ask.target, ask.what):
+            continue
+        token = signed_token(secret, keeper, identity, go_ledger.token_prefix(ask.ask_id))
+        retries.append(SavedWordsRetry(kind="go", fields=dict(keeper=keeper, id=identity, ask=ask.ask_id,
+                                                             token=token, words=preview["words"]), preview=preview))
+    return retries
+
+
+def words_delivery_status(delivery: ListFeedbackDelivery) -> change_page.DeliveryOutcome:
+    item = the_list.load(delivery.keeper, delivery.identity)
+    notice = the_list.feedback_requests(item).get(delivery.request)
+    if notice is not None and notice.state == "sent" and not notice.action_words_unconfirmed:
+        return change_page.DeliveryConfirmed()
+    if notice is not None and notice.state == "alerted":
+        return change_page.FailedDelivery(delivery.request, the_list.folder(delivery.keeper) / f"{item.id}.md",
+                                          item.id, "The showrunner was alerted.")
+    return change_page.DeliveryUnconfirmed()
 
 
 def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None = None, *,
@@ -1612,21 +1764,12 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
             or fields.keys() - required - {"scope", "run", "schedule_words", "repeat", "schedule_revision"}
             or any(len(values) != 1 for values in fields.values())):
         raise question_record.AnswerRefused("use the form on this page")
-    keeper, identity = staff.StaffId(fields["keeper"][0]), fields["id"][0]
-    if re.fullmatch(r"L[1-9]\d*", identity) is None:
-        raise question_record.AnswerRefused("the List request does not match this page")
-    prefix, retry = ListFormRequestPrefix.parse(fields["request"][0])
-    signed_prefix = prefix.format()
-    request = signed_prefix + retry
-    expected = signed_token(form_secret(root), keeper, identity, signed_prefix)
-    token = fields["token"][0].encode()
-    if not secrets.compare_digest(token, expected.encode()):
-        bootstrap = signed_token(bootstrap_form_secret(root), keeper, identity, signed_prefix)
-        if not secrets.compare_digest(token, bootstrap.encode()):
-            raise question_record.AnswerRefused("the List token does not match this page")
+    keeper, identity, request, prefix = _signed_list_request(root, fields)
     action, words, until = fields["action"][0], fields["words"][0], fields["until"][0]
     if action == "remove":
         words = words if words.strip() else ""
+    elif action in ("read", "park", "unpark", "unschedule", "start-now", "top"):
+        words = new_item_dialog.optional_feedback(words)
     elif action != the_list.ReportVerdict.NOT_FIXED:
         words = words.strip()
     if action == "top" and top_priority is TopPriority.HIDDEN:
@@ -1641,7 +1784,8 @@ def save_action(root: Path, body: str, status: change_page.DeliveryStatus | None
     if action == "read":
         read_edit = the_list.mark_read_edit(keeper, identity, source=the_list.PAGE_SOURCE, update=prefix.seen_update,
                                            page_request=the_list.PageRequest(request, "read", words))
-        delivery = _notice_delivery(keeper, read_edit.item, request)
+        delivery = _with_action_words(keeper, read_edit.item, request,
+                                      _notice_delivery(keeper, read_edit.item, request), words)
     else:
         delivery = _submit_action(root, keeper, identity, request, prefix, action, words, until, status, submitted)
     if not include_detail:
@@ -1662,8 +1806,11 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
     run_number = submitted.run_number or repeat_rule.NoNextRun.REMAINING
     expected = the_list.ScheduleExpectation(submitted.revision, run_number)
     if action in the_list.ScheduleOperation:
-        save_schedule(keeper, identity, request, the_list.ScheduleOperation(action), until, submitted, expected)
-        return change_page.NoMessageDelivery()
+        operation = the_list.ScheduleOperation(action)
+        edit = save_schedule(keeper, identity, request, operation, until, submitted, expected,
+                             words if operation is not the_list.ScheduleOperation.EDIT else "")
+        return _with_action_words(keeper, edit.item, request, change_page.NoMessageDelivery(),
+                                  words if operation is the_list.ScheduleOperation.REMOVE else "")
     item = the_list.load(keeper, identity)
     if action in (the_list.ReportVerdict.WORKS, the_list.ReportVerdict.NOT_FIXED):
         verdict = the_list.ReportVerdict(action)
@@ -1705,21 +1852,30 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
                       check_deadline: Callable[[datetime], None] | None = None) -> the_list.ListItem:
             label = parking_notice_label(parked_until, zone)
             saved_words = submitted.receipt_words(action, words) if submitted.scope else words
-            recipient = prefix.recipient if item.state is the_list.ItemState.SCHEDULED else the_list.LegacyFeedbackRecipient.KEEPER
-            notice = the_list.PageItemNotice(request, f"Studio: nate parked item {item.number} {label}.", "park",
-                                            saved_words, recipient=recipient)
+            previous_recipient = (prefix.recipient if item.state is the_list.ItemState.SCHEDULED
+                                  else the_list.LegacyFeedbackRecipient.KEEPER)
+            message = f"Studio: nate parked item {item.number} {label}."
+            notice = the_list.PageItemNotice(request, message, "park", saved_words, recipient=previous_recipient)
             return the_list.park(keeper, identity, parked_until, source=the_list.PAGE_SOURCE,
-                                 notice=notice, check_deadline=check_deadline,
+                                 notice=notice, check_deadline=check_deadline, action_words=words,
                                  schedule_scope=submitted.scope, expected_schedule=expected)
 
         changed = (save_park(the_list.ParkUntilDelivered.DELIVERED) if until == the_list.ParkUntilDelivered.DELIVERED
                    else review_actions.save_timed_park(until, zone, save_park, require_offset=len(until) != 10))
     elif action == "unpark":
         notice = the_list.PageItemNotice(request, f"Studio: nate unparked item {item.number}.", "unpark", words)
-        changed = the_list.unpark(keeper, identity, source=the_list.PAGE_SOURCE, notice=notice).item
+        changed = the_list.unpark(keeper, identity, source=the_list.PAGE_SOURCE, notice=notice, action_words=words).item
     elif action == "top":
-        _ = the_list.make_top_priority(keeper, identity)
-        return change_page.NoMessageDelivery()
+        if not words:
+            _ = the_list.make_top_priority(keeper, identity)
+            return change_page.NoMessageDelivery()
+        with exclusive(root / ".list-priority-words.lock"):
+            item = the_list.load(keeper, identity)
+            if isinstance(the_list.action_words_notice(item, request), the_list.PageFeedback):
+                return _with_action_words(keeper, item, request, change_page.NoMessageDelivery(), words,
+                                          action_result_unknown=True)
+            changed = the_list.make_top_priority(keeper, identity)
+            changed = the_list.save_priority_words(keeper, changed, request, words)
     elif action == "tell" and words and len(words) <= 10000:
         saved = the_list.save_feedback(keeper, identity, the_list.PageFeedback(
             request, words, read_update=prefix.seen_update, recipient=prefix.recipient,
@@ -1733,8 +1889,16 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
     if action == "unpark":
         outcome = (UnparkOutcome(the_list.unpark_no_change_reason(changed, request).value)
                    if request not in the_list.feedback_requests(changed) else UnparkOutcome.CLEARED)
-        return ListUnparkSubmission(outcome, delivery)
-    return delivery
+        return _with_action_words(keeper, changed, request, ListUnparkSubmission(outcome, delivery), words)
+    return _with_action_words(keeper, changed, request, delivery, words if action in ("park", "top") else "")
+
+
+def _with_action_words(keeper: staff.StaffId, item: the_list.ListItem, request: str,
+                       action: ListActionNotice, words: str, *,
+                       action_result_unknown: bool = False) -> ListActionSubmission:
+    if words and isinstance(notice := the_list.action_words_notice(item, request), the_list.PageFeedback):
+        return ListActionWithWords(action, ListFeedbackDelivery(keeper, item.id, notice.request), action_result_unknown)
+    return action
 
 
 def _notice_delivery(keeper: staff.StaffId, item: the_list.ListItem,
@@ -1754,7 +1918,27 @@ def deliver(submission: ListActionSubmission) -> None:
     _ = deliver_with_outcome(submission)
 
 
-def deliver_with_outcome(submission: ListActionSubmission) -> change_page.DeliveryOutcome:
+def deliver_scheduled_assignee_copy(keeper: staff.StaffId, identity: str,
+                                    draft: new_item_dialog.ScheduledDraftId) -> change_page.DeliveryOutcome:
+    """Send the copy saved with the Scheduled item."""
+    notice = the_list.feedback_requests(the_list.load(keeper, identity)).get(draft.value)
+    if notice is None or notice.action != "scheduled-assignee" or notice.state == "sent":
+        return change_page.DeliveryConfirmed()
+    return deliver_with_outcome(ListFeedbackDelivery(keeper, identity, draft.value))
+
+
+def deliver_with_outcome(submission: ListActionSubmission, *, retry_words: bool = False) -> change_page.DeliveryOutcome:
+    if isinstance(submission, ListActionWithWords):
+        original = submission.action
+        primary = original.delivery if isinstance(original, ListUnparkSubmission) else original
+        if primary == submission.words:
+            return deliver_with_outcome(submission.words)
+        try:
+            _ = deliver_with_outcome(original)
+        finally:
+            outcome = (words_delivery_status(submission.words) if submission.action_result_unknown
+                       else deliver_with_outcome(submission.words))
+        return outcome
     """Send saved List words with the shared retry and alert helpers."""
     delivery = submission.delivery if isinstance(submission, ListUnparkSubmission) else submission
     if isinstance(delivery, change_page.NoMessageDelivery):
@@ -1777,36 +1961,47 @@ def deliver_with_outcome(submission: ListActionSubmission) -> change_page.Delive
         key = change_page.review_delivery_key(source, item.id, feedback.request)
         recipients = feedback.recipient_ids(delivery.keeper)
         repair = feedback.action is the_list.ReportVerdict.NOT_FIXED
+        separate_words = feedback.action in ("action-words", "scheduled-assignee")
+        pending_recipients: set[staff.StaffId] = set()
         failures = change_page.send_with_retries(change_page.SENDER, recipients, message,
                                                  tries, settings.number("delivery_pause_seconds"), key=key,
-                                                 confirm=repair)
-        if repair and any(isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
+                                                 confirm=repair or separate_words,
+                                                 pending_recipients=pending_recipients if feedback.carries_action_words else None)
+        if any(isinstance(failure, change_page.UnconfirmedDelivery) for failure in failures):
             return feedback
         if not failures:
-            outcome = change_page.DeliveryConfirmed()
-            return replace(feedback, state="sent", alerted_to="")
+            if not pending_recipients:
+                outcome = change_page.DeliveryConfirmed()
+            return replace(feedback, state="sent", alerted_to="", action_words_unconfirmed=bool(pending_recipients))
         outcome = change_page.FailedDelivery(feedback.request, source, item.id, failures[-1].error)
+        if feedback.state == "sent":
+            return feedback
         owners = tuple(owner for owner in alert_showrunners(item, staff.snapshot()) if owner.id not in recipients)
         reached = change_page.alert_delivery_failures(failures, tries, source=source, row=item.id, message=message,
             recipients=tuple(owner.id for owner in owners), attempt=feedback.request, title="List feedback needs attention")
-        return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners)) if reached else feedback
-    the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send)
+        if reached and not separate_words:
+            return replace(feedback, state="alerted", alerted_to=", ".join(owner.name for owner in owners))
+        return feedback
+    the_list.deliver_feedback(delivery.keeper, delivery.identity, delivery.request, send, retry_words=retry_words)
     if not attempted:
         item = the_list.load(delivery.keeper, delivery.identity)
         feedback = the_list.feedback_requests(item).get(delivery.request)
-        if feedback is not None and feedback.action is the_list.ReportVerdict.NOT_FIXED:
-            if feedback.state == "sent":
+        if feedback is not None and (
+                feedback.action in ("action-words", "scheduled-assignee", the_list.ReportVerdict.NOT_FIXED)
+                or feedback.carries_action_words):
+            if feedback.state == "sent" and not feedback.action_words_unconfirmed:
                 return change_page.DeliveryConfirmed()
-            if feedback.state == "alerted":
+            if feedback.state == "alerted" and feedback.action is the_list.ReportVerdict.NOT_FIXED:
                 source = the_list.folder(delivery.keeper) / f"{item.id}.md"
                 return change_page.FailedDelivery(feedback.request, source, item.id,
                                                   "The owner or producer did not receive Not fixed.")
     return outcome
 
 
-def _signed_go(root: Path, body: str) -> tuple[staff.StaffId, str, str, str]:
+def _signed_go(root: Path, body: str) -> tuple[staff.StaffId, str, str, str, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
-    if set(fields) != {"keeper", "id", "ask", "token", "page"} or any(len(values) != 1 for values in fields.values()):
+    required = {"keeper", "id", "ask", "token", "page"}
+    if not required <= fields.keys() <= required | {"words", "delivery-mode", "delivery"} or any(len(values) != 1 for values in fields.values()):
         raise question_record.AnswerRefused("use the Go button on this page")
     keeper = staff.StaffId(fields["keeper"][0])
     identity, ask_id = fields["id"][0], fields["ask"][0]
@@ -1817,7 +2012,7 @@ def _signed_go(root: Path, body: str) -> tuple[staff.StaffId, str, str, str]:
     if not any(secrets.compare_digest(token, signed_token(secret, keeper, identity, prefix).encode())
                for secret in (form_secret(root), bootstrap_form_secret(root))):
         raise question_record.AnswerRefused("the List token does not match this page")
-    return keeper, identity, ask_id, fields["page"][0]
+    return keeper, identity, ask_id, fields["page"][0], new_item_dialog.optional_feedback(fields.get("words", [""])[0])
 
 
 class GoSavedUnsent(OSError):
@@ -1846,27 +2041,34 @@ def save_go(root: Path, ledger: Path, body: str, client: str, *,
             review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK
             ) -> tuple[str, SavedActionState | None]:
     """Write the ledger record, then close the ask with its go id."""
-    keeper, identity, ask_id, page = _signed_go(root, body)
-    members = staff.snapshot()
-    item = the_list.load(keeper, identity)
-    ask = next((ask for ask in the_list.answerable_asks(item, members) if ask.ask_id == ask_id), None)
-    target = members.by_id(ask.target) if ask is not None else None
-    if ask is None or target is None:
-        raise question_record.AnswerRefused("This ask is no longer open.")
-    recipients = tuple(dict.fromkeys((target.id, the_list.producer_id(members, "morty"))))
+    keeper, identity, ask_id, page, words = _signed_go(root, body)
     with go_ledger.locked(ledger):
-        entry = go_ledger.record(ledger, ask=ask, item=f"{keeper}/{identity}", recipients=recipients, client=client,
-                                 page=page, moment=the_list.now())
-        try:
-            edit = the_list.give_go(keeper, identity, ask_id, entry["go_id"], source="nate")
-        except the_list.SavedReadFailed as error:
-            raise GoSavedUnsent(str(error)) from error
-        except BaseException as error:
-            if _remove_unheld_go(ledger, keeper, identity, entry["go_id"]) is False:
+        item = the_list.load(keeper, identity)
+        previous = next((ask.go_id for ask in item.asks if ask.ask_id == ask_id and ask.go_id), "")
+        if words and previous:
+            entry = go_ledger.read(ledger, previous)
+            if entry.get("feedback") != words:
+                raise question_record.AnswerRefused("Retry with the words saved for this ask.")
+        else:
+            members = staff.snapshot()
+            ask = next((ask for ask in the_list.answerable_asks(item, members) if ask.ask_id == ask_id), None)
+            target = members.by_id(ask.target) if ask is not None else None
+            if ask is None or target is None:
+                raise question_record.AnswerRefused("This ask is no longer open.")
+            recipients = tuple(dict.fromkeys((target.id, the_list.producer_id(members, "morty"))))
+            entry = go_ledger.record(ledger, ask=ask, item=f"{keeper}/{identity}", recipients=recipients, client=client,
+                                     page=page, moment=the_list.now(), feedback=words,
+                                     target_name=target.name if words else "")
+            try:
+                item = the_list.give_go(keeper, identity, ask_id, entry["go_id"], source="nate").item
+            except the_list.SavedReadFailed as error:
                 raise GoSavedUnsent(str(error)) from error
-            raise
+            except BaseException as error:
+                if _remove_unheld_go(ledger, keeper, identity, entry["go_id"]) is False:
+                    raise GoSavedUnsent(str(error)) from error
+                raise
     try:
-        state = action_state(keeper, edit.item, review_records=review_records, include_detail=True,
+        state = action_state(keeper, item, review_records=review_records, include_detail=True,
                              top_priority=TopPriority.SHOWN)
     except Exception as error:
         print(f"review-links List Go {identity}: {error}", file=sys.stderr)
@@ -1874,7 +2076,33 @@ def save_go(root: Path, ledger: Path, body: str, client: str, *,
     return entry["go_id"], state
 
 
-def deliver_go(ledger: Path, go_id: str) -> None:
+def saved_go_words(root: Path, ledger: Path, body: str) -> str:
+    """Resolve a signed delivery request for a Go that already saved."""
+    keeper, identity, ask_id, _, words = _signed_go(root, body)
+    item = the_list.load(keeper, identity)
+    go_id = next((ask.go_id for ask in item.asks if ask.ask_id == ask_id and ask.go_id), "")
+    if not go_id or not words or go_ledger.read(ledger, go_id).get("feedback") != words:
+        raise question_record.AnswerRefused("No saved Go with these words was found.")
+    return go_id
+
+
+def go_words_status(ledger: Path, go_id: str) -> change_page.DeliveryOutcome:
+    entry = go_ledger.read(ledger, go_id)
+    pending = tuple(recipient for recipient, sent in entry["sent"].items() if not sent)
+    if not pending and not entry.get("words_unconfirmed"):
+        return change_page.DeliveryConfirmed()
+    if any(entry["reported"].get(recipient, False) for recipient in pending):
+        return change_page.FailedDelivery(go_id, ledger, entry["item"], "The Go has an undelivered recipient.")
+    return change_page.DeliveryUnconfirmed()
+
+
+def deliver_go(ledger: Path, go_id: str, *, retry_words: bool = False) -> change_page.DeliveryOutcome:
+    """Serialize delivery of one Go across browser retries and startup recovery."""
+    with go_ledger.delivery_lock(ledger, go_id):
+        return _deliver_go(ledger, go_id, retry_words=retry_words)
+
+
+def _deliver_go(ledger: Path, go_id: str, *, retry_words: bool) -> change_page.DeliveryOutcome:
     """Send the Go to each unsent recipient through the List Tell sender and keep the result in the ledger.
 
     When the Go moved the item to Working, the producer gets one message with the next step.
@@ -1884,8 +2112,13 @@ def deliver_go(ledger: Path, go_id: str) -> None:
     entry = go_ledger.read(ledger, go_id)
     found = go_ledger.closed_ask(entry)
     pending = tuple(staff.StaffId(recipient) for recipient, sent in entry["sent"].items() if not sent)
-    if found is None or not pending:
-        return
+    words_unconfirmed = entry.get("words_unconfirmed", ())
+    retrying_words = tuple(staff.StaffId(recipient) for recipient in words_unconfirmed) if retry_words else ()
+    recipients = (*pending, *retrying_words)
+    if found is None:
+        return change_page.DeliveryUnconfirmed()
+    if not recipients:
+        return change_page.DeliveryUnconfirmed() if words_unconfirmed else change_page.DeliveryConfirmed()
     keeper, item, ask = found
     members = staff.snapshot()
     target = members.by_id(ask.target)
@@ -1897,35 +2130,50 @@ def deliver_go(ledger: Path, go_id: str) -> None:
     key = change_page.review_delivery_key(source, item.id, go_id)
     next_step = the_list.go_next_step_request(go_id)
     notice = the_list.feedback_requests(item).get(next_step)
-    producer = notice.recipient_id(keeper) if notice is not None and notice.state == "pending" else None
-    plain = tuple(recipient for recipient in pending if recipient != producer)
-    failures = change_page.send_with_retries(change_page.SENDER, plain, message, tries, pause, key=key)
+    producer = None if notice is None else notice.recipient_id(keeper)
+    with_next_step = producer if notice is not None and (notice.state == "pending" or producer in retrying_words) else None
+    pending_words: set[staff.StaffId] = set()
+
+    def send_go(targets: tuple[staff.StaffId, ...], text: str) -> list[change_page.DeliveryFailure]:
+        return change_page.send_with_retries(change_page.SENDER, targets, text, tries, pause, key=key,
+                                             pending_recipients=pending_words if entry.get("feedback") else None)
+
+    plain = tuple(recipient for recipient in recipients if recipient != with_next_step)
+    failures = send_go(plain, message)
     failed = {failure.recipient for failure in failures}
     sent = [recipient for recipient in plain if recipient not in failed]
-    if producer is not None and producer in pending:
+    if with_next_step is not None and with_next_step in recipients:
         def send(_: the_list.ListItem, saved: the_list.PageFeedback) -> the_list.PageFeedback:
-            missed = change_page.send_with_retries(change_page.SENDER, (producer,), message + "\n" + saved.words,
-                                                   tries, pause, key=key)
+            missed = send_go((with_next_step,), message + "\n" + saved.words)
             failures.extend(missed)
             if missed:
                 return saved
-            sent.append(producer)
+            sent.append(with_next_step)
             return replace(saved, state="sent")
-        the_list.deliver_feedback(keeper, item.id, next_step, send)
-    go_ledger.mark(ledger, go_id, "sent", sent)
-    if producer is not None and producer not in entry["sent"]:
+        if notice is not None and notice.state == "sent":
+            _ = send(item, notice)
+        else:
+            the_list.deliver_feedback(keeper, item.id, next_step, send)
+    go_ledger.mark_sent(ledger, go_id, sent, pending_words)
+    if pending and with_next_step is not None and with_next_step not in entry["sent"]:
         deliver(ListFeedbackDelivery(keeper, item.id, next_step))
     # Report each failed recipient to nate once per Go; a resend at a later start reports nothing new.
-    new = [failure for failure in failures if not entry["reported"].get(str(failure.recipient), False)]
+    new = [failure for failure in failures
+           if failure.recipient in pending and not entry["reported"].get(str(failure.recipient), False)]
     if not new:
-        return
+        if failures:
+            return change_page.FailedDelivery(go_id, source, item.id, failures[-1].error)
+        if pending_words or not set((*pending, *words_unconfirmed)) <= set(sent):
+            return change_page.DeliveryUnconfirmed()
+        return change_page.DeliveryConfirmed()
     owners = tuple(owner.id for owner in alert_showrunners(item, members) if owner.id not in pending)
     _ = change_page.alert_delivery_failures(new, tries, source=source, row=item.id, message=message,
                                             recipients=owners, attempt=go_id, title="List Go needs attention")
     reported = tuple(staff.StaffId(failure.recipient) for failure in new if isinstance(failure.recipient, str))
     for recipient in reported:
         _ = the_list.log_go_not_delivered(keeper, item.id, go_id, recipient)
-    go_ledger.mark(ledger, go_id, "reported", reported)
+    go_ledger.mark_reported(ledger, go_id, reported)
+    return change_page.FailedDelivery(go_id, source, item.id, failures[-1].error)
 
 
 def recover_goes(ledger: Path) -> None:
@@ -1939,7 +2187,7 @@ def recover_goes(ledger: Path) -> None:
                 keeper, _, identity = go_ledger.read(ledger, go_id)["item"].partition("/")
                 if _remove_unheld_go(ledger, staff.StaffId(keeper), identity, go_id):
                     continue
-            deliver_go(ledger, go_id)
+            _ = deliver_go(ledger, go_id)
         except (OSError, ValueError) as error:
             print(f"List Go recovery {go_id}: {error}", file=sys.stderr)
 
@@ -2504,6 +2752,11 @@ font-weight:600;cursor:pointer}
 .list-tell{display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap}
 .list-tell [value="tell"]{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
 .list-tell button:disabled{opacity:.45;cursor:default}.list-tell [data-send-status]{margin-left:0}
+[data-action-words-retries]{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:8px}
+[data-words-retry]{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap}
+[data-words-retry]>div{flex:1 1 12rem;min-width:0;overflow-wrap:anywhere}
+[data-words-retry-text]{white-space:pre-wrap}
+[data-words-retry]>button{min-height:32px}
 .list-log dl{display:grid;grid-template-columns:min(7rem,42%) minmax(0,1fr);gap:2px 12px;margin:4px 0 0}
 .list-log dt{color:var(--ink-3)}.list-log dd{margin:0;overflow-wrap:anywhere}
 .list-log dd>:last-child{margin-bottom:0}
@@ -2589,6 +2842,7 @@ function decodeListKeys(list){
 }
 decodeListKeys(content);
 const actionPath=content.dataset.listPath || location.pathname;
+const goPath=''' + json.dumps(go_ledger.GO_PATH) + r''';
 let closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
 let saving=0,listSaveVersion=0,refreshNeeded=false;
 function listRequestSeconds(){
@@ -2830,6 +3084,8 @@ function syncUnread(item,form,unread,unreadSort){
 function installListDetail(item){
   const detail=recordDetails(item),form=detail.querySelector('[data-feedback-form]');
   if(form && !form.retainDraft) bindFeedbackForm(form);
+  if(!form) bindActionWordsRetries(item,form);
+  void restoreSavedWordsRetries(item,detail.querySelector('[data-saved-words-retries]'));
   tableView.showDraftCopy(drafts.get(item.dataset.key)?.words,form?.elements.words?.type==='textarea');
 }
 function renderListDetail(revision,text,{retainLinks=false}={}){
@@ -3410,6 +3666,7 @@ function bindFeedbackForm(form){
   };
   const retain=()=>{retainDraft();syncTell();};
   form.retainDraft=retainDraft;
+  bindActionWordsRetries(item,form);
   form.syncRepair=syncTell;
   form.applySavedState=applySavedState;
   retain();
@@ -3463,7 +3720,8 @@ function bindFeedbackForm(form){
    if(action==='schedule' && !scheduleEditor.applySeriesRepeat(schedule)) return;
    const scopedRemove=action==='remove' && Boolean(schedule?.scope);
    const scheduleKey=scheduleWrite || schedule?.scope ? JSON.stringify(schedule) : '';
-   const retry=preset && !parkForDelivery ? undefined : matching(action,scheduleKey);
+   const newPriority=action==='top' && Boolean(submittedWords);
+   const retry=newPriority || (preset && !parkForDelivery) ? undefined : matching(action,scheduleKey);
    let parkingTime=parkForDelivery ? deliveryParking : retry?.parkingTime ?? until.value;
    if(action==='schedule' && !schedule.startChanged) parkingTime='';
    else if(action==='park' && !parkForDelivery && !retry && (preset || !/^\d{4}-\d{2}-\d{2}$/.test(parkingTime))){
@@ -3480,7 +3738,9 @@ function bindFeedbackForm(form){
    const attempt=retry ?? {...fresh,action,words:words.value,until:until.value,parkingTime,scheduleKey};
    identity(attempt);
    const data=new URLSearchParams(new FormData(form));data.set('action',parkForDelivery ? 'park' : action);
-   if(parks || scheduleWrite){data.set('until',parks ? parkingTime : '');data.set('words','');}
+   if(waitingForm && ['read','unpark','top'].includes(action)) data.set('words',drafts.get(key)?.words ?? '');
+   if(parks || scheduleWrite) data.set('until',parks ? parkingTime : '');
+   if(action==='schedule') data.set('words','');
    if(schedule?.scope){data.set('scope',schedule.scope);data.set('run',schedule.number);}
    if(scheduleWrite || schedule?.scope) data.set('schedule_revision',schedule.revision);
    if(action==='schedule'){
@@ -3494,9 +3754,13 @@ function bindFeedbackForm(form){
     try{repair=repairRequests.begin(key,data,sendActionReceiver(form,data),drafts.get(key));}
     catch(error){showActionFailure(notice,error.message);return;}
    }
-   if(!retry){if(!rejectsRepair && (!preset || parkForDelivery)) unconfirmed.add(attempt);fresh=newRequest();}
+   if(!retry){
+    if(!newPriority && !rejectsRepair && (!preset || parkForDelivery)) unconfirmed.add(attempt);
+    fresh=newRequest();
+   }
    if(action==='park' || (action==='schedule' && schedule.startChanged)) scheduleEditor?.retainDate();
    retainDraft();
+   const carriesActionWords=['read','park','unpark','unschedule','top'].includes(data.get('action')) && data.get('words').trim();
    const stampAtSubmit=draftStamp;
    const clearConfirmedDraft=()=>{
     const clearSchedule=scheduleWrite || Boolean(schedule?.scope);
@@ -3567,7 +3831,7 @@ function bindFeedbackForm(form){
     const response=await (action==='works' || usesWords || heldSave
      ? hold.post(actionPath,{...options,requestTimeoutSeconds},saveAction ? null : receiver)
      : fetch(actionPath,{...options,signal:listRequestSignal()}));
-    refused=!response.ok && (response.status<500 || (!asksQuestion && !parkingReceipt && action!=='remove'));
+    refused=!response.ok && (response.status<500 || (!carriesActionWords && !asksQuestion && !parkingReceipt && action!=='remove'));
     if(!parkingReceipt) saved=response.ok;
     if(saved && tableView.currentItemRequest(request) && usesWords &&
        draftStamp===stampAtSubmit && words.value===attempt.words){
@@ -3593,6 +3857,15 @@ function bindFeedbackForm(form){
     }
     if(item.listRequest!==request) return;
     saved=true;
+    if(result.words_receipt){
+     void checkActionWords(item,submission,data,{check:result.delivery,unknown:result.action_result_unknown});
+    }else if(result.send_failure && carriesActionWords){
+     hold.restore();
+     applySavedState(result,{metadataOnly:true});
+     showActionFailure(notice,result.send_failure);
+     retainDraft();persistDraft();
+     return;
+    }
     clearConfirmedDraft();
     if(stale){
      if(tableView.openItem?.dataset.key===key) return;
@@ -3669,6 +3942,8 @@ function bindFeedbackForm(form){
     delete item.dataset.undoPending;
     // An undone send saved nothing, so the item returns to its state before Send and keeps the words.
     const undone=error instanceof SendUndone;
+    if(carriesActionWords && !undone && !refused && (!parkingReceipt || saved))
+     void checkActionWords(item,submission,data,{unknown:true});
     focusDraft=undone;
     if(undone) refused=true;
     if(saved){
@@ -3700,6 +3975,8 @@ function bindFeedbackForm(form){
      // A failed read back after a retry does not show that the server refused the park.
      if(retried && !current) refused=false;
     }
+    if(carriesActionWords && parkingReceipt && !undone && !refused)
+     void checkActionWords(item,submission,data,{unknown:current?.park_request_saved!==true});
     hold.restore();
     tableView.preserveRecordRowTop(()=>{
      let restore=refused || releasesLink,confirmedByReadback=false;
@@ -3794,6 +4071,124 @@ function bindFeedbackForm(form){
    }
   });
 }
+// A words retry uses the saved delivery identity and never submits the action again.
+const unresolvedActionWords=new Map();
+const readingSavedWords=new Map();
+function bindActionWordsRetries(item,form){
+ const host=form ?? recordDetails(item)?.querySelector('[data-saved-words-retries]')?.parentElement;
+ if(!host) return;
+ host.querySelector('[data-action-words-retries]')?.remove();
+ const records=unresolvedActionWords.get(item.dataset.key);
+ if(!records?.size) return;
+ const controls=document.createElement('ul');
+ controls.dataset.actionWordsRetries='';
+ for(const retry of records.values()){
+  const row=document.createElement('li');
+  row.dataset.wordsRetry='';
+  const context=document.createElement('div');
+  context.id='words-retry-'+item.dataset.key+'-'+controls.childElementCount;
+  if(retry.go && retry.preview?.what){
+   const what=document.createElement('div');
+   what.dataset.wordsRetryWhat='';
+   what.textContent='What: '+retry.preview.what;
+   context.append(what);
+  }
+  const recipients=retry.preview?.recipients ?? [];
+  if(recipients.length){
+   const to=document.createElement('strong');
+   to.dataset.wordsRetryRecipients='';
+   to.textContent='To '+recipients.join(' and ');
+   context.append(to);
+  }
+  const words=document.createElement('div');
+  words.dataset.wordsRetryText='';
+  words.textContent=retry.preview?.words ?? retry.data.get('words') ?? '';
+  context.append(words);
+  const button=document.createElement('button');
+  button.type='button';
+  button.textContent=retry.go ? 'Retry Go delivery' : 'Retry words';
+  button.setAttribute('aria-describedby',context.id);
+  button.onclick=async()=>{
+   button.disabled=true;
+   await checkActionWords(item,tableView.startAction(item),retry.data,{...retry,retry:true});
+  };
+  row.append(context,button);
+  controls.append(row);
+ }
+ host.append(controls);
+}
+async function restoreSavedWordsRetries(item,source){
+ const key=item.dataset.key;
+ if(!source || source.hasAttribute('data-loaded') || readingSavedWords.has(key)) return;
+ const checked=new Set();
+ readingSavedWords.set(key,checked);
+ const query=new URLSearchParams({'words-retries':'1'});
+ for(const field of source.content.querySelectorAll('input')) query.set(field.name,field.value);
+ query.set('item-state',query.get('id'));
+ try{
+  const response=await fetch(actionPath+'?'+query,{cache:'no-store',signal:listRequestSignal()});
+  if(!response.ok) return;
+  const {words_retries:retries}=await response.json();
+  if(!Array.isArray(retries)) return;
+  source.setAttribute('data-loaded','');
+  const records=unresolvedActionWords.get(key) ?? new Map();
+  for(const {kind,fields,preview} of retries){
+   const go=kind==='go',identity=go ? fields.ask : fields.request;
+   const existing=records.get(identity);
+   if(existing){existing.preview ??= preview;continue;}
+   if(checked.has(identity)) continue;
+   const data=new URLSearchParams(fields);
+   if(go) data.set('page',location.href);
+   records.set(identity,{data,path:go ? goPath : actionPath,go,preview});
+  }
+  if(!records.size) return;
+  unresolvedActionWords.set(key,records);
+  const active=tableView.openItem;
+  if(active?.dataset.key===key) bindActionWordsRetries(active,recordDetails(active)?.querySelector('[data-feedback-form]'));
+ }catch(_){}finally{
+  readingSavedWords.delete(key);
+ }
+}
+async function checkActionWords(item,submission,data,{path=actionPath,go=false,check,unknown=false,retry=false}={}){
+ const key=item.dataset.key,identity=data.get(go ? 'ask' : 'request');
+ let options={signal:listRequestSignal()};
+ if(go || retry){
+  const request=new URLSearchParams(data);
+  request.set(go ? 'delivery-mode' : 'action',go ? (retry ? 'retry' : 'status') : 'retry-words');
+  if(check) request.set('delivery',check);
+  options={...options,method:'POST',body:request};
+ }else{
+  const query=new URLSearchParams({'item-state':data.get('id'),'words-status':'1'});
+  for(const field of ['keeper','id','request','token']) query.set(field,data.get(field));
+  if(check) query.set('delivery',check);
+  path+='?'+query;
+  options.cache='no-store';
+ }
+ let result={},error='';
+ try{
+  const response=await fetch(path,options);
+  result=await response.json();
+  if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+  if(!Object.hasOwn(result,'words_receipt')) return;
+ }catch(failure){error=failure.message;}
+ readingSavedWords.get(key)?.add(identity);
+ const records=unresolvedActionWords.get(key) ?? new Map();
+ const message=(unknown ? 'The action result is unknown. ' : '')+
+  (error || result.send_failure || (result.words_receipt ? '' : 'No saved words delivery was found.'));
+ if((error || result.send_failure) && (result.words_receipt || check || retry)){
+  const preview=result.words_retry_preview ?? records.get(identity)?.preview;
+  records.set(identity,{data,path:go ? path : actionPath,go,preview});
+ }else if(result.words_receipt || !error)
+  records.delete(identity);
+ if(records.size) unresolvedActionWords.set(key,records);else unresolvedActionWords.delete(key);
+ const active=tableView.openItem?.dataset.key===key ? tableView.openItem : item;
+ bindActionWordsRetries(active,recordDetails(active)?.querySelector('[data-feedback-form]'));
+ if(message.trim())
+  tableView.showActionResult(active,submission,'Item '+item.dataset.number,{kind:'failure',message:message.trim()});
+ else if(retry)
+  tableView.showActionResult(active,submission,'Item '+item.dataset.number,{kind:'success',message:'Sent the saved words.'});
+}
+
 // A Go form sends nate's Go or Approved for one ask; the server closes the ask.
 document.addEventListener('submit',async event=>{
  const form=event.target instanceof Element ? event.target.closest('form[data-go-form]') : null;
@@ -3802,15 +4197,21 @@ document.addEventListener('submit',async event=>{
  const item=recordFromDetail(form),box=form.closest('[data-ask]'),button=form.querySelector('button');
  if(button.disabled) return;
  const key=item.dataset.key,hadFocus=box.contains(document.activeElement);
- const data=new URLSearchParams(new FormData(form));data.set('page',location.href);
+ const data=new URLSearchParams(new FormData(form));
+ const feedback=recordDetails(item)?.querySelector('[data-feedback-form] textarea[name=words]');
+ data.set('page',location.href);
+ data.set('words',feedback?.value ?? drafts.get(key)?.words ?? '');
+ const wordsPath={path:form.action,go:true};
  button.disabled=true;
  startListSave();
  const submission=tableView.startAction(item);
- let saved=false;
+ let saved=false,refused=false;
  try{
   const response=await fetch(form.action,{method:'POST',body:data});
+  refused=!response.ok && response.status<500;
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'HTTP '+response.status);
+  if(result.words_receipt) void checkActionWords(item,submission,data,{...wordsPath,check:result.delivery});
   saved=true;
   tableView.preserveRecordRowTop(()=>{
    const asks=box.parentElement;
@@ -3829,6 +4230,8 @@ document.addEventListener('submit',async event=>{
   button.disabled=false;
   tableView.showActionResult(item,submission,'Item '+item.dataset.number,
    {kind:'failure',message:'Not sent: '+(error instanceof Error ? error.message : String(error))});
+  if(!refused && data.get('words').trim())
+   void checkActionWords(item,submission,data,{...wordsPath,unknown:true});
  }finally{
   saving--;
   refreshAfterListSave(saved);

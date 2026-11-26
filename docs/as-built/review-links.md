@@ -1126,6 +1126,11 @@ The menu has three presets.
 A preset click calculates the deadline and hides the item at once.
 **Pick a date…** shows a calendar and a time field in the same menu.
 Review Later and List Park share the date and time picker in `record_table.py`.
+Later presets and date Save send words from the box to the record owner.
+Mark read on an Investigation or Bug sends words from the box to the record owner.
+If delivery fails, the card keeps the words and offers **Retry**.
+The retry sends the saved message. The server also retries pending messages at startup.
+If the box contains newer words, **Retry** keeps the card open and leaves those words in the box.
 The calendar keeps a valid future Later draft when it opens, including a draft restored after a refresh.
 Otherwise, it opens on tomorrow in the user zone, with `later_morning` as its time.
 The month header has previous and next buttons.
@@ -1253,7 +1258,8 @@ For an efficiency, the command is `candidates.py outcome E<n> accepted`.
 The saved answer and log show the selected name as “approved, assigned to <name>”.
 A proposal Decline stores the declined answer, as `proposal_issue.py decline-answer` does.
 Its message asks the owner to close the issue with `/close_issue`.
-An efficiency Decline writes `candidates.py outcome E<n> declined` on the ledger line and sends no message.
+An efficiency Decline writes `candidates.py outcome E<n> declined` on the ledger line.
+If the box contains text, Decline sends those words to the record owner.
 A proposal keeps its page log in the `review_log` front matter list and its page mark in `review_state`.
 An efficiency keeps them in `<ledger stem>.review.json` beside the ledger.
 That file is keyed by the `E<n>` id and holds only the log and the mark, never a copy of the ledger line.
@@ -1957,6 +1963,8 @@ A signed Unpark request from an earlier page can clear parking while the item wa
 That request moves the item to Producer answering and shows its confirmation next to Show.
 An unread answer appears in the panel with the question, both times, and an Unread mark.
 Mark read clears the signed update shown by the form.
+Mark read sends words from the box to the item's producer.
+If Mark read requests the next step, it adds the words to that request.
 Opening a row leaves its unread state and status chip unchanged.
 This rule also applies to direct links, refreshes, and reloads.
 A newer update stays unread if it arrives before the read saves.
@@ -2003,8 +2011,11 @@ Enter an instruction and choose a future start to schedule the item.
 The picker names the owner who receives the instruction and the producer who receives a copy.
 **Edit schedule** opens the picker for a Scheduled item.
 **Start now** moves the pending run to the current time.
+The start message adds the words from the main box after the saved instruction.
+Each press replaces the box words for that run.
 For a series, **Start now** applies to **This run**.
 **Unpark** on a Scheduled item removes the schedule for the selected scope.
+It sends any words from the box to the item's producer.
 Clear the instruction to replace the schedule with a parking time or **Until delivered**.
 
 The **Repeat** menu appears when the picker has an instruction and a start.
@@ -2049,7 +2060,8 @@ The server publishes the earliest active parking deadline.
 The List refreshes at that deadline.
 If the Park menu or picker is open, the List refreshes when it closes.
 While the picker is open, a refresh checks only the script version.
-**Save** sends the chosen time in UTC.
+**Save** sends the chosen time in UTC and keeps the words in the request.
+Each Park preset also sends the words in the request.
 Park writes a date, a time, or `delivered` through `the_list.park` with the List page source.
 List and Review use the same Later code to read and write their saved values.
 The server reads a date as midnight in the user zone.
@@ -2058,12 +2070,21 @@ The writer checks a Park retry against the parking condition in the receipt or t
 After an unconfirmed Park save, the List retries once with the same request ID, token, and deadline.
 The List uses `frame_retry_seconds` for the retry delay and `page_request_timeout_seconds` for each request.
 A new preset click uses a fresh request ID and calculates the deadline at the time of the click.
+**Retry words** sends the saved words without changing the parking time.
+A queue timeout keeps the words unconfirmed, even when the existing notice has a sent state.
+The item log shows “Feedback delivery unconfirmed to” for those words.
+When the item opens after a reload, the page reads the saved delivery and shows **Retry words**.
 Reopening the picker keeps a draft that matches an unconfirmed request, even after its deadline.
 The calendar gives focus to an enabled day.
-The page keeps the words for Tell.
+Park sends the words to the producer when the box contains text.
+Park and both forms of Unpark send the words to the producer recorded when the action saves.
+If an existing notice goes to that producer, it includes the words.
+If the notice goes to another recipient, the producer gets a separate copy.
 **Unpark** clears parking through `the_list.unpark` and keeps the item state.
-It records one Unparked event and saves one notice for the record keeper.
-If the item has no active parking time, the writer saves only a hidden request receipt.
+It records one Unparked event and saves one notice.
+The record keeper receives the usual notice.
+If the item has no active parking time, the writer saves a hidden request receipt.
+If the box contains words, the writer then sends those words to the producer.
 The receipt records whether the time expired or was absent.
 A replay of that request preserves any newer parking time.
 The response reports the saved request outcome and the current parking state.
@@ -2138,11 +2159,21 @@ The page can mark an item read, close it, park it, unpark it, or append feedback
 The page uses signed forms and rejects invalid fields or tokens with HTTP 400.
 The List record saves the request ID, action, and words with each change in one locked write.
 The same write saves the pending notice and its recipient for actions that send a notice.
+Action messages add box text under `Nate's words:`. An empty box leaves the message text the same.
 For Tell, the recipient is the producer named when the page renders the form.
-For Remove, Park, and Unpark, the recipient is the record keeper.
+For Remove and ordinary Park or Unpark, the recipient of the existing notice is the record keeper.
+Park, Unpark, and Make top priority send words from the box to the producer.
 For a Mark read notice, the recipient is the item's producer when the notice saves.
 Under the lock, each action checks the request ID against the saved actions.
-A retry changes no item fields and saves no second notice.
+A retry of a saved action changes no item fields and saves no second notice.
+**Make top priority** writes the priority to the staff record.
+The List saves any words in a separate write after the priority changes.
+The words receipt identifies the delivery. It does not report the action result.
+**Retry words** uses the saved recipient, text, and delivery key.
+Each retry button shows the saved words and the recipients for that delivery.
+The retry leaves the current priority and any newer draft edits in place.
+The sender retries pending records at startup.
+Existing notices use their usual delivery and alert rules.
 The writer refuses a saved ID with a different action or different words.
 After an unconfirmed directory sync, the writer checks the stored record under the same lock.
 If the record holds the request, the server reports that it saved the action.
@@ -2200,7 +2231,8 @@ A producer opens it with `the_list.py ask` ([The List: `the_list.py`](showrunner
 An open ask whose target has a staff row puts the item in Needs me, also during an active park.
 An open ask whose target has no staff row shows no box and does not hold the item.
 `the_list.answerable_asks` is the one rule for both: the page boxes, Needs me, Mark read and the Go use it.
-Mark read on an item with an open ask that shows a box clears the dot, keeps the state and sends no message.
+Mark read on an item with an open ask that shows a box clears the dot and keeps the state.
+It sends a message to the producer when the words box contains text.
 The open row shows one box for each open ask, above the item fields.
 The box has a warning border and a heading: “Needs your go” or “Needs your approval”.
 It shows What, Who needs it (the target's staff name and role) and Why.
@@ -2209,7 +2241,12 @@ The button is Go for a go ask and Approved for an approval ask. A config ask has
 Small muted text next to the button names the target: “Pressing Go sends your go to <agent>.”
 For an approval ask, it says “Pressing Approved sends your approval to <agent>.”
 The button has `aria-describedby` on that text. The keyboard and a screen reader use it like the other row buttons.
-A click sends a signed POST to `/console/list-go` with the item, the ask id and the page address.
+A click sends a signed POST to `/console/list-go` with the item, the ask id, the page address, and the box words.
+The Go or Approved message adds those words to the existing message.
+The server reports the saved Go before it sends the message.
+If delivery fails, the item keeps the draft and offers **Retry Go delivery**.
+The retry uses the same Go ID and sends only to recipients whose delivery is pending.
+The retry keeps the ask closed and keeps any newer draft edits.
 For each click, the server reads natedev's current Tailscale IPv4 and IPv6 addresses.
 It refuses a client address that matches either address, is loopback, or belongs to natedev.
 A successful socket bind to the client address proves that natedev owns it.
@@ -2244,14 +2281,22 @@ An accepted click does these steps in this order:
    At each server start, the server reads the item of each kept record. It removes the record when no ask holds its go id, and keeps it when the read fails.
 3. The server answers the page. The page removes the box and applies the saved state, so a Working row leaves Needs me in place.
 4. The server sends the target and morty one message through the List Tell sender.
-   The message names What and carries only the go id and the check command.
+   The message names What and includes the go id and the check command.
+   The message includes any text from the box under `Nate's words:`.
    When the Go set Working, the producer gets one message.
    A producer that is a Go recipient gets the Go message with the next-step line at its end. The notice becomes sent with it.
    Another producer gets the next-step notice alone, through the List Tell sender.
-   The server sets `sent` to true for each recipient that the message reached.
+   The server sets `sent` to true for each recipient whose send succeeds or returns `pending`.
+   A `pending` result leaves the words unconfirmed for that recipient.
    A failed send alerts the item's showrunners with the title “List Go needs attention”.
    It also adds the log line “Go not delivered to <agent>”, so nate sees it.
    The alert and the log line occur once for each recipient of a Go.
+
+**Retry Go delivery** uses the saved message and delivery key for each unconfirmed recipient.
+The retry shows the ask's **What** text beside the saved words and recipients.
+When the item opens after a reload, the page reads the saved delivery and shows the retry button.
+It also sends to any recipient whose original send failed.
+The retry preserves the closed ask and the next-step notice state for each accepted send.
 
 At server start, the server sends each Go that has an unsent recipient again, through the same path.
 It sends only to the recipients that the message did not reach.
@@ -2881,6 +2926,12 @@ The user receives no delivery alert.
 
 At startup, the server delivers pending records with the same retry and alert rules.
 New item saves a first-message marker before it writes the native record.
+A separately selected assignee receives a copy of the saved words.
+The server saves the copy before it claims the first message.
+For a Scheduled draft, the List saves the copy with the item before the server sends the assignment notices.
+Send and Retry attempt the saved copy even when an assignment notice needs a retry.
+The copy omits the main recipient's reply command.
+Retry sends only copies whose delivery is unconfirmed.
 For a List Send, the server saves the List route before it writes the native record.
 The server holds the recipient locks while it reserves a List number and saves the linked row.
 It releases the recipient locks before it takes the delivery lock.

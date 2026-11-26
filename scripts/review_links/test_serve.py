@@ -630,9 +630,16 @@ class ReviewLinksServerTests(unittest.TestCase):
                     retry = self.new_item_http(body, finished=True)
                     self.assertEqual(retry.status, 200, retry.body)
                     self.assertEqual(json.loads(retry.body), saved)
-                    send.assert_called_once_with(f"session:{producer.current_session}", change_page.SENDER, ANY)
-                    if assignee is not None:
-                        self.assertIn(f"{assignee.name} is the assignee.", cast(str, send.call_args.args[2]))
+                    if assignee is None:
+                        send.assert_called_once_with(f"session:{producer.current_session}", change_page.SENDER, ANY)
+                    else:
+                        primary, copy = send.call_args_list
+                        self.assertEqual(primary.args[0], f"session:{producer.current_session}")
+                        self.assertIn(f"{assignee.name} is the assignee.", cast(str, primary.args[2]))
+                        self.assertEqual(copy.args[0], f"session:{assignee.current_session}")
+                        message = cast(str, copy.args[2])
+                        self.assertTrue(message.endswith("\n\nNate's words:\n" + request.words))
+                        self.assertNotIn("Answer with", message)
 
     def test_new_item_refuses_fresh_legacy_sends_to_a_showrunner(self) -> None:
         case = self.review_fixture()
@@ -1799,6 +1806,38 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.check_list_notice_recovery(stop_before_row=True, retire_producer=scenario == "retired",
                                                 authority_unavailable=scenario == "authority unavailable",
                                                 answered_marker=scenario == "staff unavailable with answered marker")
+
+    def test_new_item_recovers_the_assignee_copy_after_the_first_claim(self) -> None:
+        case = self.review_fixture()
+        owner = case.ready_submission_recipient()
+        assignee = case.fixture.unit
+        producer = fixture_member("producer", name="dwight")
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\npage.review.owner={owner.id}\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        request = new_item_dialog.NewItemRequest(
+            "r6-" + uuid4().hex, new_item_dialog.SubmissionKind.INVESTIGATION, producer.id,
+            "Check the assignee copy.", new_item_dialog.NoEvidence(), page="review",
+            page_recipient=new_item_dialog.PageRecipient.PRODUCER, assignment=new_item_dialog.ChosenAssignee(assignee.id))
+        body = self.new_item_body(request)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              capture_sender("send_message") as send):
+            with patch.object(review_actions, "claim_saved_assignee_copy", side_effect=OSError("Server stopped.")):
+                failed = self.new_item_http(body, finished=True)
+            self.assertEqual(failed.status, 503, failed.body)
+            self.assertEqual(tuple(review_submissions.pending_initial_deliveries(case.root)), ())
+            send.assert_called_once_with(f"session:{producer.current_session}", change_page.SENDER, ANY)
+            send.reset_mock()
+            restarted = change_page.DeliveryStatus(case.root)
+            change_page.recover_pending(restarted)
+            review_actions.recover_submission_deliveries(restarted, review_page.PAGE_PATH)
+            send.assert_called_once_with(f"session:{assignee.current_session}", change_page.SENDER, ANY)
+            self.assertTrue(cast(str, send.call_args.args[2]).endswith("Nate's words:\n" + request.words))
+            send.reset_mock()
+            change_page.recover_pending(change_page.DeliveryStatus(case.root))
+            send.assert_not_called()
 
     def check_list_notice_recovery(self, *, stop_before_row: bool, retire_producer: bool = False,
                                    authority_unavailable: bool = False, answered_marker: bool = False) -> None:
@@ -4460,7 +4499,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                    "words": "Check the Scheduled item. Start 2099-11-30T09:00Z."}
         body = json.dumps(request).encode()
         sent = send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("sent", "", ""))
-        with patch.object(unrouted_alert, "message_outcome", return_value=(sent, "")) as notify:
+        with (patch.object(unrouted_alert, "message_outcome", return_value=(sent, "")) as notify,
+              capture_sender("send_message") as send):
             response = self.new_item_http(body, finished=True)
             self.assertEqual(response.status, 200, response.body)
             saved = cast(dict[str, str], json.loads(response.body))
@@ -4470,7 +4510,91 @@ class ReviewLinksServerTests(unittest.TestCase):
             changed = json.dumps({**request, "assignee_id": None}).encode()
             self.assertEqual(self.new_item_http(changed, finished=True).status, 409)
             self.assertEqual(notify.call_count, 2)
+            send.assert_called_once()
+            self.assertEqual(send.call_args.args[0], f"session:{case.fixture.unit.current_session}")
+            self.assertTrue(cast(str, send.call_args.args[2]).endswith("\n\nNate's words:\n" + request["words"]))
         self.assertEqual(the_list.records(morty.id), [item])
+
+    def test_scheduled_new_item_recovers_assignee_copy_after_assignment_failure(self) -> None:
+        case = self.review_fixture()
+        producer = fixture_member("producer", name="dwight")
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
+        _ = write_config_fixture(conf.path("the_list"), "series_run_limit=730\n")
+        draft = "s1-" + uuid4().hex
+        words = "Check the Scheduled item. Start 2099-11-30T09:00Z."
+        body = json.dumps({"token": self.server.new_item_token, "kind": "scheduled", "page": "list",
+                           "page_recipient": "producer", "request_id": draft,
+                           "recipient_id": producer.id, "assignee_id": case.fixture.unit.id,
+                           "words": words}).encode()
+        sent = send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("sent", "", ""))
+        pending = send_result.UnconfirmedSendOutcome()
+        copy_saved_before_send: list[bool] = []
+
+        def fail_producer(recipient: staff.StaffId, _sender: str, _message: str, *_options: str
+                          ) -> tuple[send_result.ConfirmedSendOutcome | send_result.UnconfirmedSendOutcome, str]:
+            if recipient == producer.id:
+                item, = the_list.records(morty.id)
+                saved = the_list.feedback_requests(item).get(draft)
+                copy_saved_before_send.append(saved is not None and saved.state == "pending")
+                return pending, "The producer is offline."
+            return sent, ""
+
+        with capture_sender("send_message") as send:
+            with (patch.object(unrouted_alert, "message_outcome", side_effect=fail_producer),
+                  patch.object(change_page, "send_to_staff", return_value="pending")):
+                response = self.new_item_http(body, finished=True)
+            self.assertEqual(response.status, 503, response.body)
+            self.assertEqual(copy_saved_before_send, [True])
+            send.assert_not_called()
+            list_page.recover_pending(self.root)
+            send.assert_called_once_with(f"session:{case.fixture.unit.current_session}", change_page.SENDER, ANY)
+            self.assertTrue(cast(str, send.call_args.args[2]).endswith("\n\nNate's words:\n" + words))
+            with patch.object(unrouted_alert, "message_outcome", return_value=(sent, "")):
+                retry = self.new_item_http(body, finished=True)
+                self.assertEqual(retry.status, 200, retry.body)
+            list_page.recover_pending(self.root)
+            send.assert_called_once()
+
+    def test_scheduled_new_item_sends_the_assignee_copy_when_the_producer_is_unavailable(self) -> None:
+        case = self.review_fixture()
+        producer = fixture_member("producer", name="dwight")
+        morty = fixture_member("producer", name="morty")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\n")
+        _ = write_config_fixture(conf.path("the_list"), "series_run_limit=730\n")
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\n")
+        draft = "s1-" + uuid4().hex
+        words = "Check the Scheduled item. Start 2099-11-30T09:00Z."
+        assignee = case.fixture.unit.id
+        body = json.dumps({"token": self.server.new_item_token, "kind": "scheduled", "page": "list",
+                           "page_recipient": "producer", "request_id": draft, "recipient_id": producer.id,
+                           "assignee_id": assignee, "words": words}).encode()
+        sent = send_result.ConfirmedSendOutcome(send_result.OutcomeHeader("sent", "", ""))
+        pending = send_result.UnconfirmedSendOutcome()
+
+        def fail_producer(recipient: staff.StaffId, _sender: str, _message: str, *_options: str
+                          ) -> tuple[send_result.ConfirmedSendOutcome | send_result.UnconfirmedSendOutcome, str]:
+            return (pending, "The producer is offline.") if recipient == producer.id else (sent, "")
+
+        with (patch.object(unrouted_alert, "message_outcome", side_effect=fail_producer),
+              patch.object(change_page, "send_to_staff", return_value="pending") as send):
+            response = self.new_item_http(body, finished=True)
+            self.assertEqual(response.status, 503, response.body)
+            send.assert_called_once()
+            first = send.call_args
+            self.assertEqual(first.args[0], assignee)
+            self.assertTrue(cast(str, first.args[2]).endswith("\n\nNate's words:\n" + words))
+
+            send.return_value = None
+            response = self.new_item_http(body, finished=True)
+            self.assertEqual(response.status, 503, response.body)
+            self.assertEqual(send.call_args_list, [first, first])
+            item, = the_list.records(morty.id)
+            self.assertEqual(the_list.feedback_requests(item)[draft].state, "sent")
+
+            response = self.new_item_http(body, finished=True)
+            self.assertEqual(response.status, 503, response.body)
+            self.assertEqual(send.call_count, 2)
 
     def test_new_item_sends_each_type_to_each_producer_in_the_to_row(self) -> None:
         case = self.review_fixture()
@@ -4752,12 +4876,13 @@ class ReviewLinksServerTests(unittest.TestCase):
             def add_after_intervening_item(keeper: staff.StaffId, title: str, *, owner: the_list.ItemOwner,
                                           source: str, changes: the_list.ItemChanges,
                                           new_item_draft_id: review_submissions.ListDraftOrigin,
+                                          assignee_copy: the_list.ScheduledAssigneeCopy | the_list.NoScheduledAssigneeCopy,
                                           before_save: Callable[[int], None] | None) -> the_list.ListItem:
                 if not intervening:
                     other = add(keeper, "Intervening item", owner=owner, source=source, changes={})
                     intervening.append(other.id)
                 return add(keeper, title, owner=owner, source=source, changes=changes,
-                           new_item_draft_id=new_item_draft_id, before_save=before_save)
+                           new_item_draft_id=new_item_draft_id, assignee_copy=assignee_copy, before_save=before_save)
 
             with self.subTest(allocation="intervening item"):
                 draft = "s1-" + uuid4().hex
@@ -5538,6 +5663,32 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(self.post(review_page.PAGE_PATH, case.card_body(cache.get(), key, 'later')+'&later=2030-12-02T18%3A30')[0], 200)
             self.assertTrue(complete.wait(TEST_HANG_GUARD_SECS))
             self.assertEqual(events, ['invalidate', 'respond', 'deliver'])
+
+    def test_review_words_http_reports_a_retry_and_its_confirmed_replay(self) -> None:
+        case = self.review_fixture()
+        row = case.question()
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        snapshot = cache.get()
+        owner = snapshot.records[row].owner
+        body = case.card_body(snapshot, row, 'later', 'Keep the notes.') + '&later=2099-12-02T18%3A30'
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(change_page, "send_to_staff", side_effect=OSError("offline")) as failed):
+            code, payload = self.post(review_page.PAGE_PATH, body)
+        self.assertEqual(code, 200, payload)
+        self.assertEqual(json.loads(payload)["words_delivery"], "failed")
+        first, = [attempt for attempt in failed.call_args_list if attempt.args[0] == owner]
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(self.server, "review_cache", cache),
+              patch.object(review_actions, "later", side_effect=AssertionError("Later repeated")),
+              patch.object(change_page, "send_to_staff") as send):
+            for _ in range(2):
+                code, payload = self.post(review_page.PAGE_PATH, body + '&feedback_retry=1')
+                self.assertEqual(code, 200, payload)
+                self.assertEqual(json.loads(payload)["words_delivery"], "delivered")
+        self.assertEqual(send.call_args_list, [first])
 
     def test_review_save_publishes_the_current_record_before_reply(self) -> None:
         case = self.review_fixture()
@@ -7524,6 +7675,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     delivery.assert_not_called()
             for action in ("read", "park", "tell", "remove"):
                 fields["action"] = action
+                fields["words"] = "" if action in ("read", "park") else "Explain this simply."
                 with self.subTest(action=action):
                     before = the_list.load(morty.id, item.id)
                     self.assertEqual(self.post(list_page.PAGE_PATH, urlencode({**fields, "token": "bad"}))[0], 400)
@@ -7608,7 +7760,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         return sorted((self.root / go_ledger.LEDGER_FOLDER).glob("*.json"))
 
     def post_go(self, body: str, *, client: str = "127.0.0.1",
-                send_error: Exception | Callable[..., None] | None = None) -> tuple[int, bytes, Mock]:
+                send_error: Exception | Callable[..., Literal["pending"] | None] | None = None
+                ) -> tuple[int, bytes, Mock]:
         """Post one Go and wait until its delivery ends."""
         delivered = threading.Event()
         deliver = list_page.deliver_go
@@ -7620,7 +7773,7 @@ class ReviewLinksServerTests(unittest.TestCase):
 
         def deliver_and_finish(ledger: Path, go_id: str) -> None:
             try:
-                deliver(ledger, go_id)
+                _ = deliver(ledger, go_id)
             finally:
                 delivered.set()
         with (patch.object(change_page, "send_to_staff", side_effect=send_error) as delivery,
@@ -7668,6 +7821,75 @@ class ReviewLinksServerTests(unittest.TestCase):
         for sent_call in delivery.call_args_list:
             messages.setdefault(cast(str, sent_call.args[0]), []).append(cast(str, sent_call.args[2]))
         return messages
+
+    def test_list_words_http_retries_the_saved_delivery_once_without_parking(self) -> None:
+        morty, item = self.list_keeper_item("Park with words")
+        _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((morty,))))
+        root = self.server.root
+        request, token = list_page.signed_item_request(list_page.ListRecord(morty.id, item), list_page.form_secret(root))
+        fields = {"keeper": morty.id, "id": item.id, "request": request, "token": token,
+                  "action": "park", "until": "delivered", "words": "Keep the notes."}
+        started = threading.Event()
+        release = threading.Event()
+        _ = write_config_fixture(conf.path("review_links"), "delivery_tries=1\ndelivery_pause_seconds=0\n")
+
+        def fail_first(_owner: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
+            started.set()
+            if not release.wait(5):
+                raise change_page.UnconfirmedSend("The action response did not arrive first.")
+            raise OSError("The recipient is offline.")
+
+        with (patch.object(change_page, "send_to_staff", side_effect=fail_first) as first_send,
+              patch.object(change_page, "alert_delivery_failures", return_value=True)):
+            try:
+                code, payload = self.post(list_page.PAGE_PATH, urlencode(fields))
+                self.assertEqual(code, 200, payload)
+                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                reply = cast(dict[str, str], json.loads(payload))
+                self.assertTrue(reply["words_receipt"])
+                self.assertNotIn("send_failure", reply)
+            finally:
+                release.set()
+            status = {key: fields[key] for key in ("keeper", "id", "request", "token")}
+            status.update({"item-state": item.id, "words-status": "1"})
+            path = list_page.PAGE_PATH + "?" + urlencode(status)
+            response = self.request(path + "&delivery=" + reply["delivery"])
+            self.assertEqual(response.status, 200, response.body)
+            self.assertEqual(json.loads(response.body)["words_delivery"], "failed")
+        _ = the_list.unpark(morty.id, item.id, source="morty")
+        response = self.request(path)
+        self.assertEqual(response.status, 200, response.body)
+        self.assertEqual(json.loads(response.body)["words_delivery"], "failed")
+
+        started.clear()
+        release.clear()
+        responses: list[tuple[int, bytes]] = []
+        retry = urlencode({**fields, "action": "retry-words"})
+
+        def send_saved(_owner: staff.StaffId, _sender: str, _message: str, **_options: str) -> None:
+            started.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise AssertionError("Concurrent retry did not return.")
+
+        with (patch.object(change_page, "send_to_staff", side_effect=send_saved) as send,
+              patch.object(the_list, "park", side_effect=AssertionError("Park repeated"))):
+            worker = threading.Thread(target=lambda: responses.append(self.post(list_page.PAGE_PATH, retry)))
+            worker.start()
+            try:
+                self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
+                code, payload = self.post(list_page.PAGE_PATH, retry)
+                self.assertEqual(code, 200, payload)
+                self.assertEqual(json.loads(payload)["words_delivery"], "unconfirmed")
+            finally:
+                release.set()
+                worker.join(TEST_HANG_GUARD_SECS)
+            code, payload = responses[0]
+            self.assertEqual(code, 200, payload)
+            self.assertEqual(json.loads(payload)["words_delivery"], "delivered")
+            self.assertEqual(self.post(list_page.PAGE_PATH, retry), (code, payload))
+        self.assertEqual(send.call_args_list, first_send.call_args_list)
+        self.assertIs(the_list.load(morty.id, item.id).parked_until, the_list.NoTimestamp.UNSET)
 
     def test_list_go_on_the_last_ask_of_a_waiting_item_sets_working_and_sends_the_producer_one_message(self) -> None:
         morty, unit, item, _ask, body = self.go_fixture(waiting=True)
@@ -7746,6 +7968,43 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn(f"update --id {item.id} --source morty --next-step", sent[0][1])
         self.assertEqual((notice().state, go_ledger.read(self.root, go_id)["sent"]), ("sent", {unit.id: True, morty.id: True}))
         self.assertEqual(self.restart_and_recover_all(), [])
+
+    def test_list_go_words_retry_only_the_recipient_whose_send_is_pending(self) -> None:
+        morty, unit, item, _ask, body = self.go_fixture(waiting=True)
+        body += "&" + urlencode({"words": "Check the notes."})
+
+        def pending_morty(recipient: staff.StaffId, _sender: str, _message: str,
+                          **_options: str) -> Literal["pending"] | None:
+            return "pending" if recipient == morty.id else None
+
+        with patch.object(change_page, "alert_delivery_failures") as alert:
+            code, reply, initial = self.post_go(body, send_error=pending_morty)
+            self.assertEqual(code, 200, reply)
+            self.assertEqual([attempt.args[0] for attempt in initial.call_args_list], [unit.id, morty.id])
+            go_id = self.go_ledger_records()[0].stem
+            entry = go_ledger.read(self.root, go_id)
+            self.assertEqual(entry["sent"], {unit.id: True, morty.id: True})
+            self.assertEqual(entry["reported"], {unit.id: False, morty.id: False})
+            saved = the_list.load(morty.id, item.id)
+            next_step = the_list.feedback_requests(saved)[the_list.go_next_step_request(go_id)]
+            self.assertEqual(next_step.state, "sent")
+            message = cast(str, initial.call_args.args[2])
+            self.assertIn("Nate's words:\nCheck the notes.", message)
+            self.assertIn("--next-step", message)
+            with (patch.object(change_page, "send_to_staff") as retry,
+                  patch.object(the_list, "give_go", side_effect=AssertionError("Go repeated"))):
+                list_page.recover_goes(self.root)
+                code, reply = self.post(go_ledger.GO_PATH, body + "&delivery-mode=status")
+                self.assertEqual((code, json.loads(reply)["words_delivery"]), (200, "unconfirmed"))
+                retry.assert_not_called()
+                for _ in range(2):
+                    code, reply = self.post(go_ledger.GO_PATH, body + "&delivery-mode=retry")
+                    self.assertEqual((code, json.loads(reply)["words_delivery"]), (200, "delivered"))
+                code, reply = self.post(go_ledger.GO_PATH, body + "&delivery-mode=status")
+                self.assertEqual((code, json.loads(reply)["words_delivery"]), (200, "delivered"))
+            self.assertEqual(retry.call_args_list, [initial.call_args])
+            self.assertEqual(the_list.load(morty.id, item.id), saved)
+        alert.assert_not_called()
 
     def test_list_go_sends_another_producer_the_next_step_alone(self) -> None:
         bob = staff.StaffRow(staff.StaffId("fixture-bob"), "producer", "bob", staff.StaffRoot(),

@@ -507,6 +507,10 @@ class ListItemDestination:
     def payload_hash(self) -> str:
         return self.claim.payload_hash
 
+    @property
+    def assignment_notices_pending(self) -> bool:
+        return any(notice.recipient not in self.confirmed for notice in self.claim.notices)
+
 
 class DraftAlreadyFiled(SubmissionConflict):
     def __init__(self, identity: str) -> None:
@@ -1998,17 +2002,12 @@ def file_list_draft(draft_id: new_item_dialog.ScheduledDraftId, payload_hash: st
             _publish_receipt(folder, saved)
         else:
             atomic_file.sync_folder(folder)
-        failed = False
         for notice in saved.claim.notices:
             if notice.recipient in saved.confirmed:
                 continue
             if deliver(notice, saved.id, f"new-item:{request_id}:{notice.role}"):
                 saved = replace(saved, confirmed=(*saved.confirmed, notice.recipient))
                 _write_location(receipt, saved)
-            else:
-                failed = True
-        if failed:
-            raise OSError(f"{saved.id} is saved. An assignment notice needs a retry.")
         return saved
 
 
