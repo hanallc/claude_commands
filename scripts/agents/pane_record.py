@@ -228,9 +228,22 @@ def _no_claude_role_fallback() -> ClaudeResumeSettings:
     return NO_CLAUDE_RESUME_SETTINGS
 
 
+def member_compact_window(session_id: str, record: staff.StaffSnapshot | None = None, *,
+                          configuration: models_registry.LaunchModelConfiguration | None = None) -> list[str]:
+    """Give the `--autocompact` option for a Claude launch of the staff member that owns `session_id`."""
+    from scripts.production import staff
+
+    owner = (staff.initial_snapshot() if record is None else record).by_member_reference(session_id)
+    if owner is None or owner.kind == "session":
+        return []
+    return models_registry.compact_window_arguments(owner.kind, session_id=session_id, configuration=configuration)
+
+
 def resume_arguments(entry: PaneLaunch, *,
-                     claude_role_fallback: Callable[[], ClaudeResumeSettings] = _no_claude_role_fallback) -> list[str]:
-    """Build resume arguments with the latest Claude settings when available."""
+                     claude_role_fallback: Callable[[], ClaudeResumeSettings] = _no_claude_role_fallback,
+                     record: staff.StaffSnapshot | None = None,
+                     configuration: models_registry.LaunchModelConfiguration | None = None) -> list[str]:
+    """Build resume arguments with the latest Claude settings and the owner's compact window when available."""
     current = resume_launch(entry) if "session_id" not in entry else entry
     if pane_launch.saved_kind(current) == "codex":
         return _resume_arguments(current)
@@ -240,32 +253,46 @@ def resume_arguments(entry: PaneLaunch, *,
     settings = claude_resume_settings(turn, fallback=ClaudeResumeSettings(model=current["model"]))
     if not settings.model or not settings.effort:
         settings = claude_resume_settings(settings, fallback=claude_role_fallback())
-    return _resume_arguments(current, claude_settings=settings)
+    return _resume_arguments(current, claude_settings=settings,
+                             compact_window=member_compact_window(current["session_id"], record, configuration=configuration))
 
 
 def _resume_arguments(entry: pane_launch.NativePaneLaunch, *,
-                      claude_settings: ClaudeResumeSettings = NO_CLAUDE_RESUME_SETTINGS) -> list[str]:
+                      claude_settings: ClaudeResumeSettings = NO_CLAUDE_RESUME_SETTINGS,
+                      compact_window: Sequence[str] = ()) -> list[str]:
     if pane_launch.saved_kind(entry) == "codex":
         arguments = ["resume", entry["session_id"]]
         if entry["model"]:
             arguments.extend(("--model", entry["model"]))
         arguments.extend(entry.get("codex_policy", []))
         return arguments
-    arguments = ["--resume", entry["session_id"]]
-    if entry["name"]:
-        arguments.extend(("-n", entry["name"]))
-    if entry["remote_control"]:
-        arguments.extend(("--remote-control", entry["name"]) if entry["name"] else ("--remote-control",))
-    arguments.extend(claude_settings.arguments())
-    for directory in entry.get("plugin_directories", []):
+    return claude_conversation_arguments(entry["session_id"], entry["name"], claude_settings,
+        entry.get("plugin_directories", []), remote_control=entry["remote_control"], compact_window=compact_window)
+
+
+def claude_conversation_arguments(session: str, name: str, settings: ClaudeResumeSettings,
+                                  plugins: Sequence[str], *, remote_control: bool, fork: bool = False,
+                                  compact_window: Sequence[str] = ()) -> list[str]:
+    """Build the common Claude arguments for resume and fork."""
+    arguments = ["--resume", session]
+    if fork:
+        arguments.append("--fork-session")
+    if name:
+        arguments.extend(("-n", name))
+    if remote_control:
+        arguments.extend(("--remote-control", name) if name else ("--remote-control",))
+    arguments.extend(settings.arguments())
+    arguments.extend(compact_window)
+    for directory in plugins:
         arguments.extend(("--plugin-dir", directory))
     arguments.extend(("--settings", '{"disableAgentView": true}'))
     return arguments
 
 
 def configured_resume_arguments(entry: PaneLaunch, identity: str, name: str,
-                                settings: models_registry.LaunchSettings) -> list[str]:
-    """Apply current model settings and retain the saved resume options."""
+                                settings: models_registry.LaunchSettings, *,
+                                configuration: models_registry.LaunchModelConfiguration) -> list[str]:
+    """Apply a producer's current model settings and compact window; retain the saved resume options."""
     current = resume_launch(entry) if "session_id" not in entry else cast(pane_launch.CurrentLaunch, entry.copy())
     current.update(kind=settings.kind, session_id=identity, name=name, model=settings.model)
     if settings.kind == "codex":
@@ -281,7 +308,7 @@ def configured_resume_arguments(entry: PaneLaunch, identity: str, name: str,
         current["codex_policy"] = policy
     arguments = _resume_arguments(current, claude_settings=ClaudeResumeSettings(model=settings.model))
     if settings.kind == "claude":
-        arguments.extend(("--effort", settings.effort))
+        arguments.extend(("--effort", settings.effort, *models_registry.compact_window_arguments("producer", configuration=configuration)))
     return arguments
 
 
@@ -388,14 +415,18 @@ def _needed(name: str) -> bool:
 
 def _environment(parts: Sequence[bytes]) -> dict[str, str]:
     pairs = (os.fsdecode(part).partition("=") for part in parts if b"=" in part)
-    return {key: value for key, _, value in pairs if _needed(key)}
+    return {key: value for key, _, value in pairs if _captured_launch_variable(key)}
+
+
+def _captured_launch_variable(name: str) -> bool:
+    return name == "HOME" or _needed(name)
 
 
 def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     # Imported here: the Linux hook never needs the account module.
     from scripts.whoami.account import kern_procargs2, procargs2_parts
 
-    parts = procargs2_parts(kern_procargs2(pid), _needed)
+    parts = procargs2_parts(kern_procargs2(pid), _captured_launch_variable)
     return list(parts.arguments), parts.environment
 
 
@@ -426,8 +457,8 @@ def pane_shell_pid(place: herdr.HerdrPlace) -> int:
 def _arguments(pid: int) -> list[str]:
     if sys.platform == "darwin":
         return _mac_record(pid)[0]
-    raw = (PROC / str(pid) / "cmdline").read_bytes()
-    return [os.fsdecode(part) for part in raw.split(b"\0") if part]
+    raw = (Path(os.environ.get("HERDR_PROC") or PROC) / str(pid) / "cmdline").read_bytes()
+    return [os.fsdecode(part) for part in raw.removesuffix(b"\0").split(b"\0")] if raw else []
 
 
 def process_arguments(pid: int) -> list[str]:

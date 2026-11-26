@@ -22,6 +22,7 @@ from scripts.build_queue.test_placement import (
 from scripts.build_hold import build_hold
 from scripts.build_targets import build_targets
 from scripts.buildlog import store
+from scripts.lib import conf
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import admission_policy_fixture, write_pressure_reading
 from scripts.production import land_runs
@@ -538,7 +539,7 @@ class QueueMoveTests(unittest.TestCase):
             inputs = replace(inputs, host=records.HostMemory(60 * GIB, 60 * GIB),
                              spacing=records.ReadyToStart())
             policy = replace(admission_policy_fixture(),
-                repository_runs=records.RepositoryRunLimits({f"{inputs.local_machine}.fixture": 1}))
+                repository_runs=records.RepositoryRunLimits({f"{conf.host_key_name(inputs.local_machine)}.fixture": 1}))
             capped_wait, memory_wait, follower_wait = gate.admission_pass(inputs, inputs.now, policy).rows
             self.assertFalse(memory_wait.decision.room.passes)
             self.assertEqual(capped_wait.decision.run_limit,
@@ -1176,7 +1177,7 @@ class QueueMoveTests(unittest.TestCase):
             self.assertIsInstance(fixture.server.handle_request(wire.QueueMoveRequest(
                 "stale", first, line.revision, wire.QueueDrop(third, "before")))[0], wire.QueueMoveConflict)
             self.assertEqual(fixture.server.handle_request(
-                wire.PriorityClearRequest("clear-later", "fixture", unit="later-unit")), [wire.Ok()])
+                wire.PriorityClearRequest("clear-later", "fixture", unit="later-unit", why="clear words")), [wire.Ok()])
             after_clear = [third, merge, urgent, new_id, first, second]
             self.assertEqual(ids(move_line(fixture)), after_clear)
             self.assertEqual(fixture.completed_queue_change(wire.PrioritySetRequest(
@@ -1191,7 +1192,7 @@ class QueueMoveTests(unittest.TestCase):
             restored, = fixture.server.handle_request(wire.QueueMoveRequest(
                 "move-after-undo", third, undone.line.revision, wire.QueueDrop(merge, "before")))
             assert isinstance(restored, wire.QueueMoved)
-            self.assertEqual(fixture.server.handle_request(wire.PriorityClearRequest("clear", "fixture")), [wire.Ok()])
+            self.assertEqual(fixture.server.handle_request(wire.PriorityClearRequest("clear", "fixture", why="clear words")), [wire.Ok()])
             self.assertIsInstance(fixture.server.priority, records.NoQueuePriority)
             self.assertEqual(ids(move_line(fixture)), [third, new_id, merge, urgent, first, second])
             fixture.free(60 * GIB)

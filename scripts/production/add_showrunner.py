@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from scripts.production import completion_receipt, staff
+from scripts.production import completion_receipt, session_staff, staff
 from scripts.herdr import herdr_types
 from scripts.lib import models_registry
 from scripts.agents.remote import local_machine
@@ -199,7 +199,8 @@ def account_for_launch(child: ProductionDocument, resume: str | None, target: st
 
 def launch(child: ProductionDocument, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount,
            *, identity: ShowrunnerLaunch | NewShowrunnerLaunch = NEW_SHOWRUNNER_LAUNCH,
-           before_prompt: Callable[[herdr.SessionTranscript], object] | None = None) -> herdr.PromptSubmitOutcome:
+           before_prompt: Callable[[herdr.SessionTranscript], object] | None = None,
+           configuration: models_registry.LaunchModelConfiguration | None = None) -> herdr.PromptSubmitOutcome:
     """Start once and prove the opening prompt reached this showrunner's transcript."""
     from scripts.message import sessions
     from scripts.whoami.account import named_account_environment
@@ -217,13 +218,16 @@ def launch(child: ProductionDocument, model: str, effort: str, resume: str | Non
     from scripts.agents.launch_names import LaunchNames
 
     name = LaunchNames.read().name(session_id, child.name)
-    arguments.extend(["--remote-control", name, "-n", name, "--settings", '{"disableAgentView": true}'])
+    configuration = models_registry.optional_launch_snapshot() if configuration is None else configuration
+    arguments.extend(["--remote-control", name, "-n", name,
+                      *models_registry.compact_window_arguments("showrunner", configuration=configuration),
+                      "--settings", '{"disableAgentView": true}'])
     environment = {"ENABLE_TOOL_SEARCH": "true"}
     environment.update(named_account_environment(selected.dir))
     host = herdr.shared_session()
     _ = herdr.start_server(host, 90_000)
     launched = herdr.launch_agent(host, child.name, name, str(cwd),
-        environment, kind="claude", agent=name, agent_arguments=arguments,
+        configuration.environment(environment), kind="claude", agent=name, agent_arguments=arguments,
         opening=herdr.OpeningPrompt(prompt, transcript,
             before_prompt if before_prompt is not None else
             lambda observed: ensure_staff_showrunner(child, runtime_id=observed.session_id)), timeout_ms=90_000)
@@ -278,15 +282,20 @@ def _main(argv: list[str]) -> int:
         parser.error("--model and --effort go together")
     caller = showrunners.own_name()
     try:
+        configuration = models_registry.optional_launch_snapshot() if model else models_registry.launch_snapshot()
         if not model:
-            default = models_registry.launch_settings("production", "showrunner", "claude")
+            default = models_registry.launch_settings("production", "showrunner", "claude", configuration=configuration)
             model, effort = default.model, default.effort
         record = staff.initial_snapshot()
         name = cast(str, args.production)
         doc = cast(Path | None, args.doc)
         existing = any(row.kind == "showrunner" and (row.name == name or row.id == name) for row in record.rows)
         child = read_new_production(doc, name) if doc and not existing else read_production(name, record=record)
-        where = cwd or child.checkout
+        if not existing:
+            from scripts.production.production_lifecycle import require_new_document
+
+            require_new_document(child)
+        where = session_staff.production_session_directory(child.doc, cwd or child.checkout)
         selected = account_for_launch(child, resume, cast(str, args.account), cast(str, args.config_dir))
         identity = ShowrunnerLaunch(resume or "", selected.dir, datetime.now(UTC))
         place: herdr.HerdrPlace | herdr.NotInHerdr = herdr.NotInHerdr()
@@ -373,7 +382,7 @@ def _main(argv: list[str]) -> int:
                     place.pane, herdr.OpeningPrompt(prompt, transcript, may_type=False), identity.started_at, 90_000)
         else:
             outcome = launch(child, model, effort, resume, where, selected,
-                             identity=identity, before_prompt=published)
+                             identity=identity, before_prompt=published, configuration=configuration)
     except herdr.AgentNotReady as error:
         print(f"add_showrunner: the session is not ready:\n{error.screen}", file=sys.stderr)
         return SESSION_NOT_READY

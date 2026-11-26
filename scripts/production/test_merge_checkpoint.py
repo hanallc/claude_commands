@@ -21,7 +21,7 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path, PurePosixPath
-from typing import cast, final
+from typing import cast, final, override
 from zoneinfo import ZoneInfo
 
 from scripts.production import merge_checkpoint
@@ -81,7 +81,7 @@ class CheckpointTestFolderTests(unittest.TestCase):
             self.assertEqual(steps[1].command[-4:], ["example", "aws-routing-proof", "--name", "demo"])
             self.assertEqual(steps[1].folder, checkout)
 
-    def test_package_commands_and_retries_use_the_package_folder(self) -> None:
+    def test_package_commands_use_the_workspace_and_retries_use_the_package_folder(self) -> None:
         for workspace in (False, True):
             for retry in (False, True):
                 with self.subTest(workspace=workspace, retry=retry), tempfile.TemporaryDirectory(dir=os.environ["ZONE_STATE"]) as temporary:
@@ -99,8 +99,9 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     _ = verify.write_text(
                         f"#!{sys.executable}\nfrom pathlib import Path\nimport sys\n"
                         + "print(f'{sys.argv[1]}={Path.cwd()}')\n"
-                        + ("if sys.argv[1] == 'test' and not Path('retried').exists():\n"
-                           + "    Path('retried').touch()\n    sys.exit(1)\n" if retry else ""))
+                        + ("marker = Path(__file__).with_name('retried')\n"
+                           + "if sys.argv[1] == 'test' and not marker.exists():\n"
+                           + "    marker.touch()\n    sys.exit(1)\n" if retry else ""))
                     verify.chmod(0o755)
                     production = production_doc.ProductionDocument(checkout / "production.md", "fixture", "merge", checkout,
                                                           checkout / "production.log", ZoneInfo("UTC"))
@@ -108,9 +109,14 @@ class CheckpointTestFolderTests(unittest.TestCase):
                     merge_tests = ((sys.executable, "-c", "from pathlib import Path; print(f'merge={Path.cwd()}')"),)
                     with mock.patch.dict(os.environ, {"MERGE_CHECKPOINT_VERIFY": str(verify)}):
                         _ = checkpoint_gate.run_checkpoint_test_steps(
-                            production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log)
+                            production, (relative,), merge_tests, frozenset({"proof_crate"}), frozenset(), log,
+                            merge_head="fixture-merge")
                     output = log.read_text()
-                    self.assertEqual(output.count(f"test={package}\n"), 2 if retry else 1)
+                    initial_folder = checkout.resolve() if workspace else package.resolve()
+                    expected = [f"test={initial_folder}"]
+                    if retry:
+                        expected.append(f"test={package.resolve()}")
+                    self.assertEqual([line for line in output.splitlines() if line.startswith("test=")], expected)
                     self.assertIn("package_proof_crate_EXIT=" + ("1" if retry else "0"), output)
                     if retry:
                         self.assertIn("package_proof_crate_RERUN_EXIT=0", output)
@@ -121,7 +127,74 @@ class CheckpointTestFolderTests(unittest.TestCase):
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
-    def test_successful_push_lists_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
+    @override
+    def bind_fixture(self, root: Path) -> None:
+        super().bind_fixture(root)
+        for key in tuple(self.env):
+            if key.startswith("GIT_"):
+                del self.env[key]
+        self.env.update({key: value for key, value in fixture_git_environment(root.parent).items()
+                         if key.startswith("GIT_")})
+        self.env["GIT_CONFIG_SYSTEM"] = os.devnull
+
+    def test_checkpoint_protects_enrolled_live_files_before_publication(self) -> None:
+        for path, content, allowed, merge_on_main in (
+            ("live/ledger", "live bytes\n", False, False),
+            ("live/ledger", "incoming bytes\n", False, False),
+            ("live", "incoming ancestor\n", False, False),
+            ("src/alpha.txt", "ordinary checkpoint\n", True, False),
+            ("live/ledger", "incoming bytes\n", False, True),
+        ):
+            with self.subTest(path=path, content=content, merge_on_main=merge_on_main):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(self.fixture_snapshot, self.root)
+                self.bind_fixture(self.root)
+                _ = self.git("switch", "--detach", "main", cwd=self.promote)
+                _ = self.git("switch", "main")
+                integration = self.root / "integration"
+                _ = self.git("worktree", "add", str(integration), "production")
+                # The ignore rule applies to the unit worktree too.
+                checkpoint = self.checkpoint(path, content)
+                live_doc = self.checkout / "docs/plans/example-production-live.md"
+                self.write(self.checkout, str(live_doc.relative_to(self.checkout)), self.doc.read_text().replace(
+                    f"- **Showrunner checkout:** `{self.checkout}`",
+                    f"- **Showrunner checkout:** `{integration}`\n- **Merge checkout:** `{self.checkout}`").replace(
+                        "- **Log:** `production.log`", "- **Log:** `live/ledger`"))
+                self.write(self.checkout, "live/ledger", "live bytes\n")
+                with (self.checkout / ".git/info/exclude").open("a", encoding="utf-8") as exclude:
+                    _ = exclude.write("\n/live/ledger\n")
+                with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+                    if merge_on_main:
+                        _ = recorded_showrunner("other", live_doc)
+                        _ = self.doc.write_text(self.doc.read_text().replace(
+                            "- **Merge branch:** `production`", "- **Merge branch:** `main`"))
+                    else:
+                        owner = showrunners.owner_for("example")
+                        _ = staff.set_doc(owner.id, staff.LiveDoc(remote.local_machine(), live_doc))
+                main = self.git("rev-parse", "main")
+                original_index = self.git("write-tree")
+                original_tip = self.git("rev-parse", "production", cwd=self.origin)
+                result = self.run_checkpoint(checkpoint)
+                self.assertEqual(result.process.returncode == 0, allowed, result.process.stdout + result.process.stderr)
+                self.assertEqual(self.git("rev-parse", "HEAD"), main)
+                self.assertEqual(self.git("write-tree"), original_index)
+                log = (self.checkout / "live/ledger").read_text()
+                if allowed:
+                    self.assertEqual(self.git("rev-parse", "HEAD^2", cwd=integration), checkpoint)
+                    self.assertIn(checkpoint, log)
+                    self.assertEqual(self.git("rev-parse", "production", cwd=self.origin),
+                                     self.git("rev-parse", "HEAD", cwd=integration))
+                else:
+                    self.assertIn("merge: held — incoming tree conflicts with live production files",
+                                  result.process.stdout)
+                    self.assertIn(str(self.checkout / "live/ledger"), result.process.stdout)
+                    self.assertEqual(log, "live bytes\n")
+                    self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
+                    self.assertEqual(self.git("rev-parse", "HEAD", cwd=integration), original_tip)
+                    if merge_on_main:
+                        self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), main)
+
+    def test_successful_push_ends_landed_worktrees_and_keeps_dirty_worktrees(self) -> None:
         checkout = Path(__file__).resolve().parents[2]
         records = self.root / "worktree-records"
         config = self.root / "staff.conf"
@@ -902,18 +975,20 @@ raise SystemExit(1)
                       never_pushed.process.stdout)
         self.assertEqual(never_pushed.process.stdout, unpushed.process.stdout)
     def test_checkpoint_on_second_origin_branch_merges_the_checkpoint_and_names_branch(self) -> None:
-        for outcome in ("live-owner", "ancestor", "equal-patch", "merge-branch", "moved", "unlanded",
-                        "delete-failed", "no-promotion"):
+        for outcome in ("live-owner", "ancestor", "equal-patch", "merge-branch", "enrolled-merge-branch", "moved", "unlanded",
+                        "delete-failed", "unresolved production", "no-promotion"):
             with self.subTest(outcome=outcome):
                 shutil.rmtree(self.root)
                 _ = shutil.copytree(self.fixture_snapshot, self.root)
                 self.bind_fixture(self.root)
+                target = self.checkout
+                promote = self.promote
                 _ = self.git("checkout", "-b", "alpha-phase", cwd=self.unit)
                 sha = self.checkpoint(push=False)
                 # The request can name a commit before the branch tip.
                 later = self.checkpoint("outside.txt", "later work\n", push=False)
                 _ = self.git("push", "origin", "alpha-phase", cwd=self.unit)
-                if outcome not in ("live-owner", "equal-patch", "unlanded"):
+                if outcome not in ("equal-patch", "unlanded"):
                     _ = self.git("update-ref", "refs/heads/alpha-phase", sha, cwd=self.origin)
                 if outcome != "live-owner":
                     _ = self.git("checkout", "alpha-branch", cwd=self.unit)
@@ -929,6 +1004,26 @@ raise SystemExit(1)
                     doc = self.root / "other-production.md"
                     _ = doc.write_text("- **Merge branch:** alpha-phase\n")
                     _ = recorded_showrunner("other", doc)
+                if outcome == "unresolved production":
+                    doc = self.root / "unresolved-production.md"
+                    _ = doc.write_text("# Unresolved production\n")
+                    _ = recorded_showrunner("unresolved", doc)
+                if outcome == "enrolled-merge-branch":
+                    _ = self.git("switch", "--detach", "main", cwd=self.promote)
+                    _ = self.git("switch", "main")
+                    other = self.root / "other-integration"
+                    _ = self.git("worktree", "add", str(other), "alpha-phase")
+                    live = self.checkout / "docs/plans/other-production-live.md"
+                    self.write(self.checkout, str(live.relative_to(self.checkout)),
+                               f"- **Repository:** `{self.checkout}`\n- **Merge branch:** `alpha-phase`\n"
+                               + f"- **Merge checkout:** `{self.checkout}`\n- **Showrunner checkout:** `{other}`\n"
+                               + "- **Log:** `other.log`\n")
+                    _ = recorded_showrunner("other", live)
+                    target = self.root / "integration"
+                    _ = self.git("worktree", "add", str(target), "production")
+                    _ = self.doc.write_text(self.doc.read_text().replace(
+                        f"- **Showrunner checkout:** `{self.checkout}`", f"- **Showrunner checkout:** `{target}`"))
+                    promote = self.checkout
                 if outcome == "moved":
                     self.executable(self.checkout / ".git/hooks/pre-push", "#!/bin/sh\n"
                         + 'read local_ref local_sha remote_ref remote_sha\n'
@@ -941,7 +1036,7 @@ raise SystemExit(1)
                         + 'read old new ref\n'
                         + '[ "$new" != 0000000000000000000000000000000000000000 ]\n')
                 if outcome != "no-promotion":
-                    _ = self.doc.write_text(self.doc.read_text() + f"\n- **Promote:** {self.promote}\n")
+                    _ = self.doc.write_text(self.doc.read_text() + f"\n- **Promote:** {promote}\n")
                 _ = self.git("config", "remote.origin.fetch",
                              "+refs/heads/alpha-branch:refs/remotes/origin/alpha-branch")
                 if outcome != "no-promotion":
@@ -956,10 +1051,11 @@ raise SystemExit(1)
                     self.assertEqual(self.git("merge-base", "--is-ancestor", sha, "HEAD"), "")
                     self.assertNotIn(later, self.git("rev-list", "HEAD").splitlines())
                 else:
-                    self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
-                    self.assertNotEqual(self.git("rev-parse", "HEAD^2"), later)
-                self.assertEqual((self.checkout / "outside.txt").exists(), outcome == "equal-patch")
-                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), self.git("rev-parse", "HEAD"))
+                    self.assertEqual(self.git("rev-parse", "HEAD^2", cwd=target), sha)
+                    self.assertNotEqual(self.git("rev-parse", "HEAD^2", cwd=target), later)
+                self.assertEqual((target / "outside.txt").exists(), outcome == "equal-patch")
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin),
+                                 self.git("rev-parse", "HEAD", cwd=target))
                 remote = self.git("ls-remote", "--heads", "origin", "refs/heads/alpha-phase")
                 if outcome in ("ancestor", "equal-patch"):
                     self.assertEqual(remote, "")
@@ -969,11 +1065,13 @@ raise SystemExit(1)
                     rerun = self.run_checkpoint(sha)
                     self.assertEqual(rerun.process.returncode, 0, rerun.process.stdout + rerun.process.stderr)
                 else:
-                    expected = later if outcome in ("live-owner", "moved", "unlanded") else sha
+                    expected = later if outcome in ("moved", "unlanded") else sha
                     self.assertEqual(remote.split()[0], expected)
                     reasons = {"live-owner": "present worktree", "merge-branch": "production merge branch",
+                               "enrolled-merge-branch": "other uses this production merge branch",
                                "moved": "delete failed or branch moved", "unlanded": "work has not reached main",
-                               "delete-failed": "delete failed", "no-promotion": "no promotion configured"}
+                               "delete-failed": "delete failed", "no-promotion": "no promotion configured",
+                               "unresolved production": "no Merge branch and no checkout with an attached HEAD"}
                     self.assertIn(reasons[outcome], result.process.stdout)
 
     def test_checkpoint_on_no_origin_branch_checks_all_heads_and_still_holds(self) -> None:
@@ -1076,6 +1174,133 @@ raise SystemExit(1)
         all_args = [arg for event in (self.events("python3") + self.events("basedpyright")) for arg in event]
         self.assertFalse(any(".venv" in arg for arg in all_args))
         self.assertIn("test: ok", result.process.stdout)
+
+    def test_red_merge_gate_uses_the_unpushed_tip_and_checks_the_base_after_rollback(self) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `env HERDR_BIN=/nonexistent/herdr "
+                            + "python3 scripts/production/gate.py --checkout . --tests-only`")
+        self.env["BUILDLOG_UNIT"] = "fixture-merge-unit"
+        original_tip = self.git("rev-parse", "HEAD")
+        main = self.push_main_change("src/main.txt", "new on main\n")
+        checkpoint = self.checkpoint()
+        tested: list[str] = []
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(options["cwd"], self.checkout)
+            self.assertNotIn("env", options)
+            self.assertEqual(os.environ["BUILDLOG_UNIT"], "fixture-merge-unit")
+            self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
+            self.assertEqual(command[:2], ["env", "HERDR_BIN=/nonexistent/herdr"])
+            self.assertEqual(command[4:8], ["run", "--repo", str(self.checkout), "--commit"])
+            tip = self.git("rev-parse", "HEAD")
+            self.assertEqual(command[8:15], [tip, "--", "python3", "scripts/production/gate.py",
+                                            "--checkout", "{tree}", "--tests-only"])
+            _ = self.git("merge-base", "--is-ancestor", main, tip)
+            tested.append(tip)
+            if len(tested) < 3:
+                _ = self.git("merge-base", "--is-ancestor", checkpoint, tip)
+                self.assertEqual(command[15:], [])
+                return subprocess.CompletedProcess(command, 1, "--- lib/test_fixture.py exit=1 ---\n", "")
+            self.assertEqual(command[15:], ["--module", "lib/test_fixture.py"])
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)):
+            result = self.run_checkpoint(checkpoint).process
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(len(tested), 3)
+        self.assertEqual(tested[0], tested[1])
+        self.assertNotEqual(tested[0], tested[2])
+        self.assertEqual(self.git("rev-parse", "HEAD"), original_tip)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), original_tip)
+        self.assertIn("red: failed", result.stdout)
+
+    def test_git_push_uses_the_tested_tip_when_the_branch_moves_during_publication(self) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `python3 scripts/production/gate.py "
+                            + "--checkout . --tests-only`")
+        checkpoint = self.checkpoint()
+        tested: list[str] = []
+        original_git = merge_checkpoint.git
+
+        def run(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            tested.append(command[command.index("--commit") + 1])
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+            if checkout == self.checkout and args[:2] == ("push", "origin"):
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit before push")
+            return original_git(checkout, *args)
+
+        with (mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)),
+              mock.patch.object(merge_checkpoint, "git", side_effect=git)):
+            result = self.run_checkpoint(checkpoint).process
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        tip, = tested
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), tip)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), tip)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit before push")
+
+    def test_base_check_keeps_an_operator_commit_when_the_gate_finishes(self) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `python3 scripts/production/gate.py "
+                            + "--checkout . --tests-only`")
+        main = self.push_main_change("src/main.txt", "new on main\n")
+        checkpoint = self.checkpoint()
+        tested: list[str] = []
+
+        def run(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            tip = command[command.index("--commit") + 1]
+            tested.append(tip)
+            if "--module" in command:
+                _ = self.git("merge-base", "--is-ancestor", main, tip)
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit during base check")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.CompletedProcess(command, 1, "--- lib/test_fixture.py exit=1 ---\n", "")
+
+        with mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)):
+            result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 77, result.process.stdout + result.process.stderr)
+        self.assertEqual(len(tested), 3)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), tested[-1])
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit during base check")
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), result.before)
+
+    def assert_moved_merge_tip_cancels_publication(self, *, move_during_retest: bool, retest_status: int = 0) -> None:
+        self.production_doc(merge_tests_line="- **Merge tests:** `python3 scripts/production/gate.py "
+                            + "--checkout . --tests-only`")
+        checkpoint = self.checkpoint()
+        original_main = self.git("rev-parse", "main", cwd=self.origin)
+        new_main = self.push_main_change("main-retest.txt", "new main\n")
+        _ = self.git("update-ref", "refs/heads/main", original_main, cwd=self.origin)
+        tested: list[str] = []
+
+        def run(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(options["cwd"], self.checkout)
+            tip = self.git("rev-parse", "HEAD")
+            self.assertIn(tip, command)
+            tested.append(tip)
+            if move_during_retest and len(tested) == 1:
+                _ = self.git("update-ref", "refs/heads/main", new_main, cwd=self.origin)
+            else:
+                _ = self.git("commit", "--allow-empty", "-m", "Operator commit during tests")
+                return subprocess.CompletedProcess(command, retest_status, "", "")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(checkpoint_gate, "subprocess", mock.Mock(run=run)):
+            result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 77, result.process.stdout + result.process.stderr)
+        self.assertIn("publication cancelled because the tree changed", result.process.stdout)
+        self.assertEqual(len(tested), 2 if move_during_retest else 1)
+        self.assertEqual(self.git("rev-parse", "HEAD^"), tested[-1])
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "Operator commit during tests")
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), result.before)
+
+    def test_copied_gate_cancels_publication_when_the_merge_tip_moves(self) -> None:
+        self.assert_moved_merge_tip_cancels_publication(move_during_retest=False)
+
+    def test_copied_gate_cancels_publication_when_the_retested_tip_moves(self) -> None:
+        self.assert_moved_merge_tip_cancels_publication(move_during_retest=True)
+
+    def test_blocked_retest_keeps_an_operator_commit(self) -> None:
+        self.assert_moved_merge_tip_cancels_publication(move_during_retest=True,
+                                                       retest_status=os.EX_TEMPFAIL)
     def test_merge_tests_that_are_not_commands_are_refused_by_name_before_the_merge(self) -> None:
         """cargo-liner wrote packages and a crate directory where the line wants commands."""
         (self.checkout / "crates/tui_pane").mkdir(parents=True)
@@ -1261,8 +1486,8 @@ class MacPromotionPathTests(unittest.TestCase):
                                    + f"sys.exit({code})\n")
                 ssh.chmod(0o755)
                 config = state / "merge_checkpoint.conf"
-                _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=2\n"
-                                      + "# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+                _ = config.write_text("# whole: 1..\nmac_pull_tries=2\n"
+                                      + "# range: 0..\nmac_pull_retry_seconds=0\n")
                 with mock.patch.dict(os.environ, {"ZONE_STATE": str(state / "zone"), "CONF_DIR": folder,
                                                   "PATH": folder + os.pathsep + os.environ["PATH"]}):
                     waiting = main_publish.PendingMacPull("zone", text, "2026-11-08", "earlier failure")
@@ -1281,7 +1506,7 @@ class MacPromotionPathTests(unittest.TestCase):
                         assert isinstance(pending, main_publish.PendingMacPull)
                         self.assertEqual(pending.text, text)
                         self.assertIn("Mac asleep", pending.reason)
-                        self.assertEqual(len(list((state / "zone").iterdir())), 1)
+                        self.assertEqual({path.name for path in (state / "zone").iterdir()}, {"mac.json", "mac.lock"})
                         if text:
                             self.assertEqual((pending.label, pending.since), (waiting.label, waiting.since))
                     elif text:
@@ -1309,7 +1534,7 @@ print("mac: fixture - sent" if "broadcast.py" in sys.argv[-1] else "rc=0")
 ''')
                 ssh.chmod(0o755)
                 _ = (state / "merge_checkpoint.conf").write_text(
-                    "# whole: 1..\nMAC_PULL_TRIES=1\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+                    "# whole: 1..\nmac_pull_tries=1\n# range: 0..\nmac_pull_retry_seconds=0\n")
                 offline = state / "offline"
                 offline.touch()
                 targets = ((PurePosixPath("~/custom checkout"), state / "first-source"),

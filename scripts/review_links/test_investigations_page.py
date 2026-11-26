@@ -1,5 +1,6 @@
 """Test investigation cards with private staff records and state folders."""
 from __future__ import annotations
+from scripts.console_text.test_support import accepting_console_text
 from scripts.lint.memory_test_support import write_config_fixture
 
 import io
@@ -8,13 +9,14 @@ import os
 from contextlib import redirect_stderr
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
 from typing import cast, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-from scripts.review_links.browser_test_support import assert_status_states
+from scripts.review_links.browser_test_support import assert_status_states, newer_script_reload_results
 from scripts.review_links.test_staff_names import without_role_colors
 from scripts.production import investigation, staff
 from scripts.review_links import console, investigations_page, page_frame
@@ -39,6 +41,7 @@ class InvestigationsPageTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="investigations-page-test-")))
         config = self.root / "config"
         config.mkdir()
@@ -123,6 +126,77 @@ class InvestigationsPageTests(unittest.TestCase):
         _ = investigation.mark_read(ORPHAN, read.id)
         body = investigations_page.render(self.root / "reviews").decode()
         assert_status_states(self, body, 15)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_mark_read_shows_only_a_failure(self) -> None:
+        ready = self.file(UNIT.id, "Check the result", "2026-11-16T13:05:00+00:00")
+        _ = investigation.answer(UNIT.id, ready.id, "The result is ready.")
+        page = investigations_page.render(self.root / "reviews").decode()
+        setup = '''<script>
+let refused=true;
+window.fetch=async(_path,options)=>{
+ if(options?.method!=='POST') return new Promise(()=>{});
+ return {ok:!refused,json:async()=>({reason:'The answer changed.'})};
+};
+</script>'''
+        probe = '''<script>
+(async()=>{
+ const card=document.querySelector('article'),form=card.querySelector('form');
+ const status=form.querySelector('[data-save-status]');
+ const button=form.querySelector('button');
+ const flush=()=>new Promise(resolve=>setTimeout(resolve,0));
+ form.requestSubmit(button);
+ await flush();
+ const failure=card.dataset.state==='answer ready' && !card.hidden && !button.disabled &&
+  !status.hidden && status.textContent==='Not saved: The answer changed.';
+ refused=false;
+ form.requestSubmit(button);
+ await flush();
+ const success=card.dataset.state==='read' && card.hidden && !form.isConnected &&
+  status.hidden && !status.textContent && !document.querySelector('[data-empty]').hidden;
+ const result=document.createElement('p');result.id='probe-result';
+ result.textContent=failure && success ? 'PASS' : 'FAIL';document.body.append(result);
+})();
+</script>'''
+        fixture = self.root / "mark-read.html"
+        _ = fixture.write_text(page.replace('<head>', '<head>' + setup, 1).replace('</body>', probe + '</body>'))
+        result = subprocess.run(['google-chrome', '--headless', '--no-sandbox', '--disable-gpu',
+            '--user-data-dir=' + str(self.root / 'chrome'), '--virtual-time-budget=1000',
+            '--dump-dom', fixture.as_uri()], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('<p id="probe-result">PASS</p>', result.stdout)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        _ = write_config_fixture(self.root / "config" / "review_links.conf",
+                                 "page_refresh_seconds=15\npage_request_timeout_seconds=5\n")
+        for hour in range(10, 15):
+            _ = self.file(UNIT.id, f"Find cause {hour}", f"2026-11-16T{hour}:00:00+00:00")
+        ready = self.file(UNIT.id, "Find the ready cause", "2026-11-16T15:00:00+00:00")
+        _ = investigation.answer(UNIT.id, ready.id, "The cause is known.")
+        body = investigations_page.render(self.root / "reviews").decode()
+        self.assertEqual(body.count(f'data-script-version="{investigations_page.SCRIPT_VERSION}"'), 1)
+        newer = "(url,options)=>options?.cache==='no-store' ? Promise.resolve({ok:true,text:async()=>NEWER_PAGE}) : undefined"
+        newer = newer.replace("NEWER_PAGE", json.dumps(body.replace(investigations_page.SCRIPT_VERSION, "newer-script"))
+                              .replace("</", "<\\/"))
+        # The page has no text field of its own, so the probe adds one, as on Accounts.
+        place = ("location.hash='owner=&show=all';await new Promise(resolve=>setTimeout(resolve,50));"
+                 + "document.querySelector('[data-cards]').before(document.createElement('textarea'));"
+                 + "scrollTo({top:120,behavior:'instant'});")
+        placed = "document.querySelector('#investigation-show').value==='all'"
+        draft = "type(document.querySelector('textarea'),'typed words');"
+        with self.subTest(hold="a visible draft"):
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, start=draft,
+                end="type(document.querySelector('textarea'),'');"), [[]])
+        with self.subTest(hold="none, for a hidden draft"):
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, holds=False,
+                start=draft + "document.querySelector('textarea').hidden=true;"), [[]])
+        with self.subTest(hold="a Mark read save that never answers"):
+            self.assertEqual(newer_script_reload_results(
+                body, newer=newer, place=place, placed=placed, saves=True,
+                start="document.querySelector('[data-read-form]').requestSubmit();"), [[]])
 
     def test_order_uses_answer_time_then_filed_time_then_read_time(self) -> None:
         items: list[investigation.Investigation] = []

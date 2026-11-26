@@ -2,6 +2,7 @@
 """Tests for tidy_wrapped.py: only a wrapped production with no update timer loses its state files."""
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents import remote
 
 import json
@@ -23,10 +24,12 @@ from urllib.parse import urlencode
 from scripts.lib import atomic_file, copy_record
 from scripts.lib.cargo_output_test_support import fake_cargo_output_roots
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production.staff_test_support import (
     fixture_member, fixture_runtime_id, isolated_source_readers, isolated_staff_file, source_environment,
 )
 from scripts.production import investigation, staff, tidy_wrapped, update_registration
+from scripts.production.production_doc import production_backup_root
 from scripts.production.cli_fixture import ImmutableGitSeed, invoke_cli
 from scripts.copies import copies
 from scripts.copies.workspace_test_support import registered_workspace
@@ -50,6 +53,7 @@ class TidyWrappedTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         _ = self.enterContext(fake_cargo_output_roots(children=True))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state = self.root / "showrunner"
@@ -95,6 +99,7 @@ class TidyWrappedTests(unittest.TestCase):
                               timeout=TEST_HANG_GUARD_SECS)
 
     def review_wrap_fixture(self) -> tuple[Path, staff.StaffRow, staff.StaffRow]:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "review_links.conf")
         environment = {**source_environment(self.root / "sources"), "SHOWRUNNER_STATE_DIR": str(self.state),
                        "REVIEW_LINKS_ROOT": str(self.root / "review")}
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
@@ -473,7 +478,10 @@ class TidyWrappedTests(unittest.TestCase):
                                           "cleanup@example.invalid", {"Cargo.toml": "[workspace]\n", "file.txt": "content"}).checkout
         doc = self.doc("done", "wrapped")
         state = self.state_files("done")
-        with registered_workspace(str(self.owner("done").id), source, "HEAD", name="damaged", branch="worker") as tree:
+        owner = self.owner("done").id
+        legacy_log = state[-1].read_bytes()
+        backup = production_backup_root() / owner / "log-backups" / "log-1.md"
+        with registered_workspace(str(owner), source, "HEAD", name="damaged", branch="worker") as tree:
             pass
         record = tree / copy_record.RECORD
         original = record.read_text()
@@ -481,11 +489,13 @@ class TidyWrappedTests(unittest.TestCase):
         refused = self.run_tidy(doc)
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertIn(str(record), refused.stderr)
-        self.assertTrue(all(path.exists() for path in state))
+        self.assertTrue(all(path.exists() for path in state[:-1]))
+        self.assertEqual(backup.read_bytes(), legacy_log)
         _ = record.write_text(original)
         self.assertEqual(self.run_tidy(doc).returncode, 0)
         self.assertFalse(tree.exists())
         self.assertFalse(any(path.exists() for path in state))
+        self.assertEqual(backup.read_bytes(), legacy_log)
 
     def test_wrap_accepts_production_and_unit_names_that_cannot_own_copies(self) -> None:
         doc = self.doc("Done_Name", "wrapped")

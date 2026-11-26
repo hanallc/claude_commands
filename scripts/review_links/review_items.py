@@ -20,8 +20,7 @@ from scripts.agents.remote import local_machine
 if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
 
-from scripts.lib import urgency
-from scripts.lib import user_zone as user_zone_config
+from scripts.lib import conf, urgency
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, delivery_state, investigation, staff, update_registration
@@ -248,6 +247,7 @@ class ChangeSource:
     assignment: change_routing.ChangeAssignment
     slots: delivery_state.DeliverySlots
     handed_at: datetime | None = None
+    validators: tuple[staff.StaffId, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -327,7 +327,7 @@ class ReviewItem:
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
-        return self.queue_at(now) is question_path.Queue.NEEDS_ME
+        return not on_list(self) and self.queue_at(now) is question_path.Queue.NEEDS_ME
 
     def hidden_until(self, now: datetime) -> bool:
         return self.queue_at(now) is question_path.Queue.LATER
@@ -501,7 +501,7 @@ def validation_log_label(words: str, validator: str) -> str:
 def change_item(path: Path, row: dict[str, str], assignment: change_routing.ChangeAssignment,
                 members: staff.StaffSnapshot, queue: str, current: Path,
                 slots: delivery_state.DeliverySlots, *, zone: ZoneInfo, handed_at: datetime | None = None,
-                validator: staff.StaffId | None = None,
+                validators: tuple[staff.StaffId, ...] = (),
                 answered_at: question_path.AnswerTime = question_path.NO_ANSWER_TIME,
                 sources: list[Path] | None = None) -> ReviewItem:
     """Project a change once for the page, counts and queue."""
@@ -510,7 +510,7 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
     owner = next((member for member in members.rows if member.name == routed.tab), None)
     routed_id = owner.id if owner is not None else staff.StaffId(routed.tab)
     state = change_state(row, slots)
-    identity = (validator or staff.StaffId('')) if state == ReviewState.VALIDATING else routed_id
+    identity = (validators[0] if validators else staff.StaffId('')) if state == ReviewState.VALIDATING else routed_id
     source = staff.StaffId(row.get('Producer', '') or routed_id)
     entry = change_review.row_entries([row], sources=sources)[0]
     if handed_at is not None:
@@ -598,7 +598,7 @@ def change_item(path: Path, row: dict[str, str], assignment: change_routing.Chan
         row['Change'], state, ReviewTimes(filed, max(event.time for event in logs)), tuple(logs),
         ('works', 'not works', 'validate', 'feedback', 'question') if state == ReviewState.OPEN
         else ('question',) if state == ReviewState.VALIDATING and identity else (),
-        ChangeSource(path, row, assignment, slots, handed_at), entry.urgency, after, queue,
+        ChangeSource(path, row, assignment, slots, handed_at, validators), entry.urgency, after, queue,
         row['#'] if local else prefix+'/'+row['#'], change_review.prerequisite_key(entry.after, path, current),
         entry.value, change_review.describe(row | {'#':shown},record=members),
         review_events.waiting_why(slots.waiting_why), answer_time=status_time,
@@ -644,8 +644,8 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, zone: ZoneInfo, do
                 sources.append(path)
             snapshots[path] = change_review.review_snapshot(path, include_reviewed=ReviewState.DONE in states,
                                                             collect_owners=owner_options is not None)
-    documents = {member.name: member.doc.path for member in members.rows
-                 if isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))}
+    documents = {member.name: doc for member in members.find(kind="showrunner")
+                 if (doc := record_store.local_document(member)) is not None}
     routing = change_routing.StaffRouting(members, documents, sources=sources, lists=(
         (path.stem.removeprefix(change_review.PREFIX), snapshot.text) for path, snapshot in snapshots.items()))
     queues: dict[tuple[str, Path], tuple[str, Path]] = {}
@@ -694,11 +694,11 @@ def change_items(root: Path, members: staff.StaffSnapshot, *, zone: ZoneInfo, do
                     else:
                         queue, current = scope_queue
                     recipients = validation_recipients(fields) if state == ReviewState.VALIDATING else ()
-                    validator = recipients[0] if recipients else None
                     handed_at = delivery_time(fields, 'handed_at')
                     answered_at = delivery_time(fields, 'answered_at') or question_path.NO_ANSWER_TIME
                     list_items.append(change_item(path, row, assignment, members, queue, current, slots,
-                                                  zone=zone, handed_at=handed_at, validator=validator, answered_at=answered_at,
+                                                  zone=zone, handed_at=handed_at, validators=recipients,
+                                                  answered_at=answered_at,
                                                   sources=sources if document is not None else None))
             found.extend(list_items)
     return found
@@ -777,7 +777,7 @@ def question_item(record: update_registration.QuestionRecord, members: staff.Sta
     status_time = question_path.answer_time(
         moment(saved_answer_time, zone) if saved_answer_time is not None else question_path.NO_ANSWER_TIME, saved_log)
     source = UnownedQuestionSource(record) if unowned else QuestionSource(record)
-    key = 'question/'+owner+'/'+path.name
+    key = question_record_key(record)
     review_id = fields.get('review_id', path.stem)
     identity = name(owner, members)+'/'+review_id if review_id else ''
     opened = update_registration.OpenItem(name(owner, members), parsed, name(asker, members) if asker else '')
@@ -941,6 +941,94 @@ def investigation_type(record: investigation.Investigation) -> ReviewType:
     return ReviewType.BUG if record.kind == investigation.InvestigationKind.BUG else ReviewType.INVESTIGATION
 
 
+def on_list(item: ReviewItem) -> bool:
+    """Check if the source record belongs to a List item."""
+    source = item.source
+    if isinstance(source, InvestigationSource) and source.record.belongs_on_list:
+        return True
+    return any(list_move_event(event) for event in item.log)
+
+
+def list_move_event(event: ReviewLog) -> bool:
+    words = cast(object, event.words)
+    return (event.who == 'nate' and isinstance(words, str)
+            and re.fullmatch(r'moved to List item [1-9][0-9]*', words) is not None)
+
+
+def change_on_list(row: dict[str, str]) -> bool:
+    return any(list_move_event(event) for event in review_events.decode(row.get('Review log', '')))
+
+
+def can_move_wait(item: ReviewItem) -> bool:
+    return (item.type != ReviewType.FOR_YOU and item.state in (ReviewState.WAITING, ReviewState.VALIDATING)
+            and not on_list(item))
+
+
+def list_reply(item: ReviewItem) -> str:
+    """Read the latest reply from the native evidence for the List."""
+    source = item.source
+    if isinstance(source, ChangeSource):
+        question = source.slots.question
+        return question.answer if isinstance(question, delivery_state.AnsweredQuestion) else ''
+    for index in reversed(range(len(item.log))):
+        words = item.log[index].words
+        if words.startswith('Answer: '):
+            return words.removeprefix('Answer: ')
+        if index in item.body_answer_events:
+            return words
+    return ''
+
+
+@dataclass(frozen=True)
+class ValidationLogStart:
+    first_result_index: int
+
+
+class LegacyValidationLog(StrEnum):
+    MOVE_MARKER = 'use the List move entry'
+
+
+def validation_request_words(feedback: str) -> str:
+    return 'validate' + (': ' + feedback if feedback else '')
+
+
+def validation_log_start(row: dict[str, str], pending_request: str = '') -> ValidationLogStart:
+    """Start at the next log entry after the validation request."""
+    events = review_events.decode(row.get('Review log', ''))
+    if pending_request and not any(
+            (event.who, event.words, event.feedback_request_id) == ('nate', pending_request, '')
+            for event in events[-1:]):
+        return ValidationLogStart(len(events)+1)
+    return ValidationLogStart(len(events))
+
+
+def validation_problem(item: ReviewItem, list_number: int, start: ValidationLogStart | LegacyValidationLog) -> str:
+    """Read the problem for the validation that moved to this List item."""
+    source = item.source
+    if not isinstance(source, ChangeSource):
+        return ''
+    log = review_events.decode(source.row.get('Review log', ''))
+    if isinstance(start, ValidationLogStart):
+        events = iter(log[start.first_result_index:])
+    else:
+        marker = f'moved to List item {list_number}'
+        events = iter(log)
+        for event in events:
+            if event.who == 'nate' and event.words == marker:
+                break
+        else:
+            return ''
+
+    prefix = 'Check found a problem: '
+    problem = ''
+    for event in events:
+        if event.words.partition(':')[0] == 'validate':
+            break
+        if event.words.startswith(prefix):
+            problem = event.words.removeprefix(prefix)
+    return problem
+
+
 def investigation_item(record: investigation.Investigation, members: staff.StaffSnapshot, path: Path, *,
                        zone: ZoneInfo | None = None) -> ReviewItem:
     zone = zone or user_zone()
@@ -954,7 +1042,7 @@ def investigation_item(record: investigation.Investigation, members: staff.Staff
     logs.extend(replace(event, time=aware(event.time, zone)) if event.time.tzinfo is None else event for event in record.log)
     state = investigation_state(record)
     owner = owner_for(record.owner, members)
-    key = 'investigation/'+record.owner+'/'+record.id
+    key = investigation_record_key(record)
     identity_text = name(record.owner, members)+'/'+record.id
     return ReviewItem(key, identity_text, investigation_type(record), owner, record.source_owner, record.title, state,
         ReviewTimes(filed, logs[-1].time), tuple(logs),
@@ -1014,7 +1102,7 @@ def issue_item(issue: Issue, owner: staff.StaffId, members: staff.StaffSnapshot,
     """Project a proposal for the Review index and its body."""
     issue = Issue(proposal_path(issue.path), issue.fields)
     row = proposals_table.issue_row(issue, members, sources=sources)
-    key = 'proposal/'+str(issue.path)
+    key = proposal_record_key(issue.path)
     if not isinstance(row.progress, proposal_issue.AwaitingApproval):
         filed = moment(issue.value('date_created') or '1970-01-01', zone)
         return proposal_item(key, issue, owner, staff.StaffId(issue.value('proposed_by') or owner),
@@ -1024,6 +1112,28 @@ def issue_item(issue: Issue, owner: staff.StaffId, members: staff.StaffSnapshot,
     filed = aware(entry.since, zone) if entry.since is not None else datetime(1970, 1, 1, tzinfo=zone)
     return proposal_item(key, issue, owner, staff.StaffId(issue.value('proposed_by')), issue.path.stem, filed,
                          members, entry, 'proposal-'+owner)
+
+
+def question_record_key(record: update_registration.QuestionRecord) -> str:
+    return f"question/{record.owner}/{record.path.name}"
+
+
+def investigation_record_key(record: investigation.Investigation) -> str:
+    return f"investigation/{record.owner}/{record.id}"
+
+
+def proposal_record_key(path: Path) -> str:
+    return f"proposal/{path}"
+
+
+def submission_review_key(saved: review_submissions.SavedSubmission) -> str:
+    """Name the saved record in the Review index."""
+    record = saved.record
+    if isinstance(record, update_registration.QuestionRecord):
+        return question_record_key(record)
+    if isinstance(record, Issue):
+        return proposal_record_key(saved.path)
+    return investigation_record_key(record)
 
 
 def submission_item(saved: review_submissions.SavedSubmission, members: staff.StaffSnapshot) -> ReviewItem:
@@ -1098,8 +1208,8 @@ def proposal_items(members: staff.StaffSnapshot, documents: tuple[Path, ...], *,
     for doc in documents:
         with guard_source(doc, sources):
             member = members.by_doc(local_machine(), doc.resolve())
-            if member is not None and member.kind == 'showrunner':
-                scopes[doc] = member.id
+            if member is not None and (local_doc := record_store.local_document(member)) is not None:
+                scopes[local_doc] = member.id
     if include_registered:
         with guard_source(state_root() / "review-folders", sources):
             if exact:
@@ -1510,7 +1620,8 @@ def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.St
         owner = scope
     if kind in QUESTION_TYPES:
         owners = (scope,) if isinstance(scope,staff.StaffRow) else tuple(member for member in members.rows
-            if member.kind == 'showrunner' and isinstance(member.doc,(staff.LiveDoc,staff.WrappedDoc)) and member.doc.path in documents)
+            if member.kind == 'showrunner' and isinstance(member.doc, (staff.LiveDoc, staff.WrappedDoc))
+            and member.doc.path in documents)
         return question_items(members,documents,zone=zone,owners=owners,sources=sources,include_unowned=False,states=states,
                               kinds=QUESTION_TYPES if kind == ReviewType.QUESTION else (kind,))
     if kind in INVESTIGATION_TYPES:
@@ -1599,13 +1710,12 @@ def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identitie
                     source: str = '') -> tuple[int,str]:
     """Count Questions in the same zone as Review and /next."""
     if sources is not None and not os.environ.get('USER_ZONE'):
-        sources.append(Path(user_zone_config.CONF))
+        sources.append(conf.path('user_zone'))
     zone = user_zone()
     items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources,show='open',zone=zone)
     now = datetime.now(zone)
-    afters = [item.times.later for item in items if not isinstance(item.times.later,NoLaterTime) and item.times.later > now]
     return (sum(item.for_you(now) and (not source or item.source_unit == source) for item in items),
-            '' if not afters else str(int(min(afters).timestamp())))
+            question_path.next_later_deadline((item.times.later for item in items), now))
 
 
 def ready_investigations(owner: staff.StaffId, *, sources: list[Path] | None = None) -> int:

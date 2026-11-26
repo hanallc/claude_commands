@@ -23,23 +23,25 @@ from enum import Enum
 from functools import cached_property
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast
+from typing import TYPE_CHECKING, ClassVar, IO, Literal, NewType, Protocol, Self, TypeVar, cast, override
 from uuid import UUID
 
 from scripts.lib import git_files
+from scripts.production.production_names import MERGE_CHECKOUT_FIELD
 
 if __name__ == "__main__":
     # Lazy runtime readers share these exact row and exception classes in the CLI.
     sys.modules["scripts.production.staff"] = sys.modules[__name__]
 # The status line imports this module on each refresh. Defer imports for other paths.
 if TYPE_CHECKING:
+    from scripts.lib import lock_holder
     import argparse
     from scripts.accounts import role_map
 
 OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
-Kind = Literal["showrunner", "unit", "worker", "producer"]
-_KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "producer")
+Kind = Literal["showrunner", "unit", "worker", "producer", "session"]
+_KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "producer", "session")
 UnitType = Literal["direct", "merge", "style"]
 UNIT_TYPES: tuple[UnitType, ...] = ("direct", "merge", "style")
 
@@ -85,7 +87,7 @@ class ReportsTo:
 
 @dataclass(frozen=True)
 class StaffRoot:
-    """A top showrunner has no parent."""
+    """The staff member has no parent."""
 
 
 @dataclass(frozen=True)
@@ -198,10 +200,11 @@ class StaffAbsent(StaffUnreadable):
 class StaffRefused(Exception):
     """A requested change would break the staff rules."""
 
-    def __init__(self, *args: object, holder: str = "") -> None:
+    def __init__(self, *args: object, holder: str = "", slot_key: str = "") -> None:
         super().__init__(*args)
         # The process that holds a busy row, as "pid N: command"; empty when unknown.
         self.holder: str = holder
+        self.slot_key: str = slot_key
 
 
 class UpkeepRowBusy(StaffRefused):
@@ -287,6 +290,38 @@ def worktree_machine(row: StaffRow) -> str:
 
 
 @dataclass(frozen=True)
+class SessionLaunchFolder:
+    """The machine and folder where a standalone session starts."""
+
+    machine: str
+    path: Path
+    unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
+
+    def __post_init__(self) -> None:
+        _location(self.machine, self.path)
+
+    def to_json(self) -> dict[str, object]:
+        return {**self.unknown_fields, "machine": self.machine, "path": str(self.path)}
+
+    @classmethod
+    def from_json(cls, value: object) -> SessionLaunchFolder:
+        match value:
+            case {"machine": str() as machine, "path": str() as path}:
+                fields = cast(dict[str, object], value)
+                try:
+                    return cls(machine, Path(path), unknown_fields=_unknown_fields(fields, {"machine", "path"}))
+                except StaffRefused as error:
+                    raise StaffUnreadable(str(error)) from error
+            case _:
+                raise StaffUnreadable("launch_folder requires a machine and path")
+
+
+@dataclass(frozen=True)
+class NoSessionLaunchFolder:
+    """The row has no standalone session launch folder."""
+
+
+@dataclass(frozen=True)
 class LiveDoc:
     machine: str
     path: Path
@@ -355,6 +390,49 @@ class HoldRecord:
 class Paused(HoldRecord):
     """The director holds at its prompt."""
 
+    keep_workers: bool = False
+
+    @override
+    def to_json(self) -> dict[str, object]:
+        fields = super().to_json()
+        if self.keep_workers:
+            fields["keep_workers"] = True
+        return fields
+
+    @classmethod
+    @override
+    def from_json(cls, value: object) -> Self:
+        hold = super().from_json(value)
+        unknown = hold.unknown_fields.copy()
+        keep_workers = unknown.pop("keep_workers", False)
+        if not isinstance(keep_workers, bool):
+            raise StaffUnreadable("paused keep_workers must be a boolean")
+        return replace(hold, keep_workers=keep_workers, unknown_fields=unknown)
+
+
+@dataclass(frozen=True)
+class NoPendingResume:
+    """The director has no continuation to recover."""
+
+
+@dataclass(frozen=True)
+class ResumePending:
+    key: str
+    original_pause: Paused
+
+    def to_json(self) -> dict[str, object]:
+        return {"key": self.key, "original_pause": self.original_pause.to_json()}
+
+    @classmethod
+    def from_json(cls, value: object) -> ResumePending:
+        if not isinstance(value, dict):
+            raise StaffUnreadable("pending resume must be an object")
+        fields = cast(dict[str, object], value)
+        key = fields.get("key")
+        if not isinstance(key, str) or not key:
+            raise StaffUnreadable("pending resume requires a key")
+        return cls(key, Paused.from_json(fields.get("original_pause")))
+
 
 @dataclass(frozen=True)
 class Exited(HoldRecord):
@@ -379,6 +457,18 @@ class RetiredProducer:
 
 
 @dataclass(frozen=True)
+class TopItem:
+    """The List item number that a producer names as its top priority."""
+
+    number: int
+
+
+@dataclass(frozen=True)
+class NoTopItem:
+    """The producer names no top priority item."""
+
+
+@dataclass(frozen=True)
 class StaffRow:
     id: StaffId
     kind: Kind
@@ -393,9 +483,12 @@ class StaffRow:
     exited: Exited | Active = field(default_factory=Active)
     role: KnownWorkerRole | WorkerRoleUnknown = field(default_factory=WorkerRoleUnknown, kw_only=True)
     home: SessionHome | HomeUnknown = field(default_factory=HomeUnknown, kw_only=True)
+    launch_folder: SessionLaunchFolder | NoSessionLaunchFolder = field(default_factory=NoSessionLaunchFolder, kw_only=True)
     run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
     unit_type: UnitDetails | NotUnit = field(default_factory=NotUnit, kw_only=True)
     retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
+    top_item: TopItem | NoTopItem = field(default_factory=NoTopItem, kw_only=True)
+    resume_pending: ResumePending | NoPendingResume = field(default_factory=NoPendingResume, kw_only=True)
     unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
 
     def reports_to(self, identity: StaffId) -> bool:
@@ -414,6 +507,8 @@ class StaffRow:
             value["run"] = str(self.run.path)
         if isinstance(self.home, SessionHome):
             value["home"] = str(self.home.path)
+        if isinstance(self.launch_folder, SessionLaunchFolder):
+            value["launch_folder"] = self.launch_folder.to_json()
         if not isinstance(self.worktree, WorktreeUnfilled):
             value["worktree"] = {**self.worktree.unknown_fields, "machine": self.worktree.machine, "path": str(self.worktree.path),
                                  "state": "present" if isinstance(self.worktree, PresentWorktree) else "removed"}
@@ -427,8 +522,12 @@ class StaffRow:
             value["paused"] = self.paused.to_json()
         if isinstance(self.exited, Exited):
             value["exited"] = self.exited.to_json()
+        if isinstance(self.resume_pending, ResumePending):
+            value["resume_pending"] = self.resume_pending.to_json()
         if isinstance(self.retirement, RetiredProducer):
             value["retired_producer"] = self.retirement.profile
+        if isinstance(self.top_item, TopItem):
+            value["top_item"] = self.top_item.number
         return value
 
     @classmethod
@@ -464,13 +563,19 @@ class StaffRow:
                        if isinstance(role, str) and role in WORKER_ROLES else WorkerRoleUnknown())
         parsed_home = SessionHome(Path(home)) if isinstance(home, str) and Path(home).is_absolute() else HomeUnknown()
         known_fields = {"id", "kind", "name", "parent", "current_session", "worktree", "doc", "paused", "exited", "run", "unit_type"}
-        known_fields.add("retired_producer")
+        known_fields.update(("retired_producer", "top_item", "resume_pending"))
         retirement: RetiredProducer | Active = Active()
         if "retired_producer" in fields:
             profile = fields["retired_producer"]
             if kind != "producer" or not isinstance(profile, str) or not profile:
                 raise StaffUnreadable("invalid retired producer profile")
             retirement = RetiredProducer(profile)
+        top_item: TopItem | NoTopItem = NoTopItem()
+        if "top_item" in fields:
+            number = fields["top_item"]
+            if kind != "producer" or not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                raise StaffUnreadable("invalid producer top item")
+            top_item = TopItem(number)
         invalid: list[str] = []
         for key, fact in (("role", parsed_role), ("home", parsed_home)):
             if isinstance(fact, (KnownWorkerRole, SessionHome)):
@@ -481,12 +586,18 @@ class StaffRow:
             # _clean_parse finds this print from the data; a new parse print must update it too.
             print(f"anomaly: {staff_id}: unknown staff fields: {', '.join(invalid)}", file=sys.stderr)
         worktree, doc = _row_locations(kind, fields)
+        launch_folder: SessionLaunchFolder | NoSessionLaunchFolder = NoSessionLaunchFolder()
+        if kind == "session":
+            launch_folder = SessionLaunchFolder.from_json(fields.get("launch_folder"))
+            known_fields.add("launch_folder")
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
-                   role=parsed_role, home=parsed_home, unit_type=unit_type,
-                   run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement,
+                   role=parsed_role, home=parsed_home, launch_folder=launch_folder, unit_type=unit_type,
+                   run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement, top_item=top_item,
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
+                   resume_pending=ResumePending.from_json(fields["resume_pending"])
+                   if "resume_pending" in fields else NoPendingResume(),
                    unknown_fields=_unknown_fields(fields, known_fields))
 
 
@@ -575,6 +686,10 @@ def _document_checkout(path: Path) -> CheckoutDocument | OutsideGitCheckout | Un
     except (OSError, RuntimeError) as error:
         return UnreadableGitCheckout(path, str(error))
     return CheckoutDocument(checkout.common_dir, document.relative_to(checkout.toplevel))
+
+
+def declares_merge_checkout(lines: Sequence[str]) -> bool:
+    return any(line.startswith(f"- **{MERGE_CHECKOUT_FIELD}:**") for line in lines)
 
 
 @dataclass(frozen=True)
@@ -697,6 +812,13 @@ class StaffSnapshot:
             if isinstance(candidate, UnreadableGitCheckout):
                 continue
             if candidate == identity:
+                try:
+                    if declares_merge_checkout(row.doc.path.read_text(encoding="utf-8").splitlines()):
+                        continue
+                except FileNotFoundError:
+                    pass
+                except (OSError, UnicodeError) as error:
+                    raise StaffRefused(f"{row.doc.path}: cannot read production document: {error}") from error
                 matches.append(row)
         if len(matches) > 1:
             names = ", ".join(str(row.id) for row in matches)
@@ -945,7 +1067,9 @@ def row_operation(reference: str) -> Generator[None]:
 
 
 def _holder_fields() -> dict[str, object]:
-    return {"pid": os.getpid(), "command": shlex.join(sys.argv)}
+    from scripts.lib import lock_holder
+
+    return lock_holder.own_fields()
 
 
 def _write_slot_holder(lock: IO[bytes]) -> None:
@@ -960,20 +1084,24 @@ def _clear_slot_holder(lock: IO[bytes]) -> None:
         os.ftruncate(lock.fileno(), 0)
 
 
-def _slot_holder(lock: IO[bytes]) -> tuple[int, str] | None:
-    try:
-        _ = lock.seek(0)
-        line = lock.read(4096).partition(b"\n")[0]
-        holder = cast(object, json.loads(line))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(holder, dict):
-        return None
-    record = cast(dict[str, object], holder)
-    pid, command = record.get("pid"), record.get("command")
-    if type(pid) is not int or pid <= 0 or not isinstance(command, str) or not command:
-        return None
-    return pid, command
+def _slot_holder(lock: IO[bytes]) -> lock_holder.HolderRecord | None:
+    from scripts.lib import lock_holder
+
+    return lock_holder.read_record(lock)
+
+
+def prove_slot_holder(key: str) -> lock_holder.ProvedLockHolder | None:
+    """Prove a holder of the current row lock."""
+    from scripts.lib import lock_holder
+
+    path, _ = _row_lock(key)
+    with path.open("rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = _slot_holder(lock)
+            return lock_holder.prove(path, [holder] if holder is not None else [])
+    return None
 
 
 _UPKEEP_LOCK_WAIT: ContextVar[float | None] = ContextVar("_UPKEEP_LOCK_WAIT", default=None)
@@ -988,15 +1116,15 @@ def upkeep_lock_wait(seconds: float) -> Generator[None]:
         _UPKEEP_LOCK_WAIT.reset(token)
 
 
-def _upkeep_pid(holder: tuple[int, str]) -> int | None:
+def _upkeep_pid(holder: lock_holder.HolderRecord) -> int | None:
     with suppress(ValueError):
-        arguments = shlex.split(holder[1])
+        arguments = shlex.split(holder.command)
         if "--work" in arguments and any(Path(arg).name == "herdr_upkeep.py" for arg in arguments):
-            return holder[0]
+            return holder.pid
     return None
 
 
-def _acquire_slot(lock: IO[bytes], name: str) -> None:
+def _acquire_slot(lock: IO[bytes], name: str, *, slot_key: str = "") -> None:
     seconds = _UPKEEP_LOCK_WAIT.get()
     deadline = time.monotonic() + seconds if seconds is not None else 0.0
     upkeep_pid: int | None = None
@@ -1015,9 +1143,9 @@ def _acquire_slot(lock: IO[bytes], name: str) -> None:
                         raise UpkeepRowBusy(f"Herdr upkeep still holds {name} (pid {upkeep_pid})") from error
                     time.sleep(min(0.05, remaining))
                     continue
-            named = f"pid {holder[0]}: {holder[1]}" if holder else ""
+            named = holder.description if holder else ""
             raise StaffRefused(f"{name}: another operation holds this row" + (f" ({named})" if named else ""),
-                               holder=named) from error
+                               holder=named, slot_key=slot_key) from error
 
 
 def wait_for_upkeep_row(row: StaffRow, deadline: float) -> None:
@@ -1068,7 +1196,7 @@ def slot_operation(key: str, name: str, *, join: bool = True) -> Generator[None]
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b", buffering=0) as lock:
-        _acquire_slot(lock, name)
+        _acquire_slot(lock, name, slot_key=key)
         previous = os.environ.get(variable)
         _write_slot_holder(lock)
         try:
@@ -1131,8 +1259,6 @@ def row_activity(key: str) -> RowAvailable | RowBusy | RowMoving:
 @contextmanager
 def mark_row_move(key: str, target: str) -> Generator[None]:
     """Publish the move while the caller holds the row lock."""
-    from scripts.lib import process_start
-
     path, variable = _row_lock(key)
     if not _joined_operation(path, variable):
         raise StaffRefused("the move does not hold the row")
@@ -1144,8 +1270,7 @@ def mark_row_move(key: str, target: str) -> Generator[None]:
             stream.flush()
 
         holder = _holder_fields()
-        owner = process_start.process_start(os.getpid())
-        write(holder | {"start": owner.start, "target": target} if isinstance(owner, process_start.Started) else holder)
+        write(holder | {"target": target} if holder.get("start") else holder)
         try:
             yield
         finally:
@@ -1192,7 +1317,7 @@ def _operation_lock_holder(path: Path) -> str:
 def _wait_for_operation_lock(descriptor: int, path: Path) -> None:
     from scripts.agents import worker_lifecycle
 
-    limit = _wait_seconds("OPERATION_LOCK_SECONDS")
+    limit = _wait_seconds("operation_lock_seconds")
     started = time.monotonic()
     try:
         worker_lifecycle.acquire_flock(descriptor, deadline=started + limit)
@@ -1235,7 +1360,7 @@ def operation() -> AbstractContextManager[None]:
 
 
 def _parent_kinds(kind: Kind) -> tuple[Kind, ...]:
-    return () if kind == "producer" else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
+    return () if kind in ("producer", "session") else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
 
 
 def validate_name(kind: Kind, name: str) -> None:
@@ -1246,6 +1371,11 @@ def validate_name(kind: Kind, name: str) -> None:
         raise StaffRefused(f"invalid short staff name: {name!r}")
     if kind == "worker":
         _ = WorkerName.parse(name)
+    if kind == "session":
+        from scripts.message.address import reserved_recipient
+
+        if reserved_recipient(name):
+            raise StaffRefused(f"{name}: reserved message address")
 
 
 def validate_unit_name_for_write(name: str) -> None:
@@ -1260,6 +1390,8 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
     unknown = {cast(str, row["id"]) for row in unknown_rows}
     sessions = {cast(str, row.get("current_session", row["id"])) for row in unknown_rows}
     names: set[tuple[Kind, ReportsTo | StaffRoot | None, str]] = set()
+    folded_names: set[str] = set()
+    standalone_names: set[str] = set()
     worktrees: set[tuple[str, Path]] = set()
     for row in rows:
         if row.id in indexed or row.id in unknown:
@@ -1270,6 +1402,8 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
         if row.current_session in sessions:
             raise StaffRefused(f"duplicate current session: {row.current_session}")
         sessions.add(row.current_session)
+        if (row.kind == "session") != isinstance(row.launch_folder, SessionLaunchFolder):
+            raise StaffRefused(f"{row.name}: only a session has a standalone launch folder")
         if row.kind not in ("unit", "producer") and not isinstance(row.worktree, WorktreeUnfilled):
             raise StaffRefused(f"{row.kind} cannot hold worktree")
         if row.kind not in ("showrunner", "producer") and not isinstance(row.doc, DocUnfilled):
@@ -1283,14 +1417,22 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
         if row.kind not in _KINDS:
             raise StaffRefused(f"invalid staff kind: {row.kind}")
         validate_name(row.kind, row.name)
+        folded = row.name.casefold()
+        if folded in standalone_names or (row.kind == "session" and folded in folded_names):
+            raise StaffRefused(f"{row.name}: another staff row has this name")
+        if row.kind == "session":
+            standalone_names.add(folded)
+        folded_names.add(folded)
         key = (row.kind, None if row.kind == "showrunner" else row.parent, row.name)
         if key in names:
             raise StaffRefused(f"{row.kind} name already exists: {row.name}")
         names.add(key)
     for row in rows:
         if isinstance(row.parent, StaffRoot):
-            if row.kind not in ("showrunner", "producer"):
+            if row.kind not in ("showrunner", "producer", "session"):
                 raise StaffRefused(f"{row.kind} {row.name} requires a parent")
+        elif row.kind == "session":
+            raise StaffRefused(f"{row.name}: a session cannot have a parent")
         elif row.parent.id not in unknown:
             parent = indexed.get(row.parent.id)
             allowed = _parent_kinds(row.kind)
@@ -1475,7 +1617,7 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
                          all("current_session" in item for item in cast(list[dict[str, object]], fields.get("rows", []))))
 
 
-def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
+def _remote(arguments: list[str], *, input_text: str | None = None, machine: str = OWNER_MACHINE) -> object:
     # Direct worker writers run inside the caller's membership lock. Match the
     # local API's row transaction without entering the outer lifecycle operation.
     import shlex
@@ -1486,8 +1628,8 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
         arguments = [*arguments, "--row-write"]
     elif arguments[0] == "retire":
         arguments = [*arguments, "--worker-row"]
-    timeout = _wait_seconds("REMOTE_SECONDS")
-    command = ["ssh", "-o", "BatchMode=yes", OWNER_MACHINE,
+    timeout = _wait_seconds("remote_seconds")
+    command = ["ssh", "-o", "BatchMode=yes", machine,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                + shlex.join([*arguments, "--json"])]
     try:
@@ -1497,10 +1639,10 @@ def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
     except (OSError, subprocess.TimeoutExpired) as error:
         if time.monotonic() >= worker_lifecycle.effective_deadline():
             raise worker_lifecycle.OperationDeadlineExpired("staff remote deadline expired") from error
-        raise StaffUnreadable(f"{OWNER_MACHINE} not reached") from error
+        raise StaffUnreadable(f"{machine} not reached") from error
     reason = done.stderr.strip()
     if done.returncode != 0 and (done.returncode == 255 or not reason):
-        raise StaffUnreadable(f"{OWNER_MACHINE} not reached")
+        raise StaffUnreadable(f"{machine} not reached")
     if done.returncode == 1 and reason.startswith("staff member not found: "):
         raise StaffNotFound(StaffId(reason.removeprefix("staff member not found: ")))
     if done.returncode == 2:
@@ -1720,7 +1862,7 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
     if not all(parts) or len(parts) > len(_KINDS):
         return None
     # A root kind starts its own path.
-    roots = [row for row in rows if row.kind in ("showrunner", "producer") and row.name == parts[0]]
+    roots = [row for row in rows if row.kind in ("showrunner", "producer", "session") and row.name == parts[0]]
     row = roots[0] if len(roots) == 1 else None
     for name in parts[1:]:
         if row is None:
@@ -1767,6 +1909,19 @@ def find(*, kind: Kind | None = None, parent: StaffId | None = None) -> list[Sta
     return snapshot().find(kind=kind, parent=parent)
 
 
+def serving_merge_unit(production_staff_id: str) -> StaffRow | None:
+    """Find the merge unit of the production or its nearest ancestor."""
+    record = snapshot()
+    production = record.by_id(StaffId(production_staff_id))
+    merge_units = tuple(row for row in active(record, "unit") if row.unit_type == UnitDetails("merge"))
+    while production is not None and production.kind == "showrunner":
+        unit = next((row for row in merge_units if row.reports_to(production.id)), None)
+        if unit is not None:
+            return unit
+        production = record.parent_of(production)
+    return None
+
+
 def _under_test_root(path: Path) -> bool:
     """Identify temporary locations before a write to the real staff record."""
     import tempfile
@@ -1777,8 +1932,8 @@ def _under_test_root(path: Path) -> bool:
 
 
 def _location_paths(row: StaffRow) -> tuple[Path, ...]:
-    return tuple(location.path for location in (row.doc, row.worktree)
-                 if isinstance(location, (LiveDoc, WrappedDoc, PresentWorktree, RemovedWorktree)))
+    return tuple(location.path for location in (row.doc, row.worktree, row.launch_folder)
+                 if isinstance(location, (LiveDoc, WrappedDoc, PresentWorktree, RemovedWorktree, SessionLaunchFolder)))
 
 
 def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
@@ -1888,6 +2043,26 @@ def _required(rows: list[StaffRow], staff_id: StaffId) -> StaffRow:
     return row
 
 
+def _document_for_owner(rows: list[StaffRow], owner: StaffId,
+                        doc: LiveDoc | WrappedDoc) -> LiveDoc | WrappedDoc:
+    from scripts.agents import remote
+
+    local = doc.machine == remote.local_machine()
+    path = doc.path.resolve() if local else doc.path
+    if any(other.id != owner and isinstance(other.doc, LiveDoc | WrappedDoc)
+           and other.doc.machine == doc.machine
+           and (other.doc.path.resolve() if local else other.doc.path) == path
+           for other in rows):
+        raise StaffRefused(f"{path}: another staff row already owns this document")
+    if not local:
+        return doc
+    try:
+        enrolled = declares_merge_checkout(path.read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        return replace(doc, path=path)
+    return replace(doc, path=path) if enrolled else doc
+
+
 def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo | StaffRoot, *,
                 worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
                 doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
@@ -1900,6 +2075,11 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: ReportsTo |
         raise StaffRefused(f"{kind} cannot hold doc")
     existing = next((row for row in rows
                      if (row.kind, row.name, row.parent) == (kind, name, parent)), None)
+    if kind == "showrunner" and not isinstance(doc, DocUnfilled):
+        if existing is not None:
+            doc = _document_for_owner(rows, existing.id, doc)
+        elif runtime_id:
+            doc = _document_for_owner(rows, native_id(runtime_id), doc)
     if existing is not None:
         if isinstance(existing.retirement, RetiredProducer):
             raise StaffRefused(f"{name}: retired; use agents resume {name} --retired")
@@ -1932,6 +2112,8 @@ def ensure(kind: Kind, *, name: str, parent: ReportsTo | StaffRoot = STAFF_ROOT,
            doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
                 runtime_id: str = "", unit_type: UnitType | None = None) -> StaffRow:
     """Admit the identity and its location in the same owner transaction."""
+    if kind == "session":
+        raise StaffRefused("use create-session to admit a session")
     if not is_owner():
         arguments = ["ensure", kind, f"--name={name}", f"--runtime-id={runtime_id}"]
         if unit_type is not None:
@@ -1947,6 +2129,27 @@ def ensure(kind: Kind, *, name: str, parent: ReportsTo | StaffRoot = STAFF_ROOT,
 
     return _transaction(lambda rows: _ensure_row(rows, kind, name, parent, worktree=worktree, doc=doc,
                                                runtime_id=runtime_id, unit_type=unit_type))
+
+
+def create_session(name: str, identity: str, folder: SessionLaunchFolder, home: SessionHome) -> StaffRow:
+    """Admit a root session once, with its launch folder and account."""
+    validate_name("session", name)
+    if not home.path.is_absolute():
+        raise StaffRefused(f"{name}: the session home must be absolute")
+    session_id = native_id(identity)
+    if not is_owner():
+        return _remote_row(["create-session", session_id, f"--name={name}", "--machine", folder.machine,
+                            "--path", str(folder.path), "--home", str(home.path)])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        if any(session_id in (row.id, row.current_session) for row in rows):
+            raise StaffRefused(f"{session_id}: runtime identity already belongs to another member")
+        row = StaffRow(session_id, "session", name, STAFF_ROOT,
+                       current_session=session_id, home=home, launch_folder=folder)
+        rows.append(row)
+        return row
+
+    return _transaction(edit)
 
 
 def ensure_worker(identity: StaffId, name: str, parent: StaffId) -> StaffRow:
@@ -2090,16 +2293,19 @@ def change_director(identity: StaffId, destination: ShowrunnerRole | UnitRole) -
         row = _required(rows, identity)
         kind: Kind = "showrunner" if promoting else "unit"
         source = "unit" if promoting else "showrunner"
+        doc = (_document_for_owner(rows, row.id, destination.doc)
+               if isinstance(destination, ShowrunnerRole) else DOC_UNFILLED)
         changed = replace(row, kind=kind, name=destination.name, parent=ReportsTo(destination.parent),
                           unit_type=NotUnit() if promoting else UnitDetails(cast(UnitRole, destination).unit_type),
                           worktree=WORKTREE_UNFILLED if promoting else cast(UnitRole, destination).worktree,
-                          doc=cast(ShowrunnerRole, destination).doc if promoting else DOC_UNFILLED)
+                          doc=doc)
         if row.kind == kind:
             if row != changed:
                 raise StaffRefused(f"{identity}: director destination conflicts")
             return row
         if row.kind != source:
             raise StaffRefused(f"{identity}: role change requires a {source}")
+        _require_document_change(row, doc)
         rows[rows.index(row)] = changed
         if not promoting:
             # A unit cannot own other directors. Its workers retain their parent.
@@ -2229,7 +2435,13 @@ def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
         if row is None:
             raise StaffNotFound(StaffId(reference))
         if isinstance(hold, Paused):
-            changed = replace(row, paused=row.paused if isinstance(row.paused, Paused) else hold, exited=Active())
+            paused = row.paused
+            if isinstance(paused, Paused):
+                if paused.keep_workers and not hold.keep_workers:
+                    paused = replace(paused, keep_workers=False)
+            else:
+                paused = hold
+            changed = replace(row, paused=paused, exited=Active())
         elif isinstance(hold, Exited):
             changed = replace(row, exited=row.exited if isinstance(row.exited, Exited) else hold, paused=Active())
         else:
@@ -2240,16 +2452,19 @@ def set_hold(reference: str, hold: Paused | Exited | Active) -> StaffRow:
     return _transaction(edit)
 
 
-def _hold(reference: str, why: str, state: type[Paused] | type[Exited]) -> StaffRow:
+def _hold(reference: str, why: str, state: type[Paused] | type[Exited], *, keep_workers: bool = False) -> StaffRow:
     from scripts.lib.user_zone import user_zone
 
     caller = by_current_session(runtime_id())
-    return set_hold(reference, state(datetime.now(user_zone()).isoformat(), caller.name if caller else "", why))
+    since = datetime.now(user_zone()).isoformat()
+    name = caller.name if caller else ""
+    hold = Paused(since, name, why, keep_workers=keep_workers) if state is Paused else Exited(since, name, why)
+    return set_hold(reference, hold)
 
 
-def pause(reference: str, why: str) -> StaffRow:
+def pause(reference: str, why: str, *, keep_workers: bool = False) -> StaffRow:
     """Record the director's pause request."""
-    return _hold(reference, why, Paused)
+    return _hold(reference, why, Paused, keep_workers=keep_workers)
 
 
 def exit(reference: str, why: str) -> StaffRow:
@@ -2260,6 +2475,46 @@ def exit(reference: str, why: str) -> StaffRow:
 def resume(reference: str) -> StaffRow:
     """Remove the pause or exit record."""
     return set_hold(reference, Active())
+
+
+def begin_resume(identity: StaffId, pause: Paused) -> StaffRow:
+    """Save the continuation and clear the matching pause in one write."""
+    if not is_owner():
+        return _remote_row(["begin-resume", identity, "--record", json.dumps(pause.to_json())])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        if isinstance(row.resume_pending, ResumePending):
+            return row
+        if row.paused != pause or isinstance(row.exited, Exited):
+            raise StaffRefused(f"{row.name}: the pause changed")
+        pending = ResumePending(f"agents-resume:{identity}:{pause.since}", pause)
+        changed = replace(row, paused=Active(), resume_pending=pending)
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
+
+
+def finish_resume(identity: StaffId, key: str, *, restore_pause: bool = False) -> StaffRow:
+    """Settle the matching continuation and preserve any newer hold."""
+    if not is_owner():
+        return _remote_row(["finish-resume", identity, f"--resume-key={key}",
+                            *(["--restore-pause"] if restore_pause else [])])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        pending = row.resume_pending
+        if isinstance(pending, NoPendingResume) or pending.key != key:
+            return row
+        pause = row.paused
+        if restore_pause and isinstance(pause, Active) and isinstance(row.exited, Active):
+            pause = pending.original_pause
+        changed = replace(row, paused=pause, resume_pending=NoPendingResume())
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
 
 
 def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
@@ -2291,17 +2546,65 @@ def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
     return _transaction(edit)
 
 
-def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc) -> StaffRow:
-    """Set one showrunner's document through the existing owner transaction."""
+@dataclass(frozen=True)
+class NoExpectedDocument:
+    """The caller did not supply a prior binding."""
+
+
+NO_EXPECTED_DOCUMENT = NoExpectedDocument()
+
+
+def _doc_arguments(doc: LiveDoc | WrappedDoc | DocUnfilled, prefix: str = "") -> list[str]:
+    if isinstance(doc, DocUnfilled):
+        return [f"--{prefix}state", "unfilled"]
+    return [f"--{prefix}machine", doc.machine, f"--{prefix}path", str(doc.path),
+            f"--{prefix}state", "live" if isinstance(doc, LiveDoc) else "wrapped"]
+
+
+def _verify_document_change(identity: StaffId, previous: LiveDoc | WrappedDoc,
+                            destination: LiveDoc | WrappedDoc | DocUnfilled, conditional: bool) -> None:
+    verify = cast(Callable[[StaffId, LiveDoc | WrappedDoc, LiveDoc | WrappedDoc | DocUnfilled, bool], None],
+                  import_module("scripts.production.production_admission").verify_document_change)
+    verify(identity, previous, destination, conditional)
+
+
+def _require_document_change(row: StaffRow, destination: LiveDoc | WrappedDoc | DocUnfilled,
+                             conditional: bool = False) -> None:
+    from scripts.agents import remote
+
+    previous = row.doc
+    if row.kind != "showrunner" or isinstance(previous, DocUnfilled) or previous == destination:
+        return
+    if previous.machine == remote.local_machine() or (_file_override() and _file().resolve() != _default_file().resolve()):
+        _verify_document_change(row.id, previous, destination, conditional)
+        return
+    arguments = ["verify-doc-change", row.id, *_doc_arguments(destination), *_doc_arguments(previous, "expected-")]
+    if conditional:
+        arguments.append("--conditional")
+    _ = _remote(arguments, machine=remote.other_machine())
+
+
+def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc, *,
+            expected: LiveDoc | WrappedDoc | DocUnfilled | NoExpectedDocument = NO_EXPECTED_DOCUMENT) -> StaffRow:
+    """Set the document through the authority and verify admitted changes on the document machine."""
     if not is_owner():
-        return _remote_row(["set-doc", showrunner, "--machine", doc.machine, "--path", str(doc.path),
-                            "--state", "live" if isinstance(doc, LiveDoc) else "wrapped"])
+        arguments = ["set-doc", showrunner, *_doc_arguments(doc)]
+        if not isinstance(expected, NoExpectedDocument):
+            arguments.extend(_doc_arguments(expected, "expected-"))
+        return _remote_row(arguments)
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, showrunner)
         if row.kind not in ("showrunner", "producer"):
             raise StaffRefused("set-doc requires a showrunner or producer")
-        changed = replace(row, doc=_keep_location_fields(doc, row.doc))
+        location = _document_for_owner(rows, row.id, doc) if row.kind == "showrunner" else doc
+        if row.doc == location:
+            return row
+        conditional = not isinstance(expected, NoExpectedDocument)
+        if conditional and row.doc != expected:
+            raise StaffRefused(f"{showrunner}: the staff document differs from the expected binding")
+        _require_document_change(row, location, conditional)
+        changed = replace(row, doc=_keep_location_fields(location, row.doc))
         rows[rows.index(row)] = changed
         return changed
 
@@ -2337,6 +2640,24 @@ def set_producer_retirement(identity: StaffId, state: RetiredProducer | Active) 
         if row.kind != "producer" or row.name.casefold() == "morty":
             raise StaffRefused(f"{row.name}: retirement requires a producer other than morty")
         changed = replace(row, retirement=state)
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
+
+
+def set_producer_top_item(identity: StaffId, top_item: TopItem) -> StaffRow:
+    """Name a producer's top priority List item. The caller checks the item."""
+    if top_item.number < 1:
+        raise StaffRefused("a top item is a List item number from 1")
+    if not is_owner():
+        return _remote_row(["set-producer-top-item", identity, f"--number={top_item.number}"])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, identity)
+        if row.kind != "producer" or isinstance(row.retirement, RetiredProducer):
+            raise StaffRefused(f"{row.name}: a top item requires an active producer")
+        changed = replace(row, top_item=top_item)
         rows[rows.index(row)] = changed
         return changed
 
@@ -2445,7 +2766,9 @@ def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
         if isinstance(row.doc, DocUnfilled):
             print(f"staff: keeping {row.id}: doc is unfilled", file=sys.stderr)
             return False
-        changed = replace(row, doc=_keep_location_fields(WrappedDoc(row.doc.machine, row.doc.path), row.doc))
+        destination = WrappedDoc(row.doc.machine, row.doc.path)
+        _require_document_change(row, destination)
+        changed = replace(row, doc=_keep_location_fields(destination, row.doc))
     else:
         raise StaffRefused("pending retirement is for units and showrunners")
     rows[rows.index(row)] = changed
@@ -2589,7 +2912,10 @@ class _Arguments:
     creation_action: str = ""
     marker: str = ""
     profile: str = ""
+    number: str = ""
     hold_record: str = ""
+    resume_key: str = ""
+    restore_pause: bool = False
     home: str = ""
     runtime_id: str = ""
     new_id: str = ""
@@ -2615,6 +2941,7 @@ class _Arguments:
     expected_state: str = ""
     expected_machine: str = ""
     expected_path: str = ""
+    conditional: bool = False
     branch: str = ""
     expected_branch: str = ""
     worktree: list[str] | None = None
@@ -2645,6 +2972,15 @@ def _parser() -> argparse.ArgumentParser:
     _ = hold.add_argument("--state", choices=("paused", "exited", "active"), required=True)
     _ = hold.add_argument("--record", dest="hold_record", default="{}")
     _ = hold.add_argument("--json", action="store_true")
+    begin_resume_cmd = verbs.add_parser("begin-resume", help=argparse.SUPPRESS)
+    _ = begin_resume_cmd.add_argument("target")
+    _ = begin_resume_cmd.add_argument("--record", dest="hold_record", required=True)
+    _ = begin_resume_cmd.add_argument("--json", action="store_true")
+    finish_resume_cmd = verbs.add_parser("finish-resume", help=argparse.SUPPRESS)
+    _ = finish_resume_cmd.add_argument("target")
+    _ = finish_resume_cmd.add_argument("--resume-key", required=True)
+    _ = finish_resume_cmd.add_argument("--restore-pause", action="store_true")
+    _ = finish_resume_cmd.add_argument("--json", action="store_true")
     show = verbs.add_parser("show", help="show the production staff")
     _ = show.add_argument("--kind", choices=_KINDS)
     _ = show.add_argument("--live", action="store_true", help="show live member identities")
@@ -2660,6 +2996,11 @@ def _parser() -> argparse.ArgumentParser:
     _ = add.add_argument("--worktree", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--doc", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
+    create = verbs.add_parser("create-session", help=argparse.SUPPRESS)
+    _ = create.add_argument("target")
+    for field_name in ("name", "machine", "path", "home"):
+        _ = create.add_argument(f"--{field_name}", required=True)
+    _ = create.add_argument("--json", action="store_true")
     worker_parser = verbs.add_parser("ensure-worker", help=argparse.SUPPRESS)
     _ = worker_parser.add_argument("target")
     _ = worker_parser.add_argument("--name", required=True)
@@ -2683,6 +3024,10 @@ def _parser() -> argparse.ArgumentParser:
     _ = producer_retirement.add_argument("target")
     _ = producer_retirement.add_argument("--profile", required=True)
     _ = producer_retirement.add_argument("--json", action="store_true")
+    producer_top_item = verbs.add_parser("set-producer-top-item", help=argparse.SUPPRESS)
+    _ = producer_top_item.add_argument("target")
+    _ = producer_top_item.add_argument("--number", required=True, help="a List item number")
+    _ = producer_top_item.add_argument("--json", action="store_true")
     creation = verbs.add_parser("producer-creation", help=argparse.SUPPRESS)
     _ = creation.add_argument("creation_action", choices=("read", "claim", "finish", "read-named"))
     _ = creation.add_argument("--name", required=True)
@@ -2719,11 +3064,12 @@ def _parser() -> argparse.ArgumentParser:
     _ = defer_parser.add_argument("ids", nargs="*")
     pending_parser = verbs.add_parser("retire-pending", help=argparse.SUPPRESS)
     location_parsers: list[argparse.ArgumentParser] = []
-    for command, states in (("set-worktree", ("present", "removed")), ("set-doc", ("live", "wrapped"))):
+    for command, states in (("set-worktree", ("present", "removed")), ("set-doc", ("live", "wrapped")),
+                            ("verify-doc-change", ("live", "wrapped", "unfilled"))):
         location_parser = verbs.add_parser(command)
         _ = location_parser.add_argument("target")
-        _ = location_parser.add_argument("--machine", required=True)
-        _ = location_parser.add_argument("--path", required=True)
+        _ = location_parser.add_argument("--machine", required=command != "verify-doc-change", default="")
+        _ = location_parser.add_argument("--path", required=command != "verify-doc-change", default="")
         _ = location_parser.add_argument("--state", required=True, choices=states)
         if command == "set-worktree":
             _ = location_parser.add_argument("--expected-state", required=True, choices=("unfilled", "present", "removed"))
@@ -2731,6 +3077,12 @@ def _parser() -> argparse.ArgumentParser:
             _ = location_parser.add_argument("--expected-path", default="")
             _ = location_parser.add_argument("--branch", default="")
             _ = location_parser.add_argument("--expected-branch", default="")
+        else:
+            _ = location_parser.add_argument("--expected-state", choices=("unfilled", "live", "wrapped"), default="")
+            _ = location_parser.add_argument("--expected-machine", default="")
+            _ = location_parser.add_argument("--expected-path", default="")
+            if command == "verify-doc-change":
+                _ = location_parser.add_argument("--conditional", action="store_true")
         location_parsers.append(location_parser)
     for verb in (*location_parsers, show, get, add, restore_parser, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
@@ -2743,6 +3095,18 @@ def _parent(value: str | None) -> ReportsTo | StaffRoot:
 
 def _print_row(row: StaffRow, path: str) -> None:
     print(f"{row.id:<12}  {row.kind:<10}  {path}")
+
+
+def _expected_document(arguments: _Arguments) -> LiveDoc | WrappedDoc | DocUnfilled | NoExpectedDocument:
+    match arguments.expected_state:
+        case "live":
+            return LiveDoc(arguments.expected_machine, Path(arguments.expected_path))
+        case "wrapped":
+            return WrappedDoc(arguments.expected_machine, Path(arguments.expected_path))
+        case "unfilled":
+            return DOC_UNFILLED
+        case _:
+            return NO_EXPECTED_DOCUMENT
 
 
 def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
@@ -2761,6 +3125,13 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         hold = (Paused.from_json(_decode(arguments.hold_record)) if arguments.state == "paused" else
                 Exited.from_json(_decode(arguments.hold_record)) if arguments.state == "exited" else Active())
         return set_hold(arguments.target, hold)
+    if arguments.verb == "begin-resume":
+        return begin_resume(StaffId(arguments.target), Paused.from_json(_decode(arguments.hold_record)))
+    if arguments.verb == "finish-resume":
+        return finish_resume(StaffId(arguments.target), arguments.resume_key, restore_pause=arguments.restore_pause)
+    if arguments.verb == "create-session":
+        return create_session(arguments.name, arguments.target,
+                              SessionLaunchFolder(arguments.machine, Path(arguments.path)), SessionHome(Path(arguments.home)))
     if arguments.verb == "ensure-worker":
         assert arguments.parent is not None
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))
@@ -2769,6 +3140,10 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
     if arguments.verb == "set-producer-retirement":
         state = RetiredProducer(arguments.profile) if arguments.profile else Active()
         return set_producer_retirement(StaffId(arguments.target), state)
+    if arguments.verb == "set-producer-top-item":
+        if not (arguments.number.isascii() and arguments.number.isdecimal()):
+            raise StaffRefused("--number takes a List item number")
+        return set_producer_top_item(StaffId(arguments.target), TopItem(int(arguments.number)))
     if arguments.verb == "transfer-producer":
         return transfer_producer(StaffId(arguments.target), native_id(arguments.new_id),
                                  SessionHome(Path(arguments.home).absolute()),
@@ -2786,7 +3161,7 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
     if arguments.verb == "set-doc":
         doc = (LiveDoc(arguments.machine, Path(arguments.path)) if arguments.state == "live"
                else WrappedDoc(arguments.machine, Path(arguments.path)))
-        return set_doc(StaffId(arguments.target), doc)
+        return set_doc(StaffId(arguments.target), doc, expected=_expected_document(arguments))
     if arguments.verb == "defer-retire":
         return defer_retire(tuple(StaffId(value) for value in arguments.ids))
     if arguments.verb == "retire-pending":
@@ -2832,6 +3207,18 @@ def _main(arguments: _Arguments) -> int:
         lock_result = ({"state": "held", "lock": str(status.lock)} if isinstance(status, StaffWorktreeWriteLockHeld)
                        else {"state": "available"})
         print(json.dumps(lock_result))
+        return 0
+    if arguments.verb == "verify-doc-change":
+        from scripts.agents import remote
+
+        previous = _expected_document(arguments)
+        if not isinstance(previous, (LiveDoc, WrappedDoc)) or previous.machine != remote.local_machine():
+            raise StaffRefused("verify the change on the document machine")
+        destination = (DOC_UNFILLED if arguments.state == "unfilled" else
+                       LiveDoc(arguments.machine, Path(arguments.path)) if arguments.state == "live" else
+                       WrappedDoc(arguments.machine, Path(arguments.path)))
+        _verify_document_change(StaffId(arguments.target), previous, destination, arguments.conditional)
+        print("null")
         return 0
     if arguments.verb == "producer-creation":
         action = arguments.creation_action

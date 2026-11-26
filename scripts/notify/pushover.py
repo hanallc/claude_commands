@@ -44,6 +44,7 @@ except FileNotFoundError:
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -55,13 +56,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
+from scripts.lib import conf
 from scripts.message import session_send
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
 from scripts.notify import silence
 from scripts.notify import decision_priority
-from scripts.notify.push_catalog import NATE_ADHOC_TEXT_ID
+from scripts.notify.push_catalog import (NATE_ADHOC_TEXT_ID, PAID_CREDIT_ACTION_PREFIX, RESTART_FAILED_TEXT_ID,
+                                         remaining_credit_accounts)
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
@@ -74,13 +77,15 @@ LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.jsonl"
 PRIORITIES = ("0", "1", "2")
 TOKEN_ALERT_IDS = token_expiry.ALERT_IDS | {token_expiry.LEGACY_MAC_EXPIRY_ID}
 TOKEN_APPROVAL_REQUIRED = "Token alert template needs current approval"
+PAID_CREDIT_TEXT_IDS = frozenset({"quota.paid_credits", "quota.paid_credits_queued"})
+PAID_CREDIT_ACCOUNT = re.compile(r"codex[1-9][0-9]*")
+PAID_CREDIT_DETAIL_PREFIX = "paid-credit account="
 RETRY_S = 300
 EXPIRE_S = 10800
 TITLE_MAX = 250
 MESSAGE_MAX = 1024
 ACTION_TEXT_MAX = MESSAGE_MAX - len("Action: ") - 1
 TIMEOUT_S = 15
-SOURCE_MAX = 80
 # send.py's default_sender: the Claude session that ran send.py follows this prefix.
 SESSION_SOURCE = "send.py in "
 FREE_TEXT = "none (free text)"
@@ -174,22 +179,33 @@ def http_post(url: str, data: bytes) -> tuple[int, bytes]:
 
 
 def parent_source() -> str:
-    """The parent command line, bounded for the audit log."""
+    """Return the bounded parent command or use the parent PID."""
+    parent_pid = os.getppid()
+    fallback = f"parent pid {parent_pid}"
+    try:
+        with conf.diagnostics(report=False) as diagnostics:
+            limit = conf.read("notify").whole("pushover.max_source_chars")
+    except conf.Unusable as error:
+        print(f"pushover: {error}", file=sys.stderr)
+        return fallback
+    for diagnostic in diagnostics:
+        print(diagnostic, file=sys.stderr)
     try:
         found = subprocess.run(
-            ["ps", "-o", "args=", "-p", str(os.getppid())],
+            ["ps", "-o", "args=", "-p", str(parent_pid)],
             capture_output=True,
             text=True,
             check=False,
         ).stdout.strip()
     except OSError:
         found = ""
-    return (found or f"parent pid {os.getppid()}")[:SOURCE_MAX]
+    return (found or fallback)[:limit]
 
 
 def sender_name(source: str) -> str:
-    """The "Sent by" name: the session for a send.py source, else the source, on one line."""
-    return " ".join(source.removeprefix(SESSION_SOURCE).split())[:SOURCE_MAX]
+    """Return the sender on one line. Use the session name for a send.py source."""
+    limit = conf.read("notify").whole("pushover.max_source_chars")
+    return " ".join(source.removeprefix(SESSION_SOURCE).split())[:limit]
 
 
 def _phone_footer(sender: str, text_id: str) -> str:
@@ -231,6 +247,7 @@ class Arguments(TypedDict):
     title: str
     message: str
     text_id: str
+    paid_credit_account: str
     session: NotificationSession
     header: bool
     due: str
@@ -368,6 +385,7 @@ def parse(argv: list[str]) -> Arguments | None:
         "title": positionals[0],
         "message": positionals[1],
         "text_id": text_id,
+        "paid_credit_account": values.get("account", "") if text_id in PAID_CREDIT_TEXT_IDS else "",
         "header": header,
     }
 
@@ -501,7 +519,8 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
             completion: review.ClaimDelivery = review.ClaimCancelled()
         else:
             completion = review.post_claim(found.hold, lambda: deliver(version, keys_file, post, detail=detail, header=header,
-                                    key=key, text_id=arguments["text_id"], silence_policy=arguments["silence_policy"]))
+                                    key=key, text_id=arguments["text_id"], silence_policy=arguments["silence_policy"],
+                                    paid_credit_account=arguments["paid_credit_account"]))
         if isinstance(completion, review.ClaimCancelled):
             review.log_review(draft, outcome, detail="claim cancelled before posting", text_id=arguments["text_id"])
             print("pushover: replaced: a newer version replaced this push; nothing was sent")
@@ -509,7 +528,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         code = completion.code if isinstance(completion, review.ClaimFailed) else 0
     else:
         code = deliver(version, keys_file, post, detail=detail, header=header, key=key, text_id=arguments["text_id"],
-                       silence_policy=arguments["silence_policy"])
+                       silence_policy=arguments["silence_policy"], paid_credit_account=arguments["paid_credit_account"])
     delivery = review.Sent(version) if code == 0 else review.NotSent()
     review.log_review(draft, outcome, delivery, detail=detail, text_id=arguments["text_id"])
     if code == 0 and send_anyway:
@@ -560,7 +579,8 @@ def via_natedev(arguments: Sequence[str], text: str, asker: AskNatedev, *,
 def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
             post: Post = http_post, *, detail: str = "", header: bool = True, key: str = "", text_id: str = "",
             asker: AskNatedev = ask_natedev,
-            silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE) -> int:
+            silence_policy: silence.SilencePolicy = silence.SilencePolicy.KEEP_DURING_SILENCE,
+            paid_credit_account: str = "") -> int:
     """Post an already reviewed version, including expiry sends; do not review again.
 
     During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
@@ -571,6 +591,9 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     need = "blocked" if priority == "2" else "decision" if draft.due or priority == "1" else "note"
     priority = decision_priority.priority(need, draft.due)
     message = posted_message(draft.action, draft.body, draft.session, header=header)
+    if text_id in PAID_CREDIT_TEXT_IDS and PAID_CREDIT_ACCOUNT.fullmatch(paid_credit_account):
+        # Save the account even if the title is too short to show it.
+        detail = f"{PAID_CREDIT_DETAIL_PREFIX}{paid_credit_account}\n{detail}"
     push: silence.KeptPush = {"source": source, "priority": priority, "title": title,
                               "message": message, "detail": detail, "key": key, "text_id": text_id,
                               "due": draft.due, "need": need, "reference": draft.reference}
@@ -582,10 +605,19 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     return deliver_here(push, keys_file, post)
 
 
+def paid_credit_details(push: silence.KeptPush) -> tuple[str, str]:
+    """Return the log detail and the saved paid-credit account."""
+    detail = push["detail"]
+    if push["text_id"] in PAID_CREDIT_TEXT_IDS and detail.startswith(PAID_CREDIT_DETAIL_PREFIX):
+        account, _, detail = detail.removeprefix(PAID_CREDIT_DETAIL_PREFIX).partition("\n")
+        return detail, account
+    return detail, ""
+
+
 def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Keep a reviewed push during silence or post it on natedev."""
     source, priority, title, message = push["source"], push["priority"], push["title"], push["message"]
-    detail = push["detail"]
+    detail, _ = paid_credit_details(push)
     if push["text_id"] == "quota.claude_expiry" or push["text_id"] in TOKEN_ALERT_IDS:
         if silence.active():
             return refuse(source, priority, title, message, "silence is active")
@@ -598,36 +630,89 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
     return post_message(source, priority, title, message, keys_file, post, detail, push["key"], push["text_id"])
 
 
+def _update_kept_restart_failure(message: str) -> push_texts.RenderedPush | None:
+    """Read the session and account from the saved legacy text."""
+    action, _, body = message.partition("\n")
+    prefix = "Action: In the Claude session named natedev on the natedev computer, run /agents restart "
+    if not action.startswith(prefix) or not action.endswith("."):
+        return None
+    account = action[len(prefix):-1]
+    prefix = "After your restart request, "
+    if not body.startswith(prefix):
+        return None
+    session, found, _ = body[len(prefix):].partition(f" on Claude account {account} did not restart on ")
+    if not found or re.match(r"(?:one|[0-9]+) sessions?\b", session, re.IGNORECASE):
+        return None
+    try:
+        return push_texts.render(RESTART_FAILED_TEXT_ID, session=session, account=account, identity="")
+    except ValueError:
+        return None
+
+
+def refresh_paid_credit_action(push: silence.KeptPush, account: str) -> str:
+    """Use the live account list for a paid-credit push released from silence."""
+    message = push["message"]
+    prefix = "Action: " + PAID_CREDIT_ACTION_PREFIX
+    if push["text_id"] not in PAID_CREDIT_TEXT_IDS or not message.startswith(prefix):
+        return message
+    # Earlier kept pushes saved the rendered title and action.
+    account = account or push["title"].partition(" ")[0]
+    try:
+        if not PAID_CREDIT_ACCOUNT.fullmatch(account):
+            raise ValueError("account missing from the kept push")
+        from scripts.whoami.agent_accounts import codex_credit_accounts
+
+        accounts = remaining_credit_accounts(account, codex_credit_accounts())
+    except (OSError, ValueError) as error:
+        log(push["source"], push["priority"], push["title"], message,
+            f"anomaly: kept paid-credit action uses the saved account list: {error}",
+            key=push["key"], template=push["text_id"])
+        return message
+    _, newline, body = message.partition("\n")
+    return f"{prefix}{accounts}{newline}{body}"
+
+
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Drop settled requests and retired alerts before posting kept pushes."""
     reference = push.get("reference", push_reference.NO_REFERENCE)
-    reason = "retired template message.repeat_flood" if push["text_id"] == "message.repeat_flood" else ""
-    if push["text_id"] in TOKEN_ALERT_IDS and not push_texts.approval_date(push["text_id"]):
-        reason = TOKEN_APPROVAL_REQUIRED
-    if reference["kind"] == "question":
-        try:
-            opening = push_reference.read_question(Path(reference["path"]))
-        except (OSError, ValueError) as error:
-            log(push["source"], push["priority"], push["title"], push["message"],
-                f"anomaly: question record {reference['path']}: {error}",
-                key=push["key"], template=push["text_id"], reference=reference)
-        else:
-            if opening.status == "closed":
-                reason = "question closed"
-            elif opening.since != reference["since"]:
-                reason = "question reopened"
-    elif reference["kind"] == "review_watch":
-        from scripts.production import review_regime
-        if review_regime.acknowledged():
-            reason = "report acknowledged"
+    text_id = push["text_id"]
+    reason = ""
+    title, message = push["title"], push["message"]
+    if text_id and not any(entry.id == text_id for entry in push_texts.catalog()):
+        reason = f"retired template {text_id}"
+    else:
+        if text_id == RESTART_FAILED_TEXT_ID and (
+                title == "Claude coding work remains stopped" or "/agents restart " in message.partition("\n")[0]):
+            rendered = _update_kept_restart_failure(message)
+            if rendered is None:
+                reason = "restart failure lacks saved resume values"
+            else:
+                title, message = rendered.posted_title, rendered.message
+        if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
+            reason = TOKEN_APPROVAL_REQUIRED
+        if reference["kind"] == "question":
+            try:
+                opening = push_reference.read_question(Path(reference["path"]))
+            except (OSError, ValueError) as error:
+                log(push["source"], push["priority"], push["title"], push["message"],
+                    f"anomaly: question record {reference['path']}: {error}",
+                    key=push["key"], template=push["text_id"], reference=reference)
+            else:
+                if opening.status == "closed":
+                    reason = "question closed"
+                elif opening.since != reference["since"]:
+                    reason = "question reopened"
     if reason:
         log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
             key=push["key"], template=push["text_id"], reference=reference)
         return push_reference.KeptPushDropped()
-    detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
+    detail, account = paid_credit_details(push)
+    detail = f"kept during silence, {detail}" if detail else "kept during silence"
+    if push["text_id"] in PAID_CREDIT_TEXT_IDS:
+        message = refresh_paid_credit_action(push, account)
     need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
     priority = decision_priority.priority(need, push.get("due", ""))
-    return post_message(push["source"], priority, push["title"], push["message"], keys_file, post, detail,
+    return post_message(push["source"], priority, title, message, keys_file, post, detail,
                         push["key"], push["text_id"])
 
 
@@ -637,12 +722,23 @@ def post_message(source: str, priority: str, title: str, message: str,
     if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
         return refuse(source, priority, title, message, TOKEN_APPROVAL_REQUIRED)
     suffix = f", {detail}" if detail else ""
-    sender = sender_name(source)
+    try:
+        with conf.diagnostics(report=False) as diagnostics:
+            sender = sender_name(source)
+    except conf.Unusable as error:
+        diagnostic = " ".join(str(error).splitlines())
+        outcome = f"{REFUSED_BEFORE_SENDING}: {diagnostic}"
+        log(source, priority, title, message, outcome + suffix)
+        print(f"pushover: {outcome}", file=sys.stderr)
+        return 2
+    for diagnostic in diagnostics:
+        print(diagnostic, file=sys.stderr)
     if not sender:
         log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
         print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
         return 2
-    message = message[:phone_message_limit(source, text_id)].rstrip() + _phone_footer(sender, text_id)
+    footer = _phone_footer(sender, text_id)
+    message = message[:MESSAGE_MAX - len(footer)].rstrip() + footer
     keys = read_keys(keys_file)
     if keys is None:
         outcome = f"{REFUSED_BEFORE_SENDING}: keys missing"
@@ -676,12 +772,14 @@ def post_message(source: str, priority: str, title: str, message: str,
 def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post, *,
            asker: AskNatedev = ask_natedev) -> int:
     """Stop every emergency push sent with this key; log the outcome like a post."""
-    source = parent_source()
+    source = ""
     if len(argv) == 3 and argv[0] == "--source" and argv[1].strip():
         source, argv = argv[1], argv[2:]
     if len(argv) != 1 or not argv[0] or argv[0].startswith("--"):
         print(CANCEL_USAGE, file=sys.stderr)
         return 2
+    if not source:
+        source = parent_source()
     key = argv[0]
     tag = push_tag(key)
     title, message = "cancel emergency push", f"key {key}, tag {tag}"

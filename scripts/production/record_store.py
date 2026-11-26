@@ -21,12 +21,17 @@ from typing import NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
-from scripts.lib import git_files
+from scripts.lib import conf, git_files
 from scripts.lib.showrunner_state import state_root as state_root
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
 from scripts.production.issues import ALL_FIELDS, Issue, header_fields, source_paths
-from scripts.production.production_doc import Refusal, production_field
+from scripts.production.production_doc import (
+    Refusal, document_history_file, former_live_documents, legacy_document_path,
+    production_backup_checkout, production_field,
+)
+
+from scripts.production.production_names import BACKUP_DOCUMENT_DIRECTORY
 
 
 class RecordText(NamedTuple):
@@ -42,6 +47,25 @@ class RecordKind(StrEnum):
     @property
     def prefix(self) -> str:
         return self.value[0].upper()
+
+
+def configured_list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Read the producer that owns the List."""
+    configured = settings.origin("page.list.owner", str)
+    if isinstance(configured, conf.UnavailableValue):
+        return None
+    row = members.by_id(staff.StaffId(configured.value))
+    return row if row is not None and row.kind == "producer" else None
+
+
+def list_keeper(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Find the active producer that owns the List."""
+    row = configured_list_producer(settings, members)
+    if (row is None or row.id not in members.rows_by_id or row.id in members.pending_retire
+            or isinstance(row.exited, staff.Exited) or isinstance(row.doc, staff.WrappedDoc)
+            or isinstance(row.worktree, staff.RemovedWorktree)):
+        return None
+    return row
 
 
 def record_owner(kind: RecordKind, issue: Issue, legacy_owner: str) -> staff.StaffId:
@@ -81,8 +105,15 @@ def issues_folder(doc: Path, *, lines: list[str] | None = None) -> Path | None:
         folder = Path(production_field(lines, PROPOSALS_FIELD)).expanduser()
     except Refusal:
         return None
-    # A relative folder starts at the checkout that contains docs/plans.
-    return folder if folder.is_absolute() else doc.parent.parent.parent / folder
+    if folder.is_absolute():
+        return folder
+    try:
+        root = git_files.locate(doc.parent).toplevel
+    except git_files.NotACheckout:
+        root = doc.parent.parent.parent
+    except git_files.GitFilesError as error:
+        raise OSError(f"{doc}: cannot find the repository: {error}") from error
+    return root / folder
 
 
 FileStamp = tuple[int, int, int, int, int, int]
@@ -219,9 +250,14 @@ def _stamps_match(stamps: Mapping[Path, FileStamp]) -> bool:
 
 
 def _read_folder_history(doc: Path) -> tuple[Path, ...] | None:
+    return _read_folder_log(doc.parent, doc.name, doc)
+
+
+def _read_folder_log(repository: Path, relative: str, doc: Path) -> tuple[Path, ...] | None:
     try:
-        result = subprocess.run(["git", "-C", str(doc.parent), "log", "--all", "--follow", "--format=", "--no-ext-diff",
-                                 "--no-textconv", "-p", "--", doc.name], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(["git", "-C", str(repository), "--literal-pathspecs",
+                                 "log", "--all", "--follow", "--format=", "--no-ext-diff",
+                                 "--no-textconv", "-p", "--", relative], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise OSError(f"Cannot read folder history for {doc}: {error}") from error
     if result.returncode != 0:
@@ -239,6 +275,7 @@ def _read_folder_history(doc: Path) -> tuple[Path, ...] | None:
 
 def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) -> Iterator[Path]:
     """Reuse successful Git history until a repository input changes."""
+    doc = legacy_document_path(doc)
     if os.environ.get("GIT_DIR"):
         yield from _read_folder_history(doc) or ()
         return
@@ -283,6 +320,21 @@ def historical_issue_folders(doc: Path, *, sources: list[Path] | None = None) ->
     yield from folders
 
 
+def _backup_issue_folders(owner: staff.StaffId, doc: Path, sources: list[Path] | None) -> tuple[Path, ...]:
+    backup = production_backup_checkout(owner)
+    if sources is not None:
+        sources.append(backup / ".git")
+    if not backup.is_dir():
+        return ()
+    try:
+        relative = Path(BACKUP_DOCUMENT_DIRECTORY) / doc.name
+        if sources is not None:
+            _ = _history_inputs(backup, backup / relative, sources)
+        return _read_folder_log(backup, relative.as_posix(), doc) or ()
+    except (git_files.GitFilesError, ValueError) as error:
+        raise OSError(f"{doc}: cannot find backup history: {error}") from error
+
+
 def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path] = (),
                   *, document: Path | None = None, strict: bool = False,
                   include_history: bool = True, require_document: bool = True,
@@ -322,8 +374,26 @@ def known_folders(kind: RecordKind, owner: staff.StaffId, current: Iterable[Path
                         raise
             if include_history:
                 try:
-                    roots.extend(historical_issue_folders(document, sources=sources))
-                except (OSError, UnicodeError):
+                    history: tuple[Path, ...] = ()
+                    if owner:
+                        try:
+                            checkout = git_files.locate(document.parent)
+                        except git_files.NotACheckout:
+                            pass
+                        else:
+                            history_file = document_history_file(checkout, owner)
+                            if sources is not None:
+                                sources.append(history_file)
+                            history = former_live_documents(history_file)
+                    if history and document in history:
+                        roots.extend(historical_issue_folders(history[0], sources=sources))
+                        for path in history:
+                            roots.extend(_backup_issue_folders(owner, path, sources))
+                    else:
+                        roots.extend(historical_issue_folders(document, sources=sources))
+                        if owner and legacy_document_path(document) != document:
+                            roots.extend(_backup_issue_folders(owner, document, sources))
+                except (OSError, UnicodeError, git_files.MissingReferencedGitDirectory):
                     if strict and require_document:
                         raise
     resolved: dict[Path, None] = {}
@@ -746,24 +816,32 @@ class NumberedRecords:
         return self.folder() / ".next-number"
 
     def require_list_keeper(self) -> None:
-        keepers = [row.id for row in staff.active(staff.snapshot(), "producer") if row.name == "morty"]
-        if self.collection != "list" or self.prefix != "L" or keepers != [self.owner]:
-            raise self.error_type("only morty's List folder can allocate List numbers")
+        keeper = list_keeper(conf.read_or_repository("console"), staff.snapshot())
+        if keeper is None:
+            raise self.error_type("The List keeper is unavailable.")
+        if self.collection != "list" or self.prefix != "L" or keeper.id != self.owner:
+            raise self.error_type(f"only {keeper.name}'s List folder can allocate List numbers")
 
     @contextmanager
     def list_allocation(self) -> Generator[None]:
         """Check the keeper before creating or locking its folder."""
         with staff.supplied_snapshot(staff.snapshot()):
             self.require_list_keeper()
-            with self.locked():
+            root = state_root()
+            root.mkdir(parents=True, exist_ok=True)
+            with exclusive(root / ".list-allocation.lock"), self.locked(check=self.require_list_keeper):
                 yield
+
+    def _list_folders(self) -> Iterator[Path]:
+        for owner in state_root().iterdir():
+            if owner.is_dir() and not owner.is_symlink():
+                folder = owner / self.collection
+                if not folder.is_symlink():
+                    yield folder
 
     def _previous_numbers(self) -> Iterator[int]:
         """Read record names and the migration log, including closed records."""
-        for owner in state_root().iterdir():
-            if not owner.is_dir() or owner.is_symlink():
-                continue
-            folder = owner / self.collection
+        for folder in self._list_folders():
             try:
                 names = [path.name for path in folder.iterdir()]
             except FileNotFoundError:
@@ -785,8 +863,7 @@ class NumberedRecords:
                 if identity != name and self.valid_id(identity):
                     yield int(identity[len(self.prefix):])
 
-    def _saved_next_number(self) -> int:
-        path = self.counter_path()
+    def _saved_next_number(self, path: Path) -> int:
         if path.is_symlink():
             raise self.error_type(f"{path}: expected a regular counter file")
         try:
@@ -800,7 +877,11 @@ class NumberedRecords:
     def next_number(self) -> int:
         """Read the next number under the store lock."""
         self.require_list_keeper()
-        number = self._saved_next_number() or max(self._previous_numbers(), default=0) + 1
+        counter = self.counter_path()
+        saved = self._saved_next_number(counter)
+        former = (self._saved_next_number(folder / counter.name) for folder in self._list_folders()
+                  if folder != counter.parent)
+        number = max(saved or max(self._previous_numbers(), default=0) + 1, max(former, default=0))
         while os.path.lexists(self.path(f"{self.prefix}{number}")):
             number += 1
         return number

@@ -39,7 +39,7 @@ class LongStepOwnershipTests(VerifyTokenWaitFixture):
                               env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
 
     def test_running_step_renews_past_its_original_hold_and_stops_on_release(self) -> None:
-        _ = write_config_fixture(self.root / "direct.conf", "VERIFY_TOKEN_HOLD_SECONDS=2\nVERIFY_TOKEN_RENEW_SECONDS=1")
+        _ = write_config_fixture(self.root / "direct.conf", "verify_token_hold_seconds=2\nverify_token_renew_seconds=1")
         board = self.root / "board"
         process = self.start_owned_step({**self.environment, "UNIT_RUN_DIR": str(board),
                                     "UNIT_TEAM_ROLE": "first", "TEST_BLOCK": "1",
@@ -91,8 +91,8 @@ class LongStepOwnershipTests(VerifyTokenWaitFixture):
                                + shell_functions(VERIFY, "buildlog_exec") + r'''
 BOARD_HELPER=$1 BOARD_DIR=$2 BOARD_SLOT=holder STEP_RECORD_SCRIPT="$TEST_STEP_SCRIPT"
 source "${STEP_RECORD_SCRIPT%/*}/../lib/conf.sh"
-TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)"
-TOKEN_RENEW_S="$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)"
+TOKEN_HOLD_S="$(conf_value direct verify_token_hold_seconds)"
+TOKEN_RENEW_S="$(conf_value direct verify_token_renew_seconds)"
 TOKEN_HELD=1 PY=$3 STEP_OWNER_PY=""
 HOLD_WAIT_DIR="$TEST_HOLD_DIR"
 bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold 30
@@ -115,7 +115,7 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
     def memory_wait_process(self, *, lose_at_launch: bool = False, scoped_attempt: bool = False,
                             board_helper: Path = BOARD, noncompiling: bool = False) -> subprocess.Popen[str]:
         # Use the real board and ownership guard with controlled admission replies.
-        _ = write_config_fixture(self.root / "direct.conf", "VERIFY_TOKEN_HOLD_SECONDS=2\nVERIFY_TOKEN_RENEW_SECONDS=1")
+        _ = write_config_fixture(self.root / "direct.conf", "verify_token_hold_seconds=2\nverify_token_renew_seconds=1")
         source = VERIFY.read_text()
         owner_start = source.index("STEP_OWNER_PY='\n")
         owner_end = source.index("\nrelease_token() {", owner_start)
@@ -126,15 +126,47 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
                                + token_admission_functions() + r'''
 BOARD_HELPER=$1 BOARD_DIR=$2 BOARD_SLOT=first
 source "${STEP_RECORD_SCRIPT%/*}/../lib/conf.sh"
-TOKEN_HOLD_S="$(conf_value direct VERIFY_TOKEN_HOLD_SECONDS)"
-TOKEN_RENEW_S="$(conf_value direct VERIFY_TOKEN_RENEW_SECONDS)"
+TOKEN_HOLD_S="$(conf_value direct verify_token_hold_seconds)"
+TOKEN_RENEW_S="$(conf_value direct verify_token_renew_seconds)"
 TOKEN_USED=1 TOKEN_HELD=0 TOKEN_WAIT_FILE="$TEST_ROOT/token-waits" TOKEN_WAITED=0 PY=$3
 BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_WAIT_FROM=0 BUILDLOG_MEM_OUTCOME=Granted passes=0
 HOLD_WAIT_DIR="$TEST_ROOT/hold"
 mkdir -p "$HOLD_WAIT_DIR"
+hold_first_sampler_tick() {
+    mkdir "$TEST_ROOT/first-sampler" 2>/dev/null || return 1
+    "$PY" -c '
+import os, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+temporary = root / "sampler-child.tmp"
+temporary.write_text(str(os.getpid()))
+temporary.replace(root / "sampler-child")
+if sys.argv[2] == "fifo":
+    with (root / "sampler-stop").open("rb") as stop:
+        stop.read()
+else:
+    sys.stdin.buffer.read()
+' "$TEST_ROOT" "$1" >/dev/null 2>&1
+}
+eval "$(declare -f buildlog_sample_anon | sed '1s/buildlog_sample_anon/sample_anon_actual/')"
+buildlog_sample_anon() {
+    # Main uses sleep. The fixed sampler uses the stop pipe.
+    sleep() { hold_first_sampler_tick fifo || command sleep "$@"; }
+    if declare -F buildlog_wait_sample_tick >/dev/null; then
+        eval "$(declare -f buildlog_wait_sample_tick | sed '1s/buildlog_wait_sample_tick/sample_tick_actual/')"
+        buildlog_wait_sample_tick() {
+            if hold_first_sampler_tick pipe; then return 1; fi
+            sample_tick_actual
+        }
+    fi
+    sample_anon_actual "$@"
+}
 eval "$(declare -f buildlog_exec_unowned | sed '1s/buildlog_exec_unowned/buildlog_exec_actual/')"
 buildlog_exec_unowned() {
     if [[ "$TEST_LOSE_AT_LAUNCH" == 1 && ! -f "$TEST_ROOT/lost-at-launch" ]]; then
+        if [[ "$TEST_SCOPED_ATTEMPT" == 1 ]]; then
+            "$PY" "$TEST_WAIT_HELPER" "$TEST_ROOT/sampler-child"
+        fi
         : > "$TEST_ROOT/lost-at-launch"
         bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
     fi
@@ -254,6 +286,7 @@ release_token
         self.assertEqual(self.live_group_processes(process.pid), [])
 
     def test_ownership_guard_refusal_readmits_before_running_and_records_only_the_step(self) -> None:
+        os.mkfifo(self.root / "sampler-stop")
         process = self.memory_wait_process(lose_at_launch=True, scoped_attempt=True)
         self.wait_for_running(self.root / "memory-wait", process)
         (self.root / "release").touch()
@@ -271,7 +304,8 @@ release_token
         self.assertEqual(len((self.root / "scoped-attempts").read_text().splitlines()), 2)
         self.assertEqual(list(self.root.glob("attempt.*.peak")), [], "discarded scope kept its peak file")
         self.assertEqual(list(self.root.glob("attempt.*.peak.cgroup")), [])
-        self.assertEqual(self.live_group_processes(process.pid), [])
+        child = int((self.root / "sampler-child").read_text())
+        self.assertEqual(self.live_group_processes(process.pid), [], f"sampler child PID {child}")
 
     def test_unstarted_noncompiling_step_reacquires_before_its_command(self) -> None:
         process = self.memory_wait_process(lose_at_launch=True, noncompiling=True)
@@ -292,7 +326,7 @@ release_token
         wrong = self.board(board, "renew", "same", "cargo", "--pid", str(os.getppid()), "--hold", "30")
         self.assertNotEqual(wrong.returncode, 0)
         self.assertEqual((lock / "expires").read_text(), "0")
-        _ = write_config_fixture(self.root / "direct.conf", "TOKEN_GUARD_ATTEMPTS=2\nTOKEN_GUARD_DELAY_MS=1")
+        _ = write_config_fixture(self.root / "direct.conf", "token_guard_attempts=2\ntoken_guard_delay_ms=1")
         with (board / "locks/cargo.guard").open("a") as guard:
             fcntl.flock(guard, fcntl.LOCK_EX)
             busy = self.board(board, "renew", "same", "cargo", "--pid", str(os.getpid()), "--hold", "30")

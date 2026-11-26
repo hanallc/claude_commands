@@ -7,20 +7,27 @@ except FileNotFoundError:
     pass
 
 import argparse
+from collections.abc import Generator
+from contextlib import contextmanager
+from enum import Enum
 import json
 import os
 import re
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
-from typing import Literal, cast, final
+from typing import TYPE_CHECKING, Literal, cast, final
 
 from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.agents import worker_lifecycle
 from scripts.message import sessions
+
+if TYPE_CHECKING:
+    from scripts.production.worker import CompletionArtifacts
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 ROOT = SCRIPTS.parent
@@ -91,7 +98,51 @@ class StyleReviewBusy(ValueError):
     """A live or unconfirmed launcher still owns the phase's style assignment."""
 
 
-def prepare(root: Path, baseline: str, directory: Path, end: ReviewEnd = WORKING_TREE) -> Preparation:
+class StyleArtifactPolicy(Enum):
+    STANDALONE = "the review uses standalone style output"
+
+
+def _write(artifacts: CompletionArtifacts | StyleArtifactPolicy, path: Path, text: str) -> None:
+    if isinstance(artifacts, StyleArtifactPolicy):
+        write_text_atomic(path, text)
+    else:
+        artifacts.write(path, text)
+
+
+def _read(artifacts: CompletionArtifacts | StyleArtifactPolicy, path: Path) -> str:
+    return path.read_text() if isinstance(artifacts, StyleArtifactPolicy) else artifacts.read(path)
+
+
+@contextmanager
+def _locked_style_state(artifacts: CompletionArtifacts | StyleArtifactPolicy, path: Path) -> Generator[dict[str, object]]:
+    if isinstance(artifacts, StyleArtifactPolicy):
+        with worker_lifecycle.locked_state(path) as saved:
+            yield saved.read_object()
+        return
+    with artifacts.lock(path.with_name(path.name + ".lock")):
+        try:
+            stored = artifacts.read(path)
+        except FileNotFoundError:
+            state: dict[str, object] = {}
+        else:
+            state = worker_lifecycle.validate_worker_state(path, cast(object, json.loads(stored)))
+        yield state
+
+
+@contextmanager
+def _style_directory(artifacts: CompletionArtifacts | StyleArtifactPolicy, parent: Path,
+                     name: str) -> Generator[Path]:
+    if isinstance(artifacts, StyleArtifactPolicy):
+        parent.mkdir(parents=True, exist_ok=True)
+        request = build_folders.UniqueBuildFolder(f"{name}-", build_folders.ExplicitBuildParent(parent))
+        with build_folders.leased_build_folder(request) as directory:
+            yield directory
+    else:
+        yield artifacts.new_directory(parent, f"{name}-{uuid.uuid4().hex[:11]}")
+
+
+def prepare(root: Path, baseline: str, directory: Path, end: ReviewEnd = WORKING_TREE, *,
+            artifacts: CompletionArtifacts | StyleArtifactPolicy = StyleArtifactPolicy.STANDALONE) -> Preparation:
     """Reject self-input, then read the switch before validating the review range."""
     try:
         validate_output(root, directory)
@@ -130,10 +181,9 @@ def prepare(root: Path, baseline: str, directory: Path, end: ReviewEnd = WORKING
         content = diff.decode(errors="replace")
         additions = "".join(line for line in content.splitlines(keepends=True)
                             if line.startswith("+") and not line.startswith("+++"))
-        directory.mkdir(parents=True, exist_ok=True)
         diff_path, additions_path = directory / "style-review.diff", directory / "style-review-additions.txt"
-        write_text_atomic(diff_path, content)
-        write_text_atomic(additions_path, additions)
+        _write(artifacts, diff_path, content)
+        _write(artifacts, additions_path, additions)
         if not diff:
             return Finished("No changes to review")
         rust = any(Path(name).suffix == ".rs" or Path(name).name in ("Cargo.toml", "Cargo.lock") for name in paths)
@@ -142,30 +192,33 @@ def prepare(root: Path, baseline: str, directory: Path, end: ReviewEnd = WORKING
         return PreparationError(str(error))
 
 
-def publish(directory: Path, state: Literal["owed", "complete"], report: str, *, in_flight: bool = False) -> None:
+def publish(directory: Path, state: Literal["owed", "complete"], report: str, *, in_flight: bool = False,
+            artifacts: CompletionArtifacts | StyleArtifactPolicy = StyleArtifactPolicy.STANDALONE) -> None:
     """Publish pass and phase evidence while the caller holds the phase state lock."""
-    write_text_atomic(directory / "report.md", report)
-    write_text_atomic(directory.parent.parent / "phase_style_review.md", report)
-    write_text_atomic(directory.parent.parent / "style_review_state.json", json.dumps({
+    _write(artifacts, directory / "report.md", report)
+    _write(artifacts, directory.parent.parent / "phase_style_review.md", report)
+    _write(artifacts, directory.parent.parent / "style_review_state.json", json.dumps({
         "state": state, "input_directory": str(directory),
         "report": str(directory.parent.parent / "phase_style_review.md"),
-        "baseline": (directory / "baseline").read_text(),
-        "until": (directory / "until").read_text(),
+        "baseline": _read(artifacts, directory / "baseline"),
+        "until": _read(artifacts, directory / "until"),
         "in_flight": in_flight,
-        "owner": json.loads((directory / "owner.json").read_text()),
+        "owner": json.loads(_read(artifacts, directory / "owner.json")),
     }, indent=2) + "\n")
 
 
 def start(root: Path, baseline: str, phase_dir: Path, prompt: Path, pass_name: str,
-          end: ReviewEnd = WORKING_TREE, *, owner_pid: int = 0) -> Path:
+          end: ReviewEnd = WORKING_TREE, *, owner_pid: int = 0,
+          artifacts: CompletionArtifacts | StyleArtifactPolicy = StyleArtifactPolicy.STANDALONE) -> Path:
     """Claim and prepare under the same phase lock used to capture the result."""
     validate_output(root, phase_dir)
     pid = owner_pid or os.getpid()
     started = sessions.process_start(pid)
     if not started:
         raise ValueError(f"cannot identify style launcher {pid}")
-    with worker_lifecycle.locked_state(phase_dir.resolve() / "style_review_state.json") as saved:
-        state = saved.read_object()
+    if isinstance(artifacts, StyleArtifactPolicy):
+        phase_dir = phase_dir.resolve()
+    with _locked_style_state(artifacts, phase_dir / "style_review_state.json") as state:
         if state.get("in_flight"):
             owner = state.get("owner")
             if not isinstance(owner, dict):
@@ -177,57 +230,56 @@ def start(root: Path, baseline: str, phase_dir: Path, prompt: Path, pass_name: s
             if not isinstance(sessions.process_liveness(previous_pid, previous_start), sessions.SessionNotLive):
                 raise StyleReviewBusy(f"style review in flight: {owner.get('dispatch')} " +
                                       f"(launcher {previous_pid}); finish or cancel that dispatch first")
-        parent = phase_dir.resolve() / "style"
-        parent.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9_.-]", "", pass_name) or "pass"
-        # The review worker and finish command read these files after prepare exits.
-        request = build_folders.UniqueBuildFolder(
-            f"{safe_name}-", build_folders.ExplicitBuildParent(parent))
-        with build_folders.leased_build_folder(request) as directory:
-            write_text_atomic(directory / "owner.json", json.dumps({
+        with _style_directory(artifacts, phase_dir / "style", safe_name) as directory:
+            _write(artifacts, directory / "owner.json", json.dumps({
                 "pid": pid, "started": started, "dispatch": pass_name,
             }))
-            write_text_atomic(directory / "baseline", baseline)
-            write_text_atomic(directory / "until", end.reference if isinstance(end, CommitEnd) else "working tree")
+            _write(artifacts, directory / "baseline", baseline)
+            _write(artifacts, directory / "until", end.reference if isinstance(end, CommitEnd) else "working tree")
             # A stop anywhere after allocation keeps this attempt owed.
-            publish(directory, "owed", "Style review: Error\nPreparation or dispatch did not finish.\n", in_flight=True)
-            result = prepare(root, baseline, directory, end)
+            publish(directory, "owed", "Style review: Error\nPreparation or dispatch did not finish.\n", in_flight=True, artifacts=artifacts)
+            result = prepare(root, baseline, directory, end, artifacts=artifacts)
             assignment = ""
             if isinstance(result, Ready):
                 inputs = result.inputs
-                write_text_atomic(directory / "baseline", inputs.baseline)
-                write_text_atomic(directory / "until", inputs.end.reference if isinstance(inputs.end, CommitEnd) else "working tree")
+                _write(artifacts, directory / "baseline", inputs.baseline)
+                _write(artifacts, directory / "until", inputs.end.reference if isinstance(inputs.end, CommitEnd) else "working tree")
                 assignment = Template((ROOT / "config/review/style.md").read_text()).substitute(
-                    range=f"{inputs.baseline}..{(directory / 'until').read_text()}",
+                    range=f"{inputs.baseline}..{_read(artifacts, directory / 'until')}",
                     scripts=str(SCRIPTS), diff=str(inputs.diff), additions=str(inputs.additions),
                     rust="yes" if inputs.rust_changed else "no", begin=BEGIN, end=END)
                 print(f"Rust change {'yes' if inputs.rust_changed else 'no'}: {', '.join(inputs.paths)}")
                 print(f"Diff: {inputs.diff}\nAdditions: {inputs.additions}")
             elif isinstance(result, Finished):
-                publish(directory, "complete", f"Style review: {result.result}\nRange: {baseline}..{(directory / 'until').read_text()}\n")
+                publish(directory, "complete", f"Style review: {result.result}\nRange: {baseline}..{_read(artifacts, directory / 'until')}\n",
+                        artifacts=artifacts)
                 print(result.result)
             else:
-                publish(directory, "owed", f"Style review: Error\n{result.cause}\n")
+                publish(directory, "owed", f"Style review: Error\n{result.cause}\n", artifacts=artifacts)
                 print(f"Style review: Error: {result.cause}", file=sys.stderr)
-            write_text_atomic(directory / "assignment.md", assignment)
-            write_text_atomic(directory / "prompt.md", prompt.read_text() + ("\n" + assignment if assignment else ""))
-            print(f"Style report: {phase_dir.resolve() / 'phase_style_review.md'}")
+            _write(artifacts, directory / "assignment.md", assignment)
+            _write(artifacts, directory / "prompt.md", _read(artifacts, prompt) + ("\n" + assignment if assignment else ""))
+            print(f"Style report: {phase_dir / 'phase_style_review.md'}")
             return directory
 
 
-def finish(directory: Path, result_file: Path, dispatch_code: int) -> None:
+def finish(directory: Path, result_file: Path, dispatch_code: int, *,
+           artifacts: CompletionArtifacts | StyleArtifactPolicy = StyleArtifactPolicy.STANDALONE) -> None:
     """Only a successful dispatch with one valid marked result settles an assignment."""
-    if not (directory / "assignment.md").read_text():
+    if not _read(artifacts, directory / "assignment.md"):
         return  # Off, empty input, or preparation error was already recorded.
     state_file = directory.parent.parent / "style_review_state.json"
-    with worker_lifecycle.locked_state(state_file) as saved:
-        state = saved.read_object()
+    with _locked_style_state(artifacts, state_file) as state:
         if state.get("input_directory") != str(directory):
             return  # A later retry owns the phase state; keep its result.
         report = "Style review: Error\nDispatch failed or was canceled.\n"
         complete = False
         if dispatch_code == 0:
-            text = result_file.read_text() if result_file.exists() else ""
+            try:
+                text = _read(artifacts, result_file)
+            except FileNotFoundError:
+                text = ""
             if text.count(BEGIN) == 1 and text.count(END) == 1 and text.index(BEGIN) < text.index(END):
                 report = text.split(BEGIN, 1)[1].split(END, 1)[0].strip() + "\n"
                 outcomes = re.findall(r"^Style review: (.+?)\.?$", report, re.MULTILINE)
@@ -235,7 +287,7 @@ def finish(directory: Path, result_file: Path, dispatch_code: int) -> None:
             else:
                 report = "Style review: Error\nMissing or ambiguous report markers.\n"
         publish(directory, "complete" if complete else "owed",
-                f"Range: {(directory / 'baseline').read_text()}..{(directory / 'until').read_text()}\n{report}")
+                f"Range: {_read(artifacts, directory / 'baseline')}..{_read(artifacts, directory / 'until')}\n{report}", artifacts=artifacts)
 
 
 @final

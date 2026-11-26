@@ -19,7 +19,7 @@ import sys
 
 from scripts.lib import build_folder_lock, build_folders, cargo_target_config, git_files
 from scripts.lib.atomic_file import write_bytes_atomic
-from scripts.worktree import worktrees
+from scripts.worktree import worktree_records, worktrees
 
 
 # The build-hold cargo wrapper. It holds the cargo word lists, each on one line, and this module reads them there.
@@ -119,7 +119,7 @@ def _workspace(argv: list[str], cwd: Path, environment: Mapping[str, str]) -> Ca
 def assigned_output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWorkspace:
     """The build output folder that the build folder model gives for the checkout."""
     layout = worktrees.worktree_output(checkout)
-    if isinstance(layout, worktrees.RecordedWorktreeOutput):
+    if isinstance(layout, worktree_records.RecordedWorktreeOutput):
         return LinkedOutput(worktrees.checked_output(layout))
     form = build_folders.parse_form(checkout)
     if isinstance(form, build_folders.UnverifiedFolderPath):
@@ -130,7 +130,7 @@ def assigned_output(checkout: Path) -> LinkedOutput | LocalOutput | UnassignedWo
         return LocalOutput(checkout)
     try:
         word = build_folders.repo_word(checkout)
-        if worktrees.main_checkout_for_word(word) == checkout:
+        if worktree_records.main_checkout_for_word(word) == checkout:
             return LinkedOutput(build_folders.main_output_path(word))
     except ValueError:
         pass
@@ -158,23 +158,35 @@ def _use_linked_output(workspace: CargoWorkspace, output: Path,
     if not target.is_symlink() and target.exists():
         raise OutsideBuildFolders(f"{target}: expected a link to {output}; retain the existing path")
     root = build_folders.build_root()
-    directory = locks.enter_context(build_folder_lock.folder_parent(output, root, create=True))
-    current_link = target.is_symlink() and target.readlink() == output and output.is_dir() and not output.is_symlink()
-    descriptor = build_folder_lock.open_lock(output, directory, create=True)
-    _ = locks.callback(os.close, descriptor)
-    mode = fcntl.LOCK_EX if not current_link else fcntl.LOCK_SH
-    fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
-    if not build_folder_lock.lock_current(output, directory, descriptor):
-        raise ValueError(f"{output}: the build folder lock changed")
-    worktrees.ensure_target_link(workspace.checkout, output, save_existing=False)
-    if mode == fcntl.LOCK_EX:
-        # The exclusive lock covers only the new folder and its link, so a parallel cargo step in the checkout
-        # takes the shared lock. flock does not change a lock in one step: a removal in that gap makes the shared
-        # lock fail, or makes one of the checks below fail.
-        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        if not build_folder_lock.lock_current(output, directory, descriptor) or not output.is_dir():
-            raise ValueError(f"{output}: the build folder lock changed")
-    return descriptor
+    for _attempt in range(2):
+        with ExitStack() as opened:
+            directory = opened.enter_context(build_folder_lock.folder_parent(output, root, create=True))
+            current_link = (target.is_symlink() and target.readlink() == output
+                            and output.is_dir() and not output.is_symlink())
+            try:
+                descriptor = build_folder_lock.open_lock(output, directory, create=True)
+            except FileNotFoundError:
+                if not build_folder_lock.parent_current(output, directory):
+                    continue
+                raise
+            _ = opened.callback(os.close, descriptor)
+            mode = fcntl.LOCK_SH if current_link else fcntl.LOCK_EX
+            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+            build_folder_lock.mark_lock(descriptor)
+            if not build_folders.allocation_parent_current(output, directory):
+                continue
+            if not build_folder_lock.lock_current(output, directory, descriptor):
+                break
+            worktrees.ensure_target_link(workspace.checkout, output, save_existing=False, output_parent=directory)
+            if mode == fcntl.LOCK_EX:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                if (not build_folders.allocation_parent_current(output, directory)
+                        or not build_folder_lock.lock_current(output, directory, descriptor) or not output.is_dir()):
+                    break
+            _ = locks.enter_context(opened.pop_all())
+            return descriptor
+    raise ValueError(f"{output}: the build folder lock changed")
+
 
 
 def _stamp_assignment(output: Path, checkout: Path) -> None:
@@ -236,7 +248,7 @@ def check_step(argv: list[str], cwd: Path, locks: ExitStack, environment: Mappin
 
 
 # The errors that end a checked step with no Cargo run.
-STEP_ERRORS = (OSError, RuntimeError, ValueError, KeyError, worktrees.Refused)
+STEP_ERRORS = (OSError, RuntimeError, ValueError, KeyError, worktree_records.Refused)
 
 
 def checked_step(argv: list[str], cwd: Path, locks: ExitStack,

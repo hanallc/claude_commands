@@ -51,8 +51,13 @@ class DiskTests(unittest.TestCase):
         }))
         # snapshot() walks SCCACHE_DIR as one more folder; the host's real cache must stay out of the test.
         _ = os.environ.pop("SCCACHE_DIR", None)
-        _ = (root / "buildlog.conf").write_text(
-            "# whole: 1..\nDISK_WALK_MINUTES=60\n# whole: 0..23\nDISK_WALK_HOUR=3\n")
+        _ = write_config_fixture(root / "buildlog.conf",
+                                 "disk_walk_minutes=60\ndisk_walk_hour=3\n"
+                                 + "# whole: 1..\ndisk.min_outside_directory_bytes=1073741824\n")
+
+    def set_outside_minimum(self, minimum: int) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "buildlog.conf",
+                                 f"# whole: 1..\ndisk.min_outside_directory_bytes={minimum}\n")
 
     def base(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -482,8 +487,8 @@ class DiskTests(unittest.TestCase):
         os.link(source, deep / "trace-link")
         blocks = source.stat().st_blocks * 512
 
-        with mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
-            measured = disk.measure([("rust", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None)
+        self.set_outside_minimum(1)
+        measured = disk.measure([("rust", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None)
 
         by_path = {row["path"]: row for row in measured["outside_build_caches"]}
         self.assertEqual(set(by_path), {str(root / "project"), str(traces)})
@@ -507,8 +512,8 @@ class DiskTests(unittest.TestCase):
         )
         _ = (target / "debug" / "app").write_bytes(os.urandom(4096))
 
-        with mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
-            measured = disk.measure([("rust", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None)
+        self.set_outside_minimum(1)
+        measured = disk.measure([("rust", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None)
 
         self.assertEqual(measured["outside_build_caches"], [])
         self.assertEqual(measured["outside_build_cache_totals"], [
@@ -527,8 +532,8 @@ class DiskTests(unittest.TestCase):
         )
         _ = (target / "debug" / "app").write_bytes(os.urandom(4096))
 
-        with mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
-            measured = disk.measure([("rust", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None)
+        self.set_outside_minimum(1)
+        measured = disk.measure([("rust", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None)
 
         by_path = {row["path"]: row for row in measured["outside_build_caches"]}
         self.assertIn(str(target), by_path)
@@ -548,8 +553,8 @@ class DiskTests(unittest.TestCase):
                 folders = ([folder for folder in disk.FOLDERS if folder[0] == label]
                            if label == "~/.local/state" else [(label, str(root))])
 
-                with mock.patch.dict(os.environ, {"HOME": str(home)}), \
-                     mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
+                self.set_outside_minimum(1)
+                with mock.patch.dict(os.environ, {"HOME": str(home)}):
                     first = disk.measure(folders, lambda: filesystem.FilesystemUsage(0, 0), None)
                     disk.write_snapshot(first)
                     next_file = deep / "next"
@@ -588,15 +593,15 @@ class DiskTests(unittest.TestCase):
         file_bytes = file.stat().st_blocks * 512
         folders = [("tmp", str(root))]
 
-        with mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
-            first = disk.measure(folders, lambda: filesystem.FilesystemUsage(0, 0), None)
-            disk.write_snapshot(first)
-            file.unlink()
-            removed.rmdir()
-            second = disk.measure(
-                folders, lambda: filesystem.FilesystemUsage(0, 0), None,
-                disk.previous_outside_measurement(disk.read_snapshot()),
-            )
+        self.set_outside_minimum(1)
+        first = disk.measure(folders, lambda: filesystem.FilesystemUsage(0, 0), None)
+        disk.write_snapshot(first)
+        file.unlink()
+        removed.rmdir()
+        second = disk.measure(
+            folders, lambda: filesystem.FilesystemUsage(0, 0), None,
+            disk.previous_outside_measurement(disk.read_snapshot()),
+        )
 
         self.assertEqual(second["outside_build_caches"], [])
         self.assertEqual(first["outside_build_cache_totals"], [
@@ -614,14 +619,17 @@ class DiskTests(unittest.TestCase):
         nested = small / "nested"
         _ = loose.write_bytes(os.urandom(4096))
         _ = nested.write_bytes(os.urandom(4096))
-        expected = (loose.stat().st_blocks + nested.stat().st_blocks) * 512
+        directory_bytes = nested.stat().st_blocks * 512
+        expected = loose.stat().st_blocks * 512 + directory_bytes
 
-        result = disk.measure([("tmp", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None)
-
-        self.assertEqual(result["outside_build_caches"], [])
-        self.assertEqual(result["outside_build_cache_totals"], [
-            {"label": "tmp", "bytes": expected, "growth_bytes": expected},
-        ])
+        for minimum, listed in ((directory_bytes + 1, []), (directory_bytes, [str(small)])):
+            with self.subTest(minimum=minimum):
+                self.set_outside_minimum(minimum)
+                result = disk.measure([("tmp", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None)
+                self.assertEqual([row["path"] for row in result["outside_build_caches"]], listed)
+                self.assertEqual(result["outside_build_cache_totals"], [
+                    {"label": "tmp", "bytes": expected, "growth_bytes": expected},
+                ])
 
     def test_folder_total_excludes_targets_and_counts_hard_links_once(self) -> None:
         root = self.base() / "rust"
@@ -653,11 +661,11 @@ class DiskTests(unittest.TestCase):
             "measured_at": "2026-10-04T12:00:00Z", "host": "test", "rows": [],
             "used": 0, "free": 0, "floor": None,
         }
-        with mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1):
-            result = disk.measure(
-                [("tmp", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None,
-                disk.previous_outside_measurement(old),
-            )
+        self.set_outside_minimum(1)
+        result = disk.measure(
+            [("tmp", str(root))], lambda: filesystem.FilesystemUsage(0, 0), None,
+            disk.previous_outside_measurement(old),
+        )
         self.assertIsNone(result["previous_measured_at"])
         self.assertEqual(result["outside_build_caches"][0]["growth_bytes"], result["outside_build_caches"][0]["bytes"])
 
@@ -689,9 +697,9 @@ class DiskTests(unittest.TestCase):
         _ = (folder / "first").write_bytes(os.urandom(4096))
         began = datetime(2026, 10, 4, 3, tzinfo=user_zone())
         clock = mock.Mock(return_value=began)
+        self.set_outside_minimum(1)
         with (
             mock.patch.object(disk, "FOLDERS", [("tmp", str(root))]),
-            mock.patch.object(disk, "MIN_OUTSIDE_DIRECTORY_BYTES", 1),
             mock.patch.object(disk, "read_floor", return_value=None),
             mock.patch.object(filesystem, "filesystem_usage", return_value=filesystem.FilesystemUsage(0, 0)),
             mock.patch.object(disk, "datetime", wraps=datetime, now=clock),

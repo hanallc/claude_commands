@@ -13,9 +13,10 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import proposal_issue, proposals_folder, staff
 from scripts.review_links import new_item_dialog, reply_tokens
 from scripts.production.issues import Issue, frontmatter
@@ -28,12 +29,15 @@ from scripts.production.update_registration_test_support import setUpModule as s
 
 
 class RegistrationTests(RegistrationFixture):
+    seed_admission: ClassVar[bool] = False
+
     @override
     def setUp(self) -> None:
         super().setUp()
         config = self.root / "title-config"
         config.mkdir()
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        _ = write_config_fixture(config / "notify.conf")
         self.env["CONF_DIR"] = str(config)
         self.env["REVIEW_LINKS_ROOT"] = str(self.root / "review-links")
         self.env["XDG_STATE_HOME"] = str(self.root / "key-state")
@@ -316,6 +320,7 @@ class RegistrationTests(RegistrationFixture):
         owner_id = self.fixture_staff_id()
         asker_id = self.fixture_staff_id("alpha")
         _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
+        self.capture_fixture_admission()
         self.checkout = unit
         self.doc = unit / relative
         with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
@@ -389,6 +394,7 @@ class RegistrationTests(RegistrationFixture):
         _ = self.git("worktree", "add", "-b", "owner-copy", str(owner))
         _ = self.git("worktree", "add", "-b", "unit-copy", str(unit))
         _ = staff.set_doc(owner_id, staff.LiveDoc(remote.local_machine(), owner / relative))
+        self.capture_fixture_admission()
         asker = staff.by_id(asker_id)
         assert asker is not None
         _ = staff.set_worktree(asker_id, staff.PresentWorktree(remote.local_machine(), unit), expected=asker.worktree)
@@ -738,7 +744,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn("questions: failed", result.stdout)
         self.assertEqual(outstanding.read_bytes(), before)
 
-    def test_a_stored_item_with_plumbing_is_named_and_a_new_one_is_refused(self) -> None:
+    def test_title_words_do_not_block_questions_or_the_model_review(self) -> None:
         outstanding = self.outstanding()
         _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"free the cargo-berth on the Mac"}]\n',
                                    encoding="utf-8")
@@ -747,17 +753,41 @@ class RegistrationTests(RegistrationFixture):
                              encoding="utf-8")
         kept = self.run_command("questions", "--state", str(state))
         self.assertEqual(kept.returncode, 0, kept.stdout + kept.stderr)
-        self.assertIn("questions: reword — free the cargo-berth on the Mac: 'berth' is the production's own plumbing",
-                      kept.stdout)
+        self.assertNotIn("questions: reword", kept.stdout)
         entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
         self.assertEqual([entry["text"] for entry in entries], ["free the cargo-berth on the Mac", "review colors"])
-        before = outstanding.read_bytes()
         _ = state.write_text(json.dumps({"open_for_user": ["review colors", "release the writers"]}), encoding="utf-8")
-        refused = self.run_command("questions", "--state", str(state))
-        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
-        self.assertIn("questions: failed — release the writers: 'writers' is the production's own plumbing",
-                      refused.stdout)
-        self.assertEqual(outstanding.read_bytes(), before)
+        replaced = self.run_command("questions", "--state", str(state))
+        self.assertEqual(replaced.returncode, 0, replaced.stdout + replaced.stderr)
+        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
+        self.assertEqual([entry["text"] for entry in entries], ["review colors", "release the writers"])
+
+        title = "Do writers see the new button?"
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(title)) as reviewer:
+            filed = self.run_command("ask", "--ask", title)
+        self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        reviewer.assert_called_once_with(review.QuestionKey(self.fixture_owner_name(), title), title,
+                                         console_kind="question")
+
+    def test_questions_uses_the_console_check_before_filing_a_new_question(self) -> None:
+        title = "Keep the layout?"
+        body = "Read ../notes/proof. Keep the layout?"
+        state = self.question_state([{"text": title, "question": body}])
+        with mock.patch.object(review, "review_question") as reader:
+            result = self.run_command("questions", "--state", str(state))
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("omit-file-path: ../notes/proof", result.stdout)
+            reader.assert_not_called()
+        self.assertEqual(self.open_rows(), [])
+
+        body = "The labels stay visible. Keep the layout?"
+        state = self.question_state([{"text": title, "question": body}])
+        draft = f"## {title}\n\n{body}"
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(draft)) as reader:
+            result = self.run_command("questions", "--state", str(state))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        reader.assert_called_once_with(review.QuestionKey(self.fixture_owner_name(), title), draft, console_kind="question")
+        self.assertEqual(self.open_rows()[0]["question"], body)
 
     def test_questions_store_what_waits_on_the_user_and_print_one_line(self) -> None:
         outstanding = self.outstanding()

@@ -14,7 +14,6 @@ import re
 import sys
 
 from scripts.lib import conf, live_settings, main_publish
-from scripts.lib.conf import Unusable
 from scripts.build_hold.override_guard import refuse_overrides
 
 SUBJECT = "tune("
@@ -83,8 +82,7 @@ def main(arguments: list[str] | None = None) -> int:
         _one_line("--user-words", args.user_words)
         _one_line("file", args.file)
         _one_line("key", args.key)
-        if "\n" in args.value or "\r" in args.value:
-            raise main_publish.Refusal("value must fit on one line")
+        live_settings.check_value_line(args.file, args.key, args.value)
         if re.search(r"\s#", args.value) or args.value != args.value.strip():
             raise main_publish.Refusal("value must have no whitespace comment marker or outer whitespace")
         if platform.system() == "Darwin":
@@ -92,7 +90,7 @@ def main(arguments: list[str] | None = None) -> int:
         return change(args)
     except SystemExit as error:
         return error.code if isinstance(error.code, int) else 2
-    except (Unusable, main_publish.Refusal, OSError, UnicodeError) as error:
+    except (conf.InvalidKey, conf.Unusable, main_publish.Refusal, OSError, UnicodeError) as error:
         print(f"tune: {error}", file=sys.stderr)
         return 2
 

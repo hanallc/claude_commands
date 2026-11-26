@@ -11,7 +11,10 @@ from pathlib import Path
 import subprocess
 import sys
 import signal
+import tempfile
+import time
 from typing import cast, override
+import unittest
 from unittest.mock import patch
 
 from scripts.lib.helper_tree_test_support import copy_helpers
@@ -131,6 +134,21 @@ class ClaudeWorkerFixture:
     sent: Path
     registry: Path
     environment: dict[str, str]
+
+
+class ClaudeTurnWaitTests(unittest.TestCase):
+    def test_wait_uses_the_configured_poll_interval(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = (root / "direct.conf").write_text("claude_worker_poll_secs=0.25\n")
+        turn = claude_worker.ClaudeTurn("fixture", root, root, root / "prompt",
+            root / "summary", root / "log", "", "", "", "", False,
+            {"CONF_DIR": str(root), "CLAUDE_BIN": "fixture-claude"})
+        delivered = claude_worker.Delivered("fixture-native", claude_worker.TurnsNotCounted())
+        with (patch.object(claude_worker, "_status", side_effect=["busy", "idle"]),
+              patch.object(claude_worker, "_refresh_log"),
+              patch.object(time, "sleep") as delay):
+            self.assertEqual(claude_worker.wait_for_turn(turn, delivered), 0)
+        delay.assert_called_once_with(0.25)
 
 
 class NativeClaudeWorkerTests(StaffTestCase):
@@ -349,6 +367,8 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 self.clear_worker(row)
 
     def test_fresh_claude_publication_precedes_work_for_each_parent_state(self) -> None:
+        _ = write_registry(Path(self.fixture.environment["MODELS_CONFIG_FILE"]),
+                           {"compact_windows": {"worker": "200k"}}, update=True)
         for count, removed in enumerate((False, True), 1):
             with self.subTest(removed=removed):
                 if removed:
@@ -364,13 +384,34 @@ class NativeClaudeWorkerTests(StaffTestCase):
                 self.assertEqual(cast(list[str], sent["arguments"])[:2], ["--to", "session:" + self.fixture.identity])
                 calls = self.backend_calls()
                 self.assertEqual(len(calls), count)
-                self.assertNotIn("--session-id", cast(list[str], calls[-1]["arguments"]))
+                arguments = cast(list[str], calls[-1]["arguments"])
+                self.assertNotIn("--session-id", arguments)
+                self.assertEqual(arguments.count("--autocompact"), 1)
+                self.assertEqual(arguments[arguments.index("--autocompact") + 1], "200k")
                 self.assertEqual(calls[-1]["STAFF_ID"], "")
                 if removed:
                     parent = staff.by_id(self.fixture.unit.id)
                     assert parent is not None
                     self.assertIsInstance(parent.worktree, staff.RemovedWorktree)
                 self.clear_worker(row)
+
+    def test_unreadable_registry_keeps_the_supplied_worker_model(self) -> None:
+        registry = self.root / "unreadable-models.conf"
+        registry.mkdir()
+        command = worker_command("fresh-impl", self.fixture.run_dir, self.fixture.work, self.fixture.prompt,
+                                 self.root / "summary", self.root / "log", model="supplied-model")
+        result = subprocess.run(command, cwd=self.fixture.work,
+                                env={**self.fixture.environment, "MODELS_CONFIG_FILE": str(registry)},
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        anomalies = [line for line in result.stderr.splitlines()
+                     if line.startswith("anomaly: cannot read the model registry:")]
+        anomaly, = anomalies
+        self.assertIn("Is a directory", anomaly)
+        self.assertIn(str(registry), anomaly)
+        arguments = cast(list[str], self.backend_calls()[0]["arguments"])
+        self.assertEqual(arguments[arguments.index("--model") + 1], "supplied-model")
+        self.assertNotIn("--autocompact", arguments)
 
     def test_worker_waits_for_its_registry_record_after_the_banner_then_publishes(self) -> None:
         fake_modules = self.root / "fake-modules"

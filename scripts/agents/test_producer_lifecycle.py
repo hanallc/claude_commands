@@ -352,7 +352,7 @@ class ProducerLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.config = self.root / "configuration"
-        _ = write_config_fixture(self.config / "staff.conf", f"PRODUCER_FOLDER_ROOT={self.root / 'documents'}\n")
+        _ = write_config_fixture(self.config / "staff.conf", f"producer_folder_root={self.root / 'documents'}\n")
         self.registry = self.config / "models.conf"
         _ = write_registry(self.registry, {"producer_defaults": {"model": "claude:sonnet:high"},
                                           "producers": {"morty": "claude:opus:high", "dwight": "claude:sonnet:high"}})
@@ -483,6 +483,7 @@ class ProducerLifecycleTests(unittest.TestCase):
         row, morty = self.producer("dwight"), self.producer("morty")
         owner = fixture_member("showrunner", name="show")
         destination = self.producer("director")
+        _ = write_config_fixture(self.config / "console.conf", f"page.list.owner={morty.id}\n")
         opened = the_list.add(morty.id, "Open work", owner=owner.id, source="fixture", changes={"producer": row.id})
         closed = the_list.add(morty.id, "Closed work", owner=owner.id, source="fixture", changes={"producer": row.id})
         closed = the_list.close(morty.id, closed.id, "Done", source="fixture")

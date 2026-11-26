@@ -16,6 +16,7 @@ from scripts.whoami.account_test_support import store_usage
 from scripts.whoami.note_file import note_name
 
 import ast
+from collections import Counter
 import io
 from importlib import import_module
 import base64
@@ -133,6 +134,10 @@ def accounts_reader_calls(source: str) -> dict[str, set[str]]:
     return readers
 
 
+# No code reads these keys. Each stays in accounts.conf until Nate approves its removal.
+KEPT_UNREAD_KEYS = frozenset({"login_sitting_window_days"})
+
+
 class AccountsConfigurationTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
@@ -154,7 +159,9 @@ class AccountsConfigurationTests(unittest.TestCase):
                         continue
                     for key, kinds in accounts_reader_calls(source.read_text()).items():
                         readers.setdefault(key, set()).update(kinds)
-                self.assertEqual(set(configured), set(readers))
+                self.assertEqual(KEPT_UNREAD_KEYS & set(readers), set())
+                self.assertLessEqual(KEPT_UNREAD_KEYS, set(configured))
+                self.assertEqual(set(configured) - KEPT_UNREAD_KEYS, set(readers))
                 for key, kinds in readers.items():
                     with self.subTest(key=key):
                         self.assertEqual(len(kinds), 1)
@@ -872,7 +879,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIs(decode_session_counts(published, local).get("claude_registry_unreadable"), True)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
-    def test_spare_accounts_report_unknown_total_when_registry_is_unreadable(self) -> None:
+    def test_spare_accounts_report_unknown_total_only_for_a_local_registry_fault(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
         self.codex_login("spare@example.invalid", self.home / ".codex1")
         registry_path = self.root / "denied-sessions"
@@ -899,25 +906,30 @@ class AccountsTests(unittest.TestCase):
                     status = accounts.read_status(source=accounts.StoredUsageOnly())
                 table = accounts.render_status_table(status)
                 self.assertIn("spare", table)
-                self.assertIn("Claude session registry unreadable. Claude session counts are unknown.",
-                              table)
+                local = "mac" if peer == "natedev" else "natedev"
+                expected = (f"{local}: Claude session registry unreadable. Claude session counts are unknown."
+                            if denied_machine == "local"
+                            else f"{peer} Claude sessions unreadable: Claude counts are {local} only")
+                self.assertIn(expected, table)
                 document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(status)))
                 self.assertEqual([row["roles"] for row in document["accounts"]], [["spare"]])
+                self.assertEqual(document["problems"].count(expected), 1)
                 cells = document["board"]["rows"][-1]["cells"]
                 self.assertEqual(cells["label"][0]["text"], "total")
-                self.assertEqual(cells["total"][0]["text"], "unknown")
+                total = "unknown" if denied_machine == "local" else "0"
+                self.assertEqual(cells["total"][0]["text"], total)
                 for column in ("busy", "idle", "paused", "exited"):
-                    self.assertEqual(cells[column][0]["text"], "")
+                    self.assertEqual(cells[column][0]["text"], "" if denied_machine == "local" else "0")
                 model_totals = accounts.models_board(status, {}).rows[-1]["cells"]
                 self.assertEqual([model_totals[column][0]["text"] for column in accounts.MODEL_COUNT_COLUMNS],
-                                 ["unknown"] * len(accounts.MODEL_COUNT_COLUMNS))
+                                 [total] * len(accounts.MODEL_COUNT_COLUMNS))
 
-    def test_unreadable_peer_registry_keeps_combined_claude_counts_unknown(self) -> None:
+    def test_unreadable_peer_registry_keeps_local_claude_counts_known(self) -> None:
         local = accounts.RoleSessionCounts(1, 2, 0, 0)
         row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude",
                       roles=("units",), role_counts=(local,))
         now = datetime.now(timezone.utc)
-        peer = remote.other_machine()
+        peer = "mac"
         publish = cast(Callable[..., accounts.MachineSessionCounts], getattr(accounts, "_session_counts_document"))
         folder = self.home / ".claude1"
         members: dict[tuple[Path, str], dict[str, session_state.SessionState]] = {(folder, "units"): {"unit": "busy"}}
@@ -928,12 +940,13 @@ class AccountsTests(unittest.TestCase):
         document = publish(members, models=models)
         document.update(machine=peer, at=now.isoformat(), claude_registry_unreadable=True)
         atomic_file.write_text_atomic(session_counts_cache(), json.dumps(document))
-        counts = machine_role_counts((row,), now)
+        with patch.object(remote, "other_machine", return_value=peer):
+            counts = machine_role_counts((row,), now)
         rows, problems = counts.rows, counts.problems
-        self.assertEqual(rows[0].role_counts, (accounts.UnknownRoleCounts(),))
-        self.assertEqual(rows[0].role_counts_by_machine[peer], {})
-        self.assertEqual(rows[0].models_by_role, {})
-        self.assertEqual(problems, (f"{peer}: Claude session registry unreadable. Claude session counts are unknown.",))
+        self.assertFalse(counts.claude_registry_unreadable)
+        self.assertEqual(rows[0].role_counts, (local,))
+        self.assertEqual(set(rows[0].role_counts_by_machine), {"natedev"})
+        self.assertEqual(problems, ("mac Claude sessions unreadable: Claude counts are natedev only",))
 
     def test_model_cells_name_counted_sessions_from_the_existing_scan(self) -> None:
         from scripts.herdr import pane_launch
@@ -993,35 +1006,35 @@ class AccountsTests(unittest.TestCase):
         ])
         self.assertEqual(published.get("unknown_model_names"), {"claude1": {"units": [short_id]}})
 
-    def test_peer_model_cells_name_remote_sessions_and_count_names_missing_from_older_documents(self) -> None:
+    def test_peer_models_and_names_do_not_change_local_model_cells(self) -> None:
         now = datetime.now(timezone.utc)
+        local = accounts.ObservedSessionModel("claude-opus-5-5", "high")
         row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude", roles=("units",),
-                      role_counts=(accounts.RoleSessionCounts(0, 0, 0, 0),))
+                      role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),),
+                      models_by_role={"units": Counter({local: 1})},
+                      model_names_by_role={"units": {local: accounts.ModelSessionNames(["local unit"])}})
         counts = {"busy": 3, "idle": 0, "paused": 0, "exited": 0, "total": 3}
         model = {"model": "claude-opus-5-5", "effort": "high", "count": 2}
-        cases: tuple[tuple[dict[str, object], list[tuple[str, ...]]], ...] = (
-            ({"models": {"claude1": {"units": [{**model, "names": ["hana-unit"]}]}},
-              "unknown_model_names": {"claude1": {"units": ["other-unit"]}}},
-             [("hana-unit (mac)", "1 more on mac"), ("other-unit (mac)",),
-              ("hana-unit (mac)", "other-unit (mac)", "1 more on mac")]),
-            ({"models": {"claude1": {"units": [model]}}},
-             [("2 more on mac",), ("1 more on mac",), ("3 more on mac",)]),
-            ({}, [("3 more on mac",), ("3 more on mac",)]),
-            ({"models": {"claude1": {"units": [{**model, "names": ["hana-unit", "\ud800"]}]}},
-              "unknown_model_names": {"claude1": {"units": ["\udfff"]}}},
-             [("hana-unit (mac)", "1 more on mac"), ("1 more on mac",),
-              ("hana-unit (mac)", "2 more on mac")]),
+        cases: tuple[dict[str, object], ...] = (
+            {"models": {"claude1": {"units": [{**model, "names": ["peer unit"]}]}},
+             "unknown_model_names": {"claude1": {"units": ["other peer unit"]}}},
+            {"models": {"claude1": {"units": [model]}}},
+            {},
+            {"models": {"claude1": {"units": [{**model, "names": ["peer unit", "\ud800"]}]}},
+             "unknown_model_names": {"claude1": {"units": ["\udfff"]}}},
         )
+        expected_board = accounts.models_board(accounts.StatusReading((row,), (), (), timezone.utc, now), {})
         with patch.object(remote, "other_machine", return_value="mac"):
-            for payload, names in cases:
+            for payload in cases:
                 with self.subTest(payload=payload):
                     _ = session_counts_cache().parent.mkdir(parents=True, exist_ok=True)
                     _ = session_counts_cache().write_text(json.dumps({"machine": "mac", "at": now.isoformat(),
                         "accounts": {"claude1": {"units": counts}}, **payload}), encoding="utf-8")
                     combined = machine_role_counts((row,), now)
+                    self.assertEqual(combined.rows[0].models_by_role, row.models_by_role)
+                    self.assertEqual(combined.rows[0].model_names_by_role, row.model_names_by_role)
                     board = accounts.models_board(accounts.StatusReading(combined.rows, (), (), timezone.utc, now), {})
-                    self.assertEqual([line.get("session_names", {}).get("units") for line in board.rows], names)
-                    self.assertEqual([line.get("session_names", {}).get("total") for line in board.rows], names)
+                    self.assertEqual(board, expected_board)
 
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_partial_move_counts_actual_accounts_and_stopped_members_once(self) -> None:
@@ -1362,7 +1375,23 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(observed, account.ConfiguredClaudeFolder(Path("/fixture/.claude4")))
         kernel.assert_called_once_with(990001)
 
-    def test_peer_members_add_a_role_to_an_unselected_account(self) -> None:
+    def test_status_keeps_live_account_evidence_outside_counted_roles(self) -> None:
+        session = sessions.SessionRecord(pid=990001, sessionId="fixture-session", name="standalone",
+                                         messagingSocketPath="", updatedAt=2, tmux="", formerNames=[])
+        other = sessions.SessionRecord(pid=990002, sessionId=session["sessionId"], name=session["name"],
+                                       messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        with (patch.object(sessions, "running_sessions", return_value=[session, other]) as running,
+              patch.object(accounts, "_session_config_dir", side_effect=[
+                  account.ConfiguredClaudeFolder(self.home / ".claude2"),
+                  account.ConfiguredClaudeFolder(self.home / ".claude4")]) as account_read):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly())
+        running.assert_called_once()
+        self.assertEqual(account_read.call_args_list, [call(session["pid"]), call(other["pid"])])
+        self.assertEqual(reading.live_claude_accounts,
+                         frozenset({(session["sessionId"], "claude2"), (session["sessionId"], "claude4")}))
+        self.assertFalse(any(row.sessions for row in reading.rows))
+
+    def test_peer_members_do_not_add_a_role_to_an_unselected_account(self) -> None:
         now = datetime.now(timezone.utc)
         row = replace(SharedStatusDocumentTests().row(), label="claude4", tool="claude", roles=(), role_counts=())
         peer = remote.other_machine()
@@ -1371,9 +1400,9 @@ class AccountsTests(unittest.TestCase):
         counts = machine_role_counts((row,), now)
         rows, problems = counts.rows, counts.problems
         self.assertEqual(problems, ())
-        self.assertEqual(rows[0].roles, ("units",))
+        self.assertEqual(rows[0].roles, ())
         self.assertEqual(rows[0].selected_roles, ())
-        self.assertIn("units 30 (busy 9, idle 20, paused 0, exited 1)", accounts.render_status_table(
+        self.assertNotIn("units 30", accounts.render_status_table(
             accounts.StatusReading(rows, (), (), timezone.utc, now)))
 
     def test_stored_status_starts_a_background_counts_fetch_without_waiting_for_ssh(self) -> None:
@@ -1387,7 +1416,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(set(self.home.rglob("*")), paths)
         self.assertEqual({path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}, before)
 
-    def test_machine_counts_publish_and_merge_on_either_machine_without_waiting_for_ssh(self) -> None:
+    def test_machine_counts_keep_only_local_roles_on_either_machine_without_waiting_for_ssh(self) -> None:
         from scripts.message import sessions
         local = accounts.RoleSessionCounts(1, 2, 0, 1)
         row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude",
@@ -1411,11 +1440,11 @@ class AccountsTests(unittest.TestCase):
                     accounts.StatusReading(rows, problems, (), timezone.utc, now))))
                 self.assertEqual(document["problems"], [])
                 machines = document["accounts"][0]["role_counts_by_machine"]
-                self.assertEqual(machines[peer]["units"], count)
-                self.assertEqual(machines[here]["units"], {"busy": 1, "paused": 0, "exited": 1, "idle": 2, "total": 4})
-                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 4, "paused": 0, "exited": 3, "idle": 3, "total": 10}])
-                self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(4, 3, 0, 3),))
-                self.assertIn("units 10 (busy 4, idle 3, paused 0, exited 3)", accounts.render_status_table(
+                expected = {"busy": 1, "paused": 0, "exited": 1, "idle": 2, "total": 4}
+                self.assertEqual(machines, {here: {"units": expected}})
+                self.assertEqual(document["accounts"][0]["role_counts"], [expected])
+                self.assertEqual(rows[0].role_counts, (local,))
+                self.assertIn("units 4 (busy 1, idle 2, paused 0, exited 1)", accounts.render_status_table(
                     accounts.StatusReading(rows, (), (), timezone.utc, now)))
 
     def test_published_counts_pass_the_older_peer_count_check(self) -> None:
@@ -1436,7 +1465,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(count, expected)
         self.assertEqual(decode_session_counts(json.dumps(published), published["machine"])["accounts"]["codex1"]["workers"], expected)
 
-    def test_older_peer_starting_and_waiting_merge_as_busy_on_both_machines(self) -> None:
+    def test_older_peer_starting_and_waiting_leave_worker_counts_local(self) -> None:
         self.write_note("codex1", "waiting@example.invalid")
         self.codex_login("waiting@example.invalid", self.home / ".codex1")
         now = datetime.now(timezone.utc)
@@ -1454,13 +1483,13 @@ class AccountsTests(unittest.TestCase):
                 counts = machine_role_counts((row,), now)
                 rows, problems = counts.rows, counts.problems
                 reading = accounts.StatusReading(rows, problems, (), timezone.utc, now)
-                self.assertEqual(rows[0].role_counts, (accounts.RoleSessionCounts(3, 0, 0, 0),))
-                self.assertIn("workers 3 (busy 3, idle 0, paused 0, exited 0)", accounts.render_status_table(reading))
+                self.assertEqual(rows[0].role_counts, row.role_counts)
+                self.assertIn("workers 1 (busy 1, idle 0, paused 0, exited 0)", accounts.render_status_table(reading))
                 document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
                 self.assertEqual(document["accounts"][0]["role_counts"],
-                                 [{"busy": 3, "idle": 0, "paused": 0, "exited": 0, "total": 3}])
+                                 [{"busy": 1, "idle": 0, "paused": 0, "exited": 0, "total": 1}])
 
-    def test_combined_role_counts_preserve_role_order_for_codex(self) -> None:
+    def test_local_role_counts_preserve_role_order_for_codex(self) -> None:
         now = datetime.now(timezone.utc)
         row = replace(SharedStatusDocumentTests().row(), label="codex1", tool="codex",
             roles=("workers", "units"), role_counts=(accounts.RoleSessionCounts(1, 2, 0, 0),))
@@ -1474,11 +1503,11 @@ class AccountsTests(unittest.TestCase):
         document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
         self.assertEqual(document["accounts"][0]["roles"], ["workers", "units"])
         self.assertEqual(document["accounts"][0]["role_counts"], [
-            {"busy": 4, "paused": 0, "exited": 0, "idle": 6, "total": 10},
-            {"busy": 2, "paused": 0, "exited": 0, "idle": 1, "total": 3}])
+            {"busy": 1, "paused": 0, "exited": 0, "idle": 2, "total": 3},
+            {"busy": 0, "paused": 0, "exited": 0, "idle": 0, "total": 0}])
         table = accounts.render_status_table(reading)
-        self.assertIn("workers 10 (busy 4, idle 6, paused 0, exited 0)", table)
-        self.assertIn("units 3 (busy 2, idle 1, paused 0, exited 0)", table)
+        self.assertIn("workers 3 (busy 1, idle 2, paused 0, exited 0)", table)
+        self.assertIn("units 0 (busy 0, idle 0, paused 0, exited 0)", table)
         self.assertNotIn("shell", table)
 
     def test_unreported_roles_have_zero_counts_and_spare_has_no_count(self) -> None:
@@ -1500,6 +1529,28 @@ class AccountsTests(unittest.TestCase):
                         "units 0 (busy 0, idle 0, paused 0, exited 0)")
                     self.assertIn(text, accounts.render_status_table(reading))
 
+    def test_peer_spare_count_is_optional_metadata_for_the_existing_spare_row(self) -> None:
+        now = datetime.now(timezone.utc)
+        spare = replace(SharedStatusDocumentTests().row(), label="codex1", tool="codex",
+                        roles=("spare",), role_counts=(accounts.NoRoleCount(),))
+        count = accounts.RoleSessionCountsDocument(busy=2, idle=0, paused=0, exited=0, total=2)
+        with patch.object(remote, "other_machine", return_value="mac"):
+            for peer_roles in ({"workers": count}, {"workers": count, "spare": count}):
+                with self.subTest(peer_roles=peer_roles):
+                    _ = session_counts_cache().write_text(json.dumps({"machine": "mac", "at": now.isoformat(),
+                        "accounts": {"codex1": peer_roles}}))
+                    counted = machine_role_counts((spare,), now)
+                    self.assertEqual(counted.problems, ())
+                    reading = accounts.StatusReading(counted.rows, (), (), timezone.utc, now)
+                    status = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                    row, = status["accounts"]
+                    self.assertEqual(row["roles"], ["spare"])
+                    self.assertEqual(row["role_counts"], [None])
+                    expected: dict[str, dict[str, accounts.RoleSessionCountsDocument]] = {"natedev": {}}
+                    if "spare" in peer_roles:
+                        expected["mac"] = {"spare": count}
+                    self.assertEqual(row["role_counts_by_machine"], expected)
+
     def test_session_counts_use_aliases_when_hostnames_differ(self) -> None:
         now = datetime.now(timezone.utc)
         row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude",
@@ -1517,7 +1568,7 @@ class AccountsTests(unittest.TestCase):
                 counts = machine_role_counts((row,), now)
                 rows, problems = counts.rows, counts.problems
                 self.assertEqual(problems, ())
-                self.assertEqual(set(rows[0].role_counts_by_machine), {here, peer})
+                self.assertEqual(set(rows[0].role_counts_by_machine), {here})
             with (patch.object(remote, "other_machine", return_value=here),
                   patch.object(role_map, "ssh_role_map", return_value=json.dumps(published))):
                 self.assertEqual(fetch_session_counts(), 0)
@@ -1576,17 +1627,24 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(observed.counts[(numbered, "workers")], {row.current_session: "idle"})
 
     def test_peer_counts_age_failure_and_recovery_use_only_the_local_counts(self) -> None:
-        row = SharedStatusDocumentTests().row()
+        row = replace(SharedStatusDocumentTests().row(), label="claude1", roles=("units",),
+                      role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),))
         now = datetime.now(timezone.utc)
         peer = remote.other_machine()
         local = "mac" if peer == "natedev" else "natedev"
+        session_counts_cache().unlink()
+        missing = machine_role_counts((row,), now)
+        self.assertEqual(missing.rows[0].role_counts, row.role_counts)
+        self.assertEqual(missing.problems, (f"{peer} unavailable: counts are {local} only",))
+        peer_counts = {"claude1": {"units": {"busy": 7, "idle": 0, "paused": 0, "exited": 0, "total": 7}}}
         for seconds, available in ((600, True), (601, False), (-1, True)):
             with self.subTest(seconds=seconds):
                 atomic_file.write_text_atomic(session_counts_cache(), json.dumps({
-                    "machine": peer, "at": (now - timedelta(seconds=seconds)).isoformat(), "accounts": {}}))
+                    "machine": peer, "at": (now - timedelta(seconds=seconds)).isoformat(), "accounts": peer_counts}))
                 counts = machine_role_counts((row,), now)
                 rows, problems = counts.rows, counts.problems
-                self.assertEqual(peer in rows[0].role_counts_by_machine, available)
+                self.assertEqual(rows[0].role_counts, row.role_counts)
+                self.assertEqual(set(rows[0].role_counts_by_machine), {local})
                 self.assertEqual(problems, () if available else
                     (f"{peer} unavailable: counts are {local} only",))
         for content in ('{"unavailable": true}', '{}', 'broken'):
@@ -2076,6 +2134,91 @@ class AccountsTests(unittest.TestCase):
             + f"Run {command}, then /login",
         ])
         moved.assert_not_called()
+
+    def test_move_cli_records_single_group_and_ambiguous_refusals(self) -> None:
+        from scripts.agents import inventory, pane_record
+
+        owner = inventory.ListedSession("fixture-id", 998071, "fixture", "fixture", "top-level",
+                                        self.home / ".claude1", "", "", "")
+        target = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
+        with (patch.object(moves, "store_file", return_value=self.root / "moves.jsonl"),
+              patch.object(pane_record, "read_strict", side_effect=AssertionError("read panes on refusal")),
+              patch.object(stop_resume, "_run_moves", side_effect=AssertionError("started a refused move")),
+              patch.object(accounts, "check_move_target",
+                           side_effect=[accounts.MoveRefused("Fixture target refused.")] * 2 + [target]),
+              patch.object(inventory, "listing", side_effect=[
+                  [owner], [owner, replace(owner, session_id="other-id", pid=998072)]])):
+            self.assertEqual(self.run_cli("move", owner.name, "claude2")[0], 1)
+            self.assertEqual(self.run_cli("move", "units", "claude2")[0], 1)
+            self.assertEqual(self.run_cli("move", owner.name, "claude2")[0], 1)
+            ambiguous, group, single = moves.read_move_progress()
+        for batch in (single, group, ambiguous):
+            self.assertEqual(batch.target, "claude2")
+            self.assertEqual(batch.cause, "by hand")
+            self.assertIsInstance(batch.members[0].state, moves.MemberMoveFailed)
+        self.assertEqual(single.members[0].member.reference, owner.session_id)
+        self.assertEqual(group.group, "units")
+        self.assertEqual(group.members[0].kind, moves.MoveMemberKind.REQUEST)
+        self.assertEqual(ambiguous.members[0].kind, moves.MoveMemberKind.REQUEST)
+        failure = ambiguous.members[0].state
+        assert isinstance(failure, moves.MemberMoveFailed)
+        self.assertIn("names multiple live sessions", failure.reason)
+
+    def test_move_cli_records_the_native_id_for_two_processes_with_one_session(self) -> None:
+        from scripts.agents import inventory
+
+        owner = inventory.ListedSession("fixture-id", 998071, "fixture", "fixture", "top-level",
+                                        self.home / ".claude1", "", "", "")
+        target = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
+        with (patch.object(moves, "store_file", return_value=self.root / "moves.jsonl"),
+              patch.object(stop_resume, "_run_moves", side_effect=AssertionError("started a refused move")),
+              patch.object(accounts, "check_move_target",
+                           side_effect=[accounts.MoveRefused("Fixture target refused."), target]),
+              patch.object(inventory, "listing", return_value=[owner, replace(owner, pid=998072)])):
+            for _attempt in range(2):
+                self.assertEqual(self.run_cli("move", owner.name, "claude2")[0], 1)
+            target_ready, target_refused = moves.read_move_progress()
+        for batch, reason in ((target_ready, "names multiple live sessions"), (target_refused, "Fixture target refused.")):
+            row, = batch.members
+            self.assertEqual(row.member.reference, owner.session_id)
+            self.assertIs(row.kind, moves.MoveMemberKind.NATIVE)
+            self.assertIsInstance(row.state, moves.MemberMoveFailed)
+            assert isinstance(row.state, moves.MemberMoveFailed)
+            self.assertIn(reason, row.state.reason)
+
+    def test_progress_keeps_target_and_multiple_process_refusals_in_selection_order(self) -> None:
+        from scripts.agents import pane_record
+        from scripts.agents.inventory import ListedSession
+
+        selection = ("fixture-first", "fixture-second", "fixture-third")
+        live = tuple(ListedSession(selection[1], pid, "fixture", "fixture session", "top-level",
+                                   self.home / ".claude1", "", "", "") for pid in (998071, 998072))
+        accepted = accounts.MoveTargetReady(accounts.NamedAccount("claude2", self.home / ".claude2"))
+        with (patch.object(moves, "store_file", return_value=self.root / "moves.jsonl"),
+              patch.object(herdr, "shared_session", return_value="fixture"),
+              patch.object(pane_record, "read_strict", return_value={}),
+              patch.object(stop_resume, "_run_moves", return_value=[
+                  stop_results.ClaudeUp(selection[0], "fixture", "claude2"),
+                  stop_results.ClaudeUp(selection[2], "fixture", "claude2")]) as run,
+              patch.object(accounts, "check_move_target", side_effect=[accounts.MoveRefused("Target refused."), accepted])):
+            rejected = accounts.move_sessions(selection, "claude2", why="fixture", live=live)
+            run.assert_not_called()
+            outcome = accounts.move_sessions(selection, "claude2", why="fixture", live=live)
+        self.assertEqual(rejected, tuple(accounts.SessionMoveRefused(identity, "Target refused.") for identity in selection))
+        self.assertEqual(outcome[1], accounts.SessionMoveRefused(selection[1], "session has several live processes"))
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [selection[0], selection[2]])
+        with patch.object(moves, "store_file", return_value=self.root / "moves.jsonl"):
+            current, refused = moves.read_move_progress()
+        for batch in (current, refused):
+            self.assertEqual(tuple(row.member.reference for row in batch.members), selection)
+        self.assertEqual([row.state.reason for row in refused.members if isinstance(row.state, moves.MemberMoveFailed)],
+                         ["Target refused."] * 3)
+        failure = current.members[1].state
+        self.assertIsInstance(failure, moves.MemberMoveFailed)
+        assert isinstance(failure, moves.MemberMoveFailed)
+        self.assertEqual(failure.reason, "session has several live processes")
+        self.assertEqual(failure.target, "claude2")
 
     def test_move_refuses_missing_credentials_before_stop(self) -> None:
         from scripts.agents import inventory
@@ -5648,6 +5791,16 @@ with path.with_name(path.name + ".lock").open("a") as lock:
         code, output, error = self.run_cli("next", "list")
         self.assertEqual((code, output.strip(), error), (0, "nothing set up", ""))
 
+    def test_next_cli_round_trips_the_fable_measure(self) -> None:
+        self.login_directory("claude2", "target@example.invalid")
+        code, output, error = self.run_cli("next", "add", "units", "4.5", "claude2", "--measure", "fable")
+        self.assertEqual((code, output.strip(), error), (0, "units 1: at 4.5% Fable → claude2", ""))
+        code, output, error = self.run_cli("next", "list")
+        self.assertEqual((code, output.strip(), error), (0, "units 1: at 4.5% Fable → claude2", ""))
+        entry, = next_moves.read_next_moves()
+        assert isinstance(entry, next_moves.ClaudeGroupMove)
+        self.assertIs(entry.measure, next_moves.QuotaMeasure.FABLE)
+
     def test_next_list_numbers_each_group_in_display_order_without_exposing_ids(self) -> None:
         self.login_directory("claude2", "target@example.invalid")
         units = next_moves.add_next_move("units", 1, "claude2", 40)
@@ -5846,7 +5999,7 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             return output
 
         with (patch.object(next_moves, "render_time", return_value=at + timedelta(minutes=22, seconds=1)),
-              patch.object(run_out, "weighted_rate", side_effect=AssertionError("started row read fresh pace"))):
+              patch.object(run_out, "hourly_usage_rate", side_effect=AssertionError("started row read fresh pace"))):
             code, listed, error = self.run_cli("next", "list")
             self.assertEqual((code, listed, error), (0, expected, ""))
             code, added, error = self.run_cli("next", "add", "workers", "1", "claude")
@@ -7912,6 +8065,8 @@ with path.with_name(path.name + ".lock").open("a") as lock:
             [accounts.AccountRoleBurn("claude3", ("unit directors",), 10, 1)])
 
     def test_workers_swap_records_producer_group_scope_and_retry_keeps_target(self) -> None:
+        _ = shutil.copyfile(Path(__file__).resolve().parents[2] / "config/shutdown.conf",
+                            Path(os.environ["CONF_DIR"]) / "shutdown.conf")
         source, _ = self.workers_fixture()
         machine = cast(Callable[[], str], getattr(accounts, "_session_counts_machine"))()
         producer = fixture_member("producer", name="codex-producer", backend=staff.CodexBackend(source),
@@ -8136,7 +8291,9 @@ with path.with_name(path.name + ".lock").open("a") as lock:
                                    return_value=stop_results.ResumePending(worker.id, target, "destination is not ready")) as stop,
                       patch.object(pane_moves, "preview_worker", return_value=pane_moves.WorkerResume(
                           worker_panes.StoppedWorker(worker, "fixture-pane", "fixture-terminal"),
-                          "impl", "codex1"))):
+                          "impl", "codex1", worker_panes.LaunchPolicy(
+                              models_registry.LaunchSettings("codex", "fixture-model", "medium", ""),
+                              "workspace-write", "", ())))):
                     code, stdout, stderr = self.run_cli("swap", "workers", target, *([] if shared else ["--dry-run"]))
                 self.assertEqual((code, stderr), (1 if shared else 0, ""))
                 if shared:
@@ -8448,16 +8605,19 @@ class PaneWorkerMoveTests(unittest.TestCase):
         config.mkdir()
         _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/accounts.conf",
                                      config / "accounts.conf")
-        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nWORKER_SPLIT_RATIO=0.667\n"
-                                               + "# whole: 1..\nUNIT_COMPACT_ABOVE_TOKENS=43000\n"
-                                               + "# range: 1..1800\nWORKER_COMPACT_SECONDS=300\n"
-                                               + "# range: 0.01..600\nWORKER_PUBLISH_LOCK_SECONDS=15\n"
-                                               + "# range: 1..600\nPANE_AGENT_START_SECONDS=90\n")
-        _ = (config / "shutdown.conf").write_text("# whole: 1..300\nSTOP_GRACE_SECONDS=2\n# whole: 1..300\nKILL_GRACE_SECONDS=5\n# whole: 1..300\nMOVE_STOP_MARGIN_SECONDS=10\n")
+        for name in ("detached_runs.conf", "postmaster.conf"):
+            _ = write_config_fixture(config / name)
+        _ = (config / "direct.conf").write_text("# range: 0.1..0.9\nworker_split_ratio=0.667\n"
+                                               + "# whole: 1..\nunit_compact_above_tokens=43000\n"
+                                               + "# range: 1..1800\nworker_compact_seconds=300\n"
+                                               + "# range: 0.01..600\nworker_publish_lock_seconds=15\n"
+                                               + "# range: 1..600\npane_agent_start_seconds=90\n")
+        _ = (config / "shutdown.conf").write_text("# whole: 1..300\nstop_grace_seconds=2\n# whole: 1..300\nkill_grace_seconds=5\n# whole: 1..300\nmove_stop_margin_seconds=10\n")
         registry = write_registry(config / "models.conf")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(config), "MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
             "UNIT_RUN_DIR": str(self.run_dir), "XDG_STATE_HOME": str(self.root / "state"),
+            "HERDR_PLATFORM": "linux", "HERDR_PROC": str(self.world.process_root),
         })))
         _ = self.enterContext(patch.object(unit_runs, "RUN_ROOT", self.root / "runs"))
         _ = self.enterContext(patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "former"))
@@ -8886,18 +9046,71 @@ class PaneWorkerMoveTests(unittest.TestCase):
 
     def test_idle_worker_with_a_live_run_resumes_and_receives_its_result_on_the_target(self) -> None:
         from scripts.agents import detached_runs
+        from scripts.direct import progress_history
         from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.lib.test_models_registry import write_registry
         from scripts.message import send, send_budget
+        from scripts.production import worker
 
-        families: tuple[Literal["claude", "codex"], ...] = ("claude", "codex")
-        for family in families:
-            with self.subTest(family=family):
-                row = self.worker("live-" + family, family=family)
+        cases: tuple[tuple[str, Literal["claude", "codex"]], ...] = (
+            ("live-claude", "claude"), ("live-codex", "codex"), ("parked", "claude"),
+            ("parked-launch-unavailable", "claude"))
+        for name, family in cases:
+            with self.subTest(case=name):
+                row = self.worker(name, family=family)
                 row = staff.set_worker_role(row.id, staff.KnownWorkerRole("impl"))
+                run_record = self.run_dir / f"detached_runs/{row.name}.json"
+                saved_options = ["--model", "opus", "--permission-mode", "bypassPermissions", "--effort", "high"]
+                if name.startswith("parked"):
+                    self.dispatch(row)
+                    pane = next(pane for pane, process in self.world.foreground.items()
+                                if self.world.processes[process[0]].current_identity == row.current_session)
+                    self.world.foreground[pane][2].extend(saved_options)
                 with live_detached_run(self.run_dir, row):
+                    if name.startswith("parked"):
+                        passed = worker_panes.worker_pass(row, self.run_dir)
+                        instance = str(passed["instance_id"])
+                        delivery = progress_history.dispatch_delivery(passed)
+                        live = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
+                        live["pane_dispatch_id"] = instance
+                        atomic_file.write_text_atomic(run_record, json.dumps(live))
+                        worker_name = staff.WorkerName.parse(name)
+                        with worker_panes.worker_lock(self.owner.id, worker_name) as hold:
+                            assert isinstance(hold, worker_panes.WorkerLockHold)
+                            receipt = worker.dispatch_receipt(row, delivery.line, delivery.completion_id,
+                                                              run=self.run_dir, require_transcript=True)
+                            assert isinstance(receipt, worker.DispatchWaitingForRuns) and receipt.can_park
+                            park = worker_panes.ParkWaitingPass(self.run_dir, instance, delivery.completion_id)
+                            closed = worker.park_waiting_worker(row, hold, park, delivery, receipt)
+                        self.assertIsInstance(closed, worker_panes.Closed)
+                        _ = write_registry(self.root / "conf/models.conf",
+                                           {"direct.claude": {"impl": "sonnet:low"}}, update=True)
+                    if name == "parked-launch-unavailable":
+                        state_path = self.run_dir / unit_runs.STATE_FILE
+                        state = cast(dict[str, object], json.loads(state_path.read_text()))
+                        saved = cast(dict[str, dict[str, object]], state["pass"])[name]
+                        del saved["parked_launch"]
+                        atomic_file.write_text_atomic(state_path, json.dumps(state))
+                        membership = staff.snapshot()
+                        before = len(self.world.stops), len(self.world.launches), moves.read_moves()
+                        preview = pane_moves.preview_worker(row, membership, "claude2", "quota", self.run_dir)
+                        moved = pane_moves.move_worker(row, membership, "claude2", "quota", self.run_dir)
+                        self.assertEqual(preview, accounts.SessionMoveRefused(
+                            row.id, "anomaly: worker launch settings are unreadable: the parked worker launch is unavailable"))
+                        self.assertEqual(moved, preview)
+                        self.assertEqual((len(self.world.stops), len(self.world.launches), moves.read_moves()), before)
+                        continue
                     context = detached_runs.resume_context(self.run_dir / "detached_runs", row.name)
                     moved = self.move(family + "2", why="quota")
                     self.assertEqual(moved.returncode, 0, moved.stderr)
+                    if name == "parked":
+                        self.assertIsInstance(self.world.launches[-1], herdr.SplitPane)
+                        kind, arguments, _ = self.world.requests[-1]
+                        self.assertEqual(kind, "claude")
+                        self.assertEqual(arguments[:2], ["--resume", row.current_session])
+                        model = arguments.index("--model")
+                        self.assertEqual(arguments[model:model + len(saved_options)], saved_options)
+                        self.assertEqual(worker_panes.worker_pass(row, self.run_dir)["instance_id"], "dispatch-" + name)
                     prompt = next(command[-1] for command in reversed(self.world.commands)
                                   if command[:2] == ("agent", "prompt"))
                     self.assertIn(context, prompt)
@@ -8907,8 +9120,7 @@ class PaneWorkerMoveTests(unittest.TestCase):
                                      str(self.account_home(family + "2")))
                     self.assertEqual(accounts.detached_move_context(str(row.id)), context)
 
-                record = cast(detached_runs.RunRecord, json.loads(
-                    (self.run_dir / f"detached_runs/{row.name}.json").read_text()))
+                record = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
                 record.update(session_dir=str(self.run_dir), label="fixture gate", done_message_file="")
                 atomic_file.write_text_atomic(Path(record["log"]), "The detached check passed.\n")
 
@@ -8929,7 +9141,23 @@ class PaneWorkerMoveTests(unittest.TestCase):
                       patch.object(send, "deliver_worker_text", side_effect=deliver) as delivery,
                       patch.object(send_budget, "seconds", return_value=1),
                       patch.object(detached_runs, "result_text", return_value="The detached check passed.")):
-                    self.assertIn("sent", detached_runs.deliver(record, detached_runs.CompletedCommand(0)))
+                    result = detached_runs.CompletedCommand(0)
+                    if name == "parked":
+                        # The supervisor parks the result; the turn-end replay resumes the worker under its lock.
+                        record.update(status="finished")
+                        atomic_file.write_text_atomic(run_record, json.dumps(record))
+                        self.assertEqual(detached_runs.deliver(record, result), detached_runs.PARKED_WORKER_RESULT)
+                        with worker_panes.worker_lock(self.owner.id, staff.WorkerName.parse(name)) as hold:
+                            assert isinstance(hold, worker_panes.WorkerLockHold)
+                            held = hold
+                            _ = detached_runs.submit_finished_worker_result(
+                                self.run_dir, row, worker_input=detached_runs.WorkerResultInput.TYPE,
+                                resume_parked=lambda: worker.restore_parked_worker(row, self.owner.id, held),
+                                input_lock=held)
+                        parked_record = cast(detached_runs.RunRecord, json.loads(run_record.read_text()))
+                        self.assertIn("sent", parked_record.get("delivery", ""))
+                    else:
+                        self.assertIn("sent", detached_runs.deliver(record, result))
                 delivery.assert_called_once()
                 result_prompt = next(command[-1] for command in reversed(self.world.commands)
                                      if command[:2] == ("agent", "prompt"))
@@ -8967,14 +9195,25 @@ class PaneWorkerMoveTests(unittest.TestCase):
         self.stop.assert_not_called()
 
     def test_worker_name_collision_between_units_has_no_detached_context(self) -> None:
-        from scripts.herdr.test_worker_panes import live_detached_run
+        from scripts.agents import detached_run_process, detached_runs
 
         row = self.worker("w74", live=False)
         other_unit = fixture_member("unit", name="other-director", parent=self.owner.parent)
         other_worker = fixture_worker(row.name, other_unit.id)
-        with live_detached_run(self.run_dir, row):
+        record_path = self.run_dir / "detached_runs" / f"{row.name}.json"
+        pid = 90001
+        record: detached_runs.RunRecord = {
+            "worker": row.name, "staff_id": row.id, "run_id": row.name,
+            "log": str(record_path.with_suffix(".log")), "status": "running", "pid": pid,
+            "command": ["fixture-check"], "label": "private verification", "started_at": 1,
+            "session_dir": str(self.run_dir), "director_dir": str(self.run_dir), "done_message_file": "",
+        }
+        atomic_file.write_text_atomic(record_path, json.dumps(record))
+        supervisor = ["python3", "detached_runs.py", "supervise", str(record_path)]
+        with patch.object(detached_run_process, "process_args", return_value=supervisor) as process_args:
             self.assertIn(f"Detached run {row.name} remains live.", accounts.detached_move_context(str(row.id)))
             self.assertEqual(accounts.detached_move_context(row.name), "")
+        process_args.assert_called_once_with(pid)
         self.assertNotEqual(row.id, other_worker.id)
 
     def test_worker_name_collision_with_a_non_worker_has_no_detached_context(self) -> None:
@@ -9704,6 +9943,105 @@ class PickerTests(unittest.TestCase):
             refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now))
         result = accounts.placement("units", self.now, exclude=frozenset())
         self.assertEqual(result.label, "claude1")
+
+    def test_pick_and_placement_skip_a_family_refusal_only_for_its_family_or_an_unknown_family(self) -> None:
+        self.assert_picked("claude3")
+        self.store_fable("claude1", 60)
+        refusals.write_refusal(refusals.AccountRefusal("claude", "third@example.invalid",
+            refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=2)), self.now,
+            refusals.ModelFamily("fable")))
+        for family, label in ((refusals.ModelFamily("fable"), "claude1"), (refusals.ModelFamily("opus"), "claude3"),
+                              (refusals.UNKNOWN_FAMILY, "claude1")):
+            with self.subTest(family=family):
+                chosen = accounts.pick("claude", self.now, family=family)
+                assert isinstance(chosen, accounts.PickedAccount)
+                self.assertEqual(chosen.label, label)
+                self.assertEqual(accounts.placement("units", self.now, exclude=frozenset(), family=family).label, label)
+                explained = [accounts._pick_explanation(reason) for reason in chosen.reasons]  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(any("refused at" in line for line in explained), label == "claude1")
+
+    def store_fable(self, label: str, left: float) -> None:
+        directory = accounts.account_dir(label)
+        identity = accounts.account_identity(directory)
+        assert isinstance(identity, agent_accounts.NumberedAccount)
+        general = usage_store.load()[usage_store.key("Claude", identity.login)].get("weekly")
+        assert general is not None
+        usage: dict[str, object] = {
+            "seven_day": {"utilization": 100 - general["left"], "resets_at": general["resets"]},
+            "limits": {"weekly_scoped": {"percent": 100 - left, "is_active": True,
+                                        "resets_at": (self.now + timedelta(days=2)).isoformat()}},
+        }
+        report = agent_accounts.Report("Claude", email=identity.login,
+            quotas=agent_accounts.claude_usage_quotas(usage), weekly_fable=agent_accounts.claude_fable_weekly(usage))
+        usage_store.save([report], self.now)
+
+    def test_fable_usage_survives_store_and_timer_round_trips(self) -> None:
+        payload: dict[str, object] = {
+            "seven_day": {"utilization": 75, "resets_at": (self.now + timedelta(days=3)).isoformat()},
+            "limits": {"weekly_scoped": {"percent": 100, "is_active": True,
+                                        "resets_at": (self.now + timedelta(days=1)).isoformat()}},
+        }
+        look_up = usage_store.key("Claude", "first@example.invalid")
+        report = agent_accounts.Report("Claude", email="first@example.invalid",
+            quotas=agent_accounts.claude_usage_quotas(payload), weekly_fable=agent_accounts.claude_fable_weekly(payload))
+        usage_store.save([report], self.now)
+        saved = usage_store.load()[look_up]
+        weekly = saved.get("weekly")
+        assert weekly is not None
+        self.assertEqual(weekly["left"], 25)
+        self.assertEqual(saved.get("weekly_fable"), usage_store.StoredWindow(left=0, at=self.now.isoformat(),
+            resets=(self.now + timedelta(days=1)).isoformat()))
+        usage_store.save_timer_usage("fixture", [report], self.now)
+        cached = usage_store.recent_timer_usage("fixture", self.now)
+        assert isinstance(cached, usage_store.RecentTimerUsage)
+        self.assertEqual(cached.reports[0].weekly_fable, report.weekly_fable)
+        usage_store.save([replace(report, weekly_fable=agent_accounts.NoFableQuota())], self.now)
+        self.assertNotIn("weekly_fable", usage_store.load()[look_up])
+
+    def test_fable_pick_and_group_placement_require_both_weekly_windows(self) -> None:
+        self.reading("Claude", "third@example.invalid", 25, 2)
+        self.store_fable("claude3", 0)
+        self.store_fable("claude1", 60)
+        registry = self.home / ".claude/config/models.conf"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        _ = registry.write_text("[claude.families]\nfable=fable\n[production.claude]\ndirector=fable:high\n")
+        with patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage read")):
+            picked = accounts.pick("claude", self.now, family=refusals.FABLE_FAMILY)
+            assert isinstance(picked, accounts.PickedAccount)
+            self.assertEqual(picked.label, "claude1")
+            self.assertEqual({reason.label: reason.status for reason in picked.reasons}["claude3"], "no room")
+            self.assertEqual(accounts.placement("units", self.now).label, "claude1")
+            self.reading("Claude", "third@example.invalid", 0, 2)
+            self.store_fable("claude3", 60)
+            self.assertEqual(accounts.placement("units", self.now).label, "claude1")
+
+    def test_fable_pick_explains_a_missing_saved_window(self) -> None:
+        with patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage read")):
+            refused = accounts.pick("claude", self.now, family=refusals.FABLE_FAMILY)
+        assert isinstance(refused, accounts.NoAccountWithRoom)
+        self.assertTrue(refused.reasons)
+        self.assertEqual({reason.status for reason in refused.reasons}, {"cannot read the Fable weekly window"})
+
+    def test_non_fable_pick_ignores_the_saved_fable_window(self) -> None:
+        self.store_fable("claude3", 0)
+        picked = accounts.pick("claude", self.now, family=refusals.ModelFamily("opus"))
+        assert isinstance(picked, accounts.PickedAccount)
+        self.assertEqual(picked.label, "claude3")
+
+    def test_group_family_reads_the_staff_model_setting(self) -> None:
+        registry = self.home / ".claude/config/models.conf"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        for producers, expected in (("morty=claude:fable:high\nbob=claude:fable:high\n", refusals.ModelFamily("fable")),
+                                    ("morty=claude:fable:high\nbob=claude:opus:high\n", refusals.UNKNOWN_FAMILY)):
+            with self.subTest(producers=producers):
+                families = "[claude.families]\nfable=fable\nopus=opus\nsonnet=sonnet\n"
+                staff = "[production.claude]\ndirector=opus:xhigh\nshowrunner=sonnet:high\n"
+                _ = registry.write_text(f"{families}\n[producers]\n{producers}\n{staff}")
+                self.assertEqual(accounts.group_family("producers"), expected)
+                self.assertEqual(accounts.group_family("units"), refusals.ModelFamily("opus"))
+                self.assertEqual(accounts.group_family("showrunners"), refusals.ModelFamily("sonnet"))
+        registry.unlink()
+        self.assertEqual(accounts.group_family("units"), refusals.UNKNOWN_FAMILY)
 
     def test_placement_units_choose_soonest_reset_and_break_ties_by_most_left(self) -> None:
         self.assertEqual(accounts.placement("units", self.now, exclude=frozenset()).label, "claude3")

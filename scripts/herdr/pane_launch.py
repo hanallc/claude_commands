@@ -22,7 +22,7 @@ from scripts.message import sessions
 from scripts.herdr.place import HerdrPlace
 from scripts.herdr import herdr_types
 from scripts.lib.probe_session import PROBE_ENV
-from scripts.lib import atomic_file, legacy_identity
+from scripts.lib import atomic_file, legacy_identity, models_registry
 from scripts.production import staff
 
 # The launch environment a resume must give back. Credentials never enter the record.
@@ -31,6 +31,7 @@ KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
 NAME_FLAGS = frozenset({"-n", "--name"})
 MODEL_FLAGS = frozenset({"--model"})
 PRODUCER_LAUNCH_REQUEST_ENV = "HERDR_PRODUCER_LAUNCH_REQUEST"
+CLAUDE_FORK_NAME_ENV = "CLAUDE_DEFER_FORK_PUBLICATION"
 
 
 class LaunchOptions(TypedDict):
@@ -49,6 +50,7 @@ class LaunchOptions(TypedDict):
     pid: NotRequired[int]
     proc_start: NotRequired[str]
     producer_binding: NotRequired[bool]
+    implicit_claude_home: NotRequired[str]
 
 
 class StaffPaneLaunch(LaunchOptions):
@@ -74,6 +76,44 @@ class CurrentLaunch(NativePaneLaunch):
 
 
 PaneLaunch = StaffPaneLaunch | NativePaneLaunch
+
+
+@dataclass(frozen=True)
+class ImplicitClaudeHome:
+    """Claude uses this HOME with no CLAUDE_CONFIG_DIR."""
+
+    home: Path
+
+    @property
+    def config_dir(self) -> Path:
+        return self.home / ".claude"
+
+    @property
+    def settings_file(self) -> Path:
+        return self.home / ".claude.json"
+
+    def environment(self, base: Mapping[str, str]) -> dict[str, str]:
+        environment = {**base, "HOME": str(self.home)}
+        _ = environment.pop("CLAUDE_CONFIG_DIR", None)
+        return environment
+
+
+class SelectedClaudeAccount(Enum):
+    USE_SELECTION = "use the selected account"
+
+
+def implicit_claude_home(entry: PaneLaunch) -> ImplicitClaudeHome | SelectedClaudeAccount:
+    if home := entry.get("implicit_claude_home"):
+        return ImplicitClaudeHome(Path(home))
+    return SelectedClaudeAccount.USE_SELECTION
+
+
+def retain_implicit_claude_home(entry: CurrentLaunch, environment: Mapping[str, str]) -> None:
+    """Keep the home of a standalone Claude session without storing credentials."""
+    home = Path(environment.get("HOME", ""))
+    if saved_kind(entry) == "claude" and "CLAUDE_CONFIG_DIR" not in environment and home.is_absolute():
+        entry["implicit_claude_home"] = str(home)
+        entry["config_dir"] = str(ImplicitClaudeHome(home).config_dir)
 
 
 class CurrentProcessEvidence(Protocol):
@@ -141,6 +181,21 @@ def producer_launch_request(request: ProducerLaunchRequest) -> Generator[None]:
             del os.environ[request.environment_key]
         else:
             os.environ[request.environment_key] = previous
+
+
+_producer_publication_configuration = ContextVar[models_registry.LaunchModelConfiguration | models_registry.FreshLaunchConfiguration](
+    "producer_publication_model", default=models_registry.FreshLaunchConfiguration()
+)
+
+
+@contextmanager
+def producer_publication_configuration(configuration: models_registry.LaunchModelConfiguration) -> Generator[None]:
+    """Use the launch configuration when publishing a producer pane."""
+    scope = _producer_publication_configuration.set(configuration)
+    try:
+        yield
+    finally:
+        _producer_publication_configuration.reset(scope)
 
 
 @dataclass(frozen=True)
@@ -433,7 +488,7 @@ def config_home(entry: Mapping[str, object], *, record: staff.StaffSnapshot | No
     return staff.SessionHome(Path(directory)) if isinstance(directory, str) and directory else staff.HomeUnknown()
 
 
-def _record_home(entry: CurrentLaunch) -> CurrentLaunch:
+def _record_home(entry: CurrentLaunch, environment: Mapping[str, str]) -> CurrentLaunch:
     """Publish the pane's home through the staff writer when membership exists."""
     try:
         record = staff.initial_snapshot()
@@ -443,6 +498,8 @@ def _record_home(entry: CurrentLaunch) -> CurrentLaunch:
             return entry
         current = entry.copy()
         current["staff_id"] = row.id
+        if row.kind == "session":
+            retain_implicit_claude_home(current, environment)
         directory = current.pop("config_dir", "")
         if directory:
             home = staff.SessionHome(Path(directory).absolute())
@@ -459,7 +516,8 @@ def staff_admitted(row: staff.StaffRow) -> staff.StaffRow:
     try:
         publication = newest_publication(record_directory(), (row.current_session,))
         if publication is not None and "config_dir" in publication.entry:
-            write(publication.path, _record_home(cast(CurrentLaunch, publication.entry)), sources=tuple(publication.path.parent.glob("*.json")))
+            entry = cast(CurrentLaunch, publication.entry)
+            write(publication.path, _record_home(entry, entry["environment"]), sources=tuple(publication.path.parent.glob("*.json")))
             return staff.by_id(row.id) or row
     except (OSError, ValueError, staff.StaffNotFound) as error:
         print(f"anomaly: {row.id}: pane publication is unavailable: {error}", file=sys.stderr)
@@ -518,6 +576,10 @@ def _validated_launch(path: Path, pane_id: str, value: object, *, required_strin
             continue
         if not isinstance(launch.get(field), bool):
             raise ValueError(f"{location}: {field} must be a boolean")
+    if "implicit_claude_home" in launch:
+        home = launch["implicit_claude_home"]
+        if not isinstance(home, str) or not Path(home).is_absolute():
+            raise ValueError(f"{location}: implicit_claude_home must be an absolute path")
     environment = launch.get("environment")
     if (not isinstance(environment, dict)
             or not all(isinstance(name, str) and isinstance(setting, str)
@@ -741,8 +803,6 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         records[path.absolute()][launch["pane_id"]] = launch
         save(path, records[path.absolute()], record=membership)
         return
-    from scripts.lib import models_registry
-
     process_reader = cast(NativeProcessReader, cast(object, import_module("scripts.herdr.herdr")))
     observed_launch = (current_launch(launch, membership) if "session_id" not in launch
                        else cast(CurrentLaunch, launch))
@@ -753,7 +813,11 @@ def _publish_producer(path: Path, launch: PaneLaunch, owner: staff.StaffRow,
         raise ValueError("producer publication does not match the current process")
     expected = observed_launch.copy()
     expected["session_id"] = owner.id
-    expected["kind"] = models_registry.launch_settings("producers", owner.name).kind
+    configuration = _producer_publication_configuration.get()
+    expected["kind"] = models_registry.launch_settings(
+        "producers", owner.name,
+        configuration=configuration if isinstance(configuration, models_registry.LaunchModelConfiguration) else None,
+    ).kind
     if isinstance(request, ProducerLaunchRequest):
         if request.member != owner.id or request.session != owner.current_session:
             raise ValueError("producer start expectation names another conversation")
@@ -1041,7 +1105,7 @@ class ClaudeArguments:
 
 # Claude options used by launch commands; all consumers share this parse.
 CLAUDE_VALUE_FLAGS = frozenset({"--resume", "-r", "--remote-control", "--settings",
-    "--model", "--name", "-n", "--effort", "--permission-mode", "--session-id", "--plugin-dir"})
+    "--model", "--name", "-n", "--effort", "--autocompact", "--permission-mode", "--session-id", "--plugin-dir"})
 RESUME_FLAGS = frozenset({"--resume", "-r"})
 
 
@@ -1109,4 +1173,4 @@ def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, st
                 if option != "-c" or not value.startswith("projects="):
                     policy.extend((option, value))
         entry["codex_policy"] = policy
-    return _record_home(entry)
+    return _record_home(entry, environment)

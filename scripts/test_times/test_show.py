@@ -192,8 +192,8 @@ class TestTimesTests(unittest.TestCase):
         }))
         _ = configure_cleanup(self, self.log)
         _ = write_config_fixture(self.config / "test_times.conf",
-                                 "TOP_RUNS=3\nTOP_CHECKOUT=~/.claude\nTOP_MAX_AGE_DAYS=7\nNEXTEST_SLOW_TEST_S=1.0\n"
-                                 + "TREND_SETTLE_MINUTES=45\n")
+                                 "top_runs=3\ntop_checkout=~/.claude\ntop_max_age_days=7\nnextest_slow_test_s=1.0\n"
+                                 + "trend_settle_minutes=45\n")
         _ = write_config_fixture(self.config / "buildlog.conf")
         _ = self.enterContext(mock.patch.object(show, "datetime", ReportTime))
         for name in ("test_alpha.py", "test_beta.py", "test_missing.py"):
@@ -228,7 +228,7 @@ class TestTimesTests(unittest.TestCase):
 
     def write_run(self, modules: list[ModuleRun], *, epoch: float = EPOCH,
                   host: str = HOST, aborted: bool = False, status: int = 0,
-                  checkout: str = "") -> None:
+                  checkout: str = "", sha: str | None = None) -> None:
         self.next_id += 1
         suites: list[gate_record.SuiteRun] = [
             {"suite": suite, "wall_s": sum(row["wall_s"] for row in modules if row["suite"] == suite),
@@ -242,6 +242,8 @@ class TestTimesTests(unittest.TestCase):
             "checkout": checkout or str(self.repo),
             "slow_test_s": gate_record.slow_test_s(),
         }
+        if sha is not None:
+            run["sha"] = sha
         with mock.patch.object(record, "new_id", return_value=f"history-{self.next_id}"), \
                 mock.patch.object(socket, "gethostname", return_value=host):
             gate_record.write_gate_run(run, fixture_executions(run))
@@ -361,7 +363,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             event.sendall(b"F")
 
     def test_report_keeps_index_only_rows_after_an_exclusive_lock_exceeds_the_read_wait(self) -> None:
-        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.05")
+        _ = write_config_fixture(self.config / "buildlog.conf", "index_read_wait_seconds=0.05")
         self.write_run([module_run("test_alpha.py", 8.0)])
         _ = show.index.update()
         with closing(sqlite3.connect(index_path_in(self.log))) as connection, connection:
@@ -392,7 +394,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             try:
                 self.assertEqual(event.recv(1), b"W")
                 with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
-                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                        timeout=conf.read("buildlog").number("index_read_wait_seconds"))) as reader:
                     with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
                         reader.execute("SELECT COUNT(*) FROM gate_modules").close()
                 with mock.patch.dict(os.environ, {"TEST_LOCKED_INDEX": "1"}), \
@@ -415,7 +417,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                     _ = writer.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_report_waits_for_an_exclusive_lock_taken_after_index_selection(self) -> None:
-        _ = write_config_fixture(self.config / "buildlog.conf", "INDEX_READ_WAIT_SECONDS=0.01")
+        _ = write_config_fixture(self.config / "buildlog.conf", "index_read_wait_seconds=0.01")
         self.write_run([module_run("test_alpha.py", 8.0)])
         _ = show.index.update()
         select_index = show.index.complete_gate_index_in
@@ -440,7 +442,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             self.assertTrue(locked.wait(TEST_HANG_GUARD_SECS))
             try:
                 with closing(sqlite3.connect(show.index.read_only_uri(self.log), uri=True,
-                        timeout=conf.read("buildlog").number("INDEX_READ_WAIT_SECONDS"))) as reader:
+                        timeout=conf.read("buildlog").number("index_read_wait_seconds"))) as reader:
                     with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
                         reader.execute("SELECT COUNT(*) FROM gate_modules").close()
             finally:
@@ -609,7 +611,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertIn("tools/test_beta.py", limited)
         self.assertNotIn("tools/test_alpha.py", limited)
         self.assertIn(type_line, limited)
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_RUNS=1")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_runs=1")
         changed = self.report("top", "--repo", str(self.repo))
         self.assertLess(changed.index("tools/test_alpha.py"), changed.index("types/basedpyright"))
 
@@ -678,7 +680,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_nextest(hana, "        PASS [ 2.000s] hana tests::recorded\n")
         with chdir(hana[0]):
             before = self.report("top")
-            _ = write_config_fixture(self.config / "test_times.conf", "NEXTEST_SLOW_TEST_S=3.0")
+            _ = write_config_fixture(self.config / "test_times.conf", "nextest_slow_test_s=3.0")
             after = self.report("top")
         self.assertIn("recorded threshold: > 1.000 s", before)
         self.assertIn("recorded threshold: > 3.000 s", after)
@@ -761,7 +763,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
 
     def test_top_aws_host_ranks_every_aws_gate_host_from_the_aws_checkout(self) -> None:
         gate = self.root / "gate-trial"
-        _ = write_config_fixture(self.config / "test_times.conf", f"TOP_CHECKOUT=~/.claude\nTOP_AWS_CHECKOUT={gate}")
+        _ = write_config_fixture(self.config / "test_times.conf", f"top_checkout=~/.claude\ntop_aws_checkout={gate}")
         self.write_run([module_run("test_alpha.py", 4.0)], host="ip-10-0-0-1.us-east-2.compute.internal",
                        checkout=str(gate))
         self.write_run([module_run("test_alpha.py", 8.0)], host="ip-10-0-0-2.us-east-2.compute.internal",
@@ -776,11 +778,164 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.assertEqual(self.cell(output, alpha, "runs counted"), "2", output)
         self.assertIn("no modules recorded yet", self.report("top", "--repo", str(self.repo)))
 
+    def test_top_uses_merge_base_time_then_start_before_the_run_limit(self) -> None:
+        old, shared, main, newer, older, missing = (digit * 40 for digit in "123456")
+        graph = (
+            f"900 {older} {old}\n"
+            + f"600 {newer} {shared}\n"
+            + f"400 {main} {old} {shared}\n"
+            + f"300 {shared} {old}\n"
+            + f"100 {old}\n"
+        )
+
+        def git(_repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+            match arguments:
+                case ("rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}"):
+                    self.assertTrue(missing_ok)
+                    return main + "\n"
+                case ("cat-file", "--batch-check"):
+                    return "".join(f"{sha} missing\n" if sha == missing else f"{sha} commit 123\n"
+                                   for sha in (input_text or "").splitlines())
+                case ("rev-list", "--topo-order", "--timestamp", "--parents", "--stdin"):
+                    self.assertEqual(set((input_text or "").splitlines()), {main, newer, shared, older})
+                    return graph
+                case _:
+                    self.fail(f"unexpected Git command {arguments}")
+
+        _ = write_config_fixture(self.config / "test_times.conf", "top_runs=2")
+        self.write_run([module_run("test_alpha.py", 40.0)], sha=shared)
+        self.write_run([module_run("test_alpha.py", 6.0)], epoch=EPOCH + 60, sha=newer)
+        self.write_run([module_run("test_alpha.py", 8.0)], epoch=EPOCH + 120, sha=shared)
+        self.write_run([module_run("test_alpha.py", 50.0), module_run("test_beta.py", 8.0)],
+                       epoch=EPOCH + 180, sha=older)
+        self.write_run([module_run("test_alpha.py", 100.0), module_run("test_beta.py", 100.0),
+                        module_run("test_missing.py", 30.0)], epoch=EPOCH + 240, sha=missing)
+
+        with mock.patch.object(show, "ranking_git", side_effect=git) as commands, \
+                mock.patch.object(show, "top_cache_root", return_value=self.root / "cache"):
+            output = self.report("top")
+            for name, median, count in (("test_alpha.py", "7.000", "2"), ("test_beta.py", "54.000", "2"),
+                                        ("test_missing.py", "30.000", "1")):
+                row = self.line(output, f"tools/{name}")
+                self.assertEqual(self.cell(output, row, "median s"), median)
+                self.assertEqual(self.cell(output, row, "runs counted"), count)
+
+            commands.reset_mock()
+            self.assertEqual(self.report("top"), output)
+            self.assertEqual([call.args[1] for call in commands.call_args_list], ["rev-parse", "cat-file"])
+
+    def test_top_shows_the_latest_counted_run_code_date_in_the_user_zone(self) -> None:
+        older, newer, missing = (digit * 40 for digit in "123")
+        older_base = int(datetime(2026, 11, 2, 1, tzinfo=UTC).timestamp())
+        newer_base = int(datetime(2026, 11, 3, 1, tzinfo=UTC).timestamp())
+        self.write_run([module_run("test_alpha.py", 6.0), module_run("test_beta.py", 3.0)], sha=newer)
+        self.write_run([module_run("test_alpha.py", 8.0)], epoch=EPOCH + 60, sha=older)
+        self.write_run([module_run("test_beta.py", 4.0)], epoch=EPOCH + 120, sha=missing)
+
+        with mock.patch.object(show, "run_code_ages", return_value={older: older_base, newer: newer_base}):
+            output = self.report("top")
+
+        self.assertTrue(output.splitlines()[0].endswith("runs counted  code date"))
+        alpha = self.line(output, "tools/test_alpha.py")
+        self.assertEqual(self.cell(output, alpha, "last s"), "8.000")
+        self.assertEqual(self.cell(output, alpha, "code date"), "11-01")
+        beta = self.line(output, "tools/test_beta.py")
+        self.assertEqual(self.cell(output, beta, "runs counted"), "2")
+        self.assertEqual(self.cell(output, beta, "code date"), "unknown")
+
+    def test_top_code_age_cache_resolves_new_objects_and_tracks_main(self) -> None:
+        old, landed = "a" * 40, "b" * 40
+        main = old
+        available = False
+
+        def git(_repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+            match arguments:
+                case ("rev-parse", *_):
+                    self.assertTrue(missing_ok)
+                    return main + "\n"
+                case ("cat-file", "--batch-check"):
+                    return "".join(f"{sha} missing\n" if sha == landed and not available
+                                   else f"{sha} commit 123\n" for sha in (input_text or "").splitlines())
+                case ("rev-list", *_):
+                    if landed in (input_text or "").splitlines():
+                        return f"200 {landed} {old}\n100 {old}\n"
+                    return f"100 {old}\n"
+                case _:
+                    self.fail(f"unexpected Git command {arguments}")
+
+        with mock.patch.object(show, "ranking_git", side_effect=git), \
+                mock.patch.object(show, "top_cache_root", return_value=self.root / "cache"):
+            revisions = {old, landed}
+            self.assertEqual(show.run_code_ages(self.repo, revisions), {old: 100})
+            available = True
+            self.assertEqual(show.run_code_ages(self.repo, revisions), {old: 100, landed: 100})
+            main = landed
+            self.assertEqual(show.run_code_ages(self.repo, revisions), {old: 100, landed: 200})
+
+    def test_top_code_age_cache_recomputes_when_the_shallow_boundary_changes(self) -> None:
+        main, run_commit, boundary, deeper_boundary = (digit * 40 for digit in "1234")
+        shallow = self.repo / ".git" / "shallow"
+        _ = shallow.write_text(boundary + "\n", encoding="ascii")
+
+        with mock.patch.object(show, "ranking_git", return_value=main + "\n"), \
+                mock.patch.object(show, "resolve_run_commits", return_value={run_commit: run_commit}), \
+                mock.patch.object(show, "merge_base_times", side_effect=[{run_commit: 200}, {run_commit: 100}]) as times, \
+                mock.patch.object(show, "top_cache_root", return_value=self.root / "cache"):
+            self.assertEqual(show.run_code_ages(self.repo, {run_commit}), {run_commit: 200})
+            self.assertEqual(show.run_code_ages(self.repo, {run_commit}), {run_commit: 200})
+            times.assert_called_once_with(self.repo, main, {run_commit})
+
+            _ = shallow.write_text(deeper_boundary + "\n", encoding="ascii")
+            self.assertEqual(show.run_code_ages(self.repo, {run_commit}), {run_commit: 100})
+            self.assertEqual(times.call_count, 2)
+
+    def test_top_retries_an_unknown_merge_base_after_git_gains_history(self) -> None:
+        main, run_commit, base = (digit * 40 for digit in "123")
+        base_time = int(EPOCH)
+        history_available = False
+        cache = self.root / "cache"
+        self.write_run([module_run("test_alpha.py", 8.0)], sha=run_commit)
+        self.write_run([module_run("test_beta.py", 5.0)], sha=main)
+
+        def git(_repo: Path, *arguments: str, input_text: str | None = None,
+                missing_ok: bool = False) -> str:
+            match arguments:
+                case ("rev-parse", *_):
+                    self.assertTrue(missing_ok)
+                    return main + "\n"
+                case ("cat-file", "--batch-check"):
+                    return "".join(f"{sha} commit 123\n" for sha in (input_text or "").splitlines())
+                case ("rev-list", *_):
+                    self.assertEqual(set((input_text or "").splitlines()), {main, run_commit})
+                    if history_available:
+                        return (f"{base_time + 60} {main} {base}\n"
+                                + f"{base_time + 30} {run_commit} {base}\n{base_time} {base}\n")
+                    return f"{base_time + 60} {main}\n{base_time + 30} {run_commit}\n"
+                case _:
+                    self.fail(f"unexpected Git command {arguments}")
+
+        with mock.patch.object(show, "ranking_git", side_effect=git), \
+                mock.patch.object(show, "top_cache_root", return_value=cache):
+            before = self.report("top")
+            self.assertEqual(self.cell(before, self.line(before, "tools/test_alpha.py"), "code date"), "unknown")
+            saved = cache / "gate-top-code-age.json"
+            self.assertEqual(json.loads(saved.read_text()), {"main": main, "shallow": "", "times": {main: base_time + 60}})
+
+            # An older version could save a null time for the run commit.
+            _ = saved.write_text(json.dumps({"main": main, "shallow": "", "times": {main: base_time + 60, run_commit: None}}))
+            history_available = True
+            after = self.report("top")
+            self.assertEqual(self.cell(after, self.line(after, "tools/test_alpha.py"), "code date"), "11-03")
+            self.assertEqual(json.loads(saved.read_text()),
+                             {"main": main, "shallow": "", "times": {main: base_time + 60, run_commit: base_time}})
+
     def test_top_reads_history_when_the_configured_checkout_is_a_symlink(self) -> None:
         self.write_run([module_run("test_alpha.py", 8.0)], checkout=str(self.repo.resolve()))
         alias = self.repo.with_name("checkout-alias")
         alias.symlink_to(self.repo, target_is_directory=True)
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_CHECKOUT=~/checkout-alias")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_checkout=~/checkout-alias")
         output = self.report("top", "--repo", str(self.repo))
         alpha = self.line(output, "tools/test_alpha.py")
         self.assertEqual(self.cell(output, alpha, "median s"), "8.000")
@@ -791,10 +946,10 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_run([module_run("test_beta.py", 9.0)], checkout=str(self.root / "other"))
         output = self.report("top", "--repo", str(self.repo))
         self.assertEqual(self.cell(output, self.line(output, "tools/test_alpha.py"), "median s"), "8.000")
-        _ = write_config_fixture(self.config / "test_times.conf", "TOP_MAX_AGE_DAYS=1")
+        _ = write_config_fixture(self.config / "test_times.conf", "top_max_age_days=1")
         output = self.report("top", "--repo", str(self.repo))
         self.assertIn("no modules recorded yet", output)
-        _ = write_config_fixture(self.config / "test_times.conf", f"TOP_CHECKOUT={self.root / 'other'}")
+        _ = write_config_fixture(self.config / "test_times.conf", f"top_checkout={self.root / 'other'}")
         output = self.report("top", "--repo", str(self.repo))
         self.assertEqual(self.cell(output, self.line(output, "tools/test_beta.py"), "median s"), "9.000")
 
@@ -891,7 +1046,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
     def test_test_history_separates_kept_missing_and_absent_rows_without_invented_durations(self) -> None:
         kept: TestTime = {"test": "Example.test_target", "s": 0.75, "status": "pass"}
         self.write_run([module_run("test_alpha.py", 8.0, tests=[kept])])
-        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=1.0")
+        _ = write_config_fixture(self.config / "test_times.conf", "slow_test_s=1.0")
         self.write_run([module_run("test_alpha.py", 7.0)], epoch=EPOCH + 60)
         removed = module_run("test_alpha.py", 6.0)
         removed["tests_run"] = 12
@@ -900,7 +1055,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_run([missing], epoch=EPOCH + 180)
         self.write_run([module_run("test_alpha.py", 999.0, tests=[kept])],
                        host="other-host", epoch=EPOCH + 240)
-        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=2.0")
+        _ = write_config_fixture(self.config / "test_times.conf", "slow_test_s=2.0")
         output = self.report("test", "target")
         self.assertIn("0.75", self.line(output, "11-03 09:30"))
         for when in ("11-03 09:31", "11-03 09:32"):
@@ -939,7 +1094,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         for entry in entries:
             remove_run_measurements(entry)
         _ = path.write_bytes(b"".join(encode(entry) for entry in entries))
-        _ = write_config_fixture(self.config / "test_times.conf", "SLOW_TEST_S=9.0")
+        _ = write_config_fixture(self.config / "test_times.conf", "slow_test_s=9.0")
         suites = self.report("suites", "--days", "100000")
         for when in ("11-03 09:30", "11-03 09:31"):
             self.assertEqual(self.cell(suites, self.line(suites, when), "tests run"), "")
@@ -1014,6 +1169,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             _ = report_without_update("top", "--repo", str(self.repo))
 
     def test_trend_groups_passing_runs_by_place_selection_and_local_day(self) -> None:
+        _ = write_config_fixture(self.config / "test_times.conf", "trend_days=2\n")
         # The first attempt is a hold restart. It still uses CPU.
         self.write_run([module_run("test_alpha.py", 120, restart="hold", status=-15),
                         module_run("test_alpha.py", 100, attempt=2)], host="natedev")
@@ -1023,7 +1179,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
                 ("natedev", True, 0, [module_run("test_alpha.py", 9999)], EPOCH),
                 ("natedev", False, 1, [module_run("test_alpha.py", 9999)], EPOCH),
                 ("natedev", False, 0, [], EPOCH),
-                ("natedev", False, 0, [module_run("test_alpha.py", 9999)], EPOCH - 9 * 86400),
+                ("natedev", False, 0, [module_run("test_alpha.py", 9999)], EPOCH - 3 * 86400),
                 ("builder", False, 0, [module_run("test_alpha.py", 10)], EPOCH),
                 ("natedev", False, 0, [module_run("test_alpha.py", 12)], EPOCH - 10 * 3600)):
             self.write_run(modules, host=host, aborted=aborted, status=status, epoch=epoch)
@@ -1034,7 +1190,7 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
             writer.execute("UPDATE gate_runs SET selection='affected', wall_s=40 WHERE id=?", (affected,)).close()
             writer.execute("UPDATE gate_runs SET wall_s=100 WHERE id='history-1'").close()
             writer.commit()
-        status, output, errors = report_without_update("trend", "--days", "8")
+        status, output, errors = report_without_update("trend")
         self.assertEqual(status, 0, errors)
         tables = trend_tables(output)
         self.assertEqual(list(tables), ["builder full suite runs", "natedev full suite runs", "natedev targeted tests"])
@@ -1234,9 +1390,9 @@ with socket.socket(fileno=int(sys.argv[2])) as event, index.update_lock():
         self.write_run([module_run("test_alpha.py", 8)], epoch=EPOCH - 86400, host="natedev")
         # The first delay ends one second after the fixed report time.
         delay = (ReportTime.now().timestamp() - (EPOCH - 9.5 * 3600)) / 60
-        _ = write_config_fixture(self.config / "test_times.conf", f"TREND_SETTLE_MINUTES={delay + 1 / 60}")
+        _ = write_config_fixture(self.config / "test_times.conf", f"trend_settle_minutes={delay + 1 / 60}")
         _ = self.report("trend", "--days", "2")
-        _ = write_config_fixture(self.config / "test_times.conf", f"TREND_SETTLE_MINUTES={delay}")
+        _ = write_config_fixture(self.config / "test_times.conf", f"trend_settle_minutes={delay}")
         with closing(sqlite3.connect(index_path_in(self.log))) as writer:
             writer.execute("UPDATE gate_modules SET cpu_s=11").close()
             writer.commit()

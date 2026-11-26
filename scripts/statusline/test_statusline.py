@@ -1,6 +1,7 @@
 """Tests for statusline.sh and statusline.jq: the role, the usage line, its reset times, and their zone."""
 from __future__ import annotations
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lint.memory_test_support import write_config_fixture
 
@@ -8,6 +9,7 @@ import json
 import io
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,15 +22,16 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import ClassVar, NotRequired, TextIO, TypedDict, cast, final, override
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import accounts, new_account
+from scripts.direct import recorder_state
 from scripts.for_you.action import ActionStore
 from scripts.hooks import showrunner_footer
-from scripts.lib import conf
+from scripts.lib import conf, conf_reads, file_lock
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production import footer_counts, investigation, session_labels, staff
@@ -106,7 +109,7 @@ def fixture_command(root: Path, *, rebuild_cache: str = "~/.local/state/showrunn
     configuration = fixture_colors(root / "config/statusline.conf")
     with configuration.open("a", encoding="utf-8") as settings:
         _ = settings.write("# whole: 1..\ncounts.retry_seconds=7\n" + fixture_rebuild_settings(rebuild_cache))
-    _ = configuration.with_name("user_zone.conf").write_text(f"zone={USER_ZONE.key}\n", encoding="utf-8")
+    _ = write_config_fixture(configuration.with_name("user_zone.conf"), f"zone={USER_ZONE.key}\n")
     for name in ("statusline.sh", "statusline.jq", "assignment.py", "rebuild_row.py"):
         _ = shutil.copyfile(PROGRAM.parent / name, folder / name)
     for source in PROGRAM.parent.iterdir():
@@ -503,14 +506,16 @@ class ForYouStatusTests(unittest.TestCase):
 
     def test_mac_shell_reads_the_console_count_without_local_actions(self) -> None:
         requests: list[str] = []
+        payload: dict[str, object] = {"available": True, "count": 3, "other_count": 2,
+                                      "rebuild_machines": ["mac"],
+                                      "rebuild_reasons": {"mac": "Update the editor +2"}}
 
         class ConsoleHost(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 requests.append(self.path)
                 self.send_response(200)
                 self.end_headers()
-                reply: dict[str, object] = {"available": True, "count": 3, "other_count": 2,
-                                            "rebuild_machines": ["mac"]}
+                reply = dict(payload)
                 if self.path == "/console/for-you.json":
                     reply["entries"] = [{"command": "x" * 70000}]
                 _ = self.wfile.write(json.dumps(reply).encode())
@@ -544,13 +549,19 @@ class ForYouStatusTests(unittest.TestCase):
                 try:
                     result = subprocess.run(["/bin/sh", "-c", command], input="{}", capture_output=True,
                                             text=True, check=True, env=env, cwd=home)
+                    del payload["rebuild_reasons"]
+                    legacy = subprocess.run(["/bin/sh", "-c", command], input="{}", capture_output=True,
+                                            text=True, check=True, env=env, cwd=home)
                 finally:
                     server.shutdown()
                     thread.join()
             unavailable = subprocess.run(["/bin/sh", "-c", command], input="{}", capture_output=True,
                                          text=True, check=True, env=env, cwd=home)
-            self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], "For you: rebuild mac, 2 actions", result.stderr)
-            self.assertEqual(requests, ["/console/for-you.json?view=count"])
+            self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1],
+                             "For you: rebuild mac: Update the editor +2, 2 actions", result.stderr)
+            self.assertEqual(ANSI.sub("", legacy.stdout).splitlines()[-1],
+                             "For you: rebuild mac: reason not read, 2 actions", legacy.stderr)
+            self.assertEqual(requests, ["/console/for-you.json?view=count"] * 2)
             self.assertEqual(unavailable.stdout.splitlines()[-1], "For you: Unavailable")
             self.assertFalse((home / ".local/state/for-you").exists())
 
@@ -568,10 +579,10 @@ class ForYouStatusTests(unittest.TestCase):
 
             with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": os.devnull,
                                          "STATUSLINE_SYSTEM": "Darwin",
+                                         "CONF_DIR": str(root),
                                          "REBUILD_NEEDS_DIR": str(root / "needs")}),
                   patch.object(sys, "argv", ["assignment.py", "-r"]),
                   patch.object(sys, "stdin", io.StringIO("{}")),
-                  patch.object(rebuild_row, "DEFAULT_CONFIG", config),
                   patch.object(for_you, "console_status_line_actions", side_effect=read_console_actions) as request,
                   patch.object(subprocess, "Popen") as refresh,
                   patch.object(os, "execvp") as render):
@@ -590,11 +601,14 @@ class ForYouStatusTests(unittest.TestCase):
             cache = root / "rebuild-cache"
             _ = config.write_text(fixture_rebuild_settings(str(cache)), encoding="utf-8")
             environment = {"HOME": directory, "STAFF_FILE": os.devnull, "STATUSLINE_SYSTEM": "Linux",
+                           "CONF_DIR": str(root),
                            "REBUILD_NEEDS_DIR": str(root / "needs"), "FOR_YOU_ACTIONS_DIR": str(fixture_actions(root))}
             for expire, expected in ((False, "0"), (True, "unavailable")):
                 seed_rebuild_cache(root, config, cache=cache)
 
-                def actions() -> tuple[()]:
+                def actions(*, watch: Callable[[Path], None] | None = None) -> tuple[()]:
+                    if watch is not None:
+                        watch(fixture_actions(root))
                     if expire:
                         lines = cache.read_text(encoding="utf-8").splitlines()
                         lines[1] = "0"
@@ -605,18 +619,293 @@ class ForYouStatusTests(unittest.TestCase):
                       patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
                       patch.object(sys, "argv", ["assignment.py", "-r"]),
                       patch.object(sys, "stdin", io.StringIO("{}")),
-                      patch.object(rebuild_row, "DEFAULT_CONFIG", config),
                       patch.object(ActionStore, "list", side_effect=actions) as read,
                       patch.object(need, "read_needs", wraps=need.read_needs) as needs,
                       patch.object(subprocess, "Popen") as refresh,
                       patch.object(os, "execvp") as render):
                     assignment.main()
-                read.assert_called_once_with()
-                needs.assert_called_once_with()
+                read.assert_called_once_with(watch=ANY)
+                needs.assert_called_once_with([], watch=ANY)
                 self.assertEqual(refresh.call_count, int(expire))
                 render.assert_called_once()
                 arguments = cast(list[str], render.call_args.args[1])
                 self.assertEqual(arguments[arguments.index("for_you") + 1], expected)
+
+    def test_action_summary_reuses_fresh_reads_and_checks_their_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / "statusline.conf"
+            _ = config.write_text(fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"))
+            seed_rebuild_cache(home, config)
+            store = ActionStore(fixture_actions(home))
+            action = store.add(title="Restore access", command="echo ok", machine="mac", cwd="/fixture",
+                               requested_by="show", reason="Login", waits="Release", concerns="Console", dedupe_key="login")
+            environment = {"HOME": directory, "FOR_YOU_ACTIONS_DIR": str(store.folder)}
+            with (patch.dict(os.environ, environment, clear=True),
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)})):
+                need.add_need("mac", "a" * 40, "Fixture need", "Fixture")
+                folder = need.needs_folder()
+                iterdir = Path.iterdir
+                with patch.object(Path, "iterdir", autospec=True, side_effect=iterdir) as scan:
+                    first = assignment.read_actions(remote=False)
+                for source in (store.folder, folder, folder / "done"):
+                    self.assertEqual(sum(call.args == (source,) for call in scan.call_args_list), 1)
+                self.assertEqual(first.value.other_count, "1")
+                self.assertTrue(first.sources.complete)
+                record, = store.folder.glob("*.json")
+                pending, = folder.glob("*.json")
+                self.assertEqual(first.sources.stamps[record], assignment.file_stamp(record))
+                self.assertEqual(first.sources.stamps[pending], assignment.file_stamp(pending))
+                damaged = folder / "bad.json"
+                _ = damaged.write_text("{", encoding="utf-8")
+                partial = assignment.read_actions(remote=False)
+                self.assertEqual((partial.value.other_count, partial.value.waiting_rebuilds),
+                                 ("1+", "rebuild mac: Fixture need"))
+                self.assertFalse(partial.sources.complete)
+                damaged.unlink()
+                _ = store.mark_done(action.key, evidence="Login restored.")
+                self.assertNotEqual(first.sources.stamps[record], assignment.file_stamp(record))
+                self.assertEqual(assignment.read_actions(remote=False).value.other_count, "0")
+
+                def failed_scan(path: Path) -> Iterator[Path]:
+                    if path == folder:
+                        raise PermissionError("Rebuild source failed.")
+                    return iterdir(path)
+
+                with patch.object(Path, "iterdir", autospec=True, side_effect=failed_scan):
+                    failed = assignment.read_actions(remote=False)
+                self.assertEqual(failed.value.other_count, "unavailable")
+                self.assertFalse(failed.sources.complete)
+
+    def test_linux_checks_the_rebuild_deadline_with_a_busy_summary_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / "statusline.conf"
+            _ = config.write_text(fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"))
+            seed_rebuild_cache(home, config)
+            state = home / ".local/state/showrunner"
+            environment = {"HOME": directory, "STAFF_FILE": os.devnull, "STATUSLINE_SYSTEM": "Linux"}
+            read = for_you.read_for_status_line
+            with (file_lock.exclusive(state / "statusline-summary-v4.lock"),
+                  patch.dict(os.environ, environment, clear=True),
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
+                  patch.object(sys, "argv", ["assignment.py", "-r"]),
+                  patch.object(sys, "stdin", io.StringIO("{}")),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+                  patch.object(time, "time", return_value=0) as clock,
+                  patch.object(subprocess, "Popen") as refresh,
+                  patch.object(os, "execvp") as render):
+                def read_actions(path: Path, *, include_reasons: bool = False,
+                                 watch: need.SourceWatch | None = None) -> for_you.ForYouSnapshot:
+                    self.assertIsNotNone(watch)
+                    snapshot = read(path, include_reasons=include_reasons, watch=watch)
+                    self.assertFalse(snapshot.comparison_refresh_due)
+                    clock.return_value = 9999999999
+                    return snapshot
+
+                with patch.object(for_you, "read_for_status_line", side_effect=read_actions):
+                    assignment.main()
+            arguments = cast(list[str], render.call_args.args[1])
+            self.assertEqual(arguments[arguments.index("for_you") + 1], "unavailable")
+            refresh.assert_called_once()
+            self.assertEqual(refresh.call_args.args[0][-3:], ["refresh", "--config", str(config)])
+
+    def test_summary_checks_config_changes_during_cache_path_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config, old, new = (home / name for name in ("statusline.conf", "old", "new"))
+            record = home / "staff.json"
+            _ = record.write_text(staff_text(OWNER), encoding="utf-8")
+            _ = config.write_text(fixture_rebuild_settings(str(old)), encoding="utf-8")
+            seed_rebuild_cache(home, config, cache=old)
+            cache_path = rebuild_row.cache_path
+
+            def move_cache(path: Path) -> Path:
+                current = cache_path(path)
+                if current == old:
+                    _ = config.write_text(fixture_rebuild_settings(str(new)), encoding="utf-8")
+                    seed_rebuild_cache(home, config, cache=new)
+                return current
+
+            with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": str(record),
+                                         "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home))}, clear=True),
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER,))),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+                  patch.object(rebuild_row, "cache_path", side_effect=move_cache)):
+                first = assignment.read_actions(remote=False)
+                self.assertTrue(first.value.refresh_due)
+                self.assertEqual(first.value.other_count, "unavailable")
+                self.assertNotEqual(first.sources.stamps[config], assignment.file_stamp(config))
+                self.assertEqual(assignment.read_actions(remote=False).value.other_count, "0")
+                _ = new.write_text("\n0\n", encoding="utf-8")
+                self.assertTrue(assignment.read_actions(remote=False).value.refresh_due)
+
+    def test_summary_does_not_publish_without_a_comparison_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config, cache, record = (home / name for name in ("statusline.conf", "comparison", "staff.json"))
+            _ = config.write_text(fixture_rebuild_settings(str(cache)), encoding="utf-8")
+            _ = record.write_text(staff_text(OWNER), encoding="utf-8")
+            seed_rebuild_cache(home, config, cache=cache)
+            state = home / ".local/state/showrunner"
+            cache_path = rebuild_row.cache_path
+            failed = False
+
+            def read_comparison_path(path: Path) -> Path:
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    raise OSError("Temporary read failure")
+                return cache_path(path)
+
+            with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": str(record),
+                                         "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home))}, clear=True),
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER,))),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+                  patch.object(rebuild_row, "cache_path", side_effect=read_comparison_path)):
+                target = state / "session-fields"
+                first = assignment.read_actions(remote=False)
+                self.assertFalse(first.sources.complete)
+                assignment.publish_render(target, "fixture", {"for_you": first.value.other_count}, first.sources)
+                self.assertFalse(target.exists())
+                second = assignment.read_actions(remote=False)
+                self.assertEqual(second.value.other_count, "0")
+                self.assertTrue(second.sources.complete)
+                self.assertEqual(second.sources.deadline, 9999999999)
+                _ = cache.write_text("\n0\n", encoding="utf-8")
+                self.assertTrue(assignment.read_actions(remote=False).value.refresh_due)
+
+    def test_invalid_cached_summary_uses_the_current_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / "statusline.conf"
+            record = home / "staff.json"
+            _ = config.write_text(fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"), encoding="utf-8")
+            _ = record.write_text(staff_text(OWNER), encoding="utf-8")
+            seed_rebuild_cache(home, config)
+            state = home / ".local/state/showrunner"
+            old = state / "statusline-summary-v4"
+            _ = old.write_text('{"other_actions":"9"}\n9999999999\n', encoding="utf-8")
+            with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": str(record),
+                                         "FOR_YOU_ACTIONS_DIR": str(fixture_actions(home))}, clear=True),
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER,))),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+                  patch.object(sys, "stdin", io.StringIO("{}")),
+                  patch.object(subprocess, "Popen"),
+                  patch.object(os, "execvp") as render):
+                assignment.render_status(remote=False)
+            arguments = cast(list[str], render.call_args.args[1])
+            self.assertEqual(arguments[arguments.index("for_you") + 1], "0")
+            self.assertEqual(old.read_text(encoding="utf-8"), '{"other_actions":"9"}\n9999999999\n')
+
+    def render_for_you_fixture(self, home: Path, config: Path, record: Path) -> tuple[str, str]:
+        with (patch.dict(os.environ, {"HOME": str(home), "STAFF_FILE": str(record),
+                                     "STATUSLINE_RENDER_KEY": "fixture"}, clear=True),
+              patch.object(sys, "argv", ["assignment.py", "-r"]),
+              patch.object(sys, "stdin", io.StringIO("{}")),
+              patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+              patch.object(os, "execvp") as render):
+            assignment.render_status(remote=False)
+        arguments = cast(list[str], render.call_args.args[1])
+        return arguments[arguments.index("for_you") + 1], arguments[arguments.index("rebuild") + 1]
+
+    def test_linux_only_caches_recorder_absence_that_the_watcher_saw(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config, record = home / "statusline.conf", home / "staff.json"
+            _ = config.write_text(fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"))
+            _ = record.write_text(staff_text(replace(OWNER, run=staff.OpenRun(home))))
+            state = home / recorder_state.STATE_FILENAME
+            cache = home / ".local/state/showrunner/counts/statusline-render-v2/s-"
+            seed_rebuild_cache(home, config)
+            with patch.dict(os.environ, {"HOME": directory}, clear=True):
+                need.add_need("mac", "a" * 40, "Rebuild", OWNER.id)
+            self.assertEqual(self.render_for_you_fixture(home, config, record), ("0", "rebuild mac: Rebuild"))
+            cache.unlink()
+            _ = state.write_text('{"open_phases":[]}', encoding="utf-8")
+            stamp = assignment.file_stamp(state)
+            read_text = Path.read_text
+
+            def missing_state(path: Path, *args: str, **kwargs: str) -> str:
+                if path == state:
+                    raise FileNotFoundError(str(path))
+                return read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", autospec=True, side_effect=missing_state):
+                self.assertEqual(self.render_for_you_fixture(home, config, record), ("unavailable", "rebuild mac: Rebuild"))
+            self.assertEqual(assignment.file_stamp(state), stamp)
+            self.assertFalse(cache.exists())
+
+    def test_linux_keeps_other_rebuilds_and_actions_when_a_pending_need_moves(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config, record = home / "statusline.conf", home / "staff.json"
+            _ = config.write_text(fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"))
+            _ = record.write_text(staff_text(OWNER))
+            seed_rebuild_cache(home, config, "rebuild mac")
+            with patch.dict(os.environ, {"HOME": directory}, clear=True):
+                need.add_need("mac", "a" * 40, "Rebuild", "Fixture")
+                need.add_need("natedev", "b" * 40, "Rebuild", "Fixture")
+                missing = need.needs_folder() / ("mac-" + "a" * 40 + ".json")
+                _ = ActionStore().add(title="Restore access", command="echo ok", machine="mac", cwd="/fixture",
+                                      requested_by="show", reason="Login", waits="Release", concerns="Console",
+                                      dedupe_key="login")
+            read_text = Path.read_text
+
+            def moved_need(path: Path, *args: str, **kwargs: str) -> str:
+                if path == missing:
+                    raise FileNotFoundError(str(path))
+                return read_text(path, *args, **kwargs)
+
+            with patch.object(Path, "read_text", autospec=True, side_effect=moved_need):
+                self.assertEqual(self.render_for_you_fixture(home, config, record),
+                                 ("1", "rebuild natedev: Rebuild, rebuild mac: " + rebuild_row.CHANGES_NOT_READ))
+            cache = home / ".local/state/showrunner/counts/statusline-render-v2/s-"
+            self.assertFalse(cache.exists())
+
+    def test_linux_does_not_publish_when_the_unit_review_refresh_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config, record = home / "statusline.conf", home / "staff.json"
+            _ = config.write_text(fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"))
+            _ = record.write_text(staff_text(OWNER, UNIT))
+            seed_rebuild_cache(home, config)
+            state = home / ".local/state/showrunner"
+            with (patch.dict(os.environ, {"HOME": directory, "STAFF_FILE": str(record),
+                                         "STATUSLINE_RENDER_KEY": "fixture"}, clear=True),
+                  patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", directory]),
+                  patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": UNIT.id}))),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER, UNIT))),
+                  patch.object(counts_row, "write_unit", side_effect=RuntimeError("Review source failed")) as refresh,
+                  patch.object(os, "execvp")):
+                assignment.render_status(remote=False)
+            refresh.assert_called_once_with(UNIT.id)
+            self.assertEqual(list(state.glob(f"counts/statusline-render-v*/s-{UNIT.id}")), [])
+
+    def test_linux_renders_when_the_action_folder_has_an_unknown_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            config = home / "statusline.conf"
+            record = home / "staff.json"
+            _ = record.write_text(staff_text(OWNER), encoding="utf-8")
+            _ = config.write_text(fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"), encoding="utf-8")
+            seed_rebuild_cache(home, config)
+            environment = {"HOME": directory, "STAFF_FILE": str(record), "STATUSLINE_SYSTEM": "Linux",
+                           "FOR_YOU_ACTIONS_DIR": "~fixture-unknown-statusline-user/actions"}
+
+            with (patch.dict(os.environ, environment, clear=True),
+                  patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((OWNER,))),
+                  patch.dict(os.environ, {"CONF_DIR": str(config.parent)}),
+                  patch.object(sys, "argv", ["assignment.py", "-r"]),
+                  patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": OWNER.current_session}))),
+                  patch.object(os, "execvp") as render):
+                assignment.main()
+            render.assert_called_once()
+            args = cast(list[str], render.call_args.args[1])
+            self.assertEqual(args[args.index("assignment") + 1], "show showrunner")
+            self.assertEqual(args[args.index("for_you") + 1], "unavailable")
 
     def test_review_and_for_you_show_separate_rows_with_both_rebuilds(self) -> None:
         rebuilds = rebuild_row.rebuild_names(("natedev", "mac", "natedev"))
@@ -629,6 +918,8 @@ class ForYouStatusTests(unittest.TestCase):
     def test_rebuild_and_other_action_share_the_for_you_row(self) -> None:
         lines = status_lines({}, for_you="1", rebuild="rebuild natedev")
         self.assertIn("For you: rebuild natedev, \x1b[1m1\x1b[22m action", lines)
+        partial = status_lines({}, for_you="1+", rebuild="rebuild natedev")
+        self.assertIn("For you: rebuild natedev, \x1b[1m1+\x1b[22m actions", partial)
 
     def test_global_actions_do_not_depend_on_the_session(self) -> None:
         for identity in ("", "sid", "another-session"):
@@ -924,7 +1215,7 @@ class RoleTests(ConfiguredShellTests):
         read_log = {"CONF_READ_LOG": os.environ["CONF_READ_LOG"]} if "CONF_READ_LOG" in os.environ else {}
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home),
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
-               "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf"), **read_log, **marks}
+               **read_log, **marks}
         command = command or self.shell_command
         result = subprocess.run(
             [shell, "-c", command], input=json.dumps(payload), capture_output=True, text=True,
@@ -943,6 +1234,173 @@ class RoleTests(ConfiguredShellTests):
                     lines = self.command_lines({"session_id": identity}, shell=shell)
                     self.assertIn("For you: 1 action", [ANSI.sub("", line) for line in lines])
 
+    def cache_shell(self, current_dir: Path | None = None) -> Callable[[str, str], str]:
+        record = self.write_staff(OWNER, UNIT, WORKER)
+        state = self.home / ".local/state/showrunner"
+        self.seed_empty_counts(record, state)
+        _ = (state / "counts" / UNIT.id).write_text(
+            f"Review: 2 questions\n9999999999\nsource=unit:{UNIT.id}\n", encoding="utf-8")
+        self.timer(f"showrunner-{OWNER.id}", f"session:{OWNER.current_session}")
+        _ = (state / "counts" / OWNER.id).write_text("Review: 3 proposals\n9999999999\n", encoding="utf-8")
+        seed_rebuild_cache(self.home, self.runtime / "config/statusline.conf", "rebuild mac")
+        (self.home / ".git").mkdir()
+        _ = (self.home / ".git/HEAD").write_text("ref: refs/heads/cached-branch\n", encoding="utf-8")
+        adhoc = self.home / ".local/state/adhoc_review"
+        adhoc.mkdir(parents=True)
+        _ = (adhoc / WORKER.id).write_text("2", encoding="utf-8")
+        launcher = self.home / "python-fixture"
+        _ = launcher.write_text(
+            f'#!/bin/sh\nprintf "Python\\n" >> "$HOME/python-invocations"\nexec {shlex.quote(sys.executable)} "$@"\n',
+            encoding="utf-8")
+        launcher.chmod(0o700)
+        seed_interpreter_cache(self.home / ".cache", launcher)
+        environment = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home),
+                       "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home))}
+
+        def render(session_id: str, shell: str) -> str:
+            payload = {"session_id": session_id}
+            if current_dir is not None:
+                payload["cwd"] = str(current_dir)
+            result = subprocess.run([shell, "-c", self.shell_command],
+                                    input=json.dumps(payload, indent=2), capture_output=True,
+                                    text=True, check=True, env=environment, cwd=self.home)
+            self.assertEqual(result.stderr, "")
+            return result.stdout
+
+        return render
+
+    def test_shell_reuses_each_role_without_starting_python(self) -> None:
+        render = self.cache_shell()
+        with patch.dict(os.environ, {"HOME": str(self.home)}, clear=True):
+            need.add_need("natedev", "a" * 40, "Fixture need", "Fixture")
+        launches = self.home / "python-invocations"
+        for index, (session, hint) in enumerate(
+                ((UNIT.id, "cached-branch"), (WORKER.id, "adhoc items"), (OWNER.id, "proposals")), 1):
+            expected = render(session, "/bin/sh")
+            self.assertIn(hint, ANSI.sub("", expected))
+            self.assertIn("For you: rebuild natedev: Fixture need, rebuild mac: " + rebuild_row.CHANGES_NOT_READ,
+                          ANSI.sub("", expected))
+            for shell in SHELLS:
+                with self.subTest(session=session, shell=shell):
+                    self.assertEqual(render(session, shell), expected)
+                    self.assertEqual(len(launches.read_text(encoding="utf-8").splitlines()), index)
+
+    def saved_render(self) -> Path:
+        cache, = (self.home / ".local/state/showrunner/counts").glob(f"statusline-render-v*/s-{UNIT.id}")
+        return cache
+
+    def test_shell_rejects_an_incomplete_source_record(self) -> None:
+        render = self.cache_shell()
+        expected = render(UNIT.id, "/bin/sh")
+        cache = self.saved_render()
+        valid = cache.read_text(encoding="utf-8").splitlines(keepends=True)
+        for index, bad in enumerate((
+                valid + [str(self.home / "partial-source")], valid[:-1], [*valid[:2], "0\n", valid[3]]), 2):
+            _ = cache.write_text("".join(bad), encoding="utf-8")
+            self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+            self.assertEqual(len((self.home / "python-invocations").read_text().splitlines()), index)
+
+    def test_shell_rejects_invalid_render_fields_and_deadlines(self) -> None:
+        render = self.cache_shell()
+        expected = render(UNIT.id, "/bin/sh")
+        cache = self.saved_render()
+        valid = cache.read_text(encoding="utf-8").splitlines()
+        for index, defect in enumerate(("count", "nul", "deadline", "missing deadline"), 2):
+            with self.subTest(defect=defect):
+                lines = valid.copy()
+                if defect == "deadline":
+                    lines[1] = "+9999999999"
+                elif defect == "missing deadline":
+                    lines[1] = ""
+                else:
+                    field, value = ("for_you", "1\n") if defect == "count" else ("branch", "other\0branch")
+                    fields = cast(dict[str, str], json.loads(lines[3]))
+                    fields[field] = value
+                    lines[3] = json.dumps(fields)
+                _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+                self.assertEqual(len((self.home / "python-invocations").read_text().splitlines()), index)
+        fields = cast(dict[str, str], json.loads(valid[3]))
+        fields["branch"] = "invalid\0branch"
+        sources = assignment.RenderSources()
+        sources.watch(cache)
+        sources.deadline = 9999999999
+        target = cache.with_name("nul")
+        assignment.publish_render(target, "fixture", fields, sources)
+        self.assertFalse(target.exists())
+
+    def test_shell_rejects_a_saved_partial_action_count(self) -> None:
+        render = self.cache_shell()
+        expected = render(UNIT.id, "/bin/sh")
+        cache = self.saved_render()
+        lines = cache.read_text(encoding="utf-8").splitlines()
+        fields = cast(dict[str, str], json.loads(lines[3]))
+        count = fields["for_you"]
+        fields["for_you"] = "1+"
+        lines[3] = json.dumps(fields)
+        _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+        launches = self.home / "python-invocations"
+        self.assertEqual(len(launches.read_text(encoding="utf-8").splitlines()), 2)
+        refreshed = cast(dict[str, str], json.loads(cache.read_text(encoding="utf-8").splitlines()[3]))
+        self.assertEqual(refreshed["for_you"], count)
+
+    def test_shell_invalidates_the_cache_when_a_reader_changes(self) -> None:
+        render = self.cache_shell()
+        expected = render(UNIT.id, "/bin/sh")
+        reader = self.runtime / "scripts/statusline/rebuild_row.py"
+        original = reader.read_bytes()
+        try:
+            _ = reader.write_bytes(original + b"\n# Fixture change.\n")
+            self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+            self.assertEqual(len((self.home / "python-invocations").read_text().splitlines()), 2)
+        finally:
+            _ = reader.write_bytes(original)
+
+    def test_shell_uses_python_when_the_saved_render_cannot_be_reused(self) -> None:
+        render = self.cache_shell()
+        state = self.home / ".local/state/showrunner"
+        launches = self.home / "python-invocations"
+        expected = render(UNIT.id, "/bin/sh")
+        cache = self.saved_render()
+        for index, reason in enumerate(
+                ("missing", "deadline", "invalid", "comparison", "actions", "review", "branch", "adhoc"), 2):
+            with self.subTest(reason=reason):
+                lines = cache.read_text(encoding="utf-8").splitlines()
+                if reason == "missing":
+                    cache.unlink()
+                elif reason in ("deadline", "invalid"):
+                    if reason == "deadline":
+                        lines[1] = "1"
+                    else:
+                        lines[3] = "null"
+                    _ = cache.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                elif reason == "comparison":
+                    comparison = state / "rebuilds"
+                    _ = comparison.write_bytes(comparison.read_bytes())
+                elif reason == "actions":
+                    _ = ActionStore(fixture_actions(self.home)).add(
+                        title="Restore access", command="echo ok", machine="mac", cwd="/fixture",
+                        requested_by="sdlc", reason="Login", waits="Release", concerns="console", dedupe_key="access")
+                elif reason == "review":
+                    _ = (state / "counts" / UNIT.id).write_text(
+                        f"Review: 5 proposals\n9999999999\nsource=unit:{UNIT.id}\n", encoding="utf-8")
+                elif reason == "branch":
+                    _ = (self.home / ".git/HEAD").write_text("ref: refs/heads/updated-branch\n", encoding="utf-8")
+                else:
+                    _ = (self.home / ".local/state/adhoc_review" / UNIT.id).write_text("1", encoding="utf-8")
+                actual = render(UNIT.id, "/bin/sh")
+                if reason in ("missing", "deadline", "invalid", "comparison"):
+                    self.assertEqual(actual, expected)
+                else:
+                    hints = {"actions": "1 action", "review": "5 proposals",
+                             "branch": "updated-branch", "adhoc": "1 adhoc item"}
+                    self.assertIn(hints[reason], ANSI.sub("", actual))
+                    expected = actual
+                self.assertEqual(render(UNIT.id, "/bin/sh"), expected)
+                self.assertEqual(len(launches.read_text(encoding="utf-8").splitlines()), index)
+
     def test_review_without_a_production_shows_only_its_own_adhoc_count_in_each_shell(self) -> None:
         path = self.home / ".local/state/adhoc_review/review-session"
         path.parent.mkdir(parents=True)
@@ -955,22 +1413,47 @@ class RoleTests(ConfiguredShellTests):
                     other = self.command_lines({"session_id": identity}, shell=shell)
                     self.assertNotIn("Review:", "\n".join(other))
 
+    def test_shell_rejects_a_cached_branch_when_a_parent_git_link_appears(self) -> None:
+        parent = self.home / "parent"
+        folder = parent / "project"
+        folder.mkdir(parents=True)
+        render = self.cache_shell(folder)
+        before = render(UNIT.id, "/bin/sh")
+        self.assertIn("cached-branch", before)
+        launches = self.home / "python-invocations"
+        self.assertEqual(render(UNIT.id, "/bin/sh"), before)
+        self.assertEqual(len(launches.read_text(encoding="utf-8").splitlines()), 1)
+        (parent / ".git").symlink_to("missing")
+        self.assertNotIn("cached-branch", render(UNIT.id, "/bin/sh"))
+        self.assertEqual(len(launches.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_shell_sends_the_original_payload_for_a_session_id_with_a_newline(self) -> None:
+        _ = self.cache_shell()
+        launcher = self.home / "python-fixture"
+        _ = launcher.write_text('#!/bin/sh\n[ -z "$STATUSLINE_RENDER_KEY" ] || exit 1\nexec cat\n', encoding="utf-8")
+        payload = json.dumps({"session_id": UNIT.id + "\n", "cwd": str(self.home)}, indent=2) + "\n\n"
+        environment = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home)}
+        result = subprocess.run(["/bin/sh", "-c", self.shell_command], input=payload, capture_output=True,
+                                text=True, check=True, env=environment, cwd=self.home)
+        self.assertEqual(result.stdout, payload)
+
     def test_reset_times_take_the_zone_from_the_setting_and_its_label(self) -> None:
         reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())
         payload = limits({"used_percentage": 95, "resets_at": reset}, {"used_percentage": 60})
-        conf = self.home / "override-zone.conf"
-        _ = conf.write_text("# the user's zone\nzone=America/Curacao\n", encoding="utf-8")
+        configuration = self.home / "override-config"
+        _ = write_config_fixture(configuration / "user_zone.conf", "zone=America/Curacao\n")
+        _ = fixture_colors(configuration / "statusline.conf")
         reads = self.home / "config-reads"
         for shell in (*SHELLS, shutil.which("dash")):
             with self.subTest(shell=shell or "dash unavailable"):
                 if shell is None:
                     self.skipTest("dash is not on PATH")
                 _ = reads.write_text("")
-                line = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf), CONF_READ_LOG=str(reads))[1]
+                line = self.command_lines(payload, shell=shell, CONF_DIR=str(configuration), CONF_READ_LOG=str(reads))[1]
                 self.assertIn("5-hour \x1b[91m5% left\x1b[0m until 08:00 AST", line)
                 self.assertIn("statusline", reads.read_text().splitlines())
-                self.assertIn(conf.stem, reads.read_text().splitlines())
-                pinned = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf),
+                self.assertIn("user_zone", reads.read_text().splitlines())
+                pinned = self.command_lines(payload, shell=shell, CONF_DIR=str(configuration),
                                             USER_ZONE="Europe/Paris")[1]
                 self.assertIn("until 13:00 CET", pinned)
 
@@ -1310,14 +1793,17 @@ class CountsRowTests(ConfiguredShellTests):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.configuration = self.home / "counts-config"
         self.configure_review_sources(self.configuration)
-        _ = (self.configuration / "statusline.conf").write_text(
-            "# whole: 1..\ncounts.retry_seconds=7\n", encoding="utf-8")
+        statusline = fixture_colors(self.configuration / "statusline.conf")
+        _ = write_config_fixture(statusline, "# whole: 1..\ncounts.retry_seconds=7\n"
+                                 + fixture_rebuild_settings("~/.local/state/showrunner/rebuilds"))
+        _ = write_config_fixture(self.configuration / "user_zone.conf", f"zone={USER_ZONE.key}\n")
         environment = {"CONF_DIR": str(self.configuration), "USER_ZONE": USER_ZONE.key}
         _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
-        seed_rebuild_cache(self.home, self.runtime / "config/statusline.conf")
+        seed_rebuild_cache(self.home, statusline)
         doc = self.home / "docs/plans/show-production.md"
         doc.parent.mkdir(parents=True)
         self.ledger = self.home / "ledger.md"
@@ -1357,8 +1843,7 @@ class CountsRowTests(ConfiguredShellTests):
     def lines(self, session_id: str = OWNER.id, shell: str = "/bin/sh") -> list[str]:
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
-               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
-               "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
+               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration)}
         result = subprocess.run([shell, "-c", self.shell_command], input=json.dumps({"session_id": session_id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         return [ANSI.sub("", line) for line in result.stdout.splitlines()]
@@ -1397,8 +1882,7 @@ class CountsRowTests(ConfiguredShellTests):
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
         env = {**SHELL_ENVIRONMENT, "PATH": os.environ["PATH"], "HOME": str(self.home), "STAFF_ID": OWNER.id, "HERDR_BIN": MISSING_HERDR_BIN,
                "FOR_YOU_ACTIONS_DIR": str(fixture_actions(self.home)),
-               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration),
-               "USER_ZONE_CONF": str(self.runtime / "config/user_zone.conf")}
+               "STAFF_FILE": str(self.home / ".local/state/staff/staff.json"), "CONF_DIR": str(self.configuration)}
         result = subprocess.run(["/bin/sh", "-c", self.shell_command], input=json.dumps({"session_id": OWNER.id}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         self.assertEqual(result.stdout.splitlines()[-1],
@@ -1615,7 +2099,6 @@ class CountsRowTests(ConfiguredShellTests):
                        "NOTIFIER_STATE_DIR": str(self.home / ".local/state/notifier"),
                        "SHOWRUNNER_STATE_DIR": str(self.home / ".local/state/showrunner")}
         with patch.dict(os.environ, environment), \
-                patch.object(rebuild_row, "DEFAULT_CONFIG", self.runtime / "config/statusline.conf"), \
                 patch.object(pane_record, "RECORD_DIR", self.home / "pane-records"), \
                 patch.object(counts_row, "write", wraps=counts_row.write) as refresh, \
                 patch.object(os, "execvp") as render, \
@@ -1623,13 +2106,16 @@ class CountsRowTests(ConfiguredShellTests):
             for reading in ("first", "cached"):
                 with self.subTest(reading=reading), \
                         patch.object(sys, "stdin", io.StringIO(json.dumps({"session_id": OWNER.current_session}))), \
-                        patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", str(self.home)]):
+                        patch.object(sys, "argv", ["assignment.py", "--arg", "pwd", str(self.home)]), \
+                        patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
                     assignment.main()
                     arguments = cast(list[str], render.call_args.args[1])
                     position = arguments.index("counts")
                     self.assertEqual(arguments[position + 1], f"{OWNER.current_session} Review: 1 question\n")
                     self.assertEqual(refresh.call_count, 1)
                     child.assert_not_called()
+                    if reading == "cached":
+                        self.assertEqual(sum(call.args[0] == self.cache for call in opened.call_args_list), 1)
                     for path in self.cache.read_text(encoding="utf-8").splitlines()[2:]:
                         self.assertTrue(Path(path).is_relative_to(self.home), path)
 
@@ -2107,17 +2593,23 @@ class CountsRowTests(ConfiguredShellTests):
                   ("wrapped status", staff.LiveDoc(remote.local_machine(), doc), doc))
         environment = {"HOME": str(self.home), "STAFF_FILE": str(record), "CONF_DIR": str(config),
                        "SHOWRUNNER_STATE_DIR": str(self.cache.parent.parent)}
+        self.cache.parent.mkdir()
+        read_started = 10**18
+        source_time = read_started - 10**9
         for name, location, watched in states:
             with self.subTest(state=name):
                 _ = record.write_text(staff_text(replace(OWNER, doc=location)), encoding="utf-8")
-                with patch.dict(os.environ, environment):
+                expected = {instance / "conf", record, self.cache.parent.parent}
+                if watched is not None:
+                    expected.add(watched)
+                # Put the first shell render after the count read, even on a coarse clock.
+                for path in expected:
+                    os.utime(path, ns=(source_time, source_time))
+                with patch.dict(os.environ, environment), patch.object(time, "time_ns", return_value=read_started):
                     cache = counts_row.write(instance)
                 line, due, *sources = cache.read_text(encoding="utf-8").splitlines()
                 self.assertEqual((line, due), ("", ""))
-                expected = {str(instance / "conf"), str(record), str(self.cache.parent.parent)}
-                if watched is not None:
-                    expected.add(str(watched))
-                self.assertEqual(set(sources), expected)
+                self.assertEqual(set(sources), {str(path) for path in expected})
                 built = cache.stat().st_mtime_ns
                 self.assertFalse(any(line.startswith("Review:") for line in self.lines()))
                 self.assertEqual(cache.stat().st_mtime_ns, built)
@@ -2221,17 +2713,25 @@ class RebuildRowTests(unittest.TestCase):
 
     def test_settings_read_values_at_use(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "statusline.conf"
+            root = Path(directory)
+            default = root / "statusline.conf"
+            path = root / "explicit.conf"
+            reads = root / "reads"
             text = ("rebuild.repo=/custom/repo\nrebuild.ref=custom\nrebuild.natedev=linux\n"
                     + "rebuild.mac=darwin\nrebuild.ssh=remote\nrebuild.interval=17\nrebuild.eval_timeout=41\nrebuild.eval_retry_seconds=301\n")
-            _ = path.write_text(text, encoding="utf-8")
-            settings = rebuild_row.RebuildSettings.read(path)
-            self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17, 41, 301))
-            _ = path.write_text(text.replace("interval=17", "interval=29").replace("eval_timeout=41", "eval_timeout=73")
-                                .replace("eval_retry_seconds=301", "eval_retry_seconds=503"), encoding="utf-8")
-            self.assertEqual(rebuild_row.RebuildSettings.read(path).interval, 29)
-            self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_timeout, 73)
-            self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_retry_seconds, 503)
+            _ = write_config_fixture(default, text.replace("interval=17", "interval=34"))
+            _ = write_config_fixture(path, text, template="statusline")
+            with patch.dict(os.environ, {"CONF_DIR": str(root)}), conf_reads.record_reads(reads):
+                self.assertEqual(rebuild_row.RebuildSettings.read().interval, 34)
+                settings = rebuild_row.RebuildSettings.read(path)
+                self.assertEqual(settings, rebuild_row.RebuildSettings(Path("/custom/repo"), "custom", "linux", "darwin", "remote", 17, 41, 301))
+                _ = write_config_fixture(path, "rebuild.interval=29\nrebuild.eval_timeout=73\nrebuild.eval_retry_seconds=503\n",
+                                         template="statusline")
+                self.assertEqual(rebuild_row.RebuildSettings.read(path).interval, 29)
+                self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_timeout, 73)
+                self.assertEqual(rebuild_row.RebuildSettings.read(path).eval_retry_seconds, 503)
+            self.assertIn("statusline", reads.read_text().splitlines())
+            self.assertIn("explicit", reads.read_text().splitlines())
 
     def test_cache_stores_the_last_evaluation_and_clears_after_rebuild(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2308,17 +2808,24 @@ class RebuildRowTests(unittest.TestCase):
                                   + "rebuild.generations=~/.local/state/rebuild/generations.log\n", encoding="utf-8")
             switched = {"natedev": "a" * 40, "mac": "b" * 40}
             # The running natedev system is the earlier switch, so a later switch to another system is not the base.
-            logs = {"natedev": f"/nix/store/x\nt switch system-1-link {'a' * 40}-dirty /nix/store/x\n"
-                               + f"t switch system-2-link {'c' * 40} /nix/store/y",
-                    "mac": f"/nix/store/m\nt switch system-9-link {'b' * 40} /nix/store/m"}
+            def switch(path: str, generation: int, revision: str) -> str:
+                return (f"/nix/store/{path}\nactivated 2026-11-19T13:00:00Z 100\n"
+                        f"generation system-{generation}-link 2026-11-19T12:59:59Z 101\n--- generations ---\n"
+                        f"2026-11-19T13:00:01Z switch system-{generation}-link {revision} /nix/store/{path}")
+
+            logs = {"natedev": switch("x", 1, switched["natedev"] + "-dirty")
+                               + f"\n2026-11-19T13:00:02Z switch system-2-link {'c' * 40} /nix/store/x",
+                    "mac": switch("m", 9, switched["mac"])}
             commands: list[list[str]] = []
             mac_reachable = True
 
             def run(command: list[str], *, timeout: int = 30) -> str:
                 commands.append(command)
                 if command[0] == "sh":
-                    self.assertEqual(command[2], "realpath /run/current-system && tail -n 200 "
-                                     + "~/.local/state/rebuild/generations.log")
+                    self.assertIn("current=/run/current-system", command[2])
+                    self.assertIn('realpath "$current"', command[2])
+                    self.assertIn('cat "$running/configuration-revision"', command[2])
+                    self.assertIn('tail -n 200 "$HOME"/.local/state/rebuild/generations.log', command[2])
                     return logs["natedev"]
                 if command[0] == "ssh":
                     return logs["mac"] if mac_reachable else ""
@@ -2334,7 +2841,8 @@ class RebuildRowTests(unittest.TestCase):
                         + "https://claude.ai/code/session_01Abc\n"
                         + f"{'e' * 40}\x1f2026-11-15T01:09:21-05:00\x1fby hand\x1f")
 
-            with patch("scripts.message.session_records.config_dirs", return_value=[root / ".claude"]):
+            with (patch("scripts.message.session_records.config_dirs", return_value=[root / ".claude"]),
+                  patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(root / "needs")})):
                 rebuild_row.write_changes(config, run)
                 wrote = [rebuild_row.Change("d" * 40, "2026-11-15T08:45:08-05:00", "memory: THP defrag defer", "96b016bf"),
                          rebuild_row.Change("e" * 40, "2026-11-15T01:09:21-05:00", "by hand", "")]
@@ -2345,12 +2853,11 @@ class RebuildRowTests(unittest.TestCase):
                 commands.clear()
                 mac_reachable = False
                 switched["natedev"] = "c" * 40
-                logs["natedev"] = f"/nix/store/y\nt switch system-2-link {'c' * 40} /nix/store/y"
+                logs["natedev"] = switch("y", 2, switched["natedev"])
                 rebuild_row.write_changes(config, run)
                 # The session map is kept, and a Mac that does not answer keeps its last list.
                 self.assertFalse(any(command[0] == "rg" for command in commands))
                 self.assertEqual(rebuild_row.read_changes(config)["mac"], tuple(wrote))
-                self.assertEqual(rebuild_row.switched_commit("", "/nix/store/x"), "")
 
     def test_read_command_prints_both_one_or_no_machines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2410,8 +2917,9 @@ class RebuildRowTests(unittest.TestCase):
                 commands.append(command)
                 self.assertEqual(timeout, 47 if command[0] == "nix" else 30)
                 if command[0] == "git":
-                    self.assertEqual(command, ["git", "-C", "/test/nixos", "rev-parse", "--verify", "main^{commit}"])
-                    return commit
+                    self.assertEqual(command, ["git", "-C", "/test/nixos", "show", "-s", "--format=%H%x00%s",
+                                               "--end-of-options", "main^{commit}"])
+                    return commit + "\0Update the settings"
                 if command[0] == "nix":
                     self.assertIn(f"?rev={commit}", command[-1])
                     self.assertIn('nixosConfigurations."natedev"', command[-1])
@@ -2556,7 +3064,13 @@ class RebuildRowTests(unittest.TestCase):
                     with self.assertRaises(RecursionError):
                         _ = ActionStore(actions).list()
                 elif source == "needs":
-                    (home / ".local/state/rebuild/needs/unreadable.json").mkdir(parents=True)
+                    folder = home / ".local/state/rebuild/needs"
+                    (folder / "unreadable.json").mkdir(parents=True)
+                    with patch.dict(os.environ, {"REBUILD_NEEDS_DIR": str(folder)}):
+                        need.add_need("mac", "a" * 40, "Apply settings.", "fixture")
+                    _ = ActionStore(actions).add(title="Check the build", command="check", machine="mac",
+                                                 cwd="/fixture", requested_by="fixture", reason="Read the result.",
+                                                 waits="Build", concerns="fixture", dedupe_key="check")
                 for shell in SHELLS:
                     with self.subTest(shell=shell, source=source):
                         result = subprocess.run([shell, "-c", command], input="{}", capture_output=True, text=True,
@@ -2564,8 +3078,11 @@ class RebuildRowTests(unittest.TestCase):
                                                                  "FOR_YOU_ACTIONS_DIR": str(actions),
                                                                  "PATH": os.environ["PATH"],
                                                                  "STAFF_FILE": str(staff_file)}, cwd=home)
-                        expected = "For you: rebuild natedev" if source == "ready" else "For you: rebuild natedev, Unavailable"
-                        self.assertEqual(result.stdout.splitlines()[-1], expected)
+                        comparison = "For you: rebuild natedev: " + rebuild_row.CHANGES_NOT_READ
+                        expected = {"ready": comparison,
+                                    "actions": comparison + ", Unavailable",
+                                    "needs": comparison + ", rebuild mac: Apply settings., 1+ actions"}
+                        self.assertEqual(ANSI.sub("", result.stdout).splitlines()[-1], expected[source])
                         self.assertEqual(result.stderr, "")
                         self.assertEqual(cache.stat().st_mtime_ns, built)
 

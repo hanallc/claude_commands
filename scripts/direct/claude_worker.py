@@ -49,6 +49,7 @@ class PreparedClaudeLaunch:
     model: str
     environment: dict[str, str]
     loaded: nix_env.Loaded | nix_env.NoEnvrc
+    compact_window: tuple[str, ...]
 
 
 class ClaudeLaunchPreparation(Enum):
@@ -156,8 +157,12 @@ def _prepare_launch(turn: ClaudeTurn, environment: dict[str, str]) -> PreparedCl
     if isinstance(loaded, nix_env.Refused):
         print(loaded.reason, file=sys.stderr)
         raise _LaunchFailed(1)
-    model = models_registry.claude_model(turn.model, loaded.env) if turn.model else ""
-    return PreparedClaudeLaunch(model, environment, loaded)
+    configuration = models_registry.optional_launch_snapshot(loaded.env)
+    if isinstance(configuration, models_registry.UnreadableLaunchModelConfiguration):
+        return PreparedClaudeLaunch(turn.model, environment, loaded, ())
+    model = models_registry.claude_model(turn.model, configuration.environment(loaded.env)) if turn.model else ""
+    window = models_registry.compact_window_arguments("worker", configuration=configuration)
+    return PreparedClaudeLaunch(model, environment, loaded, tuple(window))
 
 
 def prepare_launch(turn: ClaudeTurn) -> PreparedClaudeLaunch | NotDelivered:
@@ -188,6 +193,7 @@ def _start(turn: ClaudeTurn, binary: str, environment: dict[str, str],
         arguments += ["--model", prepared.model]
     if turn.effort:
         arguments += ["--effort", turn.effort]
+    arguments += prepared.compact_window
     start_env = models_registry.agent_environment(loaded.env)
     for name in ("UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "MODELS_CONFIG_FILE", "UNIT_RESOLVES_ROUND", "CLAUDE_CODE_CHILD_SESSION"):
         _ = start_env.pop(name, None)
@@ -293,7 +299,7 @@ def open_worker(turn: ClaudeTurn, *,
             binary = _validate(turn, environment)
             allowed = worker_admission.admit(turn.name, turn.run, reference=turn.staff_id)
             request = worker_admission.assignment_id(turn.prompt)
-            register_seconds = conf.read("direct").whole("CLAUDE_WORKER_REGISTER_WAIT_SECS")
+            register_seconds = conf.read("direct").whole("claude_worker_register_wait_secs")
 
             def start(handoff: worker_admission.FamilyHandoff) -> str:
                 nonlocal created, prepared
@@ -405,7 +411,7 @@ def wait_for_turn(turn: ClaudeTurn, delivered: Delivered) -> int:
     """Read native state and logs until the delivered turn finishes."""
     with _environment(replace(turn, env=delivered.launch_environment or turn.env)) as environment:
         binary = _binary(environment)
-        seconds = float(environment.get("UNIT_WORKER_POLL_SECS") or conf.read("direct").text("CLAUDE_WORKER_POLL_SECS"))
+        seconds = float(environment.get("UNIT_WORKER_POLL_SECS") or conf.read("direct").text("claude_worker_poll_secs"))
         identity = delivered.native_id[:8]
         seen_busy = False
         while True:

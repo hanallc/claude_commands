@@ -3,9 +3,14 @@ from __future__ import annotations
 from scripts.lint.memory_test_support import copy_config_fixture, write_config_fixture
 
 from collections import Counter
+from collections.abc import Callable
+from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import html
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
+import io
 import json
 import os
 import re
@@ -14,20 +19,25 @@ import shutil
 import subprocess
 import tempfile
 import time
+import threading
 import unittest
+from types import SimpleNamespace
 from typing import cast, override
-from unittest.mock import patch
+from unittest.mock import ANY, patch
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results
-from scripts.accounts import accounts, next_moves, role_activity, role_map
+from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results, newer_script_reload_results
+from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity, role_map
 from scripts.accounts.home_test_support import scratch_account_home
+from scripts.agents import remote, shutdown_record, stop_resume
 from scripts.agents.test_support import write_machine_config
 from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.review_links import accounts_page, console_theme, new_item_dialog, page_frame, serve
-from scripts.whoami import agent_accounts, quota_state, run_out, usage_store
+from scripts.review_links.server_test_support import started_review_server
+from scripts.whoami import account, agent_accounts, note_file, quota_state, run_out, usage_store
 from scripts.whoami.account_test_support import create_claude_account, stored_room
 
 AT = datetime(2026, 11, 15, 15, tzinfo=timezone.utc)
@@ -35,6 +45,15 @@ ACCOUNT_SETTINGS = "next_move_percent=1\nusage_stale_minutes=10\n"
 PAGE_STATUS_SETTINGS = (
     "status.round_trip_limit_seconds=1\nstatus.render_limit_seconds=1\n"
     + "status.reading_delay_seconds=1\nstatus.accounts.age_limit_seconds=45\n"
+)
+LOGIN_CARD_SETTINGS = (
+    "login_sitting_machine=natedev\nlogin_sitting_first=2026-11-15T07:00:00-08:00\n"
+    "# whole: 1..\nlogin_sitting_interval_days=5\n"
+    "# whole: 1..\nlogin_safety_margin_days=3\n"
+    "# whole: 1..\nlogin_peer_read_minutes=60\n"
+    "# whole: 1..\nlogin_peer_read_timeout_seconds=30\n"
+    "# whole: 1..\nlogin_card.error_days=2\n"
+    "# whole: 1..\nlogin_card.warning_days=6\n"
 )
 
 
@@ -44,6 +63,28 @@ def status_row(label: str) -> accounts.StatusRow:
         roles=("units",), role_counts=(accounts.RoleSessionCounts(1, 0, 0, 0),), weekly_left_percent=60,
         resets_at=AT + timedelta(days=1), credits=0, on_credits="no", use_credits=False, read_at=AT,
         read_outcome=agent_accounts.UsageReadOutcome.OK, attempted_at=AT)
+
+
+def move_progress_fixture() -> moves.MoveProgress:
+    minute = timedelta(minutes=1)
+    return moves.MoveProgress(
+        "d" * 32, "units", "claude1", "", moves.HandMoveSession("brain"), AT,
+        tuple(moves.MoveMemberProgress(moves.MoveMember(key, name), state) for key, name, state in (
+            ("member-1", "lfo", moves.MemberMoved(AT + minute, minute, "start", "claude1")),
+            ("member-2", "praxis", moves.MemberMoveFailed(AT + minute, minute, "Claude gave no prompt in 90 s.",
+                                                        "claude1", stopped=True)),
+            ("member-3", "fastest", moves.MemberMoving(AT + minute, "claude1")),
+            ("member-4", "report", moves.MoveQueued()),
+        )),
+    )
+
+
+def first_moves(*entries: next_moves.NextMove) -> accounts.FirstNextMoveEntries:
+    return accounts.FirstNextMoveEntries({entry.group: entry for entry in entries})
+
+
+def claude_move(group: accounts.ClaudeGroup, label: str) -> next_moves.ClaudeGroupMove:
+    return next_moves.ClaudeGroupMove(f"{group}-fixture", group, 1, 0, label, AT)
 
 
 def sort_reading() -> accounts.StatusReading:
@@ -62,7 +103,7 @@ def sort_reading() -> accounts.StatusReading:
         replace(status_row("codex2"), tool="codex", roles=("spare",), role_counts=(accounts.NoRoleCount(),),
                 weekly_left_percent=accounts.StatusUnavailable("fixture"), resets_at=AT + timedelta(days=2),
                 credits="unlimited", use_credits=True)), (), (), timezone.utc, AT,
-        first_next_moves=accounts.FirstNextMoveTargets({"units": "claude3", "showrunners": "claude1"}))
+        first_next_moves=first_moves(claude_move("units", "claude3"), claude_move("showrunners", "claude1")))
 
 
 def rendered_sort_orders(markup: str, table: str) -> dict[str, list[int]]:
@@ -101,101 +142,323 @@ class ProducerRoleColorTests(unittest.TestCase):
         self.assertNotRegex(body, r'data-color-text="role\.[^"]+"[^>]*>plain-account</span>')
 
 
+class MovesBoardTests(unittest.TestCase):
+    def test_interrupted_moves_show_unfinished_units_as_failures(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        moves.write_move_progress(moves.TrackedMove(move, moves.ClaimOwner(21, "start"), AT))
+        with patch.object(moves, "_claim_owner_is_live", return_value=False):
+            interrupted, = moves.read_move_progress()
+        self.assertFalse(interrupted.active)
+        self.assertEqual(interrupted.members[:2], move.members[:2])
+        failures = [row.state.reason for row in interrupted.members[2:] if isinstance(row.state, moves.MemberMoveFailed)]
+        self.assertEqual(failures, ["The move ended before it recorded a result."] * 2)
+
+    def test_current_move_shows_its_origin_progress_order_and_failures(self) -> None:
+        move = move_progress_fixture()
+        board = accounts_page.moves_board((move,), AT + timedelta(seconds=60), ZoneInfo("America/Los_Angeles"), 75,
+                                         {(move.batch_id, "member-2")})
+        self.assertIn("units → claude1", board)
+        self.assertIn("by hand · brain session · started Sun 07:00 PST", board)
+        self.assertIn('aria-label="1 of 4 moved"', board)
+        self.assertIn("about 1 min left", board)
+        self.assertIn('<span class="next-muted">Now:</span> fastest starts on claude1.', board)
+        self.assertIn('<span class="next-muted">Next:</span> report.', board)
+        self.assertIn("<summary>All 4 units</summary>", board)
+        self.assertIn("praxis did not start on claude1.", board)
+        self.assertIn("The retry did not start. Try again.", board)
+        self.assertNotIn("Claude gave no prompt in 90 s.", board)
+        self.assertIn("praxis is stopped.", board)
+        self.assertIn(f'data-retry-move="{move.batch_id}" data-move-member="member-2">Move praxis again', board)
+        self.assertIn("The move ended it after 1 min 15 s and moved lfo.", board)
+
+    def test_pruning_keeps_unended_batches_and_the_three_newest_end_marks(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        owner = moves.ClaimOwner(21, "gone")
+        unended = moves.TrackedMove(move, owner, AT)
+        moves.write_move_progress(unended)
+        finished = moves.MemberMoved(AT, timedelta(), target="claude2")
+        for index in range(1, 6):
+            at = AT + timedelta(minutes=index)
+            earlier = replace(move, batch_id=f"{index:032x}", started=AT - timedelta(days=index),
+                              members=(replace(move.members[0], state=finished),))
+            ending = moves.TrackedMove(earlier, owner, at, ended=at)
+            moves.write_move_progress(ending)
+        with patch.object(moves, "_claim_owner_is_live", return_value=False):
+            self.assertEqual(len(moves.read_move_progress()), 6)
+        moves.finish_move_progress(moves.read_tracked_move(f"{5:032x}"))
+        with patch.object(moves, "_claim_owner_is_live", return_value=False):
+            records = moves.read_move_progress()
+        self.assertEqual([item.batch_id for item in records], [move.batch_id, *(f"{index:032x}" for index in (3, 4, 5))])
+        self.assertIsInstance(moves.read_tracked_move(move.batch_id).ended, moves.MoveNotEnded)
+
+    def test_member_destinations_survive_a_new_target_and_unknown_failures_have_no_retry(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        owner = moves.own_claim_owner()
+        failed = moves.MemberMoveFailed(AT, timedelta(), "Fixture target refusal.")
+        changed = replace(move, target=moves.MoveDestinationUnselected(),
+                          members=(*move.members[:2], replace(move.members[2], state=failed), move.members[3]))
+        moves.write_move_progress(moves.TrackedMove(changed, owner, AT))
+        current = moves.read_tracked_move(move.batch_id).progress
+        self.assertEqual(current.members[0].state, move.members[0].state)
+        self.assertEqual(current.members[2].state, failed)
+        board = accounts_page.moves_board((current,), AT, ZoneInfo("America/Los_Angeles"), 75)
+        self.assertIn("units → destination unavailable", board)
+        self.assertIn("moved to claude1", board)
+        self.assertIn("fastest did not move.", board)
+        self.assertNotIn("Move fastest again", board)
+
+    def test_now_uses_moving_when_the_destination_is_unknown(self) -> None:
+        move = move_progress_fixture()
+        row = replace(move.members[2], state=moves.MemberMoving(AT))
+        move = replace(move, target=moves.MoveDestinationUnselected(), members=(row,))
+        board = accounts_page.moves_board((move,), AT, timezone.utc, 75)
+        self.assertIn('<span class="next-muted">Now:</span> fastest is moving.', board)
+
+    def test_group_refusal_has_no_unit_details_or_progress_count(self) -> None:
+        move = move_progress_fixture()
+        refusal = moves.MoveMemberProgress(moves.MoveMember("units", "units"),
+            moves.MemberMoveFailed(AT, timedelta(), "Fixture target refused.", "claude1"), moves.MoveMemberKind.REQUEST)
+        refused = replace(move, batch_id="e" * 32, members=(refusal,))
+        board = accounts_page.moves_board((refused,), AT, timezone.utc, 75)
+        self.assertIn("The retry did not start. Try again.", board)
+        self.assertNotIn("Fixture target refused.", board)
+        self.assertNotIn("All 1 units", board)
+        self.assertNotIn('class="mv-bar"', board)
+        self.assertNotIn("0 of 1 moved", board)
+        self.assertNotIn("1 failed", board)
+        archive = accounts_page.moves_board((move, refused), AT, timezone.utc, 75)
+        earlier = archive.split("Earlier moves", 1)[1]
+        self.assertIn("The retry did not start. Try again.", earlier)
+        self.assertNotIn("Fixture target refused.", earlier)
+        self.assertNotIn("0 of 1 moved", earlier)
+        self.assertNotIn("1 failed", earlier)
+
+    def test_timer_cause_uses_a_safe_display_reason_and_next_counts_waiting_members(self) -> None:
+        move = move_progress_fixture()
+        move = replace(move, initiator=moves.MoveInitiator.AUTOMATIC,
+                       reason=moves.move_display_reason("refusal", "claude3 refused: weekly limit until fixture@example.invalid"),
+                       members=(*move.members, moves.MoveMemberProgress(moves.MoveMember("member-5", "second"), moves.MoveQueued())))
+        board = accounts_page.moves_board((move,), AT, ZoneInfo("America/Los_Angeles"), 75)
+        self.assertIn("automatic · claude3 refused: weekly limit", board)
+        self.assertNotIn("fixture@example.invalid", board)
+        self.assertIn('<span class="next-muted">Next:</span> report. 1 more units wait.</p>', board)
+        self.assertEqual(moves.move_display_reason("auto", "auto: fixture@example.invalid"), "scheduled quota limit")
+        self.assertEqual(moves.move_display_reason("auto", "claude3 at 1e-05%"), "claude3 at 1e-05%")
+        fable = replace(move, reason=moves.move_display_reason("auto", "claude1 at 20% Fable"))
+        board = accounts_page.moves_board((fable,), AT, ZoneInfo("America/Los_Angeles"), 75)
+        self.assertIn("automatic · claude1 at 20% Fable", board)
+        for suffix in (" fable", "  Fable", " Fable ", " Fable fixture@example.invalid"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(moves.move_display_reason("auto", "claude1 at 20%" + suffix), "scheduled quota limit")
+
+    def test_move_failure_text_uses_the_saved_kind_and_reads_old_records(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        rows: list[moves.MoveMemberProgress] = []
+        cases = (
+            ("Fixture conflict.", moves.MoveFailureKind.MOVE_IN_PROGRESS,
+             "Another move is in progress. Try again when it ends."),
+            ("Fixture session missing.", moves.MoveFailureKind.NO_SAVED_SESSION, "fixture &lt;1&gt; has no saved session."),
+            ("Another move is in progress.", moves.MoveFailureKind.OTHER, "The retry did not start. Try again."),
+            ("Another move is in progress.", None, "Another move is in progress. Try again when it ends."),
+            ("No saved session was found.", None, "fixture &lt;4&gt; has no saved session."),
+            ("Another operation held this row.", None, "The retry did not start. Try again."),
+            ("No saved session was found.", "fixture future kind", "The retry did not start. Try again."),
+        )
+        for index, (reason, kind, _) in enumerate(cases):
+            rows.append(moves.MoveMemberProgress(
+                moves.MoveMember(str(index), f"fixture <{index}>"),
+                moves.MemberMoveFailed(AT, timedelta(), reason, failure_kind=(
+                    kind if isinstance(kind, moves.MoveFailureKind) else moves.MoveFailureKind.OTHER))))
+        move = replace(move, members=tuple(rows))
+        moves.write_move_progress(moves.TrackedMove(move, moves.ClaimOwner(21, "start"), AT))
+        path = scratch / "move-progress" / f"{move.batch_id}.json"
+        record = cast(dict[str, list[dict[str, object]]], json.loads(path.read_text()))
+        for fields, (_, kind, _) in zip(record["members"], cases):
+            if kind is None:
+                del fields["failure_kind"]
+            elif isinstance(kind, str):
+                fields["failure_kind"] = kind
+            else:
+                self.assertEqual(fields["failure_kind"], kind.value)
+        _ = path.write_text(json.dumps(record), encoding="utf-8")
+        saved = moves.read_tracked_move(move.batch_id).progress
+        with redirect_stderr(io.StringIO()) as errors:
+            board = accounts_page.moves_board((saved,), AT, timezone.utc, 75)
+            earlier = accounts_page.moves_board((move_progress_fixture(), saved), AT, timezone.utc, 75)
+        self.assertIn("Earlier moves", earlier)
+        self.assertEqual(errors.getvalue(), "")
+        for row, (reason, _, _) in zip(saved.members, cases):
+            assert isinstance(row.state, moves.MemberMoveFailed)
+            self.assertEqual(row.state.reason, reason)
+        lines = [match[1] for match in re.finditer(r'<p class="mv-line mv-fault">(.*?)</p>', board)]
+        self.assertEqual(len(lines), len(cases))
+        for line, (reason, _, message) in zip(lines, cases):
+            self.assertTrue(line.endswith(message), line)
+            self.assertNotIn(f"</span> {reason}</p>", line)
+
+    def test_saved_move_uses_plain_labels_for_old_name_and_holder_fallbacks(self) -> None:
+        scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
+        move = move_progress_fixture()
+        identity = "c278a59b-8f28-4b73-9e28-32dbfca17648"
+        row = moves.MoveMemberProgress(moves.MoveMember(identity, identity),
+                                       moves.MemberMoved(AT, timedelta(), "operation", "claude1"))
+        noncanonical = identity.upper()
+        named = replace(row, member=moves.MoveMember(noncanonical, noncanonical))
+        move = replace(move, initiator=moves.HandMoveSession(identity), members=(row, named))
+        moves.write_move_progress(moves.TrackedMove(move, moves.ClaimOwner(21, "start"), AT))
+        saved = moves.read_tracked_move(move.batch_id).progress
+        board = accounts_page.moves_board((saved,), AT, timezone.utc, 75)
+        self.assertEqual(saved.members[0].member.reference, identity)
+        self.assertNotIn(identity, board)
+        self.assertIn(noncanonical, board)
+        self.assertIn("by hand · unnamed session", board)
+        self.assertIn("a hung task held unnamed session.", board)
+        self.assertIn("after a hung task", board)
+
+    def test_completed_moves_show_the_end_and_earlier_origins(self) -> None:
+        move = move_progress_fixture()
+        ended = tuple(row for row in move.members if isinstance(row.state, (moves.MemberMoved, moves.MemberMoveFailed)))
+        finished = replace(move, members=ended)
+        earlier = replace(finished, batch_id="a" * 32, group="producers", target="claude2",
+                          initiator=moves.MoveInitiator.CONSOLE)
+        automatic = replace(earlier, batch_id="b" * 32, group="units", target="claude4",
+                            initiator=moves.MoveInitiator.AUTOMATIC, reason="claude3 at 0%")
+        zone = ZoneInfo("America/Los_Angeles")
+        board = accounts_page.moves_board((finished, earlier, automatic), AT, zone, 75)
+        self.assertIn("done Sun 07:01 PST · 1 min", board)
+        self.assertIn("<summary>Earlier moves</summary>", board)
+        self.assertIn("producers → claude2", board)
+        self.assertIn("by hand · console page", board)
+        self.assertIn("automatic · claude3 at 0%", board)
+        self.assertNotIn(">Now:", board)
+        self.assertNotIn(">Next:", board)
+        self.assertIn("No move in progress.", accounts_page.moves_board((), AT, zone, 75))
+
+
 MENU_SETUP = '''<script>
 let reads=0;const saves=[];const realFetch=fetch;let freshPage=FRESH_PAGE;
-window.fetch=(path,options)=>options?.method==='POST' ? new Promise(resolve=>saves.push({options,resolve}))
+window.fetch=(path,options)=>options?.method==='POST' ? new Promise((resolve,reject)=>saves.push({options,resolve,reject}))
  : (reads++,Promise.resolve({ok:true,text:async()=>freshPage}));
 </script>'''
 
-MENU_PROBE = '''<script>
+MOVE_DIALOG_PROBE = '''<script>
 (async()=>{
  const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
  const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>setTimeout(resolve,0))));
- const state=()=>document.querySelector('[data-page-status]').dataset.state;
- const menu=document.querySelector('[data-move-menu]');
- const items=()=>[...menu.querySelectorAll('[data-move-target]')];
- const button=()=>document.querySelector('[data-next-button]');
- const open=()=>button().click();
- const activate=name=>button().dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
- const key=name=>menu.dispatchEvent(new KeyboardEvent('keydown',{key:name,bubbles:true,cancelable:true}));
- const groupRow=()=>button().closest('tr');
+ const dialog=document.querySelector('[data-move-dialog]'), form=dialog.querySelector('form');
+ const button=group=>document.querySelector('[data-next-button][data-move-group="'+group+'"]');
+ const target=value=>form.querySelector('[name="target"][value="'+value+'"]');
+ const measure=value=>form.querySelector('[name="measure"][value="'+value+'"]');
+ const percent=form.elements.namedItem('percent'), save=form.querySelector('[data-move-submit]');
+ const cancel=form.querySelector('[data-move-cancel]'), now=form.querySelector('[data-move-now]');
+ const error=form.querySelector('[data-move-error]');
+ let nativeValidation=0;form.addEventListener('invalid',()=>nativeValidation++,true);
+ const fields=index=>Object.fromEntries(new URLSearchParams(saves[index].options.body));
+ const reply=(index,ok,result)=>saves[index].resolve({ok,json:async()=>result});
+ const key=(name,shiftKey=false)=>document.activeElement.dispatchEvent(new KeyboardEvent('keydown',
+  {key:name,bubbles:true,cancelable:true,shiftKey}));
+ const starts=group=>{button(group).focus();key('Enter');};
  try{
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
   frameElement.style.width='800px';frameElement.style.height='480px';await flush();
-  check(document.querySelectorAll('[data-move-group]').length===1 && button().dataset.moveAccount==='claude1'
-   && button().dataset.moveGroup==='units','only the selected Claude group line takes the menu');
-  check(document.querySelectorAll('[data-next-button]').length===1,'only the selected Claude line has a button');
-  const keepsBrowserMenu=cell=>cell.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true})) && menu.hidden;
-  const unselected=document.querySelector('[data-color-key="account.claude2"]').closest('tr');
-  check(keepsBrowserMenu(groupRow().cells[3]),'the selected row keeps the browser menu');
-  check(keepsBrowserMenu(unselected.cells[1]),'the unselected row keeps the browser menu');
-  open();
-  check(!menu.hidden && button().getAttribute('aria-expanded')==='true','a click opens the menu');
-  check(menu.querySelector('[data-move-title]').textContent==='When claude1 reaches 1%, move units to',
-   'the title names the account, percent and group');
-  check(JSON.stringify(items().map(item=>item.dataset.moveTarget))==='["claude2","claude3"]','the menu lists the other Claude accounts');
-  check(items()[0].textContent==='claude260% left' && items()[1].textContent==='claude3',
-   'each item shows the weekly percent left when known');
-  check(items()[0].querySelector('.move-name').style.color==='rgb(178, 148, 187)','each item uses the account color');
-  check(items()[0].querySelector('.move-left').className==='move-left','a healthy percent keeps the plain tone');
-  check(document.activeElement===items()[0],'the first item takes the focus');
-  key('ArrowDown');check(document.activeElement===items()[1],'ArrowDown moves to the next item');
-  key('ArrowDown');check(document.activeElement===menu.querySelector('[data-move-clear]'),'ArrowDown reaches No next move');
-  key('ArrowDown');check(document.activeElement===items()[0],'ArrowDown wraps to the first item');
-  key('ArrowUp');check(document.activeElement===menu.querySelector('[data-move-clear]'),'ArrowUp wraps to the last item');
-  key('Home');check(document.activeElement===items()[0],'Home moves to the first item');
-  key('End');check(document.activeElement===menu.querySelector('[data-move-clear]'),'End moves to the last item');
-  const box=menu.getBoundingClientRect();
-  check(box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight,'the menu fits the viewport');
-  check(items()[0].getAttribute('role')==='menuitemradio' && items()[0].getAttribute('aria-checked')==='true'
-   && items()[1].getAttribute('aria-checked')==='false','the current target is marked');
+  const state=()=>document.querySelector('[data-page-status]').dataset.state;
+  starts('units');
+  check(dialog.open && button('units').getAttribute('aria-haspopup')==='dialog','Enter opens a dialog');
+  check(dialog.querySelector('#move-title').textContent==='Next move of units' &&
+   dialog.querySelector('[data-move-current]').textContent==='The units run on claude1 now.','the form names the role and account');
+  check(percent.value==='4.5' && measure('fable').checked && target('claude2').checked,'the form reads the units settings');
+  check(target('claude2').parentElement.textContent==='claude260% left' &&
+   target('claude2').nextElementSibling.style.color==='rgb(178, 148, 187)','a target shows quota and account color');
+  check(!target('claude1') && !target('codex1'),'the current and Codex accounts are excluded');
+  check(document.activeElement===target('claude2') && state()==='Paused','focus enters the dialog and refresh pauses');
+  key('Tab',true);check(document.activeElement===save,'Shift+Tab wraps to Save');
+  key('Tab');check(document.activeElement===target('claude2'),'Tab wraps to the selected target');
+  target('claude3').click();measure('all-models').click();percent.value='7.5';
+  check(saves.length===0,'editing sends no request');
   key('Escape');
-  button().style.cssText='position:fixed;right:0;bottom:0';open();
-  const edge=menu.getBoundingClientRect();
-  check(edge.left>=8 && edge.top>=8 && edge.right<=innerWidth-7.5 && edge.bottom<=innerHeight-7.5,
-   'a button at the corner keeps the menu inside the viewport:'+JSON.stringify([edge.left,edge.top,edge.right,edge.bottom,innerWidth,innerHeight]));
-  check(state()==='Paused','an open menu pauses refresh');
-  key('Escape');check(menu.hidden && state()!=='Paused' && document.activeElement===button()
-   && button().getAttribute('aria-expanded')==='false','Escape closes the menu, returns focus and resumes refresh');
-  button().style.cssText='';activate('Enter');check(!menu.hidden,'Enter opens the menu');
-  key('Escape');activate(' ');check(!menu.hidden,'Space opens the menu');
-  key('Escape');
-  open();
-  document.body.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
-  check(menu.hidden && document.activeElement===button(),'a click outside closes the menu and returns focus');
-  open();
-  const readsBefore=reads;
-  items()[1].click();
-  check(menu.hidden && saves.length===1,'a choice closes the menu and posts once');
-  const form=new URLSearchParams(saves[0].options.body);
-  check(form.get('group')==='units' && form.get('to')==='claude3' && [...form.keys()].length===2 &&
-   saves[0].options.headers['Content-Type']==='application/x-www-form-urlencoded','the post names the group and the account');
-  check(state()==='Paused','a pending move holds refresh');
-  saves[0].resolve({ok:true,json:async()=>({state:'saved'})});await flush();await flush();
-  check(reads===readsBefore+1 && state()!=='Paused','a saved move reloads the board');
-  open();items()[0].click();
-  saves[1].resolve({ok:false,json:async()=>({reason:'next: cannot set entry: busy'})});await flush();
-  const error=document.querySelector('[data-color-save-error]');
-  check(!error.hidden && error.textContent==='units: next: cannot set entry: busy','a failed move reports its reason in the status line');
-  open();menu.querySelector('[data-move-clear]').click();
-  const cleared=new URLSearchParams(saves[2].options.body);
-  check(cleared.get('group')==='units' && cleared.get('clear')==='first' && [...cleared.keys()].length===2,
-   'No next move posts only the group and clear=first');
-  check(menu.hidden && document.activeElement===button(),'clear returns focus to the button');
+  check(!dialog.open && document.activeElement===button('units'),'Escape returns focus to the next cell');
+  starts('showrunners');
+  check(percent.value==='2' && measure('all-models').checked && target('claude1').checked,'the form reads the other role settings');
+  cancel.click();
+  check(!dialog.open && saves.length===0 && document.activeElement===button('showrunners'),'Cancel sends no request');
+  starts('units');
+  check(percent.value==='4.5' && measure('fable').checked && target('claude2').checked,'reopening discards local edits');
+  const saveFailure='The settings were not saved. Try again.';
+  target('claude3').click();
+  for(const invalid of ['101','-1','']){
+   percent.value=invalid;save.click();
+   check(saves.length===0 && dialog.open && percent.value===invalid && document.activeElement===percent &&
+    nativeValidation===0 && !error.hidden && error.textContent===saveFailure,
+    'invalid percent shows the form message and keeps the edit: '+invalid);
+  }
+  percent.value='9.25';save.click();
+  check(JSON.stringify(fields(0))===JSON.stringify({group:'units',to:'claude3',percent:'9.25',measure:'fable'}),
+   'Save sends the target, percent, and measure');
+  reply(0,false,{reason:'next: cannot set entry: busy'});await flush();
+  const moveFailure='The move did not start. Try again.';
+  check(dialog.open && !error.hidden && error.textContent===saveFailure && percent.value==='9.25',
+   'Save failure keeps the dialog and edits and shows the form message');
+  save.click();reply(1,true,{state:'saved'});await flush();await flush();
+  check(!dialog.open && document.activeElement===button('units'),'Save closes the dialog and keeps focus across a refresh');
+  starts('units');
+  target('claude3').click();percent.value='88';measure('all-models').click();now.click();
+  check(JSON.stringify(fields(2))===JSON.stringify({group:'units',move_now:'claude3'}),
+   'Move now posts only the role and target');
+  saves[2].resolve({ok:false,status:409,json:async()=>({state:'move-in-progress',reason:'fixture details'})});
+  await flush();
+  check(dialog.open && error.textContent==='Another move is in progress. Try again when it ends.',
+   'Move now shows the in-progress message');
+  now.click();reply(3,false,{reason:'private launcher error'});await flush();
+  check(dialog.open && error.textContent===moveFailure,'a launch refusal shows the move message');
+  now.click();saves[4].reject(new DOMException('fixture deadline','TimeoutError'));await flush();
+  check(dialog.open && error.textContent===moveFailure,'a Move now timeout shows the move message');
+  now.click();reply(5,true,{state:'saved'});await flush();await flush();
+  starts('units');
+  check(percent.value==='4.5' && measure('fable').checked,'Move now did not save the edits');
+  target('').click();check(now.disabled && saves.length===6,'No next move disables Move now and sends no request');
+  percent.value='';save.click();
+  check(JSON.stringify(fields(6))===JSON.stringify({group:'units',clear:'first'}),'Save clears the first entry without percent validation');
+  saves[6].resolve({ok:true,json:async()=>{throw new SyntaxError('fixture bad JSON');}});await flush();
+  check(dialog.open && error.textContent===saveFailure,'a bad Clear reply shows the save message');
+  save.click();saves[7].reject(new TypeError('fixture network error'));await flush();
+  check(dialog.open && error.textContent===saveFailure,'a Clear network error shows the save message');
+  save.click();
   freshPage=EMPTY_PAGE;
-  saves[2].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
-  check(button().closest('td').querySelector('.next-muted').textContent==='none','clear refreshes the cell to none');
-  open();check(!menu.querySelector('[data-move-clear]'),'an empty group has no clear item');key('Escape');
-  open();dispatchEvent(new Event('resize'));check(menu.hidden,'resize closes the menu');
-  open();dispatchEvent(new Event('scroll'));check(menu.hidden,'scroll closes the menu');
-
+  reply(8,true,{state:'saved'});await flush();await flush();
+  starts('units');
+  check(percent.value==='1' && measure('all-models').checked && target('').checked && now.disabled,
+   'an empty group uses the configured percent and all models');
+  const edge=dialog.getBoundingClientRect();
+  check(edge.left>=7.5 && edge.top>=7.5 && edge.right<=innerWidth-7.5 && edge.bottom<=innerHeight-7.5,
+   'the dialog stays inside the viewport');
+  cancel.click();
+  freshPage=UNAVAILABLE_PAGE;
+  document.dispatchEvent(new Event('visibilitychange'));await flush();await flush();
+  starts('units');
+  const unavailable=form.querySelector('[data-move-unavailable]');
+  check(dialog.open && !unavailable.hidden && unavailable.textContent==='The next moves cannot be read now.',
+   'the dialog names an unavailable queue');
+  check(save.disabled && now.disabled && percent.matches(':disabled') && document.activeElement===cancel,
+   'an unavailable queue disables both actions and focuses Cancel');
+  key('Tab');check(document.activeElement===cancel,'focus stays in the unavailable dialog');
+  now.click();save.click();check(saves.length===9,'an unavailable queue sends no POST');
+  cancel.click();
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>'''
 
-
 class AccountsPageTests(unittest.TestCase):
     review_root: Path = Path()
+    reminder_state: Path = Path()
 
     @override
     def setUp(self) -> None:
@@ -203,18 +466,282 @@ class AccountsPageTests(unittest.TestCase):
         use_fixture_history(self, scratch)
         configuration = scratch / "config"
         self.review_root = scratch / "review"
+        self.reminder_state = scratch / "login_sittings.json"
+        _ = self.enterContext(patch.object(login_sittings, "reminder_state_path", return_value=self.reminder_state))
+        _ = self.enterContext(patch.object(remote, "local_machine", return_value="natedev"))
+        _ = self.enterContext(patch.object(remote, "sys", SimpleNamespace(platform="linux")))
         _ = self.enterContext(patch.object(usage_store, "store_file", return_value=scratch / "home" / "usage.json"))
+        _ = self.enterContext(patch.object(moves, "store_file", return_value=scratch / "moves.jsonl"))
         _ = copy_config_fixture(Path(__file__).resolve().parents[2] / "config", configuration)
-        _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS)
+        _ = write_config_fixture(configuration / "accounts.conf", ACCOUNT_SETTINGS + LOGIN_CARD_SETTINGS)
         _ = write_config_fixture(configuration / "console.conf", PAGE_STATUS_SETTINGS)
         _ = write_config_fixture(configuration / "review_links.conf", "page_refresh_seconds=15\naccounts_page_seconds=30\n")
+        _ = write_config_fixture(configuration / "shutdown.conf", "move.stuck_seconds=75\n")
         _ = (configuration / "statusline.conf").write_text(
             "account.claude1=#af875f\naccount.claude2=#b294bb\naccount.codex2=#123456\nrole.unit-director=#d7af00\n"
             + "model.claude-opus-5-5=#e08a5c\n",
             encoding="utf-8")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "CONF_DIR": str(configuration), "REVIEW_LINKS_ROOT": str(self.review_root),
+            "HOME": str(scratch / "fixture-home"), "AGENT_NOTES_DIR": str(scratch / "agents"),
         })))
+
+    def test_page_reads_move_progress_above_accounts_and_uses_the_configured_wait(self) -> None:
+        move = move_progress_fixture()
+        moves.write_move_progress(moves.TrackedMove(move, moves.own_claim_owner(), AT))
+        with (patch.object(accounts, "read_status", return_value=sort_reading()),
+              patch.object(shutdown_record, "active", return_value=False),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(staff, "row_activity", return_value=staff.RowAvailable())):
+            page = accounts_page.page()
+        self.assertLess(page.index(b'aria-label="Moves"'), page.index(b'aria-label="Accounts"'))
+        self.assertIn(b"The move ended it after 1 min 15 s and moved lfo.", page)
+
+    def test_moves_page_hides_retry_on_the_target_or_while_an_operation_holds_the_member(self) -> None:
+        from scripts.agents import inventory
+
+        move = move_progress_fixture()
+        identity = "c278a59b-8f28-4b73-9e28-32dbfca17648"
+        failed = replace(move.members[1], member=moves.MoveMember(identity, "praxis"))
+        move = replace(move, members=(move.members[0], failed, *move.members[2:]))
+        moves.write_move_progress(moves.TrackedMove(move, moves.own_claim_owner(), AT))
+        cases: tuple[tuple[frozenset[tuple[str, str]], staff.RowAvailable | staff.RowBusy, bool, bool], ...] = (
+            (frozenset(), staff.RowAvailable(), False, True),
+            (frozenset({(identity, "claude2")}), staff.RowAvailable(), False, True),
+            (frozenset({(identity, "claude1")}), staff.RowAvailable(), False, False),
+            (frozenset(), staff.RowBusy(), False, False),
+            (frozenset(), staff.RowAvailable(), True, False),
+        )
+        for sessions, activity, claimed, visible in cases:
+            reading = replace(sort_reading(), live_claude_accounts=sessions)
+            with (self.subTest(activity=activity, claimed=claimed, visible=visible),
+                  patch.object(accounts, "read_status", return_value=reading),
+                  patch.object(inventory, "listing", side_effect=AssertionError("second session scan")),
+                  patch.object(shutdown_record, "active", return_value=False),
+                  patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+                  patch.object(staff, "row_activity", return_value=activity),
+                  patch.object(moves, "move_holds_session", return_value=claimed)):
+                page = accounts_page.page()
+            self.assertEqual(b"Move praxis again</button>" in page, visible)
+            self.assertIn(b"praxis did not start on claude1.", page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required")
+    def test_retry_posts_one_batch_member_and_refresh_keeps_move_details_open(self) -> None:
+        move = move_progress_fixture()
+        identity = "c278a59b-8f28-4b73-9e28-32dbfca17648"
+        failed = replace(move.members[1], member=moves.MoveMember(identity, "praxis"))
+        move = replace(move, members=(move.members[0], failed, *move.members[2:]))
+        moves.write_move_progress(moves.TrackedMove(move, moves.own_claim_owner(), AT))
+        with (patch.object(accounts, "read_status", return_value=sort_reading()),
+              patch.object(shutdown_record, "active", return_value=False),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(staff, "row_activity", return_value=staff.RowAvailable())):
+            page = accounts_page.page().decode()
+        setup = """<script>
+const realMoveFetch=fetch, retryPosts=[];
+let completeRetry, retryError;
+window.fetch=(path,options)=>{
+ if(options?.method==='POST' && path===location.pathname){
+  if(retryError) return retryError();
+  retryPosts.push(Object.fromEntries(new URLSearchParams(options.body)));
+  const response=realMoveFetch(path,options);
+  return new Promise(resolve=>{completeRetry=()=>resolve(response);});
+ }
+ return realMoveFetch(path,options);
+};
+</script>"""
+        probe = """<script>
+(async()=>{
+ const failures=[];
+ const check=(good,meaning)=>{if(!good) failures.push(meaning);};
+ const details=()=>document.querySelector('.mv-units');
+ const before=details();
+ before.open=true;
+ const button=document.querySelector('[data-retry-move]');
+ button.click();
+ button.click();
+ check(button.disabled && retryPosts.length===1,'send only one retry while it is pending');
+ check(retryPosts[0]?.retry_move===before.dataset.moveDetails &&
+       retryPosts[0]?.member===button.dataset.moveMember,'post the batch and the failed member');
+ const refreshed=new Promise((resolve,reject)=>{
+  const observer=new MutationObserver(()=>{if(details()!==before){observer.disconnect();resolve();}});
+  observer.observe(document.querySelector('main'),{childList:true});
+  setTimeout(()=>{observer.disconnect();reject(new Error('The page did not refresh.'));},4000);
+ });
+ completeRetry?.();
+ try{
+  await refreshed;
+  check(details().open,'keep All units open');
+  const notice=document.querySelector('[data-color-save-error]');
+  check(notice.hidden,'the server accepts the retry');
+  const retryMessage=()=>new Promise(resolve=>{
+   const retry=document.querySelector('[data-retry-move]');
+   const observer=new MutationObserver(()=>{
+    if(!retry.disabled){observer.disconnect();resolve(notice.textContent);}
+   });
+   observer.observe(retry,{attributes:true,attributeFilter:['disabled']});
+   retry.click();
+  });
+  const refusal='The retry did not start. Try again.';
+  retryError=()=>Promise.resolve(new Response(JSON.stringify({reason:refusal}),{status:503}));
+  check(await retryMessage()===refusal,'show the retry failure text');
+  retryError=()=>Promise.resolve(new Response(JSON.stringify({reason:'Fixture private diagnostic.'}),{status:400}));
+  check(await retryMessage()===refusal,'use the same text for an unexpected JSON reason');
+  retryError=()=>Promise.resolve(new Response(JSON.stringify({reason:'Fixture private diagnostic.'}),{status:200}));
+  check(await retryMessage()===refusal,'show the failure when a successful HTTP response lacks a state');
+  retryError=()=>Promise.resolve(new Response(JSON.stringify({state:'queued'}),{status:200}));
+  check(await retryMessage()===refusal,'show the failure when the state is not saved');
+  retryError=()=>Promise.reject(new Error('fixture network failure'));
+  check(await retryMessage()===refusal,'use the same text after a request failure');
+ }catch(error){failures.push(String(error));}
+ await realMoveFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>"""
+        page = page.replace("</head>", setup + "</head>").replace("</body>", probe + "</body>")
+        self.review_root.mkdir()
+        fixture = self.review_root.parent
+        staff_file = fixture / "staff.json"
+        _ = staff_file.write_text('{"schema":2,"rows":[]}', encoding="utf-8")
+        with (patch.dict(os.environ, {"STAFF_FILE": str(staff_file)}),
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(stop_resume, "shutdown_state_root", return_value=fixture / "shutdown"),
+              patch.object(stop_resume, "_detach", return_value=fixture / "move.log") as detach,
+              started_review_server(("127.0.0.1", 0), self.review_root) as server):
+            worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            worker.start()
+
+            def post_page(body: bytes) -> tuple[int, bytes]:
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
+                try:
+                    connection.request("POST", accounts_page.PAGE_PATH, body, {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": f"http://127.0.0.1:{server.server_port}",
+                    })
+                    response = connection.getresponse()
+                    return response.status, response.read()
+                finally:
+                    connection.close()
+
+            try:
+                self.assertEqual(firefox_probe_results(page.encode(), post_page=post_page), [[]])
+            finally:
+                server.shutdown()
+                worker.join(TEST_HANG_GUARD_SECS)
+            detach.assert_called_once_with(["batch", "--target", "claude1", "--user-command", "--", identity],
+                                           "move", initiator=moves.MoveInitiator.CONSOLE)
+
+    def login_card_reading(self) -> accounts.StatusReading:
+        urgent = login_sittings.LoginEnd("mac", "claude2", AT + timedelta(days=1, hours=2))
+        warning = login_sittings.LoginEnd("natedev", "claude1", AT + timedelta(days=2))
+        default = login_sittings.LoginEnd("mac", "claude1", AT + timedelta(days=6))
+        next_mac = login_sittings.LoginEnd("mac", "claude3", AT + timedelta(days=9))
+        login_sittings.save_state(self.reminder_state, login_sittings.ReminderState(
+            sitting=AT, named={default, warning, urgent}, peer=(default, next_mac, urgent)))
+        rows = (
+            replace(status_row("claude3"), login_ends_at=agent_accounts.LoginEndKnown(AT + timedelta(days=10))),
+            replace(status_row("claude1"), login_ends_at=agent_accounts.LoginEndKnown(warning.at)),
+        )
+        return accounts.StatusReading(rows, (), (), ZoneInfo("America/Los_Angeles"), AT)
+
+    def test_login_card_shows_reported_dates_in_end_order_and_the_following_request(self) -> None:
+        reading = self.login_card_reading()
+        with (patch.object(remote, "local_machine", return_value="natedev"),
+              patch.object(accounts, "read_status", return_value=reading) as status):
+            page = accounts_page.page().decode()
+        start = page.index('<h2>Logins</h2>')
+        card = page[start:page.index("</section>", start)]
+        self.assertLess(start, page.index('<h2>Accounts</h2>'))
+        self.assertEqual(re.findall(r'<th class="left" scope="col">(.*?)</th>', card),
+                         ["account", "machine", "login ends", "action"])
+        self.assertEqual(re.findall(r'/login in a [^<]+', card), [
+            "/login in a claude2 session on mac",
+            "/login in a claude1 session on natedev",
+            "/login in a claude1 session on mac",
+        ])
+        self.assertIn('style="color:#b294bb" data-color-text="account.claude2">claude2</span>', card)
+        self.assertIn('Next request: claude3 on mac, Fri 11-20', card)
+        self.assertNotIn("fixture@example.invalid", card)
+        self.assertNotIn("<button", card)
+        status.assert_called_once_with(source=accounts.StoredUsageOnly(), include_models=True)
+
+    def test_login_card_uses_configured_tones_and_the_user_zone(self) -> None:
+        reading = self.login_card_reading()
+        with patch.object(remote, "local_machine", return_value="natedev"):
+            card = accounts_page.logins_board(reading)
+        self.assertEqual(re.findall(r'<time datetime="[^"]+"><span class="([^"]+)">([^<]+)</span>', card), [
+            ("error", "Mon 11-16 09:00 PST"),
+            ("warning", "Tue 11-17 07:00 PST"),
+            ("default", "Sat 11-21 07:00 PST"),
+        ])
+
+    def test_login_card_removes_only_the_machine_date_that_changes(self) -> None:
+        reading = self.login_card_reading()
+        original = self.reminder_state.read_bytes()
+        renewed = replace(reading.rows[1], login_ends_at=agent_accounts.LoginEndKnown(AT + timedelta(days=30)))
+        with patch.object(remote, "local_machine", return_value="natedev"):
+            card = accounts_page.logins_board(replace(reading, rows=(reading.rows[0], renewed)))
+        self.assertNotIn("/login in a claude1 session on natedev", card)
+        self.assertIn("/login in a claude1 session on mac", card)
+        self.assertIn("/login in a claude2 session on mac", card)
+        self.assertEqual(self.reminder_state.read_bytes(), original)
+
+    def test_login_card_shows_the_empty_line_without_a_table(self) -> None:
+        reading = accounts.StatusReading((), (), (), timezone.utc, AT)
+        card = accounts_page.logins_board(reading)
+        self.assertIn('<p class="lg-next next-muted">No login request.</p>', card)
+        self.assertNotIn("<table", card)
+        self.assertNotIn("Next request:", card)
+
+    def test_login_card_shows_safety_before_the_next_sitting(self) -> None:
+        reading = self.login_card_reading()
+        for ends_in, requests_on in ((2, "Sun 11-15"), (5, "Tue 11-17")):
+            with self.subTest(ends_in=ends_in):
+                row = replace(status_row("claude4"), login_ends_at=agent_accounts.LoginEndKnown(AT + timedelta(days=ends_in)))
+                card = accounts_page.logins_board(replace(reading, rows=(*reading.rows, row)))
+                self.assertIn(f"Next request: claude4 on natedev, {requests_on}", card)
+
+    def test_login_card_uses_account_label_fallback_for_missing_and_invalid_colors(self) -> None:
+        reading = self.login_card_reading()
+        with patch.object(accounts, "role_colors", return_value={"account.claude2": "invalid"}):
+            card = accounts_page.logins_board(reading)
+        self.assertEqual(card.count('<span class="default bold">claude1</span>'), 2)
+        self.assertIn('<span class="default bold">claude2</span>', card)
+        self.assertNotIn("data-color-text", card)
+
+    def test_mac_login_card_reads_the_local_copy_until_it_is_stale(self) -> None:
+        leader_reading = self.login_card_reading()
+        state = login_sittings.load_state(self.reminder_state)
+        state.local = tuple(login_sittings.LoginEnd("natedev", row.label, row.login_ends_at.at)
+                            for row in leader_reading.rows
+                            if isinstance(row.login_ends_at, agent_accounts.LoginEndKnown))
+        mac_rows = tuple(replace(status_row(end.account), login_ends_at=agent_accounts.LoginEndKnown(end.at))
+                         for end in state.peer)
+        with (patch.object(remote, "local_machine", return_value="fixture-mac-host"),
+              patch.object(remote, "sys", SimpleNamespace(platform="darwin")),
+              patch.object(accounts, "read_status", return_value=replace(leader_reading, rows=mac_rows)),
+              patch.object(subprocess, "run", side_effect=AssertionError("unexpected process"))):
+            self.assertEqual(remote.local_machine(), "fixture-mac-host")
+            self.assertEqual(remote.this_machine(), "mac")
+            mac_reading = replace(leader_reading, rows=mac_rows)
+            self.assertIn("Login requests unavailable.", accounts_page.logins_board(mac_reading))
+            copy = login_sittings.ReminderStateCopy("natedev", AT, state)
+            self.assertEqual(login_sittings.main(["exchange"], io.StringIO(copy.encode()), io.StringIO(), io.StringIO()), 0)
+            card = accounts_page.logins_board(mac_reading)
+            self.assertEqual(accounts_page.logins_board(replace(mac_reading, rows=())), card)
+            renewed = tuple(replace(row, login_ends_at=agent_accounts.LoginEndKnown(AT + timedelta(days=30)))
+                            if row.label == "claude1" else row for row in mac_rows)
+            renewed_card = accounts_page.logins_board(replace(mac_reading, rows=renewed))
+            self.assertNotIn("/login in a claude1 session on mac", renewed_card)
+            self.assertIn("/login in a claude1 session on natedev", renewed_card)
+            boundary = AT + timedelta(hours=2, seconds=30)
+            boundary_card = accounts_page.logins_board(replace(mac_reading, checked_at=boundary))
+            self.assertIn("Next request: claude3 on mac, Fri 11-20", boundary_card)
+            self.assertIn("/login in a claude1 session on natedev", boundary_card)
+            stale = accounts_page.logins_board(replace(mac_reading, checked_at=boundary + timedelta(seconds=1)))
+            self.assertIn("Login requests unavailable.", stale)
+            self.assertNotIn("<table", stale)
+        self.assertEqual(card, accounts_page.logins_board(leader_reading))
 
     def test_page_reads_quota_clear_state_from_the_fixture_root(self) -> None:
         reading = accounts.StatusReading((replace(status_row("claude1"), weekly_left_percent=4),),
@@ -470,9 +997,11 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
                 os.environ, {"REVIEW_LINKS_ROOT": str(root)}):
             source = accounts_page.page().decode()
         setup = """<script>
-const realFetch=window.fetch.bind(window);let clearForm;
+const realFetch=window.fetch.bind(window);let clearForm,holdRefresh=false,heldRefresh=null;
+// After holdRefresh, the first refresh waits for the probe, and later refreshes never answer.
 window.fetch=(url,options)=>options?.method==='POST'
  ? (clearForm=new URLSearchParams(options.body),Promise.resolve({ok:true,json:async()=>({state:'saved'})}))
+ : holdRefresh ? new Promise(resolve=>{if(!heldRefresh) heldRefresh=resolve;})
  : realFetch(url,options);
 </script>"""
         probe = r"""<script>
@@ -491,11 +1020,21 @@ window.fetch=(url,options)=>options?.method==='POST'
   check(panel.hidden && document.activeElement===button,'Escape closes the panel and restores focus');
   button.click();document.body.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true}));
   check(panel.hidden,'an outside click closes the panel');
-  button.click();clear.click();await paint();
-  check(panel.hidden && !button.isConnected,'Clear closes the panel and removes the button');
-  check(clearForm.get('quota_account')==='claude1' && clearForm.get('quota_level')==='urgent',
+  // A refresh that starts while the panel is open must not bring the alert back after the clear.
+  const old='<!doctype html>'+document.documentElement.outerHTML;
+  button.click();holdRefresh=true;document.dispatchEvent(new Event('visibilitychange'));
+  // The fetch stub runs during dispatch. Click Clear before Firefox can resize the frame and close the panel.
+  check(heldRefresh,'a refresh is in flight while the panel is open');
+  clear.click();
+  check(clearForm?.get('quota_account')==='claude1' && clearForm.get('quota_level')==='urgent',
    'Clear posts the account and level');
-  check(percent.textContent==='4%' && getComputedStyle(percent).color===color,'the percentage keeps its color');
+  await paint();
+  heldRefresh?.({ok:true,text:async()=>old});
+  for(let wait=0;wait<5;wait++) await paint();
+  check(panel.hidden && !button.isConnected,'Clear closes the panel and removes the button');
+  check(!document.querySelector('[data-quota-account=claude1]'),'a refresh from before the clear does not bring the alert back');
+  check(percent.isConnected && percent.textContent==='4%' && getComputedStyle(percent).color===color,
+   'the percentage keeps its color');
  }catch(error){failures.push(String(error));}
  await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();</script>"""
@@ -529,6 +1068,394 @@ window.fetch=(url,options)=>options?.method==='POST'
         self.assertNotIn('Upcoming moves:', markup)
         self.assertNotIn('units → claude1', markup)
 
+    def test_account_name_titles_use_disk_logins_for_all_seven_accounts(self) -> None:
+        labels = ("claude1", "claude2", "claude3", "claude4", "claude5", "codex1", "codex2")
+        rows = tuple(replace(status_row(label), tool="claude" if label.startswith("claude") else "codex",
+                             login="" if label == "codex2" else f"{label}&fixture@example.invalid",
+                             roles=(), role_counts=()) for label in labels)
+        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        titles = dict(re.findall(r'<td class="left" data-account-name><span title="([^"]*)"[^>]*>([^<]+)</span>', markup))
+        expected = {f"{label}&amp;fixture@example.invalid": label for label in labels[:-1]}
+        expected["No email in the login record"] = "codex2"
+        self.assertEqual(titles, expected)
+
+    def test_malformed_disk_login_shows_the_fallback_in_the_page(self) -> None:
+        directory = self.review_root.parent / ".claude1"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "fixture\ud800@example.invalid"},
+        }))
+        login = agent_accounts.claude_on_disk(directory).email
+        self.assertTrue(login and "\ud800" in login)
+        row = replace(status_row("claude1"), login=login or "")
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+        with patch.object(accounts, "read_status", return_value=reading):
+            page = accounts_page.page()
+        self.assertIn(b'<td class="left" data-account-name><span title="No email in the login record"', page)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser colors")
+    def test_model_role_headings_use_the_accounts_role_colors(self) -> None:
+        config = Path(os.environ["CONF_DIR"]) / "statusline.conf"
+        colors = {"role.producer": "#112233", "role.showrunner": "#223344",
+                  "role.unit-director": "#334455", "role.worker": "#445566"}
+        _ = config.write_text("".join(f"{key}={value}\n" for key, value in colors.items()))
+        reading = sort_reading()
+        markup = accounts_page.models_board(reading)
+        for role, key in accounts.ROLE_COLOR_KEYS.items():
+            with self.subTest(role=role):
+                heading = markup.split(f'data-model-sort="{role}"', 1)[1].split("</th>", 1)[0]
+                self.assertIn(f'style="color:{colors[key]}" data-color-text="{key}">{role}</span>', heading)
+        probe = """<script>
+const failures=[];
+for(const theme of ['light','dark']){
+ document.documentElement.dataset.theme=theme;
+ for(const heading of document.querySelectorAll('[data-model-sort] [data-color-text^="role."]')){
+  const key=heading.dataset.colorText;
+  const cell=document.querySelector('.accounts-table [data-color-text="'+key+'"]');
+  if(!cell || getComputedStyle(cell).color!==getComputedStyle(heading).color)
+   failures.push(theme+' '+key+' has a different color.');
+ }
+}
+fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>"""
+        page = ('<!doctype html><html><head>' + accounts_page.STYLE + '</head><body>'
+                + accounts_page.board(reading) + markup + probe + '</body></html>').encode()
+        self.assertEqual(firefox_probe_results(page), [[]])
+
+    def test_fable_left_and_codex_reset_count_use_stored_values_and_sort_numerically(self) -> None:
+        make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
+        reset_count = cast(Callable[[str], int | accounts.StatusUnavailable], getattr(accounts, "_codex_limit_reset_count"))
+        folder = self.review_root.parent
+        claude = accounts.AccountStatus("~/.claude1", folder / ".claude1", True, True, True,
+                                        "claude1", "claude1@example.invalid", "", (), (), accounts.McpServerDifferences())
+        weekly = usage_store.StoredWindow(left=60, at=AT.isoformat(), resets=(AT + timedelta(days=4)).isoformat())
+        fable = usage_store.StoredWindow(left=9, at=AT.isoformat(), resets=(AT + timedelta(days=2)).isoformat())
+        rows = [
+            make_row(claude, usage_store.StoredUsage(weekly=weekly, weekly_fable=fable), AT, ()),
+            make_row(replace(claude, label="claude2"),
+                     usage_store.StoredUsage(weekly=weekly, weekly_fable={**fable, "left": 100}), AT, ()),
+            make_row(replace(claude, label="claude3"),
+                     usage_store.StoredUsage(weekly=weekly, weekly_fable={**fable, "resets": AT.isoformat()}), AT, ()),
+        ]
+        with patch.object(note_file, "notes_dir", return_value=folder):
+            for label, value in (("codex1", "12"), ("codex2", "0"), ("codex3", "-1")):
+                _ = (folder / note_file.note_name(label)).write_text(f"---\nlimit_reset_count: {value}\n---\n")
+                rows.append(replace(status_row(label), tool="codex", fable_left_percent=25,
+                                    limit_reset_count=reset_count(label)))
+
+        markup = accounts_page.board(accounts.StatusReading(tuple(rows), (), (), timezone.utc, AT))
+        table = markup.split('aria-label="Accounts"', 1)[1].split("</table>", 1)[0]
+        lines = cast(list[str], re.findall(r'<tr[^>]+data-account-row="[^"]+">(.*?)</tr>', table, re.S))
+        cells = [cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S)) for line in lines]
+        self.assertEqual([row[4] for row in cells[2:]], [accounts_page.DASH, "", "", ""])
+        self.assertEqual([re.sub("<[^>]+>", "", row[4]) for row in cells[:2]], ["9%", "100%"])
+        self.assertEqual([re.sub("<[^>]+>", "", row[11]) for row in cells], ["—", "—", "—", "12", "0", "—"])
+        self.assertIn('title="Claude does not give this count to our tools."', cells[0][11])
+        orders = rendered_sort_orders(markup, "accounts")
+        self.assertEqual(orders["Fable left"], [0, 1, 2, 3, 4, 5])
+        self.assertEqual(orders["Fable left-reverse"], [1, 0, 2, 3, 4, 5])
+        self.assertEqual(orders["reset count"], [4, 3, 0, 1, 2, 5])
+        self.assertEqual(orders["reset count-reverse"], [3, 4, 0, 1, 2, 5])
+
+    def test_weekly_reset_orange_weight(self) -> None:
+        for position, expected in ((0, 0), (0.125, 0.25), (0.25, 0.5), (0.5, 2 / 3), (1, 1)):
+            with self.subTest(position=position):
+                self.assertAlmostEqual(accounts_page.weekly_reset_orange_weight(position), expected)
+
+    def test_weekly_reset_colors_use_the_stored_codex_work_rule(self) -> None:
+        make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
+        folder = self.review_root.parent / ".codex1"
+        status = accounts.CodexStatus("~/.codex1", folder, True, True, "codex1", "fixture@example.invalid", "", (), ())
+        reset = (AT + timedelta(hours=3)).isoformat()
+        weekly = usage_store.StoredWindow(left=0, at=AT.isoformat(), resets=reset)
+        for weekly_left, five, balance, credits, expected in (
+            (0, None, "10", agent_accounts.CreditsOn(), "ready"),
+            (0, None, "10", agent_accounts.CreditsOff(), "exhausted"),
+            (20, None, "0", agent_accounts.CreditsOff(), "ready"),
+            (20, 0, "0", agent_accounts.CreditsOff(), "exhausted"),
+            (20, 0, "unlimited", agent_accounts.CreditsOn(), "ready"),
+        ):
+            with self.subTest(weekly=weekly_left, five=five, credits=credits, expected=expected):
+                held = usage_store.StoredUsage(weekly={**weekly, "left": weekly_left},
+                                               credits=usage_store.StoredCredits(balance=balance, at=AT.isoformat()))
+                if five is not None:
+                    held["five_hour"] = {**weekly, "left": five}
+                with patch.object(agent_accounts, "codex_credits_setting", return_value=credits):
+                    row = make_row(status, held, AT, ())
+                reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+                markup = accounts_page.board(reading)
+                self.assertIn(f'class="weekly-reset-{expected}"', markup)
+                if expected == "exhausted":
+                    self.assertIn('style="--reset-orange-weight:100%"', markup)
+
+    def test_weekly_reset_colors_reject_future_codex_readings(self) -> None:
+        make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
+        folder = self.review_root.parent / ".codex1"
+        status = accounts.CodexStatus("~/.codex1", folder, True, True, "codex1", "fixture@example.invalid", "", (), ())
+        at = AT.isoformat()
+        future = (AT + timedelta(minutes=30)).isoformat()
+        reset = (AT + timedelta(hours=3)).isoformat()
+        weekly = usage_store.StoredWindow(left=20, at=at, resets=reset)
+        for name, usage in (
+            ("weekly", usage_store.StoredUsage(weekly={**weekly, "at": future})),
+            ("five-hour", usage_store.StoredUsage(weekly=weekly, five_hour={**weekly, "at": future})),
+            ("credits", usage_store.StoredUsage(weekly={**weekly, "left": 0},
+                credits=usage_store.StoredCredits(balance="10", at=future))),
+        ):
+            with (self.subTest(reading=name),
+                  patch.object(agent_accounts, "codex_credits_setting", return_value=agent_accounts.CreditsOn())):
+                row = make_row(status, usage, AT, ())
+                reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+                self.assertIsInstance(row.codex_work_readiness, agent_accounts.CodexWorkUnknown)
+                self.assertIn('class="weekly-reset-unknown"', accounts_page.board(reading))
+
+    def test_unassigned_running_claude_session_keeps_its_weekly_reset_green(self) -> None:
+        from scripts.herdr import pane_launch
+        from scripts.message import sessions
+
+        root = self.review_root.parent
+        directory = root / ".claude1"
+        scan = cast(Callable[..., accounts.LocalRoleSessions], getattr(accounts, "_observed_role_sessions"))
+        count = cast(Callable[..., tuple[tuple[accounts.StatusRow, ...], tuple[str, ...]]],
+                     getattr(accounts, "_count_role_sessions"))
+        live = sessions.SessionRecord(pid=100, sessionId="fixture-session", name="Unassigned",
+                                      messagingSocketPath="", updatedAt=1, tmux="", formerNames=[], status="idle")
+        with (patch.object(sessions, "sessions_dir", return_value=root / "sessions"),
+              patch.object(sessions, "read_registry", return_value=sessions.RegistryRead((), ())),
+              patch.object(sessions, "running_sessions", return_value=[live]),
+              patch.object(pane_launch, "record_directory", return_value=root / "launches"),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(accounts, "_session_config_dir", return_value=account.ConfiguredClaudeFolder(directory))):
+            observed = scan(accounts.GroupAccounts(), include_workers=False, include_models=False,
+                            model_reader=accounts.SessionModelReader())
+        row = replace(status_row("claude1"), folder=str(directory), roles=(), role_counts=(), weekly_left_percent=0)
+        rows, _ = count((row,), observed)
+        self.assertEqual((rows[0].roles, rows[0].role_counts, rows[0].sessions), ((), (), ()))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT)
+        self.assertIn('class="weekly-reset-ready"', accounts_page.board(reading))
+
+    def test_weekly_reset_scale_excludes_accounts_with_a_role_or_weekly_quota_left(self) -> None:
+        exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
+        later = AT + timedelta(days=4)
+        for excluded in (
+            replace(exhausted, label="claude2", roles=("units",), selected_roles=("units",),
+                    role_counts=(accounts.RoleSessionCounts(0, 0, 0, 0),), resets_at=later),
+            replace(exhausted, label="codex1", tool="codex", roles=("spare",), weekly_left_percent=20,
+                    role_counts=(accounts.NoRoleCount(),), resets_at=later,
+                    codex_work_readiness=agent_accounts.CodexWorkExhausted(),
+                    codex_weekly_freshness=accounts.CodexWeeklyFreshness.FRESH),
+        ):
+            with self.subTest(account=excluded.label):
+                reading = accounts.StatusReading((exhausted, excluded), (), (), timezone.utc, AT)
+                markup = accounts_page.board(reading)
+                self.assertEqual(re.findall(r'<span (class="weekly-reset-[^"]+"[^>]*)>', markup),
+                                 ['class="weekly-reset-exhausted" style="--reset-orange-weight:100%"'] * 2)
+
+    def test_weekly_reset_scale_end_is_independent_of_codex_work_readiness(self) -> None:
+        make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
+        folder = self.review_root.parent / ".codex1"
+        status = accounts.CodexStatus("~/.codex1", folder, True, True, "codex1", "fixture@example.invalid", "", (), ())
+        exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
+        at = AT.isoformat()
+        weekly = usage_store.StoredWindow(left=0, at=at, resets=(AT + timedelta(days=4)).isoformat())
+        for usage, color in (
+            (usage_store.StoredUsage(weekly=weekly), "unknown"),
+            (usage_store.StoredUsage(weekly=weekly, credits=usage_store.StoredCredits(balance="10", at=at)), "ready"),
+        ):
+            with (self.subTest(color=color),
+                  patch.object(agent_accounts, "codex_credits_setting", return_value=agent_accounts.CreditsOn())):
+                codex = make_row(status, usage, AT, ("spare",))
+                reading = accounts.StatusReading((exhausted, codex), (), (), timezone.utc, AT)
+                markup = accounts_page.board(reading)
+                self.assertEqual(re.findall(r'<span (class="weekly-reset-[^"]+"[^>]*)>', markup), [
+                    'class="weekly-reset-exhausted" style="--reset-orange-weight:50%"',
+                    f'class="weekly-reset-{color}"',
+                ])
+
+    def test_weekly_reset_scale_end_requires_a_fresh_codex_weekly_reading(self) -> None:
+        age_limit = timedelta(minutes=7)
+        _ = write_config_fixture(conf.path("accounts"), "usage_stale_minutes=7\n")
+        make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
+        folder = self.review_root.parent / ".codex1"
+        status = accounts.CodexStatus("~/.codex1", folder, True, True, "codex1", "fixture@example.invalid", "", (), ())
+        exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
+        five = usage_store.StoredWindow(left=40, at=(AT - timedelta(minutes=8)).isoformat(),
+                                       resets=(AT + timedelta(hours=2)).isoformat())
+        for observed, weight in (
+            (AT - age_limit, 50),
+            (AT - age_limit - timedelta(seconds=1), 100),
+            (AT + timedelta(seconds=1), 100),
+        ):
+            with (self.subTest(observed=observed),
+                  patch.object(agent_accounts, "codex_credits_setting", return_value=agent_accounts.CreditsOff())):
+                weekly = usage_store.StoredWindow(left=0, at=observed.isoformat(),
+                                                 resets=(AT + timedelta(days=4)).isoformat())
+                usage = usage_store.StoredUsage(weekly=weekly, five_hour=five)
+                codex = make_row(status, usage, AT, ("spare",))
+                reading = accounts.StatusReading((exhausted, codex), (), (), timezone.utc, AT)
+                markup = accounts_page.board(reading)
+                self.assertEqual(re.findall(r'<span (class="weekly-reset-[^"]+"[^>]*)>', markup), [
+                    f'class="weekly-reset-exhausted" style="--reset-orange-weight:{weight}%"',
+                    'class="weekly-reset-unknown"',
+                ])
+
+    def test_weekly_reset_scale_uses_status_after_usage_store_refresh(self) -> None:
+        home = self.review_root.parent / "home"
+        configuration = Path(os.environ["CONF_DIR"])
+        write_machine_config(configuration)
+        claude = accounts.AccountStatus("~/.claude1", home / ".claude1", True, True, True,
+                                       "claude1", "fixture-claude@example.invalid", "", (), (),
+                                       accounts.McpServerDifferences())
+        codex = accounts.CodexStatus("~/.codex2", home / ".codex2", True, True, "codex2",
+                                    "fixture-codex@example.invalid", "spare", (), ())
+        at = datetime.now(timezone.utc)
+        weekly_claude = usage_store.StoredWindow(left=0, at=at.isoformat(),
+                                                  resets=(at + timedelta(days=1)).isoformat())
+        weekly_codex = usage_store.StoredWindow(left=0, at=at.isoformat(),
+                                                 resets=(at + timedelta(days=4)).isoformat())
+        claude_key = usage_store.key("Claude", claude.login)
+        codex_key = usage_store.key("Codex", codex.login)
+        stored = {claude_key: usage_store.StoredUsage(weekly=weekly_claude),
+                  codex_key: usage_store.StoredUsage(weekly=weekly_codex)}
+
+        def refresh_store(reading: accounts.StatusReading) -> str:
+            refreshed_at = (reading.checked_at + timedelta(seconds=1)).isoformat()
+            updated = usage_store.StoredUsage(weekly={**weekly_codex, "at": refreshed_at})
+            with usage_store.read_lock():
+                usage_store.write({**stored, codex_key: updated})
+            return ""
+
+        with (scratch_account_home(home, {"USER_ZONE": "UTC"}, clear=False),
+              patch.dict(os.environ, {"CONF_DIR": str(configuration)}),
+              patch.object(role_map, "is_role_map_host", return_value=True),
+              patch.object(accounts, "account_statuses", return_value=[claude]),
+              patch.object(accounts, "codex_statuses", return_value=[codex]),
+              patch.object(accounts, "_status_workers_account",
+                           return_value=accounts.CodexWorkersAccount("codex1", home / ".codex1")),
+              patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
+              patch.object(accounts, "_read_local_role_sessions",
+                           return_value=accounts.LocalRoleSessions({}, {}, (), (), (), False, frozenset())),
+              patch.object(accounts, "_start_session_counts_fetch", return_value=False),
+              patch.object(agent_accounts, "codex_credits_setting", return_value=agent_accounts.CreditsOff()),
+              patch.object(usage_store, "load", wraps=usage_store.load) as load,
+              patch.object(accounts_page, "logins_board", side_effect=refresh_store) as refresh):
+            with usage_store.read_lock():
+                usage_store.write(stored)
+            page = accounts_page.page()
+        refresh.assert_called_once()
+        load.assert_called_once_with()
+        weights = cast(list[bytes],
+                       re.findall(rb'class="weekly-reset-exhausted" style="--reset-orange-weight:([0-9.]+)%"', page))
+        self.assertEqual(len(weights), 2)
+        self.assertAlmostEqual(float(weights[0]), 50, delta=0.01)
+        self.assertEqual(float(weights[1]), 100)
+
+    def test_weekly_reset_colors_when_resets_tie_or_expire(self) -> None:
+        exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
+        for days, expected in (
+            (1, 'class="weekly-reset-exhausted" style="--reset-orange-weight:100%"'),
+            (0, 'class="weekly-reset-unknown"'),
+            (-1, 'class="weekly-reset-unknown"'),
+        ):
+            with self.subTest(days=days):
+                first = replace(exhausted, resets_at=AT + timedelta(days=days))
+                second = replace(first, label="claude2")
+                reading = accounts.StatusReading((first, second), (), (), timezone.utc, AT)
+                markup = accounts_page.board(reading)
+                self.assertEqual(re.findall(r'<span (class="weekly-reset-[^"]+"[^>]*)>', markup), [expected] * 2)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser contrast")
+    def test_weekly_reset_colors_show_room_running_sessions_and_time_until_reset(self) -> None:
+        statusline = Path(os.environ["CONF_DIR"]) / "statusline.conf"
+        _ = statusline.write_text(statusline.read_text(encoding="utf-8") + "background.codex-pair=#7896ff\n",
+                                  encoding="utf-8")
+        exhausted = replace(status_row("claude1"), weekly_left_percent=0, roles=(), role_counts=())
+        rows = (
+            replace(exhausted, weekly_left_percent=1, resets_at=AT + timedelta(days=30)),
+            replace(exhausted, label="claude2", roles=("units",), role_counts=(accounts.RoleSessionCounts(0, 1, 0, 0),)),
+            replace(exhausted, label="claude3", resets_at=AT + timedelta(days=1)),
+            replace(exhausted, label="claude4", resets_at=AT + timedelta(days=4)),
+            replace(exhausted, label="claude5", resets_at=AT + timedelta(days=8)),
+            replace(exhausted, label="claude6", resets_at=AT + timedelta(days=13)),
+            replace(exhausted, label="codex1", tool="codex", roles=("workers",), selected_roles=("workers",),
+                    weekly_left_percent=1, codex_work_readiness=agent_accounts.CodexWorkAvailable()),
+            replace(exhausted, label="codex2", tool="codex", roles=("spare",), resets_at=AT + timedelta(days=20),
+                    codex_work_readiness=agent_accounts.CodexWorkExhausted(),
+                    codex_weekly_freshness=accounts.CodexWeeklyFreshness.FRESH),
+            replace(exhausted, label="codex3", tool="codex", weekly_left_percent=accounts.StatusUnavailable()),
+        )
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
+        probe = """<script>
+const failures=[], check=(ok,label)=>{if(!ok) failures.push(label);};
+const canvas=document.createElement('canvas').getContext('2d',{willReadFrequently:true});
+const pixel=(...colors)=>{
+ canvas.clearRect(0,0,1,1);
+ for(const color of colors){canvas.fillStyle=color;canvas.fillRect(0,0,1,1);}
+ return [...canvas.getImageData(0,0,1,1).data].slice(0,3);
+};
+const luminance=pixel=>{
+ const channels=pixel.map(value=>value/255);
+ const linear=channels.map(value=>value<=0.04045 ? value/12.92 : ((value+0.055)/1.055)**2.4);
+ return linear.reduce((sum,value,index)=>sum+value*[0.2126,0.7152,0.0722][index],0);
+};
+const contrast=(base,ink)=>(Math.max(base,ink)+0.05)/(Math.min(base,ink)+0.05);
+const background=node=>getComputedStyle(node).backgroundColor;
+const fill=cell=>pixel(background(cell.closest('.card')),background(cell.closest('tr')),background(cell.parentElement));
+try{
+ const cells=[...document.querySelectorAll('.accounts-table td > [class^=weekly-reset-]')];
+ const ready=cells.filter(cell=>cell.matches('.weekly-reset-ready'));
+ const exhausted=cells.filter(cell=>cell.matches('.weekly-reset-exhausted'));
+ const labels=spans=>spans.map(cell=>cell.closest('tr').dataset.accountRow).join(',');
+ check(labels(ready)==='claude1,claude2,codex1','Accounts with room or a running session use green.');
+ check(labels(exhausted)==='claude3,claude4,claude5,claude6,codex2','Exhausted accounts use the gradient.');
+ check(labels(cells.filter(cell=>cell.matches('.weekly-reset-unknown')))==='codex3','Unknown keeps the default color.');
+ const weightProperty='--reset-orange-weight';
+ const weights=exhausted.map(cell=>cell.style.getPropertyValue(weightProperty));
+ check(weights.join(',')==='10%,40%,60%,76.666667%,100%',
+  'The orange weight follows the time from the reading to the furthest exhausted reset.');
+ const paired=cells.filter(cell=>cell.closest('tr').matches('.auto-pair'));
+ check(labels(paired)==='codex1,codex2','The pair includes an available account and an exhausted account.');
+ for(const theme of ['light','dark']){
+  document.documentElement.dataset.theme=theme;
+  const inks=cells.map(cell=>getComputedStyle(cell.firstElementChild || cell).color);
+  const readyInks=ready.map(cell=>inks[cells.indexOf(cell)]);
+  check(new Set(readyInks).size===1 && new Set(inks).size===7,theme+' has green and five distinct gradient colors.');
+  check(fill(paired[0]).join(',')!==fill(cells[0]).join(','),theme+' has a tinted pair background.');
+  for(const state of ['default','hover','limit']){
+   for(const [index,cell] of cells.entries()){
+    const row=cell.closest('tr');
+    const tint=row.style.backgroundColor;
+    if(state==='hover') cell.parentElement.style.backgroundColor='var(--hover)';
+    if(state==='limit' && paired.includes(cell)){
+     const color=theme==='dark' ? 'white' : 'black';
+     row.style.backgroundColor='color-mix(in srgb,'+color+' TINT_PERCENT%,transparent)';
+    }
+    const base=luminance(fill(cell));
+    const ink=luminance(pixel(inks[index]));
+    const ratio=contrast(base,ink);
+    check(ratio>=4.5,[theme,row.dataset.accountRow,state,ratio.toFixed(2)].join(' '));
+    if(cell===paired[1]){
+     const savedWeight=cell.style.getPropertyValue(weightProperty);
+     for(let weight=0;weight<=100;weight++){
+      cell.style.setProperty(weightProperty,weight+'%');
+      const gradientInk=luminance(pixel(getComputedStyle(cell.firstElementChild || cell).color));
+      const gradientRatio=contrast(base,gradientInk);
+      check(gradientRatio>=4.5,[theme,state,weight+'%',gradientRatio.toFixed(2)].join(' '));
+     }
+     cell.style.setProperty(weightProperty,savedWeight);
+    }
+    cell.parentElement.style.removeProperty('background-color');
+    row.style.backgroundColor=tint;
+   }
+  }
+ }
+}catch(error){failures.push(String(error));}
+fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+</script>""".replace("TINT_PERCENT", str(accounts_page.PAIR_TINT_PERCENT))
+        page = ('<!doctype html><html><head>' + accounts_page.STYLE + '</head><body>'
+                + accounts_page.board(reading) + probe + '</body></html>').encode()
+        self.assertEqual(firefox_probe_results(page), [[]])
+
     def test_account_and_role_sort_orders_use_full_values_and_keep_missing_values_last(self) -> None:
         reading = sort_reading()
         reading = replace(reading, rows=tuple(
@@ -547,9 +1474,9 @@ window.fetch=(url,options)=>options?.method==='POST'
             with self.subTest(key=key):
                 self.assertEqual(accounts_order[key], order)
         for key, order in {
-            "role": [0, 1, 2, 3], "role-reverse": [3, 2, 1, 0],
-            "busy": [0, 1, 2, 3], "busy-reverse": [3, 0, 1, 2],
-            "idle": [3, 0, 1, 2], "idle-reverse": [2, 1, 0, 3],
+            "role": [0, 1, 2, 3, 4, 5], "role-reverse": [5, 4, 3, 0, 1, 2],
+            "busy": [0, 1, 2, 3, 4, 5], "busy-reverse": [5, 0, 1, 2, 3, 4],
+            "idle": [5, 0, 1, 2, 3, 4], "idle-reverse": [4, 3, 0, 1, 2, 5],
         }.items():
             with self.subTest(key=key):
                 self.assertEqual(roles_order[key], order)
@@ -564,42 +1491,92 @@ window.fetch=(url,options)=>options?.method==='POST'
         lines = cast(list[str], re.findall(r'<tr data-account-row="[^"]+">(.*?)</tr>', table, re.S))
         first, added, spare = (cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S)) for line in lines)
         self.assertIn(">claude1</span>", first[1])
-        self.assertIn('data-color-text="role.unit-director">units</span>', first[6])
-        self.assertIn(">producers</span>", added[6])
-        self.assertIn('data-move-account="claude1" data-move-group="producers"', added[8])
-        self.assertEqual(added[:6] + added[9:], [""] * 9)
+        self.assertIn('data-color-text="role.unit-director">units</span>', first[7])
+        self.assertIn(">producers</span>", added[7])
+        self.assertIn('data-move-account="claude1" data-move-group="producers"', added[9])
+        self.assertEqual(added[:7] + added[10:], [""] * 11)
         self.assertIn(">codex1</span>", spare[1])
-        self.assertEqual(spare[6:8], ["", ""])
+        self.assertEqual(spare[7:9], ["", ""])
         self.assertNotIn("spare", markup)
         self.assertNotIn("✓", markup)
         orders = rendered_sort_orders(markup, "accounts")
         self.assertEqual(orders["role"], [1, 0, 2])
         self.assertEqual(orders["role-reverse"], [0, 1, 2])
 
-    def test_roles_shows_the_selected_account_and_totals_with_account_details(self) -> None:
+    def test_roles_shows_each_account_and_keeps_the_total(self) -> None:
         rows = (
             replace(status_row("claude1"), roles=("units", "producers"),
-                    role_counts=(accounts.RoleSessionCounts(7, 0, 2, 1), accounts.RoleSessionCounts(0, 0, 0, 0))),
+                    role_counts=(accounts.RoleSessionCounts(7, 0, 2, 1), accounts.RoleSessionCounts(0, 0, 0, 0)),
+                    named_sessions_by_role={"units": (accounts.NamedSession("tile", "paused"),)}),
             replace(status_row("claude2"), selected_roles=("units",),
-                    role_counts=(accounts.RoleSessionCounts(2, 3, 0, 4),)),
+                    role_counts=(accounts.RoleSessionCounts(2, 3, 0, 4),),
+                    named_sessions_by_role={"units": (accounts.NamedSession("report", "exited"),)}),
             replace(status_row("claude3"), roles=("producers",), selected_roles=("producers",),
                     role_counts=(accounts.RoleSessionCounts(8, 0, 0, 0),)),
         )
-        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
+                                         first_next_moves=first_moves(claude_move("units", "claude1")))
+        markup = accounts_page.board(reading)
         roles_table = markup.split('<h2>Roles</h2>', 1)[1]
-        units = roles_table.split(">units</span>", 1)[1].split("</tr>", 1)[0]
-        self.assertIn(">claude2</span></td>", units)
-        self.assertNotIn(">claude1</span>", units)
-        cells = re.findall(r'<td class="right" [^>]*data-role-counts="([^"]+)">([0-9]+)</td>', NOT_RUNNING_SLOT.sub("", units))
-        self.assertEqual(cells, [
-            (f"claude2: {selected}\nclaude1: {observed}", str(selected + observed))
-            for selected, observed in ((2, 7), (3, 0), (9, 10))
-        ])
+        units, other, _ = roles_table.split(">units</span>", 1)[1].split("</tr>", 2)
+        self.assertIn('data-color-text="account.claude2">claude2</span></td>', units)
+        self.assertIn('<td class="left next-cell"><span class="default bold" style="color:#af875f" '
+                      + 'data-color-text="account.claude1">claude1</span></td>', units)
+        self.assertTrue(other.startswith('<tr>' + '<td class="left"></td>' * 3))
+        self.assertIn('<span class="default bold" style="color:#af875f">claude1</span>', other)
+        self.assertIn('<td class="left next-cell"><span class="next-muted">none</span></td>', other)
+        self.assertNotIn("data-color-text", other)
+        self.assertNotIn("data-role-counts", units + other)
+        self.assertIn("4 not running: 4 exited (report, 3 names unknown)", units)
+        self.assertIn("3 not running: 2 paused (tile, 1 name unknown), 1 exited (names unknown)", other)
+        for row, expected in ((units, ["2", "3", "9"]), (other, ["7", "0", "10"])):
+            self.assertEqual(re.findall(r'<td class="right">(.*?)</td>', NOT_RUNNING_SLOT.sub("", row)), expected)
+        total = roles_table.split("<tr data-summary>", 1)[1].split("</tr>", 1)[0]
+        self.assertEqual(re.findall(r'<td class="right">(.*?)</td>', NOT_RUNNING_SLOT.sub("", total)),
+                         [f'<span class="default">{value}</span>' for value in (17, 3, 27)])
         orders = rendered_sort_orders(markup, "roles")
-        self.assertEqual(orders["busy"][:2], [2, 0])
-        self.assertEqual(orders["busy-reverse"][:2], [0, 2])
+        self.assertEqual(orders["busy"][:3], [2, 3, 0])
+        self.assertEqual(orders["busy-reverse"][:3], [0, 2, 3])
         producers = roles_table.split(">producers</span>", 1)[1].split("</tr>", 1)[0]
         self.assertNotIn("data-role-counts", producers)
+
+    def test_roles_count_sorts_rank_the_whole_role(self) -> None:
+        rows = (
+            replace(status_row("claude1"), selected_roles=("units",),
+                    role_counts=(accounts.RoleSessionCounts(3, 2, 0, 0),)),
+            replace(status_row("claude2"), role_counts=(accounts.RoleSessionCounts(20, 12, 0, 0),)),
+            replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",),
+                    role_counts=(accounts.RoleSessionCounts(18, 10, 0, 0),)),
+        )
+        markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
+        orders = rendered_sort_orders(markup, "roles")
+        for column in ("busy", "idle", "total"):
+            with self.subTest(column=column):
+                self.assertEqual(orders[column], [2, 3, 4, 0, 1])
+                self.assertEqual(orders[column + "-reverse"], [4, 2, 3, 0, 1])
+
+    def test_roles_orders_other_accounts_by_count_then_label(self) -> None:
+        rows = tuple(replace(status_row(label), selected_roles=("units",) if label == "claude4" else (),
+                             role_counts=(accounts.RoleSessionCounts(count, 0, 0, 0),))
+                     for label, count in (("claude1", 6), ("claude2", 11), ("claude3", 6),
+                                          ("claude4", 0), ("claude5", 0)))
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT)
+        roles = accounts_page.board(reading).split('aria-label="Roles"', 1)[1].split("</table>", 1)[0]
+        self.assertEqual(re.findall(r">(claude\d+)</span>", roles), ["claude4", "claude2", "claude1", "claude3"])
+        self.assertNotIn("role-count-units-", roles)
+
+    def test_a_role_with_one_account_keeps_its_row(self) -> None:
+        reading = accounts.StatusReading((replace(status_row("claude1"), selected_roles=("units",)),), (),
+                                         (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
+        roles = accounts_page.board(reading).split('aria-label="Roles"', 1)[1].split("</table>", 1)[0]
+        units = roles.split(">units</span>", 1)[1].split("</tr>", 1)[0]
+        self.assertEqual(roles.count("<tr>"), 5)
+        self.assertIn('data-color-text="account.claude1">claude1</span>', units)
+        self.assertIn('data-color-key="role.unit-director"', units)
+        self.assertIn('aria-label="units busy sessions, last 24 hours"', units)
+        self.assertIn('<td class="left next-cell"><span class="next-muted">none</span></td>', units)
+        self.assertEqual(re.findall(r'<td class="right">(.*?)</td>', NOT_RUNNING_SLOT.sub("", units)), ["1", "0", "1"])
+        self.assertNotIn("data-role-counts", units)
 
     def test_unassigned_role_keeps_observed_counts(self) -> None:
         reading = accounts.StatusReading((status_row("claude1"),), (), (), timezone.utc, AT)
@@ -617,12 +1594,11 @@ window.fetch=(url,options)=>options?.method==='POST'
         )
         markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT))
         roles_table = markup.split('aria-label="Roles"', 1)[1]
-        units = roles_table.split(">units</span>", 1)[1].split("</tr>", 1)[0]
-        cells = re.findall(r'<td class="right" [^>]*data-role-counts="([^"]+)">([^<]*)</td>', NOT_RUNNING_SLOT.sub("", units))
-        self.assertEqual(cells, [
-            (f"claude2: {count}\nclaude1: unknown", value)
-            for count, value in ((2, ""), (0, ""), (3, "unknown"))
-        ])
+        primary, other, _ = roles_table.split(">units</span>", 1)[1].split("</tr>", 2)
+        self.assertEqual(re.findall(r'<td class="right">(.*?)</td>', NOT_RUNNING_SLOT.sub("", primary)), ["2", "0", "3"])
+        cells = re.findall(r'<td class="right" [^>]*data-role-counts="([^"]+)">([^<]*)</td>',
+                           NOT_RUNNING_SLOT.sub("", other))
+        self.assertEqual(cells, [("claude1: unknown", ""), ("claude1: unknown", ""), ("claude1: unknown", "unknown")])
 
     def test_roles_next_column_shows_each_target_as_text_without_a_control(self) -> None:
         rows = (
@@ -631,7 +1607,7 @@ window.fetch=(url,options)=>options?.method==='POST'
             replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
         )
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
-                                         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2"}))
+                                         first_next_moves=first_moves(claude_move("units", "claude2")))
         markup = accounts_page.board(reading)
         account_table, roles_table = markup.split('aria-label="Roles"', 1)
         self.assertIn('data-next-button', account_table)
@@ -682,7 +1658,10 @@ window.fetch=(url,options)=>options?.method==='POST'
         for row in rows[:-1]:
             cells = cast(list[str], re.findall(r"<td[^>]*>(.*?)</td>", row, re.S))
             self.assertEqual(len(cells), 8)
-            self.assertTrue(cells[2].startswith('<svg class="busy-line" width="288" height="35" viewBox="-4 0 296 35" role="img"'))
+            if cells[0]:
+                self.assertTrue(cells[2].startswith('<svg class="busy-line" width="288" height="35" viewBox="-4 0 296 35" role="img"'))
+            else:
+                self.assertEqual(cells[:3], ["", "", ""])
         summary = cast(list[str], re.findall(r'<td class="[^"]+">(.*?)</td>', rows[-1], re.S))
         self.assertEqual(len(summary), 8)
         self.assertEqual(summary[1:5], [""] * 4)
@@ -764,7 +1743,7 @@ window.fetch=(url,options)=>options?.method==='POST'
                                                       accounts.NamedSession("fix2", "exited"),
                                                       accounts.NamedSession("busy-unit", "busy"))}),
             replace(status_row("claude2"), roles=("showrunners",), selected_roles=("showrunners",)),
-            # The Mac sends counts without names.
+            # The local worker count has no session names.
             replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",),
                     role_counts=(accounts.RoleSessionCounts(0, 0, 2, 0),)),
         )
@@ -797,7 +1776,7 @@ window.fetch=(url,options)=>options?.method==='POST'
                         weekly_left_percent=30),
                 replace(status_row("codex2"), tool="codex", roles=("workers",), selected_roles=("workers",),
                         weekly_left_percent=20))
-        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
 
         def left(*percents: float | accounts.StatusUnavailable) -> accounts.StatusReading:
             return replace(reading, rows=(rows[0], *(replace(row, weekly_left_percent=percent)
@@ -835,7 +1814,8 @@ window.fetch=(url,options)=>options?.method==='POST'
         for invalid in ("#12345", "not-a-color", ""):
             with self.subTest(color=invalid):
                 self.assertEqual([style for style, _, _ in pair(reading, invalid)], ["", ""])
-        targeted = replace(reading, first_next_moves=accounts.FirstNextMoveTargets({"workers": "claude1"}))
+        worker_target = next_moves.WorkersToClaude(next_moves.ClaudeWorkersTarget("claude1"))
+        targeted = replace(reading, first_next_moves=first_moves(next_moves.WorkersMove("fixture", 1, worker_target, AT)))
         self.assertNotIn("auto-pair", accounts_page.board(targeted))
         self.assertIn("tr.auto-pair+tr.auto-pair td{border-top-color:transparent}", accounts_page.STYLE)
 
@@ -847,7 +1827,7 @@ window.fetch=(url,options)=>options?.method==='POST'
                         named_sessions_by_role={"units": (accounts.NamedSession("tile", "paused"),)}),
                 replace(status_row("codex1"), tool="codex", roles=("spare",), role_counts=(accounts.NoRoleCount(),)),
                 replace(status_row("codex2"), tool="codex", roles=("workers",), selected_roles=("workers",)))
-        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
         with patch.object(accounts, "read_status", return_value=reading):
             page = accounts_page.page().decode()
         # The refreshed reading drains both Codex accounts, so the pair text changes.
@@ -912,11 +1892,12 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
     def test_each_table_has_its_own_default_and_focusable_sort_headers(self) -> None:
         markup = accounts_page.board(sort_reading())
         self.assertEqual(re.findall(r'data-account-sort="([^"]+)"', markup),
-                         ["account", "left", "used / hour", "empty at", "role", "next", "resets", "credits", "enabled"])
+                         ["account", "left", "Fable left", "used / hour", "empty at", "role", "next",
+                          "resets", "reset count", "credits", "enabled"])
         self.assertEqual(re.findall(r'data-role-sort="([^"]+)"', markup),
                          ["role", "account", "next", "busy", "idle", "total"])
-        self.assertEqual(len(re.findall(r'<th [^>]*tabindex="0"', markup)), 15)
-        self.assertEqual(markup.count('class="sort-arrow"'), 15)
+        self.assertEqual(len(re.findall(r'<th [^>]*tabindex="0"', markup)), 17)
+        self.assertEqual(markup.count('class="sort-arrow"'), 17)
         self.assertIn('<th class="left">busy, last 24 h</th>', markup)
         self.assertIn('data-account-sort="account" tabindex="0" aria-sort="ascending"', markup)
         self.assertIn('data-role-sort="role" tabindex="0" aria-sort="ascending"', markup)
@@ -929,22 +1910,27 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
             replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
         )
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
-                                         first_next_moves=accounts.FirstNextMoveTargets({"units": "claude3"}))
+                                         first_next_moves=first_moves(claude_move("units", "claude3")))
         orders = rendered_sort_orders(accounts_page.board(reading), "accounts")
 
         self.assertEqual(orders["next"], [3, 1, 0, 2])
         self.assertEqual(orders["next-reverse"], [0, 1, 3, 2])
 
     def test_weekly_forecast_columns_use_recent_history_for_both_tools(self) -> None:
+        lookback = 50
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+
         def history(used: float, rate: float, age_minutes: int = 0) -> list[run_out.Reading]:
-            return [run_out.Reading(AT - timedelta(minutes=age_minutes + 10 * step), used - rate * step / 6)
-                    for step in range(12, -1, -1)]
+            ages = (*range(age_minutes, lookback, 10), lookback, lookback + 10)
+            return [run_out.Reading(AT - timedelta(minutes=age),
+                                    used - rate * (age - age_minutes) / 60 - max(0, age - lookback) / 10)
+                    for age in reversed(ages)]
 
         rows = (
             status_row("claude1"),
             replace(status_row("claude2"), resets_at=AT + timedelta(hours=3)),
             status_row("claude3"),
-            status_row("claude4"),
+            replace(status_row("claude4"), read_at=AT - timedelta(minutes=16)),
             replace(status_row("codex1"), tool="codex"),
             replace(status_row("codex2"), tool="codex", resets_at=accounts.StatusUnavailable()),
         )
@@ -965,12 +1951,12 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
             with self.subTest(account=row.label):
                 cells = cast(list[str], re.findall(r'<td[^>]*>(.*?)</td>', line, re.S))
                 self.assertIn(f">{row.label}</span>", cells[1])
-                self.assertEqual(re.sub(r"<[^>]+>", "", cells[4]), rate)
-                self.assertEqual(re.sub(r"<[^>]+>", "", cells[5]), empty)
+                self.assertEqual(re.sub(r"<[^>]+>", "", cells[5]), rate)
+                self.assertEqual(re.sub(r"<[^>]+>", "", cells[6]), empty)
                 if row.label == "claude2":
-                    self.assertIn('title="Quota lasts until the weekly reset."', cells[5])
+                    self.assertIn('title="Quota lasts until the weekly reset."', cells[6])
                 if rate == "—":
-                    for cell in cells[4:6]:
+                    for cell in cells[5:7]:
                         self.assertIn('title="No usage rate is available."', cell)
         order = rendered_sort_orders(markup, "accounts")
         self.assertEqual(order["used / hour"], [5, 0, 1, 4, 2, 3])
@@ -993,8 +1979,61 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
         self.assertEqual(table.count('title="No usage rate is available."'), 4)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
-    def test_sort_controls_reverse_and_persist_through_refresh(self) -> None:
+    def test_an_open_page_reloads_for_a_newer_script_after_a_visible_edit_or_save_ends(self) -> None:
+        _ = write_config_fixture(Path(os.environ["CONF_DIR"]) / "review_links.conf",
+                                 "page_refresh_seconds=15\naccounts_page_seconds=30\npage_request_timeout_seconds=5\n")
         with patch.object(accounts, "read_status", return_value=sort_reading()):
+            content = accounts_page.page()
+        rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,)).decode()
+        self.assertEqual(rendered.count(f'data-script-version="{accounts_page.SCRIPT_VERSION}"'), 1)
+        # A newer server's layout that this script cannot sort: the same entries made the old script throw
+        # "insertBefore: parameter 1 is not of type 'Node'" on every update.
+        newer = re.sub(r'(data-sort-table="roles" data-sort-default="role" data-sort-orders=")[^"]*"',
+                       lambda match: match.group(1) + html.escape(json.dumps({"role": [{"index": 0, "details": True}]})) + '"',
+                       rendered.replace(accounts_page.SCRIPT_VERSION, "newer-script"), count=1)
+        self.assertNotEqual(newer, rendered.replace(accounts_page.SCRIPT_VERSION, "newer-script"))
+        setup = "<script>localStorage.removeItem('roles-sort');Date.now=()=>200000;</script>"
+        newer_reply = "()=>Promise.resolve({ok:true,text:async()=>NEWER_PAGE})".replace(
+            "NEWER_PAGE", json.dumps(newer).replace("</", "<\\/"))
+        # The page has no text field of its own, so the probe adds one.
+        place = ("document.querySelector('[data-accounts]').before(document.createElement('textarea'));"
+                 + "scrollTo({top:120,behavior:'instant'});")
+        page = rendered.replace("<script>", setup + "<script>", 1)
+        draft = "type(document.querySelector('textarea'),'typed words');"
+        with self.subTest(hold="a visible draft"):
+            self.assertEqual(newer_script_reload_results(
+                page, newer=newer_reply, place=place, start=draft,
+                end="type(document.querySelector('textarea'),'');"), [[]])
+        with self.subTest(hold="none, for a hidden draft"):
+            self.assertEqual(newer_script_reload_results(
+                page, newer=newer_reply, place=place, holds=False,
+                start=draft + "document.querySelector('textarea').hidden=true;"), [[]])
+        with self.subTest(hold="a color save that never answers"):
+            save = """
+  const timeout=AbortSignal.timeout, saveDeadline=new AbortController();
+  AbortSignal.timeout=()=>saveDeadline.signal;
+  try{
+   document.querySelector('[data-color-key="account.claude1"]').click();
+   type(document.querySelector('#account-color-value'),'#123456');
+   document.querySelector('[data-color-picker] [data-color-save]').click();
+  }finally{AbortSignal.timeout=timeout;}
+  check(!document.querySelector('[data-color-picker]').open,'the save closes the color dialog');
+"""
+            # Report failures before navigation clears the probe state.
+            release = """
+  if(failures.length) throw new Error('The save hold checks failed.');
+  saveDeadline.abort(new DOMException('The save timed out.','TimeoutError'));
+"""
+            self.assertEqual(newer_script_reload_results(
+                page, newer=newer_reply, place=place, start=save, saves=True, end=release), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
+    def test_sort_controls_reverse_and_persist_through_refresh(self) -> None:
+        reading = sort_reading()
+        reading = replace(reading, rows=tuple(replace(row, roles=(*row.roles, "units"),
+            role_counts=(*row.role_counts, accounts.RoleSessionCounts(9, 0, 0, 0))) if row.label == "claude2"
+            else row for row in reading.rows))
+        with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         rendered = accounts_page.AccountsRender(content, .1, 200).with_recent_times((.1,)).decode()
         setup = '''<script>
@@ -1014,6 +2053,15 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   .map(row=>row.cells[index].textContent).filter(Boolean).join(',');
  const direction=node=>node.getAttribute('aria-sort');
  const activate=(node,key)=>node.dispatchEvent(new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true}));
+ const checkUnits=()=>{
+  const units=rows('roles').find(row=>row.cells[0].textContent==='units');
+  const other=units?.nextElementSibling;
+  check(units?.cells[3].textContent==='claude1' && units.cells[5].textContent==='2' &&
+   other?.cells[3].textContent==='claude2' && other.cells[5].textContent==='9' &&
+   [...other.cells].slice(0,3).every(cell=>!cell.firstChild),
+   'the second units account stays under the selected row');
+  check(rows('roles').at(-1).hasAttribute('data-summary'),'the roles summary remains last');
+ };
  try{
   frameElement.style.width='1280px';frameElement.style.height='520px';await flush();
   const cards=['accounts','roles','models'];
@@ -1027,6 +2075,7 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   }
   const defaultAccounts='claude1,claude2,claude3,codex1,codex2';
   check(labels('accounts',1)===defaultAccounts,'the default shows each account label once');
+  checkUnits();
   const account=header('accounts','account');
   account.click();
   check(direction(account)==='descending' && labels('accounts',1)==='codex2,codex1,claude3,claude2,claude1',
@@ -1053,11 +2102,14 @@ window.fetch=()=>{reads++;return Promise.resolve({ok:true,text:async()=>FRESH_PA
   check(reads>0 && table('accounts')!==oldTable,'refresh replaces the tables');
   check(labels('accounts',1)===sortedAccounts && direction(header('roles','busy'))==='ascending',
    'refresh preserves the sort in both tables');
+  checkUnits();
   for(const name of ['accounts','roles']){
    for(const node of table(name).querySelectorAll('th[aria-sort]')){
     node.click();
+    checkUnits();
     const first=direction(node);
     node.click();
+    checkUnits();
     check(first!=='none' && first!==direction(node),name+' header reverses');
     const tables=[...table(name).querySelectorAll('th[aria-sort]')];
     check(tables.filter(other=>direction(other)!=='none').length===1,name+' keeps one active sort');
@@ -1138,12 +2190,12 @@ try{
  check(!other.isConnected && restored.textContent==='2' && document.activeElement===restored &&
    !tooltip.hidden && tooltip.textContent==='high-unit\nnew-unit',
    'refresh restores focus and the tooltip for the same model, effort and column');
- const busy=document.querySelector('#role-count-units-busy');
+ const busy=document.querySelector('#role-count-workers-busy');
  busy.scrollIntoView({block:'center'});
  busy.focus({preventScroll:true});
  busy.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));
- check(busy.textContent==='13' && !tooltip.hidden && tooltip.textContent==='claude1: 6\nclaude2: 7',
-   'focus shows the count for each account');
+ check(!busy.textContent && !tooltip.hidden && tooltip.textContent==='claude1: unknown',
+   'focus explains the missing count on the unassigned role');
  check(getComputedStyle(tooltip).textAlign==='right','account counts align to the right');
 }catch(error){failures.push(String(error));}
 realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
@@ -1205,16 +2257,17 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
   check(rows()[0].cells[4].querySelector('.inactive').textContent==='0','zero has a muted tone');
   check(table().querySelectorAll('[data-color-key="model.claude-opus-5-5"]').length===1,'each model has one swatch');
   check(header('model').getAttribute('aria-sort')==='ascending','model ascending is the default');
+  const labelBox=span=>box(span.querySelector('span:not(.sort-arrow)') ??
+   [...span.childNodes].find(node=>node.nodeType===Node.TEXT_NODE));
   const layout=key=>{
    const cell=header(key), right=cell.classList.contains('right');
-   const label=box([...cell.querySelector('.sort-label').childNodes].find(node=>node.nodeType===Node.TEXT_NODE));
+   const label=labelBox(cell.querySelector('.sort-label'));
    const value=box(rows().map(row=>row.cells[cell.cellIndex]).find(item=>item.textContent));
    const arrow=cell.querySelector('.sort-arrow').getBoundingClientRect();
    const edge=right ? 'right' : 'left';
    check(Math.abs(label[edge]-value[edge])<=1,key+' header aligns with the values');
    check(right ? arrow.right<label.left : arrow.left>label.right,key+' arrow is on the correct side');
-   const labels=[...table().querySelectorAll('.sort-label')].map(span=>box(
-    [...span.childNodes].find(node=>node.nodeType===Node.TEXT_NODE)));
+   const labels=[...table().querySelectorAll('.sort-label')].map(labelBox);
    check(labels.every(other=>arrow.right<=other.left || arrow.left>=other.right),key+' arrow clears the labels');
    const scroll=table().parentElement;
    check(scroll.scrollWidth===scroll.clientWidth,key+' fits at 1280px');
@@ -1313,10 +2366,11 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
                              credits=123, use_credits=True)
                      if row.label == "claude1" else replace(row, selected_roles=()) for row in reading.rows)
         reading = replace(reading, rows=rows,
-                          first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2", "showrunners": "claude3"}))
+                          first_next_moves=first_moves(claude_move("units", "claude2"),
+                                                      claude_move("showrunners", "claude3")))
         with patch.object(accounts, "read_status", return_value=reading):
             rendered = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
-        fresh = replace(reading, first_next_moves=accounts.FirstNextMoveTargets({"units": "claude3"}))
+        fresh = replace(reading, first_next_moves=first_moves(claude_move("units", "claude3")))
         with patch.object(accounts, "read_status", return_value=fresh):
             refreshed = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
         setup = '''<script>
@@ -1338,14 +2392,14 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
   const units=group('units'), showrunners=group('showrunners');
   check(target(units)==='claude2' && target(showrunners)==='claude3','the two roles have distinct next targets');
   const nextHeader=table().querySelector('[data-account-sort="next"]');
-  const details=row=>[...row.cells].filter(cell=>cell.cellIndex<6 || cell.cellIndex>8).map(cell=>cell.innerHTML);
+  const details=row=>[...row.cells].filter(cell=>cell.cellIndex<7 || cell.cellIndex>9).map(cell=>cell.innerHTML);
   const shown=details(units);
   const empty=Array(shown.length).fill('');
   check(JSON.stringify(details(showrunners))===JSON.stringify(empty),'the added row starts with no account data');
   const button=next(units).querySelector('[data-next-button]');
   button.click();
-  const menu=document.querySelector('[data-move-menu]');
-  check(!menu.hidden && nextHeader.getAttribute('aria-sort')==='none'
+  const menu=document.querySelector('[data-move-dialog]');
+  check(menu.open && nextHeader.getAttribute('aria-sort')==='none'
    && rows().every((row,index)=>row===original[index]),'the next button preserves the sort');
   menu.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
   nextHeader.click();
@@ -1357,7 +2411,7 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
   check(JSON.stringify(details(showrunners))===JSON.stringify(shown) &&
    JSON.stringify(details(units))===JSON.stringify(empty),'the account data moves to the first row of the group');
   const markup=new Map(original.map(row=>[row,next(row)?.innerHTML]));
-  for(const column of ['account','role','next','left','used / hour','empty at','resets','credits','enabled']){
+  for(const column of ['account','role','next','left','Fable left','used / hour','empty at','resets','reset count','credits','enabled']){
    const header=table().querySelector('[data-account-sort="'+column+'"]');
    for(let direction=0;direction<2;direction++){
     header.click();
@@ -1385,7 +2439,7 @@ window.fetch=async()=>({ok:true,text:async()=>FRESH_PAGE});
     def test_sort_reads_saved_choices_and_handles_unavailable_storage(self) -> None:
         with patch.object(accounts, "read_status", return_value=sort_reading()):
             content = accounts_page.AccountsRender(accounts_page.page(), .1, 200).with_recent_times((.1,)).decode()
-        for saved, denied in (("left", False), ("unknown", False), ("left", True)):
+        for saved, denied in (("left", False), ("resets", False), ("unknown", False), ("left", True)):
             with self.subTest(saved=saved, denied=denied):
                 setup = '''<script>
 Date.now=()=>200000;const realFetch=fetch;
@@ -1396,13 +2450,15 @@ if(DENIED) Object.defineProperty(window,'localStorage',{get:()=>{throw new Error
 const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
 try{
  const selected=document.querySelector('th[aria-sort="ascending"]');
- check(selected?.dataset.accountSort===EXPECTED_COLUMN,'the stored choice or default renders');
+ const key=EXPECTED_COLUMN;
+ check(selected?.dataset.accountSort===key,'the stored choice or default renders');
+ if(key==='resets') check(selected.textContent.includes('weekly reset'),'the saved reset sort still uses the date');
  document.querySelector('[data-role-sort="busy"]').click();
  check(document.querySelector('[data-role-sort="busy"]').getAttribute('aria-sort')==='descending',
   'sorting works when the storage write fails');
 }catch(error){failures.push(String(error));}
 realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
-</script>'''.replace("EXPECTED_COLUMN", json.dumps("left" if saved == "left" and not denied else "account"))
+</script>'''.replace("EXPECTED_COLUMN", json.dumps(saved if saved in ("left", "resets") and not denied else "account"))
                 page = content.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>")
                 self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
@@ -1465,7 +2521,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                     _ = config.write_text(f"account.claude1={value}\n" if value else "# no account key\n")
                     markup = accounts_page.board(reading)
                     style = f' style="color:{expected}" data-color-text="account.claude1"' if expected else ""
-                    self.assertIn(f'<span class="default bold"{style}>claude1</span>', markup)
+                    self.assertIn(f'<span title="fixture@example.invalid" class="default bold"{style}>claude1</span>', markup)
                     self.assertNotIn("position:fixed", markup)
                     self.assertNotIn("<script>", markup)
                     self.assertEqual('aria-label="Change claude1 color"' in markup, bool(expected))
@@ -1535,7 +2591,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         self.assertEqual(markup.count("data-move-group="), 1)
         targets = json.dumps([["claude1", "60%", "#af875f", "default"], ["claude2", "12%", "#b294bb", "warning"]])
         self.assertIn('data-move-percent="1"', markup)
-        self.assertIn(f'data-move-targets="{html.escape(targets, quote=True)}">', markup)
+        self.assertIn(f'data-move-targets="{html.escape(targets, quote=True)}"', markup)
         settings = Path(os.environ["CONF_DIR"]) / "accounts.conf"
         _ = write_config_fixture(settings, "next_move_percent=2.5\n")
         self.assertIn('data-move-percent="2.5"', accounts_page.board(reading))
@@ -1545,7 +2601,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 status_row("claude2"),
                 replace(status_row("codex1"), tool="codex", roles=("producers",)))
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
-            first_next_moves=accounts.FirstNextMoveTargets({"producers": "claude2"}))
+            first_next_moves=first_moves(claude_move("producers", "claude2")))
         markup = accounts_page.board(reading)
         self.assertIn('data-move-account="claude1" data-move-group="producers"', markup)
         self.assertIn('data-next-target="claude2" data-move-account="claude1" data-move-group="producers"', markup)
@@ -1555,7 +2611,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         row = replace(status_row("claude1"), roles=("showrunners", "producers"),
                       selected_roles=("showrunners", "producers"), inherited_roles=("producers",))
         reading = accounts.StatusReading((row,), (), (), timezone.utc, AT,
-                                         first_next_moves=accounts.FirstNextMoveTargets())
+                                         first_next_moves=accounts.FirstNextMoveEntries())
         markup = accounts_page.board(reading)
         self.assertIn('data-move-account="claude1" data-move-group="producers"', markup)
         self.assertIn('> (inherited)</span>', markup)
@@ -1566,8 +2622,9 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 status_row("claude2"), replace(status_row("claude3"), roles=("spare",)),
                 replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)),
                 replace(status_row("codex2"), tool="codex", roles=("spare",)))
-        for first in (accounts.FirstNextMoveTargets({"units": "claude2", "workers": "codex2"}),
-                      accounts.FirstNextMoveTargets(), accounts.NextMovesUnavailable("fixture damaged log")):
+        worker_move = next_moves.WorkersMove("workers-fixture", 1, next_moves.CodexWorkersTarget("codex2"), AT)
+        for first in (first_moves(claude_move("units", "claude2"), worker_move),
+                      accounts.FirstNextMoveEntries(), accounts.NextMovesUnavailable("fixture damaged log")):
             with self.subTest(first=first):
                 markup = accounts_page.board(accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=first))
                 account_table, roles_table = markup.split('aria-label="Roles"', 1)
@@ -1579,13 +2636,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 self.assertEqual(len(cells), 6)
                 units, showrunners, unselected, spare, workers, codex_spare = cells
                 # With no Claude target for workers, the spare Codex account takes workers in turn and reads auto.
-                workers_auto = isinstance(first, accounts.FirstNextMoveTargets) and "workers" not in first.targets
+                workers_auto = isinstance(first, accounts.FirstNextMoveEntries) and "workers" not in first.entries
                 for cell in (unselected, spare, *(() if workers_auto else (codex_spare,))):
                     self.assertIn('title="Not the selected account for a role"', cell)
                     self.assertIn('lucide-minus', cell)
                 for cell, group in ((units, "units"), (showrunners, "showrunners")):
                     self.assertIn(f'aria-label="Choose the next account for {group}"', cell)
-                    self.assertIn('aria-haspopup="menu" aria-expanded="false"', cell)
+                    self.assertIn('aria-haspopup="dialog" aria-expanded="false"', cell)
                     self.assertIn('lucide-chevron-down', cell)
                 self.assertNotIn('<button', workers)
                 if isinstance(first, accounts.NextMovesUnavailable):
@@ -1594,7 +2651,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                         self.assertIn('fixture damaged log', cell)
                 else:
                     self.assertIn('>none</span>', showrunners)
-                    if first.targets:
+                    if first.entries:
                         self.assertIn('data-color-text="account.claude2">claude2</span>', units)
                         self.assertIn('style="color:#123456" data-color-text="account.codex2">codex2</span>', workers)
                     else:
@@ -1607,7 +2664,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
     def test_muted_next_cells_meet_the_contrast_floors_in_both_themes(self) -> None:
         rows = (replace(status_row("claude1"), selected_roles=("units",)), status_row("claude2"),
                 replace(status_row("codex1"), tool="codex", roles=("workers",), selected_roles=("workers",)))
-        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets())
+        reading = accounts.StatusReading(rows, (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveEntries())
         boards = accounts_page.board(reading) + accounts_page.board(replace(
             reading, first_next_moves=accounts.NextMovesUnavailable("fixture unavailable")))
         probe = '''<script>
@@ -1667,35 +2724,199 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
             with patch.object(next_moves, "read_next_moves", side_effect=next_moves.NextMoveError("fixture damaged log")):
                 self.assertEqual(accounts_page.clear_next_move("units"), accounts_page.SaveFailed("fixture damaged log"))
 
-    def test_next_move_save_checks_the_group_and_account_then_sets_the_first_entry_at_the_configured_percent(self) -> None:
+    def test_next_move_save_checks_the_group_and_account_then_sets_the_submitted_threshold(self) -> None:
         with patch.object(next_moves, "set_first_next_move") as setter:
-            self.assertEqual(accounts_page.save_next_move("workers", "claude2"),
+            self.assertEqual(accounts_page.save_next_move_settings("workers", "claude2", "2.5", "fable"),
                              accounts_page.Refused("Choose units, showrunners, or producers."))
             with patch.object(accounts, "claude_account_dir", side_effect=accounts.AccountsError("accounts: claude9 has no note")):
-                self.assertEqual(accounts_page.save_next_move("units", "claude9"),
+                self.assertEqual(accounts_page.save_next_move_settings("units", "claude9", "2.5", "fable"),
                                  accounts_page.Refused("accounts: claude9 has no note"))
             setter.assert_not_called()
         with patch.object(accounts, "claude_account_dir", return_value=Path("/nonexistent/claude2")):
             with patch.object(next_moves, "set_first_next_move") as setter:
-                self.assertEqual(accounts_page.save_next_move("showrunners", "claude2"), accounts_page.Saved())
-                setter.assert_called_once_with("showrunners", 1.0, "claude2")
+                self.assertEqual(accounts_page.save_next_move_settings("showrunners", "claude2", "2.5", "fable"),
+                                 accounts_page.Saved())
+                setter.assert_called_once_with("showrunners", 2.5, "claude2", measure=next_moves.QuotaMeasure.FABLE)
             with patch.object(next_moves, "set_first_next_move", side_effect=next_moves.NextMoveError("next: cannot set entry: busy")):
-                self.assertEqual(accounts_page.save_next_move("units", "claude2"),
+                self.assertEqual(accounts_page.save_next_move_settings("units", "claude2", "2.5", "fable"),
                                  accounts_page.SaveFailed("next: cannot set entry: busy"))
 
+    def test_move_now_leaves_the_current_targets_next_move_in_the_log(self) -> None:
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        output = home / "move.log"
+        with (scratch_account_home(home, {}, clear=True),
+              patch.object(role_map, "is_role_map_host", return_value=True),
+              patch.object(accounts, "claude_account_dir", return_value=home / ".claude2"),
+              patch.object(stop_resume, "detach", return_value=output) as detach):
+            _ = next_moves.add_next_move("units", 1, "claude2")
+            _ = next_moves.add_next_move("units", 2, "claude3")
+            before = next_moves.next_moves_file().read_bytes()
+            with patch.object(accounts, "move_group") as move:
+                self.assertEqual(accounts_page.move_group_now("units", "claude2"), accounts_page.Saved())
+                move.assert_not_called()
+            detach.assert_called_once_with(["console-group-move", "units", "claude2"], "move",
+                                           program=Path(accounts.__file__), initiator=moves.MoveInitiator.CONSOLE)
+            self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+
+            destination = accounts.MoveTargetReady(accounts.NamedAccount("claude2", home / ".claude2"), ())
+            members = accounts.GroupMoveMembers((), (), False, frozenset())
+            with (patch.object(accounts, "check_move_target", return_value=destination),
+                  patch.object(accounts, "group_transition", return_value=accounts.NoGroupTransition()),
+                  patch.object(accounts, "group_move_members", return_value=members),
+                  patch.object(accounts, "set_group_account") as select):
+                self.assertEqual(accounts.main(["console-group-move", "--log", str(output),
+                                                "--requester", "", "units", "claude2"]), 0)
+            select.assert_called_once_with("units", "claude2", why="units moved by hand",
+                                           keep_claim=ANY, reuse_current=True, prepare=ANY)
+            self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+
+    def test_two_detached_group_starts_refuse_the_second_before_selection(self) -> None:
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        first_log, second_log = home / "first.log", home / "second.log"
+        starts: list[list[str]] = []
+
+        def detach(arguments: list[str], _task: str, *, program: Path, initiator: moves.MoveInitiator) -> Path:
+            self.assertEqual(program, Path(accounts.__file__))
+            self.assertIs(initiator, moves.MoveInitiator.CONSOLE)
+            output = first_log if not starts else second_log
+            starts.append([arguments[0], "--log", str(output), *arguments[1:]])
+            return output
+
+        write = accounts.write_role_map
+
+        def start_second(change: role_map.RoleMapChange | role_map.WorkersClaudeRouteChange) -> None:
+            self.assertFalse(accounts.groups_file().exists())
+            self.assertEqual(moves.read_move_progress(), ())
+            self.assertEqual(accounts.main(starts[1]), 1)
+            self.assertFalse(accounts.groups_file().exists())
+            write(change)
+
+        destination = accounts.MoveTargetReady(accounts.NamedAccount("claude2", home / ".claude2"), ())
+        members = accounts.GroupMoveMembers((), (), False, frozenset())
+        with (scratch_account_home(home, {}, clear=True),
+              patch.object(role_map, "is_role_map_host", return_value=True),
+              patch.object(accounts, "claude_account_dir", return_value=home / ".claude2"),
+              patch.object(accounts, "check_move_target", return_value=destination) as check,
+              patch.object(accounts, "group_move_members", return_value=members),
+              patch.object(accounts, "write_role_map", side_effect=start_second) as selecting,
+              patch.object(stop_resume, "detach", side_effect=detach)):
+            self.assertEqual(accounts_page.move_group_now("units", "claude2"), accounts_page.Saved())
+            self.assertEqual(accounts_page.move_group_now("units", "claude3"), accounts_page.Saved())
+            self.assertEqual(len(starts), 2)
+            self.assertEqual(accounts.main(starts[0]), 0)
+            self.assertEqual(accounts.current_move_account("units"), "claude2")
+            check.assert_called_once()
+            selecting.assert_called_once()
+
+            refused, = moves.read_move_progress()
+            self.assertEqual(refused.target, "claude3")
+            self.assertIs(refused.initiator, moves.MoveInitiator.CONSOLE)
+            reason = "Another move is in progress. Try again when it ends."
+            self.assertEqual(second_log.read_text(), reason + "\n")
+            card = accounts_page.moves_board((refused,), AT, timezone.utc)
+            self.assertIn(reason, card)
+
+    def test_dialog_posts_save_clear_and_hand_move_through_the_accounts_route(self) -> None:
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+        def account_home(label: str) -> Path:
+            return home / f".{accounts.numbered_account_label(label, 'claude').label}"
+
+        class AccountsPostServer(ThreadingHTTPServer):
+            bound_address: str = "127.0.0.1"
+            mode: serve.ServerMode = serve.ServerMode.LIVE
+            accounts_cache: serve.AccountsPageCache = serve.AccountsPageCache()
+
+            def request_tailscale_address(self) -> str:
+                return self.bound_address
+
+        with (scratch_account_home(home, {}, clear=True),
+              patch.object(role_map, "is_role_map_host", return_value=True),
+              patch.object(accounts, "claude_account_dir", new=account_home),
+              AccountsPostServer(("127.0.0.1", 0), serve.ReviewLinksHandler) as server):
+            original = next_moves.add_next_move("units", 4.5, "claude4", next_moves.HalfPointHold(),
+                                                fallback_targets=("claude2", "claude3"))
+            assert isinstance(original, next_moves.ClaudeGroupMove)
+            later = next_moves.add_next_move("units", 2, "claude3")
+            other = next_moves.add_next_move("showrunners", 3, "claude2")
+            worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+            worker.start()
+
+            def post(fields: dict[str, str], *, origin: str = "same") -> tuple[int, bytes]:
+                headers = {"Content-Type": "application/x-www-form-urlencoded"}
+                if origin:
+                    headers["Origin"] = f"http://127.0.0.1:{server.server_port}" if origin == "same" else origin
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
+                try:
+                    connection.request("POST", accounts_page.PAGE_PATH, urlencode({"group": "units", **fields}), headers)
+                    response = connection.getresponse()
+                    return response.status, response.read()
+                finally:
+                    connection.close()
+
+            try:
+                settings = {"to": "claude4", "percent": "4.5", "measure": "fable"}
+                self.assertEqual(post(settings)[0], 200)
+                first, second, third = next_moves.read_next_moves()
+                assert isinstance(first, next_moves.ClaudeGroupMove)
+                self.assertNotEqual(first.id, original.id)
+                self.assertEqual(first, replace(original, id=first.id, measure=next_moves.QuotaMeasure.FABLE))
+                self.assertEqual((second, third), (later, other))
+                with redirect_stderr(io.StringIO()) as errors:
+                    status, body = post({**settings, "percent": "nan"})
+                    self.assertEqual((status, json.loads(body)), (400, {}))
+                    status, body = post({**settings, "measure": "weekly"})
+                    self.assertEqual((status, json.loads(body)), (400, {}))
+                    self.assertEqual(errors.getvalue().count("next: percent must be from 0 to 100"), 1)
+                    self.assertEqual(errors.getvalue().count("next: measure must be all-models or fable"), 1)
+                self.assertEqual(post({**settings, "move_now": "claude4"})[0], 400)
+                self.assertEqual(post({"to": "claude4"})[0], 400)
+                before = next_moves.next_moves_file().read_bytes()
+                action = {"move_now": "claude4"}
+                with patch.object(stop_resume, "detach", return_value=home / "move.log") as detach:
+                    self.assertEqual(post(action, origin="")[0], 403)
+                    self.assertEqual(post(action, origin="http://other.invalid")[0], 403)
+                    with patch.object(moves, "read_move_progress", return_value=(move_progress_fixture(),)):
+                        status, body = post(action)
+                    self.assertEqual(status, 409)
+                    self.assertEqual(json.loads(body)["state"], "move-in-progress")
+                    detach.assert_not_called()
+                    self.assertEqual(post(action)[0], 200)
+                    detach.assert_called_once_with(["console-group-move", "units", "claude4"], "move",
+                                                   program=Path(accounts.__file__), initiator=moves.MoveInitiator.CONSOLE)
+                with (patch.object(stop_resume, "detach", side_effect=OSError("fixture launch failure")),
+                      redirect_stderr(io.StringIO()) as errors):
+                    status, body = post(action)
+                    self.assertEqual((status, json.loads(body)), (503, {}))
+                    self.assertEqual(errors.getvalue().count("fixture launch failure"), 1)
+                self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
+                self.assertEqual(post({"clear": "first"})[0], 200)
+                self.assertEqual(next_moves.read_next_moves(), (later, other))
+            finally:
+                server.shutdown()
+                worker.join(TEST_HANG_GUARD_SECS)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
-    def test_the_next_button_opens_the_move_menu_and_saves_or_clears_the_chosen_account(self) -> None:
-        rows = (replace(status_row("claude1"), selected_roles=("units",)), status_row("claude2"),
+    def test_dialog_edits_each_role_and_contains_the_keyboard_focus(self) -> None:
+        rows = (replace(status_row("claude1"), selected_roles=("units",)),
+                replace(status_row("claude2"), roles=("showrunners",), selected_roles=("showrunners",)),
                 replace(status_row("claude3"), weekly_left_percent=accounts.StatusUnavailable("unavailable")),
                 replace(status_row("codex1"), tool="codex"))
+        units = next_moves.ClaudeGroupMove("unit-fixture", "units", 4.5, 0, "claude2", AT,
+                                         measure=next_moves.QuotaMeasure.FABLE)
+        runners = next_moves.ClaudeGroupMove("runner-fixture", "showrunners", 2, 0, "claude1", AT)
         reading = accounts.StatusReading(rows, (), (), timezone.utc, AT,
-            first_next_moves=accounts.FirstNextMoveTargets({"units": "claude2"}))
+            first_next_moves=first_moves(units, runners))
         with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         initial = accounts_page.AccountsRender(content, 0.5, 200).with_recent_times((0.5,)).decode()
-        with patch.object(accounts, "read_status", return_value=replace(reading, first_next_moves=accounts.FirstNextMoveTargets())):
+        with patch.object(accounts, "read_status", return_value=replace(reading, first_next_moves=accounts.FirstNextMoveEntries())):
             empty = accounts_page.page().decode()
-        probe = MENU_PROBE.replace("EMPTY_PAGE", json.dumps(empty).replace("</", "<\\/"))
+        unreadable = replace(reading, first_next_moves=accounts.NextMovesUnavailable("fixture read error"))
+        with patch.object(accounts, "read_status", return_value=unreadable):
+            unavailable = accounts_page.page().decode()
+        probe = (MOVE_DIALOG_PROBE.replace("EMPTY_PAGE", json.dumps(empty).replace("</", "<\\/"))
+                 .replace("UNAVAILABLE_PAGE", json.dumps(unavailable).replace("</", "<\\/")))
         setup = MENU_SETUP.replace("FRESH_PAGE", json.dumps(initial).replace("</", "<\\/"))
         page = initial.replace("<script>", setup + "<script>", 1).replace("</body>", probe + "</body>").encode()
         self.assertEqual(firefox_probe_results(page), [[]])
@@ -1704,13 +2925,15 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             settings = Path(temporary) / "review_links.conf"
-            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS + LOGIN_CARD_SETTINGS)
             _ = write_config_fixture(Path(temporary) / "console.conf", PAGE_STATUS_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "showrunners.conf", "mac_token.account=\n")
+            write_machine_config(Path(temporary))
             for seconds in (15, 37):
                 with self.subTest(refresh_seconds=seconds):
                     _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
                     with (patch.object(accounts, "read_status", return_value=reading) as status,
-                          patch.dict(os.environ, {"CONF_DIR": temporary})):
+                          patch.dict(os.environ, {"CONF_DIR": temporary, "USER_ZONE": "UTC"})):
                         page = accounts_page.page().decode()
                     source: object = status.call_args.kwargs["source"]  # pyright: ignore[reportAny]
                     self.assertIsInstance(source, accounts.StoredUsageOnly)
@@ -1739,13 +2962,15 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         reading = accounts.StatusReading((), (), (), timezone.utc, AT)
         with tempfile.TemporaryDirectory() as temporary:
             settings = Path(temporary) / "review_links.conf"
-            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "accounts.conf", ACCOUNT_SETTINGS + LOGIN_CARD_SETTINGS)
             _ = write_config_fixture(Path(temporary) / "console.conf", PAGE_STATUS_SETTINGS)
+            _ = write_config_fixture(Path(temporary) / "showrunners.conf", "mac_token.account=\n")
+            write_machine_config(Path(temporary))
             for seconds in (15, 37):
                 with self.subTest(refresh_seconds=seconds):
                     _ = write_config_fixture(settings, f"page_refresh_seconds={seconds}\n")
                     with (patch.object(accounts, "read_status", return_value=reading),
-                          patch.dict(os.environ, {"CONF_DIR": temporary})):
+                          patch.dict(os.environ, {"CONF_DIR": temporary, "USER_ZONE": "UTC"})):
                         page = accounts_page.page().decode()
                     assert_status_states(self, page, seconds)
 
@@ -1784,9 +3009,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
         assert_status_states(self, good.decode(), 15, failed_markup=failed.decode())
 
     def test_render_runs_the_page_in_a_child_and_names_its_failure(self) -> None:
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, b"<p>page</p>", b"")) as run:
+        diagnostics = b"fixture child warning\nreview-links: move failed: Fixture start failed.\n"
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, b"<p>page</p>",
+                                                                                       diagnostics)) as run,
+              redirect_stderr(io.StringIO()) as errors):
             self.assertEqual(accounts_page.render(), b"<p>page</p>")
         self.assertEqual(run.call_args.args[0], accounts_page.CHILD)
+        self.assertEqual(errors.getvalue(), "")
         with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess((), 0, b'<p data-page-facts></p>', b"")),
               patch.object(time, "perf_counter", side_effect=[10, 10.75]),
               patch.object(time, "time", return_value=100)):
@@ -1842,7 +3071,7 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser behavior")
     def test_refresh_obeys_visibility_and_updates_the_load_time_and_data_age(self) -> None:
         reading = accounts.StatusReading((status_row("claude1"), replace(status_row("claude2"), selected_roles=("units",))),
-            (), (), timezone.utc, AT, first_next_moves=accounts.FirstNextMoveTargets({"units": "claude1"}))
+            (), (), timezone.utc, AT, first_next_moves=first_moves(claude_move("units", "claude1")))
         with patch.object(accounts, "read_status", return_value=reading):
             content = accounts_page.page()
         initial = accounts_page.AccountsRender(content, 0.75, 200).with_recent_times((0.25, 0.75)).decode()
@@ -1894,8 +3123,8 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   const heads=headings('Accounts'), roleHeads=headings('Roles');
   check(cell===row.cells[2] && row.cells[1].contains(label()) && heads[1]==='account' && heads[2]==='' && heads[3]==='left',
    'the swatch column without a heading sits between account and left');
-  check(heads.slice(4,10).join(',')==='used / hour,empty at,role,,next,resets',
-   'Accounts puts role and next after the forecast');
+  check(heads.slice(4,12).join(',')==='Fable left,used / hour,empty at,role,,next,weekly reset,resets',
+   'Accounts keeps the quota, role, and reset columns in order');
   check(roleHeads.join(',')==='role,,busy, last 24 h,account,next,busy,idle,total',
    'Roles shows the role, its busy line, account, next and counts');
   check(getComputedStyle(cell).textAlign==='left' && getComputedStyle(swatch).marginLeft==='0px' &&
@@ -1922,6 +3151,10 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   const narrow=popup.getBoundingClientRect();
   check(narrow.left>=0 && narrow.right<=innerWidth && popup.scrollWidth<=popup.clientWidth,
    'the picker fits a narrow phone without horizontal scrolling');
+  const accountScroll=cell.closest('.scroll'), accountCard=accountScroll.closest('.card');
+  check(accountScroll.scrollWidth>accountScroll.clientWidth && getComputedStyle(accountScroll).overflowX==='auto' &&
+   accountScroll.getBoundingClientRect().right<=accountCard.getBoundingClientRect().right &&
+   document.documentElement.scrollWidth<=innerWidth,'the wide Accounts table scrolls inside its card');
   frameElement.style.width='420px';dispatchEvent(new Event('resize'));
   swatch.scrollIntoView({block:'nearest',inline:'nearest'});dispatchEvent(new Event('scroll'));
   const aligned=popup.getBoundingClientRect();
@@ -1966,10 +3199,11 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   pick('invalid');
   check(!picker.checkValidity() && action('try').disabled && action('save').disabled,
    'an invalid hex value cannot be tried or saved');
+  // A held refresh still reads the page, so it can find a newer script. It does not change the view.
   pick('#123456');timer().load();await flush();
-  check(calls===0 && label().style.color===original && swatch.style.background===originalSwatch,
-   'picking a color keeps the page unchanged without a request');
-  action('try').click();
+  check(calls===1 && swatch.isConnected && label().style.color===original && swatch.style.background===originalSwatch,
+   'a held refresh reads the page and keeps the view and the pick unchanged');
+  calls=0;action('try').click();
   check(popup.open && label().style.color==='rgb(18, 52, 86)' && swatch.style.background==='rgb(18, 52, 86)' && calls===0,
    'Try paints the account name and swatch without a request');
   check(swatch.dataset.savedColor==='#af875f','Try keeps the saved color unchanged');
@@ -2004,7 +3238,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
    !action('try').disabled && !action('save').disabled,'a failed save restores the reopened picker and its usable controls');
   check(line().textContent.includes('claude1: reopened save failed') && !line().querySelector('[data-color-save-error]').hidden,
    'a failed reopened save reports its error in the page status');
-  check(calls===0 && swatch.isConnected && state()==='Paused','the reopened dialog keeps refresh paused after a failed save');
+  check(swatch.isConnected && state()==='Paused','the reopened dialog keeps refresh paused after a failed save');
   pick('#234567');action('try').click();
   check(label().style.color==='rgb(35, 69, 103)' && swatch.style.background==='rgb(35, 69, 103)',
    'Try remains usable after the reopened save fails');
@@ -2027,7 +3261,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(form.get('key')==='account.claude1' && form.get('value')==='#123456' && [...form.keys()].length===2 &&
    saves[0].options.headers['Content-Type']==='application/x-www-form-urlencoded','Save sends the form fields');
   timer().load();dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));await flush();
-  check(calls===0 && swatch.isConnected && state()==='Paused','a pending POST holds interval and visibility refreshes');
+  check(swatch.isConnected && state()==='Paused','a pending POST holds interval and visibility refreshes');
   other.click();
   check(popup.open && picker.value===other.dataset.savedColor,'another swatch opens while a save is pending');
   picker.value='#fedcba';action('save').click();
@@ -2037,7 +3271,7 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   saves[1].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
   check(other.dataset.savedColor==='#fedcba' && otherLabel.style.color==='rgb(254, 220, 186)',
    'success stores the second account color');
-  check(calls===0 && swatch.isConnected,'refresh remains held until every POST completes');
+  check(swatch.isConnected,'refresh remains held until every POST completes');
   other.click();
   saves[0].resolve({ok:false,json:async()=>({reason:'tune: cannot publish'})});await flush();
   check(popup.open && picker.value==='#fedcba','a failed earlier save keeps another account dialog open');
@@ -2053,11 +3287,11 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   saves[2].reject(new Error('network unavailable'));await flush();
   check(other.dataset.savedColor==='#fedcba' && otherLabel.style.color==='rgb(254, 220, 186)' &&
    other.style.background==='rgb(254, 220, 186)','a network failure restores the second account prior colors');
-  check(label().style.color==='rgb(171, 205, 239)' && calls===0,'a network failure preserves another pending color and the refresh hold');
+  check(label().style.color==='rgb(171, 205, 239)' && swatch.isConnected,'a network failure preserves another pending color and the refresh hold');
   check(line().textContent.includes('claude2: network unavailable'),'the page status line reports network errors');
   swatch.click();
   saves[3].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
-  check(popup.open && swatch.dataset.savedColor==='#abcdef' && calls===0,'success keeps a newly opened chooser intact');
+  check(popup.open && swatch.dataset.savedColor==='#abcdef' && swatch.isConnected,'success keeps a newly opened chooser intact');
   action('cancel').click();
   check(label().style.color==='rgb(171, 205, 239)','Cancel retains a color that saved while the chooser was open');
   swatch.click();picker.value='#234567';action('save').click();
@@ -2071,16 +3305,16 @@ window.fetch=async()=>{calls++;return {ok:true,text:async()=>FRESH_PAGE};};
   check(popup.open && swatch.dataset.savedColor==='#234567' && label().style.color==='rgb(35, 69, 103)' &&
    swatch.style.background==='rgb(35, 69, 103)','a queued failure restores the previous successful color');
   action('cancel').click();
-  swatch.click();picker.value='#abcdef';action('save').click();
+  swatch.click();picker.value='#abcdef';action('save').click();calls=0;
   saves[6].resolve({ok:true,json:async()=>({state:'saved'})});await flush();
   check(swatch.dataset.savedColor==='#abcdef','success stores the chosen color before refresh');
   check(!popup.open && calls===1,'a successful save closes the popup and refreshes');
   const roles=[...document.querySelectorAll('[data-color-key="role.unit-director"]')];
   const roleWords=[...document.querySelectorAll('[data-color-text="role.unit-director"]')];
-  check(roles.length===3 && roleWords.length===3 &&
-   roleWords.every(word=>word.textContent==='units' && word.style.color==='rgb(215, 175, 0)') &&
-   new Set(roleWords.map(word=>word.closest('table'))).size===2,
-   'both tables show the units swatch and label');
+  const tables=nodes=>nodes.map(node=>node.closest('table').getAttribute('aria-label')).sort().join(',');
+  check(tables(roles)==='Accounts,Accounts,Roles' && tables(roleWords)==='Accounts,Accounts,Models,Roles' &&
+   roleWords.every(word=>word.textContent==='units' && word.style.color==='rgb(215, 175, 0)'),
+   'Accounts and Roles show the units swatch and all three tables show the units label');
   roles[0].click();
   check(popup.open && picker.value==='#d7af00' && popup.querySelector('#color-title').textContent==='Change units color',
    'a role swatch opens the picker with the role color');

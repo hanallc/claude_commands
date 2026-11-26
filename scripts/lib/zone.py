@@ -101,8 +101,8 @@ def describe(zone: str) -> str:
 
 
 def stored(conf: Path) -> str:
-    """The file's zone= value, or the default when the file or the line is missing."""
-    return user_zone.stored_zone(str(conf)) or user_zone.DEFAULT_ZONE
+    """Read the file's zone or recover a committed zone."""
+    return user_zone.configured_zone_name(conf)
 
 
 def _ssh(remote: str) -> subprocess.CompletedProcess[str] | str:
@@ -156,19 +156,33 @@ def drain(checkout: Path | None, *, pulled: PurePosixPath | None) -> list[str]:
     change = read_queue()
     if isinstance(change, main_publish.NoPendingMacPull):
         return []
-    for pull in change.pulls:
-        if pull.mac != pulled:
+    ssh_program = os.environ.get("ZONE_SSH") or "ssh"
+    messages: list[str] = []
+    for pull in sorted(change.pulls, key=lambda item: isinstance(item, main_publish.MacCheckoutPull)):
+        if isinstance(pull, main_publish.MacPullAwaitingPublication):
+            messages.append(f"mac {pull.mac}: rerun production promotion to record the published commit")
+            continue
+        if isinstance(pull, main_publish.ProductionMacPull):
+            outcome = main_publish.run_mac_pull(main_publish.production_pull_command(pull), ssh_program=ssh_program)
+        elif pull.mac == pulled:
+            main_publish.clear_mac_pull(pull)
+            continue
+        else:
             source = pull.source if isinstance(pull.source, Path) else checkout
             if source is None:
-                return [f"mac: the {change.label} change waits since {change.since}; run /zone on natedev"]
-            outcome = main_publish.pull_mac(source, mac=pull.mac, ssh_program=os.environ.get("ZONE_SSH") or "ssh")
-            if isinstance(outcome, main_publish.MacPullFailed):
-                return [f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}"]
-        main_publish.clear_pull_only(pull.mac)
+                messages.append(f"mac: the {change.label} change waits since {change.since}; run /zone on natedev")
+                continue
+            outcome = main_publish.pull_mac(source, mac=pull.mac, ssh_program=ssh_program)
+        if isinstance(outcome, main_publish.MacPullFailed):
+            messages.append(f"mac: the {change.label} change still waits since {change.since}: {outcome.reason}")
+            continue
+        main_publish.clear_mac_pull(pull)
+    if messages:
+        return messages
     delivered, summary = broadcast_on_mac(change.text) if change.text else (True, "no message")
     if not delivered:
         return [f"mac: pulled the {change.label} change; its message still waits: {summary}"]
-    main_publish.clear_pull_only(notice_delivered=True)
+    main_publish.clear_zone_notice(change)
     return [f"mac: took the {change.label} change queued at {change.since}; message {summary}"]
 
 
@@ -177,10 +191,7 @@ def set_zone(name: str) -> int:
     if platform.system() == "Darwin":
         raise Refusal("run /zone on natedev: the Mac pulls ~/.claude main from there")
     zone = resolve(name)
-    conf = Path(user_zone.CONF)
-    if conf.resolve() != config.path(STEM).resolve():
-        raise Refusal(f"{conf} is not the live settings file {config.path(STEM)}")
-    checkout = checkout_of(conf)
+    checkout = checkout_of(config.path(STEM))
     print(f"zone: {describe(zone)}")
     delivered = True
     label = datetime.now(ZoneInfo(zone)).tzname() or zone
@@ -217,7 +228,7 @@ def set_zone(name: str) -> int:
 
 def show() -> int:
     print(f"zone: {describe(user_zone.user_zone_name())}")
-    checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
+    checkout = None if platform.system() == "Darwin" else checkout_of(config.path(STEM))
     for line in drain(checkout, pulled=None):
         print(line)
     return 0
@@ -231,7 +242,7 @@ def main(arguments: list[str]) -> int:
             case ["set", name]:
                 return set_zone(name)
             case ["drain"] | ["drain", "--pulled", _]:
-                checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
+                checkout = None if platform.system() == "Darwin" else checkout_of(config.path(STEM))
                 pulled = PurePosixPath(arguments[2]) if len(arguments) == 3 else None
                 for line in drain(checkout, pulled=pulled):
                     print(line)

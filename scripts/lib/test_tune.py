@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import fcntl
 import shlex
-import socket
 import subprocess
 import sys
 import time
@@ -80,9 +79,14 @@ class TuneTests(PublicationTestCase):
                 'The Hana image is now stale. Build and register a current Hana image.'), expected)
 
     def test_invalid_file_key_value_or_empty_approval_refuses_without_changing_anything(self) -> None:
+        repo = self.repository
+        _ = repo.config.write_text(repo.config.read_text() + "\n# Label\nlabel=main\n")
+        _ = repo.git(repo.checkout, "commit", "-qam", "Add the label fixture")
+        _ = repo.git(repo.checkout, "push", "-q", "origin", "main")
         cases = (
             ("missing", "amount", "3", "valid reason", "approved"),
             ("example", "missing", "3", "valid reason", "approved"),
+            ("example", "AMOUNT", "3", "valid reason", "approved"),
             ("example", "amount", "0", "valid reason", "approved"),
             ("example", "amount", "11", "valid reason", "approved"),
             ("example", "amount", "bad", "valid reason", "approved"),
@@ -94,12 +98,15 @@ class TuneTests(PublicationTestCase):
             ("example", "amount", "3", "   ", "approved"),
             ("example", "amount", "3", "valid reason", ""),
             ("example", "amount", "3", "valid reason", "   "),
+            ("example", "label", "main\u2028[extra]", "valid reason", "approved"),
         )
         for file, key, value, why, approval in cases:
             with self.subTest(file=file, key=key, value=value, why=why, approval=approval):
                 before = self.snapshot()
                 result = self.run_tune(file, key, value, "--why", why, "--user-words", approval)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                if key == "AMOUNT":
+                    self.assertEqual(result.stderr, "tune: configuration key 'AMOUNT' must be lower case\n")
                 self.assertEqual(self.snapshot(), before)
                 self.assertFalse(self.repository.ssh_log.exists())
                 self.assertFalse((self.repository.root / "state").exists())
@@ -607,7 +614,7 @@ class TuneTests(PublicationTestCase):
 
     def test_ambiguous_base_key_refuses_without_a_write_and_names_both_lines(self) -> None:
         repo = self.repository
-        host = socket.gethostname().split(".", 1)[0]
+        host = conf.local_host_key_name()
         original = (
             "# whole: 1..10\namount=2\n# whole: 1..10\n"
             + f"amount.{host}=5 # host capacity\namount.{host}=8 # ignored duplicate\n"

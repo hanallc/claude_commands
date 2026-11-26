@@ -1545,7 +1545,7 @@ The `sweep.disk_floor` push body is `natedev has {free} free, below the {floor} 
 - `sweep.disk_floor_push(free: int, floor: int, choices: FolderChoices) -> RenderedPush` adds the push-only words: the measure and delete-nothing choices for the unavailable state, and `; the natedev session lists every folder.` for the insufficient state. The unavailable action is `In the natedev Claude session, reply measure or delete nothing.`
 - `sweep.fit_disk_floor_push(free, floor, choices, *, lint_settings) -> RenderedPush | NoPhoneAlert` renders the measured choices, then the unavailable form, and returns `NO_PHONE_ALERT` with a stderr line when both reach `sweep_push_text_limit`.
 - `sweep.folder_choice_lines(choices, shortfall, *, path_limit) -> list[str]` writes the session lines: one line per folder with its size and effect, the folder fact, `Delete nothing: builds can fail when the disk is full.` and `natedev checks your choice before it deletes anything.` The unavailable state has the fact, `Measure first (recommended): …` and `Delete nothing: the disk stays low and builds can fail.` `notify_floor_problem` computes the shortfall once and runs `folder_choices` once per crossing for both channels.
-- `folder_choices` returns every measured choice; the `sweep_page_paths` cut is gone. The measured list comes from the folder audit rows at depth 1-2 of at least `MIN_OUTSIDE_DIRECTORY_BYTES`.
+- `folder_choices` returns every measured choice. The folder audit lists directories at depth 1 or 2. Each listed directory meets `disk.min_outside_directory_bytes` in `config/buildlog.conf`.
 - `page_paths` and `classified_folder_choices` are deleted. The out-of-reach floor sends no phone page; holder sessions and natedev get their messages.
 - Catalog examples (longest message 285 characters): available 248, unavailable 283, insufficient 285, protected 253. Purpose: `A low-disk alert recommends one folder for natedev review.`
 
@@ -2565,7 +2565,8 @@ The cutover removal commit deletes the script after the run.
 **Spec:**
 1. Change `scripts/lint/tmp_sweep.py` and its floor callers to measurement and alarms. They delete nothing. Keep the floor take in `scripts/lint/sweep.py` on Cargo build output under `/build/cargo` and `/build/paths`.
 2. Send each eligible one-off to the maker's lock and rescue path (`build_folders`). Keep explicit maker cleanup.
-   `tmp_sweep.py --apply` (`apply_cleanup_plan()` at `scripts/lint/tmp_sweep.py:1456`, which deletes through `remove_entry()` at line 1162 and `remove_idle_entry()` at line 1185) is explicit cleanup of a saved plan: route each entry through the same maker path. Keep no direct delete in it.
+   Run `tmp_sweep.py --plan <new-plan.json>` to record each candidate and the reason for the assessment.
+   Review the list that the hourly sweep publishes through `removal_guard.py` for vetted manual removal.
 3. Retire each competing managed-folder delete path after its legacy users drain.
 4. Keep `~/.cache` out of every root. Add no cleanup tool.
 5. Unfinished trim records: `_hold_floor_pass()` runs `recover_pending_trims()` before it reads free space (`scripts/lint/sweep.py:4481`), and `TrimTake.recover()` deletes the remaining paired output (`sweep.py:2051`). Both stay, because the floor take on Cargo build output stays.
@@ -2583,7 +2584,19 @@ The cutover removal commit deletes the script after the run.
 - `impl` owns `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py` and the documentation.
 - `test` owns both test modules and the alarm, cleanup and saved-plan fixtures.
 
-**Acceptance gate:** a low-disk check keeps every fixture folder and still takes Cargo build output under `/build/cargo` and `/build/paths`; the floor alarm still sends once per crossing; explicit maker cleanup still rescues and removes an unlocked one-off; `tmp_sweep.py --apply` on a saved plan removes through the maker path and keeps a locked one; a saved `deleting` trim intent on Cargo output still finishes. Run the sweep, tmp sweep, folder audit and source enforcement tests. The full gate runs after the final migration.
+**Acceptance gate**
+
+- A low-disk check keeps every temporary fixture folder.
+- The check still takes Cargo build output under `/build/cargo` and `/build/paths`.
+- The floor alarm sends once per crossing.
+- Explicit maker cleanup rescues and removes an unlocked one-off.
+- The tmp sweep lists eligible entries for vetted manual removal.
+- The tmp sweep keeps each locked entry off the list.
+- The removal guard accepts only approved build rows for removal.
+- A saved `deleting` trim intent on Cargo output still finishes.
+
+Run the sweep, tmp sweep, folder audit and source enforcement tests.
+Run the full gate after the final migration.
 
 ### Phase 132 — hana_shot launch refuses a new app at the local app cap  · status: done
 **Source:** builds showrunner 2026-11-15 23:1x, natedev decision after the 11-15 swap peak: 8 research `hana_shot.py launch` apps on ports 15820-15827 pushed swap to 36.6 GiB at 16:15 EST. An interim step; queue's memory gate for app launches (queue phase A) replaces it.
@@ -2734,7 +2747,8 @@ The cutover removal commit deletes the script after the run.
 
 **Files:** `scripts/lib/cargo_seed.py`, `scripts/lib/test_cargo_seed.py`, `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `scripts/worktree/worktrees.py`, `scripts/worktree/test_worktrees.py`, `config/build_folders.conf`.
 
-### Phase 145 — A test step with no test history gives back its build reservation once tests run  · status: held
+### Phase 145 — A test step with no test history gives back its build reservation once tests run  · status: dropped
+**Dropped:** builds, 2026-11-20 07:48 EST. The replay showed about 1% less mean wait; the gain does not pay for the code. No code went to main.
 
 Builds assigned this on 11-18 (List item 78): it is the cause of the one-build natedev line at 00:33 EST. A nextest step with matching test history already falls to its test-phase charge when the sampler sees the test phase. A step with no matching history keeps its full build need until it ends (Nov 17: 11.85 GiB reserved, 0.17 GiB test peak).
 
@@ -3067,6 +3081,27 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - Module test: 368 tests pass with both layouts.
 - Blind review: 6 findings; 2 fixed in the row; 4 go to the next phase (growth alert keys, message limits, `sweep_proc_locks_reads`, `sweep_dep_info_head_bytes`).
 
+### Phase 142b — Mac clippy fixes, part 2 (item 142)  · status: todo
+**Source:** builds 2026-11-21 08:49 EST; List item 142, producer bob. verify handed it over at 08:50. Base: 43h tip `736dd5f62` (branch `verify-cargo-token-3`); merge the new 43h tip once. Work order: verify `phases/fix_steps/part2_work_order.md`; interfaces: verify `phases/44u/contract.md` sections 2, 5.3, 6.
+
+#### Work Order
+1. Verify captures one `CallerLintPolicy` (new `scripts/lint/caller_lint_policy.py`) and passes it with `--caller-lint-policy-file` to every remote lint step: held lint, clippy --fix, the post-fix judgment (43z F009).
+2. A skipped check is a `skipped_checks` entry and never a reusable pass (`runner_result.py`: `ResultWord` skipped, `UsableRunnerResult.skipped_checks`, decoded once in `read_result`).
+3. One Clippy pass limit and progress rule in `invoke.sh`; Verify keeps host formatting and admission.
+4. A Mac fix runs only in rewrite mode, for a repairable finding in the held path.
+5. Busy fallback releases the Mac attempt at placement, reservation and runner return.
+
+### Phase 173 — No test depends on a live tuned value (item 149)  · status: in progress
+**Source:** List item 149, producer bob, go 2026-11-19 17:06 EST through builds. Base main b4e705f34. Same class as the 2026-11-16 order ("fix the class, not the instance").
+
+#### Work Order
+1. In a test run, `write_config_fixture` and `config_environment` (`scripts/lint/memory_test_support.py`) give each inherited numeric key with a `# whole:` or `# range:` bound a different value inside that bound. A test's own settings stay as written.
+2. A failing test prints the shifted keys that it read.
+3. Add a wide bound line to each true quantity among the 39 numeric keys with no bound. Values do not change. Identifiers stay unbound and unshifted.
+4. Repair `test_sweep.py` F002, F004, F005, F006.
+5. One full suite run on natemerge's word gives the offender count and the added time. Repair the offenders in this phase.
+6. bob gets the bound list, the offender count, the added time (tell him before the merge if over 1%) and the time on main.
+
 ### Phase 177 — The folder audit never scans or removes a home folder  · status: done
 **Source:** builds, URGENT, 2026-11-19 20:24 EST. The audit removed top-level home folders on natedev (11-17) and on the Mac (11-18, 11-19). Row `e59e277e4` on main `f5eb6c184`.
 
@@ -3076,3 +3111,187 @@ Comments only: what the value controls, its unit, and its default or fallback, f
 - A test runs the real scan-root list of `main()` against a fixture home.
 - Row tests: 4 modules, both layouts, green. Blind review: 7 findings, all repaired.
 - The audit stays off. Re-arm needs the fix on main and nate's word.
+
+### Phase 143s — The ~/worktrees settings row (item 143)  · status: done
+**Source:** builds, 2026-11-20 10:35 EST: the merge checkpoint needs a review trial line for settings commit `1c76e231d`. nate approved the two values via bob (2026-11-19 about 20:10 EST) and gave natemerge his direct yes (2026-11-20).
+
+- `settings.json`: `permissions.additionalDirectories` and `sandbox.filesystem.allowWrite` name `~/worktrees` beside `~/rust`.
+- Read-only review: 0 findings. On main `168cedb541` as `24e9e2013` (bb12).
+
+### Phase 180 — AWS local folder removal under the item 152 rules  · status: done
+**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Row `5b283887e` in batch bb181f on main `cfa095c714`.
+
+- `gate_box.py` resets and cleans only the exact `<GATE_BOX_DIR>/<variant>` checkout, with no link in its path.
+- `gpu_size_trial.py` keeps earlier trials with the kept line and removes only below the current run folder. `remove_path` refuses a directory where the payload expects a file.
+- `teardown.py` `remove_gate_images` removes only a direct, unlinked `gate-image` child of the state directory.
+- A GPU run that did not start keeps its real refusal reason: with no `manifest.json`, the input removal is skipped.
+- Cloud deletions do not change: their authority is the cloud resource id.
+
+### Removals to arm again (item 152)
+Each removal below is off until the bubblewrap proof is on main and nate gives his word (nate, 2026-11-19 20:42 EST). Until then, the folders stay on disk for a manual removal with `removal_guard.py remove --list <file> --sha256 <hash>`.
+
+1. Phase 178: the tmp sweep, the build sweep (`sweep.py`) and `gate_folders_delete.py` write a list and remove nothing.
+2. Phase 177: the folder audit stays off.
+3. Phase 181: six sites keep a folder from an earlier run and print the kept line (merge gate recovery, the Mac lint-copy return, Hana shot shutdown, scratch task end, selection capture, session end).
+4. Phase 180: `gpu_size_trial.py:460` `new_trial` keeps earlier trial folders. At the re-arm it removes them again, with a marker file check that prepare writes (aws, 2026-11-20 10:15 EST; bob, 10:16 EST).
+5. The masked timers: disk-floor, tmp sweep, folder-audit, transcript-retention, tmpfiles-clean.
+6. Phase 185 (bob, 2026-11-21 09:11 EST): the Mac lint-copy close removes a copy when the caller gives the allocation id that the copy's claim wrote. Today the close needs the claim in memory, and the verify helper loses it, so live runs keep about 2 copies each (about 325 MB each, under `<target>/package`).
+
+### Phase 178 — One removal guard: the guard and the sweeps (item 152)  · status: done
+**Source:** builds for bob, item 152, 2026-11-19 20:26 EST. Row `c29ac97f5` in batch bb181f on main `cfa095c714`.
+
+- The tmp sweep, the build sweep and `gate_folders_delete.py` write a removal list and remove nothing by themselves.
+- `removal_guard.py remove --list <file> --sha256 <hash>` removes an approved list, and only folders of the five `/build` forms. A live build keeps its folder.
+- Scratch lists external Cargo output for review. The folder audit reports no space freed when it only lists output.
+- The bubblewrap (Linux) and sandbox-exec (Mac) proofs show that nothing outside the forms can go.
+
+### Phase 174 — Build folders track A: the form API and the worktree tool (item 143)  · status: in progress
+
+Source: bob accepted plan version 2 of item 143 at 17:54 EST 2026-11-19; the plan is `/tmp/claude/unit/20523639-3e08-48d6-9277-73e052bca297/phases/item143/plan.md`. Rules: `~/rust/hanadocs/bob/designs/build-folders/rules.md`.
+
+Work Order:
+1. Part 1: the form API in `scripts/lib/build_folders.py` and the new keys in `config/build_folders.conf`.
+2. Part 2: `worktrees.py make <repo> <unit> <short-name>`, the `target` link, the cargo front repair and rule 20 check, removal (rule 27), retirement (rule 28), the unit name checks, the three other makers.
+3. Part 3: the worktree move pass, old-path links, the staff path update, the transcript check, the settings lines.
+4. The main worktree of a unit or a style production has the short name `worktree` (`~/worktrees/<repo>/<unit>/worktree`, branch `<unit>-worktree`). It replaces `director` and `production`. nate, via bob, 21:54 and 21:56 EST 2026-11-19.
+
+### Phase 175 — Build folders track B: copies, the 2-day pass and the slot keys (item 143)  · status: in progress
+
+natest answered 17:59 EST (no conflict, bob reading). Work Order: plan section 6, track B, and the stall watch interface agreed with devtools 18:04 EST.
+
+### Phase 176 — Build folders track C: the other makers and the path lookups (item 143)  · status: in progress
+
+Work Order:
+1. Part 1: the call map (read-only).
+2. Part 2: the code of V6 and V13 and the path lookups of plan section 4a item 9, on the part 1 API.
+
+### Phase 181 — The five worst removal sites refuse a path outside their own form (item 152)  · status: done
+**Source:** bob, item 152, 2026-11-19 21:03 EST; the five most severe sites of the 178 removal survey. Row `1f4c4a055` on main `f5eb6c184`.
+
+- Merge gate recovery, the Mac lint-copy return, Hana shot shutdown, scratch task end and selection capture each remove only a path of their own written form. None removes after a failed check.
+- Each site keeps a folder from an earlier run and prints `kept for a manual removal list: <path> (<tool>, <reason>)`. `scratch.end` returns `list[KeptFolder]`; a remote check returns `RemoteKeptFolder`.
+- The gate recovery entry stays until the folder and its lease files are gone. Kept Hana records move to `launches/retained/` and never select a process to signal.
+- A failed publication in `copies.py` removes only the folder that the same process made.
+- Fixtures clear inherited `GIT_*`, `RIPGREP_CONFIG_PATH`, `STAFF_CONFIG`, `BASH_ENV`, `CARGO_TARGET_DIR` and `COPIES_*`, and use a private home, config and session root.
+- Row tests: 54 modules, both layouts, 108 of 108 green. Reviews: blind review, 7 closure reviews, 8 repairs.
+
+### Phase 181m — Phase 181 merge test 1: two tests expect a removal that 181 keeps (item 152)  · status: done
+**Source:** builds, bb8 result 2026-11-20 03:17 EST. Row `67163d9b6` on main `740aae528` replaces `1f4c4a055`.
+
+- The worker scratch folder and the old Mac mirror checkout are kept and listed: a later process ends them. The turn-end and old-mirror tests expect the kept folder, its contents, its end record and the exact notice.
+- The worker turn-end hook puts each kept folder in its completion details, because the native hook child discards stderr.
+- The Mac fixture uses a private `HOME`, `XDG_CONFIG_HOME` and `SCRATCH_VISIBLE_ROOT`. The gate fixture keeps natest 385's tmpfs parent and `pin_gate_root` with 181's private Git environment.
+- Row tests: 57 modules, both layouts, 114 of 114 green. Reviews: 3 closure reviews, 2 fixes and 1 rebase.
+- Fix 2, `e918e5312` in batch bb181f on main `cfa095c714`: the close hook fixture renames its status file with Python `os.replace`. Under zsh the fixture PATH has no `mv`, so the bb15 Mac gate test waited until the module limit.
+
+### Phase 182 — The AWS cost history backup (item 165)  · status: in progress
+**Source:** builds, 2026-11-20 11:44 EST (List item 165, producer bob). Plan accepted 11:47 EST with three conditions: no secret file in the backup, config keys for the paths, the interval and the Mac folder, and the nixos timer text goes to builds.
+
+- `scripts/backup/state_backup.py run` copies the approved files under `~/.local/state/build-targets/aws` to the Mac folder `~/backups/natedev/aws-state`, only when a file changed. A secret pattern in any file refuses the run. The Mac checks the sha256 of each copy.
+- `restore` unpacks one copy into an empty scratch folder only. Nothing deletes a copy.
+- One alert on a failed run. The nixos timer text is in `docs/as-built/state-backup.md`; it goes to builds with the hash.
+- Until the timer is live, one manual copy each day.
+
+### Phase 183 — A failed crate checkout check keeps the removal notice (phase 174 F027)  · status: in progress
+**Source:** phase 174 closure review F027, moved to a follow-up by the builds landing rule (2026-11-20 17:04 EST). builds 18:27 and 18:34 EST: take F027 while the merges run.
+
+- `crate_run.py` `complete_run` saves `removal_reported` before `worktrees.remove_git_checkout` checks the checkout. A failed check then suppresses the next notice.
+- The order becomes: check, save, then print. A failed check saves nothing, so the next run reports again.
+- The phase stacks on the phase 174 commit. It moves onto main with phase 174.
+
+### Phase 184 — Mac gate close follow-ups (181m F005, F006, F007)  · status: done
+**Source:** phase 181m fix reviews, 2026-11-20 22:19 EST. builds 22:31 EST: take F005, F006 and F007 as one phase on top of `376413140` while bb15 merges.
+
+- F005: with no Mac close script, the fallback reports removed only when the checkout is gone on the Mac.
+- F006: a natedev pass that already looks at its Mac mirrors unregisters a Mac gate checkout that the Mac confirms is gone.
+- F007: the old-result removed paths unregister once; the receipt keeps only kept folders.
+- No automatic deletion, no timer and no config change (item 152).
+
+### Phase 143r — Item 143 restack: merge main into phases 174 and 183  · status: todo
+**Source:** builds, 2026-11-20 23:21 EST: the 143 hash (174 and 183) goes in the batch after bb16.
+
+- One merge of main `aacad65c6` into `f86816c9b`. It resolves the conflicts in `add_unit.py`, `test_verify_doc_checkout.py` and `test_slot_order.py`.
+- The commit holds the bb15 rows 178 and 181 under it, so it lands after bb15.
+
+### Phase 185 — return-copy works for a run that crosses an update (item 152 live issue)  · status: in progress
+**Source:** builds, 2026-11-21 09:00 EST: run 20261121T084352-3507509-bef1 started on the old `verify.sh` and failed on the new `return-copy` (`--allocation-id` required). bob 09:11 EST: no removal by the id on disk.
+
+- `return-copy` without `--allocation-id` (a caller from before the update) returns the changes, keeps the copy and prints the manual list line.
+- The close stays as on main: it removes only a copy that the in-process claim list holds.
+- The removal by the allocation id on disk joins the removals to arm again, after the bubblewrap proof and nate's word.
+- `docs/as-built/removal-by-hand.md` (bob, 2026-11-21 09:25 EST): the procedure for a removal by hand. Four checks, one yes per path, one record line per removal. It applies after nate answers who gives the yes; the hold of 09:19 EST stays until then.
+
+### Phase 186 — a live lint run keeps its lint-copy claim (item 152)  · status: in progress
+**Source:** builds, 2026-11-21 09:25 EST (go after the 143 row). Stacked on phase 185 `bc157b8eb`.
+
+- In live runs since 08:57 EST, every lint copy was kept, even with no source change during the run. The copy is taken, the run waits for memory admission, and the drop then finds no claim in memory.
+- Find the cause by test through `verify_helper.py` with the real call sequence. Fix it at the cause, so the claim survives between helper calls in one run.
+- No new removal path, no removal by an id on disk, no config change.
+
+### Phase 143z — The move pass keeps numbered build copies (item 143)  · status: in progress
+**Source:** resources, 2026-11-21 14:01 EST, from the live dry run on main e0a5e1e082: the pass plans to move the new-model copies /build/hana/hana-merges/1 and /2 (in use) to ~/worktrees/hana/errors/p1 and p2. Built on main merged with 143w-b, so both go on the line as one row.
+**Merge line:** `9c6dc62959` (branch builds-resources-143z-m6401) in batch bb143y, sent 2026-11-21 19:27 EST. Not on main yet.
+
+- `_migration_skip` keeps every numbered copy that `build_folders` knows; legacy /build/claude/scratch worktrees still move.
+
+### Phase 143u — Remote verify runs use one script version (item 143)  · status: todo
+Source: 143y F001 and an Astra review (2026-11-21 15:24). 143y pins the natedev side only.
+- Bind the run's script snapshot once to a remote executor for each host. Every run-owned SSH command and rsync receiver goes through it.
+- The Mac gate gets the placement identity as structured data over the natedev transport, not as caller text.
+- Reserve the snapshot folder inside the existing mirror, safe from `rsync --delete` and from source comparison.
+- Settlement runs without the remote copy, and keeps the claim until the process check confirms settlement.
+- No new Mac folder, no Mac setting change, no new removal tool.
+
+### Phase 143v — A cleanup failure never reads as a failed test (item 143)  · status: in progress
+Source: builds 2026-11-21 14:30, from the lfo 44eu trace.
+**State:** bullets 1-3 and 5 reviewed (PASS) in commit `74a9821df6` on main 6401c0f801. The affected tests run after the full test hold ends. Bullet 4 waits for bb143y on main.
+- `build_folders.py` remove prints the cause when it fails; today line 2161 returns 1 with no message.
+- `verify.sh` finish_tree_watch writes the pass record first. It then reports a cleanup failure on its own line, with its own status.
+- Tests: a removal that fails after a passed run keeps the pass record and prints the cleanup cause.
+- 143y F017: an attached run that is cancelled can lose the retention notice in the tee pipe (verify.sh:469, :4430, :4565). Write the notice so the cancellation cannot drop it.
+- The cleanup message names the cause, for example a lock lost after a script install during the run, so units see a false fail for what it is. Cases: lfo 44eu and hana inspectors v20261121T181454-174488-6851 (step 0, call 1).
+
+### Phase 143y — One script version for each verify.sh run (item 143)  · status: in progress
+**Merge line:** `87c3742af4` (branch builds-resources-143y-m355) in batch bb143y, sent 2026-11-21 18:01 EST. Not on main yet.
+**Source:** builds, 2026-11-21 13:48 EST: a verify.sh run queued before the 13:39 install of 143 called the new copies.py with the old `--capacity-file` argument and failed; hana's g45 suite lost its queue place. Cause: verify.sh keeps its own text but runs helpers from the live `~/.claude/scripts`.
+
+- verify.sh copies `scripts/` at the installed commit into a folder the run owns, then runs itself and every helper from that copy.
+- The run that owns the copy removes it when it ends; a detached run takes the ownership.
+- A dirty scripts tree or a failed copy runs as today and prints one line.
+
+### Phase 143x — Repair the bb143 gate red (item 143)  · status: todo
+**Source:** builds, 2026-11-21 13:00 EST: bb143 red; 4 modules are 143's (test_aws_trial guest, test_doc_routing, test_disks_page, test_perform_deletion_rerun). Repair on a merge of main 94e07d22c4 into the 143 tip.
+
+### Phase 143w — Restore the worktree short name in the move pass and add_style (item 143)  · status: todo
+**Source:** resources, 2026-11-21 11:40 EST, from the switch dry run of `f91a74ef81`: the migration fallback names 37 unit worktrees `director`, and `add_style.py` still uses `production`. nate (via bob, 2026-11-19 21:54 and 21:56 EST): `worktree` replaces both.
+
+- One name, `worktrees.UNIT_WORKTREE_NAME`, for the migration fallback and for style productions (path, output, new branch `<style>-worktree`). Existing branches keep their names.
+- Tests and as-built lines follow. Proof: the switch dry run shows no `/director` move.
+
+### Phase 187 — test_target_availability writes its own build_targets.conf  · status: in progress
+**Source:** builds, 2026-11-21 10:34 EST: verify found that `scripts/build_queue/test_target_availability.py` reads `build_targets.conf` from HOME on main `262952c406`, so it fails in a private home.
+
+- Each test writes its own fixture config (phase 147 rule). Proof: the module passes with an empty private HOME.
+
+### Phase diskred — test_disk ignores the host SCCACHE_DIR  · status: done
+**Source:** builds, 2026-11-21 19:50 EST: base red at `scripts/buildlog/test_disk.py:730`. On main `4ab2262145` (bbfast, 22:12 EST) as `9b98021e11`.
+
+- `setUp` removes `SCCACHE_DIR`, so `snapshot()` never scans the host cache. Proof: the module passes all 26 tests.
+
+### Phase runcap — At most 2 claude_commands runs on natedev  · status: in progress
+**Source:** nate via bob via builds, 2026-11-21 20:04 EST (fast-track). Branch builds-resources-runcap `3b7c9d38fc` (with the runcapfix repair); line row bbruncap, first after the restart.
+
+- `max_runs.natedev.claude_commands=2` in `build_admission.conf`. natemerge runs count, and are never held (`max_runs_exempt_unit=natemerge`).
+- A run held only by the limit never holds other work.
+- runcapfix (bbfast red, 21:52 EST): a legacy gate profile path maps to the Git repository name.
+
+### Phase runcap2 — Gate test runs go through admission  · status: in progress
+**Source:** builds, 2026-11-21 20:25 EST: `gate.py --tests-only --module` skips admission. Commit `f02d4d2e66` (reviewed, not pushed). Its tests run after the full test hold ends.
+
+### Phase runhana — One run limit reader for every repository  · status: in progress
+**Source:** nate via bob via builds, 2026-11-21 21:28 EST. Built on runcap.
+
+- One reader for all `max_runs.*`; a whole number, 0 or more; 0 means no run starts.
+- Gate steps count while they hold a reservation. Cargo steps count from the run start to the run end; one `verify.sh` call is one run.
+- A step of a started run never waits behind a row held only by its own limit.
+- Out of scope: other repositories' values, the Mac part, exceptions.

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 import fcntl
+import io
 import json
 import os
 import pwd
@@ -12,17 +13,18 @@ import subprocess
 import tempfile
 from threading import Event, get_ident
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO, cast, final, override
 from unittest.mock import patch
 
-from scripts.lib import land_main, live_settings, main_push_lock, models_registry, registry_rows, waiting_rows
+from scripts.lib import land_main, live_settings, main_push_lock, models_registry, names, registry_rows, waiting_rows
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.checkout_test_support import write_python_tool
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
+from scripts.lib.test_config_form import check_blank_lines
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 FIXTURE = Path(__file__).with_name("test_models_registry.conf")
@@ -291,13 +293,14 @@ class RegistryPublicationTests(ScriptRepositoryTestCase):
                 _ = self.git("push", "-q", "origin", f"{peer_tip}:main")
             return land(repo, commit, branch)
 
-        expected = catalog.replace("custom=gpt-6.1-sol", "custom=gpt-6.3-sol") if peer_advances else catalog
+        spaced = catalog.replace("\n[codex.agents]", "\n\n[codex.agents]")
+        expected = spaced.replace("custom=gpt-6.1-sol", "custom=gpt-6.3-sol") if peer_advances else spaced
         with patch.dict(os.environ, environment, clear=True), patch.object(models_registry, "DEFAULT_PATH", registry), \
                 patch.object(land_main, "land", advance_peer):
             self.assertEqual(models_registry.store_registry(registry, local, catalog, "fixture", additive_catalog=True),
                              expected)
         self.assertEqual(self.git("show", "origin/main:config/models.conf").stdout, expected)
-        self.assertEqual(attempts, [catalog, expected] if peer_advances else [catalog])
+        self.assertEqual(attempts, [spaced, expected] if peer_advances else [spaced])
 
     def test_catalog_publication_keeps_an_earlier_pending_family_downgrade(self) -> None:
         self._publish_catalog_with_pending_family(peer_advances=False)
@@ -407,21 +410,30 @@ os.execv(""" + repr(binary) + """, [""" + repr(binary) + """, *sys.argv[1:]])
         self.assertTrue((self.repo / ".git" / main_push_lock.RECORD_NAME).is_file())
 
 
+class CatalogSyncTests(unittest.TestCase):
+    def test_sync_codex_catalog(self) -> None:
+        script = Path(__file__).resolve().parents[1] / "agents/test_sync_codex_catalog.sh"
+        result = subprocess.run(["bash", str(script)], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class RegistryRowReplayTests(unittest.TestCase):
     def test_replay_places_new_rows_and_edits_existing_rows_in_place(self) -> None:
         edit = registry_rows.RowChange("producers", "bob", "bob=claude:fable:high")
-        for case, keys, tail in (
-            ("before another section",
-             "morty=claude:fable:high\ndwight=claude:fable:high\n", "\n# Directors\n[production.claude]\n"),
-            ("without keys",
-             "", "# No producers\n\n[production.claude]\n"),
-            ("at the end",
-             "dwight=claude:fable:high\n", "\n# End of registry\n"),
+        director = registry_rows.RowChange("production.codex", "director", "director=sol:high")
+        for case, change, keys, tail, added_space in (
+            ("before another section", edit, "morty=claude:fable:high\ndwight=claude:fable:high\n",
+             "\n# Directors\n[production.claude]\n", ""),
+            ("without keys", edit, "", "# No producers\n\n[production.claude]\n", "\n"),
+            ("at the end", edit, "dwight=claude:fable:high\n", "\n# End of registry\n", ""),
+            ("empty production section before its comment", director, "",
+             "# Set-model stores the Codex defaults for director and showrunner here.\n", "\n"),
+            ("empty producers before another section", edit, "", "[assignments]\nproduction=claude\n", "\n"),
         ):
             with self.subTest(case=case):
-                prefix = f"[producers]\n{keys}"
-                self.assertEqual(registry_rows.replay(prefix + tail, [edit], False),
-                                 f"{prefix}{edit.replacement}\n{tail}")
+                prefix = f"[{change.section}]\n{keys}"
+                self.assertEqual(registry_rows.replay(prefix + tail, [change], False),
+                                 f"{prefix}{change.replacement}\n{added_space}{tail}")
 
         prefix = "[producers]\nmorty=claude:fable:high\n\n[assignments]\nproduction=claude\n\n[producers]\n"
         last_key = "dwight=claude:fable:high\n"
@@ -599,8 +611,52 @@ class LaunchSettingsTests(unittest.TestCase):
             with self.subTest(family=family, model=model, effort=effort), self.assertRaises(ValueError):
                 _ = models_registry.store_producer("morty", family, model, effort)
         self.assertEqual((self.path.read_bytes(), self.path.stat().st_mtime_ns), before)
-        added = models_registry.store_producer("producer_only", "codex", "gpt-test", "high")
-        self.assertEqual(models_registry.launch_settings("producers", "producer_only"), added)
+        for name, source in (
+            ("existing producers", self.path.read_text()),
+            ("empty producers before another section",
+             "[producers]\n" + registry_text({"producers": ExactRows({})})),
+        ):
+            with self.subTest(group=name):
+                _ = self.path.write_text(source)
+                added = models_registry.store_producer("producer_only", "codex", "gpt-test", "high")
+                self.assertEqual(models_registry.launch_settings("producers", "producer_only"), added)
+                self.assertEqual(check_blank_lines(self.root, [Path(self.path.name)]), [])
+
+    def test_compact_windows_give_only_a_role_with_a_key_its_window(self) -> None:
+        _ = write_registry(self.path, {"compact_windows": {"producer": "300000"}})
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(models_registry.compact_window_arguments("producer"), ["--autocompact", "300000"])
+            for role in ("unit", "showrunner", "worker"):
+                with self.subTest(role=role):
+                    self.assertEqual(models_registry.compact_window_arguments(role), [])
+        self.assertEqual(errors.getvalue(), "")
+        _ = write_registry(self.path, {"compact_windows": {"producer": None}})
+        self.assertEqual(models_registry.compact_window_arguments("producer"), [])
+
+    def test_a_bad_compact_window_prints_one_anomaly_and_keeps_the_settings_json_window(self) -> None:
+        from scripts.lib.test_names import fixture_names
+
+        for value in ("", "30k", "3e5", "-300000", "300000.5", "99999", "1000001", "large", "0300000"):
+            with self.subTest(value=value):
+                _ = write_registry(self.path, {"compact_windows": {"producer": value}})
+                with redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(models_registry.compact_window_arguments("producer"), [])
+                lines = errors.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0].startswith(f"anomaly: {self.path}: compact_windows.producer: "), lines[0])
+                self.assertIn("--autocompact", lines[0])
+                self.assertTrue(lines[0].endswith("Use the settings.json window."), lines[0])
+        for value, expected in (("100000", "100000"), ("1000000", "1000000"), ("300K", "300k"), ("1m", "1M")):
+            with self.subTest(value=value):
+                _ = write_registry(self.path, {"compact_windows": {"producer": value}})
+                self.assertEqual(models_registry.compact_window_arguments("producer"), ["--autocompact", expected])
+        _ = write_registry(self.path, {"compact_windows": {"producer": "auto", "unknown": "300k"}})
+        with (patch.object(names, "runtime_names", return_value=fixture_names(worker="operator")),
+              redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(models_registry.compact_window_arguments("producer"), [])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f"anomaly: {self.path}: compact_windows.unknown: no role has this name. "
+            + "Use producer, showrunner, unit, worker (operator)."])
 
 
 @final

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from enum import StrEnum
@@ -16,10 +16,12 @@ import sys
 import time
 from typing import Literal, TypedDict, cast
 
-from scripts.accounts import accounts, next_moves, role_activity
+from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity
+from scripts.agents import shutdown_record
+from scripts.production import staff
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
-from scripts.review_links import change_page, console_theme, page_frame, review_link
-from scripts.whoami import mac_fallback_token, quota_alert, run_out, token_expiry
+from scripts.review_links import change_page, console_theme, page_frame, page_version, review_link
+from scripts.whoami import agent_accounts, mac_fallback_token, quota_alert, run_out, token_expiry
 # The alias keeps the module apart from this page's quota_state() path function.
 from scripts.whoami import quota_state as worker_quota_state
 
@@ -46,6 +48,11 @@ class Refused:
 class SaveFailed:
     """The checked change could not be saved."""
     reason: str
+
+
+@dataclass(frozen=True)
+class MoveInProgress:
+    """An active move blocks a new Move now request."""
 
 
 QUOTA_CLEAR_FILE = ".accounts-quota-cleared.json"
@@ -251,8 +258,15 @@ def save_color(key: str, value: str) -> Saved | Refused | SaveFailed:
     return Saved()
 
 
-def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
-    """Make the target the group's first next move at the configured percent."""
+def save_next_move_settings(group: str, target: str, percent: str, measure: str) -> Saved | Refused | SaveFailed:
+    try:
+        value = float(percent)
+        next_moves.check_next_move_percent(value)
+        quota_measure = next_moves.parse_quota_measure(measure)
+    except next_moves.NextMoveError as error:
+        return Refused(str(error))
+    except ValueError:
+        return Refused("next: percent must be from 0 to 100")
     if group not in ("units", "showrunners", "producers"):
         return Refused("Choose units, showrunners, or producers.")
     try:
@@ -260,9 +274,35 @@ def save_next_move(group: str, target: str) -> Saved | Refused | SaveFailed:
     except accounts.AccountsError as error:
         return Refused(" ".join(str(error).split()))
     try:
-        _ = next_moves.set_first_next_move(group, next_moves.console_next_move_percent(), target)
+        _ = next_moves.set_first_next_move(group, value, target, measure=quota_measure)
     except (OSError, ValueError) as error:
         return SaveFailed(" ".join(str(error).split()))
+    return Saved()
+
+
+def move_group_now(group: str, target: str) -> Saved | Refused | SaveFailed | MoveInProgress:
+    """Start the accounts hand move outside the request."""
+    from scripts.agents import stop_resume
+
+    if group not in ("units", "showrunners", "producers"):
+        return Refused("Choose units, showrunners, or producers.")
+    try:
+        _ = accounts.claude_account_dir(target)
+    except accounts.AccountsError as error:
+        return Refused(str(error))
+    try:
+        if any(move.active for move in moves.read_move_progress()):
+            return MoveInProgress()
+        _ = next_moves.read_next_moves()
+        _ = stop_resume.detach(["console-group-move", group, target], "move",
+                               program=Path(accounts.__file__), initiator=moves.MoveInitiator.CONSOLE)
+    except subprocess.CalledProcessError as error:
+        reason = cast(object, error.stderr)
+        return SaveFailed(reason.strip() if isinstance(reason, str) and reason.strip() else str(error))
+    except subprocess.TimeoutExpired as error:
+        return SaveFailed(str(error))
+    except (OSError, ValueError) as error:
+        return SaveFailed(str(error))
     return Saved()
 
 
@@ -298,14 +338,15 @@ def page_url() -> str:
     return PAGE_PATH
 
 
-def _spans(spans: list[accounts.BoardSpan]) -> str:
+def _spans(spans: list[accounts.BoardSpan], *, title: str = "") -> str:
     parts: list[str] = []
+    tooltip = f' title="{html.escape(title, quote=True)}"' if title else ""
     for span in spans:
         color = accounts.account_color(span.get("color", ""))
         style = f' style="color:{color.css}"' if isinstance(color, accounts.AccountColor) else ""
         if "color_key" in span:
             style += f' data-color-text="{html.escape(span["color_key"], quote=True)}"'
-        parts.append(f'<span class="{span["tone"]}{" bold" if span["kind"] == "bold" else ""}"{style}>{html.escape(span["text"])}</span>')
+        parts.append(f'<span{tooltip} class="{span["tone"]}{" bold" if span["kind"] == "bold" else ""}"{style}>{html.escape(span["text"])}</span>')
     return "".join(parts)
 
 
@@ -326,7 +367,7 @@ def _next_cell(row: accounts.BoardRow, move: NextMove,
     if editable:
         content += (f'<button type="button" class="next-button" data-next-button data-next-target="{html.escape(target, quote=True)}" '
                     + f'data-move-account="{html.escape(editable["account"], quote=True)}" data-move-group="{editable["group"]}" '
-                    + f'aria-label="Choose the next account for {editable["group"]}" aria-haspopup="menu" aria-expanded="false">'
+                    + f'aria-label="Choose the next account for {editable["group"]}" aria-haspopup="dialog" aria-expanded="false">'
                     + page_frame.icon_svg("chevron-down") + '</button>')
     return content
 
@@ -365,32 +406,43 @@ def _swatch(spans: list[accounts.BoardSpan]) -> str:
 
 
 def _sort_heading(column: accounts.BoardColumn, default: str, descending_columns: tuple[str, ...],
-                  *, sort_field: str = "") -> str:
-    key = column["heading"]
+                  *, sort_field: str = "", label_markup: str = "") -> str:
+    key = column["key"]
     if not key:
         return f'<th class="{column["align"]}"></th>'
     direction = "ascending" if key == default else "none"
     descending = " data-sort-descending" if key in descending_columns else ""
-    label = html.escape(key)
+    label = html.escape(column["heading"])
     arrow = '<span class="sort-arrow" aria-hidden="true">▲</span>'
-    content = arrow + label if column["align"] == "right" else label + arrow
-    return (f'<th class="{column["align"]}" data-{sort_field or default}-sort="{label}" tabindex="0" aria-sort="{direction}"{descending}>'
+    word = label_markup or label
+    content = arrow + word if column["align"] == "right" else word + arrow
+    return (f'<th class="{column["align"]}" data-{sort_field or default}-sort="{html.escape(key, quote=True)}"'
+            + f' tabindex="0" aria-sort="{direction}"{descending}>'
             + f'<span class="sort-label">{content}</span></th>')
 
 
 SortValue = str | float | None
 SortValues = dict[str, SortValue]
-ACCOUNT_COLUMNS = (
-    ("", "left"), ("account", "left"), ("", "left"), ("left", "right"),
-    ("used / hour", "right"), ("empty at", "left"), ("role", "left"), ("", "left"), ("next", "left"),
-    ("resets", "right"), ("credits", "right"), ("enabled", "left"),
+# Keep the saved sort key for the weekly reset date.
+ACCOUNT_SORT_KEYS = {"weekly reset": "resets", "resets": "reset count"}
+ACCOUNT_COLUMNS = tuple(
+    accounts.BoardColumn(key=ACCOUNT_SORT_KEYS.get(heading, heading),
+                         heading=heading, align="right" if align == "right" else "left")
+    for heading, align in (
+        ("", "left"), ("account", "left"), ("", "left"), ("left", "right"), ("Fable left", "right"),
+        ("used / hour", "right"), ("empty at", "left"), ("role", "left"), ("", "left"), ("next", "left"),
+        ("weekly reset", "right"), ("resets", "right"), ("credits", "right"), ("enabled", "left"),
+    )
 )
 ROLE_COUNT_COLUMNS = ("busy", "idle", "total")
 # Paused and exited sessions are not running. They have no column: a warning icon after the role total names them.
 NOT_RUNNING_STATES: tuple[Literal["paused", "exited"], ...] = ("paused", "exited")
 BUSY_LINE_HEADING = "busy, last 24 h"
-ROLE_COLUMNS = (("role", "left"), ("", "left"), (BUSY_LINE_HEADING, "left"), ("account", "left"), ("next", "left"),
-                *((key, "right") for key in ROLE_COUNT_COLUMNS))
+ROLE_COLUMNS = (
+    *(accounts.BoardColumn(key=key, heading=key, align="left")
+      for key in ("role", "", BUSY_LINE_HEADING, "account", "next")),
+    *(accounts.BoardColumn(key=key, heading=key, align="right") for key in ROLE_COUNT_COLUMNS),
+)
 # The busy line of each role, in SVG pixels: the line area, then the hour labels under it.
 BUSY_LINE_WIDTH = 288
 BUSY_LINE_HEIGHT = 22
@@ -402,7 +454,7 @@ BUSY_LINE_LABEL_HOURS = 3
 # The statusline.conf key of the codex pair row tint, and the strength of that tint over the card.
 PAIR_TINT_KEY = "background.codex-pair"
 PAIR_TINT_PERCENT = 12
-ACCOUNT_DETAIL_COLUMNS = "1,0,2,3,4,5,9,10,11"
+ACCOUNT_DETAIL_COLUMNS = "1,0,2,3,4,5,6,10,11,12,13"
 DASH = '<span class="next-muted">—</span>'
 
 
@@ -417,14 +469,12 @@ def _sort_orders(values: list[SortValues], descending: tuple[str, ...]) -> dict[
     return orders
 
 
-def _split_card(title: str, name: str, default: str, columns: tuple[tuple[str, str], ...],
+def _split_card(title: str, name: str, default: str, columns: Sequence[accounts.BoardColumn],
                 rows: list[str], orders: dict[str, list[int]] | dict[str, list[accounts.AccountRowPlacement]],
                 *, descending: tuple[str, ...] = (), unsorted: tuple[str, ...] = (),
                 sort_field: str = "", attributes: str = "", after: str = "") -> str:
-    head = "".join(f'<th class="{align}">{html.escape(key)}</th>' if key in unsorted
-                   else _sort_heading(accounts.BoardColumn(key=key, heading=key,
-                                      align="right" if align == "right" else "left"),
-                                      default, descending, sort_field=sort_field) for key, align in columns)
+    head = "".join(f'<th class="{column["align"]}">{html.escape(column["heading"])}</th>' if column["key"] in unsorted
+                   else _sort_heading(column, default, descending, sort_field=sort_field) for column in columns)
     orders_json = html.escape(json.dumps(orders), quote=True)
     return (f'<section class="card" data-sort-table="{name}" data-sort-default="{default}" '
             f'data-sort-orders="{orders_json}"{attributes}><h2>{title}</h2><div class="scroll">'
@@ -493,6 +543,55 @@ def _pair_tint(colors: Mapping[str, str]) -> str:
     return f' style="background:color-mix(in srgb,{color.css} {PAIR_TINT_PERCENT}%,transparent)"'
 
 
+def _weekly_reset_ready(row: accounts.StatusRow) -> bool:
+    if row.has_running_claude_session or any(isinstance(count, accounts.RoleSessionCounts) and (count.busy or count.idle)
+                                            for count in row.role_counts):
+        return True
+    if row.tool == "codex":
+        return isinstance(row.codex_work_readiness, agent_accounts.CodexWorkAvailable)
+    return isinstance(row.weekly_left_percent, (int, float)) and row.weekly_left_percent > 0
+
+
+def weekly_reset_orange_weight(position: float) -> float:
+    """Return the orange weight for a reset position from zero to one."""
+    if position <= 0.25:
+        return 2 * position
+    return 0.5 + (position - 0.25) * (0.5 / 0.75)
+
+
+def _weekly_reset_attributes(reading: accounts.StatusReading) -> dict[str, str]:
+    scale_end = max(
+        (row.resets_at for row in reading.rows
+         if row.weekly_left_percent == 0 and all(role == "spare" for role in row.roles)
+         and isinstance(row.resets_at, datetime) and row.resets_at > reading.checked_at
+         and (row.tool == "claude" or row.codex_weekly_freshness is accounts.CodexWeeklyFreshness.FRESH)),
+        default=reading.checked_at,
+    )
+    span = scale_end - reading.checked_at
+    attributes: dict[str, str] = {}
+    for row in reading.rows:
+        if _weekly_reset_ready(row):
+            attributes[row.label] = ' class="weekly-reset-ready"'
+        elif isinstance(row.resets_at, datetime) and row.resets_at > reading.checked_at:
+            exhausted = (isinstance(row.codex_work_readiness, agent_accounts.CodexWorkExhausted) if row.tool == "codex"
+                         else isinstance(row.weekly_left_percent, (int, float)) and row.weekly_left_percent <= 0)
+            if exhausted:
+                position = min(1.0, (row.resets_at - reading.checked_at) / span) if span else 1.0
+                orange_weight = 100 * weekly_reset_orange_weight(position)
+                attributes[row.label] = (f' class="weekly-reset-exhausted"'
+                                         f' style="--reset-orange-weight:{orange_weight:.8g}%"')
+    return attributes
+
+
+def _account_login_title(login: str) -> str:
+    fallback = "No email in the login record"
+    try:
+        _ = login.encode("utf-8")
+    except UnicodeEncodeError:
+        return fallback
+    return login or fallback
+
+
 def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, list[accounts.BoardRow]],
                     labels: dict[str, accounts.BoardSpan], alerts: Mapping[str, QuotaAlert],
                     colors: Mapping[str, str]) -> str:
@@ -501,6 +600,7 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
     values: list[SortValues] = []
     labels_in_row_order: list[str] = []
     facts = {row.label: row for row in reading.rows}
+    reset_attributes = _weekly_reset_attributes(reading)
     moves = _shown_moves(reading, rows_by_account, facts)
     pair = [facts[label] for label, row_moves in moves.items() if facts[label].tool == "codex" and "auto" in row_moves]
     # One Codex account has nothing to take turns with, so it keeps the plain auto text.
@@ -513,6 +613,14 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
         left = _spans(cells["left"])
         if alert := alerts.get(label):
             left = _quota_button(label, alert) + left
+        fable = row.fable_left_percent if row.tool == "claude" and isinstance(row.fable_left_percent, (int, float)) else None
+        fable_text = "" if row.tool == "codex" else DASH
+        if fable is not None:
+            fable_text = f'<span class="{"error" if fable == 0 else "default"}">{round(fable)}%</span>'
+        reset_count = row.limit_reset_count if row.tool == "codex" and isinstance(row.limit_reset_count, int) else None
+        reset_count_text = (
+            '<span class="next-muted" title="Claude does not give this count to our tools.">—</span>'
+            if row.tool == "claude" else DASH if reset_count is None else str(reset_count))
         reset = row.resets_at if isinstance(row.resets_at, datetime) else None
         forecast = (quota_alert.weekly_forecast(histories.get(label, []), reading.checked_at, reset,
                     current=run_out.Reading(row.read_at, 100 - row.weekly_left_percent))
@@ -533,7 +641,8 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
         account_values: SortValues = {
             "account": label.casefold(),
             "left": row.weekly_left_percent if isinstance(row.weekly_left_percent, (int, float)) else None,
-            "used / hour": rate, "empty at": _timestamp(empty), "resets": _timestamp(reset),
+            "Fable left": fable, "used / hour": rate, "empty at": _timestamp(empty),
+            "resets": _timestamp(reset), "reset count": reset_count,
             "credits": float("inf") if row.credits == "unlimited" else
             row.credits if isinstance(row.credits, (int, float)) else None,
             "enabled": 1 if row.use_credits else None,
@@ -542,13 +651,17 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
             color = accounts.account_color(labels[label].get("color", ""))
             targets.append((label, "".join(span["text"] for span in cells["left"]),
                             color.css if isinstance(color, accounts.AccountColor) else "", cells["left"][0]["tone"]))
+        name = _spans(cells["label"], title=_account_login_title(row.login))
         account_start = (
             _cell(f'<span title="{dot}" aria-label="{dot}">{_spans(cells["dot"])}</span>')
-            + f'<td class="left" data-account-name>{_spans(cells["label"])}</td>'
-            + _cell(_swatch(cells["label"])) + _cell(left, "right")
+            + f'<td class="left" data-account-name>{name}</td>'
+            + _cell(_swatch(cells["label"])) + _cell(left, "right") + _cell(fable_text, "right")
             + _cell(f"{rate:.1f}%" if rate is not None else no_rate, "right") + _cell(empty_text)
         )
-        account_end = (_cell(_spans(cells["resets"]), "right") + _cell(_spans(cells["credits"]), "right")
+        reset_span_attributes = reset_attributes.get(label, ' class="weekly-reset-unknown"')
+        reset_text = f'<span{reset_span_attributes}>{_spans(cells["resets"])}</span>'
+        account_end = (_cell(reset_text, "right")
+                       + _cell(reset_count_text, "right") + _cell(_spans(cells["credits"]), "right")
                        + _cell(_spans(cells["enabled"])))
         for index, line in enumerate(_shown_lines(lines)):
             spans = line["cells"]["roles"]
@@ -558,14 +671,19 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
             paired = pair_text and move == "auto"
             rows.append(f'<tr{pair_row if paired else ""} data-account-row="{html.escape(label, quote=True)}">'
                         + (account_start if index == 0 else _cell("") + '<td class="left" data-account-name></td>'
-                           + _cell("") + _cell("", "right") * 2 + _cell(""))
+                           + _cell("") + _cell("", "right") * 3 + _cell(""))
                         + _cell(_spans(visible_role)) + _cell(_swatch(visible_role))
                         + _cell(_tip_target(f"pair-auto-{label}", "next-muted", "", "auto", pair_text) if paired else _next_cell(line, move, labels), "left next-cell")
-                        + (account_end if index == 0 else _cell("", "right") * 2 + _cell("")) + "</tr>")
+                        + (account_end if index == 0 else _cell("", "right") * 3 + _cell("")) + "</tr>")
             values.append({**account_values, "role": role.casefold() or None, "next": _next_sort_value(move)})
             labels_in_row_order.append(label)
     problems = "".join(f"<li>{html.escape(note.removeprefix('* '))}</li>" for note in reading.notes)
     targets_json = html.escape(json.dumps(targets), quote=True)
+    first = reading.first_next_moves
+    settings = ({group: [next_moves.format_next_move_percent(entry.at_percent), entry.measure.value]
+                 for group, entry in first.entries.items() if isinstance(entry, next_moves.ClaudeGroupMove)}
+                if isinstance(first, accounts.FirstNextMoveEntries) else None)
+    settings_json = html.escape(json.dumps(settings), quote=True)
     percent = next_moves.format_next_move_percent(next_moves.console_next_move_percent())
     descending = ("credits", "enabled")
     orders = {
@@ -577,7 +695,7 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
     return _split_card("Accounts", "accounts", "account", ACCOUNT_COLUMNS, rows, orders,
                        descending=descending,
                        attributes=(f' data-detail-columns="{ACCOUNT_DETAIL_COLUMNS}"'
-                                   f' data-move-percent="{percent}" data-move-targets="{targets_json}"'),
+                                   f' data-move-percent="{percent}" data-move-targets="{targets_json}" data-next-settings="{settings_json}"'),
                        after=f'<h2>Problems</h2><ul class="problems">{problems}</ul>' if problems else "")
 
 
@@ -589,18 +707,22 @@ def _count_tooltip(cell_id: str, value: str, lines: Sequence[str],
             f' {attribute}="{tooltip}"')
 
 
-def _role_count_cell(role: str, assignments: list[tuple[str, accounts.BoardRow]], key: str,
-                     *, show_breakdown: bool, after: str = "") -> tuple[str, int | None]:
+def _role_count_total(assignments: list[tuple[str, accounts.BoardRow]], key: str) -> int | None:
+    counts = [line["cells"][key][0]["text"] for _, line in assignments]
+    return sum(int(count) for count in counts) if counts and all(count.isdecimal() for count in counts) else None
+
+
+def _role_count_cell(row_id: str, assignments: list[tuple[str, accounts.BoardRow]], key: str,
+                     *, show_breakdown: bool, after: str = "") -> str:
     if not assignments:
-        return _cell(after, "right"), None
-    counts = [(label, line["cells"][key][0]["text"]) for label, line in assignments]
-    total = sum(int(value) for _, value in counts) if all(value.isdecimal() for _, value in counts) else None
+        return _cell(after, "right")
+    total = _role_count_total(assignments, key)
     value = str(total) if total is not None else "unknown" if key == "total" else ""
     attributes = ""
     if show_breakdown:
-        lines = [f"{label}: {count or 'unknown'}" for label, count in counts]
-        attributes = _count_tooltip(f"role-count-{role}-{key}", value or key, lines, "data-role-counts")
-    return f'<td class="right"{attributes}>{value}{after}</td>', total
+        lines = [f"{label}: {line['cells'][key][0]['text'] or 'unknown'}" for label, line in assignments]
+        attributes = _count_tooltip(f"role-count-{row_id}-{key}", value or key, lines, "data-role-counts")
+    return f'<td class="right"{attributes}>{value}{after}</td>'
 
 
 NotRunningNames = dict[str, list[str]]
@@ -639,6 +761,21 @@ def _not_running_slot(cell_id: str, text: str, icon: str) -> str:
     """A fixed slot after the total keeps the totals aligned; it holds the icon when sessions are not running."""
     content = _tip_target(cell_id, "not-running", ' role="img" aria-label="not running"', icon, text) if text else ""
     return f'<span class="not-running-slot">{content}</span>'
+
+
+def _role_assignment_order(assignment: tuple[str, accounts.BoardRow]) -> tuple[int, str]:
+    label, line = assignment
+    total = line["cells"]["total"][0]["text"]
+    return (-int(total) if total.isdecimal() else 0, label)
+
+
+def _role_counts(row_id: str, assignments: list[tuple[str, accounts.BoardRow]], not_running: str, icon: str,
+                 *, show_breakdown: bool) -> str:
+    cells: list[str] = []
+    for key in ROLE_COUNT_COLUMNS:
+        after = _not_running_slot(f"role-not-running-{row_id}", not_running, icon) if key == "total" else ""
+        cells.append(_role_count_cell(row_id, assignments, key, show_breakdown=show_breakdown, after=after))
+    return "".join(cells)
 
 
 def _busy_line(role: str, color: str, samples: Sequence[role_activity.RoleBusySample],
@@ -701,6 +838,7 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
                  samples: Sequence[role_activity.RoleBusySample]) -> str:
     rows: list[str] = []
     values: list[SortValues] = []
+    placements: list[list[accounts.AccountRowPlacement]] = []
     facts = {row.label: row for row in reading.rows}
     role_names = sorted(set(groups) | set(accounts.CLAUDE_GROUPS) | {accounts.CODEX_ROLE})
     not_running = {role: _not_running(role, groups.get(role, []), facts) for role in role_names}
@@ -710,10 +848,10 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
     all_text = _not_running_text(all_counts, all_names)
     icon = page_frame.icon_svg("triangle-alert") if all_text else ""
     for role in role_names:
-        assignments = sorted(groups.get(role, []), key=lambda item: role not in selected[item[0]])
-        role_span = (assignments[0][1]["cells"]["roles"][:1] if assignments
-                     else [accounts.board_role_span(role, colors)])
-        selected_assignment = next(((label, line) for label, line in assignments if role in selected[label]), None)
+        assignments = groups.get(role, [])
+        selected_assignment = next((item for item in assignments if role in selected[item[0]]), None)
+        role_span = (selected_assignment or assignments[0])[1]["cells"]["roles"][:1] if assignments else [
+            accounts.board_role_span(role, colors)]
         move = (accounts.account_board_next_move(selected_assignment[1], reading.first_next_moves)
                 if selected_assignment else "unselected")
         next_text = DASH if move == "unselected" else _next_text(move, labels)
@@ -724,32 +862,47 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
             label, line = selected_assignment
             name = _spans([labels[label], *(span for span in line["cells"]["roles"][1:] if span["text"] != " ✓")])
             account_value = label.casefold()
-        selected_label = selected_assignment[0] if selected_assignment else None
-        show_breakdown = any(
-            label != selected_label and line["cells"]["total"][0]["text"] not in ("", "0")
-            for label, line in assignments
-        )
+        other_accounts = [item for item in assignments if item is not selected_assignment
+                          and item[1]["cells"]["total"][0]["text"] not in ("", "0")]
+        # Keep the account breakdown when an unassigned role uses a single row.
+        show_breakdown = selected_assignment is None and len(other_accounts) == 1
+        if selected_assignment is not None:
+            primary = [selected_assignment]
+        elif len(other_accounts) <= 1:
+            primary, other_accounts = assignments, []
+        else:
+            primary = []
+        count_cells = _role_counts(role, primary, _not_running_text(*_not_running(role, primary, facts)),
+                                   icon, show_breakdown=show_breakdown)
         values.append({"role": role.casefold(), "account": account_value,
-                       "next": _next_sort_value(move)})
-        count_cells: list[str] = []
-        for key in ROLE_COUNT_COLUMNS:
-            after = (_not_running_slot(f"role-not-running-{role}", _not_running_text(*not_running[role]), icon)
-                     if key == "total" else "")
-            cell, count = _role_count_cell(role, assignments, key, show_breakdown=show_breakdown, after=after)
-            count_cells.append(cell)
-            values[-1][key] = count
+                       "next": _next_sort_value(move),
+                       **{key: _role_count_total(assignments, key) for key in ROLE_COUNT_COLUMNS}})
         color = accounts.account_color(role_span[0].get("color", ""))
         line_color = color.css if isinstance(color, accounts.AccountColor) else ""
+        group_rows = [accounts.AccountRowPlacement(index=len(rows), details=True)]
+        placements.append(group_rows)
         rows.append("<tr>" + _cell(_spans(role_span)) + _cell(_swatch(role_span))
                     + _cell(_busy_line(role, line_color, samples, reading.checked_at, reading.zone), "left busy-cell")
-                    + _cell(name) + _cell(next_text, "left next-cell") + "".join(count_cells) + "</tr>")
+                    + _cell(name) + _cell(next_text, "left next-cell") + count_cells + "</tr>")
+        for label, line in sorted(other_accounts, key=_role_assignment_order):
+            account_span = labels[label].copy()
+            _ = account_span.pop("color_key", None)
+            row_id = f"{role}-{label}"
+            detail = [(label, line)]
+            count_cells = _role_counts(row_id, detail, _not_running_text(*_not_running(role, detail, facts)), icon,
+                                       show_breakdown=line["cells"]["total"][0]["text"] == "unknown")
+            group_rows.append(accounts.AccountRowPlacement(index=len(rows), details=False))
+            rows.append("<tr>" + _cell("") * 3 + _cell(_spans([account_span]))
+                        + _cell(_next_text("none", labels), "left next-cell") + count_cells + "</tr>")
     cells = total["cells"]
     rows.append('<tr data-summary>' + _cell(_spans(cells["label"])) + _cell("") * 4
                 + "".join(_cell(_spans(cells[key]) + (_not_running_slot("role-not-running-total", all_text, icon)
                                                       if key == "total" else ""), "right")
                           for key in ROLE_COUNT_COLUMNS) + "</tr>")
-    return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, _sort_orders(values, ROLE_COUNT_COLUMNS),
-                       descending=ROLE_COUNT_COLUMNS, unsorted=(BUSY_LINE_HEADING,))
+    orders = {key: [row for index in order for row in placements[index]]
+              for key, order in _sort_orders(values, ROLE_COUNT_COLUMNS).items()}
+    return _split_card("Roles", "roles", "role", ROLE_COLUMNS, rows, orders,
+                       descending=ROLE_COUNT_COLUMNS, unsorted=(BUSY_LINE_HEADING,), attributes=' data-detail-columns="0,1,2"')
 
 
 def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | None = None) -> str:
@@ -786,8 +939,11 @@ def _model_cell(row: accounts.ModelsBoardRow, column: accounts.BoardColumn) -> s
 
 
 def models_board(reading: accounts.StatusReading) -> str:
-    table = accounts.models_board(reading, accounts.role_colors())
-    head = "".join(_sort_heading(column, "model", accounts.MODEL_COUNT_COLUMNS)
+    colors = accounts.role_colors()
+    table = accounts.models_board(reading, colors)
+    role_labels = {role: _spans([accounts.board_role_span(role, colors)]) for role in accounts.MODEL_ROLES}
+    head = "".join(_sort_heading(column, "model", accounts.MODEL_COUNT_COLUMNS,
+                                label_markup=role_labels.get(column["key"], ""))
                    + ('<th class="left"></th>' if column["key"] == "model" else "")
                    for column in accounts.MODEL_COLUMNS)
     rows = "".join(("<tr data-summary>" if index == len(table.rows) - 1 else "<tr>") + "".join(
@@ -864,6 +1020,259 @@ def tokens_board(reading: accounts.StatusReading) -> str:
             f'<tbody>{"".join(rows)}</tbody></table></div>{steps}</section>')
 
 
+def _move_duration(elapsed: timedelta) -> str:
+    minutes, seconds = divmod(max(0, round(elapsed.total_seconds())), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} h {minutes} min"
+    if minutes:
+        return f"{minutes} min" + (f" {seconds} s" if seconds else "")
+    return f"{seconds} s"
+
+
+def _move_time(at: datetime, zone: tzinfo) -> str:
+    return html.escape(at.astimezone(zone).strftime("%a %H:%M %Z"))
+
+
+def _move_cause(move: moves.MoveProgress) -> str:
+    origin = move.initiator
+    if origin is moves.MoveInitiator.AUTOMATIC:
+        return "automatic" + (f" · {html.escape(move.reason)}" if move.reason else "")
+    source = f"{origin.name} session" if isinstance(origin, moves.HandMoveSession) else origin.value
+    return f"by hand · {html.escape(source)}"
+
+
+def _move_result(moved: int, total: int, failed: int, already: int) -> str:
+    counts = f"{moved} of {total} moved"
+    if moved == total:
+        return f'<span class="success bold">{counts}</span>'
+    return (f'<span class="bold">{counts}</span>'
+            + (f' · <span class="error">{failed} failed</span>' if failed else "")
+            + (f' · <span class="next-muted">{already} already on target</span>' if already else ""))
+
+
+def _retryable_members(history: Sequence[moves.MoveProgress], reading: accounts.StatusReading) -> set[tuple[str, str]]:
+    failed = [(move.batch_id, row, row.state.target) for move in history for row in move.members
+              if row.kind is not moves.MoveMemberKind.REQUEST and isinstance(row.state, moves.MemberMoveFailed)
+              and isinstance(row.state.target, str)]
+    if not failed:
+        return set()
+    try:
+        try:
+            record = staff.local_snapshot()
+        except staff.StaffAbsent:
+            record = staff.StaffSnapshot(())
+        restarting: set[str] = set(shutdown_record.read()) if shutdown_record.active() else set()
+    except (OSError, ValueError, staff.StaffRefused):
+        return set()
+    live = reading.live_claude_accounts.union((observed["session"], account.label)
+        for account in reading.rows for observed in account.sessions if observed["state"] in ("busy", "idle"))
+    retryable: set[tuple[str, str]] = set()
+    for batch_id, row, target in failed:
+        reference = row.member.reference
+        owner = record.by_id(staff.StaffId(reference)) if row.kind is moves.MoveMemberKind.STAFF else None
+        try:
+            if row.kind is moves.MoveMemberKind.STAFF and owner is None:
+                continue
+            identity = str(owner.current_session if owner is not None else staff.native_id(reference))
+            owner = owner or record.by_current_session(identity)
+            if ((identity, target) in live or not isinstance(staff.row_activity(moves.native_row_key(identity)), staff.RowAvailable)
+                    or (owner is not None and (owner.id in restarting
+                        or not isinstance(staff.row_activity(owner.id), staff.RowAvailable)))
+                    or moves.move_holds_session(identity)):
+                continue
+        except (OSError, ValueError, staff.StaffRefused):
+            continue
+        retryable.add((batch_id, reference))
+    return retryable
+
+
+def move_failure_text(kind: moves.MoveFailureKind, member_name: str = "") -> str:
+    match kind:
+        case moves.MoveFailureKind.MOVE_IN_PROGRESS:
+            return "Another move is in progress. Try again when it ends."
+        case moves.MoveFailureKind.NO_SAVED_SESSION:
+            return f"{member_name} has no saved session."
+        case moves.MoveFailureKind.OTHER:
+            return "The retry did not start. Try again."
+
+
+def _move_failure(move: moves.MoveProgress, member: moves.MoveMember,
+                  failure: moves.MemberMoveFailed, retryable: Collection[tuple[str, str]]) -> str:
+    name = html.escape(member.name)
+    action = "did not start on" if failure.stopped else "did not move to"
+    message = (f"{name} {action} {html.escape(failure.target)}." if isinstance(failure.target, str)
+               else f"{name} did not move.")
+    stopped = f" {name} is stopped." if failure.stopped else ""
+    retry = ""
+    if (move.batch_id, member.reference) in retryable:
+        retry = (f' <button type="button" data-retry-move="{html.escape(move.batch_id, quote=True)}"'
+                 + f' data-move-member="{html.escape(member.reference, quote=True)}">Move {name} again</button>')
+    text = html.escape(move_failure_text(failure.failure_kind, member.name))
+    return f'<p class="mv-line mv-fault"><span class="error">{message}</span> {text}{stopped}{retry}</p>'
+
+
+def _move_members(move: moves.MoveProgress) -> str:
+    rows: list[str] = []
+    for row in move.members:
+        if row.kind is moves.MoveMemberKind.REQUEST:
+            continue
+        state = row.state
+        elapsed = ""
+        if isinstance(state, moves.MemberMoved):
+            destination = f" to {html.escape(state.target)}" if isinstance(state.target, str) and state.target != move.target else ""
+            word = f'<span class="success">moved{destination}</span>'
+            if state.recovered_holder:
+                word += f' <span class="next-muted">after a hung {html.escape(state.recovered_holder)}</span>'
+            elapsed = _move_duration(state.elapsed)
+        elif isinstance(state, moves.MemberAlreadyOnTarget):
+            word = f'<span class="next-muted">already on {html.escape(state.target)}</span>'
+            elapsed = _move_duration(state.elapsed)
+        elif isinstance(state, moves.MemberMoveFailed):
+            word = f'<span class="error">{"did not start" if state.stopped else "did not move"}</span>'
+            elapsed = _move_duration(state.elapsed)
+        elif isinstance(state, moves.MemberMoving):
+            label = state.target if isinstance(state.target, str) else move.target
+            word = (f'<span class="mv-starting">starts on {html.escape(label)}</span>' if isinstance(label, str)
+                    else '<span class="mv-starting">moving</span>')
+        else:
+            word = '<span class="next-muted">next</span>'
+        rows.append("<tr>" + _cell(html.escape(row.member.name)) + _cell(word) + _cell(elapsed, "right") + "</tr>")
+    if not rows:
+        return ""
+    return (f'<details class="mv-units" data-move-details="{html.escape(move.batch_id, quote=True)}">'
+            + f'<summary>All {len(rows)} units</summary><div class="scroll"><table aria-label="Units of this move">'
+            + '<thead><tr><th class="left">unit</th><th class="left">state</th><th class="right">time</th></tr></thead>'
+            + "<tbody>" + "".join(rows) + "</tbody></table></div></details>")
+
+
+def _move_current(move: moves.MoveProgress, now: datetime, zone: tzinfo, wait_seconds: float | Literal["configured"],
+                  retryable: Collection[tuple[str, str]]) -> str:
+    moved = [row.state for row in move.members if isinstance(row.state, moves.MemberMoved)]
+    already = [row.state for row in move.members if isinstance(row.state, moves.MemberAlreadyOnTarget)]
+    failed = [(row.member, row.state) for row in move.members if isinstance(row.state, moves.MemberMoveFailed)]
+    moving = [row for row in move.members if isinstance(row.state, moves.MemberMoving)]
+    queued = [row.member.name for row in move.members if isinstance(row.state, moves.MoveQueued)]
+    ended = [state.ended for state in (*moved, *already)] + [state.ended for _, state in failed]
+    total = len(move.members)
+    target = html.escape(move.target) if isinstance(move.target, str) else "destination unavailable"
+    if move.active:
+        if ended:
+            rate = (max(ended) - move.started) / len(ended)
+            remaining = max(rate, rate * total - (now - move.started))
+            timing = f"about {_move_duration(remaining)} left"
+        else:
+            timing = "time left unknown"
+    else:
+        finished = max(ended, default=move.started)
+        timing = f"done {_move_time(finished, zone)} · {_move_duration(finished - move.started)}"
+    cause = _move_cause(move)
+    head = (f'<p class="mv-head"><span class="bold">{html.escape(move.group)} → {target}</span>'
+            + f'<span class="next-muted"> · {cause} · started {_move_time(move.started, zone)}</span></p>')
+    lines = [head]
+    if any(row.kind is not moves.MoveMemberKind.REQUEST for row in move.members):
+        segments = (("done", len(moved)), ("now", len(moving)), ("failed", len(failed)))
+        bar = "".join(f'<span class="mv-{state}" style="width:{count / total:.3%}"></span>'
+                      for state, count in segments if count)
+        lines.extend((f'<div class="mv-bar" role="img" aria-label="{len(moved)} of {total} moved">{bar}</div>',
+                      f'<p class="mv-line">{_move_result(len(moved), total, len(failed), len(already))}'
+                      + f'<span class="next-muted"> · {timing}</span></p>'))
+    else:
+        lines.append(f'<p class="mv-line"><span class="next-muted">{timing}</span></p>')
+    if moving:
+        names = html.escape(_joined([row.member.name for row in moving]))
+        verb = "starts" if len(moving) == 1 else "start"
+        targets = {row.state.target if isinstance(row.state.target, str) else move.target
+                   for row in moving if isinstance(row.state, moves.MemberMoving)}
+        destination = next(iter(targets)) if len(targets) == 1 else moves.MoveDestinationUnselected()
+        motion = f"{verb} on {html.escape(destination)}" if isinstance(destination, str) else (
+            "is moving" if len(moving) == 1 else "are moving")
+        lines.append(f'<p class="mv-line"><span class="next-muted">Now:</span> {names} {motion}.</p>')
+    if queued:
+        waiting = f" {len(queued) - 1} more units wait." if len(queued) > 1 else ""
+        lines.append(f'<p class="mv-line"><span class="next-muted">Next:</span> {html.escape(queued[0])}.{waiting}</p>')
+    lines.extend(_move_failure(move, member, failure, retryable) for member, failure in failed)
+    for row in move.members:
+        if isinstance(row.state, moves.MemberMoved) and row.state.recovered_holder:
+            if wait_seconds == "configured":
+                wait_seconds = conf.read("shutdown").number("move.stuck_seconds")
+            name, holder = html.escape(row.member.name), html.escape(row.state.recovered_holder)
+            limit = _move_duration(timedelta(seconds=wait_seconds))
+            lines.append(f'<p class="mv-line"><span class="next-muted">Note:</span> a hung {holder} held {name}. '
+                         + f'The move ended it after {limit} and moved {name}.</p>')
+    return "".join(lines) + _move_members(move)
+
+
+def _move_history(history: Sequence[moves.MoveProgress], zone: tzinfo,
+                  retryable: Collection[tuple[str, str]]) -> str:
+    rows: list[str] = []
+    for move in history:
+        moved = [row.state for row in move.members if isinstance(row.state, moves.MemberMoved)]
+        already = [row.state for row in move.members if isinstance(row.state, moves.MemberAlreadyOnTarget)]
+        failed = [(row.member, row.state) for row in move.members if isinstance(row.state, moves.MemberMoveFailed)]
+        result = _move_result(len(moved), len(move.members), len(failed), len(already))
+        ended = [state.ended for state in (*moved, *already)] + [state.ended for _, state in failed]
+        if all(row.kind is moves.MoveMemberKind.REQUEST for row in move.members):
+            result = "".join(_move_failure(move, member, failure, retryable) for member, failure in failed)
+        elif failed:
+            result = (f'<details data-move-details="{html.escape(move.batch_id, quote=True)}"><summary>{result}</summary>'
+                      + "".join(_move_failure(move, member, failure, retryable) for member, failure in failed) + "</details>")
+        target = move.target if isinstance(move.target, str) else "destination unavailable"
+        rows.append("<tr>" + _cell(_move_time(move.started, zone)) + _cell(html.escape(f"{move.group} → {target}"))
+                    + _cell(_move_cause(move)) + _cell(result)
+                    + _cell(_move_duration(max(ended, default=move.started) - move.started), "right") + "</tr>")
+    return ('<details class="mv-earlier" data-move-details="earlier" open><summary>Earlier moves</summary>'
+            + '<div class="scroll"><table aria-label="Earlier moves"><thead><tr><th class="left">started</th>'
+            + '<th class="left">move</th><th class="left">cause</th><th class="left">result</th>'
+            + '<th class="right">time</th></tr></thead><tbody>' + "".join(rows) + "</tbody></table></div></details>")
+
+
+def moves_board(history: Sequence[moves.MoveProgress], now: datetime, zone: tzinfo,
+                wait_seconds: float | Literal["configured"] = "configured",
+                retryable: Collection[tuple[str, str]] = ()) -> str:
+    active = [move for move in history if move.active]
+    earlier = [move for move in history if not move.active]
+    if not active and earlier:
+        active.append(earlier.pop(0))
+    current = ("".join(f'<div class="mv-current">{_move_current(move, now, zone, wait_seconds, retryable)}</div>' for move in active)
+               or '<p class="mv-line"><span class="next-muted">No move in progress.</span></p>')
+    return '<section class="card mv-card" aria-label="Moves"><h2>Moves</h2>' + current + _move_history(earlier, zone, retryable) + "</section>"
+
+
+def logins_board(reading: accounts.StatusReading) -> str:
+    heading = '<section class="card lg-card"><h2>Logins</h2>'
+    try:
+        settings = conf.read("accounts")
+        requests = login_sittings.login_requests(reading, settings)
+        if not requests.current:
+            return heading + '<p class="lg-next next-muted">No login request.</p></section>'
+        thresholds = login_sittings.LoginCardThresholds.read(settings)
+    except (OSError, ValueError):
+        return heading + '<p class="lg-next next-muted">Login requests unavailable.</p></section>'
+    colors = accounts.role_colors()
+    rows: list[str] = []
+    for end in requests.current:
+        account = _spans([accounts.account_label_span(end.account, colors)])
+        machine = html.escape(end.machine)
+        at = end.at.astimezone(reading.zone)
+        remaining = end.at - reading.checked_at
+        tone = "error" if remaining < thresholds.error else "warning" if remaining < thresholds.warning else "default"
+        when = f'<time datetime="{end.at.isoformat()}"><span class="{tone}">{at:%a %m-%d %H:%M %Z}</span></time>'
+        action = f"/login in a {html.escape(end.account)} session on {machine}"
+        rows.append("<tr>" + _cell(account) + _cell(machine) + _cell(when) + _cell(action) + "</tr>")
+    upcoming = ""
+    if isinstance(requests.upcoming, login_sittings.ScheduledLoginRequest):
+        next_end = min(requests.upcoming.batch.ends, key=lambda end: (end.at, end.account, end.machine))
+        at = requests.upcoming.at.astimezone(reading.zone)
+        upcoming = (f'<p class="lg-next next-muted">Next request: {html.escape(next_end.account)} '
+                    f'on {html.escape(next_end.machine)}, {at:%a %m-%d}</p>')
+    headers = "".join(f'<th class="left" scope="col">{name}</th>'
+                      for name in ("account", "machine", "login ends", "action"))
+    return (heading + '<div class="scroll"><table aria-label="Logins">'
+            + f'<thead><tr>{headers}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+            + upcoming + "</section>")
+
+
 def page() -> bytes:
     """Read the stored accounts status, then render the page."""
     reading = accounts.read_status(source=accounts.StoredUsageOnly(), include_models=True)
@@ -873,12 +1282,19 @@ def page() -> bytes:
     except (UnreadableQuotaState, InvalidQuotaThresholds) as error:
         reading = replace(reading, notes=(*reading.notes, str(error)))
         alerts = {}
-    body = board(reading, alerts) + models_board(reading) + tokens_board(reading)
-    refresh_seconds = conf.read("review_links").number("page_refresh_seconds")
+    history = moves.read_move_progress()
+    body = (moves_board(history, reading.checked_at, reading.zone, retryable=_retryable_members(history, reading))
+            + logins_board(reading) + board(reading, alerts) + models_board(reading) + tokens_board(reading))
+    settings = conf.read("review_links")
+    refresh_seconds = settings.number("page_refresh_seconds")
+    request_timeout = settings.whole("page_request_timeout_seconds")
+    retry_failure = html.escape(move_failure_text(moves.MoveFailureKind.OTHER), quote=True)
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             + '<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>'
-            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}">' + page_frame.title("Accounts", "accounts")
-            + f'<div data-accounts>{body}</div></main>' + POPUP + MENU + QUOTA_PANEL
+            + f'{STYLE}</head><body><main data-refresh-seconds="{refresh_seconds}"'
+            + f' data-request-timeout-seconds="{request_timeout}" data-retry-failure="{retry_failure}">'
+            + page_frame.title("Accounts", "accounts", SCRIPT_VERSION)
+            + f'<div data-accounts>{body}</div></main>' + POPUP + MOVE_DIALOG + QUOTA_PANEL
             + '<div class="model-tooltip" hidden aria-hidden="true"></div>'
             + f"<script>{SCRIPT}</script></body></html>").encode()
 
@@ -912,7 +1328,24 @@ def main() -> int:
 STYLE = "<style>\n" + console_theme.CSS + page_frame.STYLE + """
 h2{margin:16px 0 4px}
 [data-accounts] .card>h2:first-child{margin-top:0}
+.mv-card.card{width:895px;box-sizing:border-box}
+.mv-head,.mv-line{margin:0 0 6px;font-size:.93rem}
+.mv-head{margin-bottom:8px}
+.mv-bar{display:flex;height:10px;margin:0 0 8px;border-radius:5px;overflow:hidden;background:var(--line)}
+.mv-done{background:var(--room)}
+.mv-now{background:color-mix(in srgb,var(--room) 45%,var(--line))}
+.mv-failed{background:var(--error)}
+.mv-current+.mv-current,.mv-units,.mv-earlier{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+.mv-fault button{margin-left:8px;border:0;border-radius:7px;padding:3px 12px;background:var(--filter-selected-bg);
+color:var(--filter-selected-ink);font:inherit;font-weight:600;cursor:pointer}
+.mv-fault button:disabled{opacity:.5;cursor:default}
+.mv-card summary{width:fit-content;margin-left:-6px;padding:2px 6px;border-radius:4px;font-weight:700;cursor:pointer}
+.mv-card :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.mv-units summary,.mv-earlier>summary{font-size:.93rem}
+.mv-earlier .mv-fault{white-space:normal;min-width:16ch}
 .card{--column-gap:1.125rem;--table-font-size:.86rem;width:fit-content;max-width:100%;padding-right:var(--column-gap)}
+.lg-card{box-sizing:border-box;width:895px;max-width:100%}
+.lg-next{margin:10px 0 0;font-size:.93rem}
 .models-card,.tokens-card{margin-top:24px}
 .token-steps{margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:var(--table-font-size)}
 .token-steps summary{width:fit-content;margin-left:-6px;padding:2px 6px;border-radius:4px;
@@ -965,6 +1398,11 @@ tbody tr td{border-top:1px solid var(--line)}
 .roles-table tbody tr[data-summary] td{border-top:1px solid var(--ink-3)}
 tbody tr:hover td{background:var(--hover)}
 .bold{font-weight:600}.success{color:var(--room)}.error{color:var(--error)}.warning{color:var(--warning)}
+.accounts-table{--reset-green:light-dark(color-mix(in srgb,var(--room) 60%,var(--ink)),
+color-mix(in srgb,var(--room) 75%,var(--ink)));
+--reset-orange:light-dark(color-mix(in srgb,var(--warning) 94%,var(--ink)),var(--warning))}
+.weekly-reset-ready{color:var(--reset-green)}
+.weekly-reset-exhausted{color:color-mix(in srgb,var(--reset-green),var(--reset-orange) var(--reset-orange-weight))}
 .inactive{color:var(--ink-3)}
 .color-swatch{width:18px;height:18px;vertical-align:middle;background:var(--ink);border:1px solid var(--ink-3);border-radius:4px;cursor:pointer}
 .color-picker{position:fixed;inset:auto;margin:0;padding:16px;width:280px;box-sizing:border-box;max-width:calc(100vw - 16px);
@@ -999,17 +1437,36 @@ background:var(--bg);color:var(--ink);cursor:pointer}
 background:transparent;color:var(--ink-2);cursor:pointer}
 .next-button:focus-visible{background:var(--hover)}
 .next-button svg,.next-minus svg{width:14px;height:14px;vertical-align:middle}
-.move-menu button[aria-checked=true]{background:var(--hover)}
-.move-menu{position:fixed;z-index:5;margin:0;padding:6px;width:max-content;min-width:220px;max-width:calc(100vw - 16px);box-sizing:border-box;
+.move-dialog{position:fixed;inset:auto;margin:0;width:330px;max-width:calc(100vw - 16px);
+max-height:calc(100vh - 16px);overflow:auto;padding:14px 16px;box-sizing:border-box;
 border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);box-shadow:0 4px 20px var(--edge);
 font-size:.86rem;font-variant-numeric:tabular-nums}
-.move-menu[hidden]{display:none}
-.move-title{padding:6px 10px 8px;margin-bottom:4px;color:var(--ink-2);border-bottom:1px solid var(--line)}
-.move-menu button{display:flex;justify-content:space-between;gap:24px;width:100%;padding:6px 10px;border:0;border-radius:6px;
-background:none;color:inherit;font:inherit;text-align:left;cursor:pointer}
-.move-menu button:focus-visible{background:var(--hover);outline:none}
-.move-name{font-weight:600}.move-left{color:var(--ink-2)}.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
-.move-empty{padding:6px 10px;color:var(--ink-3)}
+.move-dialog::backdrop{background:transparent}
+.move-title{font-size:.98rem;font-weight:600}
+.move-current{margin:2px 0 12px;color:var(--ink-2)}
+.move-group{margin:0 0 14px;padding:0;border:0;min-width:0}
+.move-group legend{margin:0 0 4px;padding:0;font-size:.74rem;font-weight:600;letter-spacing:.06em;
+text-transform:uppercase;color:var(--ink-2)}
+.move-choice{display:flex;align-items:center;gap:9px;margin:0 -8px;padding:5px 8px;border-radius:6px}
+.move-choice:has(:checked){background:var(--hover)}
+.move-choice input{appearance:none;flex:none;box-sizing:border-box;width:14px;height:14px;margin:0;
+border:1.5px solid var(--ink-2);border-radius:50%}
+.move-choice input:checked{border-color:var(--accent);background:radial-gradient(circle,var(--accent) 0 3.2px,transparent 3.8px)}
+.move-name{font-weight:600}.move-left{margin-left:auto;color:var(--ink-2)}
+.move-left.warning{color:var(--warning)}.move-left.error{color:var(--error)}
+.move-when{display:flex;align-items:center;gap:7px;padding:2px 0 6px}
+.move-when input{appearance:textfield;box-sizing:border-box;width:3.8em;padding:3px 6px;border:1px solid var(--line);
+border-radius:6px;background:var(--bg);color:var(--ink);font:inherit;text-align:right}
+.move-when input::-webkit-inner-spin-button,.move-when input::-webkit-outer-spin-button{appearance:none}
+.move-hint{margin:0 0 12px;padding-top:10px;border-top:1px solid var(--line);color:var(--ink-2);line-height:1.45}
+.move-error{margin:0 0 12px;color:var(--error);overflow-wrap:anywhere}
+.move-actions{display:flex;align-items:center;gap:8px}
+.move-actions button{padding:5px 14px;border:1px solid var(--line);border-radius:7px;background:none;color:inherit;
+font:inherit;font-weight:600;cursor:pointer}
+.move-actions button:disabled{opacity:.5;cursor:default}
+.move-actions [data-move-submit]{border-color:var(--filter-selected-bg);background:var(--filter-selected-bg);color:var(--filter-selected-ink)}
+.move-actions [data-move-now]{margin-right:auto}
+.move-dialog :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .quota-icon{display:inline-grid;place-items:center;vertical-align:middle;width:22px;height:22px;margin:-3px 5px -3px 0;
 padding:2px;border:0;border-radius:5px;background:transparent;cursor:pointer}
 .quota-icon svg{width:16px;height:16px}
@@ -1042,14 +1499,34 @@ maxlength="7" spellcheck="false" autocomplete="off" required>
 <button type="button" data-color-save>Save</button>
 <button type="button" data-color-cancel>Cancel</button></div></dialog>'''
 
-MENU = ('<div class="move-menu" role="menu" tabindex="-1" aria-labelledby="move-title" hidden data-move-menu>'
-        + '<div id="move-title" class="move-title" data-move-title></div><div data-move-items></div></div>')
+MOVE_DIALOG = """<dialog class="move-dialog" aria-labelledby="move-title" data-move-dialog>
+<form novalidate>
+<div id="move-title" class="move-title"></div>
+<p class="move-current" data-move-current></p>
+<p class="move-error" hidden data-move-unavailable>The next moves cannot be read now.</p>
+<fieldset class="move-group"><legend>Move to</legend><div data-move-choices></div></fieldset>
+<fieldset class="move-group"><legend>When</legend>
+<div class="move-when">
+<span><span class="move-name" data-move-source></span> has</span>
+<input name="percent" aria-label="Percent left" type="number" inputmode="decimal" min="0" max="100" step="any" required>
+<span>% left of</span>
+</div>
+<label class="move-choice"><input type="radio" name="measure" value="all-models">all models</label>
+<label class="move-choice"><input type="radio" name="measure" value="fable">Fable</label>
+</fieldset>
+<p class="move-hint" data-move-instructions>Save keeps these settings.<span data-move-hint></span></p>
+<p class="move-error" role="alert" hidden data-move-error></p>
+<div class="move-actions">
+<button type="button" data-move-now>Move now</button>
+<button type="button" data-move-cancel>Cancel</button>
+<button type="submit" data-move-submit>Save</button>
+</div></form></dialog>"""
 
 QUOTA_PANEL = ('<div class="quota-panel" id="quota-panel" role="dialog" aria-labelledby="quota-title" hidden>'
                + '<strong id="quota-title"></strong><p data-quota-description></p>'
                + '<button type="button" data-quota-clear>Clear</button></div>')
 
-SCRIPT = page_frame.REFRESH_SCRIPT + r"""(() => {
+SCRIPT = page_frame.REFRESH_SCRIPT + page_frame.ACTION_STATUS_SCRIPT + r"""(() => {
 let view = document.querySelector('[data-accounts]');
 let newestRequest = 0;
 const modelTooltip=document.querySelector('.model-tooltip');
@@ -1177,12 +1654,16 @@ message.className='color-save-error';message.dataset.colorSaveError='';message.h
 message.setAttribute('role','status');message.setAttribute('aria-live','polite');
 document.querySelector('[data-page-status]').append(message);
 let selected=null;
-const menu=document.querySelector('[data-move-menu]'), menuItems=menu.querySelector('[data-move-items]');
-let menuRow=null, menuButton=null;
+const moveDialog=document.querySelector('[data-move-dialog]'), moveForm=moveDialog.querySelector('form');
+const moveChoices=moveForm.querySelector('[data-move-choices]'), moveNow=moveForm.querySelector('[data-move-now]');
+const moveError=moveForm.querySelector('[data-move-error]'), moveHint=moveForm.querySelector('[data-move-hint]');
+const moveSubmit=moveForm.querySelector('[data-move-submit]'), moveCancel=moveForm.querySelector('[data-move-cancel]');
+const movePercent=moveForm.elements.namedItem('percent');
+let moveButton=null, moveSaving=false;
 const pendingMoves=new Set();
 const quotaPanel=document.querySelector('#quota-panel'), quotaClear=quotaPanel.querySelector('[data-quota-clear]');
 let quotaButton=null, quotaSaving=false;
-const hold=()=>selected ? 'A color is being edited.' : menuRow ? 'An account move is being chosen.'
+const hold=()=>selected ? 'A color is being edited.' : moveButton ? 'An account move is being chosen.'
  : pendingSaves.size ? 'Colors are being saved.' : pendingMoves.size ? 'An account move is being saved.'
  : quotaSaving ? 'A quota alert is being cleared.' : quotaButton ? 'A quota alert is open.' : '';
 const sortSelector='th[aria-sort]';
@@ -1263,6 +1744,12 @@ function keepOpenSteps(fresh){
  const open=new Set([...view.querySelectorAll('details[data-token][open]')].map(node=>node.dataset.token));
  for(const node of fresh.querySelectorAll('details[data-token]')) node.open=open.has(node.dataset.token);
 }
+function keepMoveDetails(fresh){
+ const open=new Map([...view.querySelectorAll('[data-move-details]')].map(node=>[node.dataset.moveDetails,node.open]));
+ for(const node of fresh.querySelectorAll('[data-move-details]')){
+  if(open.has(node.dataset.moveDetails)) node.open=open.get(node.dataset.moveDetails);
+ }
+}
 // A refresh keeps focus on the same summary or command of a token's renewal steps.
 function keepStepFocus(){
  const steps=document.activeElement?.closest('details[data-token]');
@@ -1272,17 +1759,19 @@ function keepStepFocus(){
   ?.querySelectorAll('summary,.token-command')[index]?.focus({preventScroll:true});
 }
 async function refresh(supersede=false,current=()=>true) {
-  if (hold()) return;
   const request = ++newestRequest;
   const response = await fetch(location.pathname, {cache: 'no-store'});
   if (!response.ok) throw new Error('HTTP ' + response.status);
   const page = new DOMParser().parseFromString(await response.text(), 'text/html');
   const fresh = page.querySelector('[data-accounts]');
-  if (request !== newestRequest || !current() || hold()) return;
+  if (request !== newestRequest || !current()) return;
+  const newer = reloadForNewScript(page, () => Boolean(hold()));
+  if (newer || hold()) return newer;
   if (!fresh) throw new Error('The page has no accounts.');
   const top = scrollY;
-  const restoreFocus = countCell(document.activeElement) ? restoreFocusAfterRefresh() : keepStepFocus();
+  const restoreFocus = countCell(document.activeElement) ? restoreFocusAfterRefresh() : keepStepFocus() || keepMoveFocus();
   keepOpenSteps(fresh);
+  keepMoveDetails(fresh);
   view.replaceWith(fresh);view = fresh;
   applySorts();
   scrollTo({top, behavior: 'instant'});
@@ -1339,17 +1828,22 @@ popup.addEventListener('keydown',event=>{
 async function publish(save){
  const pending=queue(save.key);
  try{
-  const response=await fetch(location.pathname,{method:'POST',
+  const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
    body:new URLSearchParams({key:save.key,value:save.value}).toString()});
   const result=await response.json();
   if(!response.ok) throw new Error(result.reason || 'The color could not be saved.');
   for(const button of swatches(save.key)) button.dataset.savedColor=save.value;
  }catch(error){
-  for(const button of swatches(save.key)) button.dataset.savedColor=save.oldColor;
-  paint(save.key,save.oldColor);
-  if(selected?.dataset.colorKey===save.key){picker.value=pickerColor(selected,save.oldColor);readHex();}
-  message.textContent=save.name+': '+(error.message || 'The color could not be saved.');message.hidden=false;
+  // After a timeout the save can still finish, so the color stays. The next refresh shows the true color.
+  const unknown=saveTimeoutWords(error);
+  if(unknown){for(const button of swatches(save.key)) button.dataset.savedColor=save.value;}
+  else{
+   for(const button of swatches(save.key)) button.dataset.savedColor=save.oldColor;
+   paint(save.key,save.oldColor);
+   if(selected?.dataset.colorKey===save.key){picker.value=pickerColor(selected,save.oldColor);readHex();}
+  }
+  showActionFailure(message,save.name+': '+(unknown || error.message || 'The color could not be saved.'));
  }finally{
   pending.shift();pendingSaves.delete(save);
   const next=pending[0];
@@ -1364,93 +1858,192 @@ popup.querySelector('[data-color-save]').addEventListener('click',()=>{
  const button=selected,key=button.dataset.colorKey,pending=queue(key);
  const save={key,name:button.dataset.colorName,value:picker.value,oldColor:button.dataset.savedColor};
  paint(key,save.value);pending.push(save);pendingSaves.add(save);
- message.textContent='';message.hidden=true;close(false);
+ showActionFailure(message);close(false);
  if(pending.length===1) void publish(save);
 });
 addEventListener('resize',position);addEventListener('scroll',position,{passive:true});
-function closeMenu(){
- if(!menuRow) return;
- const button=menuButton;menuRow=null;menuButton=null;
- menu.hidden=true;menuItems.replaceChildren();button.setAttribute("aria-expanded","false");
+function closeMoveDialog(){
+ if(!moveButton || moveSaving) return;
+ const button=moveButton;
+ moveButton=null;moveDialog.close();button.setAttribute('aria-expanded','false');
  button.focus({preventScroll:true});updates.changed();
 }
-function menuItem([label,left,color,tone]){
- const item=document.createElement('button');
- item.type='button';item.setAttribute('role','menuitemradio');item.dataset.moveTarget=label;
- item.setAttribute('aria-checked',String(label===menuButton.dataset.nextTarget));
- const name=document.createElement('span'), room=document.createElement('span');
- name.className='move-name';name.textContent=label;if(color) name.style.color=color;
- room.className='move-left'+(tone==='default' ? '' : ' '+tone);room.textContent=left && left!=='—' ? left+' left' : '';
- item.append(name,room);return item;
+function moveAccountName(label,color){
+ const name=document.createElement('span');
+ name.className='move-name';name.textContent=label;
+ if(color) name.style.color=color;
+ return name;
 }
-function openMenu(button){
- const box=button.getBoundingClientRect();
- if(selected) close(true);
- const card=view.querySelector('[data-move-targets]');
- const account=button.dataset.moveAccount, group=button.dataset.moveGroup;
- const targets=JSON.parse(card.dataset.moveTargets).filter(([label])=>label!==account);
- menuRow=button.closest("tr");menuButton=button;button.setAttribute("aria-expanded","true");
- menu.querySelector('[data-move-title]').textContent='When '+account+' reaches '+card.dataset.movePercent+'%, move '+group+' to';
- const empty=document.createElement('div');
- empty.className='move-empty';empty.textContent='No other Claude account';
- menuItems.replaceChildren(...(targets.length ? targets.map(menuItem) : [empty]));
- if(button.dataset.nextTarget){
-  const clear=document.createElement('button');clear.type='button';clear.dataset.moveClear='first';
-  clear.setAttribute('role','menuitem');clear.textContent='No next move';menuItems.append(clear);
+function moveChoice([label,left,color,tone],target){
+ const choice=document.createElement('label'), radio=document.createElement('input');
+ choice.className='move-choice';radio.type='radio';radio.name='target';radio.value=label;
+ radio.checked=label===target;
+ choice.append(radio, label ? moveAccountName(label,color) : 'No next move');
+ if(left && left!=='—'){
+  const room=document.createElement('span');
+  room.className='move-left'+(tone==='default' ? '' : ' '+tone);room.textContent=left+' left';
+  choice.append(room);
  }
- menu.hidden=false;
- const size=menu.getBoundingClientRect();
- menu.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
- menu.style.top=Math.max(8,Math.min(box.bottom,innerHeight-size.height-8))+'px';
- (menuItems.querySelector('button') || menu).focus({preventScroll:true});
+ return choice;
+}
+function updateMoveHint(){
+ const selected=moveChoices.querySelector(':checked');
+ moveNow.disabled=!selected?.value;
+ moveHint.replaceChildren();
+ if(selected?.value){
+  moveHint.append(' Move now moves the '+moveButton.dataset.moveGroup+' to ',
+   selected.nextElementSibling.cloneNode(true),' at once.');
+ }
+}
+function positionMoveDialog(){
+ if(!moveButton) return;
+ const box=moveButton.getBoundingClientRect(), size=moveDialog.getBoundingClientRect();
+ moveDialog.style.left=Math.max(8,Math.min(box.left,innerWidth-size.width-8))+'px';
+ const below=box.bottom+4, above=box.top-size.height-4, bottomEdge=innerHeight-size.height-8;
+ const top=below<=bottomEdge ? below : above>=8 ? above : Math.max(8,bottomEdge);
+ moveDialog.style.top=top+'px';
+}
+function openMoveDialog(button){
+ if(selected) close(true);
+ closeQuota(false);
+ const card=view.querySelector('[data-move-targets]');
+ const {moveAccount:account,moveGroup:group,nextTarget:target}=button.dataset;
+ const settings=JSON.parse(card.dataset.nextSettings), unavailable=settings===null;
+ const targets=JSON.parse(card.dataset.moveTargets);
+ const color=targets.find(([label])=>label===account)?.[2];
+ const choices=targets.filter(([label])=>label!==account);
+ if(target && !choices.some(([label])=>label===target)) choices.push([target,'','','default']);
+ moveButton=button;button.setAttribute('aria-expanded','true');
+ moveDialog.querySelector('#move-title').textContent='Next move of '+group;
+ moveForm.querySelector('[data-move-current]').replaceChildren('The '+group+' run on ',moveAccountName(account,color),' now.');
+ const source=moveForm.querySelector('[data-move-source]');
+ source.textContent=account;source.style.color=color ?? '';
+ moveChoices.replaceChildren();
+ for(const field of moveForm.querySelectorAll('fieldset')){
+  field.hidden=unavailable;field.disabled=unavailable;
+ }
+ moveForm.querySelector('[data-move-instructions]').hidden=unavailable;
+ moveForm.querySelector('[data-move-unavailable]').hidden=!unavailable;
+ moveSubmit.disabled=unavailable;
+ if(!unavailable){
+  moveChoices.append(...choices.map(choice=>moveChoice(choice,target)),moveChoice(['','','','default'],target));
+  const [percent,measure]=settings[group] ?? [card.dataset.movePercent,'all-models'];
+  movePercent.value=percent;
+  moveForm.elements.namedItem('measure').value=measure;
+ }
+ moveError.hidden=true;
+ updateMoveHint();
+ moveDialog.showModal();positionMoveDialog();
+ (moveChoices.querySelector(':checked') ?? moveCancel).focus({preventScroll:true});
  updates.abandon();
 }
-async function saveMove(form){
- const group=form.group, save={form};
- pendingMoves.add(save);message.textContent='';message.hidden=true;
+function keepMoveFocus(){
+ const focused=document.activeElement;
+ if(focused?.matches('[data-next-button]')){
+  const group=focused.dataset.moveGroup;
+  return ()=>[...view.querySelectorAll('[data-next-button]')].find(button=>button.dataset.moveGroup===group)
+   ?.focus({preventScroll:true});
+ }
+ if(focused?.matches('[data-retry-move]')){
+  const {retryMove,moveMember}=focused.dataset;
+  return ()=>[...view.querySelectorAll('[data-retry-move]')].find(button=>button.dataset.retryMove===retryMove
+    && button.dataset.moveMember===moveMember)?.focus({preventScroll:true});
+ }
+ if(focused?.matches('[data-move-details]>summary')){
+  const key=focused.parentElement.dataset.moveDetails;
+  return ()=>[...view.querySelectorAll('[data-move-details]')].find(node=>node.dataset.moveDetails===key)
+    ?.querySelector('summary')?.focus({preventScroll:true});
+ }
+ return null;
+}
+async function saveMove(form,button=null){
+ const save={form};
+ const fallback=button ? document.querySelector('main').dataset.retryFailure : 'The move could not be saved.';
+ if(button){button.disabled=true;updates.abandon();}
+ pendingMoves.add(save);showActionFailure(message);
  try{
-  const response=await fetch(location.pathname,{method:'POST',
+  const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
    body:new URLSearchParams(form).toString()});
   const result=await response.json();
-  if(!response.ok) throw new Error(result.reason || 'The move could not be saved.');
+  if(!response.ok || (button && result?.state!=='saved')){
+   throw new Error(button ? fallback : result.reason || fallback);
+  }
  }catch(error){
-  message.textContent=group+': '+(error.message || 'The move could not be saved.');message.hidden=false;
+  showActionFailure(message,button ? fallback : form.group+': '+(saveTimeoutWords(error) || error.message || fallback));
  }finally{
+  if(button) button.disabled=false;
   pendingMoves.delete(save);updates.changed();
   if(!hold()) void updates.refresh(true);
  }
 }
 document.addEventListener('click',event=>{
+ const button=event.target instanceof Element ? event.target.closest('[data-retry-move]') : null;
+ if(!button || button.disabled) return;
+ void saveMove({retry_move:button.dataset.retryMove,member:button.dataset.moveMember},button);
+});
+document.addEventListener('click',event=>{
  const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;
  if(!button) return;
- const wasOpen=menuButton===button;closeMenu();if(!wasOpen) openMenu(button);
+ if(!moveButton) openMoveDialog(button);
 });
 document.addEventListener('keydown',event=>{
  const button=event.target instanceof Element ? event.target.closest('[data-next-button]') : null;
  if(!button || !['Enter',' '].includes(event.key)) return;
  event.preventDefault();button.click();
 });
-document.addEventListener('pointerdown',event=>{
- if(menuRow && !(event.target instanceof Node && (menu.contains(event.target) || menuButton.contains(event.target)))) closeMenu();
+moveChoices.addEventListener('change',updateMoveHint);
+moveCancel.addEventListener('click',closeMoveDialog);
+moveDialog.addEventListener('cancel',event=>{event.preventDefault();closeMoveDialog();});
+moveDialog.addEventListener('keydown',event=>{
+ if(event.key==='Escape'){event.preventDefault();closeMoveDialog();return;}
+ if(event.key!=='Tab') return;
+ const stops=[...moveForm.querySelectorAll('input:not(:disabled),button:not(:disabled)')]
+  .filter(control=>control.type!=='radio' || control.checked);
+ if(!stops.length){event.preventDefault();return;}
+ const at=stops.indexOf(document.activeElement), step=event.shiftKey ? -1 : 1;
+ if(at<0 || at+step<0 || at+step===stops.length){
+  event.preventDefault();stops[event.shiftKey ? stops.length-1 : 0].focus();
+ }
 });
-menu.addEventListener('click',event=>{
- const item=event.target instanceof Element ? event.target.closest('[data-move-target],[data-move-clear]') : null;
- if(!item || !menuRow) return;
- const form=item.dataset.moveClear ? {group:menuButton.dataset.moveGroup,clear:'first'}
-  : {group:menuButton.dataset.moveGroup,to:item.dataset.moveTarget};
- void saveMove(form);closeMenu();
-});
-menu.addEventListener('keydown',event=>{
- const items=[...menuItems.querySelectorAll('button')], at=items.indexOf(document.activeElement);
- if(event.key==='Escape' || event.key==='Tab'){event.preventDefault();closeMenu();return;}
- if(!items.length || !['ArrowDown','ArrowUp','Home','End'].includes(event.key)) return;
- event.preventDefault();
- const down=event.key==='ArrowDown';
- const next=event.key==='Home' ? 0 : event.key==='End' ? items.length-1
-  : at<0 ? (down ? 0 : items.length-1) : (at+(down ? 1 : -1)+items.length)%items.length;
- items[next].focus();
-});
+function showMoveFailure(now,busy,focus){
+ moveError.textContent=busy ? 'Another move is in progress. Try again when it ends.'
+  : now ? 'The move did not start. Try again.' : 'The settings were not saved. Try again.';
+ moveError.hidden=false;positionMoveDialog();focus.focus({preventScroll:true});
+}
+async function submitMoveDialog(now){
+ if(!moveButton || moveSaving || moveSubmit.disabled) return;
+ const {moveGroup:group,nextTarget:savedTarget}=moveButton.dataset;
+ const {target,percent,measure}=Object.fromEntries(new FormData(moveForm));
+ if(now && !target) return;
+ if(!target && !savedTarget){closeMoveDialog();return;}
+ if(!now && target && !movePercent.validity.valid){
+  showMoveFailure(false,false,movePercent);return;
+ }
+ const fields=now ? {group,move_now:target} : target ? {group,to:target,percent,measure} : {group,clear:'first'};
+ moveSaving=true;moveError.hidden=true;moveForm.setAttribute('aria-busy','true');
+ const focused=document.activeElement;
+ const controls=[...moveForm.querySelectorAll('fieldset,button:not(:disabled)')];
+ for(const control of controls) control.disabled=true;
+ let accepted=false;
+ let busy=false;
+ try{
+  const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
+   headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(fields)});
+  const result=await response.json();
+  busy=now && response.status===409 && result?.state==='move-in-progress';
+  accepted=response.ok && result?.state==='saved';
+ }catch{
+  // Use the action's message for a failed request.
+ }finally{
+  for(const control of controls) control.disabled=false;
+  moveSaving=false;moveForm.removeAttribute('aria-busy');
+  if(accepted){closeMoveDialog();void updates.refresh(true);}
+  else showMoveFailure(now,busy,focused);
+ }
+}
+moveNow.addEventListener('click',()=>void submitMoveDialog(true));
+moveForm.addEventListener('submit',event=>{event.preventDefault();void submitMoveDialog(false);});
 function closeQuota(restoreFocus){
  if(!quotaButton) return;
  const button=quotaButton;
@@ -1486,9 +2079,9 @@ document.addEventListener('keydown',event=>{
 quotaClear.addEventListener('click',async()=>{
  if(!quotaButton || quotaSaving) return;
  const button=quotaButton, {quotaAccount,quotaLevel,quotaReset}=button.dataset;
- quotaSaving=true;quotaClear.disabled=true;message.hidden=true;
+ quotaSaving=true;quotaClear.disabled=true;showActionFailure(message);updates.abandon();
  try{
-  const response=await fetch(location.pathname,{method:'POST',
+  const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
    headers:{'Content-Type':'application/x-www-form-urlencoded'},
    body:new URLSearchParams({quota_account:quotaAccount,quota_level:quotaLevel,quota_reset:quotaReset})});
   const result=await response.json();
@@ -1501,14 +2094,17 @@ quotaClear.addEventListener('click',async()=>{
   if(hadFocus){cell.tabIndex=-1;cell.focus({preventScroll:true});}
   window.parent.postMessage('accounts-quota-cleared',location.origin);
  }catch(error){
-  message.textContent=error.message || 'The quota alert could not be cleared.';message.hidden=false;
+  showActionFailure(message,saveTimeoutWords(error) || error.message || 'The quota alert could not be cleared.');
  }finally{
   quotaSaving=false;quotaClear.disabled=false;updates.changed();
+  if(!hold()) void updates.refresh(true);
  }
 });
 for(const name of ['resize','scroll']) addEventListener(name,()=>closeQuota(false),{passive:true});
-for(const name of ['resize','scroll','blur']) addEventListener(name,closeMenu,{passive:true});
+for(const name of ['resize','scroll']) addEventListener(name,positionMoveDialog,{passive:true});
 })();"""
+VERSION_PARTS = (POPUP, MOVE_DIALOG, QUOTA_PANEL, STYLE, SCRIPT)
+SCRIPT_VERSION = page_version.script_version(*VERSION_PARTS)
 
 
 if __name__ == "__main__":

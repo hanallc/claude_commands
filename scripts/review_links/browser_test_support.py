@@ -4,11 +4,10 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import tempfile
 import threading
 import unittest
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,10 +15,43 @@ from typing import cast, override
 from unittest.mock import patch
 
 from scripts.lib import conf
+from scripts.lib.process_group import run_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.review_links import console
 
 NO_DATA_FILE: dict[str, object] = {}
+UNDO_ACTION_SCRIPT = r"""
+function fixtureUndo(){
+ const realFetch=window.fetch.bind(window),posts=[];
+ window.fetch=async(url,options={})=>{
+  if(options.method!=='POST') return realFetch(url,options);
+  if(String(url).endsWith('/undo')) return Response.json({outcome:'undone'});
+  if(new Headers(options.headers).get('X-Undo-Hold')!=='1') throw new Error('The action sent no hold header.');
+  posts.push(new URLSearchParams(options.body));
+  return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+ };
+ const until=async(test,label)=>{
+  const end=performance.now()+8000;
+  while(!test()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ const toast=()=>window.top.document.querySelector('[data-send-undo]');
+ async function undo(){
+  await until(()=>toast()?.querySelector('button'),'The Undo toast did not show.');
+  const current=toast();
+  const button=current.querySelector('button');
+  if(current.querySelector('span').textContent!=='Saved.' || button.textContent!=='Undo')
+   throw new Error('The toast must say Saved and offer Undo.');
+  button.click();
+  await until(()=>!current.isConnected,'The Undo toast did not close.');
+ }
+ return {realFetch,posts,until,undo};
+}
+"""
+
 STATUS_PAGES = (
     ("accounts", "Accounts", "users", "Accounts", 45),
     ("aws", "AWS", "cloud", "AWS", 3900),
@@ -46,14 +78,17 @@ def status_configuration() -> Generator[None]:
             + "# range: 0.001..86400\nstatus.render_limit_seconds=1\n"
             + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
             + pages)
-        _ = (root / "review_links.conf").write_text(
+        _ = write_config_fixture(root / "review_links.conf",
             "# range: 5..300\npage_refresh_seconds=15\n"
-            + "# range: 0.5..60\nframe_retry_seconds=2\n")
+            + "# range: 0.5..60\nframe_retry_seconds=2\n"
+            + "# whole: 1..300\npage_request_timeout_seconds=15\n")
         with patch.dict(os.environ, {"CONF_DIR": temporary, "USER_ZONE": "America/New_York"}):
             yield
 
 
-def firefox_probe_results(page: bytes) -> list[list[str]]:
+def firefox_probe_results(page: bytes, *, window_size: tuple[int, int] | None = None,
+                          dark: bool = False, screenshot: Path | None = None,
+                          post_page: Callable[[bytes], tuple[int, bytes]] | None = None) -> list[list[str]]:
     """Load the page in a headless Firefox frame and return the failure lists its probe posts."""
     results: list[list[str]] = []
     complete = threading.Event()
@@ -66,12 +101,21 @@ def firefox_probe_results(page: bytes) -> list[list[str]]:
             if self.path == "/complete":
                 _ = complete.wait(TEST_HANG_GUARD_SECS)
             elif self.path == "/":
-                _ = self.wfile.write(b'<iframe src="/accounts"></iframe><img hidden src="/complete">')
+                viewport = (b'<style>body{margin:0}iframe{display:block;border:0;width:100vw;height:100vh}</style>'
+                            if screenshot is not None else b"")
+                _ = self.wfile.write(viewport + b'<iframe src="/accounts"></iframe><img hidden src="/complete">')
             else:
                 _ = self.wfile.write(page)
 
         def do_POST(self) -> None:
             payload = self.rfile.read(int(self.headers["Content-Length"]))
+            if self.path == "/accounts" and post_page is not None:
+                status, body = post_page(payload)
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                _ = self.wfile.write(body)
+                return
             results.append(cast(list[str], json.loads(payload)))
             complete.set()
             self.send_response(204)
@@ -87,9 +131,18 @@ def firefox_probe_results(page: bytes) -> list[list[str]]:
         try:
             profile = Path(temporary) / "profile"
             profile.mkdir()
-            run = subprocess.run(["firefox", "--headless", "--no-remote", "--profile", str(profile),
-                                  "--screenshot", str(Path(temporary) / "page.png"), f"http://127.0.0.1:{server.server_port}/"],
-                                 capture_output=True, text=True, timeout=45)
+            options: list[str] = []
+            environment = os.environ.copy()
+            if window_size is not None:
+                width, height = window_size
+                options.extend(("--window-size", f"{width},{height}"))
+                environment.update(MOZ_HEADLESS_WIDTH=str(width), MOZ_HEADLESS_HEIGHT=str(height))
+            if dark:
+                _ = (profile / "user.js").write_text('user_pref("ui.systemUsesDarkTheme", 1);\n')
+            capture = screenshot if screenshot is not None else Path(temporary) / "page.png"
+            run = run_process_group(["firefox", "--headless", "--no-remote", "--profile", str(profile), *options,
+                                     "--screenshot", str(capture), f"http://127.0.0.1:{server.server_port}/"],
+                                    timeout=45, env=environment)
             if run.returncode:
                 raise AssertionError(run.stderr)
         finally:
@@ -168,6 +221,12 @@ window.fetch=async(url,options={})=>{
    button.top>=bar.top && button.bottom<=bar.bottom,
    'the '+state()+' line shows the same labeled Measure now button at its right edge');
  };
+ const checkMeasureFailure=()=>{
+  const notice=document.querySelector('#measure-failure');
+  check(state()==='Live' && !part('age').hidden && age()==='0 s ago' &&
+   notice.checkVisibility() && notice.textContent==='HTTP 502',
+   'a refused Disks measure shows its notice and keeps the live data time');
+ };
  const shown=()=>dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  const requestTimer=()=>[...intervals.values()].find(timer=>timer.ms===expectedPeriod);
  const clock=()=>[...intervals.values()].find(timer=>timer.ms===1000);
@@ -176,10 +235,14 @@ window.fetch=async(url,options={})=>{
   checkMeasure();
   if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
   await flush();
-  if(mode==='retained' || measureFails){
+  if(mode==='retained'){
    check(state()==='Failed' && !part('age').hidden && age()==='0 s ago',
     'a first failed read with shown data keeps its data time');
-   mode='good';measureFails=false;
+   mode='good';
+  }
+  if(measureFails){
+   checkMeasureFailure();
+   measureFails=false;
   }
   shown();await flush();
   check(reads>0 && state()==='Live','the real loader completes a good read');
@@ -190,14 +253,17 @@ window.fetch=async(url,options={})=>{
   const positions=[...line.children].filter(node=>!node.hidden && !node.matches('[data-status-announcement]'));
   check(positions.length===4 && positions[0].matches('.page-status-state') && positions[1]===part('age') &&
    positions[2]===part('trip') && positions[3]===part('render'),'the Live line has the same four positions');
+  const originalScroll=scrollY;
+  scrollTo({top:0,behavior:'instant'});
   const title=document.querySelector('.page-title'),titleBox=title.getBoundingClientRect(),lineBox=line.getBoundingClientRect();
+  const header=title.closest('.page-top');
   const headingBox=(title.closest('.page-heading') || title).getBoundingClientRect();
   const main=document.querySelector('main'),mainBox=main.getBoundingClientRect(),width=document.documentElement.clientWidth;
   // A wide page uses the pane width; a text page keeps the 1124 px column.
   check(mainBox.width===(main.classList.contains('page-wide')?width:Math.min(width,1124)) &&
    Math.abs(mainBox.left-(width-mainBox.right))<1,'the page uses the shared centered column');
   check(main.classList.contains('page-wide')===(document.title==='Builds'),'only the Builds page is wide');
-  check(titleBox.x===mainBox.x+32 && headingBox.y+scrollY===32,'the title starts at the shared column edge');
+  check(titleBox.x===mainBox.x+32 && headingBox.y===32,'the title starts at the shared column edge');
   const searchField=main.querySelector('[data-review] #list-search');
   const search=searchField?.getBoundingClientRect();
   if(search){
@@ -211,8 +277,11 @@ window.fetch=async(url,options={})=>{
   check(lineBox.height===21,'the line uses the shared height');
   check(getComputedStyle(title).fontSize==='26px' && getComputedStyle(title).fontWeight==='700',
    'the title uses the shared size and weight');
-  check(getComputedStyle(line).fontSize==='14px' && getComputedStyle(line).lineHeight==='21px' &&
-   getComputedStyle(line).marginBottom===(search ? '0px' : '20px'),'the line uses the shared font and the expected lower space');
+  check(getComputedStyle(line).fontSize==='14px' && getComputedStyle(line).lineHeight==='21px',
+   'the line uses the shared font');
+  const lowerSpace=header.getBoundingClientRect().bottom-Math.max(lineBox.bottom,search?.bottom ?? lineBox.bottom)
+   +parseFloat(getComputedStyle(header).marginBottom);
+  check(Math.abs(lowerSpace-(search ? 12 : 20))<1,'the header keeps the expected space below the status row');
   const ink=document.createElement('span');ink.style.color='var(--ink)';line.append(ink);
   check(getComputedStyle(title).color===getComputedStyle(ink).color,'the title uses the shared ink color');ink.remove();
   check(getComputedStyle(document.body).backgroundColor===getComputedStyle(line).backgroundColor,
@@ -221,6 +290,7 @@ window.fetch=async(url,options={})=>{
   if(content) check(content.getBoundingClientRect().x===titleBox.x,'the page content starts at the title edge');
   const icon=line.querySelector('[data-status-icon=Live] svg').getBoundingClientRect();
   check(icon.width===16 && icon.height===16,'the Live icon uses the shared size');
+  scrollTo({top:originalScroll,behavior:'instant'});
   const root=document.querySelector('[data-accounts],[data-review-content],[data-images],[data-investigations],[data-list],[data-review]');
   if(root) check(root.dataset.loaded==='true','the real loader replaces page content');
   if(expectedPeriod) check(!!requestTimer(),'the real request period runs');
@@ -231,8 +301,11 @@ window.fetch=async(url,options={})=>{
    root.querySelector('.review-queue').append(spacer);
    const top=scrollY;
    scrollTo({top:innerHeight,behavior:'instant'});
-   check(scrollY>0 && title.getBoundingClientRect().bottom<0 && Math.abs(line.getBoundingClientRect().top)<1,
-    'The '+state()+' status stays visible when the Review queue scrolls.');
+   const frozenTop=header.getBoundingClientRect();
+   const frozenTitle=title.getBoundingClientRect(), frozenLine=line.getBoundingClientRect();
+   check(scrollY>0 && Math.abs(frozenTop.top)<1 && frozenTitle.top>=0 &&
+    frozenLine.top>=frozenTitle.bottom && frozenLine.bottom<=innerHeight,
+    'The title and '+state()+' status stay visible when the Review queue scrolls.');
    scrollTo({top,behavior:'instant'});spacer.remove();
   };
   const count=reads;
@@ -320,8 +393,7 @@ window.fetch=async(url,options={})=>{
    check(state()==='Failed' && part('reason').textContent==='HTTP 404','a missing Disks file reports failure');
    check(document.querySelector('#drives').innerHTML===kept,'a missing Disks file keeps the shown drives');
    mode='good';measureFails=true;await read();
-   check(state()==='Failed' && !part('age').hidden && age()==='0 s ago',
-    'a failed Disks measure retains the time of the shown data');
+   checkMeasureFailure();
   }
   statusVisibility='hidden';document.dispatchEvent(new Event('visibilitychange'));await flush();
   check(state()==='Paused','a hidden page pauses');
@@ -379,13 +451,109 @@ window.fetch=async(url,options={})=>{
         try:
             profile = Path(temporary) / 'profile'
             profile.mkdir()
-            done = subprocess.run(['firefox', '--headless', '--no-remote', '--profile', str(profile),
-                                   '--window-size', '1600,900',
-                                   '--screenshot', str(Path(temporary) / 'page.png'),
-                                   f'http://127.0.0.1:{server.server_port}/?page={identity}'],
-                                  capture_output=True, text=True, timeout=45)
+            done = run_process_group(['firefox', '--headless', '--no-remote', '--profile', str(profile),
+                                      '--window-size', '1600,900',
+                                      '--screenshot', str(Path(temporary) / 'page.png'),
+                                      f'http://127.0.0.1:{server.server_port}/?page={identity}'],
+                                     timeout=45)
             case.assertEqual(done.returncode, 0, done.stderr)
         finally:
             server.shutdown()
             thread.join(TEST_HANG_GUARD_SECS)
     case.assertEqual(results, [[]], 'The real page loader must complete every status check.')
+
+
+NEWER_SCRIPT_PROBE = r"""<script>
+(async()=>{
+ const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
+ const send=()=>navigator.sendBeacon('/results',JSON.stringify(failures));
+ const flush=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+ const until=async test=>{for(let wait=0;wait<60;wait++){try{if(await test()) return true;}catch(_){}await pause(50);}return false;};
+ const line=()=>document.querySelector('[data-page-status]');
+ const status=()=>line().dataset.state+': '+line().textContent.replace(/\s+/g,' ');
+ const refresh=async()=>{document.dispatchEvent(new Event('visibilitychange'));for(let wait=0;wait<10;wait++){await flush();await pause(50);}};
+ const placed=()=>PLACED;
+ const expected=JSON.parse(sessionStorage.getItem('reload-probe') || 'null');
+ if(expected){
+  sessionStorage.removeItem('reload-probe');
+  if(document.readyState!=='complete') await new Promise(resolve=>addEventListener('load',resolve,{once:true}));
+  for(let wait=0;wait<10;wait++){await flush();await pause(50);}
+  check(expected.ready,'the page reloaded before the hold ended');
+  check(expected.top>0,'the end of the hold keeps a scrolled place');
+  check(Math.abs(scrollY-expected.top)<=1,'the reload keeps the scroll place: '+scrollY+' not '+expected.top);
+  check(placed(),'the reload keeps the open place');
+  if(expected.saves) check(sessionStorage.getItem('reload-probe-timeout'),'the save ends by its timeout');
+  sessionStorage.removeItem('reload-probe-timeout');
+  send();return;
+ }
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='300px';await flush();
+  PLACE
+  await flush();
+  check(scrollY>0 && placed(),'the probe starts at a scrolled place');
+  // A reload before ready() is a failure. The reload must keep the scroll place that the page has when it unloads.
+  // The end of a hold can move that place, for example by scroll anchoring when a picker closes.
+  const ready=()=>sessionStorage.setItem('reload-probe',JSON.stringify({ready:true,top:scrollY,saves:SAVES}));
+  sessionStorage.setItem('reload-probe',JSON.stringify({ready:false,top:scrollY,saves:SAVES}));
+  addEventListener('pagehide',()=>{
+   const probe=JSON.parse(sessionStorage.getItem('reload-probe') || 'null');
+   if(probe) sessionStorage.setItem('reload-probe',JSON.stringify({...probe,top:scrollY}));
+  });
+  sessionStorage.removeItem('reload-probe-timeout');
+  const newer=NEWER,realFetch=window.fetch;
+  let posts=0,timedOut=false;
+  window.fetch=(url,options)=>{
+   // The save never answers, so only its timeout signal can end it. The reload after it checks the marker.
+   if(SAVES && options?.method==='POST'){
+    posts++;
+    return new Promise((_,reject)=>options.signal?.addEventListener('abort',()=>{
+     timedOut=true;sessionStorage.setItem('reload-probe-timeout','1');reject(options.signal.reason);
+    },{once:true}));
+   }
+   return newer(url,options,realFetch) ?? realFetch(url,options);
+  };
+  const type=(field,words)=>{field.value=words;field.dispatchEvent(new Event('input',{bubbles:true}));};
+  START
+  if(SAVES) check(await until(()=>posts>0),'the save starts');
+  if(HOLDS){
+   const held='A newer page loads when your edit ends.';
+   await refresh();
+   check(line().dataset.state==='Paused' && status().includes(held),'the hold defers the reload: '+status());
+   // A held reload answers now, so a hold that outlasts the age limit stays Paused, not Late.
+   const now=Date.now,options=JSON.parse(line().dataset.statusOptions);
+   Date.now=()=>now()+(options.ageLimit+5)*1000;
+   await refresh();
+   check(line().dataset.state==='Paused' && status().includes(held),'a long hold stays Paused: '+status());
+   Date.now=now;
+   // A save timeout ends the hold, so the checks above must run while the save still waits.
+   if(SAVES) check(!timedOut,'the Paused checks run before the save timeout');
+   ready();
+   // The end of the hold reloads the page at once. No refresh call follows.
+   END
+  }else{
+   ready();
+   await refresh();
+  }
+  // A save waits for its timeout, then the page reloads.
+  for(let wait=0;wait<100;wait++) await pause(100);
+  sessionStorage.removeItem('reload-probe');
+  failures.push('the page did not reload; its status is '+status());
+ }catch(error){failures.push(String(error));}
+ send();
+})();</script>"""
+
+
+def newer_script_reload_results(page: str, *, newer: str, place: str, start: str, placed: str = "true",
+                                holds: bool = True, saves: bool = False, end: str = "") -> list[list[str]]:
+    """Check when Firefox reloads a page and whether it keeps the scroll position.
+
+    `newer` supplies the refresh response. `place` scrolls the page and `placed` checks the open content.
+    `start` sets the initial state. Use `type(field, words)` to set a draft.
+    With `holds`, verify Paused and run `end` to release the hold.
+    With `saves`, wait for the save timeout to release the hold.
+    """
+    probe = (NEWER_SCRIPT_PROBE.replace("PLACED", placed).replace("PLACE", place).replace("START", start)
+             .replace("END", end).replace("HOLDS", "true" if holds else "false")
+             .replace("SAVES", "true" if saves else "false").replace("NEWER", newer))
+    return firefox_probe_results(page.replace("</body>", probe + "</body>").encode())

@@ -171,7 +171,8 @@ class ShutdownStatusTests(ShutdownTestCase):
         self.assertEqual(shutdown_record.read(), ["earlier", str(row.id)])
 
     def test_named_resume_cleanup_precedes_a_stop_after_the_row_lock_releases(self) -> None:
-        row = fixture_member("producer", name="resume-race")
+        row = fixture_member("producer", name="resume-race",
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root / "producer"))
         shutdown_record.save([str(row.id)])
         operation = staff.row_operation
         stopped_again: list[str] = []
@@ -228,7 +229,8 @@ class ShutdownStatusTests(ShutdownTestCase):
         from scripts.whoami import quota_state
 
         owner = fixture_member("showrunner", name="resume-owner")
-        row = fixture_member("unit", name="resume-unit", parent=owner.id)
+        row = fixture_member("unit", name="resume-unit", parent=owner.id,
+                             worktree=staff.PresentWorktree(remote.local_machine(), self.root / "unit"))
         notice = "Codex workers have no capacity. Send no assign."
         for delivered, held in ((True, False), (False, False), (True, True)):
             with self.subTest(delivered=delivered, held=held):
@@ -348,6 +350,66 @@ else:
 
         self.assertEqual(result, 0)
         self.assertIn("natedev:\n  no sessions on claude2\n", standard_output.getvalue())
+
+    def test_status_names_the_workers_kept_by_the_director_pause(self) -> None:
+        owner = fixture_member("showrunner", name="production")
+        director = fixture_member("unit", name="selected", parent=owner.id)
+        other = fixture_member("unit", name="other", parent=owner.id)
+        review = fixture_worker("review", director.id)
+        impl = fixture_worker("impl", director.id)
+        stopped = fixture_worker("stopped", director.id)
+        closed = fixture_worker("closed", director.id)
+        _ = fixture_worker("unrelated", other.id)
+        _ = staff.pause(str(director.id), "maintenance", keep_workers=True)
+        _ = staff.pause(str(other.id), "maintenance")
+        reports = [
+            {**complete_session(host={"kind": "unknown"}), "kind": "unit", "name": row.name,
+             "session_id": row.current_session}
+            for row in (director, other)
+        ]
+        report = inventory.parse_inventory(json.dumps({**empty_inventory(), "sessions": reports}))
+        states = {director.id: [worker_panes.OpenWorker(review, "w1:p1", "review", herdr.AgentStatus.IDLE),
+                                worker_panes.OpenWorker(impl, "w1:p2", "impl", herdr.AgentStatus.WORKING),
+                                worker_panes.StoppedWorker(stopped, "w1:p3", "stopped"),
+                                worker_panes.ClosedWorker(closed)]}
+        with (patch.object(status_entry, "inventory", return_value=report),
+              patch.object(worker_panes, "observe_parents", return_value=states),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
+        lines = output.getvalue().splitlines()
+        self.assertTrue(any("unit selected" in line and "paused (workers kept: impl, review)" in line for line in lines))
+        self.assertFalse(any("unit other" in line and "workers kept" in line for line in lines))
+
+        with (patch.object(status_entry, "inventory", return_value=report),
+              patch.object(worker_panes, "observe_parents", return_value=states),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--here", "--json"]), 0)
+        expected = {**report, "sessions": [{**report["sessions"][0], "kept_workers": ["impl", "review"]},
+                                           report["sessions"][1]]}
+        self.assertEqual(output.getvalue(), json.dumps(expected, sort_keys=True) + "\n")
+
+        peer = {**expected, "machine": "Mac"}
+        result, peer_output, errors = self.run_status(0, json.dumps(peer))
+        self.assertEqual((result, errors), (0, ""))
+        self.assertEqual(json.loads(peer_output), [empty_inventory(), peer])
+
+    def test_peer_status_keeps_the_local_workers_for_a_shared_session_id(self) -> None:
+        session = complete_session(host={"kind": "unknown"})
+        local = inventory.parse_inventory(json.dumps({**empty_inventory(), "sessions": [session]}))
+        peer: dict[str, object] = {**empty_inventory("Mac"), "sessions": [{**session, "kept_workers": []}]}
+        identity = str(session["session_id"])
+        with (patch.object(status_entry, "_local_inventory", return_value=(local, {identity: ["impl"]})),
+              patch.object(remote, "run_remote", return_value=(0, json.dumps(peer))),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["status", LOGIN, "--json"]), 0)
+            with redirect_stdout(io.StringIO()) as human:
+                self.assertEqual(shutdown.main(["status", LOGIN]), 0)
+        reports = cast(list[dict[str, object]], json.loads(output.getvalue()))
+        self.assertEqual(reports, [
+            {**local, "sessions": [{**session, "kept_workers": ["impl"]}]}, peer,
+        ])
+        lines = [line for line in human.getvalue().splitlines() if "workers kept" in line]
+        self.assertEqual([line.split(" · ")[-1] for line in lines], ["paused (workers kept: impl)", "paused (workers kept)"])
 
     def test_status_starts_the_peer_before_finishing_the_local_report(self) -> None:
         authority = staff.PeerStatusAuthority(staff.snapshot(), role_map.RoleMap({"units": "claude2"}, "codex1"))

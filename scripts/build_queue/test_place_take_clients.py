@@ -19,7 +19,7 @@ from scripts.build_queue.admission_test_support import (
 from scripts.build_queue.admission_wire import REPLACED_REASON
 from scripts.build_queue.test_placement import local_candidate, placement_request
 from scripts.lib import build_folders
-from scripts.lib.build_slots import SlotQueuePosition
+from scripts.lib.build_copies import CopyQueuePosition
 from scripts.message.session_send_test_support import forbid_real_sender
 
 UNIT_LINE = "Replaced: a newer run of queue took the place of this run."
@@ -126,7 +126,7 @@ class ReplacedClientTests(unittest.TestCase):
                     with self.assertRaises(first_step.FirstStepRefused) as refused:
                         _ = first_step._program_grant(  # pyright: ignore[reportPrivateUsage]
                             ["python3", "gate.py", "--tests-only"], fixture.root, request.owner,
-                            SlotQueuePosition(request.episode, request.since),
+                            CopyQueuePosition(request.episode, request.since),
                             wire.RunIdentity(request.owner.pid, request.owner.start_time))
                 self.assertEqual(str(refused.exception), shown)
                 self.assertEqual(refused.exception.exit_code, 2)
@@ -205,7 +205,7 @@ class HandoffClientTests(unittest.TestCase):
             path = fixture.root / "assignment.json"
             client.write_assignment(path, wire.LocalPlacementGranted(assignment, granted))
             closed = mock.Mock(assignment=assignment, state=placement.ClosedAssignment("completed"))
-            position = SlotQueuePosition(request.episode, request.since)
+            position = CopyQueuePosition(request.episode, request.since)
             local = wire.LocalPlacementGranted(assignment, granted)
             grants: tuple[tuple[wire.Admitted | wire.LocalPlacementGranted, bool,
                                 tuple[int, wire.ReleaseEnding]], ...] = (
@@ -228,7 +228,7 @@ class HandoffClientTests(unittest.TestCase):
             with (mock.patch.dict(os.environ),
                   mock.patch.object(client, "release", return_value=wire.Ok()) as released):
                 # A gate keeps the grant through the handoff; gate.py ends it after its assignment check.
-                first_step.FirstStepAdmission(position, first_step.GatePlacement(local, request), path).handoff(fixture.root)
+                first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(local, request), path).handoff(fixture.root)
                 released.assert_not_called()
 
     def test_a_release_carries_its_ending_and_an_older_release_reads_as_a_result(self) -> None:

@@ -18,7 +18,7 @@ from typing import cast
 
 from scripts.build_queue.scope_activity import ScopeProcesses, LiveBuildRun, NotServiceSlice
 from scripts.build_queue import admission_protocol as wire, cloud_progress, progress_profile
-from scripts.build_queue.admission_wire import cloud_queue_order
+from scripts.build_queue.admission_wire import WaitingForCloudSlot, cloud_queue_time
 from scripts.build_queue.admission_records import (reason_phrase as reason_phrase, behind_place as behind_place,
     eligible_head_position as eligible_head_position)
 from scripts.build_queue.queue_evidence import step_labels as step_labels
@@ -71,27 +71,6 @@ class MacBuildOrigin(Enum):
     UNKNOWN = "unknown"
 
 
-class MacLauncher(Enum):
-    """Who started a Mac build: the first launcher program above it, or else a terminal."""
-
-    CLAUDE = "claude"
-    CI = "hana-ci"
-    RUST_ANALYZER = "rust-analyzer"
-    TERMINAL = "terminal"
-    UNKNOWN = "unknown"
-
-
-# The one table of launcher programs. The Mac reader matches a process by its program name,
-# with or without a version suffix such as rust-analyzer-2026-11-02.
-MAC_LAUNCHER_PROGRAMS: Mapping[str, MacLauncher] = {
-    "claude": MacLauncher.CLAUDE, "Runner.Worker": MacLauncher.CI, "Runner.Listener": MacLauncher.CI,
-    "rust-analyzer": MacLauncher.RUST_ANALYZER}
-
-
-def parse_mac_launcher(wire: str) -> MacLauncher:
-    return next((launcher for launcher in MacLauncher if launcher.value == wire), MacLauncher.UNKNOWN)
-
-
 class MacGateLabel(Enum):
     USER = "user"
     PLACEMENT = "placement"
@@ -124,8 +103,7 @@ class MacBuild:
     ci_job: str = ""
     gate_label: MacGateLabel = MacGateLabel.UNAVAILABLE
     gate_placement: str = ""
-    launcher: MacLauncher = MacLauncher.UNKNOWN
-    launcher_session: str = ""
+    verify_call_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -218,13 +196,14 @@ def mac_build_record(build: MacBuild) -> dict[str, object]:
                 if isinstance(build.counter, progress_profile.ProgressCounter) else {},
             "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value,
             "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build),
-            "launcher": build.launcher.value, "launcher_session": build.launcher_session}
+            "verify_call_id": build.verify_call_id}
 
 
 def mac_build_from_record(row: dict[str, object]) -> MacBuild:
     test_pid = int(cast(int, row["test_pid"]))
     resident = int(cast(int, row["resident_bytes"]))
     command = str(row["command"])
+    session = str(row.get("session") or row.get("launcher_session") or "")
     counter_data = cast(dict[str, object], row["counter"])
     counter = progress_profile.ProgressCounter(str(counter_data["phase"]), int(cast(int, counter_data["done"])),
         int(cast(int, counter_data["total"]))) if counter_data else progress_profile.NoCounter()
@@ -234,13 +213,13 @@ def mac_build_from_record(row: dict[str, object]) -> MacBuild:
     return MacBuild(int(cast(int, row["pid"])), str(row["folder"]), float(cast(float, row["started_at"])),
                     command, str(row["repository"]), stage,
                     resident if resident >= 0 else MacMemoryUnavailable(), mac_command_jobs(command), counter,
-                    str(row["recorded_unit"]), str(row["session"]),
+                    str(row["recorded_unit"]), session,
                     MacBuildOrigin(str(row.get("origin", MacBuildOrigin.UNKNOWN.value))),
                     str(row.get("ci_runner", "")), str(row.get("ci_job", "")),
                     parse_gate_label(str(row.get("gate_label", ""))),
                     str(row.get("gate_label", "")).removeprefix("placement ")
                     if str(row.get("gate_label", "")).startswith("placement ") else "",
-                    parse_mac_launcher(str(row.get("launcher", ""))), str(row.get("launcher_session", "")))
+                    str(row.get("verify_call_id", "")))
 
 
 def read_mac_builds() -> MacBuildReading:
@@ -270,6 +249,7 @@ def mac_build_script() -> str:
     """Read cargo tile registrations and process trees in one SSH call."""
     return "python3 - <<'MAC_READING'\n" + inspect.getsource(cargo_target_config) + r'''
 import ctypes
+from functools import cache
 import json
 import re
 import struct
@@ -282,7 +262,6 @@ import time
 import tomllib
 
 CAPTURE_ROOT = Path("/tmp/cargo-tile")
-''' + mac_launcher_source() + r'''
 
 def output(arguments):
     return subprocess.check_output(arguments, text=True, stderr=subprocess.DEVNULL,
@@ -453,16 +432,22 @@ def cargo_environment(data):
             break
         key, separator, value = field.partition(b"=")
         if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
-                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT", b"CLAUDE_CODE_SESSION_ID"):
+                                 b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT", b"BUILDLOG_CALL_ID",
+                                 b"CODEX_THREAD_ID", b"CLAUDE_CODE_SESSION_ID"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
     return selected
 
 
-def test_output_directories(pid, folder, command, members, processes):
+@cache
+def observed_environment(pid):
+    """Read each process environment once per Mac reading."""
+    return process_environment(pid)
+
+
+def test_output_directories(folder, command, environment, members, processes):
     """Resolve target settings and observed compiler output directories."""
     try:
         arguments = shlex.split(command)
-        environment = process_environment(pid)
         settings = cargo_folder_settings(arguments, folder, environment)
         if "target-dir" in settings:
             setting = settings["target-dir"]
@@ -487,8 +472,8 @@ def test_output_directories(pid, folder, command, members, processes):
     return targets, outputs
 
 
-def running_test_pid(pid, folder, command, members, processes):
-    targets, outputs = test_output_directories(pid, folder, command, members, processes)
+def running_test_pid(pid, folder, command, environment, members, processes):
+    targets, outputs = test_output_directories(folder, command, environment, members, processes)
     for member in members:
         try:
             executable = Path(processes[member]["executable"]).resolve()
@@ -501,44 +486,26 @@ def running_test_pid(pid, folder, command, members, processes):
     return 0
 
 
-def program_launcher(process):
-    """Name the launcher of one process from LAUNCHERS by its first argument or its program, or give ""."""
+def runner_process(process):
+    """Match a GitHub Actions runner by its program name."""
     try:
         words = shlex.split(process["command"])
     except ValueError:
         words = []
-    for name in (Path(words[0]).name if words else "", Path(process["executable"]).name):
-        launcher = LAUNCHERS.get(re.sub(r"-[0-9][0-9.-]*$", "", name))
-        if launcher:
-            return launcher
-    return ""
-
-
-def first_launcher(pid, processes):
-    """Find the nearest launcher program in the parent process chain of a build, or give ""."""
-    cursor = pid
-    seen = set()
-    while cursor in processes and cursor not in seen:
-        seen.add(cursor)
-        launcher = program_launcher(processes[cursor])
-        if launcher:
-            return launcher
-        cursor = processes[cursor]["parent"]
-    return ""
+    return any(re.sub(r"-[0-9][0-9.-]*$", "", name) in ("Runner.Worker", "Runner.Listener")
+               for name in (Path(words[0]).name if words else "", Path(process["executable"]).name))
 
 
 def build_origin(pid, processes):
     """Identify a build with a GitHub Actions runner ancestor."""
-    return "ci" if first_launcher(pid, processes) == CI_LAUNCHER else "non-ci"
-
-
-def build_launcher(pid, processes, marker_session):
-    """Name who started a build: the nearest launcher program, a Claude session marker, or else a terminal."""
-    launcher = first_launcher(pid, processes) or (CLAUDE_LAUNCHER if marker_session else TERMINAL_LAUNCHER)
-    session = ""
-    if launcher == CLAUDE_LAUNCHER:
-        session = process_environment(pid).get("CLAUDE_CODE_SESSION_ID", "") or marker_session
-    return dict(launcher=launcher, launcher_session=session)
+    cursor = pid
+    seen = set()
+    while cursor in processes and cursor not in seen:
+        seen.add(cursor)
+        if runner_process(processes[cursor]):
+            return "ci"
+        cursor = processes[cursor]["parent"]
+    return "non-ci"
 
 
 def read_gate_records():
@@ -568,7 +535,7 @@ def gate_label(pid, processes, records, ci_uid):
         if record and record[0] == process["started_at"]:
             return record[1]
         # offload.py and mac_queue_run.py set MAC_PLACEMENT; sccache passes it on to the compiler.
-        placement = process_environment(pid).get("MAC_PLACEMENT", "")
+        placement = observed_environment(pid).get("MAC_PLACEMENT", "")
         if PLACEMENT_FORM.fullmatch(placement):
             return "placement " + placement
         pid = process["parent"]
@@ -653,8 +620,9 @@ def read_builds(processes=None, records=None, captures=None):
         except Exception:
             record = dict(recorded_unit="", session="", repository="")
         command = capture.get("command", processes[pid]["command"])
+        environment = observed_environment(pid)
         try:
-            test_pid = running_test_pid(pid, folder, command, members, processes)
+            test_pid = running_test_pid(pid, folder, command, environment, members, processes)
         except Exception:
             test_pid = -1
         try:
@@ -665,11 +633,8 @@ def read_builds(processes=None, records=None, captures=None):
             origin = build_origin(pid, processes)
         except Exception:
             origin = "unknown"
-        ci_environment = process_environment(pid) if origin == "ci" else {}
-        try:
-            launcher = build_launcher(pid, processes, record["session"])
-        except Exception:
-            launcher = dict(launcher="unknown", launcher_session="")
+        ci_environment = environment if origin == "ci" else {}
+        session = record["session"] or environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
         try:
             folder = str(Path(folder).resolve())
         except OSError:
@@ -681,10 +646,11 @@ def read_builds(processes=None, records=None, captures=None):
                            command=command, test_pid=test_pid,
                            resident_bytes=sum(processes[member]["resident_bytes"] for member in members),
                            progress_tail=tail, repository=repository,
-                           recorded_unit=record["recorded_unit"], session=record["session"],
+                           recorded_unit=record["recorded_unit"], session=session,
                            origin=origin, ci_runner=ci_environment.get("RUNNER_NAME", ""),
                            ci_job=ci_environment.get("GITHUB_JOB", ""),
-                           gate_label=gate_label(pid, processes, records, ci_uid), **launcher))
+                           gate_label=gate_label(pid, processes, records, ci_uid),
+                           verify_call_id=environment.get("BUILDLOG_CALL_ID", "")))
     return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
 
 
@@ -699,13 +665,6 @@ def read_reading():
 print(json.dumps(read_reading()))
 print("rc=0")
 ''' + "MAC_READING\n"
-
-
-def mac_launcher_source() -> str:
-    """Give the Mac reader the launcher table and the launcher names it returns."""
-    programs = {name: launcher.value for name, launcher in MAC_LAUNCHER_PROGRAMS.items()}
-    return (f"LAUNCHERS = {programs!r}\nCLAUDE_LAUNCHER = {MacLauncher.CLAUDE.value!r}\n"
-            f"CI_LAUNCHER = {MacLauncher.CI.value!r}\nTERMINAL_LAUNCHER = {MacLauncher.TERMINAL.value!r}\n")
 
 
 def refresh_mac_builds() -> None:
@@ -828,13 +787,16 @@ def cloud_update_age(seconds: float) -> str:
     return f"{int(seconds)} s"
 
 
+def cloud_location(progress: cloud_progress.CloudProgress) -> str:
+    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
+    return ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
+
+
 def cloud_detail(row: wire.CloudRow) -> str:
     progress = row.progress
     if not isinstance(progress, cloud_progress.CloudProgress):
         return ""
-    zone = progress.zone.removeprefix(progress.region) if progress.region else progress.zone
-    location = ", ".join(filter(None, (progress.region, f"zone {zone}" if zone else "")))
-    return " · ".join(filter(None, (progress.stage, location)))
+    return " · ".join(filter(None, (progress.stage, cloud_location(progress))))
 
 
 def cloud_status(row: wire.CloudRow, work: CloudWork) -> Line:
@@ -854,11 +816,7 @@ def cloud_failed_modules(work: CloudWork) -> str:
 def cloud_page_status(row: wire.CloudRow, work: CloudWork) -> Line:
     if isinstance(row.wait, wire.CloudSlotWait):
         return cloud_status(row, work)
-    parts = (work.state if work.state != "running" else "",
-             cloud_detail(row),
-             work.modules if isinstance(row.counter, progress_profile.ProgressCounter) else "",
-             cloud_failed_modules(work))
-    return (Span(" · ".join(filter(None, parts))),)
+    return (Span(cloud_failed_modules(work)),)
 
 
 @dataclass(frozen=True)
@@ -867,21 +825,28 @@ class WaitingBuild:
     step: admission_records.WaitingStep
 
 
-def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow]:
-    """Insert cloud waits in admission order. Keep the local queue order."""
-    rows: list[WaitingBuild | wire.CloudRow | wire.RepositorySlotRow] = [WaitingBuild(index, step)
+def waiting_builds(model: QueueModel) -> list[WaitingBuild | wire.CloudRow]:
+    """Keep the queue order within each machine."""
+    rows: list[WaitingBuild | wire.CloudRow] = [WaitingBuild(index, step)
         for index, step in enumerate(model.reading.view.waiting, 1)]
-    slot_rows = model.reading.repository_slots if isinstance(model.reading, wire.CloudQueueRead) else ()
 
-    def order(row: wire.CloudRow | wire.RepositorySlotRow) -> tuple[float, int, str]:
-        return cloud_queue_order(row.place, row.since) if isinstance(row, wire.CloudRow) else (row.since, 1, "")
+    def time_key(row: wire.CloudRow) -> tuple[float, int, str]:
+        return cloud_queue_time(row.place, row.since)
 
-    for cloud in sorted([*(row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)), *slot_rows],
-                        key=order):
-        order_time = order(cloud)[0]
+    cloud_waits = [row for row in cloud_rows(model) if isinstance(row.wait, wire.CloudSlotWait)]
+    for cloud in sorted(cloud_waits, key=time_key):
+        order_time = time_key(cloud)[0]
         position = next((index for index, row in enumerate(rows)
-                         if (row.step.since if isinstance(row, WaitingBuild) else order(row)[0]) > order_time), len(rows))
+                         if (row.step.since if isinstance(row, WaitingBuild) else time_key(row)[0]) > order_time),
+                        len(rows))
         rows.insert(position, cloud)
+
+    # Keep the positions of the local waits and the waits with a reserved cloud slot.
+    cloud_order = (row for row in cloud_waits if isinstance(row.wait, wire.CloudSlotWait)
+                   and isinstance(row.wait.state, WaitingForCloudSlot))
+    for index, row in enumerate(rows):
+        if isinstance(row, wire.CloudRow) and isinstance(row.wait, wire.CloudSlotWait) and isinstance(row.wait.state, WaitingForCloudSlot):
+            rows[index] = next(cloud_order)
     return rows
 
 

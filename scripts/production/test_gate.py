@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from scripts.build_queue import admission_records, first_step
+from scripts.build_queue import admission_client, admission_records, admission_wire, execution_identity, first_step, placement, queue_place
 from scripts.build_queue.admission_jobs import StepJob
 
 from scripts.agents import remote
+from scripts.build_hold import build_hold
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 import unittest
@@ -18,21 +19,31 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import tempfile
+from textwrap import dedent
 import time
-from typing import cast, final, override
-from contextlib import AbstractContextManager, contextmanager, redirect_stdout
 from collections.abc import Generator, Sequence
+from typing import cast, final, override
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime, tzinfo
 from unittest import mock
+from scripts.build_targets import mac_linux
+from scripts.buildlog import treekey
+from scripts.buildlog.store import host_name
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.copies import copies
-from scripts.lib import scratch
-from scripts.lib.build_steps import MAC_LINUX_PRELAUNCH_REFUSED_STATUS
+from scripts.lib import build_folders, conf, scratch
+from scripts.lib.build_copies import CopyQueuePosition
+from scripts.lib.build_steps import (
+    GATE_PRELAUNCH_REFUSED_STATUS, GATE_UNSETTLED_LAUNCH_STATUS, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, gate_job_for_command,
+)
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.process_start import Gone
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import change_review, gate, staff
-from scripts.production.gate_modules import GateRefused
+from scripts.production import change_review, gate, promotion, staff
+from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.test_change_review import ProducerFixture
 from scripts.production.staff_test_support import (
     build_fixture_sessions, fixture_member, fixture_unit_location, isolated_source_readers, isolated_staff_file, source_environment,
@@ -67,8 +78,387 @@ class GateModuleOwnerTests(unittest.TestCase):
         self.assertFalse(child.keys() & (environment.keys() - {"PATH"}))
 
 
+GATE_EVENTS = ".git/gate-events"
+
+
+def record_gate_event(source: Path, event: str) -> None:
+    with (source / GATE_EVENTS).open("a") as log:
+        _ = log.write(f"{event}\n")
+
+
+def run_affected_gate_fixture(status: int | None, detail: str, *, folder_cleanup_error: str) -> int:
+    """Run the gate in the child that receives the handoff."""
+    source = Path.cwd()
+    path = source / ".git" / "assignment.json"
+    assert os.environ["BUILDLOG_PLACEMENT_FILE"] == str(path)
+    assignment = admission_wire.read_assignment(path).assignment
+    identity = build_hold.ProcessIdentity(assignment.owner.pid, assignment.owner.start_time)
+    reply = admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
+        assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
+
+    @contextmanager
+    def run_folder() -> Generator[Path]:
+        try:
+            yield source
+        finally:
+            if folder_cleanup_error:
+                raise PermissionError(folder_cleanup_error)
+
+    def run(args: gate.GateArguments, mode: gate.SuiteMode, target: gate.GateTarget) -> int:
+        record_gate_event(source, "guest")
+        assert args.prepared_copy
+        assert mode is gate.SuiteMode.TARGETED
+        if status is None:
+            return 0
+        assert target == gate.MacLinuxAssignment(assignment)
+        if status == GATE_PRELAUNCH_REFUSED_STATUS:
+            raise gate.MacLinuxTookNoRun(detail)
+        raise gate.GateSettlementPending(detail)
+
+    with (mock.patch.object(build_hold, "caller_processes", return_value=frozenset({identity})),
+          mock.patch.object(gate, "gate_job_from_process",
+                            return_value=gate_job_for_command(("gate.py", *sys.argv[1:]))),
+          mock.patch.object(admission_client, "placement_status", return_value=reply),
+          mock.patch.object(gate, "test_run_folder", side_effect=run_folder),
+          mock.patch.object(gate, "run_tests_only", side_effect=run) as suite):
+        code = gate.main()
+    if status is None:
+        suite.assert_not_called()
+    else:
+        suite.assert_called_once()
+    record_gate_event(source, "child finished")
+    return code
+
+
+class DirectGatePlacementTests(unittest.TestCase):
+    def checkout(self, folder: str) -> Path:
+        source = Path(folder).resolve()
+        _ = subprocess.run(["git", "init", "-q", str(source)], check=True)
+        _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                            "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+                            "commit", "-qm", "Fixture", "--allow-empty"], check=True)
+        return source
+
+    def admission(self, source: Path, command: tuple[str, ...], *, target: str = "mac-linux"
+                  ) -> first_step.FirstStepAdmission:
+        key = treekey.tree_key(str(source))
+        start = admission_records.process_start_time(os.getpid())
+        assert key is not None and start is not None
+        owner = placement.SubmittingOwner(host_name(), os.getpid(), start)
+        assignment = replace(placed(target).assignment, owner=owner,
+                             source_key=execution_identity.SourceKeyKnown(key))
+        grant = admission_wire.Assignment(assignment)
+        position = CopyQueuePosition(assignment.episode, assignment.since)
+        profile = admission_records.ProgramProfile("gate", str(source), str(source),
+            admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0))
+        constraints = placement.PlacementConstraints(assignment.source_key, command, str(source), "", assignment.session,
+            (placement.PlacementCandidate(assignment.destination),))
+        request = admission_wire.PlacementRequest(position.episode, assignment.owner, position.since, profile, constraints)
+        path = source / ".git" / "assignment.json"
+        admission_client.write_assignment(path, grant)
+        return first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(grant, request), path)
+
+    def placement_status(self, admitted: first_step.FirstStepAdmission) -> admission_wire.PlacementStatusReply:
+        assignment = admission_wire.read_assignment(admitted.assignment_file).assignment
+        status = admission_wire.KnownPlacementStatus(assignment, placement.CurrentAssignment(), placement.NoProviderClaim())
+        return admission_wire.PlacementStatusReply(status)
+
+    def run_affected_gate(self, source: Path, arguments: tuple[str, ...], *, status: int | None = None,
+                          detail: str = "", folder_cleanup_error: str = "") -> int:
+        script = "scripts/production/gate.py"
+        (source / script).parent.mkdir(parents=True, exist_ok=True)
+        # Keep the fixture launcher out of the placement source key.
+        _ = (source / ".git/info/exclude").write_text(f"/{script}\n")
+        _ = (source / script).write_text(dedent(f"""\
+            from scripts.production.test_gate import run_affected_gate_fixture
+
+            raise SystemExit(run_affected_gate_fixture(
+                {status!r}, {detail!r}, folder_cleanup_error={folder_cleanup_error!r}))
+            """))
+        events = source / GATE_EVENTS
+        events.unlink(missing_ok=True)
+        command = [sys.executable, "-B", script, *arguments]
+        repository = Path(__file__).resolve().parents[2]
+        with (mock.patch.dict(os.environ, {"PYTHONPATH": str(repository)}),
+              mock.patch.object(copies, "caller_owner", return_value="fixture"),
+              mock.patch.object(copies, "requested_source", return_value=nullcontext(source)),
+              mock.patch.object(copies, "standing", return_value=nullcontext(source)),
+              tempfile.TemporaryFile(mode="w+") as diagnostic, redirect_stderr(diagnostic)):
+            saved_stderr = os.dup(2)
+            try:
+                _ = os.dup2(diagnostic.fileno(), 2)
+                code = copies.main(["run", "--repo", str(source), "--commit", "HEAD", "--", *command])
+            finally:
+                _ = os.dup2(saved_stderr, 2)
+                os.close(saved_stderr)
+            _ = diagnostic.seek(0)
+            errors = diagnostic.read()
+        _ = sys.stderr.write(errors)
+        self.assertIn("child finished", events.read_text().splitlines() if events.exists() else [], errors)
+        return code
+
+    def test_direct_gate_requests_settlement_without_replacement(self) -> None:
+        for flag, mode in (("--tests-only", gate.SuiteMode.GATE), ("--affected", gate.SuiteMode.TARGETED)):
+            for blocked in (False, True):
+                with self.subTest(flag=flag, blocked=blocked), tempfile.TemporaryDirectory() as folder:
+                    source = self.checkout(folder)
+                    arguments = (flag, "--repo", str(source))
+                    admitted = self.admission(source, ("gate.py", *arguments))
+                    original = admission_wire.read_assignment(admitted.assignment_file).assignment
+                    @contextmanager
+                    def admit(_command: Sequence[str], checkout: Path, *,
+                              targets: tuple[str, ...],
+                              place_unnamed_gate: bool = True) -> Generator[first_step.FirstStepAdmission]:
+                        self.assertEqual(checkout, source)
+                        self.assertEqual(targets, ("mac-linux",))
+                        self.assertTrue(place_unnamed_gate)
+                        record_gate_event(source, "admit")
+                        try:
+                            yield admitted
+                        finally:
+                            record_gate_event(source, "close")
+
+                    def run(_args: gate.GateArguments, selected_mode: gate.SuiteMode, target: gate.GateTarget) -> int:
+                        self.assertIs(selected_mode, mode)
+                        self.assertEqual(os.environ["BUILDLOG_PLACEMENT_FILE"], str(admitted.assignment_file))
+                        self.assertEqual(target, gate.MacLinuxAssignment(original))
+                        record_gate_event(source, "guest")
+                        raise gate.GateSettlementPending("fixture guest did not confirm its end")
+
+                    def settle(request: admission_wire.SettlementRequest) -> None:
+                        self.assertEqual(request.assignment, original)
+                        record_gate_event(source, "settle")
+                        if blocked:
+                            raise admission_wire.AdmissionUnavailable("fixture settlement failure")
+
+                    with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
+                          mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                          mock.patch.object(first_step, "admitted_run", side_effect=admit),
+                          mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
+                          mock.patch.object(admission_client, "request_settlement", side_effect=settle),
+                          mock.patch.object(queue_place, "wait_for_placement") as again,
+                          mock.patch.object(gate, "run_tests_only", side_effect=run),
+                          redirect_stderr(io.StringIO()) as errors):
+                        if flag == "--affected":
+                            status = self.run_affected_gate(source, arguments, status=GATE_UNSETTLED_LAUNCH_STATUS,
+                                detail="fixture guest did not confirm its end",
+                                folder_cleanup_error="fixture test folder cleanup failed" if blocked else "")
+                        else:
+                            status = gate.main(arguments)
+                        self.assertEqual(status, GATE_UNSETTLED_LAUNCH_STATUS, errors.getvalue())
+                    events = (source / GATE_EVENTS).read_text().splitlines()
+                    expected = ["admit", "guest"]
+                    if flag == "--affected":
+                        expected.append("child finished")
+                    self.assertEqual(events, [*expected, "settle", "close"])
+                    again.assert_not_called()
+                    self.assertIn("fixture guest did not confirm its end", errors.getvalue())
+                    if blocked:
+                        if flag == "--affected":
+                            self.assertIn("Gate placement blocked during launch settlement. fixture settlement failure",
+                                          errors.getvalue())
+                            self.assertIn("Gate cleanup failed. fixture test folder cleanup failed", errors.getvalue())
+                        else:
+                            self.assertIn("Cannot request launch settlement. fixture settlement failure", errors.getvalue())
+
+    def test_unproven_guest_end_requests_settlement_through_run_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.checkout(folder)
+            arguments = ("--tests-only", "--repo", str(source))
+            admitted = self.admission(source, ("gate.py", *arguments), target="mac-linux")
+            assignment = admission_wire.read_assignment(admitted.assignment_file).assignment
+            armed = mac_linux.ArmedGuestAttempt("fixture-arm", "f" * 32, "boot-id", 10, "user", "/fixture")
+            failure = mac_linux.GuestEndUnproven("fixture guest end remains unproven", armed)
+            with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
+                  mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                  mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
+                  mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
+                  mock.patch.object(conf, "read", return_value=mock.Mock(value=mock.Mock(return_value=True))),
+                  mock.patch.object(gate, "read_gate_checkout", return_value=("fixture-tree", set())),
+                  mock.patch.object(gate, "gate_recovery", return_value=nullcontext()),
+                  mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+                  mock.patch.object(copies, "source_owner", return_value=""),
+                  mock.patch.object(mac_linux, "route", side_effect=failure),
+                  mock.patch.object(admission_client, "request_settlement",
+                                    side_effect=admission_wire.AdmissionUnavailable("fixture settlement failure")) as settle,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(gate.main(arguments), GATE_UNSETTLED_LAUNCH_STATUS)
+            settle.assert_called_once_with(admission_wire.SettlementRequest(assignment))
+            self.assertIn(str(failure), errors.getvalue())
+            self.assertIn("Cannot request launch settlement. fixture settlement failure", errors.getvalue())
+
+    def test_direct_tests_only_keeps_exit_79_after_retry_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.checkout(folder)
+            arguments = ("--tests-only", "--repo", str(source))
+            admitted = self.admission(source, ("gate.py", *arguments), target="mac-linux")
+            with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
+                  mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)),
+                  mock.patch.object(gate, "run_tests_only", return_value=GATE_PRELAUNCH_REFUSED_STATUS) as run,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(gate.main(arguments), GATE_PRELAUNCH_REFUSED_STATUS, errors.getvalue())
+            run.assert_called_once()
+
+    def test_gate_recovery_keeps_placement_status_when_finish_fails(self) -> None:
+        checkpoint = ["--merge-branch", "main", "--unit-branch", "fixture", "--checkpoint", "tip",
+                      "--previous-checkpoint", "base", "--unit", "fixture", "--phase", "1"]
+        for arguments in (checkpoint, ["--tests-only"]):
+            for status, refusal in (
+                (GATE_PRELAUNCH_REFUSED_STATUS, gate.MacLinuxTookNoRun("fixture guest took no run")),
+                (GATE_UNSETTLED_LAUNCH_STATUS, gate.GateSettlementPending("fixture guest end is unproven")),
+            ):
+                with (self.subTest(arguments=arguments, status=status), tempfile.TemporaryDirectory() as directory,
+                      mock.patch.object(gate, "current_gate_placement", return_value=placed("mac-linux")),
+                      mock.patch.object(gate, "gate_state_dir", return_value=Path(directory)),
+                      mock.patch.object(scratch, "copy_lock", return_value=nullcontext()),
+                      mock.patch.object(copies, "source_owner", return_value=""),
+                      mock.patch.object(gate, "gate_production", return_value=Path(directory)),
+                      mock.patch.object(gate, "merge_checkpoint", side_effect=refusal),
+                      mock.patch.object(gate, "run_gate_suites", side_effect=refusal),
+                      mock.patch.object(gate.GateRecovery, "finish",
+                                        side_effect=PermissionError("fixture recovery cleanup failed")) as finish,
+                      redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(gate.main(arguments), status, errors.getvalue())
+                    finish.assert_called_once()
+                    self.assertIn(str(refusal), errors.getvalue())
+                    self.assertIn("fixture recovery cleanup failed", errors.getvalue())
+
+    def test_direct_affected_gate_keeps_placement_status_through_folder_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.checkout(folder)
+            arguments = ("--affected", "--repo", str(source))
+            for status, failed_cleanup in ((GATE_PRELAUNCH_REFUSED_STATUS, ""),
+                                           (GATE_PRELAUNCH_REFUSED_STATUS, "folder"),
+                                           (GATE_UNSETTLED_LAUNCH_STATUS, "folder"),
+                                           (GATE_PRELAUNCH_REFUSED_STATUS, "admission")):
+                with self.subTest(status=status, failed_cleanup=failed_cleanup):
+                    admitted = self.admission(source, ("gate.py", *arguments))
+                    owned = admitted.grant
+                    assert isinstance(owned, first_step.OwnedGatePlacement)
+                    cleanup_error = (PermissionError("fixture admission cleanup failed")
+                                     if failed_cleanup == "admission" else None)
+                    detail = ("fixture guest took no run" if status == GATE_PRELAUNCH_REFUSED_STATUS
+                              else "fixture guest end remains unproven")
+                    with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
+                          mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                          mock.patch.object(build_folders, "tool_folder", return_value=nullcontext(source / ".git")),
+                          mock.patch.object(first_step, "_gate_request", return_value=owned.request),
+                          mock.patch.object(first_step, "_placement_grant", return_value=owned.grant),
+                          mock.patch.object(admission_client, "cancel_placement", side_effect=cleanup_error) as cancel,
+                          mock.patch.object(admission_client, "request_settlement",
+                                            side_effect=admission_wire.AdmissionUnavailable("fixture settlement failure")),
+                          redirect_stderr(io.StringIO()) as errors):
+                        result = self.run_affected_gate(source, arguments, status=status, detail=detail,
+                            folder_cleanup_error="fixture folder cleanup failed" if failed_cleanup == "folder" else "")
+                    self.assertEqual(result, status, errors.getvalue())
+                    cancel.assert_called_once()
+                    self.assertIn(detail, errors.getvalue())
+                    if failed_cleanup:
+                        self.assertIn(f"fixture {failed_cleanup} cleanup failed", errors.getvalue())
+
+    def test_named_gate_refuses_an_inherited_assignment_for_a_different_source(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.checkout(folder)
+            test = source / "scripts/lib/test_fixture.py"
+            test.parent.mkdir(parents=True)
+            test.touch()
+            path = source / ".git" / "assignment.json"
+            key = treekey.tree_key(str(source))
+            assert key is not None
+            owner = placement.SubmittingOwner(host_name(), os.getpid(), "fixture-start")
+            assignment = replace(placed("natedev").assignment, owner=owner,
+                                 source_key=execution_identity.SourceKeyKnown(key))
+            identity = build_hold.ProcessIdentity(owner.pid, owner.start_time)
+            grant = admission_wire.Assignment(assignment)
+            admission_client.write_assignment(path, grant)
+            inherited = first_step.FirstStepAdmission(CopyQueuePosition(assignment.episode, assignment.since),
+                                                       first_step.InheritedGatePlacement(grant), path)
+            _ = (source / "edit.txt").write_text("Changed since placement.\n")
+            response = admission_wire.PlacementStatusReply(admission_wire.KnownPlacementStatus(
+                assignment, placement.CurrentAssignment(), placement.NoProviderClaim()))
+            for flag in ("--tests-only", "--affected"):
+                with self.subTest(flag=flag):
+                    arguments = (flag, "--module", "lib/test_fixture.py", "--repo", str(source / ".." / source.name))
+                    with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"], "BUILDLOG_PLACEMENT_FILE": str(path),
+                                                       "BUILDLOG_PLACEMENT_EPISODE": assignment.episode}, clear=True),
+                          mock.patch.object(build_hold, "caller_processes", return_value=frozenset({identity})),
+                          mock.patch.object(admission_client, "placement_status", return_value=response),
+                          mock.patch.object(gate, "test_run_folder", return_value=nullcontext()),
+                          mock.patch.object(gate, "run_tests_only", return_value=0) as run,
+                          redirect_stderr(io.StringIO()) as errors):
+                        if flag == "--affected":
+                            with (mock.patch.object(first_step, "gate_targets", return_value=("natedev",)),
+                                  mock.patch.object(first_step, "admitted_run", return_value=nullcontext(inherited))):
+                                result = self.run_affected_gate(source, arguments)
+                        else:
+                            result = gate.main(arguments)
+                        self.assertEqual(result, 1)
+                    self.assertIn("source does not match", errors.getvalue())
+                    run.assert_not_called()
+
+    def test_direct_gate_refuses_a_missing_module_before_admission(self) -> None:
+        with (tempfile.TemporaryDirectory() as folder,
+              mock.patch.dict(os.environ, {}, clear=True),
+              mock.patch.object(first_step, "admitted_run") as admit,
+              mock.patch.object(gate, "run_tests_only") as run,
+              redirect_stderr(io.StringIO()) as errors):
+            status = gate.main(["--tests-only", "--repo", folder, "--module", "lib/test_missing.py"])
+        self.assertEqual(status, 1)
+        self.assertIn("--module 'lib/test_missing.py' does not name a test module", errors.getvalue())
+        admit.assert_not_called()
+        run.assert_not_called()
+
+    def test_direct_gate_accepts_a_symlinked_module_that_discovery_accepts(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            source = base / "checkout"
+            shared = base / "sibling/test_shared.py"
+            shared.parent.mkdir()
+            shared.touch()
+            module = "lib/test_shared.py"
+            link = source / "scripts" / module
+            link.parent.mkdir(parents=True)
+            link.symlink_to(shared)
+            self.assertEqual(discover_test_modules(source), [("lib", link)])
+            with (mock.patch.dict(os.environ, {}, clear=True),
+                  mock.patch.object(gate, "checked_gate_target", return_value="natedev"),
+                  mock.patch.object(gate, "run_tests_only", return_value=0) as run):
+                self.assertEqual(gate.main(["--tests-only", "--repo", str(source), "--module", module]), 0)
+            args, mode, target = cast(tuple[gate.GateArguments, gate.SuiteMode, gate.GateTarget], run.call_args.args)
+            self.assertEqual((args.modules, mode, target), ([module], gate.SuiteMode.GATE, "natedev"))
+
+    def test_direct_gate_refuses_an_assignment_for_a_different_source(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = self.checkout(folder)
+            arguments = ("--tests-only", "--repo", str(source / ".." / source.name))
+            admitted = self.admission(source, ("gate.py", *arguments))
+            _ = (source / "edit.txt").write_text("Changed since placement.\n")
+            with (mock.patch.dict(os.environ, {"PATH": os.environ["PATH"]}, clear=True),
+                  mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+                  mock.patch.object(first_step, "admitted_run", return_value=nullcontext(admitted)) as open_admission,
+                  mock.patch.object(admission_client, "placement_status", return_value=self.placement_status(admitted)),
+                  mock.patch.object(treekey, "tree_key", wraps=treekey.tree_key) as key,
+                  mock.patch.object(gate, "run_tests_only", return_value=0) as run,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(gate.main(arguments), 1)
+            open_admission.assert_called_once_with(("gate.py", *arguments), source, targets=("mac-linux",))
+            key.assert_called_once_with(str(source))
+            self.assertIn("source does not match", errors.getvalue())
+            run.assert_not_called()
+
+
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    @override
+    def bind_fixture(self, root: Path) -> None:
+        super().bind_fixture(root)
+        self.environment = {
+            **fixture_git_environment(root.parent),
+            **{key: value for key, value in self.environment.items() if not key.startswith("GIT_")},
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "SHOWRUNNER_STATE_DIR": str(Path(self.environment["HOME"]) / ".local/state/showrunner"),
+        }
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -93,6 +483,24 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.environment["CLAUDE_CODE_SESSION_ID"] = runner.current_session
         unit = fixture_unit_location(runner, "fixture", self.unit)
         return unit.id
+
+    def install_rollback_prepare_hook(self, body: str) -> Path:
+        hook = self.checkout / ".git/hooks/reference-transaction"
+        marker = self.checkout / ".git/rollback-prepare"
+        self.write(hook, f'''#!{sys.executable}
+import sys
+from pathlib import Path
+
+rows = [line.split() for line in sys.stdin]
+merge = next((old for old, new, ref in rows
+              if new == {self.base!r} and ref in ("HEAD", "refs/heads/integration")), "")
+if sys.argv[1] != "prepared" or not merge:
+    raise SystemExit(0)
+Path({str(marker)!r}).write_text(merge)
+{body}
+''')
+        hook.chmod(0o755)
+        return marker
 
     def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
         copies = self.root / "copies"
@@ -141,7 +549,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
             self.assertEqual(targets, ("natedev",))
             self.assertEqual(os.environ[admission_records.BUILDLOG_UNIT], "fixture")
             self.assertEqual(self.git(source, 'rev-parse', 'HEAD^2'), self.checkpoint)
-            yield mock.Mock(spec=first_step.FirstStepAdmission, grant=mock.Mock(spec=first_step.GatePlacement))
+            yield mock.Mock(spec=first_step.FirstStepAdmission, grant=first_step.InheritedGatePlacement(assignment))
 
         assignment = placed('natedev')
         with (mock.patch.object(gate, "run_suites", side_effect=suites),
@@ -244,15 +652,244 @@ class MergeGateCheckpointTests(MergeGateFixture):
                     self.assertEqual(result.returncode == 0, outcome == "pass", result.stdout + result.stderr)
                     self.assertEqual(restored, [previous])
 
+    def test_rollback_and_recovery_keep_a_commit_made_during_the_suites(self) -> None:
+        for change in ("commit", "amend"):
+            state = self.state / change
+            with self.subTest(change=change), mock.patch.dict(self.environment, GATE_STATE_DIR=str(state)):
+                checkout = self.root / change
+                _ = self.git(self.root, "clone", "-q", "--branch", "integration", str(self.origin), str(checkout))
+                file = checkout / "concurrent.txt"
+                changed_head = ""
+
+                def suites(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+                    nonlocal changed_head
+                    self.assertEqual(repo, checkout)
+                    self.write(file, "concurrent change\n")
+                    _ = self.git(repo, "add", file.name)
+                    commit_args = ("--amend", "--no-edit") if change == "amend" else ("-m", "concurrent change")
+                    _ = self.git(repo, "commit", *commit_args)
+                    changed_head = self.git(repo, "rev-parse", "HEAD")
+                    return gate.GateRun((), 0, 0, tests_reused=True)
+
+                with mock.patch.object(gate, "run_gate_suites", side_effect=suites):
+                    result = self.run_gate("--repo", str(checkout))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), changed_head)
+                self.assertIn(f"rollback kept HEAD {changed_head}", result.stderr)
+                self.assertEqual(file.read_text(), "concurrent change\n")
+
+                with mock.patch.dict(os.environ, self.environment, clear=True), \
+                        mock.patch.object(gate, "process_start", return_value=Gone()):
+                    with self.assertRaisesRegex(GateRefused, f"rollback kept HEAD {changed_head}"):
+                        directory = gate.gate_run_directory(checkout)
+                        gate.recover_gate_directory(directory, own_directory=directory)
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), changed_head)
+                self.assertEqual(file.read_text(), "concurrent change\n")
+                self.assert_not_pushed()
+
+    def test_rollback_keeps_a_commit_made_before_rollback_starts(self) -> None:
+        file = self.checkout / "concurrent.txt"
+        changed_head = ""
+
+        def fail_after_commit(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+            nonlocal changed_head
+            self.write(file, "concurrent change\n")
+            changed_head = self.commit(repo, "concurrent change")
+            raise GateRefused("fixture suite failure")
+
+        with mock.patch.object(gate, "run_gate_suites", side_effect=fail_after_commit):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), changed_head)
+        self.assertIn(changed_head, result.stderr)
+        self.assertEqual(file.read_text(), "concurrent change\n")
+        self.assertEqual((self.checkout / "unit.txt").read_text(), "checkpoint\n")
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+        with mock.patch.dict(os.environ, self.environment, clear=True), \
+                mock.patch.object(gate, "process_start", return_value=Gone()):
+            with self.assertRaisesRegex(GateRefused, f"rollback kept HEAD {changed_head}"):
+                directory = gate.gate_run_directory(self.checkout)
+                gate.recover_gate_directory(directory, own_directory=directory)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), changed_head)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assert_not_pushed()
+
+    def test_rollback_restores_the_index_before_a_competing_commit_can_land(self) -> None:
+        hook = self.checkout / ".git/hooks/reference-transaction"
+        attempts = self.checkout / ".git/rollback-commit-attempts"
+        self.write(hook, f'''#!/bin/sh
+matches=$(awk '$2 == "{self.base}" && ($3 == "HEAD" || $3 == "refs/heads/integration") {{ print $3 }}')
+case "$1" in
+prepared|committed)
+    if [ -n "$matches" ]; then
+        git commit --allow-empty -qm 'concurrent change' >/dev/null 2>&1
+        printf '%s %s\\n' "$1" "$?" >> .git/rollback-commit-attempts
+    fi
+    ;;
+esac
+exit 0
+''')
+        hook.chmod(0o755)
+
+        with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")):
+            result = self.run_gate()
+
+        self.assertEqual(attempts.read_text().splitlines(), ["prepared 128", "committed 0"])
+        self.assertEqual(self.git(self.checkout, "ls-tree", "HEAD", "--", "unit.txt"), "",
+                         "The competing commit contains the rejected checkpoint.")
+        self.assertEqual(self.git(self.checkout, "ls-files", "--", "unit.txt"), "")
+        self.assertFalse((self.checkout / "unit.txt").exists())
+        self.assertEqual(self.git(self.checkout, "log", "-1", "--format=%s"), "concurrent change")
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD^"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("merge undone, not pushed", result.stderr)
+        self.assert_not_pushed()
+
+    def test_rollback_completes_when_the_prepare_hook_writes_large_diagnostics(self) -> None:
+        marker = self.install_rollback_prepare_hook('sys.stderr.write("x" * (256 * 1024) + "\\n")')
+        result = self.run_gate(own_process=True, preamble='''\
+def fail_suites(*args, **kwargs):
+    raise gate.GateRefused("fixture suite failure")
+
+gate.run_gate_suites = fail_suites
+''')
+        self.assertTrue(marker.is_file(), result.stderr[-512:])
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(result.returncode, 1, result.stderr[-512:])
+        self.assertIn("fixture suite failure; merge undone, not pushed", result.stderr[-512:])
+        self.assert_not_pushed()
+
+    def test_rollback_refusal_includes_the_prepare_hook_diagnostic(self) -> None:
+        message = "fixture prepare hook refused rollback"
+        marker = self.install_rollback_prepare_hook(f"print({message!r}, file=sys.stderr)\nraise SystemExit(1)")
+        with mock.patch.object(gate, "run_gate_suites", side_effect=GateRefused("fixture suite failure")):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(marker.is_file(), result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertIn("cannot prepare the rollback ref transaction", result.stderr)
+        merged = marker.read_text()
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, self.base, self.checkpoint])
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assert_not_pushed()
+
+    def test_recovery_finishes_rollback_on_either_side_of_the_ref_commit(self) -> None:
+        hold = gate.hold_rollback_head
+        for when in ("before", "after"):
+            state = self.state / when
+            with self.subTest(when=when), mock.patch.dict(self.environment, GATE_STATE_DIR=str(state)):
+                checkout = self.root / f"rollback-{when}"
+                _ = self.git(self.root, "clone", "-q", "--branch", "integration", str(self.origin), str(checkout))
+                merged = ""
+                injected = False
+
+                def fail_suites(repo: Path, *_arguments: object, **_keywords: object) -> gate.GateRun:
+                    nonlocal merged
+                    merged = self.git(repo, "rev-parse", "HEAD")
+                    raise GateRefused("fixture suite failure")
+
+                @contextmanager
+                def interrupt_ref_commit(repo: Path, baseline: str, head: str) -> Generator[None]:
+                    nonlocal injected
+                    with hold(repo, baseline, head):
+                        yield
+                        if when == "before":
+                            injected = True
+                            raise KeyboardInterrupt("fixture stop before the ref commit")
+                    injected = True
+                    raise KeyboardInterrupt("fixture stop after the ref commit")
+
+                with mock.patch.object(gate, "run_gate_suites", side_effect=fail_suites), \
+                        mock.patch.object(gate, "hold_rollback_head", side_effect=interrupt_ref_commit):
+                    result = self.run_gate("--repo", str(checkout))
+                self.assertTrue(injected)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"fixture stop {when} the ref commit", result.stderr)
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), merged if when == "before" else self.base)
+                self.assertEqual(self.git(checkout, "ls-files", "--", "unit.txt"), "")
+                self.assertFalse((checkout / "unit.txt").exists())
+
+                with mock.patch.dict(os.environ, self.environment, clear=True), \
+                        mock.patch.object(gate, "process_start", return_value=Gone()):
+                    directory = gate.gate_run_directory(checkout)
+                    self.assertEqual(len(list(directory.glob("*.json"))), 1)
+                    gate.recover_gate_directory(directory, own_directory=directory)
+                    self.assertEqual(list(directory.glob("*.json")), [])
+                self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), self.base)
+                self.assertEqual(self.git(checkout, "status", "--porcelain"), "")
+                self.assert_not_pushed()
+
+    def test_checkpoint_uses_default_sigterm_for_recovery(self) -> None:
+        def run(_args: gate.GateArguments, _target: gate.GateTarget) -> int:
+            self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+            return 0
+
+        with (mock.patch.object(gate, "checked_gate_target", return_value=gate.NO_GATE_ASSIGNMENT),
+              mock.patch.object(gate, "run_gate_command", side_effect=run)):
+            result = gate.main(["--repo", str(self.checkout), "--merge-branch", "integration",
+                                "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint,
+                                "--previous-checkpoint", self.base, "--unit", "fixture", "--phase", "1"])
+        self.assertEqual(result, 0)
+
+    def test_unsettled_checkpoint_keeps_exit_80_and_the_baseline_when_rollback_fails(self) -> None:
+        pending = gate.GateSettlementPending("fixture launch remains unproven")
+        with (mock.patch.object(gate, "current_gate_placement", return_value=placed("mac-linux")),
+              mock.patch.object(gate, "run_gate_suites", side_effect=pending) as run,
+              mock.patch.object(gate, "rollback_merge", side_effect=OSError("fixture rollback failed")) as rollback):
+            result = self.run_gate()
+        run.assert_called_once()
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        rollback.assert_called_once_with(self.checkout, self.base, checkpoint=self.checkpoint,
+                                         recorded_merge=merged, recovery=mock.ANY)
+        self.assertEqual(result.returncode, GATE_UNSETTLED_LAUNCH_STATUS, result.stdout + result.stderr)
+        self.assertIn(str(pending), result.stderr)
+        self.assertIn("fixture rollback failed", result.stderr)
+        with mock.patch.dict(os.environ, self.environment):
+            records = list(gate.gate_run_directory(self.checkout).glob("*.json"))
+        self.assertEqual(len(records), 1)
+        saved = cast(dict[str, object], json.loads(records[0].read_text()))
+        self.assertEqual(saved["rollback"], self.base)
+        self.assert_not_pushed()
+
+    def test_unsettled_checkpoint_keeps_exit_80_when_admission_cleanup_fails(self) -> None:
+        pending = gate.GateSettlementPending("fixture launch remains unproven")
+        profile = admission_records.ProgramProfile("gate", str(self.checkout), str(self.checkout),
+            admission_records.HistoryPeakSizing(1, admission_records.FirstProgramPeak(1), 0))
+        grant = placed("mac-linux")
+        assignment = grant.assignment
+        constraints = placement.PlacementConstraints(assignment.source_key, ("gate.py",), str(self.checkout),
+            "", assignment.session, (placement.PlacementCandidate(assignment.destination),))
+        request = admission_wire.PlacementRequest(assignment.episode, assignment.owner, assignment.since,
+                                                 profile, constraints)
+
+        @contextmanager
+        def admit() -> Generator[first_step.FirstStepAdmission]:
+            try:
+                position = CopyQueuePosition(assignment.episode, assignment.since)
+                yield first_step.FirstStepAdmission(position, first_step.OwnedGatePlacement(grant, request),
+                                                   self.root / "assignment.json")
+            finally:
+                raise OSError("fixture admission cleanup failed")
+
+        with (mock.patch.object(gate, "current_gate_placement", side_effect=[gate.NO_GATE_ASSIGNMENT, grant]),
+              mock.patch.object(first_step, "gate_targets", return_value=("mac-linux",)),
+              mock.patch.object(first_step, "admitted_run", return_value=admit()),
+              mock.patch.object(admission_client, "request_settlement"),
+              mock.patch.object(gate, "run_gate_suites", side_effect=pending) as run):
+            result = self.run_gate()
+        self.assertEqual(result.returncode, GATE_UNSETTLED_LAUNCH_STATUS, result.stdout + result.stderr)
+        self.assertIn(str(pending), result.stderr)
+        self.assertIn("fixture admission cleanup failed", result.stderr)
+        run.assert_called_once()
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
+        self.assert_not_pushed()
+
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
-        checked = gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "integration"):
-                raise GateRefused("injected stop before push")
-            return checked(repo, *arguments)
-
-        with mock.patch.object(gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(promotion, "push_integration", side_effect=GateRefused("injected stop before push")):
             stopped = self.run_gate()
         self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertIn("injected stop before push", stopped.stderr)
@@ -270,14 +907,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.write(self.checkout / "published.txt", "published code\n")
         published = self.commit(self.checkout, "published non-doc change")
         _ = self.git(self.checkout, "push", "origin", "integration")
-        checked = gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "integration"):
-                raise GateRefused("injected stop before push")
-            return checked(repo, *arguments)
-
-        with mock.patch.object(gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(promotion, "push_integration", side_effect=GateRefused("injected stop before push")):
             stopped = self.run_gate()
         self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
         self.assertIn("injected stop before push", stopped.stderr)
@@ -293,14 +923,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.base)
 
     def test_checkpoint_retry_refuses_a_recorded_merge_for_another_checkpoint(self) -> None:
-        checked = gate.checked_git
-
-        def stop_at_push(repo: Path, *arguments: str) -> str:
-            if arguments == ("push", "origin", "integration"):
-                raise GateRefused("injected push failure")
-            return checked(repo, *arguments)
-
-        with mock.patch.object(gate, "checked_git", side_effect=stop_at_push):
+        with mock.patch.object(promotion, "push_integration", side_effect=GateRefused("injected push failure")):
             stopped = self.run_gate()
         self.assertIn("injected push failure", stopped.stderr)
         merged = self.git(self.checkout, "rev-parse", "HEAD")
@@ -344,6 +967,24 @@ class MergeGateCheckpointTests(MergeGateFixture):
                         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(folders)
                 self.assertTrue(all(not folder.exists() for folder in folders), folders)
+
+    def test_finished_module_keeps_a_held_child_folder(self) -> None:
+        prepare = gate.test_module_environment
+        children: list[Path] = []
+
+        def hold_child(root: Path, environment: dict[str, str]) -> dict[str, str]:
+            child = root / "active-child"
+            child.mkdir()
+            lock = self.enterContext((root / "active-child.lock").open("wb"))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            children.append(child)
+            return prepare(root, environment)
+
+        with mock.patch.object(gate, "test_module_environment", side_effect=hold_child):
+            result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(children)
+        self.assertTrue(all(child.is_dir() for child in children), children)
 
     def test_nested_modules_run_and_retry_from_their_own_folder_under_the_top_suite(self) -> None:
         nested = self.checkout / "scripts" / "hooks" / "tests" / "test_first.py"
@@ -413,7 +1054,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
                         job_folders.append(root)
                         return prepare(root, environment)
 
-                    with (mock.patch.dict(self.environment, {"TMPDIR": str(inherited)}),
+                    environment = {"TMPDIR": str(inherited), "BUILDLOG_PREPARED_COPY": str(self.checkout)}
+                    with (mock.patch.dict(self.environment, environment),
+                          mock.patch.object(copies, "take_prepared_gate_handoff", return_value=flag == "--affected"),
                           mock.patch.object(gate, "test_module_environment", side_effect=prepare_module)):
                         result = self.run_gate(flag, "--module", "hooks/test_first.py", "--module", "message/test_first.py")
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -511,7 +1154,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
         with (mock.patch.object(gate, "run_gate_suites", side_effect=gate.MacLinuxTookNoRun(refusal)),
               mock.patch.object(gate, "rollback_merge", side_effect=OSError("fixture rollback failed")) as rollback):
             result = self.run_gate()
-        rollback.assert_called_once_with(self.checkout, self.base)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        rollback.assert_called_once_with(self.checkout, self.base, checkpoint=self.checkpoint,
+                                         recorded_merge=merged, recovery=mock.ANY)
         self.assertEqual(result.returncode, MAC_LINUX_PRELAUNCH_REFUSED_STATUS, result.stdout + result.stderr)
         self.assertIn(refusal, result.stderr)
         self.assertIn("fixture rollback failed", result.stderr)
@@ -658,6 +1303,9 @@ class MergeGateCheckpointTests(MergeGateFixture):
         producer = self.review_producer(doc)
         runner = staff.by_id(producer)
         assert runner is not None and isinstance(runner.parent, staff.ReportsTo)
+        owner = staff.by_id(runner.parent.id)
+        assert owner is not None
+        self.environment["CODEX_THREAD_ID"] = owner.current_session
         timer = Path(self.environment["NOTIFIER_STATE_DIR"]) / f"showrunner-{runner.parent.id}"
         timer.mkdir(parents=True)
         self.write(timer / "conf", f"TARGET=session:{runner.parent.id}\n"
@@ -683,7 +1331,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
     def test_a_production_without_a_list_still_merges_a_checkpoint_with_its_line(self) -> None:
         doc = self.root / "production.md"
-        self.write(doc, "# p\n")
+        self.write(doc, "# p\n\n- **Merge branch:** `integration`\n")
         _ = self.review_producer(doc)
         checkpoint = self.checkpoint_commit("checkpoint(fixture): grid fades\n\nChange-Review: none — the gate script")
         result = self.run_gate("--promote", "--production", "fixture-showrunner", checkpoint=checkpoint)
@@ -762,7 +1410,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                      "--main-repo", str(self.main),
                      "--ssh", str(self.bin / "ssh"), "--production", "quiet"]
         output = io.StringIO()
-        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
+        with mock.patch.dict(os.environ, self.environment, clear=True), mock.patch.object(
             gate, "notify_style", side_effect=malformed_notification,
         ), redirect_stdout(output):
             code = gate.main(arguments)
@@ -821,6 +1469,25 @@ class GateRecoveryTests(MergeGateFixture):
                     process.kill()
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
+    def test_recovery_reports_every_refusal_in_its_own_directory(self) -> None:
+        directory = self.root / "recovery"
+        directory.mkdir()
+        unreadable = GateRefused("cannot recover gate 5000001: start is unreadable")
+        rollback = gate.RollbackRecoveryRefused("gate recovery kept the rollback record")
+        refusals = {directory / "a.json": unreadable, directory / "b.json": rollback}
+        for path in refusals:
+            self.write(path, "{}")
+
+        def refuse(path: Path) -> None:
+            raise refusals[path]
+
+        with (mock.patch.object(gate, "recover_gate_record", side_effect=refuse) as recover,
+              self.assertRaises(GateRefused) as refused):
+            gate.recover_gate_directory(directory, own_directory=directory)
+        self.assertEqual(recover.call_count, 2)
+        self.assertIs(type(refused.exception), GateRefused)
+        self.assertEqual(str(refused.exception), f"{unreadable}\n{rollback}")
+
     def test_tests_only_recovers_unfinished_record_and_keeps_finished_record(self) -> None:
         with mock.patch.dict(os.environ, self.environment):
             directory = gate.gate_run_directory(self.checkout)
@@ -847,14 +1514,15 @@ class GateRecoveryTests(MergeGateFixture):
 class LiveConfigTripwireTests(unittest.TestCase):
     def test_live_config_violation_uses_the_nonrerunnable_tripwire(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        job_root = root / "job"
-        job_root.mkdir()
+        folders = self.enterContext(ExitStack())
+        spec = build_folders.BuildFolderSpec(kind="tool", parent=root, purpose="job", suffix_length=0)
+        job_root = folders.enter_context(build_folders.temporary_build_folder(spec))
         marker = job_root / "live-config-writes"
         _ = marker.write_text("/fixture/config/console.conf\n")
         log = job_root / "output.log"
         process = cast(subprocess.Popen[str], mock.Mock(spec=subprocess.Popen))
         job = gate.RunningGateJob("hooks", Path("test_fixture.py"), process, time.monotonic(),
-                                  time.time(), log.open("w+"), log, "test_fixture.py")
+                                  time.time(), log.open("w+"), log, "test_fixture.py", folder_cleanup=folders)
         self.addCleanup(job.output.close)
         with mock.patch.object(gate, "kill_job_group"):
             result = gate.finish_gate_job(job, 0)

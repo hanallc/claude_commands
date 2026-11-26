@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from enum import Enum
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
@@ -212,17 +213,18 @@ def _refusal_blocks_return(readings: CodexAlertPassReadings, selected: agent_acc
             and not _credits_pay_after(refusal, readings, selected))
 
 
-def _refusal_window(window: refusals.KnownWindow | refusals.UnknownWindow,
+def _refusal_window(window: refusals.RefusalWindow,
                     reading: refusals.FreshReading | refusals.StaleReading | refusals.NoReading,
-                    at: datetime) -> refusals.KnownWindow | refusals.UnknownWindow:
-    if isinstance(window, refusals.KnownWindow):
+                    at: datetime) -> refusals.RefusalWindow:
+    if not isinstance(window, refusals.UnknownWindow):
         return window
     if isinstance(reading, refusals.FreshReading):
-        exhausted = [name for name, value in (("weekly", reading.weekly), ("five_hour", reading.five_hour))
+        exhausted = [known for known, value in ((refusals.KnownWindow("weekly"), reading.weekly),
+                                               (refusals.KnownWindow("five_hour"), reading.five_hour))
                      if isinstance(value, refusals.ReadingWindow) and value.at > at and value.left == 0]
         if len(exhausted) == 1:
-            return refusals.KnownWindow(cast(Literal["weekly", "five_hour"], exhausted[0]))
-    return refusals.UnknownWindow()
+            return exhausted[0]
+    return window
 
 
 def _finish_workers_transitions(
@@ -1914,17 +1916,16 @@ class WorkersMovedWithoutNotice:
 
 def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexCreditsSetting,
                       now: datetime, *, state: State, owner: agent_accounts.KnownCodexAccount,
-                      workers_queued: bool) -> ZeroEpisodeNotice | WorkersMovedWithoutNotice:
+                      workers_queued: bool,
+                      pick_destination: Callable[[], accounts.PickedAccount | accounts.NoAccountWithRoom],
+                      ) -> ZeroEpisodeNotice | WorkersMovedWithoutNotice:
     from scripts.accounts import accounts
     reset = report.weekly_reset
     assert reset is not None
     if isinstance(credits, agent_accounts.CreditsOff) and workers_queued:
         return ZeroEpisodeNotice(id="quota.codex_workers_stay",
                                  values={"account": label, "outcome": QUEUED_WORKERS_OUTCOME})
-    chosen = _zero_destination(label, now, prefer_weekly_room=True,
-                               included_only=isinstance(credits, agent_accounts.CreditsOn))
-    if isinstance(credits, agent_accounts.CreditsOn) and isinstance(chosen, accounts.PickedAccount):
-        chosen = _zero_destination(label, now, prefer_weekly_room=True, included_only=True)
+    chosen = pick_destination()
     stamp = now.isoformat(timespec="seconds")
     move_failed = False
     if (isinstance(chosen, accounts.PickedAccount) and not workers_queued
@@ -1951,10 +1952,12 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
         else:
             if isinstance(credits, agent_accounts.CreditsOn):
                 return WorkersMovedWithoutNotice()
+            from scripts.notify.push_catalog import codex_workers_moved_title
+
             uses_credits = accounts.codex_destination_uses_credits(chosen, now)
             return ZeroEpisodeNotice(id="quota.codex_workers_moved", values={
                 "account": label, "reset": reset_display(refusals.KnownReset(reset)), "target": chosen.label,
-                "transition": "Codex work now spends paid credits" if uses_credits else f"Codex work now uses {chosen.label}",
+                "transition": codex_workers_moved_title(label, chosen.label, uses_credits=uses_credits),
                 "funding": "its own paid credits" if uses_credits else f"{chosen.weekly_left:g}% weekly usage left"})
     if isinstance(credits, agent_accounts.CreditsOn):
         return _paid_credits_notice(label, report, chosen, reset)
@@ -2033,28 +2036,27 @@ def _credits_forecast_notice(label: str, report: Report, now: datetime) -> ZeroE
     horizon = "run-out unknown"
     if balance_text == "unlimited":
         horizon = "have no limit"
-        forecast = f"Codex account {label} has unlimited paid credits; its coding workers remain on paid usage with no credit limit."
+        forecast = "Paid credits have no limit."
     elif not math.isfinite(balance) or balance < 0:
-        forecast = f"Codex account {label} reports no credit balance; its coding workers remain on paid usage, but the run-out time is unknown."
+        forecast = "No credit balance; the run-out time is unknown."
     else:
         usage = run_out.credits_used(run_out.read_credit_readings(run_out.READINGS_LOG), label,
                                      since=now - timedelta(hours=1), until=now)
         if isinstance(usage, (run_out.NoCreditReading, run_out.UsageUnknown)):
-            reason = usage.reason if isinstance(usage, run_out.UsageUnknown) else "no numeric credit observations were recorded"
-            forecast = f"Coding workers on Codex account {label} remain on paid usage. Their hourly use is unknown because {reason}; {balance:,.0f} credits left."
+            forecast = f"{balance:,.0f} credits left; the run-out time is unknown."
         elif usage.used == 0:
             horizon = "use is zero"
-            forecast = f"Workers on Codex account {label} used no credits in the last hour; {balance:,.0f} paid credits left."
+            forecast = f"{balance:,.0f} credits left; none used in the last hour."
         else:
             until = _credits_run_out(balance, usage, now)
-            time = until.strftime("%a %Y-%m-%d %H:%M %Z")
-            horizon = until.strftime("until %a %H:%M %Z")
-            forecast = (f"Workers on Codex account {label} used {usage.used:,.0f} paid credits in the last hour; "
-                        + f"its {balance:,.0f} credits last until about {time}.")
+            time = until.strftime("%a %H:%M")
+            horizon = f"until {time} {until:%Z}"
+            forecast = f"{balance:,.0f} credits left; they run out about {time}."
     return ZeroEpisodeNotice(id="quota.codex_credits_forecast", values={"account": label, "horizon": horizon, "forecast": forecast, "destination": destination})
 
 
-def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bool = False) -> ZeroEpisodeNotice:
+def _current_notice(label: str, notice: ZeroEpisodeNotice, credit_accounts: frozenset[str],
+                    *, workers_queued: bool = False) -> ZeroEpisodeNotice:
     """Copy pending facts for rendering; never persist the queued advice overlay."""
     values = dict(notice["values"])
     if "file" in values:
@@ -2067,16 +2069,20 @@ def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bo
         outcome = {"work moves to Claude": _self_actualize_outcome(),
                    "workers wait for their next entry": QUEUED_WORKERS_OUTCOME}.get(outcome, outcome)
         values = {"account": values["account"], "outcome": outcome}
-    if workers_queued:
-        if notice["id"] == "quota.paid_credits":
-            return ZeroEpisodeNotice(id="quota.paid_credits_queued", values={key: values[key] for key in
-                ("sender", "account", "machine", "credits", "refill")})
-        if notice["id"] == "quota.codex_credits_forecast":
-            values["destination"] = "When credits run out, workers wait for the account move you queued."
+    if notice["id"] == "quota.paid_credits":
+        from scripts.notify.push_catalog import remaining_credit_accounts
+
+        values["credit_accounts"] = remaining_credit_accounts(label, credit_accounts)
+        if workers_queued:
+            del values["next_reset"]
+            return ZeroEpisodeNotice(id="quota.paid_credits_queued", values=values)
+    if workers_queued and notice["id"] == "quota.codex_credits_forecast":
+        values["destination"] = "When credits run out, workers wait for the account move you queued."
     return ZeroEpisodeNotice(id=notice["id"], values=values)
 
 
 def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: datetime) -> list[str]:
+    from scripts.accounts import accounts
     from scripts.notify.push_texts import render
 
     del config
@@ -2107,31 +2113,37 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
         if at_zero and label in state["episodes"]:
             state["episodes"][label]["reached_zero"] = True
         existing_episode = label in episodes
+        if not existing_episode and not at_zero:
+            return log
+        credit_accounts = agent_accounts.codex_credit_accounts()
+        setting = agent_accounts.CreditsOn() if label in credit_accounts else agent_accounts.CreditsOff()
+
+        @cache
+        def pick_destination() -> accounts.PickedAccount | accounts.NoAccountWithRoom:
+            return _zero_destination(label, now, prefer_weekly_room=True,
+                                     included_only=isinstance(setting, agent_accounts.CreditsOn))
+
         if not existing_episode:
-            if not at_zero:
-                return log
             reset = report.weekly_reset
             assert reset is not None
-            credits = agent_accounts.codex_credits_setting(label)
-            notice = _zero_open_notice(label, report, credits, now, state=state, owner=identity,
-                                      workers_queued=workers_queued)
+            notice = _zero_open_notice(label, report, setting, now, state=state, owner=identity,
+                                      workers_queued=workers_queued, pick_destination=pick_destination)
             if isinstance(notice, WorkersMovedWithoutNotice):
                 return log
             episodes[label] = CodexZeroEpisode(since=stamp, weekly_reset=reset.isoformat(),
-                credits="off" if isinstance(credits, agent_accounts.CreditsOff) else "on",
+                credits="off" if isinstance(setting, agent_accounts.CreditsOff) else "on",
                 phone="due", forecast_at=stamp, notice=notice)
-            if isinstance(credits, agent_accounts.CreditsOff) and workers_queued:
+            if isinstance(setting, agent_accounts.CreditsOff) and workers_queued:
                 episodes[label]["credits_off_fallback"] = "waiting_for_next_entry"
-            current = _current_notice(label, notice, workers_queued=workers_queued)
+            current = _current_notice(label, notice, credit_accounts, workers_queued=workers_queued)
             rendered = render(current["id"], **current["values"])
             log.append(f"quota zero {label}: {rendered.title}" + (f"\n{rendered.body}" if rendered.body else ""))
         episode = episodes[label]
-        setting = agent_accounts.codex_credits_setting(label)
         if (at_zero and existing_episode
                 and isinstance(setting, agent_accounts.CreditsOn) and not workers_queued
                 and isinstance(state["fallback"], NoCodexQuotaFallback)):
             reconsidered = _zero_open_notice(label, report, setting, now, state=state, owner=identity,
-                                            workers_queued=False)
+                                            workers_queued=False, pick_destination=pick_destination)
             if isinstance(reconsidered, WorkersMovedWithoutNotice):
                 del episodes[label]
                 return log
@@ -2142,7 +2154,7 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 and (episode["credits"] == "on"
                      or episode.get("credits_off_fallback") == "waiting_for_next_entry" and not workers_queued)):
             changed = _zero_open_notice(label, report, setting, now, state=state, owner=identity,
-                                       workers_queued=workers_queued)
+                                       workers_queued=workers_queued, pick_destination=pick_destination)
             assert not isinstance(changed, WorkersMovedWithoutNotice)
             episode["credits"] = "off"
             if workers_queued:
@@ -2153,7 +2165,7 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             _ = episode.pop("forecast_phone", None)
             _ = episode.pop("forecast_notice", None)
             result = render(changed["id"], **changed["values"])
-            log.append(f"quota credits off {label}: {result.posted_body}")
+            log.append(f"quota credits off {label}: {result.posted_body or result.posted_title}")
 
         # Old opening notices used values that the current templates do not accept.
         if episode["notice"]["id"] not in ("quota.paid_credits", "quota.codex_workers_moved", "quota.codex_workers_stay",
@@ -2162,12 +2174,14 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 _zero_destination(label, now, prefer_weekly_room=True, included_only=True),
                 report.weekly_reset or datetime.fromisoformat(episode["weekly_reset"]))
         if episode["phone"] == "due":
-            episode["notice"] = _current_notice(label, episode["notice"])
-            notice = _current_notice(label, episode["notice"], workers_queued=workers_queued)
-            pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "phone", episode["since"]))
+            episode["notice"] = _current_notice(label, episode["notice"], credit_accounts)
+            notice = _current_notice(label, episode["notice"], credit_accounts, workers_queued=workers_queued)
+            if notice["id"] != "quota.codex_refused" or (
+                    not workers_queued and isinstance(accounts.pick("codex", now), accounts.NoAccountWithRoom)):
+                pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "phone", episode["since"]))
         if at_zero and episode["credits"] == "on" and now - datetime.fromisoformat(episode["forecast_at"]) >= timedelta(hours=1):
             notice = _credits_forecast_notice(label, report, now)
-            current = _current_notice(label, notice, workers_queued=workers_queued)
+            current = _current_notice(label, notice, credit_accounts, workers_queued=workers_queued)
             rendered = render(current["id"], **current["values"])
             log.append(f"quota credits forecast {label}: {rendered.title}\n{rendered.body}")
             episode["forecast_at"] = stamp
@@ -2175,8 +2189,8 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
                 episode["forecast_phone"] = "due"
                 episode["forecast_notice"] = notice
         if episode.get("forecast_phone") == "due" and "forecast_notice" in episode:
-            episode["forecast_notice"] = _current_notice(label, episode["forecast_notice"])
-            notice = _current_notice(label, episode["forecast_notice"], workers_queued=workers_queued)
+            episode["forecast_notice"] = _current_notice(label, episode["forecast_notice"], credit_accounts)
+            notice = _current_notice(label, episode["forecast_notice"], credit_accounts, workers_queued=workers_queued)
             pushes.append((QuotaNote(label, render(notice["id"], **notice["values"])), "forecast_phone", episode["since"]))
     for push, field, since in pushes:
         delivery = tell_user(push.rendered)
@@ -2237,20 +2251,15 @@ def weekly_forecast(readings: list[run_out.Reading], now: datetime,
         return None
     readings = [reading for reading in readings
                 if (start is None or start <= reading.at) and reading.at < current.at] + [current]
-    # A refill can start a new window before the scheduled reset.
-    for end in range(len(readings) - 1, 0, -1):
-        if readings[end].used_percent < readings[end - 1].used_percent:
-            readings = readings[end:]
-            break
-    rate = run_out.weighted_rate(readings, current.at.timestamp())
-    if rate is None or not math.isfinite(rate) or rate <= 0:
+    rate = run_out.hourly_usage_rate(readings, now)
+    if isinstance(rate, run_out.NoUsageRate):
         return None
-    seconds = (100 - current.used_percent) / rate
+    hours = (100 - current.used_percent) / rate.points_per_hour
     empty_at = None
-    lasts_to_deadline = reset is not None and seconds >= (reset - current.at).total_seconds()
-    if reset is not None and not lasts_to_deadline and (now - current.at).total_seconds() < seconds:
-        empty_at = current.at + timedelta(seconds=seconds)
-    return WeeklyForecast(rate * 3600, empty_at, lasts_to_deadline)
+    lasts_to_deadline = reset is not None and hours >= (reset - now).total_seconds() / 3600
+    if reset is not None and not lasts_to_deadline:
+        empty_at = now + timedelta(hours=hours)
+    return WeeklyForecast(rate.points_per_hour, empty_at, lasts_to_deadline)
 
 
 def _expiry_current_reading(note: AgentNote, readings: list[run_out.Reading],
@@ -2596,7 +2605,7 @@ def blocked(notes: list[AgentNote], refusing_account: agent_accounts.RefusingCod
             now: datetime | None = None, *,
             selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
-            window: refusals.KnownWindow | refusals.UnknownWindow = UNKNOWN_REFUSAL_WINDOW,
+            window: refusals.RefusalWindow = UNKNOWN_REFUSAL_WINDOW,
             refused_at: RefusedAt | RefusalTimeUnknown = REFUSAL_TIME_UNKNOWN,
             stopped: StoppedWorker | StoppedWorkerUnknown = STOPPED_WORKER_UNKNOWN) -> list[str]:
     routed = _route_refusal(notes, refusing_account, now, selection=selection,
@@ -2612,7 +2621,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
             now: datetime | None = None, *,
             selection: ClaudeAccountsInUse | ReadCurrentClaudeSelection = READ_CURRENT_CLAUDE_SELECTION,
             codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS,
-            window: refusals.KnownWindow | refusals.UnknownWindow = UNKNOWN_REFUSAL_WINDOW,
+            window: refusals.RefusalWindow = UNKNOWN_REFUSAL_WINDOW,
             refused_at: RefusedAt | RefusalTimeUnknown = REFUSAL_TIME_UNKNOWN) -> RoutedRefusal:
     """A provider refusal waits briefly, moves workers, or opens the Claude fallback."""
     from scripts.accounts import accounts
@@ -2638,9 +2647,19 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
     name = refusing_account.label
     reading = refusals.stored_reading("codex", refusing_account.login, now)
     window = _refusal_window(window, _reading_for_account(readings, refusing_account, now), refusal_time)
+    window_name = refusals.window_name(window)
+    journal_window = refusals.move_window(window)
     reset: refusals.KnownReset | refusals.NoResetKnown = refusals.NoResetKnown()
-    if isinstance(window, refusals.KnownWindow) and isinstance(reading, (refusals.FreshReading, refusals.StaleReading)):
-        held_window = reading.weekly if window.name == "weekly" else reading.five_hour
+    if isinstance(reading, (refusals.FreshReading, refusals.StaleReading)):
+        match window_name:
+            case "weekly":
+                held_window = reading.weekly
+            case "five_hour":
+                held_window = reading.five_hour
+            case "weekly_fable" if isinstance(reading, refusals.FreshReading):
+                held_window = reading.weekly_fable
+            case _:
+                held_window = refusals.NoWindow()
         if isinstance(held_window, refusals.ReadingWindow):
             reset = held_window.reset
     refusals.write_refusal(refusals.AccountRefusal("codex", refusing_account.login, window, reset, refusal_time))
@@ -2653,6 +2672,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                       else "an account whose worker selection is unknown")
     transition_line = ""
     no_room = ""
+    no_codex_destination = False
     with state_file() as state:
         if "pending_switch" in state:
             _ = _complete_pending_claude_switch(state, state["pending_switch"])
@@ -2667,9 +2687,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                                        agent_accounts.codex_credits_setting(readings.workers.label))
             entries = moves.read_moves()
             if (isinstance(reset, refusals.KnownReset) and (pending_head
-                    or isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
+                    or window_name == "five_hour"
                     and timedelta(0) < reset.at - now < timedelta(minutes=20))):
-                window_name = window.name if isinstance(window, refusals.KnownWindow) else "unknown"
                 window_text = "5-hour" if window_name == "five_hour" else window_name
                 if any(entry["tool"] == "codex" and entry["subject"] == "workers" and entry["kind"] == "waited"
                        and entry["reset"] == reset.at.isoformat() for entry in entries):
@@ -2677,7 +2696,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                                          WorkersWaitForReset(reset_display(reset)))
                 move_id = uuid.uuid4().hex
                 moves.append_move(moves.WaitedMove(kind="waited", at=stamp, tool="codex", subject="workers",
-                    move_id=move_id, window=window_name, reset=reset.at.isoformat()))
+                    move_id=move_id, window=journal_window, reset=reset.at.isoformat()))
                 transition_line = f"workers wait for {name}'s {window_text} reset at {reset_display(reset)}"
                 outcome = WorkersWaitForReset(reset_display(reset))
             elif pending_head:
@@ -2688,11 +2707,10 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                 chosen = accounts.pick("codex", now, exclude=frozenset({readings.workers.label}), keep=accounts.NoKeep())
                 if isinstance(chosen, accounts.PickedAccount):
                     move_id = uuid.uuid4().hex
-                    window_name: Literal["weekly", "five_hour", "unknown"] = window.name if isinstance(window, refusals.KnownWindow) else "unknown"
                     reason = f"{name} refused ({window_name} limit until {reset_display(reset)})"
                     request: moves.RequestedMove = {"kind": "requested", "scope": "group", "at": stamp, "tool": "codex",
                         "subject": "workers", "move_id": move_id, "from": readings.workers.label, "to": chosen.label,
-                        "why": reason, "window": window_name}
+                        "why": reason, "window": journal_window}
                     if isinstance(reset, refusals.KnownReset):
                         request["reset"] = reset.at.isoformat()
                     moves.append_move(request)
@@ -2708,6 +2726,7 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                         transition_line = f"workers moved from {name} to {chosen.label}: {reason}"
                         outcome = WorkersMoved(chosen.label)
                 else:
+                    no_codex_destination = True
                     closed = {entry["move_id"] for entry in entries if entry["kind"] == "room again"}
                     pending = any(entry["tool"] == "codex" and entry["subject"] == "workers" and entry["kind"] == "no room"
                                   and entry["move_id"] not in closed for entry in entries)
@@ -2755,6 +2774,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
             if owns_role:
                 failed = notice.get("switch_failed") or (episode.get("switch_failed") if episode is not None else None)
                 push = refusal_push(note, fallback, failed, already)
+                if isinstance(push, UserPush) and not no_codex_destination:
+                    return RoutedRefusal(log, outcome)
             else:
                 text = f"Codex refused work on {name}, {account_status}. Nothing switched to Claude."
                 status = QuotaStatusNote(name, text)

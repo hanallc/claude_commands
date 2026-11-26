@@ -6,7 +6,6 @@ import json
 import os
 import re
 import signal
-import socket
 import stat
 import subprocess
 import tomllib
@@ -22,14 +21,13 @@ from scripts.lib import process_group
 
 from scripts.build_hold import override_guard
 from scripts.copies import copies
-from scripts.lib import cargo_output, conf_reads, scratch
+from scripts.lib import cargo_output, conf, scratch
 from scripts.notify import review
 from scripts.notify.push_texts import RenderedPush
 
 CHANNEL_URL = "https://static.rust-lang.org/dist/channel-rust-stable.toml"
 HANA = Path.home() / "rust/hana"
 HOLD_DIR = Path.home() / ".local/state/build-hold"
-LINT_CONFIG = Path(__file__).resolve().parents[2] / "config/lint.conf"
 TRIAL_HEADROOM_GIB = 50
 GIB = 2**30
 
@@ -203,24 +201,12 @@ def mapping(value: object) -> dict[str, object]:
 
 
 def free_floor_gib() -> float:
-    values: dict[str, str] = {}
     try:
-        contents = conf_reads.read_text(LINT_CONFIG)
-        for raw in contents.splitlines():
-            line = raw.split("#", 1)[0].strip()
-            if line and not (line.startswith("[") and line.endswith("]")) and "=" in line:
-                key, _, value = line.partition("=")
-                _ = values.setdefault(key.strip(), value.strip())
-    except OSError:
-        return 0
-    selected = f"sweep_free_floor_gib.{socket.gethostname()}"
-    if selected not in values:
-        selected = "sweep_free_floor_gib"
-    raw = conf_reads.trace_values(LINT_CONFIG, contents, values).get(selected, "0")
-    try:
-        return max(0.0, float(raw))
+        key = "sweep_free_floor_gib"
+        floor = conf.read("lint").values(key).get(key)
+        return 0.0 if floor is None else max(0.0, float(conf.decimal(floor)))
     except ValueError:
-        return 0
+        return 0.0
 
 
 def waiting_reason(held: Callable[[], bool], building: Callable[[], bool], free_gib: Callable[[], float]) -> str:

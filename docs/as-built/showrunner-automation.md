@@ -246,6 +246,14 @@ Its subject is `Merge <unit> phase <N> as-built (<short>) into <branch>`.
 `Promote: none` and an absent field both mean `NoPromotion`.
 Each local Promote checkout must exist before the command pushes.
 
+For an enrolled production, use the exact staff document for live policy.
+The showrunner starts in the main checkout from `Repository`.
+The serving merge unit publishes from the integration worktree on `Merge branch`.
+Run the enrolled production's merge checks in item 143 test copies.
+Resolve the live LOG relative to the main checkout.
+Removal tools protect both checkouts and their branches.
+Sync refuses incoming paths that overlap the live document, LOG, or notes.
+
 - **Origin ancestry:** The checkpoint must occur on an origin branch. The command fetches and checks the unit's Branch first. If necessary, it fetches all origin heads. Machine-readable fetch output identifies current origin refs. Stale tracking refs cannot certify a checkpoint. Neither ancestry checks nor worktree cleanup prune shared refs. This also applies when the checkout normally fetches one branch. The ancestry line names the containing branch. Without a containing branch, the result stays `commit is not on origin`. Scope, conflict checks, and merging use the submitted checkpoint hash. The overlap report checks other units' branches and dirty worktrees. It excludes the submitting unit. Push preparation, publication, batch preparation, and promotion fetch explicit refspecs before they read full origin ref names.
 - **Inputs:** The showrunner staff row supplies the production name and document path. Unit staff rows supply the worktrees. `.unit.toml` supplies each plan. The document supplies `Merge branch`, `Showrunner checkout`, `Log`, and `Merge tests`. It also supplies `Known flakes` and `Known flaky tests`. Flakes name packages. Flaky tests use the form `` `<path::test>`, `<path::test>` ``. `Push` selects `validate_and_push` by default, or `git`. `Promote` accepts `<checkout>[, mac <path>]`. Its type is `NoPromotion | PromoteTo(checkouts, MacCheckout | NoMac)`.
 
@@ -312,6 +320,16 @@ Each local Promote checkout must exist before the command pushes.
      It selects every changed path from the tip before the checkpoint merge through the prepared tip.
      Packages run through `verify.sh test`, and changed examples run through `verify.sh example`.
      Then each configured Merge tests command runs without a shell.
+     Gate commands run through `copies.py run --repo <checkout> --commit <tested tip> -- <command>`.
+     The gate uses the copy path for `--checkout` and the normal target selection.
+     The copy uses the local commit before the push.
+     AWS receives the commit in a Git bundle.
+     Admission uses `BUILDLOG_UNIT` or the calling session's unit from the staff record.
+     Before publication, check that the merge checkout and branch still point to the tested tip.
+     A moved tip cancels publication with status 77 and keeps the local changes.
+     The direct Git push uses the checked commit ID as the source.
+     A failed validation can roll back formatter commits from this run.
+     The branch reflog must show only updates from this validation since the checked commit.
      `parse_merge_tests` reads backticked entries before the first unquoted parenthesis and splits them with `shlex`.
      Each word expands home and environment variables.
      A remaining `$VAR` or an unavailable executable refuses the command by name.
@@ -319,6 +337,7 @@ Each local Promote checkout must exist before the command pushes.
      A command that cannot start has exit 127.
      A shrink runs no tests.
   7. *red*: run each failed command once alone.
+     A gate rerun uses `copies.py run` with the same commit.
      If every nextest `FAIL` row names a Known flaky test, run only those tests again.
      Use `verify.sh test [<package>] --filter <name>` per test, or `-E test(=<name>)` for other nextest commands.
      A pass alone continues with a LOG note in this case, or when Known flakes lists the package.
@@ -327,8 +346,11 @@ Each local Promote checkout must exist before the command pushes.
      A failure names the failed nextest tests or the failed gate modules (`--- <suite>/<module> exit=<rc> ---`).
      A module green on its rerun alone is not a red name. The rerun's names replace the first run's names when it names any.
   8. *base check*: merge the same `origin/main` into the restored tip, and run each red command there once.
+     A gate base check uses `copies.py run` with the prepared base commit.
      Limit the run to failed names with `--filter`, `-E test(=<name>)`, or the gate's `--module <suite>/<module>`.
-     The log gets `<name>_BASE_EXIT=<rc>` lines. The check then resets to the restored tip. A green checkpoint runs no base check.
+      The log gets `<name>_BASE_EXIT=<rc>` lines.
+      The check resets the checkout to the restored tip only if the checkout still points to the expected base commit.
+      A green checkpoint runs no base check.
      A name red on the base too goes to the merge director. The run prints `merge director: <commands and names> red on base <commit> without the checkpoint; repair the base, then run the checkpoint again; test log: <log>`.
      The unit gets a repair line only for its own red names.
      When every red name is also red on the base, the stop is `red: held`, and the unit's line tells it to send nothing.
@@ -353,7 +375,7 @@ Each local Promote checkout must exist before the command pushes.
      It pushes main only when main holds no foreign commits outside origin main and the production merge branch.
      Mac promotion calls `pull_mac_checkout(mac, source)` with the first Promote checkout as source.
      The Mac pulls through [`main_publish.mac_pull_command`](repair-rounds.md#mac-pulls-and-visible-change-ownership).
-     It reads the printed `rc=` line and uses `MAC_PULL_TRIES` and `MAC_PULL_RETRY_SECONDS` from `config/merge_checkpoint.conf`.
+     It reads the printed `rc=` line and uses `mac_pull_tries` and `mac_pull_retry_seconds` from `config/merge_checkpoint.conf`.
      An unreachable Mac queues its target and source through `main_publish` and permits the merge to finish.
      An answering Mac whose pull fails still fails promotion.
   10. Record the code checkpoint's review ledger row and production log line.
@@ -463,13 +485,21 @@ Each local Promote checkout must exist before the command pushes.
   A directory lock protects every write without a separate lock file.
   A write commits only the list when the list is in a Git worktree.
   It never pushes the commit or changes another staged file.
-  A failed commit prints `written but not committed`; the next write commits the complete list.
+  Commits share the vault's main push lock with the other Git writers.
+  The readiness scan also runs after a merge. It tries the vault lock once per list without waiting.
+  If the lock is busy, the list stays uncommitted. The next scan tries again.
+  Each failed commit attempt gives one warning with the list path, the number of new rows, and the reason.
+  Other list writes report a commit failure immediately.
+  The next successful commit saves the complete list.
   The vault's Templater must exclude the change-review folder to prevent concurrent changes to new lists.
 
   Every new or edited visible row requires a registered image.
   Metadata changes and verdicts can update existing imageless rows; the image rule applies only to new rows and visible content edits.
   This write rule has no date exception; `problem()` retains its date rule for commit checks.
   `add` requires `--image` or `--output` and records ready changes that have no checkpoint line.
+  The Console text check reads the change, the check steps, and the result before `add` or a text edit writes the row.
+  A batch checks its text edits before any list write.
+  The review log records the reason if the model is unavailable.
   `--image` accepts a PNG path or a registered image id.
   `batch` checks all edits before any list write and names every row without an image.
   `edit` keeps an existing image and requires an image when the row has none.
@@ -499,8 +529,9 @@ Each local Promote checkout must exist before the command pushes.
   A failed main push or Mac pull adds no rows.
   The next successful call adds the rows from earlier promoted merges.
 - **Overrides for tests:** `MERGE_CHECKPOINT_VERIFY`, `MERGE_CHECKPOINT_VALIDATE_AND_PUSH`, `MERGE_CHECKPOINT_REVIEW_REGIME`, `MERGE_CHECKPOINT_SCRATCH`.
-- **Unit targeted tests.** A unit runs `scripts/production/targeted_test.py --checkout TREE`.
-  It uses the shared runner with affected-module selection.
+- **Unit targeted tests.** A `claude_commands` unit runs `gate.py --affected` through `copies.py run`.
+  Use the command in `<FinalGate/>` in `docs/direct/final_gate_commit.md`.
+  The gate uses the shared runner with affected-module selection.
 - **The `~/.claude` repo's own gate.** `scripts/production/merge_gate.py` checks ancestry and checkout changes before it merges a checkpoint with `--no-ff`.
   The gate runs all test modules under a memory governor.
   Basedpyright runs only with `--nightly`.
@@ -513,7 +544,16 @@ Each local Promote checkout must exist before the command pushes.
   `--promote` sends the green merge to `~/.claude` main and the Mac.
   See [merge-gate-and-test-speed.md](merge-gate-and-test-speed.md).
 
-The showrunner still judges, before the call: the other units' overlap notice, new public items without a consumer, the design check. After it: `<ChangeReviewFeatureLog/>` for a merge in `~/rust/hana` or `~/rust/hana_catalyst` (one feature-log proposal per change-review row; `docs/as-built/feature-log.md`), then `<ClearGate/>`, `<CrossUnitChange/>`, `<CIPoint/>` and the review watch. It sends the script's `send <unit>:` line and puts every `into:` line in the user update, adding one in the same form for each unit worktree it then merges the merge branch into. A change for the user to check is never an open question: it goes on the change review list, and `<CloseChangeReview/>` takes the user's verdict for every production, with feature-log calls only where the project closes out by change review (Hana and `~/.claude`).
+Before the call, the showrunner checks the overlap notice, new public items without a consumer, and the design check.
+After the call, it runs `<ChangeReviewFeatureLog/>` for a merge in `~/rust/hana` or `~/rust/hana_catalyst`.
+It records one feature log proposal per change review row. See `docs/as-built/feature-log.md`.
+It then runs `<ClearGate/>` and `<CrossUnitChange/>`.
+It runs `<CIPoint/>` only when `ci_points.py due` reports that CI is due.
+It sends the script's `send <unit>:` line and includes each `into:` line in the user update.
+It adds an `into:` line for each unit worktree that receives the merge branch.
+It puts changes that need a user check on the change review list.
+`<CloseChangeReview/>` records the user's verdict for every production.
+It calls the feature log only for projects that close work by change review (Hana and `~/.claude`).
 
 ### Smoke launch
 
@@ -545,12 +585,12 @@ The [launch receipt contract](build-followups-fn-length-hook.md#production-launc
 
 The List keeps one Markdown record at `<SHOWRUNNER_STATE_DIR>/<morty staff id>/list/L<n>.md`.
 The default root is `~/.local/state/showrunner`.
-The CLI requires a producer staff row for the current session.
+The CLI requires a producer staff row for commands other than confirmation.
 Morty's fixed staff ID selects the folder for each new item.
 The item's `owner` field names its showrunner.
 `nate` and `Not recorded` identify items without an assigned showrunner.
 The item's `producer` field stores the assigned producer's fixed staff ID.
-Old records without the field default to morty.
+Old records without the field use their record keeper.
 `record_store.NumberedRecords` supplies the folder, frontmatter, file lock, and atomic replacement for both stores.
 Both stores use `file_lock.exclusive` and the shared `record_store.state_root` function.
 `update_registration` also uses this root function.
@@ -559,19 +599,31 @@ Investigations retain their existing format and command behavior.
 `ListItem` stores the number, title, owner, unit, state, next check, ETA, unread time, and parked time.
 It also stores dependencies, related numbers, requester, opened time, updated time, closed time, and closing words.
 The body stores the next step, latest status, evidence, completion condition, and log.
+The CLI checks text fields with the fast Console text check before saving them.
+This includes closing words, the text of Go requests, and answers to List questions.
 Length fields preserve headings and line endings inside each text section.
 The log keeps dated changes in file order, newest last, with the source on each line.
 The Added line preserves initial field values, including state, ETA, next step, and latest status.
 Quoted log values preserve line endings as JSON escapes.
 
-States are `New`, `Working`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
+States are `New`, `Working`, `Scheduled`, `Blocked`, `Waiting for nate`, `Delivered`, `Done`, `Paused`, and `Closed`.
 Parking stores a time or a delivery condition and keeps the current item state.
 The List ends a delivery park automatically when the producer sets the item state to Delivered.
 Linked changes supply review information on the List.
-The List hides an item with unanswered questions while each send is pending or successful.
+The List shows a waiting panel while each unanswered question has a pending send or confirmed delivery.
 If a question send fails, the item shows Question not delivered.
-The `the_list.py list` command still shows the item.
-The producer uses `the_list.py answer` to save an answer and mark the item unread.
+The `the_list.py list` command still shows the item when it is in morty's folder.
+The `the_list.py answer` command accepts answers from the saved recipient, the record keeper, or morty.
+A saved answer marks the item unread.
+Use `answer --keeper` to select the item's folder.
+Without `--keeper`, `answer` uses the caller's List folder if it holds the item, or morty's folder otherwise.
+The fast check and model review run before the write lock.
+The save checks the question ID and the caller's permission again.
+`update` uses morty's folder by default.
+For a legacy item, use `the_list.py update --keeper <keeper> --id L<N> --next-step "<step>"`.
+A producer can name any keeper in `update`, but it updates only its own fields on items it produces.
+Each command refuses a `--keeper` that has no List folder.
+In a keeper folder other than morty's, `update` refuses `--producer` and `--owner`.
 Add and update accept `Mon D`, `Mon D HH:MM ZONE`, `No time yet`, `Waiting for nate`, `Paused`, and `Delivered` as an ETA.
 The command selects the date nearest to today in the user's time zone.
 The record and log store a date-only ETA as an ISO date, such as `2026-11-20`, with kind `time or status`.
@@ -597,6 +649,88 @@ An empty optional time removes that time.
 6. Restore a Closed item as New with `reopen --id L<n> --source <source>`.
 7. Clear its unread time with `mark-read --id L<n> --source <source>`.
 8. Print the table with `list`.
+9. Ask nate for a Go with `ask L<n> --kind go|approval --target <staff id> --what <text> --why <text> [--config]`.
+10. Withdraw an open ask with `withdraw-ask L<n> --ask A<k> --reason "<text>"`.
+    `withdraw-ask` works on a closed item and keeps the item closed.
+11. Set the top priority item with `top-priority --id L<n>`.
+    A producer can name only its own item. Morty can name the item of any producer.
+
+`ask` adds an `Ask` to the item's `asks` field and prints `L<n> A<k>`.
+The ids are `A1`, `A2` and on for each item.
+Only the item's producer or morty can open an ask. The target must have a staff row.
+`--config` marks a settings.json, CLAUDE.md or config change. The page shows the same button for it.
+Each ask stores the kind, What, Why, the target, the config flag, the opened time, the closed time and the go id.
+The frontmatter stores the asks as JSON. Old records without the field load with no asks and are not written.
+An open ask makes the item unread, and the log gets an “Ask opened” line.
+Only the item's producer or morty can withdraw an ask.
+Withdrawal closes the ask without a go id and saves a withdrawal flag.
+The log records “Ask withdrawn” with the ask, the caller's staff name and the reason.
+The List removes the button for the withdrawn ask. `go_check.py` refuses it.
+The List page Go closes the ask with its go id and logs a “Go given” line; see review-links.md, [Asks for nate's Go](review-links.md#asks-for-nates-go).
+When no ask that shows a box stays open, the item becomes read if it has no other unread change.
+An ask whose target has no staff row shows no box.
+A Go that leaves no ask with a box on a Waiting for nate item also sets Working and asks the producer for the next step, as Mark read does.
+A Go message that does not reach a recipient adds a “Go not delivered” log line.
+nate's Go counts as his go for the one named change only after `go_check.py` prints `go ok` for the target session.
+
+Add or update a Scheduled item with `--state Scheduled --start <time> --do <words>`.
+Use an ISO time with an offset or an IANA zone in brackets.
+For example, use `--start '2026-11-30T09:00[America/Los_Angeles]'` to keep 09:00 across daylight-saving changes.
+Use `--repeat 'FREQ=WEEKLY;BYDAY=MO'` to repeat on Mondays.
+The CLI prints the rule in words before it saves the schedule.
+The schedule stores its start and instruction in the `schedule` field.
+A series also stores its RRULE, run allowance, and run progress.
+It stores changes and skips by run number.
+Delivery uses the saved allowance.
+Old records without the field have no schedule.
+The `list` command shows the start, repeat rule in words, and next run.
+
+Use `--scope this|following|all` to change or remove a repeat with `update`, `park`, or `close`.
+Use `this` to change the next run's start or words, or to skip the next run.
+The run limit counts skipped runs.
+If you skip a run with `close`, the skip record keeps the closing words.
+Use `following` after a run occurs to apply the change from the next run.
+Use `all` to change or remove the series.
+Use `--repeat ''` to remove the repeat and keep the pending run.
+Supply a new start if the pending start is in the past.
+Use scoped `update --state Working`, `park`, or `close` to remove a repeat schedule.
+A manual state change, including reopening, settles all runs awaiting confirmation in one save.
+The same save clears their deadlines.
+Runs awaiting the owner instruction keep their delivery state.
+The next run stays scheduled.
+The record keeps its earlier log entries when the schedule changes or ends.
+A producer can change its own schedules. Morty can change all schedules.
+Herdr upkeep checks the List on natedev after it restores the shared server.
+The job uses its existing lock and interval.
+It reads the next check time from each item header.
+It loads the item when a run, notice, or confirmation deadline is due.
+If the scan reaches its time limit, the next check starts after the last item it inspected.
+Delivery has separate time limits for a notice, an item, and the whole check.
+The watchdog keeps the sender group's deadline after upkeep or the sender exits.
+It stays active until the sender group exits or the deadline expires.
+The List reports a group timeout separately from the sender's result.
+
+On the first check at or after the start, the List saves the run and sets the item to Working.
+The owner receives the instruction. The producer receives a copy.
+The List opens the capture files before it saves the notice as sending.
+If a file cannot open, the notice stays ready for the next check.
+The List calls the sender after it saves the notice as sending.
+If the List cannot confirm acceptance, it records one uncertainty entry.
+The List calls `send.py` at most once per notice.
+The List starts runs due within two upkeep intervals in order of their saved start times.
+It keeps the latest due run even after an outage.
+The same save records the other runs older than two intervals as missed.
+
+Use `the_list.py confirm --id L<n>` to confirm the latest active run.
+The start message includes `--run` to select that exact run.
+The owner saved for that run or morty can confirm.
+On the Mac, the command forwards the confirmation to natedev.
+The confirmation time starts when the sender accepts the owner's instruction or the List marks its delivery uncertain.
+If the confirmation time passes, the List sends one phone text to nate and a second message to the producer.
+The List stores the result on the run's start line.
+Each future run can start while an earlier run awaits confirmation.
+After the active runs finish, an item still in Working returns to Scheduled if runs remain.
+The item stays open when the series ends.
 
 Use `--include-parked` to include parked items or `--all` to include parked and closed items.
 Use `--latest-status` to show the latest status column.
@@ -607,36 +741,57 @@ The command refuses a `--source` that ends with a clock time.
 Morty can use every command.
 Other producers can add items assigned to themselves.
 The command uses the caller's staff name as the source for those items.
+On add, producers can use `--related-to` for any existing List item.
+They can use `--blocked-by` only for their own List items.
 Other producers can list only their own items, including with `--all`.
 If the directory or a record is unreadable, the producer's list reports an incomplete result and exits nonzero.
 The command shows any readable items in scope and omits details of the read error.
-They can use `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence` on those items.
+Producers can update their own items with `--title`, `--done-when`, `--unit`, `--latest-status`, `--next-step`, `--eta`, `--state`, `--next-check`, `--evidence`, and `--add-evidence`.
 Their updates use the caller's staff name as the log source.
-They can also run `park`, `close`, and `reopen` on those items.
-These commands use the `--source` words as the log source.
-The command refuses each item of another producer.
+Their `add` can set `--producer` to their own name or staff ID. The item goes to the caller by default.
+The CLI refuses another producer and `--number` on their `add`.
+The CLI saves new items in morty's store on the machine where it runs. Every producer runs on natedev.
+`park`, `unpark`, `close`, and `reopen` use morty's folder. Producers can run them on their own items.
+These commands require `--source` and use its words as the log source.
+Close clears the parking time.
+The writer checks the assigned producer under the same lock as the save.
+Only morty can change the owner or producer of an existing item.
 Only morty can run `mark-read`, `clean-evidence`, `link`, and `unlink`.
 
 Morty uses `--producer <name or staff id>` on add or update to assign an item.
-Morty's new items default to morty.
-Changing the producer to someone other than morty sends two notices after the save.
+New items that morty adds without `--producer` default to morty.
+An assignment that morty makes to another producer sends two notices after the save.
+When another producer adds their own item, the CLI sends only the showrunner notice after the save.
 The producer gets the title, showrunner, and List commands.
 The current showrunner gets the title, producer, and where to send design questions.
 The sender checks the fixed staff ID, required role, and current session before each delivery attempt.
 If the recipient is offline, the notice fails and stays unsent.
-If the producer retires before the staff refresh, the CLI reports the failed producer notice.
+If a producer that morty assigned retires before the staff refresh, the CLI reports the failed producer notice.
 The showrunner gets a notice that the saved assignment needs a new producer.
 When the Owner has no current showrunner row, the CLI reports a failed showrunner notice.
-When the staff refresh fails, the CLI reports the saved item ID and both unsent notices.
+When the staff refresh fails, the CLI reports the saved item ID and the notices it could not send.
 The CLI exits nonzero if a notice fails. The saved assignment stays in place.
 An unchanged producer or an assignment to morty sends no notice.
 
 Add and update accept `--unit`, `--state`, `--next-check`, `--eta`, and `--requested-by nate|dwight`.
 They also accept `--next-step`, `--latest-status`, `--evidence`, `--add-evidence`, and `--done-when`.
+Use `--done-when` to name every result the item needs before it can close.
 `--evidence` replaces the evidence text. `--add-evidence` appends one line.
+The CLI reads character limits in `config/the_list.conf` when add or update sets the applicable field.
+
+| Config key | Limit |
+| --- | --- |
+| `max_chars.latest_status` | 200 characters for the latest status |
+| `max_chars.next_step` | 160 characters for the next step |
+| `max_chars.evidence_line` | 300 characters for each replacement or appended evidence line |
+| `series_run_limit` | 730 runs per series, including the start |
+| `confirm_wait_minutes` | 15 minutes for the owner to confirm a scheduled run |
+
+The CLI refuses a write if the applicable text setting is missing, invalid, or too small for the supplied text.
+The limit applies when the CLI next sets that text. Existing text stays readable at any length.
 `--blocked-by L<n>:<condition> ...` records dependencies; `--related-to L<n> ...` records related items.
 Either option with no values clears its field.
-References use numbers in morty's List folder.
+References use numbers in the folder of the item that the command edits.
 Add and update check references when they set dependency or related fields.
 The store refuses missing references, self-dependencies, and dependency cycles.
 Other changes, including mark-read, do not read referenced records.
@@ -706,6 +861,7 @@ Other state changes receive one refusal line.
 
 1. File an investigation with `investigation.py file --title "<one line>" --question "<full question>" --waiting-why "<reason>"`.
 2. Save its answer with `investigation.py answer --id I<n> --text "<answer>"`.
+   The Console text check runs before the answer is saved. The review log records any model outage.
 3. Mark its answer read with `investigation.py read --id I<n>`.
 4. List waiting investigations with `investigation.py list`.
 5. Include read investigations with `investigation.py list --all`.
@@ -744,10 +900,17 @@ A missing folder uses its nearest existing parent until the folder appears.
   Questions use `QuestionRecord` files; reminder strings use `OUTSTANDING`.
   `OUTSTANDING` is `<SHOWRUNNER_STATE_DIR>/outstanding/<showrunner staff id>.json`.
   A missing `open_for_user` key preserves the existing items.
-  A new question requires its full text and a review result before storage.
+  A new question requires its full text.
+  The `questions` command uses the same fast check and model review as `ask`.
 
 - `ask --ask "<one line>" [--context "<why now>"] [--item "<entry>" ...] [--recommend "<choice and why>"] [--choice "<answer>" ...] [--unit <unit>]` files a reviewed question without a reply to the user.
-  The record keeps the parts in `parts` and the joined full text in `question`, so `/next`, messages and the review read one text.
+  The [Console text standard](../console_text_standard.md) applies to `ask` and to answers and replies from the writer.
+  The fast check tests text patterns before the existing model reviewer reads the draft.
+  The model approves a draft only with a `send` verdict.
+  The filing command returns the failed rules and quotes to the writer. The hold keeps the draft.
+  A quote that differs from the draft keeps the draft on hold.
+  If the model is unavailable, `ask` records the reason.
+  The record keeps the parts in `parts` and their full text in `question`.
   The Review page shows question parts as sections: the items as a numbered list, links as links, and each choice as a radio item that fills the answer box.
   `--ask` is required and holds one line; `--text` defaults to it. There is no `--question` option.
   A question with `--choice` needs at least two of them and a `--recommend`; otherwise `ask` refuses before the review.
@@ -783,6 +946,7 @@ A missing folder uses its nearest existing parent until the folder appears.
   A question with a follow-up that waits for its reply is not due: `open` lists it as `waiting for the asker's reply since <time>`, and `/next` and the page leave it out.
   `reply` finds the one question with exactly that text and a waiting follow-up, in this production or a production below it.
   It keeps the follow-up and the reply in `followups`, and the question is due again with both shown.
+  If the reviewer is unavailable, the reply record keeps the reason in `review_unavailable`.
   The Python `followup` API requires `waiting_why`; the Review action uses the user's question text automatically.
   It prints `reply: ok — <showrunner name>: <text>: back on the open-questions list with the reply`.
 - `withdraw --item <text>` removes one open item with exactly that text from this production or a production below it.
@@ -821,9 +985,6 @@ The herdr session list classifies showrunner panes through native session identi
 Quota notices retain staff IDs for named recipients.
 Current staff names resolve at notice creation; former names do not resolve.
 Explicit `session:` and `uds:` recipients retain their native addresses.
-Wind-down projection keys and count timer commands use staff IDs.
-Count timers resolve the current session through staff when they fire.
-Wind-down starts clear projection state; this change adds no conversion.
 Worker completion notices resolve the director's staff ID after the worker lock releases.
 Consultation waits use the native process and the last transcript prompt's reply address.
 Consultations need no staff row.
@@ -896,9 +1057,13 @@ Pane labels do not identify a consultation.
   Stored instants keep their offsets.
   Tests select a private zone when their assertions need one.
 
-### CI points and review watch: `ci_points.py`
+### CI points in `ci_points.py`
 
-`ci_points.py due | ci start [--cancel-prior] | ci collect | watch | notice clear <gate> | notice lift <gate> --log <path>`, each with `--production`; `due`, `ci`, `watch` take `--state-dir`; `due` and `ci` take `--no-ci`.
+`ci_points.py due | ci start [--cancel-prior] | ci collect | notice clear <gate> | notice lift <gate> --log <path>`
+
+Each command requires `--production`. The `due` and `ci` commands require `--state-dir` and accept `--no-ci`.
+
+The 2026-11-24 change removed the review watch and its push.
 
 - `due` counts distinct recorded unit checkpoints that reached the merge branch. Five checkpoints after the last CI point produce `CiDue`. A collected point saves the count and tip in `ci_points.json`. Shrink commits and child hand-offs have no unit checkpoint record.
 - `ci start`: validates the merge-branch tip with `validate_and_push.sh`, publishes it with `push_direct.sh --publish-only`, follows the CI run with `push_direct.sh --follow-published`, and writes `ci_run.json` (`repo`, `run_id`, `tip`), the only handoff to `collect`. The run's repository and head commit must match the push remote and the published commit.
@@ -911,12 +1076,11 @@ Pane labels do not identify a consultation.
   - A failed run still runs the `--cancel-prior` step before `ci start` exits with the failure.
   - An `ssh.github.com` (SSH over 443) remote uses `github.com` for GitHub API calls and run links.
 - `ci collect`: takes the tip and its code-merge count before `gh run watch --exit-status`, then `gh run view --json headSha,status,conclusion,jobs`. It passes only when `headSha` equals the validated tip and the current tip, the run is `completed` and concluded `success`, job `Test Suite` succeeded, and every other job succeeded or was skipped. Then it records `{count, tip}` and prints `--ci-green <tip>` as the last line, which `promote-main` and `wrap` take as is. Anything else is `ci collect: failed — rerun <check> on <tip>: …`, with no flag; a missing or empty `headSha` is never a pass.
-- `watch` / `review_watch(production, state_dir) -> WatchFirstAlert(line, table) | WatchRepeat(line) | WatchBelowThreshold(line)`: runs `review_regime.py watch` under `fcntl.flock` on `review_watch.lock`. On the first exit 3 with no `review_watch.json`, it takes `review_regime.py report --since 2026-09-28`, appends `- HH:MM <zone>: review watch: <line>` and the table to `LOG`, then writes `review_watch.json`. It sends no phone push: a status note that asks nothing goes to the log (`docs/as-built/message-clarity.md`). The shared state prevents repeated first alerts.
 - `notice clear <gate>` requires the code merge.
   It drafts `send <waiting unit>: <gate> clear — <unit> phase <N> is on <merge branch> as <merge hash>. Merge <merge branch> and continue.`
   `notice lift <gate> --log <path>` drafts `send <waiting unit>: <gate> lifted — your tests pass without <unit> phase <N> (<log>). Continue.`
   Each gate row has the form `| <id> | <waiting unit> phase <N> | <unit> phase <N> | … |`.
-- Overrides for tests: `CI_POINTS_VALIDATE_SCRIPT`, `CI_POINTS_REVIEW_REGIME`, `CI_POINTS_REVIEW_REGIME`.
+- Tests can use `CI_POINTS_VALIDATE_SCRIPT` to select the validation script.
 
 ### Unit configuration formatting
 
@@ -944,7 +1108,7 @@ The lookup resolves live process evidence through that native ID.
 The [staff identity contract](staff-accessors.md#staff-identity-and-backends) defines the stored facts.
 Saved progress state uses the fixed staff reference instead of a copied session name.
 
-- **Readers.** `live_units.py <showrunner>` joins the production's staff units with their current sessions. It prints the unit, its pane, `live|stopped|unknown|gone` and its session name, separated by tabs. `unit_status.sh`, `broadcast.py`, `codex_winddown.py`, `stall_watch.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
+- **Readers.** `live_units.py <showrunner>` joins the production's staff units with their current sessions. It prints the unit, its pane, `live|stopped|unknown|gone` and its session name, separated by tabs. `unit_status.sh`, `broadcast.py`, `stall_watch.py`, `waiting.py` and `production_lifecycle.py` take a unit's pane or name from the lookup at the moment of use. Saved state (judgments, status blocks, decisions seen, stall stretches) is keyed by unit id.
 
   `unit_status.sh` recognizes peers by their staff name, fixed staff id, and current session id.
   A replaced session therefore keeps its peer-wait classification.
@@ -1002,7 +1166,7 @@ An unstaffed session requires an explicit native id and an explicit unit name.
     A missing pane launch record does not make a resolved staff worker unknown.
     `scripts/message/morty_identity.py` supplies the native ID on the producer staff row named `morty`.
     `CodexProcessThreads` reads it one time for each report. A process with that ID produces no anomaly.
-    `unit_phases.send_anomalies` sends all lines once to `UNIT_ANOMALIES_TO` from `config/production.conf` (`sdlc`).
+    `unit_phases.send_anomalies` sends all lines once to `unit_anomalies_to` from `config/production.conf` (`sdlc`).
     The same text to the same recipient sends once inside `units_anomaly_repeat_minutes`.
     A failed send adds one anomaly line and preserves the table and exit code.
   - **Pause and exit:** `agents pause <unit> --why "<why>"` records `paused: {since, by, why}` and stops the workers.
@@ -1173,6 +1337,8 @@ An unstaffed session requires an explicit native id and an explicit unit name.
   With no rows, it prints `no open proposals`.
 
 - **Nightly list (`scripts/nightly_review/candidates.py`, `/showrunner:nightly`, user 2026-10-12).** Prints one Markdown table, `| Pick | Night | Area | Candidate | Gain per week | State |`, of every nightly-review candidate still open. The ledger (`nightly-review/ledger.md` under `XDG_STATE_HOME`, else `~/.local/state`) is the one record. A night's proposal and each of its Also found and Noted items is a line of its own, `- <night> <scope>[, also found|, noted]: <title> [gain/week: <gain>] [by: <staff id>] — <state>`, open while it ends `proposed` or `deferred`. `record()` writes the ` [by: <staff id>]` tag only when the caller is a unit director. Printing changes no file but the vault note below.
+  The fast Console text check reads each new candidate's title, target, and gain.
+  A failed draft leaves the ledger and note unchanged. A deferral also checks its reason before saving.
   Recording prints and flushes new entries before it publishes the complete ledger atomically. An interrupted print leaves them available on retry. A partial final candidate from an interrupted append is replaced on rerun; proposed, deferred, accepted, declined, done and relayed states count as recorded, including the dated outcomes written by `/next`.
   - **Order.** `rank` reads the tag: `N min` or `N h` is user-visible time, `N%` is a share of tokens, and a line with no tag or other words is unmeasured. Time comes before tokens, each largest first; unmeasured lines come last, in the ledger's order. `/next efficiency` takes its candidates and their order from this table.
   - **Pick.** Row one reads `recommended` only when its gain is measured; with nothing measured no row is marked.
@@ -1203,7 +1369,7 @@ A unit uses its Unit value or its current session name.
 
 Permission prompts notify their owning showrunner after 60 seconds, retrying until delivered; the saved `told` mark stops repeats. A still-blocked prompt alerts the user at its start plus 60 seconds plus `prompt_grace_seconds` from `config/stall_watch.conf`, independently of owner delivery. Missing or invalid grace prints an error and uses zero grace. A prompt cleared during the grace sends no push. Units whose showrunner is not running remain unwatched; notices grant no permission to answer another pane. Prompt state stores the owning session id, an immutable wall-clock observation-start time (taken before the pane and blocked-status reads), and its alert key; `since` only measures the wait. Stop and move call `stall_watch.retire_session_prompt`, which atomically publishes `{session_id, at}` without any lookup, watcher lock or send. At tick entry, the watcher scans saved prompts for that session and retires their stored keys only when `created <= at`. A prompt observed after a completed stop is untouched; a pane read that spans stop/resume can be retired, and the next tick observes the resumed prompt afresh. Launch deletion or parent changes cannot lose the old alert. The local write is synchronous; a failure is printed on its own line and never fails stop or move. Requests are removed after confirmed retirement, or when no matching prompt and no unresolved ownership remain. One reader classifies current, legacy and invalid prompt files for all consumers, reporting each bad file once per tick. Recoverable legacy ownership is migrated; orphan alerts with known keys retire independently of live unit discovery, and unusable keyless state is removed with a warning. Unreadable content and its cancellation obligation remain for retry without blocking identified retirements; each malformed request is reported and retained independently, including timestamp overflow, while other requests and alerts continue. Relays share the `sender_batch_seconds` limit (90 seconds in config), capped before the pass's 110-second deadline to leave `sender_cleanup_seconds` (two seconds in config) for cleanup. Showrunner discovery, owner socket lookup and RCA case locks share that deadline; failed work remains for the next pass. RCA first notices and reminders send concurrently within the remaining budget, below the notifier's 120-second watchdog.
 
-The pass shares one absolute monotonic deadline across discovery, pane text and agent-status reads, sends and RCA work. Each discovery lookup receives a share of the remaining time, reserving time for later productions and inspection; a failed lookup prints once and leaves healthy results available in the same pass. The discovery result carries each failed production and its reason alongside the rows; one formatter renders log diagnostics, while single-value callers receive reason text without the command prefix; the showrunner listing, name, address and tree commands, and stall-watch, finish their healthy work before returning non-zero when a lookup failed. Single-name and address APIs still raise on unknown liveness rather than treating it as a stopped showrunner; incomplete registrations keep their existing warning-and-skip behavior. Herdr caps each pane command at the smaller of its usual 10 seconds and the remaining pass time. Once inspection time expires, each skipped unit prints one line and retains its saved prompt and idle state for the next pass. A status read that exhausts the budget also leaves that unit unchanged. Inspection ends `delivery_reserve_seconds` before the pass deadline (10 seconds in `config/stall_watch.conf`, read at use). This leaves time to deliver alerts found in that pass. The process snapshot shares the inspection deadline and reserves the configured cleanup time within it. A failed, timed-out or unavailable `ps` produces one process-snapshot diagnostic and unknown liveness, never an empty process table. That pass retains pane prompt and idle state, sends already pending deliveries and retires, then exits non-zero. Snapshot and sender children start in separate process groups. On timeout the watcher signals the owned group through the shared checked process-group helper, bounds pipe draining and child reaping by the cleanup deadline, and closes pipes that still remain open. A timed-out retire keeps its state for retry; neither inherited output pipes nor sender cleanup can extend the pass deadline. The pass reads and validates both sender limits once from `config/stall_watch.conf`, then shares them between the snapshot and delivery batch. An invalid override prints one sender-config diagnostic and uses the packaged limits, so pending relays and retires still run within the pass deadline; the pass returns non-zero after that work. Scheduling uses one atomically written `inspection.cursor`, separate from alert state. Work is sorted by production and unit, then starts after the previous pass's first attempted unit, wrapping at the end. The first eligible pane about to be read advances the cursor once per pass, even if its text or status read exhausts the inspection budget. A pass that starts no inspection leaves the cursor unchanged. With a stable eligible set, every unit gets first access to the budget within at most one pass per unit. Exhausted and skipped units retain their alert state byte for byte. A partial discovery never clears watchdog recovery evidence for unobserved productions, permits a safety decision about unknown child liveness, or reports a successful wind-down. Inventory callers that require completeness reject the partial result with its plain reasons; observational reports keep the healthy rows with their visible failure status.
+The pass shares one absolute monotonic deadline across discovery, pane text and agent-status reads, sends and RCA work. Each discovery lookup receives a share of the remaining time, reserving time for later productions and inspection; a failed lookup prints once and leaves healthy results available in the same pass. The discovery result carries each failed production and its reason alongside the rows; one formatter renders log diagnostics, while single-value callers receive reason text without the command prefix; the showrunner listing, name, address and tree commands, and stall-watch, finish their healthy work before returning non-zero when a lookup failed. Single-name and address APIs still raise on unknown liveness rather than treating it as a stopped showrunner; incomplete registrations keep their existing warning-and-skip behavior. Herdr caps each pane command at the smaller of its usual 10 seconds and the remaining pass time. Once inspection time expires, each skipped unit prints one line and retains its saved prompt and idle state for the next pass. A status read that exhausts the budget also leaves that unit unchanged. Inspection ends `delivery_reserve_seconds` before the pass deadline (10 seconds in `config/stall_watch.conf`, read at use). This leaves time to deliver alerts found in that pass. The process snapshot shares the inspection deadline and reserves the configured cleanup time within it. A failed, timed-out or unavailable `ps` produces one process-snapshot diagnostic and unknown liveness, never an empty process table. That pass retains pane prompt and idle state, sends already pending deliveries and retires, then exits non-zero. Snapshot and sender children start in separate process groups. On timeout the watcher signals the owned group through the shared checked process-group helper, bounds pipe draining and child reaping by the cleanup deadline, and closes pipes that still remain open. A timed-out retire keeps its state for retry; neither inherited output pipes nor sender cleanup can extend the pass deadline. The pass reads and validates both sender limits once from `config/stall_watch.conf`, then shares them between the snapshot and delivery batch. An invalid override prints one sender-config diagnostic and uses the packaged limits, so pending relays and retires still run within the pass deadline; the pass returns non-zero after that work. Scheduling uses one atomically written `inspection.cursor`, separate from alert state. Work is sorted by production and unit, then starts after the previous pass's first attempted unit, wrapping at the end. The first eligible pane about to be read advances the cursor once per pass, even if its text or status read exhausts the inspection budget. A pass that starts no inspection leaves the cursor unchanged. With a stable eligible set, every unit gets first access to the budget within at most one pass per unit. Exhausted and skipped units retain their alert state byte for byte. A partial discovery retains watchdog recovery evidence for unobserved productions and blocks safety decisions about children with unknown liveness. Inventory callers that require completeness reject the partial result with its plain reasons; observational reports keep the healthy rows with their visible failure status.
 
 - **Paused units and external waits.** `stall_watch.status_defers_bump` checks the latest assistant turn-end status in the transcript. The pane supplies a fallback when the transcript has no usable status. A pause or an explicit external-owner wait resets the stretch without a bump or report, including near compaction. The watcher reads `paused_status_pattern`, `external_wait_pattern` and `external_owner_pattern` from `config/stall_watch.conf` at use. The `owner` group identifies the dependency. Live peer names and the showrunner's staff name also match. Matching ignores case. Other `holding:` lines prevent a bump only when they name an outside party anywhere in the line. The watcher reads those party words from `holding_party_pattern` at use and also checks the same peer names. The unit's own name, pane label, Claude session name and full session address do not count as outside parties. A party occurrence inside a complete own name does not count. A separate occurrence or a longer peer name still counts. The watcher reuses the pane labels from discovery through the shared pane snapshot. It makes no extra herdr read for labels. A failed label read produces one diagnostic per session per pass. Prompt checks continue without the label. Both checks keep the status text unchanged. Hyphens join words, so `user-interface` does not name the user. A sentence period ends a name; `.v2` continues it. Such a hold gets only the per-unit log line `inspected <showrunner name>/<name>: holding`. It sends no delivery to the unit or showrunner. The hold leaves `tell_sent` false, so a later idle unit can receive its bump and tell. A hold naming only its own worker, work order, tests or build receives the normal idle bump when nothing runs. Running work resets the stretch, and the unit reads `running`. Running work is one of these: a process that `work_running` finds; a busy pane worker whose staff parent is the director (`worker_panes.worker_state(observed) == "busy"`); or a live detached run of such a worker (`detached_runs.live_runs(<held run folder>/detached_runs, <worker name>)`). The watcher checks pane workers only for a unit with no process work, and detached runs only when no pane worker is busy. `read_busy_pane_worker_parents` makes one `worker_panes.observe_parents` read for all directors of the pass, on first need, and makes none when no watched director has staff workers. The held run folder is `unit_lookup.HeldRun.folder`, which can be a verified marker target outside `unit_runs.run_roots()`. A worker that waits on its own detached run reads idle in its pane, so only the detached-run check finds that work. A failed pane read or detached-run read counts as no work. It prints one `stall-watch: pane workers:` or `stall-watch: detached runs: <unit>:` line, and the pass continues. A resumed unit gets a fresh idle stretch. An override may omit status patterns; the watcher reads those patterns from the packaged config. Prompt grace still requires a valid value in the selected file. Invalid status rules print a diagnostic and suppress the unit's bump for that pass. Other units and pending deliveries continue. Missing, unmatched or empty `owner` captures are invalid. Run records still control eligibility. Herdr's `blocked` status follows the permission-prompt path above. Shutdown adds no unit-pause flag; stopped directors fail the live-session check.
 
@@ -1257,7 +1423,7 @@ Copied pane marks do not select rows.
   Publication never uses force.
 
 
-- One state directory: `eta_seen.json` and `review_watch.json` live in `WAITING_STATE_DIR` for every caller; a second directory forks the once-per-phase and first-alert records. The command document names this shared path.
+- All callers share `eta_seen.json` in `WAITING_STATE_DIR` to record each phase once.
 
 - `then` reaches the renderer unchanged; the renderer refuses, it never rewrites.
 
@@ -1297,9 +1463,7 @@ Copied pane marks do not select rows.
 
 - `merge_checkpoint.py` accepts a Merge tests command only with status zero.
 
-- CI point: due at 5 code merges; `ci collect` requires job `Test Suite` by name. The review table is `report --since 2026-09-28`.
-
-- `review_watch.json` is written after the LOG line: a crash between them repeats the log entry once (at least once).
+- A CI point is due at five code merges. `ci collect` requires the job named `Test Suite`.
 
 
 - The renderer exposes no list of required fields, which is why the builder names five itself.

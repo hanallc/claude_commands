@@ -9,18 +9,19 @@ from collections.abc import Collection, Generator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import cast
 
 from scripts.agents import worker_lifecycle
-from scripts.direct import pass_record
+from scripts.direct import pass_record, progress_history
 from scripts.lib import atomic_file, scratch, unit_runs
 from scripts.message import send
 from scripts.production import staff
 
 REPEAT_MINUTES = 52_596_000
 NOTICE_FILES = ".*.pass-notices.jsonseq"
+TURN_EVENT = "turn:"
 
 
 class NoticeKind(StrEnum):
@@ -38,6 +39,15 @@ class Notice:
     source_event_id: str = ""
     settled: bool = False
     legacy_stamp: str = ""
+    # A replacement text has its own delivery key, so a send of the earlier text cannot hide it.
+    revision: str = ""
+    # A busy or uncertain notice sends only while this dispatch delivery stays unconfirmed.
+    unconfirmed_delivery: str = ""
+
+    @property
+    def ordered_turn(self) -> bool:
+        """Only the latest-turn check of the turn end sends this notice."""
+        return self.source_event_id.startswith(TURN_EVENT)
 
 
 @dataclass(frozen=True)
@@ -56,6 +66,11 @@ class LegacyNoticeStamp:
                       NoticeKind.STATUS, settled=True, legacy_stamp=self.saved)
 
 
+class StagedText(Enum):
+    FIRST = "keep the first staged text"
+    REPLACES_UNSETTLED = "replace a saved text that is not settled"
+
+
 @dataclass(frozen=True)
 class Route:
     instance_id: str
@@ -63,14 +78,22 @@ class Route:
     worker_name: str
 
 
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 def _path(run: Path, instance: str) -> Path:
     digest = hashlib.sha256(instance.encode()).hexdigest()
     return run / f".{digest}.pass-notices.jsonseq"
 
 
+def _lock_path(path: Path, purpose: str) -> Path:
+    return path.with_suffix(f".{purpose}.lock")
+
+
 @contextmanager
 def _locked(path: Path, purpose: str) -> Generator[None]:
-    with path.with_suffix(f".{purpose}.lock").open("a") as lock:
+    with _lock_path(path, purpose).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
@@ -96,7 +119,11 @@ class PassNotices:
             if fields is None:
                 raise ValueError(f"{path}: invalid pass notice frame")
             if isinstance(key := fields.get("settled"), str):
-                if record is not None and (notice := record.notices.get(key)) is not None:
+                # The settle frame names the text that was sent. An older frame names no text,
+                # so it settles only a first text, never a replacement.
+                sent = fields.get("text_sha256")
+                if (record is not None and (notice := record.notices.get(key)) is not None
+                        and (sent == _digest(notice.text) if sent is not None else not notice.revision)):
                     record.notices[key] = replace(notice, settled=True)
                 continue
             route = _read_route(path, fields)
@@ -108,6 +135,10 @@ class PassNotices:
                 notices = {**initial, **{key: value for key, value in notices.items() if key not in initial}}
             for key, value in notices.items():
                 if key in seen:
+                    replacement = _read_notice(path, key, value)
+                    if (replacement.revision and (saved := record.notices.get(key)) is not None
+                            and not saved.settled and saved.text != replacement.text):
+                        record.notices[key] = replacement
                     continue
                 seen.add(key)
                 notice = _read_notice(path, key, value)
@@ -135,7 +166,9 @@ def _read_notice(path: Path, key: str, value: object) -> Notice:
         raise ValueError(f"{path}: incomplete pass notice {key}")
     return Notice(text, sender, NoticeKind(pass_record.string(fields.get("kind"))),
                   pass_record.string(fields.get("transition")), pass_record.string(fields.get("source_event_id")),
-                  fields.get("settled") is True, pass_record.string(fields.get("legacy_stamp")))
+                  fields.get("settled") is True, pass_record.string(fields.get("legacy_stamp")),
+                  pass_record.string(fields.get("revision")),
+                  pass_record.string(fields.get("unconfirmed_delivery")))
 
 
 def _append(path: Path, content: dict[str, object]) -> None:
@@ -158,9 +191,12 @@ def _publish(path: Path, route: Route, notices: dict[str, Notice], *, initial: d
     _append(path, content)
 
 
-def stage_result(run: Path, route: Route, key: str, notice: Notice, *, legacy: LegacyNoticeStamp) -> None:
+def stage_result(run: Path, route: Route, key: str, notice: Notice, *, legacy: LegacyNoticeStamp,
+                 staged: StagedText = StagedText.FIRST) -> None:
     path = _path(run, route.instance_id)
     initial = {key if legacy.matches_replay else "status:1": legacy.settled_event(notice)} if legacy.saved else {}
+    if staged is StagedText.REPLACES_UNSETTLED:
+        notice = replace(notice, revision=_digest(notice.text))
     with _locked(path, "record"):
         _publish(path, route, {key: notice}, initial=initial)
 
@@ -193,7 +229,7 @@ def stage_status(run: Path, route: Route, notice: Notice, *, legacy: LegacyNotic
 
 
 def _diagnostics(sender: str, messages: dict[str, bool]) -> dict[str, Notice]:
-    return {f"diagnostic:{hashlib.sha256(text.encode()).hexdigest()}":
+    return {f"diagnostic:{_digest(text)}":
             Notice(text, sender, NoticeKind.DIAGNOSTIC, settled=settled)
             for text, settled in messages.items()}
 
@@ -208,9 +244,37 @@ def stage_diagnostics(run: Path, route: Route, sender: str, messages: Collection
     return tuple(notices)
 
 
+def _legacy_diagnostics(path: Path) -> Path:
+    return path.with_name(path.name.replace(".pass-notices.jsonseq", ".completion-diagnostics.json"))
+
+
+def has_legacy_diagnostics(run: Path, instance: str) -> bool:
+    return _legacy_diagnostics(_path(run, instance)).is_file()
+
+
+def stage_ended_run_result(run: Path, route: Route, sender: str, run_id: str, message: str) -> str:
+    """Keep one director notice for a detached run after its pass ends."""
+    path = _path(run, route.instance_id)
+    key = f"detached-result:{run_id}"
+    ending = f"\n\nThe worker pass {route.instance_id} has ended."
+    with _locked(path, "record"):
+        saved = PassNotices.read(path)
+        if saved is not None:
+            if saved.route.director_id != route.director_id:
+                raise ValueError("the pass notice recipient changed")
+            if key in saved.notices:
+                return key
+            for old_key, notice in saved.notices.items():
+                if (old_key.startswith("diagnostic:") and notice.text.startswith(f"Detached run: {run_id}\n")
+                        and notice.text.endswith(ending)):
+                    return old_key
+        _publish(path, route, {key: Notice(message + ending, sender, NoticeKind.DIAGNOSTIC)})
+    return key
+
+
 def import_legacy_diagnostics(run: Path, route: Route, sender: str) -> None:
     path = _path(run, route.instance_id)
-    legacy = path.with_name(path.name.replace(".pass-notices.jsonseq", ".completion-diagnostics.json"))
+    legacy = _legacy_diagnostics(path)
     if not legacy.is_file():
         return
     with _locked(path, "record"):
@@ -221,13 +285,14 @@ def import_legacy_diagnostics(run: Path, route: Route, sender: str) -> None:
             legacy.unlink(missing_ok=True)
 
 
-def _delivery_key(route: Route, key: str) -> str:
-    return f"worker-completion:{route.instance_id}:{key}"
+def _delivery_key(route: Route, key: str, notice: Notice) -> str:
+    first = f"worker-completion:{route.instance_id}:{key}"
+    return f"{first}:{notice.revision}" if notice.revision else first
 
 
-def _received(route: Route, key: str) -> bool:
+def _received(route: Route, key: str, notice: Notice) -> bool:
     message = send.Message(send.staff_queue_key(route.director_id), route.worker_name, "", "",
-                           _delivery_key(route, key))
+                           _delivery_key(route, key, notice))
     return send.confirmed_skip(message, timedelta(minutes=REPEAT_MINUTES), send.now()) is not None
 
 
@@ -269,16 +334,16 @@ def _send(run: Path, route: Route, key: str, notice: Notice) -> send.Result:
     body = (_completion_text(run, route.instance_id, notice.text)
             if notice.kind == NoticeKind.RESULT and key != "stopped" else notice.text)
     options = send.parse(["--to", prefix + str(director.current_session), "--from", route.worker_name,
-                          "--text", body, "--key", _delivery_key(route, key),
+                          "--text", body, "--key", _delivery_key(route, key, notice),
                           "--recipient-key", send.staff_queue_key(route.director_id),
                           "--repeat-minutes", str(REPEAT_MINUTES)])
     return send.send(options._replace(sender_origin=send.ForwardedSender(send.read_sender_stamp(notice.sender_native_id)),
                                       shown_sender=send.ShownSender(route.worker_name)))
 
 
-def _settle(path: Path, key: str) -> None:
+def _settle(path: Path, key: str, notice: Notice) -> None:
     with _locked(path, "record"):
-        _append(path, {"settled": key})
+        _append(path, {"settled": key, "text_sha256": _digest(notice.text)})
 
 
 def read(run: Path, instance: str) -> PassNotices | None:
@@ -290,30 +355,48 @@ def is_settled(run: Path, instance: str, key: str) -> bool:
     return record is not None and (notice := record.notices.get(key)) is not None and notice.settled
 
 
+def _unsettled(path: Path, keys: Collection[str]) -> bool:
+    with _locked(path, "record"):
+        record = PassNotices.read(path)
+    return record is not None and any((notice := record.notices.get(key)) is not None and not notice.settled
+                                      for key in keys)
+
+
 def _deliver(path: Path, keys: Collection[str], *, retry: bool = False) -> None:
+    # A settled notice takes no delivery lock, so a recovery inside a send cannot wait on that send.
+    if not _unsettled(path, keys):
+        return
     # Keep transport outside the record lock so a new assignment can save its state.
     with _locked(path, "delivery"):
-        status_blocked = False
-        for key in keys:
-            with _locked(path, "record"):
-                record = PassNotices.read(path)
-            if record is None or (notice := record.notices.get(key)) is None or notice.settled:
+        _deliver_held(path, keys, retry=retry)
+
+
+def _deliver_held(path: Path, keys: Collection[str], *, retry: bool = False) -> None:
+    status_blocked = False
+    for key in keys:
+        with _locked(path, "record"):
+            record = PassNotices.read(path)
+        if record is None or (notice := record.notices.get(key)) is None or notice.settled:
+            continue
+        if status_blocked and notice.kind == NoticeKind.STATUS:
+            continue
+        try:
+            if notice.unconfirmed_delivery and not progress_history.dispatch_delivery_pending(
+                    path.parent, record.route.instance_id, notice.unconfirmed_delivery):
+                _settle(path, key, notice)
                 continue
-            if status_blocked and notice.kind == NoticeKind.STATUS:
-                continue
-            try:
-                if not retry or not _received(record.route, key):
-                    result = _send(path.parent, record.route, key, notice)
-                    if not isinstance(result, send.RepeatGuardHeld) and result.outcome not in ("sent", "skipped"):
-                        if result.outcome == "held" and notice.kind == NoticeKind.DIAGNOSTIC:
-                            continue
-                        raise ValueError(result.detail)
-                _settle(path, key)
-            except (OSError, ValueError, staff.StaffRefused) as error:
-                if not retry:
-                    raise
-                status_blocked |= notice.kind == NoticeKind.STATUS
-                unit_runs.report_anomaly(" ".join(f"anomaly: {path}: pass notice retry failed: {error}".splitlines()))
+            if not retry or not _received(record.route, key, notice):
+                result = _send(path.parent, record.route, key, notice)
+                if not isinstance(result, send.RepeatGuardHeld) and result.outcome not in ("sent", "skipped"):
+                    if result.outcome == "held" and notice.kind == NoticeKind.DIAGNOSTIC:
+                        continue
+                    raise ValueError(result.detail)
+            _settle(path, key, notice)
+        except (OSError, ValueError, staff.StaffRefused) as error:
+            if not retry:
+                raise
+            status_blocked |= notice.kind == NoticeKind.STATUS
+            unit_runs.report_anomaly(" ".join(f"anomaly: {path}: pass notice retry failed: {error}".splitlines()))
 
 
 def deliver(run: Path, instance: str, keys: Collection[str]) -> None:
@@ -327,7 +410,7 @@ def deliver_status(run: Path, instance: str, event: str) -> None:
         return
     pending: list[str] = []
     for key, notice in record.notices.items():
-        if notice.kind == NoticeKind.STATUS and not notice.settled:
+        if notice.kind == NoticeKind.STATUS and not notice.settled and (key == event or not notice.ordered_turn):
             pending.append(key)
         if key == event:
             break
@@ -338,24 +421,50 @@ def retry_result(run: Path, instance: str, event: str) -> None:
     _deliver(_path(run, instance), (event,), retry=True)
 
 
-def deliver_diagnostics(run: Path, instance: str) -> None:
-    path = _path(run, instance)
+def _pending_diagnostics(path: Path) -> tuple[str, ...]:
     record = PassNotices.read(path)
-    if record is not None:
-        pending = tuple(key for key, notice in record.notices.items()
-                        if notice.kind == NoticeKind.DIAGNOSTIC and not notice.settled)
-        if pending:
-            _deliver(path, pending)
+    if record is None:
+        return ()
+    return tuple(key for key, notice in record.notices.items()
+                 if notice.kind == NoticeKind.DIAGNOSTIC and not notice.settled)
 
 
-def retry(run: Path, worker: str = "", *, exclude_instance: str = "", retry_excluded_diagnostics: bool = False) -> None:
+class DiagnosticsDelivery(Enum):
+    SETTLED = "every diagnostic of the pass is settled"
+    PENDING = "a diagnostic of the pass waits for delivery"
+
+
+class BusyDelivery(Enum):
+    WAIT = "wait for a delivery in progress"
+    LEAVE_PENDING = "leave the diagnostics pending while another delivery runs"
+
+
+def deliver_diagnostics(run: Path, instance: str, *, busy: BusyDelivery = BusyDelivery.WAIT) -> DiagnosticsDelivery:
+    """Deliver the pending diagnostics of one pass."""
+    path = _path(run, instance)
+    pending = _pending_diagnostics(path)
+    if not pending:
+        return DiagnosticsDelivery.SETTLED
+    with _lock_path(path, "delivery").open("a") as lock:
+        # A notice send can start a recovery before its sender releases the lock.
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (fcntl.LOCK_NB if busy is BusyDelivery.LEAVE_PENDING else 0))
+        except BlockingIOError:
+            return DiagnosticsDelivery.PENDING
+        _deliver_held(path, pending)
+    return DiagnosticsDelivery.PENDING if _pending_diagnostics(path) else DiagnosticsDelivery.SETTLED
+
+
+def retry(run: Path, worker: str = "", *, exclude_instance: str = "",
+          retry_excluded_diagnostics: bool = False) -> None:
     for path in run.glob(NOTICE_FILES):
         try:
             record = PassNotices.read(path)
             if record is None or (worker and record.route.worker_name != worker):
                 continue
             excluded = record.route.instance_id == exclude_instance
-            pending = tuple(key for key, notice in record.notices.items() if not notice.settled
+            # The pending-DONE retry of the turn end owns each ordered turn notice.
+            pending = tuple(key for key, notice in record.notices.items() if not notice.settled and not notice.ordered_turn
                             and (not excluded or retry_excluded_diagnostics and notice.kind == NoticeKind.DIAGNOSTIC))
             if pending:
                 _deliver(path, pending, retry=True)

@@ -1,5 +1,63 @@
 # Config Files
 
+## One common way
+
+1. **Format.** Write each tunable setting as a `key=value` row in a `.conf` file.
+2. **Location.** Use `~/.claude/config/<stem>.conf` and give each tool or area one stem.
+   Use only the shared config folder for live files.
+   Do not use a per-file environment variable to select a config file.
+   Use only `CONF_DIR` to select a test folder.
+3. **Full key name.** The full name is `<stem>.<key>`.
+   The stem is the file name without `.conf`.
+   Write only `<key>` in the file.
+4. **Key form.**
+
+   - The stem is the first part of the full name.
+     The `hand_made.claude.model` key in `config/cli.conf` has the full name `cli.hand_made.claude.model`.
+   - Start the key with the feature name.
+     Use the same first part for all keys of the feature.
+     Each part narrows the meaning.
+     The last part names the field.
+   - Use lowercase snake case for each descriptive part.
+     Put the unit on the field, such as `_seconds`, `_bytes`, `_minutes`, `_kib`, or `_chars`.
+   - Use `paths` for a list of folder paths.
+     Use `path_templates` when the values contain substitution names.
+   - Use one value for all machines that need the same setting.
+     Add a machine part only when the machines need different values.
+     Put a comment above the row to explain the difference.
+   - Use the lowercase machine or host name, as in `enabled.mac-linux` and `slots.nates-macbook-pro-2023.hana.max`.
+     Keep the host override form `<key>.<short-host>`.
+   - Use the name that the code looks up for a repository, program, build step, path, model, or ID.
+     Write it in lowercase.
+   - Approved examples include `machines.window_days`, `enabled.mac`, and `slots.<host>.<repo>.max`.
+
+5. **Groups.** Use dots in keys and a plain comment to name a group of keys.
+   Omit `[section]` lines.
+   `conf.py` ignores `[section]` lines, so sections can cause a read to return the wrong value.
+6. **Comments and limits.** Put a comment above each key to describe what it controls.
+   Put `# whole: A..B` or `# range: A..B` directly above each numeric key.
+   Use `# one of: a, b` for a closed text choice.
+7. **One reader.** Use `conf.read(stem)` in Python and `conf_value` in shell.
+   Read values at use on each pass.
+   Keep cached values within the pass and define defaults in config.
+8. **Change and approval.** Get the user's approval for each value change.
+   Run `/tune` with the user's words.
+   Send each key change, rename, or deletion to the showrunner for Nate's approval before merge.
+   Merge a new key with the working name that Bob gives through the showrunner.
+   Bob asks Nate about the name after the merge.
+   A later name change is a rename.
+   You can delete a key without approval if no code reads it.
+9. **Tests.** Set `CONF_DIR` and write fixtures with `write_config_fixture`.
+   Use `CONF_DIR` as the only config path variable in tests.
+   The gate uses the confsweep audit hook in `scripts/test_times/module_run.py` on main.
+   This hook alone fails tests that write to the live config folder.
+10. **Data files.** Keep the formats of lists, tables, and documents that people do not tune.
+    Examples include `config/names.toml`, `config/cargo-fmt-allowlist.json`, `config/aws-build-tailscale.json`, and the `.md` prompts.
+    Keep runtime state outside `config/`.
+11. **Model registry.** Keep the sections, parser, and `/default_models` for `config/models.conf`.
+    The catalog sync and the publisher use the sections.
+12. **Blank lines.** Put one blank line between a key row and the next comment or `[section]` line.
+
 ## Live values
 
 Python callers use `scripts/lib/conf.py`. Each `conf.read(file)` reads and parses
@@ -15,17 +73,24 @@ A comment directly above a key sets its limits: `# whole: A..B`,
 `# range: A..B` or `# one of: a, b, c`.
 
 The reader resolves a missing or invalid key when the caller uses it.
+A path to a `.conf` file in the active configuration folder recovers like its stem.
 An absent default file or key can use the repository value when `CONF_DIR` is unset.
 Otherwise, the reader warns and uses the newest valid committed value under that revision's limits.
 Recovery prefers a value that also passes the current setting's limit.
 With no usable value, it raises `conf.Unusable`.
 `ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
 
-Only the user approves a value change. A session asks the user and runs `/tune`
-on approval, with the user's words. `/tune` makes the value live on both
-machines at once, then commits it on main and pulls the Mac, without a test or
-release cycle. Moving an unchanged value from code
-to config needs no approval and does not use `/tune`.
+`/tune` makes an approved value live on both machines.
+It commits the value on main and pulls main on the Mac.
+
+## accounts.conf
+
+`login_sitting_first` sets the first sitting and its time zone offset.
+`login_sitting_interval_days` sets the number of days between sittings.
+Each sitting selects the account with the earliest unreported login end.
+`login_safety_margin_days` sets the number of days before a login end that requires a safety reminder.
+Only the safety reminder can name more than one account.
+`login_card.error_days` and `login_card.warning_days` set the Logins card color limits.
 
 ## machines.conf
 
@@ -68,10 +133,13 @@ five minutes, and when a source is newer than the last successful sync. The
 Claude catalog is hand-maintained; the sync warns when the Claude CLI
 advertises a model alias that `[claude.agents]` does not yet list.
 
+`[compact_windows]` sets the Claude auto-compact window for producer, showrunner, unit, or worker at launch.
+
 `[claude.context]` sets the windows for the auto-compaction trigger.
 It contains `default=<window>` and one `<family>=<first version>:<window>` row per Claude family.
 For example, `opus=4.7:1m` sets a window of one million tokens for Opus 4.7 and later.
 Use a finite positive window in tokens. The hook skips windows that it cannot parse.
+The hooks and stall watcher check the Claude process for an explicit window.
 The per-call message uses `context_usage.conf`.
 
 ## codex_daemon.conf
@@ -98,13 +166,16 @@ An exhausted retry count fails the gate. A failed message does not change the re
 `on` enables the existing thresholds and messages.
 A missing file, missing key, or invalid value means `on`.
 The hook reads the file on each call through `scripts.lib.conf`.
+The hook uses `transcript.tail_bytes` for the first scan.
+If this value is unusable, the hook scans once with the 4 MiB retry limit.
 Tests select a temporary config folder with `CONF_DIR`.
 The hook still reads the transcript and writes its debug log.
 Compaction runs by itself during work.
 
 ## context_deferral.conf
 
-Each non-comment line uses `kind: value`; `#` starts a comment.
+The current hook still reads `kind: value` rows.
+`#` starts a comment.
 `window` sets the maximum region length in characters, after whitespace is collapsed.
 `action`, `marker`, `state`, `later`, and `exclude` hold case-insensitive regular expressions.
 The hook joins the expressions of each kind with `|`.
@@ -118,11 +189,12 @@ A missing file, invalid entry, or hook error permits the stop without output.
 
 ## lint.conf
 
-Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
-`clippy`, `doc`, `fmt`, under an `[operations]` section. Values are `on` or
-`off`; a missing key or missing file means `on`. One key per check with no
-per-consumer override — `clippy=off` means cargo clippy does not run in a
-`/unit:direct` phase or the lint CLI.
+The current file still groups the lint switches under `[operations]`.
+The switches are `cache`, `mend`, `style_review`, `clippy`, `doc`, and `fmt`.
+Each switch accepts `on` or `off`.
+The current reader uses `on` if the file or key is missing.
+Each switch applies to all callers.
+`clippy=off` disables cargo clippy in a `/unit:direct` phase and in the lint CLI.
 
 Use `/lint_config` to view or change them. Consumers read it on their
 next run, so a change is immediate:
@@ -423,7 +495,6 @@ Reports read local evidence without an AWS call or a coordination file.
 Each active peer report shows its last successful exchange and latest failure.
 The report gives `buildlog sync` and `buildlog sync resume` actions when needed.
 Target status separates confirmed results from slots retained for cleanup.
-Slot counts apply to each repository. They do not describe one global capacity.
 
 Positive numeric settings use the readable lower bound `# range: 0.001..`.
 Zero-permitted settings retain `# range: 0..`. Whole-number settings retain their existing limits.
@@ -519,10 +590,10 @@ The runner reports `aws_interrupted=<generation>` after interruption. The sender
 Confirmed stopping, stopped, or terminated evidence releases only unchanged claims captured for that target and generation.
 A retained `.linux-run.json` marker includes boot identity. Recovery preserves new processes that reuse an earlier PID.
 
-The SSH, retry, storage, slot, hold and claim settings apply when each command reads this file.
+Commands read the SSH, retry, storage, hold and claim settings from this file.
 Block and claim settings use the same units as `mac_test.conf`.
 `build_budget_gib`, `target_budget_gib` and `free_floor_gib` use GiB.
-`slots.<repo>` and `target_budget_gib.<repo>` replace the corresponding target values for that repository.
+`target_budget_gib.<repo>` sets the storage budget for one repository.
 
 Configured SSH targets use `~/.local/state/build-targets/<target>/` for claims, locks, blocks and retry records.
 The Mac retains `~/.local/state/mac-test/` and its existing fixture overrides.
@@ -534,18 +605,14 @@ Repository claims use the normalized origin identity from memory admission.
 Local clones and linked worktrees use the source repository identity.
 The readable name remains the source directory name from `sweep.repo_name`.
 The origin name does not change legacy Mac mirror or claim paths.
-Linux targets allocate slots under the target lock.
-`slots` sets the repository capacity. `slots.<repo>` replaces that value for one repository.
-The Mac keeps one claim per repository name and preserves its mirror paths.
 Origins with the same repository name take turns on the Mac.
-The AWS values are two slots by default and four slots for `hana` and `cargo-liner`.
-Each Linux slot uses `.local/state/build-target/mirror/<encoded-origin>/<slot>` and its own `target` folder.
-The target state directory retains the last slot for each existing worktree.
-Each affinity write removes paths that no longer exist.
-An occupied slot remains unavailable until its claim ends.
-Takeover retries retain the cleanup requirement until the owner releases the claim.
+Each SSH target permits one claim per repository.
+Mac and mac-linux work share this limit.
+Linux runs use the first mirror and its `target` folder.
+Cleanup uses the saved mirror for each old numbered claim.
+Takeover retries require cleanup until the owner releases the claim.
 Another worktree of the same repository can take over a lost run.
-The configured platform selects the mirror layout and slot protocol.
+The configured platform selects the mirror layout.
 
 ## build_targets.conf
 
@@ -599,7 +666,7 @@ Rsync replaces complete files and preserves this host's append files.
 | --- | --- | --- |
 | `output_folder` | `~/.local/share/review-links/h7uj5c` | Publish `memory_live.html` and `memory.json` in this folder. |
 | `interval_seconds` | `3` | Set the interval between readings and the page refresh interval. |
-| `history_days` | `7` | Show this many days of build history and top costs; at least `TOP_COST_RECENT_DAYS`. |
+| `history_days` | `7` | Show this many days of build history and top costs; at least `top_cost_recent_days`. |
 | `swap_rows` | `6` | Show this many of the largest swap users; one line sums the rest. |
 | `report_refresh_seconds` | `300` | Read the history charts and top costs again after this many seconds. |
 | `remote_memory_light` / `remote_memory_dark` | `#626a78` / `#a0a8b6` | Color memory bars that do not count against natedev. |
@@ -613,12 +680,27 @@ The text colors exceed 4.5:1 contrast against both backgrounds in their theme.
 The service publishes the repository page with an atomic write at each start.
 The service retains the last successful reading when the admission service does not answer.
 
+## screen_record.conf
+
+`recording.max_bytes` sets the ffmpeg file cap and the size that marks a clip as capped.
+`retention.max_directory_bytes` sets the size limit for stored clips before recording.
+
+## shot_report.conf
+
+`transcripts.parallel_scan_bytes` sets the total file size above which a transcript scan uses parallel workers.
+The scan runs in series if the setting is unusable.
+
+## style_ledger.conf
+
+`write.lock_attempts` sets the maximum number of attempts when ledger rows change before the write lock.
+
 ## test_times.conf
 
-`SLOW_TEST_S` sets the minimum gate test time retained in the build log.
-`NEXTEST_SLOW_TEST_S` sets the recording threshold for nextest rows.
+`slow_test_s` sets the minimum gate test time retained in the build log.
+`nextest_slow_test_s` sets the recording threshold for nextest rows.
 Failed tests, errors, and unexpected successes remain in the log at every duration.
-`TOP_RUNS` sets the number of recent gate runs used to rank each module by its median CPU time.
+`top_runs` sets the number of recent gate runs used to rank each module by its median CPU time.
+`module_cost.max_output_replay_bytes` limits the bytes replayed from each module cost output stream.
 Callers read these settings through `scripts/lib/conf.py` at each use.
 `CONF_DIR` selects a fixture folder for tests.
 
@@ -626,14 +708,14 @@ Callers read these settings through `scripts/lib/conf.py` at each use.
 
 The `/unit:direct` tuning file: the convergence limits — how many automatic
 fix rounds one phase runs before the gate remarks on how it is going — plus
-the progress-report interval. `MIN_REPAIR_BUDGET` is the floor every phase gets
+the progress-report interval. `min_repair_budget` is the floor every phase gets
 regardless of finding count (3);
-`REPAIR_ROUNDS_PER_FINDING` scales the budget above that floor from the first
-round's gating count (0.5, so 8 findings buy 4 rounds); `RUNAWAY_ROUNDS` is the
+`repair_rounds_per_finding` scales the budget above that floor from the first
+round's gating count (0.5, so 8 findings buy 4 rounds); `runaway_rounds` is the
 hard ceiling (5). The rest bound the other patterns worth reporting:
-`MAX_FIX_ATTEMPTS`, `MAX_REOPENS`, `STALLED_ROUNDS`,
-`MAX_CONSECUTIVE_SAME_KIND_PASSES`, `MAX_REVIEW_CANCELLATIONS`.
-Set `STALLED_ROUNDS` to at least 2. The stall check uses the last two charged rounds.
+`max_fix_attempts`, `max_reopens`, `stalled_rounds`,
+`max_consecutive_same_kind_passes`, `max_review_cancellations`.
+Set `stalled_rounds` to at least 2. The stall check uses the last two charged rounds.
 
 **None of these stops a phase.** `findings.py gate` answers `converged` or
 `dispatch` and nothing else; a limit that trips names itself in the verdict's
@@ -641,7 +723,7 @@ Set `STALLED_ROUNDS` to at least 2. The stall check uses the last two charged ro
 agent says something, not when it halts — the decision to stop is the user's,
 made from what gets reported.
 
-`UNIT_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
+`unit_progress_interval_seconds` sets the Codex poll timeout, per
 `<CodexDispatchWait/>` in `docs/direct/codex_dispatch_wait.md`; Codex requires a positive
 integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
 someone asks (2026-10-19): no notifier instance or timer sends them.
@@ -654,14 +736,14 @@ the command. `CONF_DIR` selects the fixture folder in tests.
 
 The test environment policy has three keys:
 
-- `VERIFY_RESULT_ENV_NAMES` names exported values that change test results.
+- `verify_result_env_names` names exported values that change test results.
   The default names are `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `FORCE_COLOR`, `CI`, `TZ`, and `LANG`.
   The locale names are `LC_ALL`, `LC_COLLATE`, `LC_CTYPE`, `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, and `LC_TIME`.
   The list also includes `LC_ADDRESS`, `LC_IDENTIFICATION`, `LC_MEASUREMENT`, `LC_NAME`, `LC_PAPER`, and `LC_TELEPHONE`.
-- `VERIFY_RESULT_ENV_PREFIXES` selects exported values by prefix.
+- `verify_result_env_prefixes` selects exported values by prefix.
   The default prefixes are `HANA_`, `WGPU_`, `BEVY_`, `INSTA_`, and `TRACE_`.
   `LC_TERMINAL` and `LC_TERMINAL_VERSION` do not enter the key.
-- `VERIFY_TEST_FIXED_ENV` sets terminal values for each test, including the test step of `final`.
+- `verify_test_fixed_env` sets terminal values for each test, including the test step of `final`.
   The defaults are `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=verify`, `COLUMNS=80`, and `LINES=24`.
 
 `scripts/direct/result_environment.py` reads these keys through `conf.read` at use.
@@ -722,7 +804,7 @@ Files that the `/orphans` command should ignore when checking for unreferenced s
 
 ## Linux development shells
 
-Linux SSH targets use the admission repository name for `slots.<repo>`, `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
+Linux SSH targets use the admission repository name for `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
 The source directory name still selects the legacy Mac mirror and claim.
 `kinds=test,check,doc,lint,example,build` permits tests, checks, docs, lint judgments, examples, and builds on Linux targets.
 
@@ -886,8 +968,8 @@ The command includes configured types and the r7a.8xlarge, m8a.8xlarge, and c8a.
 `remove-images` changes the home image and keeps regional stacks and copied images.
 
 The gate uses `gate` and `test-affected` as step names.
-`gate.py --affected` runs the affected modules.
+`gate.py --affected` requires the prepared handoff from `copies.py run`.
+It runs the affected modules in that copy.
 `build_steps.conf` defines `names.gate`, `names.test-affected`, and `prose.gate`.
-Its owner keys are `owned.gate`, `owned.test-affected`, and `owned.showrunner-gate`.
 `build_admission.conf` defines `program_first_peak_gib.gate` and `program_first_peak_gib.test-affected`.
 It also defines `peak_hold_seconds.gate` and `peak_hold_seconds.test-affected`.

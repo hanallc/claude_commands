@@ -74,8 +74,8 @@ class VerifyStepRoutesTests(VerifyStepRoutesFixture):
         self.assertIsInstance(run, wire.RunIdentity)
         assert isinstance(run, wire.RunIdentity)
         self.assertEqual([requests[step].run for step in ("mend", "clippy")], [run, run])
-        # Doc has its own slot, so it can leave its grant without a memory handoff.
-        self.assertEqual(requests["doc"].run, wire.NO_RUN)
+        # Doc uses the same run identity for its queue rank.
+        self.assertEqual(requests["doc"].run, run)
         rows = cast(list[dict[str, object]], self.fixture.call_records())
         self.assertEqual([row["verb"] for row in rows], ["test", "lint", "doc"])
         self.assertEqual([row.get("run_id") for row in rows], [f"{run.pid}:{run.start_time}"] * 3)

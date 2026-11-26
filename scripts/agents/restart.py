@@ -26,7 +26,7 @@ from enum import Enum
 from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeVar, cast, override
+from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, TypeVar, cast, override
 from importlib import import_module
 from uuid import uuid4
 
@@ -304,6 +304,7 @@ class FollowUp:
     unit: str = ""
     operator: bool = False
     director_check: bool = False
+    worker_inspection: bool = False
 
     def line(self) -> str:
         reason = " ".join(self.reason.split()).rstrip(".")
@@ -317,6 +318,7 @@ class FollowUpFields(TypedDict):
     unit: str
     operator: bool
     director_check: bool
+    worker_inspection: NotRequired[bool]
 
 
 class DetachedReport(TypedDict):
@@ -410,6 +412,7 @@ class BulkReport:
         issues: dict[str, FollowUpFields] = {key: {
             "name": issue.name, "reason": issue.reason, "step": issue.step,
             "unit": issue.unit, "operator": issue.operator, "director_check": issue.director_check,
+            "worker_inspection": issue.worker_inspection,
         } for key, issue in self.issues.items()}
         data: DetachedReport = {
             "retry": self.retry,
@@ -468,8 +471,10 @@ class BulkReport:
         if units:
             count = len(units)
             actions.append("1 unit needs a step." if count == 1 else f"{count} units need a step.")
-        if any(item.unit and not item.director_check for item in issues.values()):
+        if any(item.unit and not (item.director_check or item.worker_inspection) for item in issues.values()):
             actions.append("The affected directors run worker.py restore.")
+        if any(item.worker_inspection for item in issues.values()):
+            actions.append("The affected directors inspect the workers.")
         if any(item.director_check for item in issues.values()):
             actions.append("The affected directors check the continuation message.")
         inherited = self.inherited - self.not_started.keys()
@@ -484,7 +489,7 @@ class BulkReport:
         elif actions and not any(item.operator for item in issues.values()):
             actions.append("Nate has no step.")
         actions.extend(f"{item.name}: {item.step}" for item in sorted(
-            (item for key, item in issues.items() if key in inherited), key=lambda issue: issue.name))
+            (item for key, item in issues.items() if key in inherited and not item.worker_inspection), key=lambda issue: issue.name))
         if received is not None:
             lines.append(f"{self.command}: {received.name} stopped the run.")
         if actions or received is None:
@@ -651,6 +656,8 @@ class WorkerRestoreReports:
         return result.restored | (result.skipped.keys() - result.failures.keys())
 
     def report(self) -> None:
+        from scripts.production.worker import RestoreFailureAction
+
         owners: dict[staff.StaffId, staff.StaffRow] = {}
         scopes: dict[staff.StaffId, dict[staff.StaffId, RestoreReport]] = {}
         for scope, (owner, result) in self.attempts.items():
@@ -662,23 +669,29 @@ class WorkerRestoreReports:
             run_failures: dict[Path, str] = {}
             skipped: dict[staff.StaffId, str] = {}
             record_busy: set[staff.StaffId] = set()
+            failure_actions: dict[staff.StaffId, RestoreFailureAction] = {}
             for result in scopes[owner.id].values():
                 restored.update(result.restored)
                 failures.update(result.failures)
                 run_failures.update(result.run_failures)
                 skipped.update(result.skipped)
                 record_busy.update(result.record_busy)
+                failure_actions.update(result.failure_actions)
             if (bulk := _BULK_REPORT.get()) is not None:
                 for identity in restored:
                     _ = bulk.targets.setdefault(identity, str(identity))
                     bulk.finish(identity)
                 for identity, (name, reason) in failures.items():
                     bulk.targets[identity] = name
-                    bulk.issues[identity] = (
-                        FollowUp(f"{owner.name} / {name}", reason,
-                            _record_retry_step(replace(self.command, only=(identity,)).retry()), operator=True)
-                        if identity in record_busy else FollowUp(f"{owner.name} / {name}", reason,
-                            f"The director runs worker.py restore in {owner.name}.", owner.name))
+                    label = f"{owner.name} / {name}"
+                    if failure_actions.get(identity) is RestoreFailureAction.INSPECT_WORKER:
+                        bulk.issues[identity] = FollowUp(label, reason, "", owner.name, worker_inspection=True)
+                    elif identity in record_busy:
+                        step = _record_retry_step(replace(self.command, only=(identity,)).retry())
+                        bulk.issues[identity] = FollowUp(label, reason, step, operator=True)
+                    else:
+                        bulk.issues[identity] = FollowUp(label, reason,
+                            f"The director runs worker.py restore in {owner.name}.", owner.name)
                 for identity, reason in skipped.items():
                     if identity in bulk.targets and identity not in restored and identity not in failures:
                         bulk.issues[identity] = FollowUp(bulk.targets[identity], reason,
@@ -692,10 +705,12 @@ class WorkerRestoreReports:
             next_step = f"run worker.py restore in {owner.name}"
             for identity, (name, reason) in sorted(failures.items(), key=lambda item: item[1]):
                 status = "restored" if identity in restored else "not restored"
-                step = (_record_retry_step(replace(self.command, only=(identity,)).retry())
-                        if identity in record_busy else next_step)
-                print(f"restart anomaly: {owner.name}: worker {name} {status}: "
-                      + f"{' '.join(reason.splitlines())}; {step}", file=sys.stderr)
+                detail = " ".join(reason.splitlines())
+                if failure_actions.get(identity) is not RestoreFailureAction.INSPECT_WORKER:
+                    step = (_record_retry_step(replace(self.command, only=(identity,)).retry())
+                            if identity in record_busy else next_step)
+                    detail = f"{detail}; {step}"
+                print(f"restart anomaly: {owner.name}: worker {name} {status}: {detail}", file=sys.stderr)
             for run, reason in sorted(run_failures.items()):
                 print(f"restart anomaly: {owner.name}: cannot reap detached runs in {run}: "
                       + f"{' '.join(reason.splitlines())}; {next_step}", file=sys.stderr)
@@ -720,8 +735,8 @@ class DirectorResumeChecks:
             return
         try:
             settings = conf.read("shutdown")
-            deadline = time.monotonic() + settings.number("RESUME_CHECK_SECONDS")
-            interval = settings.number("RESUME_CHECK_INTERVAL_SECONDS")
+            deadline = time.monotonic() + settings.number("resume_check_seconds")
+            interval = settings.number("resume_check_interval_seconds")
         except (OSError, ValueError):
             for check in self.checks:
                 self.report_check(check, ResumeCheckState.UNREADABLE)
@@ -829,7 +844,7 @@ def _error_reason(error: object) -> str:
 
 
 def _launch_failure_reason(error: Exception) -> str:
-    if isinstance(error, subprocess.TimeoutExpired):
+    if isinstance(error, subprocess.TimeoutExpired) or isinstance(error.__cause__, subprocess.TimeoutExpired):
         return "The launcher timed out before the detached process claimed the log"
     if isinstance(error, FileNotFoundError) and cast(object, error.filename) == "systemd-run":
         return "The systemd-run command is missing"
@@ -900,19 +915,28 @@ def _saved_launch(entry: pane_record.PaneLaunch, identity: str, name: str, *,
     if "staff_id" not in projected:
         projected["session_id"] = identity
         projected["name"] = name
-    arguments = pane_record.resume_arguments(projected)
     kind = pane_launch.saved_kind(projected)
+    configuration = models_registry.optional_launch_snapshot() if kind == "claude" else None
+    arguments = pane_record.resume_arguments(projected, record=record, configuration=configuration)
+    environment = configuration.environment({}) if configuration is not None else {}
     home = pane_launch.config_home(projected, record=record)
     if isinstance(home, staff.HomeUnknown):
         print(f"anomaly: {identity}: session home is unknown; select the normal account", file=sys.stderr)
-        return kind, {}, arguments
-    environment = {"CODEX_HOME": str(home.path)} if kind == "codex" else named_account_environment(home.path)
+        return kind, environment, arguments
+    environment.update({"CODEX_HOME": str(home.path)} if kind == "codex" else named_account_environment(home.path))
     return kind, environment, arguments
 
 
 def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], list[str]]:
-    """Select the configured producer settings without a resume identity."""
-    settings = models_registry.launch_settings("producers", name)
+    """Select the configured producer settings and compact window without a resume identity."""
+    configuration = models_registry.launch_snapshot()
+    settings = models_registry.launch_settings("producers", name, configuration=configuration)
+    return settings.kind, producer_arguments(name, settings, configuration)
+
+
+def producer_arguments(name: str, settings: models_registry.LaunchSettings,
+                       configuration: models_registry.LaunchModelConfiguration) -> list[str]:
+    """Build arguments for a producer from one launch configuration."""
     if settings.kind == "codex":
         arguments = ["--model", settings.model,
                      "-c", f'model_reasoning_effort="{settings.effort}"']
@@ -921,24 +945,33 @@ def producer_first_arguments(name: str) -> tuple[Literal["claude", "codex"], lis
     else:
         arguments = ["--name", name, "--remote-control", name,
                      "--model", settings.model, "--effort", settings.effort,
+                     *models_registry.compact_window_arguments("producer", configuration=configuration),
                      "--settings", '{"disableAgentView": true}']
-    return settings.kind, arguments
+    return arguments
 
 
-def producer_launch(row: staff.StaffRow) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
+def producer_launch(row: staff.StaffRow, *, configuration: models_registry.LaunchModelConfiguration | None = None
+                    ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     """Resume the producer's current conversation with its configured settings."""
-    kind, arguments = producer_first_arguments(row.name)
-    return kind, {}, ["resume" if kind == "codex" else "--resume", str(row.current_session), *arguments]
+    configuration = models_registry.launch_snapshot() if configuration is None else configuration
+    settings = models_registry.launch_settings("producers", row.name, configuration=configuration)
+    arguments = producer_arguments(row.name, settings, configuration)
+    environment = configuration.environment({}) if settings.kind == "claude" else {}
+    return settings.kind, environment, ["resume" if settings.kind == "codex" else "--resume", str(row.current_session), *arguments]
 
 
-def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch
+def producer_resume(row: staff.StaffRow, entry: pane_record.PaneLaunch, *,
+                    configuration: models_registry.LaunchModelConfiguration | None = None
                     ) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
     """Keep saved launch options with the producer's current model settings; a Claude producer runs with Remote Control."""
-    settings = models_registry.launch_settings("producers", row.name)
+    configuration = models_registry.launch_snapshot() if configuration is None else configuration
+    settings = models_registry.launch_settings("producers", row.name, configuration=configuration)
     if settings.kind == "claude":
         entry = entry.copy()
         entry["remote_control"] = True
-    return settings.kind, {}, pane_record.configured_resume_arguments(entry, str(row.current_session), row.name, settings)
+    environment = configuration.environment({}) if settings.kind == "claude" else {}
+    return settings.kind, environment, pane_record.configured_resume_arguments(
+        entry, str(row.current_session), row.name, settings, configuration=configuration)
 
 
 def session_launch(identity: str, name: str) -> tuple[Literal["claude", "codex"], dict[str, str], list[str]]:
@@ -1057,6 +1090,8 @@ def _restore_workers(row: staff.StaffRow, record: staff.StaffSnapshot, *,
     else:
         reports.attempts[row.id] = parent, report
     if result != worker.ExitCode.OK:
+        if worker.RestoreFailureAction.INSPECT_WORKER in report.failure_actions.values():
+            raise WorkerRestoreIncomplete(worker.RestoreFailureAction.INSPECT_WORKER.value)
         raise WorkerRestoreIncomplete(f"run worker.py restore in {parent.name}")
     return started_panes.get(row.id, "")
 
@@ -1081,7 +1116,8 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
               opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = NO_RESTART_MESSAGE,
               resume_checks: DirectorResumeChecks | NoDirectorResumeChecks = NoDirectorResumeChecks.CURRENT,
               live_worker_recovery: LiveWorkerRecovery = LiveWorkerRecovery.LEAVE_RUNNING,
-              success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> str:
+              success_report: RestartSuccessReport = RestartSuccessReport.START_ROW,
+              configuration: models_registry.LaunchModelConfiguration | None = None) -> str:
     restore_workers = (partial(_restore_workers, reports=resume_checks.worker_restores)
                        if isinstance(resume_checks, DirectorResumeChecks) else _restore_workers)
     with operation_deadline.within(deadline):
@@ -1112,19 +1148,37 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         original = publication.entry if publication is not None else None
         projected = names.resume(original) if original is not None else None
         if row.kind == "producer":
-            kind, environment, arguments = producer_resume(row, original) if original is not None else producer_launch(row)
+            kind, environment, arguments = (producer_resume(row, original, configuration=configuration)
+                if original is not None else producer_launch(row, configuration=configuration))
         else:
             kind, environment, arguments = (_saved_launch(original, str(row.current_session), row.name, record=record)
                 if original is not None else session_launch(str(row.current_session), row.name))
+            if original is None and kind == "claude":
+                configuration = models_registry.optional_launch_snapshot()
+                environment = configuration.environment(environment)
+                if row.kind != "session":
+                    arguments = [*arguments, *models_registry.compact_window_arguments(
+                        row.kind, session_id=row.current_session, configuration=configuration)]
         selected = member_account.resume_account(kind, row, to=target_account)
-        if isinstance(selected, accounts.NamedAccount):
+        implicit = (member_account.implicit_claude_resume(row, projected, target_account)
+                    if projected is not None else pane_launch.SelectedClaudeAccount.USE_SELECTION)
+        configuration_environment = {key: environment[key] for key in models_registry.OPERATION_ENVIRONMENT[:1]
+                                     if key in environment}
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            environment = configuration_environment
+        elif isinstance(selected, accounts.NamedAccount):
             environment = named_account_environment(selected.dir)
+            environment.update(configuration_environment)
         else:
             environment = {"CODEX_HOME": str(selected.home)}
         if projected is not None:
             environment = {**names.environment(projected), **environment}
+        remove = herdr.NO_ENVIRONMENT_REMOVALS
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            environment = implicit.environment(environment)
+            remove = frozenset({"CLAUDE_CONFIG_DIR"})
         settings = conf.read("shutdown")
-        start_seconds = settings.number("START_SECONDS")
+        start_seconds = settings.number("start_seconds")
         reuse_deadline = time.monotonic() + operation_deadline.remaining(start_seconds)
         workspace = herdr.row_workspace(row, record, row.name)
         destination = (client.producer_row_tab(str(row.id), row.name, workspace, record=record) if row.kind == "producer" else
@@ -1133,10 +1187,12 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         expectation = pane_launch.ProducerLaunchRequest(row.id, row.current_session, kind, Path(folder), selected_home)
         if row.kind == "producer":
             environment = expectation.environment(environment)
-        prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment,
-                                                      herdr.NO_ENVIRONMENT_REMOVALS)
+        prepared = herdr.prepare_session_environment(str(row.current_session), str(folder), environment, remove)
         if isinstance(prepared, nix_env.Refused):
             raise OSError(str(prepared))
+        if isinstance(implicit, pane_launch.ImplicitClaudeHome):
+            prepared = replace(prepared, env=implicit.environment(prepared.env), claude_home=implicit,
+                               unset_environment=(prepared.unset_environment | remove) - {"HOME"})
         target: herdr.NewTab | herdr.ExistingPane = destination
         source_pane: pane_launch.ResumeSourcePane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
         exiting_source: RetainedRestartPane | pane_launch.ResumeSourceAbsent = pane_launch.ResumeSourceAbsent.CURRENT
@@ -1226,7 +1282,7 @@ def start_row(row: staff.StaffRow, record: staff.StaffSnapshot, client: herdr.He
         scope = (pane_launch.producer_launch_request(expectation)
                  if row.kind == "producer" else nullcontext())
         with scope:
-            launch_seconds = (max(start_seconds, settings.number("OPENING_PROMPT_SECONDS"))
+            launch_seconds = (max(start_seconds, settings.number("opening_prompt_seconds"))
                               if kind == "claude" and isinstance(opening, herdr.OpeningPrompt) else start_seconds)
             result = herdr.launch_prepared_agent(client.session, target, prepared, kind,
                 trust_arguments(kind, str(folder), arguments),
@@ -1726,13 +1782,14 @@ def restart(*, stop_all: bool = False, dry_run: bool = False, only: tuple[str, .
             why: str = DEFAULT_RESTART_CAUSE) -> int:
     activity = (nullcontext() if dry_run else shutdown_record.active_operation(
         record_lock_seconds=shutdown_record.record_lock_seconds()))
-    with activity, ExitStack() as pane_evidence:
+    with activity as operation, ExitStack() as pane_evidence:
         _ = pane_evidence.enter_context(herdr.pane_evidence_run())
-        return _restart(pane_evidence, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
+        return _restart(pane_evidence, operation, stop_all=stop_all, dry_run=dry_run, only=only, account=account,
                         after_stop=after_stop, why=why)
 
 
-def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: tuple[str, ...],
+def _restart(pane_evidence: ExitStack, operation: shutdown_record.RestartActivity | None, *,
+             stop_all: bool, dry_run: bool, only: tuple[str, ...],
              account: AllRestartAccounts | accounts.AccountSelection, after_stop: AfterStop, why: str) -> int:
     report = _BULK_REPORT.get()
     command = BulkCommand("stop" if after_stop is AfterStop.KEEP_STOPPED else "restart",
@@ -1750,7 +1807,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
     try:
         record = staff.initial_snapshot()
         if stop_all and not dry_run:
-            deadline = time.monotonic() + conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS")
+            deadline = time.monotonic() + conf.read("shutdown").number("upkeep_row_wait_seconds")
             only = tuple(str(row.id) if (row := record.by_member_reference(reference)) is not None else reference
                          for reference in only)
             for row in record.find(kind="producer"):
@@ -1923,7 +1980,7 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
             _discovery_anomaly("The stop includes the session that runs this reboot")
             return 1
         return _detach_stop(command, selected, record)
-    lock_wait = conf.read("shutdown").number("UPKEEP_ROW_WAIT_SECONDS") if holders else 0
+    lock_wait = conf.read("shutdown").number("upkeep_row_wait_seconds") if holders else 0
     from scripts.herdr.worker_panes import (
         CheckedRolePolicy, StartRefused, checked_role_policy, dispatch_role, use_checked_resume_policies,
     )
@@ -2032,6 +2089,9 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
                                 if identity not in report.issues and identity in failures:
                                     report.failure(identity, row.name, failures[identity])
                 stopped = stop_row(holder, client, codex=observed.codex)
+                if stopped and operation is not None and after_stop is AfterStop.RESTART:
+                    operation.claim_rows([member for member in saved_by_holder[holder.id]
+                                          if staff.StaffId(member) not in changed and staff.StaffId(member) not in workers])
                 if not stopped and holder.kind != "worker":
                     if previous_hold is not None:
                         _ = staff.set_hold(str(holder.id), previous_hold)
@@ -2175,13 +2235,18 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
 
     def start_holder(holder: staff.StaffRow, focus: bool,
                      success_report: RestartSuccessReport = RestartSuccessReport.START_ROW) -> RestartDisposition | None:
-        if stop_requested():
-            return None
         with ExitStack() as locks, use_checked_resume_policies(resume_policies), staff.upkeep_lock_wait(lock_wait):
+            members = members_by_holder[holder.id]
+            if operation is not None:
+                _ = locks.callback(operation.release_rows, members)
+            if stop_requested():
+                return None
             _ = locks.enter_context(staff.row_operation(str(holder.id)))
-            for member in members_by_holder[holder.id]:
+            for member in members:
                 if member != str(holder.id):
                     _ = locks.enter_context(staff.row_operation(member))
+            if operation is not None:
+                operation.release_rows(members)
             if stop_requested():
                 return None
             shutdown_record.update(started=[], pending=saved_by_holder[holder.id])
@@ -2347,14 +2412,14 @@ def _restart(pane_evidence: ExitStack, *, stop_all: bool, dry_run: bool, only: t
         except errors as error:
             print(f"restart: layout anomaly: {str(error).splitlines()[0]}", file=sys.stderr)
     if restarted:
-        from scripts.worktree import worktrees
+        from scripts.worktree import worktree_records, worktrees
 
         try:
             scope = worktrees.RestartedWorktrees(frozenset(path.resolve() for path in restarted))
             for link in worktrees.old_worktree_links(remove_unused=True, scope=scope):
                 if link.removed:
                     print(f"restart: removed old worktree link {link.old}")
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, worktrees.Refused) as error:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, worktree_records.Refused) as error:
             print(f"restart: kept old worktree links: {_error_reason(error)}", file=sys.stderr)
     resume_checks.report()
     report_record_save_failures()

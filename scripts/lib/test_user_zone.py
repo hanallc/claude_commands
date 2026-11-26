@@ -10,9 +10,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
+from unittest.mock import patch
 
 from scripts.lib.code_kind import is_test_code
 from scripts.lib import user_zone
+from scripts.lib.git_test_support import commit_repository
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import write_config_fixture
 
 SCRIPT = Path(__file__).with_name("user_zone.py")
 PROBE = ("from scripts.lib import user_zone; from datetime import datetime, timezone; "
@@ -32,7 +36,6 @@ MACHINE_ZONE = re.compile(r"\.astimezone\(\)")
 USES_THE_MACHINE_ZONE = {
     "notify/pushover.py": "a log stamp written with its offset",
     "notify/review.py": "a log stamp written with its offset",
-    "production/review_regime.py": "a stamp written with its offset",
     "whoami/agent_notes.py": "reset times written with their offset, and the note's date as the vault's linter writes it",
     "whoami/codex_pacer.py": "Codex names its session folders by the machine's date",
     "whoami/note_file.py": "reads a reset time stored before the offset was, in the machine's zone",
@@ -49,58 +52,79 @@ class UserZoneTests(unittest.TestCase):
 
     def run_script(self, *, pinned: str = "") -> subprocess.CompletedProcess[str]:
         env = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
-        env["USER_ZONE_CONF"] = str(self.conf)
+        env["CONF_DIR"] = str(self.conf.parent)
         if pinned:
             env["USER_ZONE"] = pinned
         return subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True, text=True, check=False)
 
     def test_the_file_names_the_zone(self) -> None:
-        _ = self.conf.write_text("# a comment\nzone=Europe/Paris\n", encoding="utf-8")
+        _ = write_config_fixture(self.conf, "zone=Europe/Paris\n")
         result = self.run_script()
         self.assertEqual((result.returncode, result.stdout), (0, "Europe/Paris\n"), result.stderr)
 
-    def test_stored_zone_reads_the_first_zone_line_and_reloads_edits(self) -> None:
-        self.assertEqual(user_zone.stored_zone(str(self.conf)), "")
-        _ = self.conf.write_text("# zone=ignored\nother=value\n", encoding="utf-8")
-        self.assertEqual(user_zone.stored_zone(str(self.conf)), "")
-        _ = self.conf.write_text("# comment\nzone= Europe/Paris \nzone=UTC\n", encoding="utf-8")
-        self.assertEqual(user_zone.stored_zone(str(self.conf)), "Europe/Paris")
-        _ = self.conf.write_text("zone=UTC\n", encoding="utf-8")
-        self.assertEqual(user_zone.stored_zone(str(self.conf)), "UTC")
+    def test_configured_zone_reads_the_first_zone_line_and_reloads_edits(self) -> None:
+        with patch.dict(os.environ, {"CONF_DIR": str(self.conf.parent), "USER_ZONE": ""}):
+            with self.assertRaisesRegex(ValueError, "no usable committed value"):
+                _ = user_zone.user_zone_name()
+            _ = self.conf.write_text("# zone=ignored\nother=value\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "no usable committed value"):
+                _ = user_zone.user_zone_name()
+            _ = write_config_fixture(self.conf, "zone=Europe/Paris\n")
+            with self.conf.open("a", encoding="utf-8") as stream:
+                _ = stream.write("zone=UTC\n")
+            self.assertEqual(user_zone.user_zone_name(), "Europe/Paris")
+            _ = write_config_fixture(self.conf, "zone=UTC\n")
+            self.assertEqual(user_zone.user_zone_name(), "UTC")
 
     def test_cli_import_budget_without_site(self) -> None:
-        _ = self.conf.write_text("zone=Europe/Paris\n", encoding="utf-8")
-        environment = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
-        environment["USER_ZONE_CONF"] = str(self.conf)
-        result = subprocess.run([sys.executable, "-S", "-X", "importtime", str(SCRIPT)],
-                                env=environment, capture_output=True, text=True, check=False, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "Europe/Paris\n")
-        imports = {line.rpartition("|")[2].strip() for line in result.stderr.splitlines()
-                   if line.startswith("import time:")}
-        self.assertTrue(imports, result.stderr)
-        self.assertNotIn("pathlib", imports)
+        _ = write_config_fixture(self.conf, "zone=UTC\n")
+        for pinned, zone, excluded in (
+            ("Europe/Paris", "Europe/Paris", ("pathlib",)),
+            ("", "UTC", ("decimal", "scripts.lib.models_registry", "subprocess")),
+        ):
+            with self.subTest(zone=zone):
+                environment = {key: value for key, value in os.environ.items() if key != "USER_ZONE"}
+                environment["CONF_DIR"] = str(self.conf.parent)
+                if pinned:
+                    environment["USER_ZONE"] = pinned
+                result = subprocess.run([sys.executable, "-S", "-X", "importtime", str(SCRIPT)],
+                                        env=environment, capture_output=True, text=True, check=False, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"{zone}\n")
+                imports = {line.rpartition("|")[2].strip() for line in result.stderr.splitlines()
+                           if line.startswith("import time:")}
+                self.assertTrue(imports, result.stderr)
+                for module in excluded:
+                    self.assertNotIn(module, imports)
 
-    def test_no_file_and_no_zone_line_both_give_the_default(self) -> None:
-        self.assertEqual(self.run_script().stdout, "America/New_York\n")
-        _ = self.conf.write_text("# nothing set\n", encoding="utf-8")
-        self.assertEqual(self.run_script().stdout, "America/New_York\n")
+    def test_missing_or_unknown_zone_recovers_the_committed_value(self) -> None:
+        _ = subprocess.run(["git", "-C", str(self.conf.parent), "init", "-q"], check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = write_config_fixture(self.conf, "zone=America/Chicago\n")
+        _ = commit_repository(self.conf.parent, "Set test zone", self.conf.name)
+        self.conf.unlink()
+        for contents in (None, "# nothing set\n", "zone=Mars/Phobos\n"):
+            with self.subTest(contents=contents):
+                if contents is not None:
+                    _ = self.conf.write_text(contents, encoding="utf-8")
+                result = self.run_script()
+                self.assertEqual((result.returncode, result.stdout), (0, "America/Chicago\n"), result.stderr)
 
     def test_the_environment_wins_over_the_file(self) -> None:
-        _ = self.conf.write_text("zone=Europe/Paris\n", encoding="utf-8")
+        _ = write_config_fixture(self.conf, "zone=Europe/Paris\n")
         self.assertEqual(self.run_script(pinned="America/Los_Angeles").stdout, "America/Los_Angeles\n")
 
     def test_an_unknown_zone_is_refused_and_its_source_named(self) -> None:
-        _ = self.conf.write_text("zone=Mars/Phobos\n", encoding="utf-8")
+        _ = write_config_fixture(self.conf, "zone=Mars/Phobos\n")
         from_file = self.run_script()
         self.assertEqual(from_file.returncode, 2)
-        self.assertIn(f"user_zone: {self.conf}: 'Mars/Phobos' is not a zone name", from_file.stderr)
+        self.assertIn(f"user_zone: {self.conf}: zone='Mars/Phobos': 'Mars/Phobos' is not a zone name", from_file.stderr)
         pinned = self.run_script(pinned="Nowhere")
         self.assertEqual(pinned.returncode, 2)
         self.assertIn("user_zone: USER_ZONE: 'Nowhere' is not a zone name", pinned.stderr)
 
     def test_the_label_comes_from_the_zone_and_the_date(self) -> None:
-        env = {**os.environ, "USER_ZONE_CONF": str(self.conf), "USER_ZONE": "America/New_York"}
+        env = {**os.environ, "CONF_DIR": str(self.conf.parent), "USER_ZONE": "America/New_York"}
         result = subprocess.run([str(SCRIPT.with_name("py")), "-c", PROBE], env=env, capture_output=True,
                                 text=True, check=False)
         self.assertEqual(result.stdout, "America/New_York EDT EST\n", result.stderr)
@@ -131,8 +155,8 @@ class UserZoneTests(unittest.TestCase):
                          + "user_zone() to astimezone(), or add the script to USES_THE_MACHINE_ZONE with the reason")
 
     def test_the_shipped_setting_is_a_real_zone(self) -> None:
-        env = {key: value for key, value in os.environ.items() if key not in ("USER_ZONE", "USER_ZONE_CONF")}
-        result = subprocess.run([sys.executable, str(SCRIPT)], env=env, capture_output=True, text=True, check=False)
+        _ = write_config_fixture(self.conf)
+        result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.strip())
 

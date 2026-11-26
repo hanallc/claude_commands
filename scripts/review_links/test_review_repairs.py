@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import shutil
-import subprocess
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,13 +14,25 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from unittest.mock import patch
 
 from scripts.lib import conf, urgency
+from scripts.lib.process_group import run_process_group
 from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.production import change_review, footer_counts, investigation, next_item, staff, update_registration
+from scripts.production import change_review, footer_counts, investigation, next_item, staff, the_list, update_registration
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import fixture_member
-from scripts.review_links import change_page, console, review_actions, review_items, review_page, test_review_page
+from scripts.review_links import change_page, console, list_page, review_actions, review_items, review_page, test_review_page
 from scripts.review_links import question_record
+
+
+CHIP_PROBE_SCRIPT = r"""
+const reviewChips=(row,doc=document)=>[...doc.querySelectorAll('[data-filter-row="'+row+'"] [data-filter-value]')];
+const reviewChip=(row,value,doc=document)=>reviewChips(row,doc).find(button=>button.dataset.filterValue===value);
+const pressedChip=(row,doc=document)=>reviewChips(row,doc).find(button=>button.getAttribute('aria-pressed')==='true');
+const ownerValue=id=>id ? 'staff:'+id : 'all';
+const ownerChip=id=>reviewChip('owner',ownerValue(id));
+const visibleOwners=()=>reviewChips('owner').filter(button=>!button.hidden);
+const showCount=(value,doc=document)=>reviewChip('show',value,doc)?.dataset.filterCount;
+"""
 
 
 class ReviewRepairsTests(unittest.TestCase):
@@ -287,7 +298,8 @@ class ReviewRepairsTests(unittest.TestCase):
         probe_timeout = 60
         case = self.case
         markup=markup.replace('<head>','<head><script>'+test_review_page.BODY_READY_SCRIPT+'</script>',1)
-        document = markup.replace('</body>','<img hidden src="/complete"><script>'+probe+'</script></body>').encode()
+        document = markup.replace('</body>', '<img hidden src="/complete"><script>'
+                                  + CHIP_PROBE_SCRIPT + probe + '</script></body>').encode()
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
@@ -321,6 +333,28 @@ class ReviewRepairsTests(unittest.TestCase):
                     assert isinstance(validation, (change_page.DeliveryIntent, change_page.ValidationRequested))
                     _ = change_review.save_verdict(case.fixture.review_list, row, verdict, case.fixture.production,
                                                    validation_id=validation.attempt)
+                if route.path == '/validation-list':
+                    fields = parse_qs(route.query)
+                    key = 'page-owner/'+fields['row'][0]
+                    members = staff.snapshot()
+                    records = list_page.records()
+                    record = next((entry.item for entry in records if key in entry.item.reviews), None)
+                    reviews = {item.key: item for item in review_items.read(case.root, members=members)}
+                    owner = members.by_id(record.owner) if record is not None and not isinstance(
+                        record.owner, the_list.UnassignedOwner) else None
+                    now = the_list.now()
+                    detail = list_page.review_links(record, reviews, now) if record is not None else ''
+                    started = list_page.report_state_time(record, now) if record is not None else ''
+                    verdict = next((item.get('Verdict', '') for item in change_review.review_rows(case.fixture.review_list)
+                                    if item['#'] == fields['row'][0]), '')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    _ = self.wfile.write(json.dumps({
+                        'kind': record.report.kind if record is not None and isinstance(record.report, the_list.ListReport) else '',
+                        'owner': owner.name if owner is not None else '', 'detail': detail, 'verdict': verdict, 'started': started,
+                    }).encode())
+                    return
                 fields = parse_qs(route.query)
                 snapshot = review_page.build_snapshot(case.root) if route.path in ('/fresh', review_page.PAGE_PATH) else None
                 self.send_response(200)
@@ -348,8 +382,11 @@ class ReviewRepairsTests(unittest.TestCase):
                     result: dict[str, object] = {'answer': saved.answer, 'version': saved.version}
                     if isinstance(saved.item, review_items.ReviewItem):
                         later = saved.item.times.later
-                        result.update(state=saved.item.state, later=0 if isinstance(later, review_items.NoLaterTime)
+                        state = review_items.ReviewState.DONE if review_items.on_list(saved.item) else saved.item.state
+                        result.update(state=state, later=0 if isinstance(later, review_items.NoLaterTime)
                                       else later.timestamp()*1000)
+                    if isinstance(saved.detail, review_page.ClosedReviewDetail):
+                        result['detail_closed'] = True
                     try:
                         content = json.dumps(result).encode()
                         self.send_response(200)
@@ -376,10 +413,9 @@ class ReviewRepairsTests(unittest.TestCase):
             thread.start()
             try:
                 with tempfile.TemporaryDirectory(dir=self.case.fixture.temporary) as profile:
-                    done = subprocess.run(['firefox','--headless','--no-remote','--profile',profile,
+                    done = run_process_group(['firefox','--headless','--no-remote','--profile',profile,
                         '--window-size',f'{width},1100','--screenshot',str(self.case.fixture.temporary/'repair.png'),
-                        f'http://127.0.0.1:{server.server_port}'+place],capture_output=True,text=True,
-                        timeout=probe_timeout+30)
+                        f'http://127.0.0.1:{server.server_port}'+place],timeout=probe_timeout+30)
                 self.assertEqual(done.returncode,0,done.stderr)
             finally:
                 server.shutdown()
@@ -403,42 +439,40 @@ window.fetch=(url,options)=>{
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
- const chip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
- const count=value=>chip(value)?.querySelector('b')?.textContent;
- const pressed=value=>chip(value)?.getAttribute('aria-pressed')==='true';
+ const count=value=>ownerChip(value)?.dataset.filterCount;
+ const pressed=value=>ownerChip(value)?.getAttribute('aria-pressed')==='true';
  const address=()=>new URLSearchParams(location.hash.slice(1));
- const visible=()=>[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
  const navigate=async params=>{
   const changed=new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   location.hash=new URLSearchParams(params);await changed;
  };
  try{
   const group=document.querySelector('[role="group"][aria-label="Owner"]');
-  check(group?.firstElementChild===chip('') && pressed('') &&
-   visible().every(button=>button.type==='button' && button.tabIndex===0 && button.querySelector('b')),
+  check(group?.querySelector('[data-filter-value]')===ownerChip('') && pressed('') &&
+   visibleOwners().every(button=>button.type==='button' && button.tabIndex===0 && button.querySelector('b')),
    'Owner uses native chips with All first and pressed.');
   const search=document.querySelector('#list-search');
-  document.querySelector('[data-type-chip="question"]').click();
+  reviewChip('type','question').click();
   check(count('')==='2' && count(PAGE_OWNER)==='2','Owner counts use the selected Type.');
   search.value='layout';search.dispatchEvent(new Event('input'));
   check(count('')==='1' && count(PAGE_OWNER)==='1','Owner counts use the words filter.');
-  chip(PAGE_OWNER)?.click();
+  ownerChip(PAGE_OWNER)?.click();
   check(pressed(PAGE_OWNER) && count('')==='1' && address().get('owner')===PAGE_OWNER,
    'An Owner chip sets the address and leaves the All count unchanged.');
   await navigate({owner:UNIT_OWNER,type:'investigation',show:'open'});
   check(pressed(UNIT_OWNER) && address().get('owner')===UNIT_OWNER,'The address restores the Owner chip.');
-  check(pressed(UNIT_OWNER) && !chip(UNIT_OWNER)?.hidden && count(UNIT_OWNER)==='0' && count('')==='0',
+  check(pressed(UNIT_OWNER) && !ownerChip(UNIT_OWNER)?.hidden && count(UNIT_OWNER)==='0' && count('')==='0',
    'The selected owner stays visible with zero in another Show.');
   const previous=document.querySelector('[data-review]');
-  chip(UNIT_OWNER)?.focus();
+  ownerChip(UNIT_OWNER)?.focus();
   const refreshed=new Promise(resolve=>previous.addEventListener('review-refreshed',resolve,{once:true}));
   dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
   await refreshed;
-  check(pressed(UNIT_OWNER) && count(UNIT_OWNER)==='0' && document.activeElement===chip(UNIT_OWNER),
+  check(pressed(UNIT_OWNER) && count(UNIT_OWNER)==='0' && document.activeElement===ownerChip(UNIT_OWNER),
    'Refresh keeps the selected Owner chip, its count and its focus.');
-  const unitChip=chip(UNIT_OWNER);
-  document.querySelector('[data-type-chip="question"]').click();
-  check(pressed('') && !address().get('owner') && unitChip && unitChip===chip(UNIT_OWNER) && unitChip.hidden,
+  const unitChip=ownerChip(UNIT_OWNER);
+  reviewChip('type','question').click();
+  check(pressed('') && !address().get('owner') && unitChip && unitChip===ownerChip(UNIT_OWNER) && unitChip.hidden,
    'A Type without the selected owner resets to All and hides the same chip.');
  }catch(error){failures.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
@@ -459,15 +493,14 @@ window.fetch=(url,options)=>{
         probe = r'''
 (()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
- const chip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
- const counts=()=>['',FIRST,SECOND].map(value=>chip(value)?.querySelector('b').textContent).join('|');
+ const counts=()=>['',FIRST,SECOND].map(value=>ownerChip(value)?.dataset.filterCount).join('|');
  const address=()=>new URLSearchParams(location.hash.slice(1));
  const rows=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')];
- check(chip(FIRST)?.getAttribute('aria-pressed')==='true' && address().get('source-owner')===FIRST &&
+ check(ownerChip(FIRST)?.getAttribute('aria-pressed')==='true' && address().get('source-owner')===FIRST &&
   rows().length===1 && rows()[0].dataset.sourceOwner===FIRST,'The legacy link keeps its selected owner and source.');
  check(counts()==='2|1|1','Expected Owner counts 2|1|1, got '+counts()+'.');
- chip(SECOND)?.click();
- check(chip(SECOND)?.getAttribute('aria-pressed')==='true' && !address().has('source-owner') &&
+ ownerChip(SECOND)?.click();
+ check(ownerChip(SECOND)?.getAttribute('aria-pressed')==='true' && !address().has('source-owner') &&
   rows().length===1 && rows()[0].dataset.sourceOwner===SECOND,'The second chip selects its matching row.');
  void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''.replace('FIRST', json.dumps(str(first.owner))).replace('SECOND', json.dumps(str(second.owner)))
@@ -493,8 +526,7 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
- const chip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
- const owner=chip(OWNER);
+ const owner=ownerChip(OWNER);
  owner.focus();
  check(document.activeElement===owner && owner.getAttribute('aria-pressed')==='true' &&
   owner.querySelector('b').textContent==='1','The selected Owner starts focused with one match.');
@@ -502,7 +534,7 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
  const refreshed=new Promise(resolve=>previous.addEventListener('review-refreshed',resolve,{once:true}));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await refreshed;
- const replacement=chip(OWNER),all=chip('');
+ const replacement=ownerChip(OWNER),all=ownerChip('');
  check(replacement?.getAttribute('aria-pressed')==='true' && !replacement.hidden &&
   replacement.querySelector('b').textContent==='0' && all.querySelector('b').textContent==='0' &&
   !document.querySelector('[data-list-item]:not([hidden])'),'Refresh keeps the selected Owner visible with zero matches.');
@@ -535,18 +567,17 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
         probe = r'''
 (async()=>{
  const failures=[],check=(ok,label)=>{if(!ok) failures.push(label);};
- const chip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
  const pressed=button=>button?.getAttribute('aria-pressed')==='true';
- chip(OTHER).focus();
- check(document.activeElement===chip(OTHER) && pressed(chip(SELECTED)) && !pressed(chip(OTHER)),
+ ownerChip(OTHER).focus();
+ check(document.activeElement===ownerChip(OTHER) && pressed(ownerChip(SELECTED)) && !pressed(ownerChip(OTHER)),
   'The other chip has focus while the selected chip stays pressed.');
  const previous=document.querySelector('[data-review]');
  const refreshed=new Promise(resolve=>previous.addEventListener('review-refreshed',resolve,{once:true}));
  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
  await refreshed;
- check(!chip(OTHER) && pressed(chip(SELECTED)) && new URLSearchParams(location.hash.slice(1)).get('owner')===SELECTED,
+ check(!ownerChip(OTHER) && pressed(ownerChip(SELECTED)) && new URLSearchParams(location.hash.slice(1)).get('owner')===SELECTED,
   'Refresh removes the other chip and keeps the selected owner.');
- check(document.activeElement===chip(SELECTED),
+ check(document.activeElement===ownerChip(SELECTED),
   'Expected focus on the pressed Owner chip, got '+(document.activeElement.id || document.activeElement.tagName)+'.');
  await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''.replace('SELECTED', json.dumps(str(selected.owner))).replace('OTHER', json.dumps(str(other.id)))
@@ -557,6 +588,7 @@ window.fetch=(url,options)=>options?.method==='POST' ? nativeFetch(url,options) 
     def test_index_refresh_and_owner_constraints(self) -> None:
         _ = self.case.question()
         ready = self.case.investigation()
+        _ = self.case.investigation(False)
         setup = '''<script>const nativeFetch=fetch;window.setInterval=()=>0;
 window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/fresh'+new URL(url,location.href).search,options);
 </script>'''
@@ -567,17 +599,15 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
  const refresh=async()=>{const loaded=nextView();dispatchEvent(new MessageEvent('message',{
   source:parent,origin:location.origin,data:'console-shown'}));await loaded;};
  const show=async value=>{
-  const chip=document.querySelector('[data-show-chip="'+value+'"]');
+  const chip=reviewChip('show',value);
   if(chip.getAttribute('aria-pressed')==='true') return;
   chip.click();await new Promise(resolve=>requestAnimationFrame(resolve));
  };
- const count=value=>Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent);
- const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
- const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
- const ownerChips=()=>[...document.querySelectorAll('[data-owner-chip]:not([hidden])')];
+ const count=value=>Number(showCount(value));
+ const selectedOwner=()=>pressedChip('owner');
  const chooseOwner=value=>ownerChip(value).click();
 
- const type=value=>document.querySelector('[data-type-chip="'+value+'"]').click();
+ const type=value=>reviewChip('type',value).click();
  const search=value=>{const field=document.querySelector('#list-search');field.value=value;field.dispatchEvent(new Event('input'));};
  const save=async form=>{
   const complete=new Promise(resolve=>{
@@ -587,8 +617,8 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   form.requestSubmit(form.querySelector('[value="question"]'));await complete;
  };
  try{
-  check(count('Done')===0,'Done has no rows for these records.');
-  for(const [id,selected] of [['C1','all'],['C2','Validating']]){
+  check(Number(showCount('Done'))===0,'Done has no rows for these records.');
+  for(const [id,selected] of [['C1','all'],['C2','open']]){
    await show('open');const before=count('open'),all=count('all');
    const key='page-owner/'+id,row=document.querySelector('[data-key="'+key+'"]');
    row.querySelector('.list-toggle').click();await save(await readyReviewCard(row));
@@ -603,26 +633,29 @@ window.fetch=(url,options={})=>nativeFetch(options.method==='POST'?'/action':'/f
   location.hash=new URLSearchParams({legacy:'investigation',owner:'unknown',type:'investigation',show:'not-read'});
   await navigated;
   const address=new URLSearchParams(location.hash.slice(1));
-  check(selectedOwner().dataset.ownerChip==='' && ownerChip('').textContent==='All 1' && count('open')===1 &&
+  check(selectedOwner().dataset.filterValue==='all' && ownerChip('').textContent==='All 1' && count('open')===1 &&
    !address.get('owner') && !address.has('source-owner') &&
    document.querySelectorAll('[data-list-item]:not([hidden])').length===1,
    'F006: hash navigation clears every owner constraint before it counts');
-  chooseOwner(UNIT_OWNER);await show('Validating');
-  check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
-   count('open')===1 && count('Validating')===0,
-   'F007: the owner stays selected when its rows match another state.');
+  chooseOwner(UNIT_OWNER);await show('all');
+  check(selectedOwner().dataset.filterValue===ownerValue(UNIT_OWNER) && selectedOwner().textContent===UNIT_NAME+' 2' &&
+   count('open')===1 && count('all')===2,
+   'F007: the owner stays selected across Open and All.');
+  await show('open');
+  check(selectedOwner().textContent===UNIT_NAME+' 1',
+   'F007: the owner chip counts only the Open records.');
   check(!ownerChip(UNIT_OWNER).hidden,
    'F007: Owner lists matching type and words across every Show');
   type('question');
-  check(selectedOwner().dataset.ownerChip==='' && ownerChips().length===2 &&
-   ownerChips()[1].dataset.ownerName==='page-owner' &&
+  check(selectedOwner().dataset.filterValue==='all' && visibleOwners().length===2 &&
+   visibleOwners()[1].dataset.ownerName==='page-owner' &&
    !new URLSearchParams(location.hash.slice(1)).get('owner'),
    'F007: an owner without the selected type resets to All and hides its chip');
   await show('open');type('investigation');chooseOwner(UNIT_OWNER);search('no matching title');
   const owner=ownerChip(UNIT_OWNER);
   owner.focus();
   await refresh();
-  check(selectedOwner()===owner && document.activeElement===owner && ownerChips().length===2 &&
+  check(selectedOwner()===owner && document.activeElement===owner && visibleOwners().length===2 &&
    owner.querySelector('b').textContent==='0' && ownerChip('').textContent==='All 0' && count('open')===0,
    'F007: refresh keeps the selected Owner and its focus when the search has no matches.');
  }catch(error){failures.push(String(error));}
@@ -662,66 +695,15 @@ window.fetch=async(url,options={})=>{
   form.requestSubmit(form.querySelector('[value="'+value+'"]'));await complete;
  };
  const show=async value=>{
-  const chip=document.querySelector('[data-show-chip="'+value+'"]');
+  const chip=reviewChip('show',value);
   if(chip.getAttribute('aria-pressed')==='true') return;
   chip.click();await new Promise(resolve=>requestAnimationFrame(resolve));
  };
  try{
-  row('C1').querySelector('.list-toggle').click();
-  const count=value=>Number(document.querySelector('[data-show-chip="'+value+'"] b').textContent);
-  const counts=()=>['open','Validating','all'].map(count);
-  check(count('Done')===0,'Done has no rows for these records.');
-  const before=counts();
-  const form=await readyReviewCard(row('C1'));await save(form,'validate');
-  check(JSON.stringify(counts())===JSON.stringify([before[0]-1,before[1]+1,before[2]]),
-   'A save moves the entry from Open to Validating without changing All.');
-  check(!row('C1') || row('C1').hidden,'the saved check leaves Open');
-  await refresh();check(!row('C1') || row('C1').hidden,'a refresh keeps the active check out of Open');
-  check(counts()[1]===before[1]+1 && counts()[2]===before[2],
-   'F001: refresh replaces the counts with the saved state');
-  await show('Validating');
-  check(row('C1') && !row('C1').hidden && row('C1').dataset.state==='Validating',
-   'Validating shows the saved check.');
-  await show('all');
-  check(!row('C1').hidden && row('C1').querySelector('button.list-toggle') &&
-   row('C1').textContent.includes('With page-owner · Validating for'),
-   'All shows the elapsed time and a button to open the active check.');
-  await show('open');
-  await nativeFetch('/problem');await refresh();check(!row('C1').hidden,'a problem returns to Open');
-  row('C2').querySelector('.list-toggle').click();
-  const second=await readyReviewCard(row('C2'));await save(second,'validate');
-  const [openBeforePass,validatingBeforePass,allBeforePass]=counts();
-  await nativeFetch('/passed');await refresh();check(!row('C2') || row('C2').hidden,'a passed check stays out of Open');
-  const [openAfterPass,validatingAfterPass,allAfterPass]=counts();
-  check(openAfterPass===openBeforePass && validatingAfterPass===validatingBeforePass-1 && allAfterPass===allBeforePass-1,
-   'A passed check leaves the Validating and All counts.');
-  await show('all');
-  check(!row('C2') || row('C2').hidden,'A passed check stays out of All.');
-  row('C3').querySelector('.list-toggle').click();
-  const third=await readyReviewCard(row('C3'));
-  const [openBeforeWorks,validatingBeforeWorks,allBeforeWorks]=counts();
-  let resumeRefresh;
-  allowReviewRefresh=new Promise(resolve=>{resumeRefresh=resolve;});
-  try{
-   await save(third,'works');
-   check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
-   const [open,validating,all]=counts();
-   check(open===openBeforeWorks-1 && validating===validatingBeforeWorks && all===allBeforeWorks-1,
-    'F010: Save removes the completed item from the Open and All counts before refresh.');
-   await show('open');
-   check(!row('C3') || row('C3').hidden,'F010: Save removes the completed item from Open before refresh.');
-  }finally{resumeRefresh();}
-  for(let pass=0;pass<2;pass++){
-   await refresh();
-   for(const choice of ['open','Validating','all']){
-    await show(choice);check(!row('C3') || row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
-   }
-   const [open,validating,all]=counts();
-   check(open===openBeforeWorks-1 && validating===validatingBeforeWorks && all===allBeforeWorks-1,
-    'F010: refresh keeps completed work out of the counts.');
-  }
-  const keys=QUESTION_KEYS;
-  for(const key of keys){
+  const count=value=>Number(showCount(value));
+  const counts=()=>['open','all'].map(count);
+  const onList=async id=>(await nativeFetch('/validation-list?row='+id)).json();
+  const ask=async key=>{
    await show('open');
    const asked=()=>document.querySelector('[data-key="'+key+'"]');
    asked().querySelector('.list-toggle').click();
@@ -729,21 +711,80 @@ window.fetch=async(url,options={})=>{
    const openBeforeAsk=count('open');
    await save(asking,'question');
    check(count('open')===openBeforeAsk-1,'F021: Ask question reduces the Open count for '+key);
-   // A change or proposal Ask keeps its row open; any other row that stays open fails below.
    if(STAYS_OPEN.includes(key)) asked().querySelector('.list-toggle').click();
    check(!asked() || asked().hidden,'F021: Ask question leaves Open for '+key);
    for(let pass=0;pass<2;pass++){
     await refresh();check(!asked() || asked().hidden,'F021: the sent request stays out of Open after refresh for '+key);
    }
    await nativeFetch('/owner-answer?item='+encodeURIComponent(key));await refresh();
-   const returnedState='Open';
-   check(!asked().hidden && asked().dataset.state===returnedState,'F021: the owner answer returns '+key);
+   check(!asked().hidden && asked().dataset.state==='Open','F021: the owner answer returns '+key);
+  };
+  await ask('page-owner/C1');
+  row('C1').querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row('C1'));
+  check(count('Done')===0,'Done has no rows for these records.');
+  const before=counts();
+  await save(form,'validate');
+  check(JSON.stringify(counts())===JSON.stringify(before.map(count=>count-1)),
+   'A save removes the validation from Open and All.');
+  check(!row('C1') || row('C1').hidden,'The saved check leaves Open.');
+  await refresh();
+  check(!row('C1') || row('C1').hidden,'A refresh keeps the active check out of Open.');
+  check(JSON.stringify(counts())===JSON.stringify(before.map(count=>count-1)),
+   'F001: Refresh keeps the saved counts.');
+  await show('all');
+  check(!row('C1') || row('C1').hidden,'The saved check leaves All.');
+  const pending=await onList('C1');
+  check(pending.kind==='Validation' && pending.owner==='page-owner' &&
+   pending.detail.includes('review waiting on others') && pending.detail.includes('data-list-review-card') &&
+   pending.started.includes('<time'),
+   'The List shows the pending validation, its owner, and its start time.');
+  await show('open');
+  await nativeFetch('/problem');await refresh();
+  check(!row('C1') || row('C1').hidden,'The problem stays out of Review Open.');
+  const problem=await onList('C1');
+  check(problem.kind==='Validation' && problem.detail.includes('Validation result') &&
+   problem.detail.includes('The spacing differs.'),'The List shows the validation problem.');
+  row('C2').querySelector('.list-toggle').click();
+  const second=await readyReviewCard(row('C2'));await save(second,'validate');
+  const beforePass=counts();
+  await nativeFetch('/passed');await refresh();
+  check(!row('C2') || row('C2').hidden,'A passed check stays out of Open.');
+  check(JSON.stringify(counts())===JSON.stringify(beforePass),'A passed check stays out of the Review counts.');
+  await show('all');
+  check(!row('C2') || row('C2').hidden,'A passed check stays out of All.');
+  const passed=await onList('C2');
+  check(passed.kind==='Validation' && passed.verdict==='works' && !passed.detail.includes('Validation result'),
+   'The saved validation passed without a problem.');
+  row('C3').querySelector('.list-toggle').click();
+  const third=await readyReviewCard(row('C3'));
+  const [openBeforeWorks,allBeforeWorks]=counts();
+  let resumeRefresh;
+  allowReviewRefresh=new Promise(resolve=>{resumeRefresh=resolve;});
+  try{
+   await save(third,'works');
+   check(!row('C3') || row('C3').hidden,'F010: Works leaves All');
+   const [open,all]=counts();
+   check(open===openBeforeWorks-1 && all===allBeforeWorks-1,
+    'F010: Save removes the completed item from the Open and All counts before refresh.');
+   await show('open');
+   check(!row('C3') || row('C3').hidden,'F010: Save removes the completed item from Open before refresh.');
+  }finally{resumeRefresh();}
+  for(let pass=0;pass<2;pass++){
+   await refresh();
+   for(const choice of ['open','all']){
+    await show(choice);check(!row('C3') || row('C3').hidden,'F010: refresh keeps Works hidden in '+choice);
+   }
+   const [open,all]=counts();
+   check(open===openBeforeWorks-1 && all===allBeforeWorks-1,
+    'F010: refresh keeps completed work out of the counts.');
   }
+  const keys=QUESTION_KEYS;
+  for(const key of keys) await ask(key);
   location.hash=new URLSearchParams({owner:UNIT_OWNER,show:'open',type:'investigation'});
   await new Promise(resolve=>addEventListener('hashchange',resolve,{once:true}));
   const investigation=()=>document.querySelector('[data-key="'+keys.at(-1)+'"]');
-  const ownerChip=value=>document.querySelector('[data-owner-chip="'+value+'"]');
-  const selectedOwner=()=>document.querySelector('[data-owner-chip][aria-pressed="true"]');
+  const selectedOwner=()=>pressedChip('owner');
   check(selectedOwner()===ownerChip(UNIT_OWNER),'The investigation owner starts selected.');
   investigation().querySelector('.list-toggle').click();
   await readyReviewCard(investigation());
@@ -753,7 +794,7 @@ window.fetch=async(url,options={})=>{
   check(latest(),'The row shows the current answer before marking it read.');
   await save(await readyReviewCard(investigation()),'read');
   await refresh();
-  check(selectedOwner().dataset.ownerChip===UNIT_OWNER && selectedOwner().textContent===UNIT_NAME+' 0' &&
+  check(selectedOwner().dataset.filterValue===ownerValue(UNIT_OWNER) && selectedOwner().textContent===UNIT_NAME+' 0' &&
     ownerChip('').textContent==='All 0' && counts()[0]===0,
    'Review keeps the selected Owner with zero after its last Open row disappears.');
   check(!document.querySelector('[data-list-item]:not([hidden])'),'the selected type and Show still have no rows');
@@ -764,7 +805,7 @@ window.fetch=async(url,options={})=>{
  }catch(error){failures.push(String(error));}
  await nativeFetch('/results',{method:'POST',body:JSON.stringify(failures)});
 })();'''
-        probe = probe.replace('QUESTION_KEYS',json.dumps([question,'page-owner/C1',*decisions,f'investigation/{ready.owner}/{ready.id}']))
+        probe = probe.replace('QUESTION_KEYS',json.dumps([question,*decisions,f'investigation/{ready.owner}/{ready.id}']))
         probe = probe.replace('STAYS_OPEN', json.dumps(['page-owner/C1', decisions[0]]))
         probe = probe.replace('UNIT_OWNER', json.dumps(str(ready.owner))).replace(
             'UNIT_NAME', json.dumps(review_items.name(ready.owner, staff.snapshot())))
@@ -799,26 +840,25 @@ window.fetch=async(url,options={})=>{
   check(filters.get('type')==='question','the alias keeps the question type');
   const rows=[...frame.contentDocument.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
   check(rows.length===1 && rows[0].dataset.type==='question','the Review filters select the owner question');
-  check(frame.contentDocument.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===OWNER,'the owner name resolves to its staff ID');
+  check(pressedChip('owner',frame.contentDocument).dataset.filterValue===ownerValue(OWNER),'the owner name resolves to its staff ID');
   const cases=CASES;
   for(const entry of cases){
    const legacy=document.createElement('iframe');legacy.src=entry.url;
    const loaded=new Promise(resolve=>legacy.addEventListener('load',resolve,{once:true}));document.body.append(legacy);await loaded;
    const page=legacy.contentDocument;await loadedView(page,entry.show);
-   check(page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip===entry.show,'F012: legacy Show '+entry.url);
+   check(pressedChip('show',page).dataset.filterValue===entry.show,'F012: legacy Show '+entry.url);
    const visible=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
    check(visible.length===entry.count && visible.every(row=>row.dataset.type===entry.type),'F012: legacy records '+entry.url);
-   if(entry.owner) check(page.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip===entry.owner &&
+   if(entry.owner) check(pressedChip('owner',page).dataset.filterValue===ownerValue(entry.owner) &&
     visible.every(row=>row.dataset.sourceOwner===entry.owner),'F012: the legacy link keeps its owner.');
-   if(entry.type==='investigation') check(page.querySelector('[data-show-chip="Done"] b')?.textContent==='0' &&
-    !page.querySelector('[data-state="Done"]'),
+   if(entry.type==='investigation') check(showCount('Done',page)==='0' && !page.querySelector('[data-state="Done"]'),
     'F012: the legacy link shows only active states.');
    if(entry.item){
     const item=page.querySelector('[data-list-item][data-key="'+entry.item+'"]');
     const summary=item?.querySelector('.list-toggle'),detail=item?.querySelector('[data-detail]');
-    const owner=page.querySelector('[data-owner-chip][aria-pressed="true"]');
     check(summary?.getAttribute('aria-expanded')==='true' && detail && !detail.hidden &&
-     owner?.dataset.ownerChip===item.dataset.owner,'F012: the legacy row opens in its row with the review owner kept.');
+     pressedChip('owner',page)?.dataset.filterValue===ownerValue(item.dataset.owner),
+     'F012: the legacy row opens in its row with the review owner kept.');
    }
    legacy.remove();
   }
@@ -832,7 +872,7 @@ window.fetch=async(url,options={})=>{
         cases.extend({'url':'/console/investigations.html#'+urlencode({'owner':ready.owner,'show':old}),
                       'show':new,'count':count,'type':'investigation','item':'','owner':str(ready.owner)}
                      for old,new,count in (('not-read','open',1),('answer ready','open',1),
-                                           ('open','Waiting',1),('read','open',1),('all','all',2)))
+                                           ('open','open',1),('read','open',1),('all','all',2)))
         cases.extend(({'url':'/console/investigations.html#'+urlencode({'owner':owner.id,'show':'all'}),
                        'show':'all','count':1,'type':'investigation','item':'','owner':str(owner.id)},
                       {'url':'/console/investigations.html#'+urlencode({'owner':ready.owner}),
@@ -849,7 +889,7 @@ window.fetch=async(url,options={})=>{
  const failures=[];
  try{
   const frame=[...document.querySelectorAll('iframe')].find(frame=>!frame.hidden);
-  const count=value=>frame.contentDocument.querySelector('[data-show-chip="'+value+'"] b')?.textContent;
+  const count=value=>showCount(value,frame.contentDocument);
   const deadline=performance.now()+8000;
   while(!count('open') || !count('all')){
    if(performance.now()>deadline) throw new Error('F012: Review did not populate the filtered counts.');
@@ -859,8 +899,8 @@ window.fetch=async(url,options={})=>{
   const place=new URLSearchParams(frame.contentWindow.location.hash.slice(1));
   const rows=[...page.querySelectorAll('[data-list-item]')].filter(row=>!row.hidden);
   if(place.get('show')!=='open' || place.get('source-owner')!==INVESTIGATION_OWNER ||
-   page.querySelector('[data-show-chip][aria-pressed="true"]').dataset.showChip!=='open' ||
-   page.querySelector('[data-owner-chip][aria-pressed="true"]').dataset.ownerChip!==INVESTIGATION_OWNER ||
+   pressedChip('show',page).dataset.filterValue!=='open' ||
+   pressedChip('owner',page).dataset.filterValue!==ownerValue(INVESTIGATION_OWNER) ||
    rows.length!==1 || rows[0].dataset.key!==READY_KEY || rows[0].dataset.sourceOwner!==INVESTIGATION_OWNER ||
    page.querySelector('[data-key="'+READ_KEY+'"],[data-state="Done"]') ||
    count('open')!=='1' || count('all')!=='2' || count('Done')!=='0')

@@ -28,6 +28,7 @@ from scripts.lib.checkout_test_support import copy_runtime
 from scripts.lib import user_zone
 from scripts.lib.shell_test_support import fixture_zsh_environment
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
+from scripts.lint.memory_test_support import write_config_fixture
 
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
@@ -53,6 +54,7 @@ class NotifierTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = write_config_fixture(self.root / "config/user_zone.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, fixture_zsh_environment())))
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.owned = OwnedTestProcesses()
@@ -144,15 +146,16 @@ class NotifierTests(unittest.TestCase):
         launched = self.root / "drain.argv"
         launcher = self.launcher_dir / "systemd-run"
         _ = launcher.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {shlex.quote(str(launched))}\n')
-        config = self.root / "selected.conf"
+        config = self.root / "selected"
+        _ = write_config_fixture(config / "user_zone.conf")
         with mock.patch.dict(os.environ, {"NOTIFIER_REPEAT_STATE": str(pending),
-                                         "SEND_REPEAT_CONFIG": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
+                                         "CONF_DIR": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
             _ = self.successful("tick")
             _ = self.successful("tick")
         arguments = launched.read_text().splitlines()
         self.assertIn("--no-block", arguments)
         self.assertIn("SEND_REPEAT_STATE=" + str(pending), arguments)
-        self.assertIn("SEND_REPEAT_CONFIG=" + str(config), arguments)
+        self.assertIn("CONF_DIR=" + str(config), arguments)
         self.assertIn("XDG_STATE_HOME=" + str(self.root / "xdg"), arguments)
         self.assertEqual(arguments[-2:], [str(self.fake_send), "repeat-notices"])
         self.assertIn("notices", arguments)
@@ -172,6 +175,7 @@ class NotifierTests(unittest.TestCase):
         command = ["zsh", str(SCRIPT), *args]
         environment = self.owned.environment({
             **os.environ,
+            "CONF_DIR": os.environ.get("CONF_DIR", str(self.root / "config")),
             "NOTIFIER_STATE_DIR": str(self.state_dir),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
             "NOTIFIER_SEND": str(self.fake_send),
@@ -181,13 +185,8 @@ class NotifierTests(unittest.TestCase):
             "PATH": f"{self.launcher_dir}{os.pathsep}{os.environ['PATH']}",
         })
         if not process_boundary_for_case(self) and "SHOWN_ZONE" not in environment:
-            config = environment.get("USER_ZONE_CONF") or str(
-                Path(user_zone.__file__).resolve().parents[2] / "config/user_zone.conf")
-            if not Path(config).is_absolute():
-                config = str(Path.cwd() / config)
             try:
-                with mock.patch.object(user_zone, "CONF", config):
-                    zone = invoke_cli(user_zone, user_zone.main, [], environment, self.root)
+                zone = invoke_cli(user_zone, user_zone.main, [], environment, self.root)
             except Exception:
                 # The shell ignores helper failures and uses the machine zone.
                 environment["SHOWN_ZONE"] = ""
@@ -631,6 +630,9 @@ class NotifierTests(unittest.TestCase):
         failing = self.run_cli("health", "example")
         self.assertEqual(failing.returncode, 1)
         self.assertEqual(failing.stdout.strip(), "failing: last two sends exit 3, 1")
+        _ = self.successful("fire", "example", send_rc=0)
+        _ = self.successful("fire", "example", send_rc=3)
+        self.assertEqual(self.successful("health", "example").strip(), "ok")
         _ = self.successful("stop", "example")
         self.assertEqual(self.successful("health", "example").strip(), "ok: stopped")
         self.assertIn("failing: no tick since", self.run_cli("health", "example", now=NOW + 121).stdout)
@@ -647,7 +649,29 @@ class NotifierTests(unittest.TestCase):
         _ = self.successful("remove", "example")
         self.assertEqual(self.run_cli("status", "example").returncode, 1)
 
-    def test_run_only_tick_executes_once_without_sending_or_logging_success(self) -> None:
+    def test_health_fails_after_two_failed_runs(self) -> None:
+        _ = self.successful("new", "example", "--every", "1", "--run", "/bin/sh -c 'exit 3'")
+        _ = self.successful("tick")
+        fire_log = self.state_dir / "example" / "fire.log"
+        _ = fire_log.write_text("earlier | run exit 3\nlater | run timeout\n")
+        _ = self.successful("fire", "example")
+        self.assertEqual(self.successful("health", "example").strip(), "ok")
+        _ = self.successful("new", "example", "--every", "1", "--run", "/bin/sh -c 'exit 7'")
+        _ = self.successful("fire", "example")
+        failing = self.run_cli("health", "example")
+        self.assertEqual(failing.returncode, 1)
+        self.assertEqual(failing.stdout.strip(), "failing: last two runs exit 3, exit 7")
+
+    def test_health_is_ok_after_a_success_between_failed_runs(self) -> None:
+        for code in (3, 0, 7):
+            _ = self.successful("new", "example", "--every", "1", "--run", f"/bin/sh -c 'exit {code}'")
+            _ = self.successful("fire", "example")
+        _ = self.successful("tick")
+        self.assertEqual([line.rsplit(" | ", 1)[-1] for line in self.lines()],
+                         ["run result exit 3", "run result exit 0", "run result exit 7"])
+        self.assertEqual(self.successful("health", "example").strip(), "ok")
+
+    def test_run_only_tick_logs_success_without_sending(self) -> None:
         output = self.root / "runs"
         command = f"/bin/sh -c 'printf run >> {output}'"
         _ = self.successful("new", "example", "--every", "1", "--run", command)
@@ -655,17 +679,18 @@ class NotifierTests(unittest.TestCase):
         _ = self.successful("tick", now=MINUTE + 60)
         self.assertEqual(self.wait_for_text(output, "run"), "run")
         self.assertFalse(self.send_args.exists())
-        self.assertEqual(self.lines(), [])
+        fire_log = self.state_dir / "example" / "fire.log"
+        _ = self.wait_for_text(fire_log, "run result exit 0")
+        self.assertEqual([line.rsplit(" | ", 1)[-1] for line in self.lines()], ["run result exit 0"])
         _ = self.successful("tick", now=MINUTE + 60)
         self.assertEqual(output.read_text(), "run")
         _ = self.successful("tick", now=MINUTE + 120)
         self.assertEqual(self.wait_for_text(output, "runrun"), "runrun")
 
-    def test_run_only_tick_logs_exit_failure_and_timeout(self) -> None:
+    def test_run_only_timeout_counts_as_a_failed_run_in_health(self) -> None:
         _ = self.successful("new", "example", "--every", "1", "--run", "/bin/sh -c 'exit 7'")
         _ = self.successful("tick", now=MINUTE + 60)
-        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "exit 7")
-        self.assertTrue(any("exit 7" in line for line in self.lines()))
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run result exit 7")
         self.assertFalse(self.send_args.exists())
         slow = self.root / "slow-run"
         blocked = self.root / "run-blocked"
@@ -674,8 +699,10 @@ class NotifierTests(unittest.TestCase):
         slow.chmod(0o755)
         _ = self.successful("new", "example", "--every", "1", "--run", str(slow), "--timeout", "1")
         _ = self.successful("tick", now=MINUTE + 120)
-        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run timeout")
-        self.assertTrue(any("timeout" in line for line in self.lines()))
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run result timeout")
+        failing = self.run_cli("health", "example", now=MINUTE + 120)
+        self.assertEqual(failing.returncode, 1)
+        self.assertEqual(failing.stdout.strip(), "failing: last two runs exit 7, timeout")
         self.assertFalse(self.send_args.exists())
 
     def test_run_marker_wait_reports_an_exited_child(self) -> None:
@@ -723,7 +750,7 @@ class NotifierTests(unittest.TestCase):
                 tick.kill()
             _ = tick.wait(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(self.wait_for_text(finished, "finished"), "finished")
-        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run exit 7")
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run result exit 7")
 
     def fake_launchctl(self) -> Path:
         """Install a fake launchctl that, like macOS 27, starts a submitted job only on kickstart."""
@@ -755,7 +782,7 @@ case $1 in
     done ;;
   remove)
     result=before-fire
-    [[ -e $FAKE_LAUNCHCTL_FIRE && "$(<$FAKE_LAUNCHCTL_FIRE)" == *"run exit 7"* ]] && result=after-fire
+    [[ -e $FAKE_LAUNCHCTL_FIRE && "$(<$FAKE_LAUNCHCTL_FIRE)" == *"run result exit 7"* ]] && result=after-fire
     print -rn -- $result > $state/$2.removed ;;
 esac
 """
@@ -786,7 +813,7 @@ esac
         launch_state = self.fake_launchctl()
         runs = self.root / "mac-runs"
         fire_log = self.tick_mac_run_only(launch_state, runs)
-        self.assertEqual(self.wait_for_text(fire_log, "run exit 7").count("run exit 7"), 1)
+        self.assertEqual(self.wait_for_text(fire_log, "run result exit 7").count("run result exit 7"), 1)
         self.assertEqual(self.wait_for_text(runs, "run"), "run")
         label = (launch_state / "submitted").read_text()
         self.assertEqual((launch_state / "kickstarted").read_text(), f"gui/{os.getuid()}/{label}")
@@ -804,7 +831,7 @@ esac
             "run launcher unavailable: example; waiting after tick",
             (self.state_dir / "notifier.log").read_text(),
         )
-        self.assertEqual(fire_log.read_text().count("run exit 7"), 1)
+        self.assertEqual(fire_log.read_text().count("run result exit 7"), 1)
         self.assertEqual(runs.read_text(), "run")
         self.assertFalse((launch_state / "pid").exists())
 
@@ -827,7 +854,7 @@ esac
         self.assertTrue(self.send_args.exists())
         _ = release_file.write_text("release")
         _ = self.wait_for_text(finished_file, "finished")
-        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run exit 7")
+        _ = self.wait_for_text(self.state_dir / "example" / "fire.log", "run result exit 7")
 
     def test_run_only_run_log_captures_stderr_and_replaces_previous_run(self) -> None:
         run_log = self.state_dir / "example" / "run.log"
@@ -837,7 +864,6 @@ esac
         _ = self.successful("new", "example", "--every", "1", "--run", "/bin/sh -c 'echo second >&2'")
         _ = self.successful("tick", now=MINUTE + 120)
         self.assertEqual(self.wait_for_text(run_log, "second"), "second\n")
-        self.assertEqual(self.lines(), [])
 
     def test_run_only_rejects_delivery_and_check_options(self) -> None:
         for option, value in (("--to", "session:sid-1"), ("--command", "prompt"),

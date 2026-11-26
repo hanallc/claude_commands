@@ -245,8 +245,8 @@ An in-flight notice blocks a second notice for one send budget.
 A worker's owner is its director.
 Other staff senders use their first showrunner ancestor.
 The notice addresses a staff owner by its staff id, so two units with one name stay distinct.
-Senders without a staff row use `failed_lookup_owners` from `send.conf`, then `UNIT_ANOMALIES_TO` from `production.conf`.
-Staff senders without a parent also use `UNIT_ANOMALIES_TO`.
+Senders without a staff row use `failed_lookup_owners` from `send.conf`, then `unit_anomalies_to` from `production.conf`.
+Staff senders without a parent also use `unit_anomalies_to`.
 The detector sends notices as `send.py` and ignores failures from that sender.
 Detector errors print one stderr line and preserve the failed send's result.
 
@@ -553,18 +553,19 @@ Each evidence cell names the request id and the report, receive or transcript li
 ### `broadcast.py`: groups on both machines
 
 ```
-broadcast.py [--here] --from NAME (--all TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT |
+broadcast.py [--here] --from NAME (--all TEXT | --producers TEXT | --showrunners TEXT | [--production SHOWRUNNER] --units TEXT |
              --agents TEXT | [--of UNIT] --workers TEXT | --top-level TEXT)...
 ```
 
-`BroadcastGroup = AllRoles | Showrunners | UnitDirectors | UnitsOfProduction(address, production) | Agents | Workers | WorkersOfUnit(address, unit, machine) | TopLevel`.
+`BroadcastGroup = AllRoles | Producers | Showrunners | UnitDirectors | UnitsOfProduction(address, production) | Agents | Workers | WorkersOfUnit(address, unit, machine) | TopLevel`.
 The group type stays separate from the roster's `Role` because flags overlap.
 Every group excludes closed workers before delivery and empty-group checks.
 The roster keeps these rows for direct sends and other readers.
 
 | Flag | Members |
 |---|---|
-| `--all` | every eligible row |
+| `--all` | every eligible row, including producers |
+| `--producers` | roster rows whose session or thread matches the current session of a producer in staff |
 | `--showrunners` | role `showrunner` |
 | `--units` | every unit director; after `--production <showrunner name or session: address>`, unit directors whose `UnderShowrunner.address` matches that showrunner |
 | `--agents` | every worker and freestanding session, Claude and Codex |
@@ -580,6 +581,8 @@ The roster keeps these rows for direct sends and other readers.
   If a recipient disappears after the roster read, the delivery fails on that machine.
   Each selected `CannotReceiveMessages` row prints the refusal from `send.py`.
   These refusals do not affect the sent count or the exit status.
+- A send that saves the message for an open review reports `kept`. For a recipient selected by `--producers`, it reports `held: in a review`.
+  Both outcomes leave the sent count and exit status unchanged.
 - Without `--here`, `ssh <other machine> env -u CODEX_THREAD_ID -u CLAUDE_CODE_SESSION_ID [BROADCAST_SEND=...] BROADCAST_CLOSING_MACHINES=... broadcast.py --here --from <sender> <same groups>` runs in parallel (120 s timeout); its lines print under `<host>: `. The replay spells an all-workers group `--all-workers` (accepted by `main`, absent from `USAGE`) so it does not inherit an earlier `--of`. ssh exit 255, a timeout, or a nonzero exit with no `NOT sent` line yields `<host>: NOT sent: <why>`.
 - `--of` is resolved once across both machines before any delivery: one director gives its machine and address; several give exit 2 with `<target> matches more than one unit director:` and their addresses; none gives `unknown unit <target>; known units:`. If the other machine is not reached, `--of` sends nothing: one `NOT sent` line, exit 1. `--of` without a following `--workers` is a usage error.
 - `--production` resolves a showrunner's staff name or session address across both machines before delivery.
@@ -592,10 +595,17 @@ The roster keeps these rows for direct sends and other readers.
 - Remote replay carries the resolved address and production through the internal `--resolved-production` spelling.
   The replay also requires a roster without problems before delivery.
   The internal `--all-units` spelling keeps an unscoped group independent of an earlier production scope.
-- Output: `<shown name> [<address>] - <outcome>[: <detail>]`. The outcomes are `sent`, `no live session` and `NOT sent`. The address appears in brackets only when it differs from the shown name. The shown name includes the job, so there is no role column. A group with no member besides the sender prints `<group> - none on this machine` on each machine. The report ends with `<N> sent in <S> s` and the closing line. Exit 0 when nothing is `NOT sent`, 1 otherwise, 2 for usage. Roster problems print as `broadcast: roster: <problem>`. Without a production scope, delivery to the other rows continues.
-- Library API: `broadcast(sender, texts: Mapping[BroadcastGroup, str], *, scope=ALL_MACHINES) -> list[Delivery]` runs the same orchestration as the command; `report(deliveries) -> bool`; `send(session, sender, text, *options) -> str` (empty on success). `codex_winddown.announce()` calls `broadcast.broadcast(sender, {Showrunners(): ..., UnitDirectors(): ...})` and `broadcast.report`.
+- The output uses `<shown name> [<address>] - <outcome>[: <detail>]`. Outcomes are `sent`, `kept`, `held`, `no live session`, and `NOT sent`.
+  The address appears in brackets when it differs from the shown name.
+  A producer's `held` line uses the staff name. Other lines use the roster name, which can include the job.
+  An empty group prints `<group> - none on this machine` on each machine.
+  If the staff read fails, `--producers` reports `producers - NOT sent` with the reason.
+  The report ends with `<N> sent in <S> s` and the closing line.
+  Exit 0 when nothing is `NOT sent`, 1 on a delivery failure, and 2 on a usage error. Roster problems print as `broadcast: roster: <problem>`.
+  Without a production scope, delivery to the other rows continues.
+- Library API: `broadcast(sender, texts: Mapping[BroadcastGroup, str], *, scope=ALL_MACHINES) -> list[Delivery]` runs the same orchestration as the command; `report(deliveries) -> bool`; `send(session, sender, text, *options) -> str` (empty on success).
 
-Callers: `/announce` (`--all`), `/unit:announce` (`--units`), `/showrunner:announce` (`--showrunners`), each on both machines, and `/codex_winddown`.
+The commands `/announce` (`--all`), `/producer:announce` (`--producers`), `/unit:announce` (`--units`), and `/showrunner:announce` (`--showrunners`) use both machines.
 
 ### `top_level.py`
 
@@ -618,7 +628,9 @@ It asks showrunners to give the message to their unit directors.
 
 ### `process_table.py`
 
-`Process(pid, parent, command, arguments)` (`NamedTuple`); `snapshot() -> dict[int, Process]` runs `PS` (from `PROCESS_TABLE_PS`, read at import); `is_codex_agent(process)` recognizes `codex exec`. Standard library only, importing no other script; `roster.py`, `broadcast.py` and `codex_winddown.py` read it.
+`Process(pid, parent, command, arguments)` is a `NamedTuple`.
+`snapshot() -> dict[int, Process]` runs `PS`.
+The module reads `PROCESS_TABLE_PS` at import and uses only the standard library.
 
 ### `codex_daemon.py`
 
@@ -684,7 +696,7 @@ Release recalculates the priority of a kept decision.
   Use `send.py --to <address>` for one session and `broadcast.py` for groups.
   The sender hook refuses native `SendMessage` to another session, including urgent messages.
   Use `send.py --urgent` for urgent messages.
-- **Codex sessions** read `~/.codex/AGENTS.md`, workers included. Codex has no scriptable list, so its text points to `roster.py`, `send.py` and `broadcast.py` for every kind. `codex/AGENTS-messaging.md` is the source: listing, sending, groups, messaging the user, "Outcomes and recovery", partly missing results, the message rules, and the sandbox rerun.
+- **Codex sessions** read `~/.codex/AGENTS.md`, workers included. Codex has no scriptable list, so its text points to `roster.py`, `send.py` and `broadcast.py` for every kind. `codex/AGENTS-messaging.md` is the source: listing, sending, groups, messaging the user, "Outcomes and recovery", partly missing results, the message rules, the sandbox rerun, the images and links rules, and the user-specified behavior rule.
 - Both texts carry the same outcome and recovery words.
 - `scripts/message/install_codex_agents.py [--machine HOST] [--agents-file PATH]` writes that text into `~/.codex/AGENTS.md` between `<!-- claude-messaging: begin -->` and `<!-- claude-messaging: end -->`:
   - No markers: appends the block, creating the file and parent if needed.
@@ -708,8 +720,8 @@ Release recalculates the priority of a kept decision.
 - `scripts/notify/user_action.py`, `scripts/notify/pushover.py` — the message-to-user gate; `scripts/notify/review.py` — the clarity review
 - `scripts/message/escalate.py`, `scripts/agents/restart_support.py`, `scripts/agents/restart.py` — held and shutdown messages
 - `scripts/agents/test_support.py` — shutdown send guard
-- `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py`, `commands/message.md`, `commands/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `commands/alert_user.md` — instructions
-- Tests: `scripts/message/test_{roster,send,postmaster,codex_daemon,process_table,sessions,top_level,install_codex_agents}.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_{broadcast,codex_winddown}.py`, `scripts/agents/test_*.py` (`test_send_guard.py` proves the guard); `mods/postmaster/tests/*.test.ts` exercise fake call sets and kit-loaded hooks
+- `codex/AGENTS-messaging.md`, `scripts/message/install_codex_agents.py`, `commands/message.md`, `commands/announce.md`, `commands/producer/announce.md`, `commands/unit/announce.md`, `commands/showrunner/announce.md`, `commands/notify_top_level.md`, `commands/alert_user.md` — instructions
+- Tests: `scripts/message/test_{roster,send,postmaster,codex_daemon,process_table,sessions,top_level,install_codex_agents}.py`, `scripts/notify/test_pushover.py`, `scripts/production/test_broadcast.py`, `scripts/agents/test_*.py` (`test_send_guard.py` proves the guard); `mods/postmaster/tests/*.test.ts` exercise fake call sets and kit-loaded hooks
 
 ## Invariants
 
@@ -732,11 +744,9 @@ Release recalculates the priority of a kept decision.
 
 - `--all-workers` appears in no command file or Codex text.
 
-- `process_table` imports none of `roster`, `broadcast` or `codex_winddown`, so `broadcast.py` imports `roster.py` without a cycle.
+- `process_table` uses only the standard library, so `broadcast.py` can import `roster.py` without a cycle.
 
 - `running_sessions()` and `live_sessions()` select per record through their own predicate; a change to `running_session` keeps that. `sessions.process_start` is the one process-start reader. A record with a `procStart` is running only while it matches its process, socket or not, so a phantom is never a roster row, a broadcast line, an unreachable line or a cause of name ambiguity. A headless run (`sessions.headless`) is never running either, so a relay is never a roster row and no name lookup finds it.
-
-- A role-key or signature change in `broadcast.broadcast` carries `codex_winddown.py` and `test_codex_winddown.py`.
 
 - The mod writes its claim before checking the outbox entry. The client withdraws the entry before checking the claim. An unconfirmed claimed send gets no relay or queued copy.
 
@@ -802,7 +812,6 @@ Release recalculates the priority of a kept decision.
 - Read `/proc/<pid>/stat` as bytes: the kernel's 15-byte `comm` limit can cut a process name inside a UTF-8 character.
 - When `process_start` returns `None` (malformed stat, `ps` failure), a record with a `procStart` is not running until its start reads again, socket or not.
 - The macOS `ps -o lstart=` path is covered in tests only with a faked `ps`.
-- `codex_winddown.start()` keeps the first record per name, so it depends on `sessions.live_sessions()` listing the newest first.
 
 **Imports**
 - Repository modules share one package identity.
@@ -830,8 +839,6 @@ Release recalculates the priority of a kept decision.
 - A session's role from its name (a Claude worker's slot role is the one value read from a name); a transport-specific route state in `broadcast.py`; name matching for membership or sender exclusion; a `--json` field for `RosterEntry.session`.
 
 - `live_sessions()` as `running_sessions()` filtered by the socket check; making `procStart` required.
-
-- A module-wide ban on wind-down calling `broadcast`.
 
 - Writing AGENTS.md in place.
 
@@ -861,8 +868,6 @@ Release recalculates the priority of a kept decision.
 - **Shutdown tests can never reach the user's phone.** Two fixture alerts once reached it from a test whose fake had gone stale. The guard fails at the last call before a real process, so a stale fake fails loudly instead of sending.
 
 - **The installer writes atomically.** `Path.write_bytes` truncates first, so a failed in-place write would erase the user's rules outside the block and leave markers every later install refuses.
-
-- **The process table has its own module** so `broadcast.py` can import `roster.py` without a cycle, and roster, broadcast and wind-down share one reader.
 
 The owning machine reads account attribution and includes it in the snapshot.
 Claude rows use their process configuration.

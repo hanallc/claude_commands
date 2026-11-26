@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -13,9 +14,11 @@ import sys
 import tempfile
 import unittest
 from typing import override
+from unittest import mock
 
-from scripts.lib import test_hang_guard
+from scripts.lib import build_folder_lock, build_folders, test_hang_guard
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
+from scripts.lint.memory_test_support import write_config_fixture
 
 from scripts.build_hold import cargo_folder
 from scripts.build_hold.override_guard import require_checkout
@@ -110,17 +113,18 @@ class CargoWrapperTest(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(
             prefix="cargo-test-", dir="/tmp",
         )))
-        self.wrapper = self.root / "scripts" / "cargo"
-        self.wrapper.parent.mkdir()
+        self.wrapper = self.root / "scripts" / "build_hold" / "cargo"
+        self.wrapper.parent.mkdir(parents=True)
         _ = shutil.copy2(SCRIPTS / "cargo", self.wrapper)
-        library = self.root / "lib"
+        library = self.wrapper.parent.parent / "lib"
         library.mkdir()
-        _ = shutil.copy2(SCRIPTS.parent / "lib" / "py", library / "py")
+        for name in ("py", "conf.sh", "conf_record.sh"):
+            _ = shutil.copy2(SCRIPTS.parent / "lib" / name, library / name)
         self.installer = self.wrapper.with_name("install_cargo_wrapper.sh")
         _ = shutil.copy2(SCRIPTS / self.installer.name, self.installer)
         _ = self.wrapper.with_name("hold_applies.py").write_text(HOLD_STUB)
         _ = self.wrapper.with_name("cargo_folder.py").write_text(FOLDER_STUB)
-        queue = self.root / "build_queue"
+        queue = self.wrapper.parent.parent / "build_queue"
         queue.mkdir()
         _ = (queue / "queue_place.py").write_text(QUEUE_STUB)
         self.front = self.root / "front"
@@ -199,6 +203,35 @@ class CargoWrapperTest(unittest.TestCase):
         self.assertTrue(self.python_log.exists())
         self.assertFalse(self.scope_log.exists())
 
+    def test_cargo_retries_when_the_output_parent_moves_after_lock_open(self) -> None:
+        parent = self.root / "output-root" / "unit"
+        parent.mkdir(parents=True)
+        output = parent / "target"
+        former = parent.with_name("former-unit")
+        workspace = cargo_folder.CargoWorkspace(self.cwd, str(self.home), self.cwd, self.cwd)
+        open_lock = build_folder_lock.open_lock
+        module = cargo_folder.__name__
+
+        def move_parent(path: Path, directory: int, *, create: bool) -> int:
+            descriptor = open_lock(path, directory, create=create)
+            if path == output and not former.exists():
+                _ = parent.rename(former)
+            return descriptor
+
+        with (ExitStack() as locks,
+              mock.patch.object(build_folders, "build_root", return_value=parent.parent),
+              mock.patch.object(build_folder_lock, "open_lock", side_effect=move_parent),
+              mock.patch(f"{module}._workspace", return_value=workspace),
+              mock.patch.object(cargo_folder, "assigned_output", return_value=cargo_folder.LinkedOutput(output)),
+              mock.patch(f"{module}._check_paths"), mock.patch(f"{module}._stamp_assignment"),
+              mock.patch("scripts.worktree.worktrees.git_exclude.ensure_excluded")):
+            checked = cargo_folder.check_step(["check"], self.cwd, locks, self.env, enforce=True)
+            self.assertIsInstance(checked, cargo_folder.CheckedOutputLock)
+            assert isinstance(checked, cargo_folder.CheckedOutputLock)
+            self.assertTrue(former.is_dir())
+            self.assertTrue(os.path.samestat(os.fstat(checked.descriptor), output.with_suffix(".lock").stat()))
+            self.assertEqual(build_folders.build_folder_state(output), "held")
+
     def test_non_building_commands_start_with_no_python_and_no_queue_request(self) -> None:
         _ = (self.hold / "holder").write_text("held")
         for args in (
@@ -267,12 +300,15 @@ class CargoWrapperTest(unittest.TestCase):
                 self.assertFalse(self.queue_log.exists())
                 self.assert_cargo(args)
 
-    def test_fast_path_keeps_the_output_lock_through_cargo_exec(self) -> None:
-        for name in ("hostname", "flock", "stat", "touch"):
+    def seed_fast_path_tools(self) -> None:
+        for name in ("uname", "flock", "stat", "touch"):
             executable = shutil.which(name)
             if executable is None:
                 self.skipTest(f"{name} is unavailable")
             (self.tools / name).symlink_to(executable)
+
+    def test_fast_path_keeps_the_output_lock_through_cargo_exec(self) -> None:
+        self.seed_fast_path_tools()
         workspace = self.root / "workspace"
         build = self.root / "build"
         self.cwd = workspace / "origin/demo/director"
@@ -292,9 +328,11 @@ class CargoWrapperTest(unittest.TestCase):
         lock = output.with_suffix(".lock")
         lock.touch()
         (self.cwd / "target").symlink_to(output, target_is_directory=True)
-        config = self.home / ".claude/config"
-        config.mkdir(parents=True)
-        _ = (config / "build_folders.conf").write_text(f"roots.workspace={workspace}\nroots.build={build}\n")
+        config = self.root / "fixture-config"
+        host = socket.gethostname().partition(".")[0]
+        _ = write_config_fixture(config / "build_folders.conf",
+                                 f"roots.workspace={workspace}\nroots.build.{host}={build}\n")
+        self.env["CONF_DIR"] = str(config)
         stamp = output / ".lint-sweep-used"
         self.env["FOLDER_EXIT"] = "1"
         for evidence in (None, f"{workspace}/other\n", f"{self.cwd}\nextra\n",
@@ -330,6 +368,43 @@ class CargoWrapperTest(unittest.TestCase):
             self.assertFalse(self.folder_log.exists())
             self.assertTrue((output / ".lint-sweep-used").is_file())
             self.assert_cargo(["build"])
+
+    def test_fast_path_finds_the_claude_commands_build_folder(self) -> None:
+        self.seed_fast_path_tools()
+        self.cwd = self.home / ".claude"
+        git = self.cwd / ".git"
+        git.mkdir(parents=True)
+        (git / "config").touch()
+        _ = (self.cwd / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
+        build = self.root / "build"
+        output = build / "commands-fixture/main"
+        output.mkdir(parents=True)
+        lock = output.with_suffix(".lock")
+        lock.touch()
+        _ = (output / ".lint-sweep-used").write_text(f"{self.cwd}\n")
+        (self.cwd / "target").symlink_to(output, target_is_directory=True)
+        config = self.root / "fixture-config"
+        config.mkdir()
+        read_log = self.root / "config-reads"
+        self.env.update({"CONF_DIR": str(config), "XDG_RUNTIME_DIR": str(self.root / "no-bus"),
+                         "FOLDER_EXIT": "1", "CHECK_CARGO_OUTPUT_LOCK": str(lock),
+                         "CONF_READ_LOG": str(read_log)})
+        host = socket.gethostname().partition(".")[0]
+        live = config / "build_folders.conf"
+        _ = write_config_fixture(live, f"roots.workspace={self.root}\nroots.build.{host}={build}\n"
+                                 + "repo_word.claude_commands=commands-fixture\n")
+        for source in ("fixture", "repository"):
+            with self.subTest(source=source):
+                if source == "repository":
+                    fallback = self.root / "config" / live.name
+                    fallback.parent.mkdir()
+                    _ = live.rename(fallback)
+                read_log.unlink(missing_ok=True)
+                result = self.invoke("build")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(self.folder_log.exists())
+                self.assert_cargo(["build"])
+                self.assertIn("build_folders", read_log.read_text().splitlines())
 
     def test_clean_with_toolchain_or_global_option_goes_to_cargo(self) -> None:
         self.env["FOLDER_EXIT"] = "1"

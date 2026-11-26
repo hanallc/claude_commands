@@ -1,10 +1,12 @@
 """Record worktrees and end them during the production merge."""
 from __future__ import annotations
 
+import os
 import sys
 
 if __name__ == "__main__" and "--dry-run" in sys.argv:
     sys.dont_write_bytecode = True
+    _ = os.environ.pop("CONF_READ_LOG", None)
 
 try:
     with open(__file__[:__file__.rfind("/") + 1] + "../lib/package_root.py") as _package_root: exec(_package_root.read(), {"__file__": _package_root.name})
@@ -15,66 +17,53 @@ import argparse
 from collections.abc import Callable, Generator
 import errno
 import fcntl
-import hashlib
 import json
-import os
 import re
 import shlex
 import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stdout, suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from functools import cached_property
 from itertools import chain
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 from uuid import uuid4
 
+from scripts.lib import (
+    build_folder_lock, build_folders, cancellation, conf, conf_reads, copy_record, file_lock,
+    git_exclude, git_files, land_main, scratch, session_folder,
+)
+from scripts.lib.atomic_file import create_text_atomic, write_text_atomic
 from scripts.lib.process_failure import failure_detail
-from scripts.lib import build_folder_lock, build_folders, conf, conf_reads, copy_record, file_lock, git_exclude, git_files, scratch, session_folder
-from scripts.lib.atomic_file import write_text_atomic
+from scripts.production.production_names import CARGO_LINER_PRODUCTION
 from scripts.worktree import worktree_links
+from scripts.worktree.worktree_records import (
+    MakeStage as MakeStage,
+    RecordedWorktreeOutput as RecordedWorktreeOutput,
+    Refused as Refused,
+    UnassignedOutput as UnassignedOutput,
+    WorktreeRecord as WorktreeRecord,
+    checkout_record as checkout_record,
+    main_checkout as main_checkout,
+    main_checkout_for_word as _shared_main_checkout_for_word,
+    main_checkout_path,
+    read_record as read_record,
+    record_file as record_file,
+    registered_checkout,
+    registered_worktree_branches,
+    state_folder,
+    worktree_branches,
+)
 
 if TYPE_CHECKING:
     from scripts.lint import tmp_sweep
     from scripts.production import staff
-
-
-@dataclass(frozen=True)
-class UnassignedOutput:
-    """The worktree has no recorded output in the build layout."""
-
-
-@dataclass(frozen=True)
-class RecordedWorktreeOutput:
-    """The record gives the unit, short name, and output path."""
-
-    unit: str
-    short_name: str
-    output: Path
-
-
-class MakeStage(Enum):
-    MAKING = "making"
-    DONE = "done"
-
-
-@dataclass(frozen=True)
-class WorktreeRecord:
-    version: int
-    path: str
-    branch: str
-    repo: str
-    base: str
-    merge_branch: str
-    owner: str
-    made_at: str
-    layout: RecordedWorktreeOutput | UnassignedOutput = UnassignedOutput()
-    stage: MakeStage = MakeStage.DONE
 
 
 @dataclass(frozen=True)
@@ -111,10 +100,16 @@ class OriginBranchAbsent:
 
 
 @dataclass(frozen=True)
+class OriginBranchRetained:
+    reason: str
+
+
+@dataclass(frozen=True)
 class CheckedOriginTip:
     """The origin tip is contained in the local branch or the target."""
 
     sha: str
+    push_url: str
 
 
 @dataclass(frozen=True)
@@ -130,40 +125,19 @@ class CheckedLocalTip:
 @dataclass(frozen=True)
 class CleanupReady:
     local: CheckedLocalTip
-    origin: OriginBranchAbsent | CheckedOriginTip
+    origin: OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip
 
 
-class Refused(Exception):
-    def __init__(self, code: int, reason: str) -> None:
-        super().__init__(reason)
-        self.code: int = code
-
-
-def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(["git", "-C", str(repo), *arguments],
+def git(repo: Path, *arguments: str, check: bool = True,
+        input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(["git", "-C", str(repo), *arguments], input=input_text,
                             capture_output=True, text=True, check=False)
     if check and result.returncode:
         raise Refused(1, failure_detail(result))
     return result
 
 
-def state_folder() -> Path:
-    return Path(os.environ.get("WORKTREES_STATE_DIR", str(Path.home() / ".local/state/worktrees"))) / "made"
-
-
-def record_file(path: Path) -> Path:
-    return state_folder() / (hashlib.sha256(str(path).encode()).hexdigest() + ".json")
-
-
-def read_record(path: Path) -> WorktreeRecord:
-    try:
-        decoded = cast(object, json.loads(path.read_text()))
-    except ValueError as error:
-        raise ValueError(f"{path}: invalid worktree record: {error}") from error
-    if not isinstance(decoded, dict):
-        raise ValueError(f"{path}: worktree record must be an object")
-    fields = cast(dict[str, object], decoded)
-
+def _worktree_record(fields: dict[str, object], path: Path) -> WorktreeRecord:
     def text_field(name: str) -> str:
         value = fields.get(name)
         if not isinstance(value, str):
@@ -189,28 +163,74 @@ def read_record(path: Path) -> WorktreeRecord:
         made_at=text_field("made_at"), layout=layout, stage=stage)
 
 
-def has_unit_word(owner: str, unit: str) -> bool:
-    """Check if a completed record for this owner uses the unit word."""
-    for path in state_folder().glob("*.json"):
-        try:
-            record = read_record(path)
-        except (OSError, ValueError):
-            continue
-        if (record.owner == owner and record.stage is MakeStage.DONE
-                and isinstance(record.layout, RecordedWorktreeOutput) and record.layout.unit == unit):
-            return True
-    return False
-
-
 def write_record(record: WorktreeRecord) -> None:
     path = record_file(Path(record.path))
+    write_text_atomic(path, json.dumps(_record_fields(record), indent=2) + "\n")
+
+
+def _record_fields(record: WorktreeRecord) -> dict[str, object]:
     fields = cast(dict[str, object], asdict(record))
     _ = fields.pop("layout")
     fields["stage"] = record.stage.value
     if isinstance(record.layout, RecordedWorktreeOutput):
         fields.update(unit=record.layout.unit, short_name=record.layout.short_name, output=str(record.layout.output))
-    write_text_atomic(path, json.dumps(fields, indent=2) + "\n")
+    return fields
 
+
+def cargo_liner_main(repository: Path) -> Path:
+    """Require the main checkout of the local cargo-liner production."""
+    from scripts.production import production_doc, staff
+
+    owners = [row for row in production_doc.local_production_documents() if row.name == CARGO_LINER_PRODUCTION]
+    if len(owners) != 1 or not isinstance(owners[0].doc, staff.LiveDoc):
+        raise Refused(1, "cargo-liner must have one local live production document")
+    document = owners[0].doc.path
+    lines = document.read_text(encoding="utf-8").splitlines()
+    declared = Path(production_doc.production_field(lines, "Repository")).expanduser().resolve(strict=True)
+    main = git_files.at(declared)
+    if (main.git_dir != main.common_dir or git_files.locate(document.parent).common_dir != main.common_dir
+            or main_checkout(repository) != main.toplevel):
+        raise Refused(1, f"{repository}: expected the cargo-liner production repository")
+    return main.toplevel
+
+
+def retarget_cargo_liner_records(repository: Path, integration_branch: str, receipt: Path,
+                                *, reverse: bool = False) -> int:
+    """Save the original records before retargeting them. Reverse only those edits."""
+    expected = f"{CARGO_LINER_PRODUCTION}-merges-integration"
+    if integration_branch != expected:
+        raise Refused(1, f"the cargo-liner integration branch must be {expected}")
+    main = cargo_liner_main(repository)
+    if not reverse and not receipt.exists():
+        originals: list[WorktreeRecord] = []
+        for path in sorted(state_folder().glob("*.json")):
+            record = read_record(path)
+            if Path(record.repo).resolve() == main and record.merge_branch == "main":
+                originals.append(record)
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        _ = create_text_atomic(receipt, json.dumps({
+            "version": 1, "repository": str(main), "integration_branch": integration_branch,
+            "records": [_record_fields(record) for record in originals],
+        }, indent=2) + "\n")
+    saved = cast(dict[str, object], json.loads(receipt.read_text()))
+    if saved["version"] != 1 or saved["repository"] != str(main) or saved["integration_branch"] != integration_branch:
+        raise Refused(1, f"{receipt}: does not describe this cargo-liner move")
+    original_records = tuple(_worktree_record(fields, receipt)
+                             for fields in cast(list[dict[str, object]], saved["records"]))
+    if any(Path(record.repo).resolve() != main or record.merge_branch != "main" for record in original_records):
+        raise Refused(1, f"{receipt}: contains a record outside the cargo-liner main target")
+    changed = 0
+    for original in original_records:
+        updated = replace(original, merge_branch=integration_branch)
+        before, after = (updated, original) if reverse else (original, updated)
+        try:
+            current = read_record(record_file(Path(original.path)))
+        except FileNotFoundError:
+            continue
+        if current == before:
+            write_record(after)
+            changed += 1
+    return changed
 
 def enforce_build_folders() -> bool:
     """Read whether the migration permits refusal of legacy paths."""
@@ -258,13 +278,17 @@ def _target_matches(target: Path, output: Path) -> bool:
     return target.is_symlink() and target.readlink() == output
 
 
-def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = True) -> None:
+def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = True,
+                       output_parent: int | None = None) -> None:
     """Create the output and repair the checkout's target link."""
     target = checkout / "target"
     if save_existing and not target.is_symlink() and target.exists():
         _link_with_previous_target(checkout, output, target)
         return
-    ensure_output_folder(output)
+    if output_parent is None:
+        ensure_output_folder(output)
+    else:
+        _mkdir_output(output, output_parent)
     if _target_matches(target, output):
         return
     git_exclude.ensure_excluded(checkout, "/target")
@@ -283,6 +307,45 @@ def ensure_target_link(checkout: Path, output: Path, *, save_existing: bool = Tr
 
 
 _EARLIER_CARGO_TARGET = "the checkout's earlier Cargo target"
+_MAIN_STAYS = "main checkout stays in place"
+_ALREADY_MOVED = "already moved"
+_AT_DESTINATION = "already at the destination"
+# Keeps that need no further work.
+_DEFERRED_OUTPUT = "already moved; defer output: archive the old build root first"
+_SETTLED_KEEPS = frozenset((_MAIN_STAYS, _ALREADY_MOVED, _AT_DESTINATION, _DEFERRED_OUTPUT))
+
+
+class TargetReappeared(FileExistsError):
+    """A new target appeared after the move, so the link failed; `kept` holds the earlier target."""
+
+    def __init__(self, error: OSError, kept: Path) -> None:
+        super().__init__(error.errno, error.strerror, cast(object, error.filename), None, cast(object, error.filename2))
+        self.kept: Path = kept
+
+
+def _saved_target_prefix(checkout: Path) -> str:
+    return f".saved-target-{checkout.name}-"
+
+
+# Older migrations named no checkout, so such a folder can belong to any checkout beside it.
+_UNNAMED_SAVED_TARGET = re.compile(r"\.saved-target-[a-z0-9_]{8}")
+
+
+def _report_saved_targets(checkout: Path, reported: set[Path]) -> None:
+    """Report each saved-target folder beside the checkout once in a run."""
+    for saved in _saved_targets(checkout):
+        if saved not in reported:
+            reported.add(saved)
+            report_retained_folder(saved, _EARLIER_CARGO_TARGET)
+
+
+def _saved_targets(checkout: Path) -> tuple[Path, ...]:
+    """Find the folders beside the checkout that can hold its earlier target."""
+    name = re.compile(re.escape(_saved_target_prefix(checkout)) + r"[a-z0-9_]{8}")
+    with suppress(FileNotFoundError):
+        return tuple(sorted(entry for entry in checkout.parent.iterdir()
+                            if name.fullmatch(entry.name) or _UNNAMED_SAVED_TARGET.fullmatch(entry.name)))
+    return ()
 
 
 def _link_with_previous_target(checkout: Path, output: Path, previous: Path) -> None:
@@ -301,16 +364,27 @@ def _link_with_previous_target(checkout: Path, output: Path, previous: Path) -> 
                 raise ValueError(f"{output}: the build folder lock is held. Rerun when idle") from error
         if not build_folder_lock.lock_current(output, parent, descriptor):
             raise ValueError(f"{output}: the build folder lock changed. Rerun when idle")
-        _ensure_output_directory(output, parent)
+        build_folder_lock.mark_lock(descriptor)
+        if not build_folders.allocation_parent_current(output, parent):
+            raise ValueError(f"{output}: the build folder parent changed. Rerun when idle")
+        _mkdir_output(output, parent)
         if stat.S_ISDIR(previous.lstat().st_mode):
-            try:
-                os.rename(previous, output.name, dst_dir_fd=parent)
-            except OSError as error:
-                if error.errno not in (errno.EXDEV, errno.EEXIST, errno.ENOTEMPTY, errno.EBUSY):
-                    raise
-            else:
-                target.symlink_to(output, target_is_directory=True)
-                return
+            # A stop between the rename and the link leaves the checkout with no target.
+            with cancellation.defer_cleanup_signals():
+                try:
+                    os.rename(previous, output.name, dst_dir_fd=parent)
+                except OSError as error:
+                    if error.errno not in (errno.EXDEV, errno.EEXIST, errno.ENOTEMPTY, errno.EBUSY):
+                        raise
+                else:
+                    try:
+                        target.symlink_to(output, target_is_directory=True)
+                    except OSError as error:
+                        if os.path.lexists(target):
+                            raise TargetReappeared(error, output) from error
+                        os.rename(output.name, previous, src_dir_fd=parent)
+                        raise
+                    return
         if previous == target:
             _save_target_and_link(target, output)
         else:
@@ -319,37 +393,49 @@ def _link_with_previous_target(checkout: Path, output: Path, previous: Path) -> 
 
 
 def _save_target_and_link(target: Path, output: Path) -> None:
-    saved = Path(tempfile.mkdtemp(prefix=".saved-target-", dir=target.parent.parent)) / "target"
-    try:
-        _ = target.rename(saved)
-    except OSError:
-        report_retained_folder(saved.parent, "target move failed")
-        raise
-    try:
-        target.symlink_to(output, target_is_directory=True)
-    except OSError:
-        if not os.path.lexists(target):
-            _ = saved.rename(target)
-            report_retained_folder(saved.parent, "target link creation failed")
-        else:
-            report_retained_folder(saved.parent, _EARLIER_CARGO_TARGET)
-        raise
+    saved = Path(tempfile.mkdtemp(prefix=_saved_target_prefix(target.parent), dir=target.parent.parent)) / "target"
+    with cancellation.defer_cleanup_signals():
+        try:
+            _ = target.rename(saved)
+        except OSError:
+            report_retained_folder(saved.parent, "target move failed")
+            raise
+        try:
+            target.symlink_to(output, target_is_directory=True)
+        except OSError as error:
+            if not os.path.lexists(target):
+                _ = saved.rename(target)
+                report_retained_folder(saved.parent, "target link creation failed")
+            else:
+                report_retained_folder(saved.parent, _EARLIER_CARGO_TARGET)
+                if isinstance(error, FileExistsError):
+                    raise TargetReappeared(error, saved) from error
+            raise
     report_retained_folder(saved.parent, _EARLIER_CARGO_TARGET)
 
 
-def ensure_output_folder(output: Path) -> None:
-    """Create the output without following links below the build root."""
-    with build_folder_lock.folder_parent(output, build_folders.build_root(), create=True) as parent:
-        _ensure_output_directory(output, parent)
-
-
-def _ensure_output_directory(output: Path, parent: int) -> None:
+def _mkdir_output(output: Path, parent: int) -> None:
     try:
         os.mkdir(output.name, dir_fd=parent)
     except FileExistsError:
         mode = os.stat(output.name, dir_fd=parent, follow_symlinks=False).st_mode
         if not stat.S_ISDIR(mode):
             raise ValueError(f"{output}: expected a real output folder") from None
+
+
+def ensure_output_folder(output: Path) -> None:
+    """Create the output under the current parent without following links."""
+    for _attempt in range(2):
+        with build_folder_lock.folder_parent(output, build_folders.build_root(), create=True) as parent:
+            try:
+                _mkdir_output(output, parent)
+            except FileNotFoundError:
+                if build_folder_lock.parent_current(output, parent):
+                    raise
+                continue
+            if build_folder_lock.parent_current(output, parent):
+                return
+    raise FileNotFoundError(f"{output}: the build folder parent changed")
 
 
 def worktree_output(path: Path) -> RecordedWorktreeOutput | UnassignedOutput:
@@ -383,7 +469,7 @@ def retire(unit: str) -> None:
         return
     for repo in sorted(root.iterdir()):
         if (repo.name in build_folders.BUILD_ROOT_EXCEPTIONS
-                or repo.name in ("cargo", "paths", "slot", "hana-ci")
+                or repo.name in ("cargo", "paths", "hana-ci")
                 or repo.name.startswith("old-") or repo.is_symlink() or not repo.is_dir()):
             continue
         folder = build_folders.unit_folder(repo.name, unit)
@@ -448,11 +534,10 @@ def only_target_merges(record: WorktreeRecord) -> bool:
     return True
 
 
-def landed(record: WorktreeRecord) -> Landed | NotLanded:
+def landed(record: WorktreeRecord, target: str) -> Landed | NotLanded:
     repo = Path(record.repo)
     if not has_branch(repo, record.branch):
         return Landed()
-    target = f"refs/remotes/origin/{record.merge_branch}"
     branch = f"refs/heads/{record.branch}"
     ancestor = git(repo, "merge-base", "--is-ancestor", branch, target, check=False)
     if ancestor.returncode == 0:
@@ -489,24 +574,6 @@ def landed(record: WorktreeRecord) -> Landed | NotLanded:
     return Landed()
 
 
-def _registered_worktree_branches(repo: Path) -> Generator[tuple[Path, str]]:
-    path = repo
-    for field in git(repo, "worktree", "list", "--porcelain", "-z").stdout.split("\0"):
-        if field.startswith("worktree "):
-            path = Path(field.removeprefix("worktree "))
-        elif field.startswith("branch refs/heads/"):
-            yield path, field.removeprefix("branch refs/heads/")
-
-
-def worktree_branches(repo: Path) -> dict[Path, str]:
-    return {path.resolve(): branch for path, branch in _registered_worktree_branches(repo)}
-
-
-def main_checkout(repo: Path) -> Path:
-    first = git(repo, "worktree", "list", "--porcelain", "-z").stdout.split("\0", 1)[0]
-    return Path(first.removeprefix("worktree ")).resolve()
-
-
 def new_record(path: Path, branch: str, repo: Path, base: str,
                owner: str, merge_branch: str) -> WorktreeRecord:
     return WorktreeRecord(1, str(path), branch, str(repo), base, merge_branch, owner,
@@ -519,12 +586,54 @@ def local_branch_tip(repo: Path, branch: str) -> LocalBranchAbsent | CheckedLoca
     return CheckedLocalTip(git(repo, "rev-parse", "--verify", f"refs/heads/{branch}").stdout.strip())
 
 
-def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedOriginTip | Kept:
+def origin_push_urls(repo: Path) -> tuple[str, ...]:
+    if "origin" not in git(repo, "remote").stdout.splitlines():
+        return ()
+    urls = tuple(git(repo, "remote", "get-url", "--push", "--all", "origin").stdout.splitlines())
+    if not urls or any(not url for url in urls):
+        raise Refused(1, "origin has no usable push destination")
+    return urls
+
+
+def single_push_url(urls: tuple[str, ...]) -> str:
+    if len(urls) != 1:
+        raise Refused(1, "origin deletion requires one push destination")
+    return urls[0]
+
+
+def origin_retention(ref: str) -> str:
+    from scripts.production import production_doc
+
+    try:
+        return production_doc.origin_ref_protection(ref)
+    except production_doc.ProductionPathsError as error:
+        return str(error)
+
+
+def push_destination_heads(repo: Path, url: str, *patterns: str) -> dict[str, str]:
+    if git(repo, "ls-remote", "--get-url", "--", url).stdout.rstrip("\n") != url:
+        raise Refused(1, "Git rewrites the resolved push destination")
+    heads = git(repo, "ls-remote", "--heads", "--", url, *patterns).stdout.splitlines()
+    return {name: tip for tip, name in (line.split("\t", 1) for line in heads)}
+
+
+def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip | Kept:
     repo = Path(record.repo)
-    remote_branch = git(repo, "ls-remote", "--heads", "origin", f"refs/heads/{record.branch}").stdout
-    if not remote_branch:
+    ref = f"refs/heads/{record.branch}"
+    if reason := origin_retention(ref):
+        return OriginBranchRetained(reason)
+    urls = origin_push_urls(repo)
+    if not urls:
         return OriginBranchAbsent()
-    tip = remote_branch.split()[0]
+    url = single_push_url(urls)
+    tip = push_destination_heads(repo, url, ref).get(ref)
+    if tip is None:
+        return OriginBranchAbsent()
+    return check_origin_landing(record, CheckedOriginTip(tip, url))
+
+
+def check_origin_landing(record: WorktreeRecord, origin: CheckedOriginTip) -> CheckedOriginTip | Kept:
+    repo, tip = Path(record.repo), origin.sha
     reason = f"origin has commits that the local branch lacks: {tip}"
     commit = git(repo, "cat-file", "-e", f"{tip}^{{commit}}", check=False)
     if commit.returncode in (1, 128):
@@ -540,25 +649,42 @@ def origin_branch_state(record: WorktreeRecord) -> OriginBranchAbsent | CheckedO
         return Kept(Path(record.path), reason)
     if ancestor.returncode:
         raise Refused(1, ancestor.stderr.strip())
-    return CheckedOriginTip(tip)
+    return origin
 
 
-def dirty_check(path: Path) -> Kept | Clean:
-    """Keep a checkout with uncommitted changes, and name them on one line."""
-    dirty = git(path, "status", "--porcelain").stdout
+def dirty_check(path: Path, *, all_untracked: bool = False) -> Kept | Clean:
+    """Keep a checkout with uncommitted changes and list them on one line."""
+    options = ("--untracked-files=all",) if all_untracked else ()
+    dirty = git(path, "status", "--porcelain", *options).stdout
     return Kept(path, "dirty worktree: " + " ".join(dirty.splitlines())) if dirty else Clean()
 
 
-def cleanup(path: Path) -> CleanupReady | Kept:
-    _ = git(path, "fetch", "--no-prune", "origin")
-    if isinstance(dirty := dirty_check(path), Kept):
-        return dirty
+def origin_cleanup_tip(repo: Path, branch: str | land_main.RemoteDefaultBranch) -> land_main.AdvertisedBranchTip:
+    try:
+        return land_main.remote_branch_tip(repo, "origin", branch)
+    except land_main.RemoteBranchMissing as error:
+        reason = (f"refs/heads/{branch}: origin branch is missing" if isinstance(branch, str)
+                  else "origin default branch is missing")
+        raise Refused(1, reason) from error
+    except land_main.LandError as error:
+        raise Refused(1, str(error)) from error
+
+
+def check_local_cleanup(path: Path) -> tuple[CheckedLocalTip, WorktreeRecord] | Kept:
+    from scripts.production import production_doc
+
     head = git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
-    if head.returncode == 1:
-        return Kept(path, "HEAD is detached")
-    if head.returncode:
+    if head.returncode not in (0, 1):
         raise Refused(1, head.stderr.strip())
     branch = head.stdout.strip()
+    try:
+        production_doc.require_removable_checkout(path, path, branch)
+    except production_doc.ProductionPathsError as error:
+        return Kept(path, str(error))
+    if isinstance(dirty := dirty_check(path), Kept):
+        return dirty
+    if head.returncode == 1:
+        return Kept(path, "HEAD is detached")
     repo = main_checkout(path)
     local = local_branch_tip(repo, branch)
     if isinstance(local, LocalBranchAbsent):
@@ -573,22 +699,27 @@ def cleanup(path: Path) -> CleanupReady | Kept:
         if record.stage is MakeStage.MAKING:
             return Kept(path, "worktree creation is incomplete")
     if record is None or not record.merge_branch:
-        default = git(repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
-        if default.returncode == 1:
-            raise Refused(1, "origin default branch is missing")
-        if default.returncode:
-            raise Refused(1, default.stderr.strip())
-        target = default.stdout.strip()
-        base = git(repo, "merge-base", f"refs/heads/{branch}", target).stdout.strip()
-        record = new_record(path, branch, repo, base, "", target.removeprefix("refs/remotes/origin/"))
-    result = landed(record)
+        target = origin_cleanup_tip(repo, land_main.RemoteDefaultBranch.HEAD)
+        base = git(repo, "merge-base", f"refs/heads/{branch}", target.commit).stdout.strip()
+        record = new_record(path, branch, repo, base, "", target.branch)
+    else:
+        target = origin_cleanup_tip(repo, record.merge_branch)
+    result = landed(record, target.commit)
     if isinstance(result, NotLanded):
         return Kept(path, "work has not landed: " + " ".join((*result.commits, *result.paths)))
+    if local_branch_tip(repo, branch) != local:
+        return Kept(path, "the local branch changed during the cleanup check")
+    return local, record
+
+
+def cleanup(path: Path) -> CleanupReady | Kept:
+    local_check = check_local_cleanup(path)
+    if isinstance(local_check, Kept):
+        return local_check
+    local, record = local_check
     origin = origin_branch_state(record)
     if isinstance(origin, Kept):
         return origin
-    if local_branch_tip(repo, branch) != local:
-        return Kept(path, "the local branch changed during the cleanup check")
     return CleanupReady(local, origin)
 
 
@@ -604,25 +735,41 @@ def release_worktree_pair(path: Path) -> None:
         print(f"Worktree pair kept for {str(path)!r}: {result.value}", file=sys.stderr)
 
 
+def recorded_worktree_change(path: Path, repo: Path, branch: str) -> str:
+    if path.exists():
+        if git_files.at(path).common_dir != git_files.at(repo).common_dir:
+            return "the worktree belongs to a different repository"
+        if isinstance(dirty := dirty_check(path, all_untracked=True), Kept):
+            return dirty.reason
+        head = git(path, "symbolic-ref", "-q", "HEAD", check=False)
+        expected = f"refs/heads/{branch}"
+        if head.returncode or head.stdout.strip() != expected:
+            return head.stderr.strip() or f"HEAD is {head.stdout.strip() or 'detached'}; expected {expected}"
+    return ""
+
+
 def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended | Kept:
     from scripts.agents import remote
-    from scripts.production import session_staff
+    from scripts.production import production_doc, session_staff
 
     path, repo = Path(record.path), Path(record.repo)
+    try:
+        production_doc.require_removable_checkout(path, repo, record.branch)
+    except production_doc.ProductionPathsError as error:
+        return Kept(path, str(error))
+
     if record.stage is MakeStage.MAKING:
         return Kept(path, "worktree creation is incomplete")
     resolver = session_staff.RowResolver(snapshot)
     member = resolver.member_by_folder(remote.local_machine(), path)
     if isinstance(member, session_staff.MemberFound):
         return Kept(path, f"staff member {member.row.name} holds this worktree")
-    if path.exists():
-        if isinstance(dirty := dirty_check(path), Kept):
-            return dirty
-        head = git(path, "symbolic-ref", "-q", "HEAD", check=False)
-        expected = f"refs/heads/{record.branch}"
-        if head.returncode or head.stdout.strip() != expected:
-            reason = head.stderr.strip() or f"HEAD is {head.stdout.strip() or 'detached'}; expected {expected}"
-            return Kept(path, reason)
+    if reason := recorded_worktree_change(path, repo, record.branch):
+        return Kept(path, reason)
+    holder = next((peer for peer, name in worktree_branches(repo).items()
+                   if peer != path and name == record.branch), None)
+    if holder is not None:
+        return Kept(path, f"Git registers branch {record.branch} at {holder}")
     if has_branch(repo, record.branch) and not git(
             repo, "rev-list", "-n", "1", f"{record.base}..refs/heads/{record.branch}").stdout.strip():
         # A tree with no commit of its own can be in use before its first commit.
@@ -630,7 +777,7 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
     if has_branch(repo, record.branch) and only_target_merges(record):
         return Kept(path, "only merges of the target outside it")
     local = local_branch_tip(repo, record.branch)
-    result = landed(record)
+    result = landed(record, f"refs/remotes/origin/{record.merge_branch}")
     if isinstance(result, NotLanded):
         detail = "\n".join((*result.commits, *result.paths))
         return Kept(path, f"work has not landed: {detail}")
@@ -641,7 +788,7 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         return Kept(path, "the local branch changed after the cleanup check")
     checkout_present = os.path.lexists(path)
     if not checkout_present:
-        for registered, branch in _registered_worktree_branches(repo):
+        for registered, branch in registered_worktree_branches(repo):
             if registered.resolve() == path:
                 checkout_present = True
             elif branch == record.branch:
@@ -652,11 +799,17 @@ def end_record(record: WorktreeRecord, snapshot: staff.StaffSnapshot) -> Ended |
         reason = "the checkout landed and requires manual review"
         report_retained_folder(path, reason)
         return Kept(path, reason)
-    if isinstance(origin, CheckedOriginTip):
-        deletion = git(repo, "push", f"--force-with-lease=refs/heads/{record.branch}:{origin.sha}",
-                       "origin", "--delete", record.branch, check=False)
-        if deletion.returncode:
-            return Kept(path, "origin branch deletion failed: " + failure_detail(deletion))
+    ref = f"refs/heads/{record.branch}"
+    if isinstance(origin, OriginBranchRetained):
+        print(f"Kept origin ref {ref}: {origin.reason}")
+    elif isinstance(origin, CheckedOriginTip):
+        from scripts.lib import origin_deletion
+
+        deletion = origin_deletion.delete(repo, "origin", ref, origin.sha, expected_push_url=origin.push_url)
+        if isinstance(deletion, origin_deletion.Kept):
+            if deletion.cause is origin_deletion.RetentionCause.GIT_FAILURE:
+                return Kept(path, f"origin branch deletion failed: {deletion.reason}")
+            print(f"Kept origin ref {ref}: {deletion.reason}")
     if isinstance(local, CheckedLocalTip):
         deletion = git(repo, "update-ref", "-d", f"refs/heads/{record.branch}", local.sha, check=False)
         if deletion.returncode:
@@ -790,15 +943,6 @@ def empty_checkout_path(path: Path) -> bool:
     return not path.is_symlink() and path.is_dir() and not any(path.iterdir())
 
 
-def registered_checkout(path: Path, repo: Path, branch: str) -> bool:
-    if path.is_symlink() or path == repo or worktree_branches(repo).get(path.resolve()) != branch:
-        return False
-    try:
-        return git_files.at(path).common_dir == git_files.at(repo).common_dir
-    except git_files.GitFilesError:
-        return False
-
-
 def pending_checkout(path: Path, source: Path, branch: str) -> bool:
     """Identify an interrupted make before Git registers its checkout."""
     record = checkout_record(path)
@@ -836,20 +980,18 @@ def _finish_checkout(path: Path, source: Path,
         raise
 
 
-def _main_checkout_path(repo: str) -> Path:
-    alias_key = "repo_word.claude_commands"
-    alias = conf.read_or_repository("build_folders").values(alias_key).get(alias_key)
-    return Path.home() / (".claude" if repo == alias else f"rust/{repo}")
+class UnknownRepoWord(ValueError):
+    """No main checkout matches the repo word."""
 
 
 def main_checkout_for_word(repo: str) -> Path:
     """Verify the main checkout selected by the repo word."""
-    source = _main_checkout_path(repo)
-    if not (source / ".git").is_dir() or source.is_symlink() or main_checkout(source) != source.resolve():
-        raise ValueError(f"{source}: no main checkout for {repo!r}")
-    if build_folders.repo_word(source) != repo:
-        raise ValueError(f"{source}: the repo word {repo!r} differs from origin")
-    return source.resolve()
+    try:
+        return _shared_main_checkout_for_word(repo)
+    except (build_folders.InvalidFolderForm, conf.Unusable):
+        raise
+    except ValueError as error:
+        raise UnknownRepoWord(str(error)) from error
 
 
 @dataclass(frozen=True)
@@ -922,10 +1064,17 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
 
     Call before_report after all checks and before the first notice.
     """
+    from scripts.production import production_doc
+
     _ = force
-    if path.exists() and git_files.at(path).common_dir != git_files.locate(repository).common_dir:
-        raise ValueError(f"{path}: worktree belongs to another repository")
-    if path == main_checkout(repository):
+    if path.exists():
+        checkout = git_files.at(path)
+        if checkout.common_dir != git_files.locate(repository).common_dir:
+            raise ValueError(f"{path}: worktree belongs to another repository")
+        is_main = checkout.git_dir == checkout.common_dir
+    else:
+        is_main = path == main_checkout(repository)
+    if is_main:
         raise ValueError(f"{path}: cannot remove the main checkout")
     layout = worktree_output(path)
     reason = "the checkout is selected for removal"
@@ -935,9 +1084,14 @@ def remove_git_checkout(path: Path, repository: Path, *, force: bool = False, re
         if isinstance(output, Path):
             report_retained_folder(output, reason)
 
+    registered = worktree_branches(repository)
+    try:
+        production_doc.require_removable_checkout(path, repository, registered.get(path, ""))
+    except production_doc.ProductionPathsError as error:
+        raise Refused(1, str(error)) from error
+    retain_checkout = os.path.lexists(path) or _is_registered_worktree(path, repository)
     if before_report is None:
         report_output()
-    retain_checkout = os.path.lexists(path) or path in worktree_branches(repository)
     if before_report is not None and (isinstance(output, Path) or retain_checkout):
         before_report()
         report_output()
@@ -981,7 +1135,7 @@ def remove_named(unit: str, short_name: str) -> list[str]:
             first_line = str(error).partition("\n")[0]
             lines.append(f"{path} not removed: {first_line}")
             continue
-        command = shlex.join(["env", f"--chdir={repo}", str(Path.home() / ".claude/scripts/lib/py"),
+        command = shlex.join([str(Path.home() / ".claude/scripts/lib/py"),
                               str(Path.home() / ".claude/scripts/worktree/worktrees.py"), "remove", str(path)])
         lines.append(f"{path} kept: {state.reason}. Save the work, then run: {command}")
     return lines
@@ -1041,8 +1195,6 @@ class UnitFolderRename:
             for folder in (old, new):
                 for name in sorted(names):
                     path = folder / name
-                    _ = locks.enter_context(build_folder_lock.folder_parent(
-                        path, build_folders.build_root(), create=True))
                     lease = locks.enter_context(build_folders.folder_removal_lease(
                         path, root=build_folders.build_root(), create=True, wait=False))
                     if not isinstance(lease, build_folders.HeldFolderRemovalLease):
@@ -1549,9 +1701,11 @@ def _source_signature(source: Path) -> dict[Path, tuple[int, int, int]]:
 def _discard_changed_stage(journal: MoveJournal) -> None:
     stage = journal.staging
     try:
-        if not journal.destination.matches(stage):
+        status = stage.lstat()
+        if not stat.S_ISDIR(status.st_mode) or journal.destination != FolderIdentity(status.st_dev, status.st_ino):
             raise ValueError("the stage identity changed")
-        shutil.rmtree(stage)
+        if not build_folders.remove_build_folder(stage, wait=False, expected=status):
+            report_retained_folder(stage, "cannot discard the stage after the source changed")
     except (OSError, ValueError):
         report_retained_folder(stage, "cannot discard the stage after the source changed")
 
@@ -1956,6 +2110,10 @@ def linked_trees(repo: Path) -> tuple[RegisteredTree, ...]:
     return tuple(entries)
 
 
+def _is_registered_worktree(path: Path, repository: Path) -> bool:
+    return any(tree.path.resolve() == path for tree in linked_trees(repository))
+
+
 @dataclass(frozen=True)
 class StaffUnitName:
     name: str
@@ -2013,18 +2171,48 @@ class ListedWorktree:
 class MigrationScope(Enum):
     LISTED = "listed worktrees"
     ALL = "all worktrees"
+    REPOSITORY = "one repository"
 
 
 @dataclass(frozen=True)
 class MigrationSelection:
     scope: MigrationScope
     listed: dict[Path, ListedWorktree]
+    repo: str = ""
+    members: frozenset[Path] = frozenset()
 
     def includes(self, path: Path) -> bool:
-        return self.scope is MigrationScope.ALL or path in self.listed
+        match self.scope:
+            case MigrationScope.ALL:
+                return True
+            case MigrationScope.LISTED:
+                return path in self.listed
+            case MigrationScope.REPOSITORY:
+                return path in self.members
+
+    def plans_main(self, repo: str) -> bool:
+        return self.scope is MigrationScope.ALL or (self.scope is MigrationScope.REPOSITORY and repo == self.repo)
 
     def includes_journal(self, journal: MoveJournal) -> bool:
         return any(self.includes(path) for path in (journal.move.old, journal.move.new, journal.source_key))
+
+
+def repository_selection(repo: str, listed: dict[Path, ListedWorktree],
+                         folders: MigrationFolders) -> MigrationSelection:
+    """Select the main checkout of one repository, its worktrees, its scratch clones, and its saved moves."""
+    main = main_checkout_for_word(repo)
+    members = {main, *(tree.path for tree in linked_trees(main))}
+    for clone in _scratch_checkouts(folders.scratch):
+        try:
+            if _repository_names(clone, follow_local_origin=True).word == repo:
+                members.update((clone, *(tree.path for tree in linked_trees(clone))))
+        except (build_folders.InvalidFolderForm, Refused, git_files.GitFilesError, OSError, UnicodeError):
+            continue
+    for path in sorted(move_folder().glob("*.json")):
+        journal = read_move(path)
+        if journal.move.repo == repo:
+            members.update((journal.move.old, journal.move.new, journal.source_key))
+    return MigrationSelection(MigrationScope.REPOSITORY, listed, repo, frozenset(members))
 
 
 def listed_worktrees(path: Path, folders: MigrationFolders, snapshot: staff.StaffSnapshot) -> dict[Path, ListedWorktree]:
@@ -2069,17 +2257,6 @@ def _subject_unit(path: Path) -> str:
     subject = git(path, "log", "-1", "--format=%s", "--grep=^checkpoint(", "--grep=^shrink(", "HEAD").stdout
     match = re.match(r"^(?:checkpoint|shrink)\(([^)]+)\)", subject)
     return match[1] if match else ""
-
-
-def checkout_record(path: Path) -> WorktreeRecord | None:
-    """Read the record for this checkout path if it exists."""
-    try:
-        value = read_record(record_file(path))
-    except FileNotFoundError:
-        return None
-    if value.path != str(path):
-        raise ValueError(f"{path}: worktree record names a different path")
-    return value
 
 
 @dataclass(frozen=True)
@@ -2213,7 +2390,8 @@ def _migration_maker_roots(scratch: Path, settings: conf.ConfigRead) -> tuple[Pa
     values = settings.settings
     if isinstance(values, dict) and (setting := values.get("roots.scratch")) is not None and setting.value:
         former_scratch = Path(setting.value).expanduser()
-    roots = (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate"), scratch.parents[1] / "slot",
+    user_roots = tuple(scratch.parents[1] / name for name in sorted(build_folders.USER_REMOVAL_ROOTS))
+    roots = (Path("/tmp/claude/unit"), Path("/tmp/claude/delegate"), *user_roots,
              session_folder.configured_root().resolve(), Path.home() / ".local")
     former_scratch = former_scratch.resolve()
     return roots if former_scratch == scratch else (*roots, former_scratch)
@@ -2316,6 +2494,10 @@ class WorktreeMigration:
     main: tuple[MainOutputPlan, ...]
     clone_members: dict[Path, tuple[Path, ...]]
     skipped: dict[Path, str]
+    # Moved checkouts whose target is a real folder or missing, so it still needs the link to the recorded output.
+    moved: tuple[Path, ...] = ()
+    # Other moved checkouts that have a folder with an earlier target.
+    saved: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2445,7 +2627,7 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
                if journal.stage is MoveStage.PLANNED and journal.git_entry != Path(".git")}
     repaired_entries = {journal.move.new: journal for journal in repairs.values()}
     clones: dict[Path, tuple[RegisteredTree, ...]] = {}
-    skipped = {path: "main checkout stays in place" for path in mains} | journals.kept
+    skipped = {path: _MAIN_STAYS for path in mains} | journals.kept
     trees: list[RegisteredTree] = []
     for path in _scratch_checkouts(scratch_root):
         reason = _migration_path_keep(path, folders)
@@ -2486,9 +2668,9 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
             continue
         repos[repo] = names
         if repo in mains:
-            primary = _main_checkout_path(names.word)
+            primary = main_checkout_path(names.word)
             if not primary.is_symlink() and repo == primary.resolve():
-                if selection.scope is MigrationScope.ALL:
+                if selection.plans_main(names.word):
                     main_plans.append(MainOutputPlan(repo, names.word))
             else:
                 skipped[repo] = f"keeps its current output; {primary} is the main checkout for {names.word}"
@@ -2548,8 +2730,8 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
             else:
                 validated.append(tree)
 
-    placed_destinations = {journal.move.new for journal in journals.relocated
-                           if journal.stage is not MoveStage.FINISHED}
+    recovering = {journal.move.new for journal in journals.relocated if journal.stage is not MoveStage.FINISHED}
+    placed_destinations = recovering.copy()
     finished_destinations: dict[Path, list[FolderIdentity]] = {}
     for journal in journals.relocated:
         path = journal.move.new
@@ -2577,7 +2759,7 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
             continue
         if path in placed_destinations:
             already_placed.add(path)
-            skipped[path] = "already moved"
+            skipped[path] = _ALREADY_MOVED
         elif selection.includes(path):
             candidates.append(tree)
 
@@ -2654,7 +2836,7 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
             skipped[path] = str(error)
             continue
         if new == path:
-            skipped[path] = "already at the destination"
+            skipped[path] = _AT_DESTINATION
             continue
         if os.path.lexists(new):
             skipped[path] = f"short name occupied at {new}"
@@ -2692,9 +2874,14 @@ def plan_worktree_migration(selection: MigrationSelection, snapshot: staff.Staff
     for path in listed.keys() - registered_paths - skipped.keys() - former:
         skipped[path] = "no registered worktree at this path"
     ordered = tuple(sorted(selected.values(), key=lambda plan: (plan.tree.path in clones, plan.tree.path)))
+    placed = sorted(path for path in already_placed if selection.includes(path))
+    # Journal recovery handles the output for each unfinished move.
+    moved = tuple(path for path in placed if path not in recovering
+                  and (_is_real_target(path / "target") or not os.path.lexists(path / "target")))
     return WorktreeMigration(ordered, tuple(tree for tree in stale if selection.includes(tree.path)),
                              tuple(main_plans), clone_members,
-                             {path: reason for path, reason in skipped.items() if selection.includes(path)})
+                             {path: reason for path, reason in skipped.items() if selection.includes(path)},
+                             moved, tuple(path for path in placed if path not in moved and _saved_targets(path)))
 
 
 _NO_PROBE_FDS: frozenset[int] = frozenset()
@@ -2899,7 +3086,8 @@ def _take_migration_locks(source: Path, folders: MigrationFolders, locks: ExitSt
         leased.add(lease_path)
         lease = locks.enter_context(build_folders.folder_removal_lease(
             lease_path, children=covered and not isinstance(copy, Path), wait=False,
-            create=create and isinstance(copy, Path), probe_fds=fds))
+            create=create and isinstance(copy, Path), root=folders.build_root if isinstance(copy, Path) else None,
+            probe_fds=fds))
         if isinstance(lease, build_folders.RemovalLockHeld):
             raise MigrationInUse(f"kept: {lease.lock} held")
         if isinstance(lease, build_folders.RefusedRemovalLease):
@@ -3024,6 +3212,7 @@ class MigrationProgress:
     in_use: dict[Path, str]
     kernel_hidden: dict[int, str]
     moved: int = 0
+    reported_saved_targets: set[Path] = field(default_factory=set[Path])
 
     def record_process_scan(self, uses: tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable) -> None:
         from scripts.lint import tmp_sweep
@@ -3146,10 +3335,10 @@ def _migration_clone_keep(plan: WorktreeMigration, progress: MigrationProgress,
     return ""
 
 
-def _scratch_backups_needing_recovery(scratch: Path) -> Generator[Path]:
+def _scratch_backups_needing_recovery(scratch: Path, selection: MigrationSelection) -> Generator[Path]:
     for path in sorted(move_folder().glob("*.json")):
         journal = read_move(path)
-        if not journal.copy_tag or journal.stage is MoveStage.FINISHED:
+        if not journal.copy_tag or journal.stage is MoveStage.FINISHED or not selection.includes_journal(journal):
             continue
         backup = journal.backup
         if not backup.is_relative_to(scratch) or not journal.source.matches(backup):
@@ -3159,7 +3348,8 @@ def _scratch_backups_needing_recovery(scratch: Path) -> Generator[Path]:
         yield backup
 
 
-def migrate_worktrees(list_file: Path | None, *, dry_run: bool, scope: MigrationScope = MigrationScope.LISTED) -> int:
+def migrate_worktrees(list_file: Path | None, *, dry_run: bool, scope: MigrationScope = MigrationScope.LISTED,
+                      repo: str = "") -> int:
     try:
         with ExitStack() as locks:
             if dry_run:
@@ -3167,18 +3357,151 @@ def migrate_worktrees(list_file: Path | None, *, dry_run: bool, scope: Migration
             folders = MigrationFolders.configured()
             snapshot = staff_record()
             listed = listed_worktrees(list_file, folders, snapshot) if list_file is not None else {}
-            selection = MigrationSelection(scope, listed)
+            if scope is MigrationScope.REPOSITORY:
+                try:
+                    selection = repository_selection(repo, listed, folders)
+                except UnknownRepoWord as error:
+                    return _unknown_repo(repo, error)
+            else:
+                selection = MigrationSelection(scope, listed)
             _ = locks.enter_context(move_lock(create=not dry_run))
             try:
                 status = _apply_migration(selection, snapshot, folders, dry_run=dry_run)
             finally:
-                backups = tuple(_scratch_backups_needing_recovery(folders.scratch)) if not dry_run and scope is MigrationScope.ALL else ()
+                backups = (tuple(_scratch_backups_needing_recovery(folders.scratch, selection))
+                           if not dry_run and scope is not MigrationScope.LISTED else ())
                 for backup in backups:
                     print(f"{backup}: keep the old build root until the move can resume from this backup", file=sys.stderr)
             return 1 if backups else status
     except WorktreeMoveLockHeld as error:
         print(f"kept: {error.lock} held")
         return error.code
+
+
+def _unknown_repo(repo: str, error: UnknownRepoWord) -> int:
+    print(f"migrate --repo {repo}: {error}", file=sys.stderr)
+    return 2
+
+
+# The Mac copy of this script runs the guarded switch for one repository.
+_MAC_MIGRATE = "~/.claude/scripts/lib/py ~/.claude/scripts/worktree/worktrees.py migrate --repo"
+
+
+def migrate_on_mac(repo: str, *, dry_run: bool) -> int:
+    """Hold the repository's Mac claim on natedev while the Mac switches that repository's outputs."""
+    from scripts.build_queue import mac_run
+    from scripts.mac_test import mac_test
+
+    command = f"{_MAC_MIGRATE} {shlex.quote(repo)}" + (" --dry-run" if dry_run else "")
+    if dry_run:
+        return _run_on_mac(command)
+    try:
+        checkout = main_checkout_for_word(repo)
+    except UnknownRepoWord as error:
+        return _unknown_repo(repo, error)
+    try:
+        with mac_run.repository_claim(checkout, "mac", f"migrate --repo {repo}", mac_test.MacClaimKind.MIRROR):
+            return _run_on_mac(command)
+    except mac_run.MacRunRefused as error:
+        print(f"kept: {repo}: {error}")
+    return 1
+
+
+def _run_on_mac(command: str) -> int:
+    """Run the command on the Mac with the configured SSH keepalive."""
+    from scripts.build_targets import mac_linux, target_config
+    from scripts.mac_test import eligibility
+
+    connection = eligibility.read_connection_settings(target_config.configured_ssh_target("mac").settings)
+    return _run_ssh(("ssh", *mac_linux.SSH_OPTIONS, "-o", f"ConnectTimeout={mac_linux.SSH_CONNECT_TIMEOUT_SECONDS}",
+                     *eligibility.server_alive_options(connection.unreachable_wait_s), connection.host, command))
+
+
+def _run_ssh(command: tuple[str, ...]) -> int:
+    """Run ssh with stops deferred until it ends, so the claim lasts while the Mac command runs."""
+    # ssh runs in its own session, so a terminal or pane signal reaches only this process, which waits.
+    with cancellation.defer_cleanup_signals():
+        return subprocess.run(command, stdin=subprocess.DEVNULL, start_new_session=True, check=False).returncode
+
+
+def _hold_idle_target(target: Path, held: ExitStack) -> frozenset[int] | str:
+    """Hold every Cargo lock in the target folder and give their descriptors, or give the lock that is held."""
+    from scripts.lint import sweep
+
+    # A Cargo build folder holds no nested build folder, so the walk stops at one; its output folders are skipped.
+    skipped = {*sweep.HASHED_DIRS, sweep.INCREMENTAL_DIR, sweep.DOC_DIR}
+    trees: list[str] = []
+    for folder, children, files in os.walk(target):
+        if any(name in files for name in sweep.LOCK_NAMES):
+            trees.append(folder)
+            children.clear()
+        else:
+            children[:] = [child for child in children if child not in skipped]
+    locks = sweep.lock_trees(sorted(trees))
+    if isinstance(locks, sweep.TargetLockBusy):
+        return f"kept: {locks.path} held"
+    _ = held.callback(sweep.release, locks.held)
+    return frozenset(locks.held)
+
+
+def _switch_output(checkout: Path, output: Path, progress: MigrationProgress, *, dry_run: bool) -> bool:
+    """Link the checkout's target to the output when no lock or process holds the target."""
+    common = git_files.at(checkout).common_dir
+    if reason := _migration_target_lock(checkout, common, output):
+        progress.kept[checkout] = reason
+        return False
+    target = checkout / "target"
+    real = _is_real_target(target)
+    with ExitStack() as held:
+        if real:
+            # The flocks come first: a cargo that waits on one keeps the lock file open, so the scan finds it.
+            locks = _hold_idle_target(target, held)
+            if isinstance(locks, str):
+                progress.kept[checkout] = locks
+                return False
+            # The scan skips this process's own lock descriptors.
+            uses = _migration_processes((target,), ignored_fds=locks)
+            progress.record_process_scan(uses)
+            if reason := _migration_process_use(target, uses, ignore_stopped_pane_shells=False):
+                progress.kept[checkout] = f"target in use ({reason})"
+                return False
+        # A target that appears after this check is not moved; the link refuses it and keeps the checkout.
+        if not dry_run and (reason := _link_output(checkout, output, save_existing=real)):
+            progress.kept[checkout] = reason
+            return False
+    return True
+
+
+def _moved_output(checkout: Path, publication: MigrationPublication) -> Path | str:
+    """Give the recorded output of a moved checkout, or the reason its target stays."""
+    try:
+        layout = worktree_output(checkout)
+        if isinstance(layout, UnassignedOutput):
+            return "already moved; the record names no output for the real target"
+        output = checked_output(layout)
+        form = build_folders.parse_form(output)
+        if not isinstance(form, build_folders.WorktreeOutput):
+            return f"already moved; {output} is not a worktree output"
+        if _tracked_target_paths(checkout):
+            return "already moved; Git tracks the checkout's target"
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return f"already moved; cannot read the recorded output ({error})"
+    if not publication.places_output(form.repo):
+        return _DEFERRED_OUTPUT
+    return output
+
+
+def _link_output(checkout: Path, output: Path, *, save_existing: bool) -> str:
+    """Move the target to the output and link it, or give the reason to keep the checkout."""
+    try:
+        ensure_target_link(checkout, output, save_existing=save_existing)
+    except TargetReappeared as error:
+        return f"rerun: a new {checkout / 'target'} appeared after the move; the earlier target is in {error.kept}"
+    except (OSError, ValueError) as error:
+        # The target is unchanged or back in place.
+        # If the move back failed, the target is in the output, and a rerun links it.
+        return f"kept: {error}"
+    return ""
 
 
 def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapshot,
@@ -3298,28 +3621,334 @@ def _apply_migration(selection: MigrationSelection, snapshot: staff.StaffSnapsho
         progress.moved += 1
         names = f"{layout.unit} | {layout.short_name} | {planned.source} | {layout.output.value}"
         print(f"move {layout.old} -> {layout.new} | {names}")
+    # The report comes before any defer or keep, so each saved folder is reported in each run.
+    for checkout in (*(main.checkout for main in plan.main), *plan.moved, *plan.saved):
+        _report_saved_targets(checkout, progress.reported_saved_targets)
     for main in plan.main:
         output = build_folders.main_output_path(main.repo)
-        places_output = publication.places_output(main.repo)
-        if places_output:
-            common = git_files.at(main.checkout).common_dir
-            if reason := _migration_target_lock(main.checkout, common, output):
-                progress.kept[main.checkout] = reason
-                continue
-        verb = "main output" if places_output else "defer main output"
-        print(f"{verb} {main.checkout} -> {output}")
-        if not dry_run and places_output:
-            ensure_target_link(main.checkout, output)
+        if not publication.places_output(main.repo):
+            print(f"defer main output {main.checkout} -> {output}")
+            continue
+        if _switch_output(main.checkout, output, progress, dry_run=dry_run):
+            print(f"main output {main.checkout} -> {output}")
+    for checkout in plan.moved:
+        recorded = _moved_output(checkout, publication)
+        if isinstance(recorded, str):
+            # A missing target with no output to link stays as it is.
+            if _is_real_target(checkout / "target"):
+                progress.kept[checkout] = recorded
+        elif _switch_output(checkout, recorded, progress, dry_run=dry_run):
+            _ = progress.kept.pop(checkout, None)
+            print(f"output {checkout} -> {recorded}")
     progress.print_keeps(dry_run=dry_run)
     if not dry_run and any(selection.includes(path)
                            and progress.kept.get(path) not in (_UNVERIFIED_SCRATCH, _ARCHIVED_SCRATCH)
                            for path in _scratch_checkouts(folders.scratch)):
         print("keep the old build root until all remaining scratch checkouts have a confirmed location", file=sys.stderr)
         return 1
-    return int(bool(branch_blocked))
+    # A repository run reports failure if a checkout still needs work.
+    kept = progress.in_use.keys() | {path for path, reason in progress.kept.items() if reason not in _SETTLED_KEEPS}
+    return int(bool(branch_blocked or (selection.scope is MigrationScope.REPOSITORY and kept)))
 
+
+
+class DeletionLocalIdentity(TypedDict):
+    worktree_path: str
+    repository: str
+    common_dir: str
+    branch_ref: str
+    local_commit: str
+
+
+class DeletionApproval(TypedDict):
+    local: DeletionLocalIdentity
+    created_at: int
+    expires_at: int
+
+
+class WorktreeDeletionPreview(DeletionApproval):
+    scope: Literal["worktree"]
+    push_urls: list[str]
+    remote_ref: str
+    origin_action: Literal["keep", "absent", "delete"]
+    origin_commit: str
+    retention_reason: str
+    has_uncommitted: bool
+    cleanup: bool
+
+
+class BranchOnlyDeletionPreview(DeletionApproval):
+    scope: Literal["branch-only"]
+
+
+DeletionPreview = WorktreeDeletionPreview | BranchOnlyDeletionPreview
+
+
+def deletion_local_identity(path: Path, repository: Path, branch: str) -> DeletionLocalIdentity:
+    path = path.resolve(strict=True)
+    repository = main_checkout(repository)
+    local = git_files.at(path)
+    if local.common_dir != git_files.at(repository).common_dir:
+        raise Refused(1, "the worktree belongs to a different repository")
+    if path == repository or Path.cwd().resolve().is_relative_to(path):
+        raise Refused(1, "cannot delete the main or current worktree")
+    if branch == "main":
+        raise Refused(1, "cannot delete main")
+    if git_files.head(local) != git_files.OnBranch(branch) or worktree_branches(repository).get(path) != branch:
+        raise Refused(1, f"the worktree branch does not match {branch}")
+    ref = f"refs/heads/{branch}"
+    tip = git(repository, "rev-parse", "--verify", ref).stdout.strip()
+    return DeletionLocalIdentity(worktree_path=str(path), repository=str(repository),
+                                 common_dir=str(local.common_dir), branch_ref=ref, local_commit=tip)
+
+
+def branch_only_identity(path: Path, repository: Path, ref: str) -> DeletionLocalIdentity:
+    from scripts.production import production_doc
+
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        path = path.resolve()
+    else:
+        raise Refused(1, f"{path}: the worktree path still exists")
+    if not ref.startswith("refs/heads/"):
+        raise Refused(1, "give the full local ref under refs/heads/")
+    repository = main_checkout(git_files.at(repository.resolve(strict=True)).toplevel)
+    _ = git(repository, "check-ref-format", ref)
+    branch = ref.removeprefix("refs/heads/")
+    default = git(repository, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
+    if branch == "main" or default.stdout.strip() == f"refs/remotes/origin/{branch}":
+        raise Refused(1, f"{ref}: protected branch")
+    production_doc.require_removable_checkout(path, repository, branch)
+    if branch in worktree_branches(repository).values():
+        raise Refused(1, f"{ref}: a registered worktree holds this branch")
+    common = git_files.at(repository).common_dir
+    reject_branch_in_use(common, branch)
+    tip = git(repository, "show-ref", "--verify", "--hash", ref).stdout.strip()
+    return DeletionLocalIdentity(worktree_path=str(path), repository=str(repository),
+                                 common_dir=str(common), branch_ref=ref, local_commit=tip)
+
+
+def reject_branch_in_use(common: Path, branch: str) -> None:
+    """Check Git operations that detach HEAD while they hold a branch."""
+    try:
+        linked = tuple((common / "worktrees").iterdir())
+    except FileNotFoundError:
+        linked = ()
+    for git_dir in (common, *(path for path in linked if path.is_dir())):
+        for marker in ("rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"):
+            try:
+                saved_branch = (git_dir / marker).read_text().strip().removeprefix("refs/heads/")
+            except FileNotFoundError:
+                continue
+            if saved_branch == branch:
+                raise Refused(1, f"{branch}: a registered worktree holds this branch for a Git operation")
+
+
+def preview_origin(repo: Path, urls: tuple[str, ...], ref: str) -> tuple[
+    OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip, tuple[str, ...]
+]:
+    if reason := origin_retention(ref):
+        return OriginBranchRetained(reason), ()
+    if not urls:
+        return OriginBranchAbsent(), ()
+    url = single_push_url(urls)
+    refs = push_destination_heads(repo, url)
+    other_tips = sorted({sha for name, sha in refs.items() if name != ref})
+    objects = git(repo, "cat-file", "--batch-check", input_text="".join(f"{sha}\n" for sha in other_tips)).stdout
+    local_heads = tuple(sha for sha, kind, *_ in (line.split() for line in objects.splitlines())
+                        if kind == "commit")
+    tip = refs.get(ref)
+    if tip is None:
+        return OriginBranchAbsent(), local_heads
+    # Count loss from the exact commit that the deletion lease will use.
+    if git(repo, "cat-file", "-e", f"{tip}^{{commit}}", check=False).returncode != 0:
+        _ = git(repo, "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", url, tip)
+    return CheckedOriginTip(tip, url), local_heads
+
+
+def deletion_preview(path: Path, directory: Path, ttl: int) -> dict[str, object]:
+    from scripts.production import production_doc
+
+    path = path.resolve(strict=True)
+    head = git_files.head(git_files.at(path))
+    if not isinstance(head, git_files.OnBranch):
+        raise Refused(1, "the worktree HEAD is detached")
+    identity = deletion_local_identity(path, Path.cwd(), head.name)
+    repo, ref = Path(identity["repository"]), identity["branch_ref"]
+    production_doc.require_removable_checkout(path, repo, head.name)
+    dirty = bool(git(path, "status", "--porcelain", "--untracked-files=all").stdout)
+    try:
+        local_check = check_local_cleanup(path)
+    except (Refused, OSError, ValueError, KeyError, TypeError) as error:
+        local_check = Kept(path, str(error))
+    urls = origin_push_urls(repo)
+    origin, other_heads = preview_origin(repo, urls, ref)
+    retained = isinstance(origin, OriginBranchRetained)
+    deletes = isinstance(origin, CheckedOriginTip)
+    origin_tip = origin.sha if deletes else ""
+    if urls:
+        # Use known origin heads as exclusions. An unknown head cannot hide loss.
+        exclusions = (*other_heads, origin_tip) if deletes else other_heads
+        unpushed = int(git(repo, "rev-list", "--count", identity["local_commit"], "--not", *exclusions).stdout)
+    else:
+        unpushed = int(git(repo, "rev-list", "--count", identity["local_commit"], "--not",
+                           f"--exclude={ref.removeprefix('refs/heads/')}", "--branches").stdout)
+    remote_only = int(git(repo, "rev-list", "--count", origin_tip, "--not", *other_heads).stdout) if deletes else 0
+    if deletion_local_identity(path, repo, head.name) != identity:
+        raise Refused(1, "the local worktree changed during preview")
+    cleanup_reason = "cleanup: all work is on the target branch"
+    can_clean = not dirty and not isinstance(local_check, Kept) and local_check[0].sha == identity["local_commit"]
+    if isinstance(local_check, Kept):
+        cleanup_reason = local_check.reason
+    elif deletes and isinstance(checked := check_origin_landing(local_check[1], origin), Kept):
+        can_clean = False
+        cleanup_reason = checked.reason
+    now = int(time.time())
+    record = WorktreeDeletionPreview(
+        local=identity, scope="worktree", push_urls=list(urls), remote_ref=ref,
+        origin_action="delete" if deletes else "keep" if retained else "absent",
+        origin_commit=origin_tip, retention_reason=origin.reason if retained else "",
+        has_uncommitted=dirty, cleanup=can_clean, created_at=now, expires_at=now + ttl,
+    )
+    return {
+        "status": "success", "preview_id": save_deletion_preview(directory, record), "worktree_path": str(path),
+        "target_branch": head.name, "has_uncommitted": dirty, "has_unpushed": unpushed > 0,
+        "branch_ref": ref, "local_commit": identity["local_commit"],
+        "unpushed_count": unpushed, "has_remote_branch": deletes, "keep_origin": retained,
+        "origin_action": record["origin_action"], "origin_commit": origin_tip,
+        "retention_reason": record["retention_reason"], "has_remote_only": remote_only > 0,
+        "remote_only_count": remote_only, "cleanup": can_clean, "cleanup_reason": cleanup_reason,
+    }
+
+
+def branch_only_preview(path: Path, repo: Path, ref: str, directory: Path, ttl: int) -> dict[str, object]:
+    identity = branch_only_identity(path, repo, ref)
+    branch = ref.removeprefix("refs/heads/")
+    local_only = int(git(Path(identity["repository"]), "rev-list", "--count", identity["local_commit"], "--not",
+                         f"--exclude={branch}", "--branches").stdout)
+    now = int(time.time())
+    record = BranchOnlyDeletionPreview(
+        local=identity, scope="branch-only", created_at=now, expires_at=now + ttl,
+    )
+    return {
+        "status": "success", "preview_id": save_deletion_preview(directory, record),
+        "worktree_path": identity["worktree_path"], "repository": identity["repository"],
+        "branch_ref": ref, "local_commit": identity["local_commit"],
+        "local_only_count": local_only,
+    }
+
+
+def save_deletion_preview(directory: Path, preview: DeletionPreview) -> str:
+    preview_id = uuid4().hex
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not create_text_atomic(deletion_record(directory, preview_id, "preview"), json.dumps(preview)):
+        raise Refused(1, "the preview identifier already exists")
+    return preview_id
+
+
+def deletion_record(directory: Path, preview_id: str, state: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", preview_id):
+        raise Refused(1, "invalid deletion preview identifier")
+    metadata = directory.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        raise Refused(1, "the deletion preview directory is not private to the current user")
+    return directory / f"{preview_id}.{state}"
+
+
+def read_deletion_preview(file: Path) -> DeletionPreview:
+    try:
+        decoded = cast(object, json.loads(file.read_text()))
+    except FileNotFoundError as error:
+        raise Refused(1, "the deletion preview is missing or already used; create a new preview") from error
+    if not isinstance(decoded, dict):
+        raise Refused(1, "invalid deletion preview")
+    fields = cast(dict[str, object], decoded)
+    if fields.get("scope") not in ("worktree", "branch-only"):
+        raise Refused(1, "create and confirm a new deletion preview")
+    preview = cast(DeletionPreview, cast(object, fields))
+    if not preview["created_at"] <= int(time.time()) < preview["expires_at"]:
+        raise Refused(1, "the deletion preview expired; create a new preview")
+    return preview
+
+
+def confirm_deletion(directory: Path, preview_id: str) -> None:
+    file = deletion_record(directory, preview_id, "preview")
+    preview = read_deletion_preview(file)
+    if preview["scope"] == "worktree" and preview["has_uncommitted"]:
+        raise Refused(1, "the preview shows uncommitted changes")
+    _ = file.rename(deletion_record(directory, preview_id, "confirmed"))
+
+
+def take_deletion_preview(directory: Path, preview_id: str, *, automatic: bool) -> DeletionPreview:
+    file = deletion_record(directory, preview_id, "preview" if automatic else "confirmed")
+    used = deletion_record(directory, preview_id, "used")
+    try:
+        _ = file.rename(used)
+    except FileNotFoundError as error:
+        raise Refused(1, "the deletion preview is missing or already used; create a new preview") from error
+    try:
+        return read_deletion_preview(used)
+    finally:
+        used.unlink()
+
+
+def delete_branch_only(directory: Path, preview_id: str, path: Path, repo: Path, ref: str) -> None:
+    from scripts.production import production_doc
+
+    production_doc.require_removable_checkout(path, repo, ref.removeprefix("refs/heads/"))
+    preview = take_deletion_preview(directory, preview_id, automatic=False)
+    if preview["scope"] != "branch-only":
+        raise Refused(1, "create and confirm a branch-only preview")
+    identity = branch_only_identity(path, repo, ref)
+    if preview["local"] != identity:
+        raise Refused(1, "the local branch identity changed after preview")
+    _ = git(Path(identity["repository"]), "update-ref", "--no-deref", "-d", ref, identity["local_commit"])
+    print(f"Deleted local ref {ref}.")
+
+
+def consume_deletion(directory: Path, preview_id: str, path: Path, repo: Path, branch: str, *,
+                     automatic: bool) -> tuple[CheckedLocalTip, OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip]:
+    preview = take_deletion_preview(directory, preview_id, automatic=automatic)
+    if preview["scope"] == "branch-only":
+        raise Refused(1, "use the branch-only deletion command")
+    identity = deletion_local_identity(path, repo, branch)
+    if preview["local"] != identity or preview["remote_ref"] != identity["branch_ref"]:
+        raise Refused(1, "the local worktree identity changed after preview")
+    if preview["has_uncommitted"] or git(path, "status", "--porcelain", "--untracked-files=all").stdout:
+        raise Refused(1, "the worktree has uncommitted changes; create a new preview")
+    local = CheckedLocalTip(identity["local_commit"])
+    if automatic:
+        if not preview["cleanup"]:
+            raise Refused(1, "the preview requires confirmation")
+        checked = check_local_cleanup(path.resolve())
+        if isinstance(checked, Kept):
+            raise Refused(1, checked.reason)
+        if checked[0] != local:
+            raise Refused(1, "the local branch changed after preview")
+    action = preview["origin_action"]
+    if action == "keep":
+        return local, OriginBranchRetained(preview["retention_reason"])
+    if action == "absent":
+        return local, OriginBranchAbsent()
+    if action != "delete":
+        raise Refused(1, "invalid origin action in deletion preview")
+    url = single_push_url(tuple(preview["push_urls"]))
+    return local, CheckedOriginTip(preview["origin_commit"], url)
+
+
+def print_retirement(local: CheckedLocalTip, origin: OriginBranchAbsent | OriginBranchRetained | CheckedOriginTip) -> None:
+    print(local.sha)
+    if isinstance(origin, CheckedOriginTip):
+        print("delete", origin.sha, origin.push_url, sep="\n")
+    elif isinstance(origin, OriginBranchRetained):
+        print("keep", " ".join(origin.reason.splitlines()), sep="\n")
+    else:
+        print("absent")
 
 def main() -> int:
+    from scripts.agents import remote
     from scripts.production import staff
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -3336,37 +3965,130 @@ def main() -> int:
     _ = repair_branch.add_argument("path", type=Path)
     remove = commands.add_parser("remove")
     _ = remove.add_argument("path", type=Path)
+    _ = remove.add_argument("--repo", metavar="WORD", help="select the repository by name (default: use the path)")
     _ = remove.add_argument("--force", action="store_true")
     retire_unit = commands.add_parser("retire")
     _ = retire_unit.add_argument("unit")
     migration = commands.add_parser("migrate")
-    _ = migration.add_argument("--all", dest="scope", action="store_const", const=MigrationScope.ALL,
+    selection = migration.add_mutually_exclusive_group()
+    _ = selection.add_argument("--all", dest="scope", action="store_const", const=MigrationScope.ALL,
                                default=MigrationScope.LISTED, help="select all worktrees")
-    _ = migration.add_argument("--list", type=Path, help="select worktrees or supply names for --all")
+    _ = selection.add_argument("--repo", help="select one repository by its repo word: its main checkout, worktrees, scratch clones and saved moves")
+    _ = migration.add_argument("--host", choices=("mac",),
+                               help="hold the Mac claim on natedev and run migrate --repo on the Mac")
+    _ = migration.add_argument("--list", type=Path, help="select worktrees or supply names for --all or --repo")
     _ = migration.add_argument("--dry-run", action="store_true")
     links = commands.add_parser("old-links")
     _ = links.add_argument("--remove-unused", action="store_true")
     check_cleanup = commands.add_parser("cleanup")
     _ = check_cleanup.add_argument("path")
     _ = check_cleanup.add_argument("--checked-tips", action="store_true")
+    protection = commands.add_parser("protect-deletion")
+    _ = protection.add_argument("path")
+    _ = protection.add_argument("branch")
+    _ = protection.add_argument("repository")
+    preview = commands.add_parser("deletion-preview")
+    _ = preview.add_argument("path", type=Path)
+    _ = preview.add_argument("directory", type=Path)
+    _ = preview.add_argument("ttl", type=int)
+    branch_preview = commands.add_parser("branch-only-preview")
+    _ = branch_preview.add_argument("path", type=Path)
+    _ = branch_preview.add_argument("repository", type=Path)
+    _ = branch_preview.add_argument("ref")
+    _ = branch_preview.add_argument("directory", type=Path)
+    _ = branch_preview.add_argument("ttl", type=int)
+    branch_delete = commands.add_parser("delete-branch-only")
+    _ = branch_delete.add_argument("directory", type=Path)
+    _ = branch_delete.add_argument("preview_id")
+    _ = branch_delete.add_argument("path", type=Path)
+    _ = branch_delete.add_argument("repository", type=Path)
+    _ = branch_delete.add_argument("ref")
+    confirm = commands.add_parser("confirm-deletion")
+    _ = confirm.add_argument("directory", type=Path)
+    _ = confirm.add_argument("preview_id")
+    consume = commands.add_parser("consume-deletion")
+    _ = consume.add_argument("directory", type=Path)
+    _ = consume.add_argument("preview_id")
+    _ = consume.add_argument("path", type=Path)
+    _ = consume.add_argument("repository", type=Path)
+    _ = consume.add_argument("branch")
+    _ = consume.add_argument("--automatic", action="store_true")
     release = commands.add_parser("release-pair")
     _ = release.add_argument("path")
+    retarget = commands.add_parser("cargo-liner-target")
+    _ = retarget.add_argument("repository")
+    _ = retarget.add_argument("integration_branch")
+    _ = retarget.add_argument("receipt")
+    _ = retarget.add_argument("--reverse", action="store_true")
     arguments = parser.parse_args()
+    command = cast(str, arguments.command)
+    if command in ("deletion-preview", "branch-only-preview", "confirm-deletion", "consume-deletion", "delete-branch-only"):
+        from scripts.production import production_doc
+
+        try:
+            directory = cast(Path, arguments.directory)
+            if command == "deletion-preview":
+                print(json.dumps(deletion_preview(cast(Path, arguments.path), directory, cast(int, arguments.ttl))))
+            elif command == "branch-only-preview":
+                print(json.dumps(branch_only_preview(cast(Path, arguments.path), cast(Path, arguments.repository),
+                                                     cast(str, arguments.ref), directory, cast(int, arguments.ttl))))
+            elif command == "delete-branch-only":
+                delete_branch_only(directory, cast(str, arguments.preview_id), cast(Path, arguments.path),
+                                   cast(Path, arguments.repository), cast(str, arguments.ref))
+            elif command == "confirm-deletion":
+                confirm_deletion(directory, cast(str, arguments.preview_id))
+                print("Confirmation recorded.")
+            else:
+                local, origin = consume_deletion(directory, cast(str, arguments.preview_id),
+                                                 cast(Path, arguments.path), cast(Path, arguments.repository),
+                                                 cast(str, arguments.branch), automatic=cast(bool, arguments.automatic))
+                print_retirement(local, origin)
+        except (Refused, production_doc.ProductionPathsError, OSError, ValueError, KeyError, TypeError) as error:
+            if command in ("deletion-preview", "branch-only-preview"):
+                print(json.dumps({"status": "error", "message": str(error)}))
+            else:
+                print(str(error), file=sys.stderr)
+            return 1
+        return 0
+    if cast(str, arguments.command) == "cargo-liner-target":
+        from scripts.production import production_doc
+
+        try:
+            count = retarget_cargo_liner_records(
+                Path(cast(str, arguments.repository)).expanduser(), cast(str, arguments.integration_branch),
+                Path(cast(str, arguments.receipt)).expanduser(), reverse=cast(bool, arguments.reverse))
+        except (Refused, production_doc.Refusal, OSError, ValueError, KeyError, TypeError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        print(f"updated {count} cargo-liner worktree records")
+        return 0
+    if cast(str, arguments.command) == "protect-deletion":
+        from scripts.production import production_doc
+
+        try:
+            branch = cast(str, arguments.branch)
+            production_doc.require_removable_checkout(
+                Path(cast(str, arguments.path)), Path(cast(str, arguments.repository)), branch)
+        except production_doc.ProductionPathsError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        return 0
     if cast(str, arguments.command) == "release-pair":
         release_worktree_pair(Path(cast(str, arguments.path)).absolute())
         return 0
     if cast(str, arguments.command) == "cleanup":
+        from scripts.production import production_doc
+
         try:
             result = cleanup(Path(cast(str, arguments.path)).expanduser().resolve())
-        except (Refused, OSError, ValueError, KeyError, TypeError) as error:
+        except (Refused, production_doc.ProductionPathsError, OSError, ValueError, KeyError, TypeError) as error:
             print(str(error), file=sys.stderr)
             return 2
         if isinstance(result, Kept):
             print(result.reason)
             return 1
         if cast(bool, arguments.checked_tips):
-            origin_tip = result.origin.sha if isinstance(result.origin, CheckedOriginTip) else ""
-            print(f"{result.local.sha} {origin_tip}")
+            print_retirement(result.local, result.origin)
         else:
             print("cleanup: all work is on the target branch")
         return 0
@@ -3375,9 +4097,18 @@ def main() -> int:
             case "migrate":
                 scope = cast(MigrationScope, arguments.scope)
                 list_file = cast(Path | None, arguments.list)
-                if scope is MigrationScope.LISTED and list_file is None:
-                    migration.error("specify --list FILE or --all")
-                return migrate_worktrees(list_file, scope=scope, dry_run=cast(bool, arguments.dry_run))
+                repo = cast(str | None, arguments.repo)
+                if cast(str | None, arguments.host) is not None:
+                    if repo is None or list_file is not None:
+                        migration.error("--host needs --repo WORD and takes no --list")
+                    if remote.local_machine() != staff.OWNER_MACHINE:
+                        migration.error("--host runs on natedev only")
+                    return migrate_on_mac(repo, dry_run=cast(bool, arguments.dry_run))
+                if repo is not None:
+                    scope = MigrationScope.REPOSITORY
+                elif scope is MigrationScope.LISTED and list_file is None:
+                    migration.error("specify --list FILE, --all or --repo WORD")
+                return migrate_worktrees(list_file, scope=scope, repo=repo or "", dry_run=cast(bool, arguments.dry_run))
             case "old-links":
                 for link in old_worktree_links(remove_unused=cast(bool, arguments.remove_unused)):
                     users = ", ".join(session.identity for session in link.sessions) or "no known sessions"
@@ -3385,8 +4116,27 @@ def main() -> int:
                     uncertainty = f"; unreadable: {', '.join(link.unreadable)}" if link.unreadable else ""
                     print(f"{status} {link.old} -> {link.new} | {users}{uncertainty}")
             case "remove":
-                remove_git_checkout(cast(Path, arguments.path).expanduser().resolve(), Path.cwd(),
-                                    force=cast(bool, arguments.force))
+                path = cast(Path, arguments.path).expanduser().resolve()
+                repo = cast(str | None, arguments.repo)
+                if repo is None and not path.exists() and (record := checkout_record(path)) is not None:
+                    repository = Path(record.repo).resolve()
+                elif repo is None:
+                    try:
+                        checkout = git_files.at(path)
+                    except git_files.GitFilesError as error:
+                        raise ValueError(
+                            f"{path}: not a Git checkout root. Give the checkout root, or use --repo WORD.") from error
+                    repository = checkout.toplevel
+                else:
+                    repository = main_checkout_for_word(repo)
+                    if not path.exists():
+                        record = checkout_record(path)
+                        if record is None:
+                            if not _is_registered_worktree(path, repository):
+                                raise ValueError(f"{path}: worktree is not registered in {repository}")
+                        elif Path(record.repo).resolve() != repository:
+                            raise ValueError(f"{path}: worktree belongs to another repository")
+                remove_git_checkout(path, repository, force=cast(bool, arguments.force))
             case "retire":
                 retire(cast(str, arguments.unit))
             case "make":

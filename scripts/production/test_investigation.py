@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.production import investigation, staff
+from scripts.console_text.test_support import accepting_console_text, real_review_question
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.notify import review
+from scripts.production import investigation, staff, the_list
 from scripts.review_links import change_page, new_item_dialog, reply_tokens, review_page, test_review_page
 
 RUNNER = staff.StaffRow(staff.StaffId("32102748-cf44-498e-9a53-b710c2a70916"), "showrunner", "show", staff.StaffRoot(),
@@ -24,6 +27,9 @@ OWNER = staff.StaffRow(staff.StaffId("62ec2f46-df7a-40fd-b919-789581e63d53"), "u
                        current_session=staff.StaffId("07990246-10cf-440e-a32a-13e62f15b78b"), unit_type=staff.UnitDetails("direct"))
 OTHER = staff.StaffRow(staff.StaffId("4fc94517-b49f-4979-9308-37bb5cc90236"), "producer", "dwight", staff.StaffRoot(),
                        current_session=staff.StaffId("e289fc59-9b1f-44b2-bb22-beb7359f97bb"))
+LIST_KEEPER = staff.StaffRow(staff.StaffId("fdab6975-69b4-44ec-b688-22f66d92aa67"), "producer",
+                           "fixture-list-keeper", staff.StaffRoot(),
+                           current_session=staff.StaffId("e6183e17-a8ce-437f-93be-e2b3004a95cf"))
 
 
 class InvestigationTests(unittest.TestCase):
@@ -31,14 +37,23 @@ class InvestigationTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         staff_file = self.root / "staff.json"
-        _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [RUNNER.to_json(), OWNER.to_json(), OTHER.to_json()]}))
+        _ = staff_file.write_text(json.dumps({
+            "schema": 1, "rows": [row.to_json() for row in (RUNNER, OWNER, OTHER, LIST_KEEPER)],
+        }))
+        configuration = self.root / "config"
+        configuration.mkdir()
+        _ = (configuration / "console.conf").write_text(f"page.list.owner={LIST_KEEPER.id}\n")
+        _ = (configuration / "producer_map.conf").write_text("")
+        _ = write_config_fixture(configuration / "notify.conf")
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
+        _ = self.enterContext(patch.object(review, "reviewer_environment", side_effect=OSError("Fixture reviewer.")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "STAFF_FILE": str(staff_file), "SHOWRUNNER_STATE_DIR": str(self.root / "state"),
-            "REVIEW_LINKS_ROOT": str(self.root / 'reviews'),
-            "XDG_STATE_HOME": str(self.root / "key-state"),
+            "REVIEW_LINKS_ROOT": str(self.root / 'reviews'), "NOTIFY_STATE_DIR": str(self.root / "notify"),
+            "XDG_STATE_HOME": str(self.root / "key-state"), "CONF_DIR": str(configuration),
             "CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": OWNER.current_session})))
 
     def command(self, *args: str) -> tuple[int, str, str]:
@@ -50,11 +65,54 @@ class InvestigationTests(unittest.TestCase):
             result = investigation.main(arguments)
         return result, output.getvalue(), errors.getvalue()
 
+    def test_answer_refuses_a_draft_and_records_a_model_outage(self) -> None:
+        self.assertEqual(self.command("file", "--title", "Find the cause", "--question", "Why did it stop?")[0], 0)
+        before = investigation.load(OWNER.id, "I1")
+        directory = self.root / "notify"
+        with (patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(directory)}),
+              patch.object(review, "review_question", new=real_review_question),
+              patch.object(review, "_review", return_value=review.Unreviewed("reviewer unavailable")) as reader):
+            code, _, errors = self.command("answer", "--id", "I1", "--text", "Read /tmp/result.txt.")
+            self.assertEqual(code, 1)
+            self.assertIn("Revise the investigation answer draft. omit-file-path: /tmp/result.txt", errors)
+            self.assertEqual(investigation.load(OWNER.id, "I1"), before)
+            reader.assert_not_called()
+
+            answer = "The download stopped when the disk filled."
+            code, _, errors = self.command("answer", "--id", "I1", "--text", answer)
+            self.assertEqual(code, 0, errors)
+            self.assertEqual(investigation.load(OWNER.id, "I1").answer, answer)
+            self.assertIn("unreviewed: reviewer unavailable", (directory / "review.jsonl").read_text())
+            reader.assert_called_once()
+
+    def test_answer_reviews_without_the_owner_lock_and_refuses_a_changed_record(self) -> None:
+        report = investigation.file(OWNER.id, "Find the cause", "Which check failed?",
+                                    waiting_why="The owner answers.")
+        answer = "The first check failed."
+        lock = investigation.state_root() / "investigation-locks" / (OWNER.id + ".lock")
+
+        def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+            with lock.open("r") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            investigation.set_waiting_why(OWNER.id, report.id, "The owner checks a new result.")
+            return review.QuestionAccepted(answer)
+
+        with patch.object(review, "review_question", side_effect=read_draft) as reader:
+            with self.assertRaisesRegex(investigation.InvestigationError, "The selected investigation changed"):
+                _ = investigation.answer(OWNER.id, report.id, answer)
+        reader.assert_called_once()
+        current = investigation.load(OWNER.id, report.id)
+        self.assertEqual((current.waiting_why, current.answer), ("The owner checks a new result.", ""))
+
     def test_file_answer_read_and_list(self) -> None:
         question = "Find the cause.\r\n\n## Answer\n\nThis heading is part of the question.\n"
         title = 'Find the cause: "example"'
+        _ = (self.root / "config" / "producer_map.conf").write_text(f"{RUNNER.id}={OTHER.id}\n")
         self.assertEqual(self.command("file", "--title", title, "--question", question), (0, "I1\n", ""))
         item = investigation.load(OWNER.id, "I1")
+        row, = the_list.records(LIST_KEEPER.id)
+        self.assertEqual(item.list_destination, investigation.ListDestination(LIST_KEEPER.id, row.number))
+        self.assertEqual((row.owner, row.producer), (OWNER.id, OTHER.id))
         self.assertEqual((item.owner, item.title, item.question, item.answer), (OWNER.id, title, question, ""))
         self.assertEqual(item.state, investigation.InvestigationState.OPEN)
         self.assertTrue(item.filed)
@@ -68,13 +126,9 @@ class InvestigationTests(unittest.TestCase):
         self.assertEqual(ready.filed, item.filed)
         self.assertTrue(ready.answered)
         self.assert_review_checks_under_the_owner_lock(ready)
-        self.assertEqual(self.command("read", "--id", "I1"), (0, "", ""))
-        read = investigation.load(OWNER.id, "I1")
-        self.assertTrue(read.read)
-        self.assertEqual(read.answered, ready.answered)
-        self.assertEqual(self.command("list"), (0, "", ""))
-        self.assertIn(f"I1 | read | {title}", self.command("list", "--all")[1])
-        self.assertEqual(investigation.records(OWNER.id, include_read=True), [read])
+        self.assertEqual(self.command("read", "--id", "I1"),
+                         (1, "", "investigation: Open the report on the List.\n"))
+        self.assertEqual(investigation.load(OWNER.id, "I1"), ready)
 
     def test_f079_new_investigation_keeps_the_answer_at_a_late_collision(self) -> None:
         first = investigation.file(OWNER.id, "First report", "Check the result.", waiting_why="The owner answers.")
@@ -132,12 +186,19 @@ class InvestigationTests(unittest.TestCase):
                 self.assertEqual(result, 1)
                 self.assertEqual(len(error.splitlines()), 1)
                 self.assertEqual(path.read_bytes(), before)
-        _ = investigation.answer(OWNER.id, item.id, "The cause is known.")
+        ready = investigation.answer(OWNER.id, item.id, "The cause is known.")
         before, timestamp = path.read_bytes(), path.stat().st_mtime_ns
         _ = investigation.answer(OWNER.id, item.id, "The cause is known.")
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (before, timestamp))
         self.assertEqual(self.command("answer", "--id", item.id, "--text", "Different answer")[0], 1)
-        _ = investigation.mark_read(OWNER.id, item.id)
+        for args in (("read", "--id", item.id), ("list",)):
+            with self.subTest(args=args):
+                self.assertEqual(self.command(*args), (0, "", ""))
+        read = investigation.load(OWNER.id, item.id)
+        self.assertTrue(read.read)
+        self.assertEqual(read.answered, ready.answered)
+        self.assertIn(f"{item.id} | read | {item.title}", self.command("list", "--all")[1])
+        self.assertEqual(investigation.records(OWNER.id, include_read=True), [read])
         before, timestamp = path.read_bytes(), path.stat().st_mtime_ns
         _ = investigation.mark_read(OWNER.id, item.id)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (before, timestamp))
@@ -229,8 +290,18 @@ class InvestigationTests(unittest.TestCase):
         self.assertNotIn(token, note)
         self.assertIn(proof.nonce, note)
         reply_tokens.path().unlink()
-        self.assertTrue(investigation.answer_submission(path, new_item_dialog.read_submission_key(key),
-                                                        "The first check failed.", token, owner=OWNER.id))
+        answer = "The first check failed."
+
+        def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+            lock = investigation.state_root() / "investigation-locks" / (OWNER.id + ".lock")
+            with lock.open("r") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return review.QuestionAccepted(answer)
+
+        with patch.object(review, "review_question", side_effect=read_draft) as reader:
+            self.assertTrue(investigation.answer_submission(path, new_item_dialog.read_submission_key(key),
+                                                            answer, token, owner=OWNER.id))
+        reader.assert_called_once()
         self.assertFalse(reply_tokens.path().exists())
 
     def test_all_owners_number_records_under_one_lock(self) -> None:
@@ -250,6 +321,8 @@ class InvestigationTests(unittest.TestCase):
             self.assertEqual(self.command("read", "--id", "I1", "--owner", OWNER.id)[0], 0)
         self.assertEqual(investigation.load(OWNER.id, "I1").state, investigation.InvestigationState.READ)
         self.assertEqual(investigation.load(OTHER.id, "I14").state, investigation.InvestigationState.OPEN)
+        row, = the_list.records(LIST_KEEPER.id)
+        self.assertEqual((row.owner, row.producer), (OTHER.id, OTHER.id))
 
     def test_missing_callers_and_invalid_inputs_get_one_refusal_line(self) -> None:
         for args in (("file", "--title", "Two\nlines", "--question", "Why?"),
@@ -331,8 +404,12 @@ class InvestigationTests(unittest.TestCase):
 
     def test_a_showrunner_owns_records_without_a_production_document(self) -> None:
         owner = replace(OWNER, kind="showrunner", parent=staff.StaffRoot(), unit_type=staff.NotUnit())
-        _ = (self.root / "staff.json").write_text(json.dumps({"schema": 1, "rows": [owner.to_json()]}))
+        _ = (self.root / "staff.json").write_text(json.dumps({
+            "schema": 1, "rows": [owner.to_json(), LIST_KEEPER.to_json()],
+        }))
         self.assertEqual(self.command("file", "--title", "Cause", "--question", "Why?"), (0, "I1\n", ""))
+        row, = the_list.records(LIST_KEEPER.id)
+        self.assertEqual((row.owner, row.producer), (owner.id, LIST_KEEPER.id))
 
     def test_corrupt_records_keep_their_files_and_allocated_numbers(self) -> None:
         item = investigation.file(OWNER.id, "Cause", "Why?", waiting_why='The owner must complete the investigation.')
