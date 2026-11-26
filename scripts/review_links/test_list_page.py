@@ -1275,7 +1275,7 @@ if(example.filterOn){
         studio = list_page.render(self.root / "reviews").decode()
         row = '<div class="record-filter-row" role="group" aria-label="Producer" data-filter-row="producer">'
         self.assertEqual(studio.count(row), 1)
-        self.assertIn('<div class="studio-tabs">' + row, studio)
+        self.assertIn('<div class="studio-tab-row"><div class="studio-tabs">' + row, studio)
         controls = ('<div class="studio-tabs">', '<div class="record-filter-words">',
                     '<div class="list-top-bands">', '<div data-record-filters>')
         positions = [studio.index(control) for control in controls]
@@ -11554,8 +11554,16 @@ if(innerWidth>960){
  check(Math.abs(width('Next step')-width('Item')*23/17)<1,
   'Item and Next step share the available width in their original proportion.');
 }
-const producerBox=rows[1].getBoundingClientRect(),words=document.getElementById('list-search').getBoundingClientRect();
-check(words.top>=producerBox.bottom,'The words box stays below the Producer tabs.');
+const producerBounds=()=>rows[1].getBoundingClientRect();
+const wordsBounds=()=>document.getElementById('list-search').getBoundingClientRect();
+const producerBox=producerBounds(),words=wordsBounds();
+check(innerWidth===VIEWPORT_WIDTH,'The page uses the requested viewport width.');
+check(words.left>=producerBox.right || words.top>=producerBox.bottom,'The words box does not overlap the Producer tabs.');
+if(innerWidth===1440){
+ check(words.top>=producerBox.top && words.top<producerBox.bottom,'The words box shares the picture row.');
+ check(Math.abs(words.top+words.bottom-producerBox.top-producerBox.bottom)<=2,
+  'The words box is vertically centered with the pictures.');
+}
 const allChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="all"]'));
 const staffChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="staff:all"]'));
 const chipText=chip=>chip?.querySelector('.studio-name') ? chip.querySelector('.studio-name').textContent+' '+chip.querySelector('b').textContent : chip?.textContent;
@@ -11566,9 +11574,13 @@ check(ownerChips[2].textContent==='builds 1' && ownerChips[3].textContent==='bui
 const matchesAllStaff=()=>[...document.querySelectorAll('[data-list-item]:not([hidden])')].map(row=>row.dataset.number).join()==='13';
 staffChips.forEach(chip=>chip.click());
 const band=document.querySelector('[data-top-band="none"]').getBoundingClientRect();
-const search=document.getElementById('list-search').getBoundingClientRect();
+const search=wordsBounds();
 check(band.height>0 && search.bottom<=band.top,'The words box stays above the visible Top priority band.');
 check(Math.abs(search.right-band.right)<=1,'The words box and the Top priority band align at the right edge.');
+if(innerWidth===390){
+ check(search.top>=producerBounds().bottom && Math.abs(search.left-band.left)<=1,
+  'The words box takes the full width below the tabs on a phone.');
+}
 const selectedPlace=new URLSearchParams(location.hash.slice(1));
 check(matchesAllStaff() && selectedPlace.get('owner')==='all' && selectedPlace.get('producer')==='all',
  'Selecting the staff ID all filters the items and stores the raw IDs.');
@@ -11578,14 +11590,25 @@ location.hash='show=all&owner=all&producer=all';
 await restored;
 check(matchesAllStaff() && staffChips.every(chip=>chip.getAttribute('aria-pressed')==='true'),
  'An existing address with the staff ID all selects both staff chips.');
+if(innerWidth===1440){
+ const tabs=rows[1].querySelector('div');
+ tabs.append(...Array.from({length:16},()=>document.createElement('button')));
+ const bounds=producerBounds();
+ check([...tabs.children].every(tab=>{
+  const box=tab.getBoundingClientRect();
+  return box.width===88 && box.left>=bounds.left && box.right<=bounds.right+1;
+ }), 'Each tab keeps its full width when many tabs wrap.');
+ check(wordsBounds().top>=bounds.bottom && document.documentElement.scrollWidth<=innerWidth,
+  'Many tabs move the words box to the next line without horizontal scrolling.');
+}
 }catch(error){failures.push(String(error));}
 const result=document.createElement('p');result.id='probe-results';
 result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
 </script>"""
-        for width in (1700, 1280, 1024, 390):
+        for width in (1700, 1440, 1280, 1024, 390):
             with self.subTest(width=width):
-                self.browser_actions(markup, "", probe, window_size=(width, 900))
+                self.browser_actions(markup, "", probe.replace("VIEWPORT_WIDTH", str(width)), window_size=(width, 900))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_staff_chips_strip_repeated_suffixes_and_keep_empty_name_ids(self) -> None:
