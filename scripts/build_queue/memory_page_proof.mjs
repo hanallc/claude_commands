@@ -461,6 +461,8 @@ try {
   let killResults = [];
   let submittedItem;
   let queueFixture = null;
+  let queuePost;
+  let queuePostCount = 0;
   let unnamedPlace = -1;
   let confirmedQueueLine = null;
   const undoAnchors = new Map();
@@ -472,7 +474,7 @@ try {
   const fixtureMoveLine = reading => {
     const members = reading.waiters.filter(row => row.move).map(row => row.move);
     if (unnamedPlace >= 0) members.splice(unnamedPlace, 0, unnamed);
-    return {revision:reading.move_revision, members, kept_runs:[]};
+    return {revision:reading.move_revision, members, kept_runs:(reading.held_places ?? []).map(row => row.key)};
   };
   const server = createServer(async (req, res) => {
     if (req.url.split('?', 1)[0] === '/console/review/new-item') {
@@ -506,11 +508,13 @@ try {
       let body = '';
       for await (const part of req) body += part;
       const request = JSON.parse(body);
+      queuePost = request;
+      queuePostCount++;
       const {revision, row_id, destination} = request;
       const rows = queueFixture.waiters;
       const ordered = rows.filter(row => row.move);
       const {members} = fixtureMoveLine(queueFixture);
-      const line = () => ({revision:queueFixture.move_revision, members, kept_runs:[]});
+      const line = () => ({...fixtureMoveLine(queueFixture), members});
       if (revision !== queueFixture.move_revision) return json(409, {reason:'The queue changed.', line:line()});
       const undo = request.kind === 'QueueUndoRequest';
       if (!undo) assert.equal(request.kind, 'QueueMoveRequest');
@@ -578,9 +582,17 @@ try {
     let reading = servedReading;
     if (isData && reading.move_revision?.startsWith('fixture')) {
       const move_line = fixtureMoveLine(reading);
-      const places = new Map(move_line.members.map((member, index) => [member.row_id, index + 1]));
+      let keptBefore = 0;
+      const places = new Map(move_line.members.map((member, index) => {
+        keptBefore = Math.max(keptBefore, member.kept_before ?? 0);
+        return [member.row_id, index + 1 + keptBefore];
+      }));
+      const held_places = (reading.held_places ?? []).map((row, index) => {
+        const after = move_line.members.findIndex(member => member.kept_before > index);
+        return {...row, position:(after < 0 ? move_line.members.length : after) + index + 1};
+      });
       reading = {...reading, move_line, waiters:reading.waiters.map(row =>
-        row.move ? {...row, place:places.get(row.move.row_id)} : row)};
+        row.move ? {...row, place:places.get(row.move.row_id)} : row), held_places};
     }
     res.end(isData ? JSON.stringify(reading) : isReport ? JSON.stringify(awsCostShots ? servedReading.report : base.report)
       : req.url === '/before.html' ? beforePage : req.url === '/swap-before.html' ? swapBeforePage : page);
@@ -1646,6 +1658,7 @@ try {
           await call('Emulation.setDeviceMetricsOverride', {width:gateMode ? 1400 : 1600,height:1200,deviceScaleFactor:1,mobile:false});
         }
         await checkQueueDrag(navigate, evaluate, call);
+        await checkLongQueueDrag(navigate, evaluate, call);
         if (queueDragProof) {
           console.log(JSON.stringify({shot:join(folder, 'drag-dark.png')}));
           break browserProof;
@@ -1860,6 +1873,133 @@ try {
         }
         queueFixture = null;
         servedReading = base;
+      }
+
+      async function checkLongQueueDrag(navigate, evaluate, call) {
+        const restoreSize = await evaluate('({width:innerWidth, height:innerHeight})');
+        const resize = size => call('Emulation.setDeviceMetricsOverride', {...size, deviceScaleFactor:1, mobile:false});
+        await resize({width:1440, height:800});
+        const template = readings.spacing.waiters.find(row => row.kind !== 'cloud');
+        const moving = 'drag-25';
+        const head = {kind:'QueueHeadDrop'};
+        const point = selector => evaluate(`(() => {
+          const row = document.querySelector(${JSON.stringify(selector)});
+          if (!row) return null;
+          const box = row.getBoundingClientRect();
+          return {x:box.left + box.width/2, y:box.top + box.height/2};
+        })()`);
+        const grip = id => point(`.queue-grip[data-move-id="${id}"]`);
+        const mouse = (type, position) => call('Input.dispatchMouseEvent', {
+          type, ...position, button:'left', buttons:type === 'mouseReleased' ? 0 : 1, clickCount:1,
+        });
+        const start = async (held, align = 'center', id = moving) => {
+          unnamedPlace = -1;
+          queuePost = null;
+          queuePostCount = 0;
+          queueFixture = {...structuredClone(readings.spacing), move_revision:'fixture-long',
+            held_places:[{kind:'held', key:'drag-held', unit:'held',
+              position:held, kept_until:'12:00 UTC', targets:['natedev']}],
+            waiters:Array.from({length:27}, (_, index) => {
+              const unit = `drag-${index + 1}`;
+              return {...template, key:unit, unit, detail:unit, name:'test affected', title:{unit, step:'test affected'},
+                machine:'natedev', move:{row_id:unit, kept_before:Number(index + 1 >= held)}};
+            })};
+          servedReading = queueFixture;
+          await navigate('memory_live.html');
+          await waitForMoveHandle(evaluate, id);
+          assert.equal(await movingPlace(id), '26');
+          await evaluate(`document.querySelector('.queue-grip[data-move-id="${id}"]')
+            .scrollIntoView({block:'${align}'}); true`);
+          await mouse('mousePressed', await grip(id));
+        };
+        const showQueueTop = () =>
+          evaluate("document.querySelector('#walk .queue-title').scrollIntoView({block:'start'}); true");
+        const placeCell = (id = moving) => `tr[data-tip="wait:${id}"] .place`;
+        const movingPlace = id => evaluate(`document.querySelector(${JSON.stringify(placeCell(id))}).textContent`);
+        const release = async position => {
+          await mouse('mouseReleased', position);
+          const message = await evaluate(`new Promise(resolve => {
+            const status = document.querySelector('#queue-status');
+            if (!queueSending) return resolve(status.textContent);
+            const observer = new MutationObserver(() => {
+              if (!queueSending) { observer.disconnect(); resolve(status.textContent); }
+            });
+            observer.observe(status, {childList:true});
+          })`);
+          return {destination:queuePost?.destination ?? null, message};
+        };
+
+        const edgeRow = 'drag-26';
+        await start(27, 'end', edgeRow);
+        const edge = {x:(await grip(edgeRow)).x, y:2};
+        assert.ok(await evaluate(`document.elementFromPoint(${edge.x}, ${edge.y}).closest('.page-top') !== null`));
+        const before = await evaluate('scrollY');
+        await mouse('mouseMoved', edge);
+        const edgePreview = await evaluate(`new Promise(resolve => {
+          const start = performance.now();
+          function check() {
+            const destination = queueDrag.destination;
+            if (destination?.kind !== 'QueueHeadDrop' && performance.now() - start < 3000) {
+              requestAnimationFrame(check);
+              return;
+            }
+            resolve({scrolled:scrollY < ${before}, destination,
+              overHeader:document.elementFromPoint(${edge.x}, ${edge.y}).closest('.page-top') !== null,
+              place:document.querySelector(${JSON.stringify(placeCell(edgeRow))}).textContent});
+          }
+          requestAnimationFrame(check);
+        })`);
+        const edgeDrop = {destination:(await release(edge)).destination, posts:queuePostCount};
+
+        await start(1);
+        await mouse('mouseMoved', await grip('drag-24'));
+        assert.equal(await movingPlace(), '25');
+        const back = await grip('drag-24');
+        await mouse('mouseMoved', back);
+        assert.equal(await movingPlace(), '26');
+        const startDrop = await release(back);
+
+        await start(1);
+        await showQueueTop();
+        await mouse('mouseMoved', await grip('drag-1'));
+        assert.equal(await movingPlace(), '2');
+        const heldDrop = await release(await point('tr.held .place'));
+
+        await start(1);
+        await showQueueTop();
+        await mouse('mouseMoved', await grip('drag-1'));
+        await evaluate(`(() => {
+          const original = window.setTimeout;
+          window.setTimeout = (callback, delay, ...args) => {
+            if (delay !== queueAccess.highlight_seconds * 1000) return original(callback, delay, ...args);
+            window.setTimeout = original;
+            window.expireQueueMessage = () => callback(...args);
+          };
+          return true;
+        })()`);
+        const outsideDrop = await release({x:1, y:400});
+        const cancelNotice = await evaluate(`(() => {
+          const feedback = document.querySelector('#queue-feedback');
+          const {top, bottom, height} = feedback.getBoundingClientRect();
+          const visible = height > 0 && top >= 0 && bottom <= innerHeight;
+          const usesHighlightDelay = Boolean(window.expireQueueMessage);
+          window.expireQueueMessage?.();
+          return {visible, usesHighlightDelay, hidden:feedback.hidden, text:document.querySelector('#queue-status').textContent};
+        })()`);
+        const result = {
+          edgePreview, edgeDrop, startDrop, heldDrop:heldDrop.destination, outsideDrop, cancelNotice,
+        };
+        if (queueDragProof) console.log(JSON.stringify(result));
+        assert.deepEqual(result, {
+          edgePreview:{scrolled:true, destination:head, overHeader:true, place:'1'},
+          edgeDrop:{destination:head, posts:1},
+          startDrop:{destination:null, message:''}, heldDrop:head,
+          outsideDrop:{destination:null, message:'Not moved. Release the row inside the list.'},
+          cancelNotice:{visible:true, usesHighlightDelay:true, hidden:true, text:''},
+        });
+        queueFixture = null;
+        servedReading = base;
+        await resize(restoreSize);
       }
 
       async function checkHeadcounts(navigate, evaluate, call) {

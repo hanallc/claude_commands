@@ -361,6 +361,8 @@ body:has(.queue-lift) #tip { visibility: hidden; }
 .queue-emphasis.lift { outline: 1px solid #4f8ff0; box-shadow: 0 6px 18px #0005; transform: translateY(-2px); }
 .queue-feedback { display: inline-flex; align-items: baseline; gap: 12px; margin: 8px 0 0; padding: 6px 12px;
   border-radius: 7px; background: var(--ink); color: var(--card); font-size: 0.88rem; }
+.queue-feedback.cancelled { position: fixed; inset: auto var(--gap) var(--gap); width: fit-content;
+  z-index: 9; pointer-events: none; }
 .queue-feedback[hidden] { display: none; }
 .queue-feedback button { color: inherit; font: inherit; font-weight: 650; text-decoration: underline;
   background: none; border: 0; padding: 0; cursor: pointer; }
@@ -3237,21 +3239,28 @@ function buildStepEvidence(key, data, row, cells, tooltip, limits) {
   return {evidence, clippedTip};
 }
 const queueMovePath = "/console/builds/queue-move";
+const queueOutsideMessage = "Not moved. Release the row inside the list.";
 let queueAccess = null;
 let queueDrag = null;
 let queueSending = false;
 let queueReply = null;
 let queueHighlight = "";
 let queueHighlightTimer;
+let queueMessageTimer;
 let queueAction = null;
 
 function queueMessage(text, action = null) {
-  $("queue-feedback").hidden = !text;
+  clearTimeout(queueMessageTimer);
+  const feedback = $("queue-feedback");
+  const cancelled = text === queueOutsideMessage;
+  feedback.hidden = !text;
+  feedback.classList.toggle("cancelled", cancelled);
   $("queue-status").textContent = text;
   const button = $("queue-action");
   button.hidden = !action;
   if (action) button.textContent = action.label;
   queueAction = action;
+  if (cancelled) queueMessageTimer = setTimeout(() => queueMessage(""), queueAccess.highlight_seconds * 1000);
 }
 
 function queueReading(d) {
@@ -3323,16 +3332,21 @@ function previewQueueMove(neighbor) {
   showWalk(preview);
 }
 
-function finishQueueDrag(commit) {
+function finishQueueDrag(commit, message = "") {
   const drag = queueDrag;
   if (!drag) return;
   queueDrag = null;
+  if (drag.scrollFrame != null) cancelAnimationFrame(drag.scrollFrame);
   const walk = $("walk");
   if (drag.pointer !== null && walk.hasPointerCapture(drag.pointer)) walk.releasePointerCapture(drag.pointer);
-  if (commit && drag.destination && drag.rows.indexOf(drag.row) !== drag.reading.waiters.indexOf(drag.row)) {
+  const moved = drag.pointer === null
+    ? drag.rows.indexOf(drag.row) !== drag.reading.waiters.indexOf(drag.row)
+    : queuePlace(displayedQueue, drag.row.move.row_id, drag.reading.move_revision)
+      !== queuePlace(drag.reading, drag.row.move.row_id, drag.reading.move_revision);
+  if (commit && drag.destination && moved) {
     void sendQueueMove(drag.row, drag.reading, {kind:"QueueMoveRequest", destination:drag.destination});
   } else {
-    queueMessage("");
+    queueMessage(message);
     if (latest) showQueue(latest);
   }
 }
@@ -3404,22 +3418,49 @@ $("walk").addEventListener("pointerdown", event => {
   const button = event.target.closest(".queue-grip");
   if (event.button !== 0 || !button || queueDrag || !beginQueueDrag(button.dataset.moveId, event.pointerId)) return;
   event.preventDefault();
+  queueDrag.rowHeight = button.closest(".wrow").getBoundingClientRect().height;
+  queueDrag.point = {clientX:event.clientX, clientY:event.clientY};
   button.focus({preventScroll:true});
   $("walk").setPointerCapture(event.pointerId);
   showWalk(queueDrag.reading);
+  queueDrag.scrollFrame = requestAnimationFrame(scrollQueueDrag);
 });
-function queueRowAt(event) {
-  const row = document.elementFromPoint(event.clientX, event.clientY)?.closest(".wait[data-tip]");
+function queueRowAt({clientX, clientY}) {
+  const row = document.elementFromPoint(clientX, clientY)?.closest(".wait[data-tip]");
   return queueDrag.rows.find(item => item.move && row?.dataset.tip === `wait:${item.key}`);
+}
+
+function queuePointBelowHeader({clientX, clientY}, headerBottom =
+  parseFloat(getComputedStyle(document.documentElement).scrollPaddingTop) || 0) {
+  return {clientX, clientY:Math.max(clientY, Math.ceil(headerBottom))};
+}
+
+function scrollQueueDrag() {
+  const drag = queueDrag;
+  drag.scrollFrame = null;
+  const {rowHeight, point} = drag;
+  const headerBottom = parseFloat(getComputedStyle(document.documentElement).scrollPaddingTop) || 0;
+  const step = point.clientY < headerBottom + rowHeight ? -rowHeight
+    : point.clientY >= document.documentElement.clientHeight - rowHeight ? rowHeight : 0;
+  if (!step) return;
+  const before = window.scrollY;
+  window.scrollBy({top:step, behavior:"instant"});
+  if (window.scrollY === before) return;
+  previewQueueMove(queueRowAt(queuePointBelowHeader(point, headerBottom)));
+  drag.scrollFrame = requestAnimationFrame(scrollQueueDrag);
 }
 
 $("walk").addEventListener("pointermove", event => {
   if (queueDrag?.pointer !== event.pointerId) return;
-  previewQueueMove(queueRowAt(event));
+  queueDrag.point = {clientX:event.clientX, clientY:event.clientY};
+  previewQueueMove(queueRowAt(queueDrag.point));
+  queueDrag.scrollFrame ??= requestAnimationFrame(scrollQueueDrag);
 });
 $("walk").addEventListener("pointerup", event => {
   if (queueDrag?.pointer !== event.pointerId) return;
-  finishQueueDrag(Boolean(queueRowAt(event)));
+  const {clientX, clientY} = queuePointBelowHeader(event);
+  const inside = $("walk").contains(document.elementFromPoint(clientX, clientY));
+  finishQueueDrag(inside, inside ? "" : queueOutsideMessage);
 });
 $("walk").addEventListener("lostpointercapture", event => {
   if (queueDrag?.pointer === event.pointerId) finishQueueDrag(false);
