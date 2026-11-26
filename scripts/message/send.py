@@ -453,6 +453,7 @@ class PendingDelivery(TypedDict):
     clearing: NotRequired[Emergency]
     recipient: NotRequired[QueuedClaudeMailbox | SavedRelayProcess]
     postmaster: NotRequired[PostmasterReservation]
+    codex_pane_unconfirmed: NotRequired[Literal[True]]
     once_per_key: NotRequired[bool]
 
 
@@ -1185,18 +1186,22 @@ def write_key_states(states: KeyStates) -> None:
     write_atomic(STATE / "keys.json", json.dumps(states, indent=2, sort_keys=True) + "\n")
 
 
-def read_key_states() -> KeyStates:
+def read_key_states(*, require_readable: bool = False) -> KeyStates:
     try:
         return cast(KeyStates, json.loads((STATE / "keys.json").read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError):
+        if require_readable:
+            raise
         return {}
 
 
 @contextmanager
-def key_states() -> Generator[KeyStates]:
+def key_states(*, require_readable: bool = False) -> Generator[KeyStates]:
     """The key states, under the lock, written back on exit when changed."""
     with locked():
-        states = read_key_states()
+        states = read_key_states(require_readable=require_readable)
         before = json.dumps(states, sort_keys=True)
         yield states
         if json.dumps(states, sort_keys=True) != before:
@@ -1841,28 +1846,32 @@ def remote_once_receipt(destination: OnceRemoteDestination, key: str) -> bool:
             and result.header.detail == ONCE_ACCEPTED)
 
 
-def confirmed_skip(message: Message, repeat: timedelta | None, at: datetime, *,
-                   live: bool = False, aliases: tuple[str, ...] = ()) -> str | None:
-    """Read prior acceptance under a delivery turn; a lock alone never means sent."""
+def recorded_delivery(message: Message, repeat: timedelta | None, at: datetime, *,
+                      live: bool = False, aliases: tuple[str, ...] = ()) -> ClaimGranted | RepeatAccepted | RepeatPending:
+    """Read prior delivery evidence before the next transport attempt."""
     if message.key is None:
-        return None
+        return ClaimGranted()
     with key_states() as states:
         state = states.get(message.key, {"last": {}})
         if "acknowledged" in state:
-            return acknowledged_skip_reason(message.key, state["acknowledged"])
+            return RepeatAccepted(acknowledged_skip_reason(message.key, state["acknowledged"]))
+        addresses = (message.to, *aliases)
+        pending = pending_deliveries(state)
+        if codex_pane_unconfirmed(pending, addresses):
+            return RepeatCodexPanePending(CODEX_PANE_UNCONFIRMED)
         if repeat is not None:
-            pending = pending_deliveries(state)
-            for address in dict.fromkeys((message.to, *aliases)):
+            for address in dict.fromkeys(addresses):
                 last = state["last"].get(address)
                 attempt = pending.get(address)
                 if last is None or attempt is not None and attempt["started"] == last:
                     continue
                 if at - datetime.fromisoformat(last) < repeat:
                     if live:
-                        return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
+                        return RepeatAccepted(still_live(message.key, message.sender, datetime.fromisoformat(last), repeat))
                     minutes = repeat.total_seconds() / 60
-                    return f"key {message.key!r} last sent to {address} at {last}, inside its {minutes:g}-minute window"
-    return None
+                    return RepeatAccepted(
+                        f"key {message.key!r} last sent to {address} at {last}, inside its {minutes:g}-minute window")
+    return ClaimGranted()
 
 
 def record_acceptance(message: Message, at: datetime) -> None:
@@ -1905,6 +1914,18 @@ class RepeatAccepted:
 class RepeatPending:
     """An earlier attempt has not confirmed acceptance."""
     reason: str
+
+
+class RepeatCodexPanePending(RepeatPending):
+    """The previous prompt may already be in the Codex pane."""
+
+
+CODEX_PANE_UNCONFIRMED = "Codex pane delivery is unconfirmed"
+
+
+def codex_pane_unconfirmed(pending: dict[str, PendingDelivery], addresses: Iterable[str]) -> bool:
+    return any((attempt := pending.get(address)) is not None and attempt.get("codex_pane_unconfirmed") is True
+               for address in addresses)
 
 
 def pending_deliveries(state: KeyState) -> dict[str, PendingDelivery]:
@@ -2236,17 +2257,20 @@ def _finish_clearing(state: KeyState) -> None:
 def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None, at: datetime, *,
           delivery_limit: float,
           legacy_aliases: tuple[str, ...] = (), live: bool = False, postmaster_recipient: str = "",
-          clears_when: str = "", posted_on: str = "", emergency: bool = False) -> ClaimGranted | RepeatAccepted | RepeatPending:
+          clears_when: str = "", posted_on: str = "", emergency: bool = False,
+          codex_pane_input: bool = False) -> ClaimGranted | RepeatAccepted | RepeatPending:
     """Check acceptance before recording an attempt under the stable recipient.
 
     The lock prevents overlapping sends with one key from both sending.
-    Known transport aliases contribute timestamps only to the window check.
+    Check known transport aliases for earlier attempts.
     With `live`, the window is the lifetime of an emergency push.
     """
     if message.key is None:
         return ClaimGranted()
-    with key_states() as states:
+    with key_states(require_readable=codex_pane_input) as states:
         state: KeyState = states.get(message.key, {"last": {}})
+        if codex_pane_input and message.once_per_key and (state.get("once_accepted") or state.get("once_confirmed")):
+            return RepeatAccepted(ONCE_ACCEPTED)
         _finish_clearing(state)
         for alias in (postmaster_recipient, recipient.value, *legacy_aliases):
             recorded = postmaster_claim(states, message.key, alias, review_delivery=message.review_delivery)
@@ -2255,6 +2279,8 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
         if "acknowledged" in state:
             return RepeatAccepted(acknowledged_skip_reason(message.key, state["acknowledged"]))
         pending = pending_deliveries(state)
+        if codex_pane_unconfirmed(pending, (recipient.value, *legacy_aliases)):
+            return RepeatCodexPanePending(CODEX_PANE_UNCONFIRMED)
         for alias in (recipient.value, *legacy_aliases):
             attempt = pending.get(alias)
             if attempt is None or "owner_pid" not in attempt or attempt["started"] != state["last"].get(alias):
@@ -2286,6 +2312,10 @@ def claim(message: Message, recipient: StableRecipient, repeat: timedelta | None
             minutes = repeat.total_seconds() / 60
             return RepeatAccepted(f"key {message.key!r} last sent to {recipient.value} at {last}, inside its {minutes:g}-minute window")
         attempt = PendingDelivery(started=at.isoformat(), limit_seconds=delivery_limit)
+        if codex_pane_input:
+            attempt["codex_pane_unconfirmed"] = True
+            if message.once_per_key:
+                attempt["once_per_key"] = True
         if isinstance(message.claude_attempt, ClaudeDeliveryAttempt):
             attempt["recipient"] = _attempt_record(message.claude_attempt)
         accepted_before = state["last"].get(recipient.value)
@@ -2328,6 +2358,8 @@ def accept_sent(key: str, to: str, at: datetime, *, delivered: bool = True) -> N
             return
         if delivered and "clearing" in owned:
             state["clearing"] = owned["clearing"]
+        if delivered and owned.get("codex_pane_unconfirmed") and owned.get("once_per_key"):
+            state["once_accepted"] = True
         del pending[to]
         if not pending:
             del state["pending"]
@@ -4556,6 +4588,7 @@ def deliver_codex(
     *,
     selection: RecipientSelection,
     review_recipient: str = "",
+    pane_repeat: timedelta | None = None,
 ) -> Result:
     text = agent_text(message)
     if isinstance(selection, FixedStaffLookup):
@@ -4563,13 +4596,8 @@ def deliver_codex(
         if isinstance(current, RecipientLookupFailed):
             return Result("failed", current.reason)
     if isinstance(recipient, CodexPaneRecipient):
-        try:
-            _prompt_pane(recipient.place, text, target=recipient.thread_id, timeout=timeout)
-            return Result("sent", f"{recipient.address} at {recipient.place.session}:{recipient.place.pane}")
-        except (herdr_types.HerdrFailure, OSError) as error:
-            if message.once_per_key:
-                return UncertainRelayDelivery("failed", str(error))
-            return Result("failed", str(error))
+        return _deliver_codex_pane(message, recipient, text, timeout, repeat=pane_repeat,
+                                   identity=StableRecipient(review_recipient or recipient.address))
     if (message.review_delivery or message.once_per_key) and message.key is not None:
         digest = hashlib.sha256(json.dumps((message.key, review_recipient)).encode()).hexdigest()
         queued = codex_daemon.queue(recipient.daemon, recipient.thread_id, text, timeout=timeout,
@@ -4585,6 +4613,38 @@ def deliver_codex(
             return UncertainRelayDelivery("failed", f"timed out after {queued.seconds:g} s")
         return Result("failed", f"timed out after {queued.seconds:g} s")
     return Result("failed", queued.reason)
+
+
+def _deliver_codex_pane(message: Message, recipient: CodexPaneRecipient, text: str, timeout: float, *,
+                        repeat: timedelta | None, identity: StableRecipient) -> Result:
+    """Save the key claim before the pane can receive the prompt."""
+    from scripts.herdr import herdr
+
+    key = message.key
+    started = now()
+    try:
+        reservation = claim(message, identity, repeat, started, delivery_limit=timeout,
+                            postmaster_recipient=identity.value, legacy_aliases=(recipient.address,), codex_pane_input=True)
+    except (OSError, ValueError) as error:
+        return Result("pending", f"Cannot verify the Codex pane delivery record: {error}")
+    if isinstance(reservation, RepeatAccepted):
+        return Result("skipped", reservation.reason)
+    if isinstance(reservation, RepeatPending):
+        return Result("pending", reservation.reason)
+    try:
+        _prompt_pane(recipient.place, text, target=recipient.thread_id, timeout=timeout)
+    except (herdr_types.HerdrFailure, OSError) as error:
+        if key is not None:
+            if not isinstance(error, herdr.HerdrCommandNotStarted):
+                return Result("pending", f"{CODEX_PANE_UNCONFIRMED}: {error}")
+            forget_sent(key, identity.value, started)
+        return Result("failed", str(error))
+    if key is not None:
+        try:
+            accept_sent(key, identity.value, started)
+        except OSError as error:
+            return Result("pending", f"Cannot save the Codex pane acceptance: {error}")
+    return Result("sent", f"{recipient.address} at {recipient.place.session}:{recipient.place.pane}")
 
 
 def action_arguments(action: UserAction) -> list[str]:
@@ -5423,6 +5483,8 @@ def once_relay_status(key: str) -> ClaimGranted | RepeatAccepted | RepeatPending
         for address, attempt in pending_deliveries(states.get(key, {"last": {}})).items():
             if not attempt.get("once_per_key"):
                 continue
+            if attempt.get("codex_pane_unconfirmed"):
+                return RepeatCodexPanePending(CODEX_PANE_UNCONFIRMED)
             prior = postmaster_claim(states, key, address)
             if isinstance(prior, RepeatAccepted):
                 return prior
@@ -5485,8 +5547,14 @@ def _prompt_pane(place: HerdrPlace, text: str, *, target: str, timeout: float) -
     """Submit text and require the selected pane to start a turn."""
     from scripts.herdr import herdr
 
-    herdr.Herdr(place.session).prompt(
-        place.pane, text, target=target, proof=herdr.SubmitStarts(int(timeout * 1000)))
+    submission = herdr.TrackedPromptSubmission(lambda: None)
+    try:
+        herdr.Herdr(place.session).prompt(
+            place.pane, text, target=target, proof=herdr.SubmitStarts(int(timeout * 1000)), on_submission=submission)
+    except (herdr_types.HerdrFailure, OSError) as error:
+        if not submission.may_have_submitted:
+            raise herdr.HerdrCommandNotStarted(str(error)) from error
+        raise
 
 
 @dataclass(frozen=True)
@@ -5965,10 +6033,12 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         recorded = _legacy_staff_reservation(key, recipient)
     if not isinstance(recorded, ClaimGranted):
         claim_result = recorded
-    elif unproved_claude or (isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency):
-        aliases = legacy_aliases if unproved_claude else (postmaster_identity.to,)
-        skip = None if refused or held is not None else confirmed_skip(identity, window, started, live=live, aliases=aliases)
-        claim_result = RepeatAccepted(skip) if skip is not None else ClaimGranted()
+    elif (unproved_claude or isinstance(route, CodexPaneRecipient)
+          or isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency):
+        aliases = ((*legacy_aliases, postmaster_identity.to) if isinstance(route, CodexPaneRecipient)
+                   else legacy_aliases if unproved_claude else (postmaster_identity.to,))
+        claim_result = (ClaimGranted() if refused or held is not None else
+                        recorded_delivery(identity, window, started, live=live, aliases=aliases))
     else:
         claim_result = ClaimGranted() if refused or held is not None else claim(
             message, attempt_recipient, window, started, delivery_limit=send_budget.seconds(options.timeout) if emergency else options.timeout,
@@ -6018,6 +6088,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             new_message_result = Result("skipped", claim_result.reason)
     elif isinstance(claim_result, RepeatUnconfirmed):
         new_message_result = UnconfirmedPostmasterDelivery("failed", claim_result.reason)
+    elif isinstance(claim_result, RepeatCodexPanePending):
+        new_message_result = Result("pending", claim_result.reason)
     elif isinstance(claim_result, RepeatPending):
         new_message_result = Result("retry" if options.review_delivery else "pending", claim_result.reason)
     elif guarded.held:
@@ -6069,7 +6141,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
                           silence_policy=options.silence_policy, user_asked=options.user_asked)
             if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
                 _ = rca.open_case(refusal_report(options), defer_owner=True)
-        elif isinstance(route, (CodexSessionRecipient, CodexPaneRecipient)):
+        elif isinstance(route, CodexPaneRecipient):
+            result = deliver_codex(message, route, options.timeout, selection=options.selection,
+                                   review_recipient=stable.value, pane_repeat=window)
+        elif isinstance(route, CodexSessionRecipient):
             result = deliver_codex(message, route, options.timeout, selection=options.selection,
                                    review_recipient=stable.value)
         elif isinstance(route, QueuedStaffRecipient):
@@ -6240,12 +6315,13 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         for address in addresses:
             _ = remove_queued_key(address, message.key, recipient=attempt_recipient, order=order,
                                   membership=membership)
-    if isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency:
+    if (isinstance(options.recipient_identity, LogicalRecipientIdentity) and not emergency
+            and not isinstance(route, CodexPaneRecipient)):
         if (not refused and held is None and isinstance(claim_result, ClaimGranted)
                 and not isinstance(result, RecordedDeliveryAcceptance)
                 and result.outcome in {"sent", "queued", "kept", "replaced", "skipped"}):
             record_acceptance(identity, started)
-    else:
+    elif not isinstance(route, CodexPaneRecipient):
         # An undelivered emergency releases its claim for a later attempt.
         # Other queued or kept messages retain their claims until delivery.
         if (key is not None and not refused and not unproved_claude and held is None

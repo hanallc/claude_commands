@@ -9027,8 +9027,9 @@ class PaneWorkerMessageTests(unittest.TestCase):
                 submit.assert_called_once()
                 self.assertEqual(submit.call_args.args[0], "w2:p1")
                 self.assertIn("Read the private report.", cast(str, submit.call_args.args[1]))
-                self.assertEqual(submit.call_args.kwargs,
-                                 {"target": row.current_session, "proof": herdr.SubmitStarts(40000)})
+                self.assertEqual(submit.call_args.kwargs["target"], row.current_session)
+                self.assertEqual(submit.call_args.kwargs["proof"], herdr.SubmitStarts(40000))
+                self.assertIsInstance(cast(object, submit.call_args.kwargs["on_submission"]), herdr.TrackedPromptSubmission)
         prompts = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
         self.assertEqual([command[2] for command in prompts], ["w2:p1", "w2:p1"])
 
@@ -9049,6 +9050,63 @@ class PaneWorkerMessageTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(output.getvalue(), "FAILED: agent_prompt_stalled: private pane did not start\n")
         self.assertEqual(send.pending(f"staff:{row.id}"), "")
+
+    def test_keyed_codex_pane_retry_stays_pending_after_lost_confirmation(self) -> None:
+        row, observed = self.codex_agent()
+        address = f"codex:{row.current_session}"
+        route = send.resolve_recipient(address, send.LocalOnly(), observed, membership=staff.snapshot())
+        assert isinstance(route, send.CodexPaneRecipient)
+        message = send.Message(address, "fixture", "Read the report.", "", "report", review_delivery=True)
+        copies: list[str] = []
+
+        def prompt(_place: HerdrPlace, text: str, *, target: str, timeout: float) -> None:
+            self.assertEqual((target, timeout), (row.current_session, 1))
+            copies.append(text)
+            if len(copies) == 1:
+                raise OSError("The pane lost confirmation.")
+
+        with mock.patch("scripts.message.send._prompt_pane", side_effect=prompt):
+            first = send.deliver_codex(message, route, 1, selection=send.RosterLookup(address))
+            with mock.patch.object(send, "now", return_value=send.now() + timedelta(minutes=2)):
+                retry = send.deliver_codex(message, route, 1, selection=send.RosterLookup(address))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual([first.outcome, retry.outcome], ["pending", "pending"])
+
+    def test_keyed_codex_pane_confirms_one_copy_on_the_first_send(self) -> None:
+        row, observed = self.codex_agent()
+        options = send.parse(["--here", "--to", row.name, "--from", "fixture", "--text", "Read the report.",
+                              "--key", "report", "--repeat-minutes", "1"])
+        with mock.patch.object(roster, "roster", return_value=observed):
+            first = send.send(options)
+            retry = send.send(options)
+        self.assertEqual((first.outcome, retry.outcome), ("sent", "skipped"))
+        prompt, = [command for command in self.fixture.world.commands if command[:2] == ("agent", "prompt")]
+        self.assertIn("Read the report.", prompt[3])
+
+    def test_codex_pane_sends_the_same_text_with_a_different_key(self) -> None:
+        row, observed = self.codex_agent()
+        options = send.parse(["--here", "--to", row.name, "--from", "fixture", "--text", "Read the report.",
+                              "--key", "report", "--recipient-key", "reader", "--review-delivery"])
+        pane_run = self.fixture.world.run
+        copies: list[str] = []
+
+        def run(*arguments: str, deadline: float = math.inf) -> str:
+            result = pane_run(*arguments, deadline=deadline)
+            if arguments[:2] == ("agent", "prompt"):
+                copies.append(arguments[3])
+                if len(copies) == 1:
+                    raise OSError("The pane lost confirmation.")
+            return result
+
+        with (mock.patch.object(roster, "roster", return_value=observed),
+              mock.patch.object(self.fixture.world, "run", side_effect=run)):
+            first = send.send(options)
+            retry = send.send(options)
+            other = send.send(options._replace(key="next-report"))
+        self.assertEqual(len(copies), 2)
+        self.assertEqual([first.outcome, retry.outcome, other.outcome], ["pending", "pending", "sent"])
+        for copy in copies:
+            self.assertIn("Read the report.", copy)
 
     def live_codex_worker(self) -> tuple[staff.StaffRow, str, roster.Roster]:
         worker = self.fixture.worker("codex-impl", family="codex")
