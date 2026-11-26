@@ -7047,8 +7047,10 @@ class ServiceTests(unittest.TestCase):
             def admit_and_change_labels(waiters: list[service.WaitingAdmission], config: records.MemoryConfig,
                                         share_percent: int, *,
                                         cargo_folder: placement.CargoFolder | placement.NoCargoFolder,
-                                        verify_slots: Mapping[str, service.VerifyRunSlot]) -> None:
-                admit(waiters, config, share_percent, cargo_folder=cargo_folder, verify_slots=verify_slots)
+                                        verify_slots: Mapping[str, service.VerifyRunSlot],
+                                        room: int | None = None, loan: int | None = None) -> None:
+                admit(waiters, config, share_percent, cargo_folder=cargo_folder, verify_slots=verify_slots,
+                      room=room, loan=loan)
                 labels[older.identity.session_id] = UnitLabels("older", unit="urgent")
                 labels[chosen.identity.session_id] = UnitLabels("chosen", unit="other")
                 del fixture.server.waiters[removed.episode]
@@ -12546,10 +12548,18 @@ class MemoryTraceCaptureTests(unittest.TestCase):
             self.assertEqual(trace.state.coverage, memory_trace.IncompleteRun(memory_trace.IncompleteReason.RESTART))
             self.assertIsInstance(run.store.newest_whole_run(trace.header.shape_key), memory_trace.NoMatchingWholeRun)
 
-    def test_non_hana_other_steps_and_unscoped_grants_do_not_record(self) -> None:
+    def test_other_scoped_steps_record_general_traces_and_unscoped_steps_record_none(self) -> None:
         for repository, step, scoped in (("other", "nextest", True), ("hana", "check", True), ("hana", "nextest", False)):
             with self.subTest(repository=repository, step=step, scoped=scoped), AdmissionFixture() as fixture:
                 run = self.grant(fixture, repository=repository, step=step, scoped=scoped)
                 self.drive(fixture, run, 3, ())
-                self.assertFalse(list(run.store.root.glob("*/*.jsonl")))
-                self.assertFalse(list(run.store.root.glob("*/*/*.jsonl")))
+                files = list(run.store.root.rglob("*.jsonl"))
+                if scoped:
+                    self.assertEqual(files, [run.store.root / "live" / f"{run.grant.reservation}.jsonl"])
+                    trace = run.store.read_live(run.grant.reservation)
+                    assert isinstance(trace, memory_trace.MemoryTrace)
+                    self.assertEqual(trace.header.general, memory_trace.GeneralTraceShape(
+                        fixture.server.host, f"git-root:{repository}", step, run.request.argv))
+                    self.assertEqual(trace.test_samples, ())
+                else:
+                    self.assertEqual(files, [])
