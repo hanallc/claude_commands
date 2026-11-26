@@ -91,3 +91,12 @@ class PeerCountsTests(unittest.TestCase):
 
                 self.assertIn("<li>mac unavailable: counts are natedev only</li>", page)
                 self.assertNotIn("mac counts from", page)
+
+    def test_board_reports_one_problem_for_an_unreadable_peer_claude_registry(self) -> None:
+        _ = self.cache.write_text(json.dumps({"machine": "mac",
+            "at": PeerCountsClock.now(timezone.utc).isoformat(), "accounts": {}, "claude_registry_unreadable": True}))
+
+        page = self.board()
+
+        self.assertEqual(page.count("<li>mac Claude sessions unreadable: Claude counts are natedev only</li>"), 1)
+        self.assertNotIn("mac unavailable", page)

@@ -12,29 +12,31 @@ The status line's first row shows its current staff assignment and path; its sec
 
 ## Preventive login sittings
 
-The weekly reminder asks you to renew Claude logins before their server end dates.
-The first sitting is Tuesday, November 17, 2026, at 10:00 EST.
-Later sittings occur every seven days.
-The reminder selects accounts whose earliest stored end date is within ten days of the sitting.
-It compares the dates on natedev and the Mac.
-When none is within ten days, it selects the account with the earliest end date.
-It sends no sitting reminder when no account has a stored date.
-A missed sitting produces only the latest sitting reminder.
+The first sitting is Tuesday, November 17, 2026, at 07:00 PST.
+`login_sitting_interval_days` in `config/accounts.conf` sets the interval between sittings.
+Each sitting selects the account with the earliest unreported login end on natedev or the Mac.
+The reminder includes only the unreported end dates for that account.
+When all stored ends are reported or no dates are available, the sitting sends no reminder.
+If the timer misses a sitting, it processes only the latest sitting.
 
-The push lists each selected account and its known end date on each machine.
-For each selected account:
+For the selected account, follow these steps.
 
 1. Sign out of claude.ai in the browser.
 2. Sign in as that account.
 3. On each named machine, run `/login` in a Claude session on that account.
 
-One sitting renews the account on both machines.
 A token refresh does not extend the server end date.
-An additional safety reminder covers an unreported login within three days of its end date.
-The safety reminder does not repeat for the same machine, account, and end date.
-Both reminders respect notification silence.
+The timer records when it first sees a later stored end on each machine.
+The new end enters the reminder list in date order.
+The time from the observation to the new end gives the remaining login lifetime at observation.
+
+The safety push covers unreported ends within `login_safety_margin_days` of expiry.
+Only the safety push can name more than one account.
+Both reminder types respect notification silence. Silence retains each batch under its own key.
+The timer retires a reminder batch when every end date in it has changed.
+It keeps a batch with a date that still needs a reminder.
 Only natedev sends these reminders.
-It reads peer dates at most once per hour and retains the last good dates when the Mac is unavailable.
+It reads Mac dates at the configured interval and retains the last successful dates if the Mac is unavailable.
 
 ## Trusted worktrees
 
@@ -116,10 +118,10 @@ A token refresh does not extend this server time limit.
 Roles include observed members and selected roles with zero members.
 `selected_roles` identifies the selected account independently.
 Codex roles are `workers` or `spare`.
-Each `role_counts` entry combines available machine counts for the role at the same index, as `{busy, idle, paused, exited, total}`.
+Each `role_counts` entry gives the local count for the role at the same index, as `{busy, idle, paused, exited, total}`.
 `sessions` lists each locally observed member once as `{"session": "<native session id>", "state": "busy|idle|paused|exited"}`.
 The list uses the same classified results as the local role counts, without another pane read.
-Peer caches supply aggregate counts only; they supply no session identities.
+Peer caches can supply counts for `spare` accounts.
 Claude sessions use their session-record state for busy and idle counts.
 A unit or showrunner without a live session counts as exited on its selected role account.
 Absent units use the units account; absent showrunners use the showrunners account.
@@ -142,7 +144,7 @@ The Models card below the accounts board counts the same sessions by full model 
 The `unknown` row counts sessions with missing model or effort evidence.
 Select a Models header to sort its rows.
 Use a model swatch to add or change its `model.<id>` color in `config/statusline.conf`.
-Each role has a separate row with its own counts from natedev and the Mac.
+Each role has a separate row with counts from the machine that reads status.
 The first role row includes all account values.
 Later rows show only the role and its counts.
 For example, `units` can have a busy count of `3`, followed by `showrunners` with `2`.
@@ -164,7 +166,8 @@ Unknown process evidence keeps its pane and reason; incomplete observations keep
 Neither state proves that a worker stopped or disappeared.
 An unreadable staff record produces a problem, not an empty worker list.
 Codex shell counts remain unknown and blank.
-The last row sums known counts across all accounts and roles.
+The last row sums the local counts across all accounts and roles.
+An unreadable local Claude registry makes the Claude counts and the total `unknown`.
 Narrow panes preserve the order and the total row.
 JSON retains `credits_in_use`, `read_at`, and `read_ok` for other consumers.
 The board has no `in use` or `read` column or fact.
@@ -180,20 +183,19 @@ One file lock prevents concurrent fetches.
 The board read never waits for the fetch.
 `status --stored` reads the saved peer counts with the same ten-minute age limit.
 The board uses `peer_session_counts.json` only within the existing ten-minute age limit.
-A failed fetch keeps the last good copy, so one slow read on a busy machine does not hide the peer counts.
+A failed fetch keeps the last good peer copy until its age limit.
 It writes the time and reason of the last failure to `peer_session_counts_failed.json`; each failure replaces that file.
 A missing, damaged, or old copy also makes the peer unavailable.
 Problems then contains one line: `<machine> unavailable: counts are <this machine> only`.
-The count columns then show local counts only.
-A later successful fetch restores the combined counts on the next board tick.
+An unreadable Claude registry in a fresh peer copy adds `<peer> Claude sessions unreadable: Claude counts are <local> only` to Problems.
 
 Each JSON account has `role_counts_by_machine`, keyed by machine and then role.
 Each role value contains `busy`, `idle`, `paused`, `exited`, and `total`, in that order.
-The JSON omits unavailable machines from this field.
-Python combines the available machine counts once in `role_counts`, in role order.
-The board and text table read `role_counts` without combining machine records again.
-Each activity count includes every available machine.
-The JSON has no session identities or account directories.
+Each assigned role appears only under the local machine key.
+The peer machine key appears only when it supplies a count for an existing `spare` row.
+The `role_counts` entry for `spare` stays null, and the display stays blank.
+The board and text table use `role_counts` in role order.
+JSON omits peer session identities and account directories.
 
 The JSON `session_inputs` lists the files and directories that the board watches, including the peer cache.
 Each existing ten-second tick refreshes local liveness.
@@ -454,7 +456,7 @@ The ranking chooses the soonest weekly reset, then the most weekly allowance lef
 A caller can keep the current account while it has room.
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py placement --explain` to see each account's readings and selection reason.
 
-Claude accounts have room until they have an unresolved provider refusal. Without an account move entry, low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. A group with an account move entry waits for its head; refusal fallback runs only when that group has no entry. Completing off-target members onto its already-selected account still runs; if fallback finds no destination with room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
+Claude accounts have room until they have an unresolved provider refusal for the work's model family. A model family refusal (for example Fable) blocks only work of that family; work of an unknown family treats it as a block. The producers use their family from `[producers]` in `config/models.conf`; unit directors and showrunners use `[production.claude]`. Without an account move entry, low and zero percentages do not move a group or remove room. Readings rank accounts: units use the soonest weekly reset, breaking ties by most weekly left; showrunners use most weekly left. A group with an account move entry waits for its head; refusal fallback runs only when that group has no entry. Completing off-target members onto its already-selected account still runs; if fallback finds no destination with room, the group keeps its account and the existing no-room notice names the earliest reset. Codex still uses fresh allowance and credits.
 
 natedev holds the one role map for both machines: Claude groups in `~/.local/state/accounts/groups.json`, workers in `~/.claude/config/accounts.json`, and changes in `~/.local/state/accounts/roles.jsonl`. All readers and writers use `read_role_map()` / `write_role_map(change)`. On the Mac, writes run through `ssh natedev` and preserve the reason, cause and move id; failed writes refuse without changing local selections. Reads fetch the map once per command and save `~/.local/state/accounts/role_map_cache.json`. When natedev is unreachable, a cached map prints `role map from <time in the user's zone>; natedev unreachable`; without a usable cache the command refuses. No machine selects a substitute account.
 
@@ -687,7 +689,23 @@ It holds them again when claude4 reads low, then moves them to claude2.
 Both groups can use the same account.
 The table shows `units` and `showrunners` on separate rows for that account.
 
-`--hold-minutes N` is finite and nonnegative; omitted or zero moves immediately. `--hold half-point` instead estimates the time to use another 0.5 percentage point from the selected account’s weighted pace history, including usage by other groups sharing that account. One point per hour gives 30 minutes, rounded up to whole minutes; missing, zero or negative pace uses 40 minutes. The list shows, for example, “showrunners 1: at 1% → claude2, hold half a point (≈30 min)” or “hold half a point (40 min default: no pace history)”. The Mac prints natedev’s rendered list using natedev’s selection and readings; `next-read` remains machine JSON.
+`--hold-minutes N` accepts a finite, nonnegative duration.
+An omitted duration or zero moves the group immediately.
+`--hold half-point` estimates the time to use another 0.5 percentage point on the selected account.
+The hold uses the same hourly rate as the Accounts page and the Claude expiry push.
+The rate includes usage from all groups on the account.
+The key `rate.lookback_minutes` in `config/accounts.conf` sets the window to 60 minutes by default.
+The window ends at the current time.
+The rate needs a reading at or before the window start and a newest reading at most 15 minutes old.
+The reading at or before the window start can be any age.
+The rate divides the total usage rise by the observed hours in the window.
+It skips refills and gaps over 15 minutes, including gaps that cross the window start.
+It also skips spans that start at 100% used or have two readings at 0% used.
+The hold uses the 40-minute default when no rate is available.
+One point per hour gives a 30-minute hold. The estimate rounds up to whole minutes.
+The list shows “showrunners 1: at 1% → claude2, hold half a point (≈30 min)” or “hold half a point (40 min default: no pace history)”.
+The Mac uses the list that natedev renders from its selection and readings.
+`next-read` returns JSON.
 
 The first fresh low reading starts an aware clock and stores its resolved duration and source with `account`, `at`, `move_id` and `percent` in `refusal_watch.json`’s `auto_move_holds`. Restarts and later pace readings leave that duration fixed. A fresh high reading clears it, while stale or missing readings leave it alone. A selection change (including away and back) or percent change clears the clock. Legacy holds without a duration resolve from their entry’s fixed minutes and retain their original start time. Legacy reset progress is ignored and dropped on the next state write.
 
@@ -701,7 +719,7 @@ Each refusal-watch pass starts a quiet probe session for each local noted Claude
 
 Account launches and renewal probes find Claude on PATH, then in `~/.local/bin`, and start its full path, including terminal relaunches; Codex account launches use the same search.
 
-Entries require fresh readings, room above the first entry's threshold, and no unresolved target quota refusal.
+Entries require fresh readings, room above the first entry's threshold, and no unresolved target quota refusal for the group's model family.
 A group that already moved this pass waits.
 Recording the group choice removes its entry under the log lock.
 Recorded `auto: <id>` history prevents a repeated move after an interrupted queue write.

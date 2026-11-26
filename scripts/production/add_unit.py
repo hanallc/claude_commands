@@ -26,11 +26,10 @@ from scripts.herdr import herdr_types
 from scripts.herdr import pane_launch
 from scripts.herdr import herdr
 from scripts.agents import pane_record, remote
-from scripts.lib import build_folders, git_exclude, git_files, models_registry
+from scripts.lib import autocompact, build_folders, git_exclude, git_files, models_registry
 from scripts.worktree import worktree_records, worktrees
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-from scripts.production import autocompact
 from scripts.message import sessions
 from scripts.production import unit_names
 from scripts.production.production_doc import (
@@ -146,6 +145,8 @@ class Effort(NamedTuple):
 class DirectorAgent(NamedTuple):
     model: str
     effort: DefaultEffort | Effort
+    configuration: models_registry.LaunchModelConfiguration | models_registry.FreshLaunchConfiguration = (
+        models_registry.FreshLaunchConfiguration())
 
 
 class OmittedCell(NamedTuple):
@@ -557,7 +558,7 @@ def director_agent(request: UnitLaunch) -> DirectorAgent:
     family, model, effort = values
     if family != "claude":
         raise Refusal(f"unit directors launch only on claude; production.director resolves to {family} ({model})")
-    return DirectorAgent(model, Effort(effort) if effort else DefaultEffort())
+    return DirectorAgent(model, Effort(effort) if effort else DefaultEffort(), configuration)
 
 
 def _is_excluded_standing_plan(production: Production, plan: Path) -> bool:
@@ -570,7 +571,7 @@ def _is_excluded_standing_plan(production: Production, plan: Path) -> bool:
 
 
 def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
-              record: staff.StaffSnapshot | None = None) -> ReadyToLaunch:
+              record: staff.StaffSnapshot | None = None, director: DirectorAgent | None = None) -> ReadyToLaunch:
     del selected
 
     handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
@@ -664,7 +665,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
         saved_words = source[1].split("\n\n", 1) if len(source) == 2 else []
         if len(saved_words) != 2 or saved_words[1] != launch.plan.words + "\n":
             raise Refusal(f"stub plan {launch.plan.stub} already exists with different content")
-    return ReadyToLaunch(launch, existing, director_agent(launch), handoff, plan_transition)
+    return ReadyToLaunch(launch, existing, director_agent(launch) if director is None else director, handoff, plan_transition)
 
 
 def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
@@ -900,8 +901,12 @@ def launch_session(
         arguments.extend(["--resume", session_id])
     else:
         session_id = ""
-    if autocompact_window:
-        arguments.extend(["--autocompact", autocompact_window])
+    configuration = (models_registry.optional_launch_snapshot()
+                     if isinstance(director.configuration, models_registry.FreshLaunchConfiguration)
+                     else director.configuration)
+    arguments.extend(models_registry.compact_window_arguments(
+        "unit", configuration=configuration, unit_window=autocompact_window))
+    environment = configuration.environment(environment)
     saved_name = request.identity.session
     session_name = LaunchNames.read().name(session_id, saved_name)
     profile = request.profile
@@ -1444,8 +1449,10 @@ def _main(argv: list[str]) -> int:
             resume_autocompact = autocompact_for_resume(request, cast(str, args.autocompact))
 
             handoff: NoSessionHandoff | StoppedSessionHandoff = NoSessionHandoff()
+            attach_director = None
             if isinstance(request.session, ResumedSession) and isinstance(request.session.handoff, AttachRunningSession):
                 attach_ready = preflight(request, unit_account, record=identity_record)
+                attach_director = attach_ready.director
                 source = attach_ready.handoff
                 if cast(bool, args.check):
                     return 0
@@ -1457,7 +1464,8 @@ def _main(argv: list[str]) -> int:
                 request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
             outcome = herdr.PromptNotSubmitted("restore reused a session without submit proof")
-            ready = preflight(request, unit_account, record=identity_record)
+            ready = (preflight(request, unit_account, record=identity_record) if attach_director is None else
+                     preflight(request, unit_account, record=identity_record, director=attach_director))
             request = ready.launch
             if cast(bool, args.check):
                 return 0

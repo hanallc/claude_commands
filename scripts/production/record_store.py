@@ -21,7 +21,7 @@ from typing import NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
-from scripts.lib import git_files
+from scripts.lib import conf, git_files
 from scripts.lib.showrunner_state import state_root as state_root
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
@@ -49,9 +49,23 @@ class RecordKind(StrEnum):
         return self.value[0].upper()
 
 
-def morty_ids(members: staff.StaffSnapshot) -> list[staff.StaffId]:
-    """Return the staff ID of each active producer named morty. Each caller decides what zero or two IDs mean."""
-    return [row.id for row in staff.active(members, "producer") if row.name == "morty"]
+def configured_list_producer(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Read the producer that owns the List."""
+    configured = settings.origin("page.list.owner", str)
+    if isinstance(configured, conf.UnavailableValue):
+        return None
+    row = members.by_id(staff.StaffId(configured.value))
+    return row if row is not None and row.kind == "producer" else None
+
+
+def list_keeper(settings: conf.ConfigRead, members: staff.StaffSnapshot) -> staff.StaffRow | None:
+    """Find the active producer that owns the List."""
+    row = configured_list_producer(settings, members)
+    if (row is None or row.id not in members.rows_by_id or row.id in members.pending_retire
+            or isinstance(row.exited, staff.Exited) or isinstance(row.doc, staff.WrappedDoc)
+            or isinstance(row.worktree, staff.RemovedWorktree)):
+        return None
+    return row
 
 
 def record_owner(kind: RecordKind, issue: Issue, legacy_owner: str) -> staff.StaffId:
@@ -802,24 +816,32 @@ class NumberedRecords:
         return self.folder() / ".next-number"
 
     def require_list_keeper(self) -> None:
-        keepers = morty_ids(staff.snapshot())
-        if self.collection != "list" or self.prefix != "L" or keepers != [self.owner]:
-            raise self.error_type("only morty's List folder can allocate List numbers")
+        keeper = list_keeper(conf.read_or_repository("console"), staff.snapshot())
+        if keeper is None:
+            raise self.error_type("The List keeper is unavailable.")
+        if self.collection != "list" or self.prefix != "L" or keeper.id != self.owner:
+            raise self.error_type(f"only {keeper.name}'s List folder can allocate List numbers")
 
     @contextmanager
     def list_allocation(self) -> Generator[None]:
         """Check the keeper before creating or locking its folder."""
         with staff.supplied_snapshot(staff.snapshot()):
             self.require_list_keeper()
-            with self.locked():
+            root = state_root()
+            root.mkdir(parents=True, exist_ok=True)
+            with exclusive(root / ".list-allocation.lock"), self.locked(check=self.require_list_keeper):
                 yield
+
+    def _list_folders(self) -> Iterator[Path]:
+        for owner in state_root().iterdir():
+            if owner.is_dir() and not owner.is_symlink():
+                folder = owner / self.collection
+                if not folder.is_symlink():
+                    yield folder
 
     def _previous_numbers(self) -> Iterator[int]:
         """Read record names and the migration log, including closed records."""
-        for owner in state_root().iterdir():
-            if not owner.is_dir() or owner.is_symlink():
-                continue
-            folder = owner / self.collection
+        for folder in self._list_folders():
             try:
                 names = [path.name for path in folder.iterdir()]
             except FileNotFoundError:
@@ -841,8 +863,7 @@ class NumberedRecords:
                 if identity != name and self.valid_id(identity):
                     yield int(identity[len(self.prefix):])
 
-    def _saved_next_number(self) -> int:
-        path = self.counter_path()
+    def _saved_next_number(self, path: Path) -> int:
         if path.is_symlink():
             raise self.error_type(f"{path}: expected a regular counter file")
         try:
@@ -856,7 +877,11 @@ class NumberedRecords:
     def next_number(self) -> int:
         """Read the next number under the store lock."""
         self.require_list_keeper()
-        number = self._saved_next_number() or max(self._previous_numbers(), default=0) + 1
+        counter = self.counter_path()
+        saved = self._saved_next_number(counter)
+        former = (self._saved_next_number(folder / counter.name) for folder in self._list_folders()
+                  if folder != counter.parent)
+        number = max(saved or max(self._previous_numbers(), default=0) + 1, max(former, default=0))
         while os.path.lexists(self.path(f"{self.prefix}{number}")):
             number += 1
         return number

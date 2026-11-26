@@ -16,15 +16,16 @@ from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal, NamedTuple, cast, final
+from typing import ClassVar, Literal, NamedTuple, cast, final, get_args
 
 from scripts.lib import build_folders
-from scripts.lib import conf_reads, land_main, main_publish, main_push_lock, registry_rows, waiting_rows
+from scripts.lib import conf_reads, land_main, main_publish, main_push_lock, names, registry_rows, waiting_rows
 from scripts.lib.registry_rows import parse_registry as parse_registry
 from scripts.lib.operation_environment import OPERATION_ENVIRONMENT as OPERATION_ENVIRONMENT
 from scripts.lib.operation_environment import agent_environment as agent_environment
 from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import autocompact
 
 DEFAULT_PATH = Path("~/.claude/config/models.conf").expanduser()
 REGISTRY_PATH = "config/models.conf"
@@ -40,8 +41,17 @@ class LaunchModelConfiguration(NamedTuple):
         return _environment(environment, OPERATION_ENVIRONMENT[0], self)
 
 
+class UnreadableLaunchModelConfiguration(LaunchModelConfiguration):
+    """An empty snapshot that keeps the supplied model and omits the role option."""
+
+    __slots__: ClassVar[tuple[()]] = ()
+
+
 class FreshLaunchConfiguration(NamedTuple):
     """The next operation must read a new registry configuration."""
+
+
+FRESH_LAUNCH_CONFIGURATION = FreshLaunchConfiguration()
 
 
 class RegistryEditBase(NamedTuple):
@@ -182,14 +192,30 @@ def producer_defaults() -> ProducerProfile:
     return profile
 
 
+def launch_snapshot(environment: Mapping[str, str] | None = None) -> LaunchModelConfiguration:
+    """Read the configuration of one launch: the inherited operation snapshot, or models.conf once."""
+    return LaunchModelConfiguration(*_snapshot(
+        os.environ if environment is None else environment, OPERATION_ENVIRONMENT[0], registry_path(environment)))
+
+
+def optional_launch_snapshot(environment: Mapping[str, str] | None = None) -> LaunchModelConfiguration:
+    """Read the configuration when the launch already has its model."""
+    try:
+        return launch_snapshot(environment)
+    except (OSError, ValueError) as error:
+        detail = " ".join(str(error).splitlines())
+        print(f"anomaly: cannot read the model registry: {detail}. Use the supplied model and omit the registry window.",
+              file=sys.stderr)
+        return UnreadableLaunchModelConfiguration(registry_path(environment), "", ())
+
+
 def launch_settings(section: str, key: str, family: Literal["claude", "codex", "assigned"] = "assigned", *,
                     configuration: LaunchModelConfiguration | None = None) -> LaunchSettings:
     """Read launch settings through the existing shell resolver.
 
     A named family reads that family's row; a writer passes its candidate text.
     """
-    if configuration is None:
-        configuration = LaunchModelConfiguration(*_snapshot(os.environ, OPERATION_ENVIRONMENT[0], registry_path()))
+    configuration = launch_snapshot() if configuration is None else configuration
     resolver = 'agents_resolve "$2.$3"' if family == "assigned" else '_agents_resolve_in_family "$2.$3" "$4"'
     resolver_arguments: list[str] = [] if family == "assigned" else [family]
     if section in ("producers", "producer_defaults"):
@@ -206,6 +232,55 @@ def launch_settings(section: str, key: str, family: Literal["claude", "codex", "
                              f"{section}.{key}")
 
 
+COMPACT_WINDOWS = "compact_windows"
+CompactRole = Literal["producer", "showrunner", "unit", "worker"]
+COMPACT_ROLES = cast(tuple[CompactRole, ...], get_args(CompactRole))
+
+
+def _compact_role_choices() -> str:
+    """List registry keys with the configured display names."""
+    loaded = names.runtime_names()
+    if not isinstance(loaded, names.Names):
+        return ", ".join(COMPACT_ROLES)
+    display = dict(showrunner=loaded.job("showrunner"), worker=loaded.job("worker"))
+    return ", ".join(f"{key} ({display[key]})" if key in display and display[key] != key else key
+                     for key in COMPACT_ROLES)
+
+
+def compact_window_arguments(role: CompactRole, *, session_id: str = "", unit_window: str = "",
+                             configuration: LaunchModelConfiguration | None = None) -> list[str]:
+    """Give the `--autocompact <tokens>` option for a Claude launch of `role`, or no option.
+
+    Use a unit session's own record even when the registry is unreadable.
+    An absent role key or the value `auto` leaves the window to Claude when the unit has no record.
+    A bad value, or a key that names no role, prints one anomaly line.
+    """
+    configuration = optional_launch_snapshot() if configuration is None else configuration
+    windows = {row.key: row.value for row in configuration.rows if row.section == COMPACT_WINDOWS and row.key}
+    for key in sorted(windows.keys() - set(COMPACT_ROLES)):
+        print(f"anomaly: {configuration.path}: {COMPACT_WINDOWS}.{key}: no role has this name. "
+              + f"Use {_compact_role_choices()}.", file=sys.stderr)
+    if role == "unit" and unit_window:
+        return ["--autocompact", unit_window]
+    if role == "unit" and session_id:
+        try:
+            recorded = autocompact.recorded(session_id)
+        except (autocompact.BadAutocompact, OSError, UnicodeError) as error:
+            print(f"anomaly: {session_id}: auto-compact record: {error}. Use the unit role window.", file=sys.stderr)
+            recorded = ""
+        if recorded and recorded != autocompact.AUTO:
+            return ["--autocompact", recorded]
+    if role not in windows:
+        return []
+    try:
+        value = autocompact.checked(windows[role])
+    except autocompact.BadAutocompact as error:
+        print(f"anomaly: {configuration.path}: {COMPACT_WINDOWS}.{role}: {error}. "
+              + "Use the settings.json window.", file=sys.stderr)
+        return []
+    return [] if value == autocompact.AUTO else ["--autocompact", value]
+
+
 def requested_model(word: str, effort: str, configuration: RegistryEditBase) -> LaunchSettings:
     """Validate a model and effort through the launch resolver."""
     resolver = ('AGENT_FAMILY="$(_agents_agent_families_inline "$2")"; '
@@ -218,6 +293,14 @@ def requested_model(word: str, effort: str, configuration: RegistryEditBase) -> 
                 '_agents_validate_pair model "$AGENT_FAMILY" "$2:$3" && '
                 'AGENT_SERVICE_TIER=""')
     return _resolve_settings(configuration, resolver, [word, effort], word)
+
+
+def check_agent_value(registry: Path, context: str, family: Literal["claude", "codex"], value: str) -> None:
+    """Check an agent value against the given catalog with the launch validator."""
+    configuration = RegistryEditBase(*_snapshot({}, "", registry))
+    resolver = ('AGENT_FAMILY="$3"; _agents_validate_pair "$2" "$3" "$4" && '
+                'AGENT_SERVICE_TIER=""')
+    _ = _resolve_settings(configuration, resolver, [context, family, value], context)
 
 
 def _resolve_settings(configuration: LaunchModelConfiguration | RegistryEditBase, resolver: str,
@@ -391,7 +474,7 @@ def _publish(repo: Path, path: Path, description: str, replay_registry: waiting_
         previous = _git(repo, "show", f"{base}:{REGISTRY_PATH}") + "\n"
         if not registry_rows.changes(previous, contents):
             return False
-        commit = _registry_commit(repo, base, contents, description)
+        commit = _registry_commit(repo, base, registry_rows.space_groups(contents), description)
         try:
             landed = land_main.land(repo, commit, branch)
         except (OSError, land_main.LandError) as error:
@@ -511,7 +594,8 @@ def save_registry(registry: Path, before: str, after: str, description: str, *,
             replay = _catalog_replay(latest, result, changes)
         changed = registry_rows.values(latest) != registry_rows.values(result)
         if changed:
-            result = after if latest == before and not additive_catalog else result
+            if latest == before and not additive_catalog:
+                result = registry_rows.space_groups(after)
             write_text_atomic(path, result)
     if not isinstance(target, SharedRegistry) or path != DEFAULT_PATH.resolve():
         return SavedRegistry(result, changed, RegistryPublication.LOCAL_ONLY)
@@ -595,7 +679,7 @@ class Arguments(argparse.Namespace):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=("store", "catalog", "shell"))
+    _ = parser.add_argument("command", choices=("store", "catalog", "shell", "worker-window"))
     _ = parser.add_argument("--launch", action="store_true")
     _ = parser.add_argument("--edit", action="store_true")
     _ = parser.add_argument("--registry", type=Path)
@@ -605,6 +689,11 @@ def main() -> int:
     _ = parser.add_argument("--additive-catalog", action="store_true")
     arguments = parser.parse_args(namespace=Arguments())
     try:
+        if arguments.command == "worker-window":
+            configuration = LaunchModelConfiguration(*_snapshot(
+                os.environ, OPERATION_ENVIRONMENT[0], arguments.registry))
+            print(" ".join(compact_window_arguments("worker", configuration=configuration)))
+            return 0
         if arguments.command == "shell":
             if arguments.launch:
                 configuration = LaunchModelConfiguration(*_snapshot(

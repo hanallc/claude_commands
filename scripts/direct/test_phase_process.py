@@ -591,7 +591,7 @@ class TrialProcessTests(unittest.TestCase):
                     self.assertIn("ExposureNotRecorded n=1", output.getvalue())
 
     def test_local_date_window_uses_the_user_zone(self) -> None:
-        with patch.dict(os.environ, {"USER_ZONE": "America/New_York", "USER_ZONE_CONF": "/nonexistent"}):
+        with patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
             self.assertEqual(process.date_epoch("2026-10-28T09:00:00"), process.date_epoch("2026-10-28T13:00:00+00:00"))
 
     def test_cli_before_anchor_keeps_mixed_open_and_other_exclusion_counts(self) -> None:
@@ -1041,7 +1041,7 @@ class PhaseProcessTests(unittest.TestCase):
 
     def test_render_names_window_counts_and_missing_sources(self) -> None:
         output = io.StringIO()
-        with patch.dict(os.environ, {"USER_ZONE": "America/New_York", "USER_ZONE_CONF": "/nonexistent"}), contextlib.redirect_stdout(output):
+        with patch.dict(os.environ, {"USER_ZONE": "America/New_York"}), contextlib.redirect_stdout(output):
             process.render_baseline(phase_events(), WINDOW, process.NotRecorded("fixture usage", "absent"), (), (), ())
         text = output.getvalue()
         self.assertIn("natedev only", text)
