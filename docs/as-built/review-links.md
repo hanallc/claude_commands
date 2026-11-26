@@ -544,7 +544,17 @@ That function returns `/console/rebuilds.html`.
 `?page=rebuilds` still selects that page for commit details.
 The shell refreshes its grouped details while that page is visible.
 The status line shows session counts under `Review:`.
-It names waiting rebuilds and counts other open actions under `For you:`.
+The question count includes questions from staff that wait for Nate's answer.
+The same count includes questions from Nate that wait for the session's answer.
+Review saves the delivery recipient with each pending follow-up.
+The footer uses that recipient for the count.
+For older follow-ups without a saved recipient, the footer uses the question's relay.
+Older questions from New item use the record owner.
+Ask question in Review sends to the showrunner.
+Followup on the legacy Questions form uses the question's relay.
+When staff answer a question from Nate, Review shows the answer under Responses and the footer count drops.
+The List's other-page counts include only questions that wait for Nate.
+The status line names waiting rebuilds and counts other open actions under `For you:`.
 `assignment.py` reads both rows before it replaces itself with jq.
 The Mac requests `/console/for-you.json?view=count` for the rebuild machines and counts without command text.
 The `for_you.host` setting in `console.conf` names the Tailscale peer that serves this data.

@@ -684,6 +684,9 @@ class QuestionIdentityTests(RegistrationFixture):
             production = read_production("example")
             relay = registration.followup(production, "Choose the layout", "Which file holds it?")
             self.assertEqual(relay.recipient, self.asker_id)
+            pending, = registration.question_records(production, registration.QuestionStaff.read())
+            assert "followup" in pending.item
+            self.assertEqual(pending.item["followup"].get("recipient"), relay.recipient)
             with self.assertRaises(registration.RegistrationFailure):
                 _ = registration.followup(production, "Choose the layout", "A second one")
         waiting = self.run_command("open")
