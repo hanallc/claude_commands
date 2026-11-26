@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
 from pathlib import Path
+from typing import final
 from zoneinfo import ZoneInfo
 
 from scripts.lib.user_zone import user_zone
@@ -74,110 +75,74 @@ def _read_times(log: Iterable[ReviewLog]) -> Iterator[datetime]:
 
 def _reply_positions(record: update_registration.QuestionRecord, source: Source, log: tuple[ReviewLog, ...],
                      zone: ZoneInfo, members: staff.StaffSnapshot,
-                     history: tuple[list_exchange.FiledExchange, ...]) -> dict[int, int]:
-    """Claim each answer event once, in order of evidence."""
+                     history: tuple[list_exchange.FiledExchange, ...]) -> dict[int, _VerifiedReply]:
+    """Associate native pairs with log events without changing their saved words."""
     fields = record.item
     replies = fields.get("followups", [])
-    positions: dict[int, int] = {}
-    claimed: set[int] = set()
-    disputed: set[int] = set()
-    disputed_replies: set[int] = set()
-
-    def assign(candidates: dict[int, list[int]]) -> None:
-        owners: dict[int, list[int]] = defaultdict(list)
-        for index, matches in candidates.items():
-            for position in matches:
-                owners[position].append(index)
-        disputed.update(position for position, indexes in owners.items() if len(indexes) > 1)
-        for index, matches in candidates.items():
-            if disputed.intersection(matches):
-                disputed_replies.add(index)
-            if len(matches) == 1 and matches[0] not in disputed:
-                positions[index] = matches[0]
-                claimed.add(matches[0])
-
-    def eligible(index: int, position: int) -> bool:
-        return (index not in positions and position not in claimed and position not in disputed and position in range(len(log))
-                and _answer_event(log[position]) and log[position].words.rstrip() == "Answer: " + replies[index]["reply"])
-
+    tags = tuple((reply.get("question_id", ""), reply["followup"]) for reply in replies)
+    verifier = ExchangeVerifier(log, members, native_tags=tags)
     saved = {exchange.exchange_id: exchange.binding for exchange in history}
-    stored: dict[int, list[int]] = defaultdict(list)
-    for index in range(len(replies)):
+    locators = fields.get("reply_log_positions", {})
+    positions: dict[int, _VerifiedReply] = {}
+
+    def candidate(index: int, position: int, strength: ReplyProof) -> _VerifiedReply | None:
+        reply = replies[index]
+        tag, text = tags[index]
         binding = saved.get(f"followup:{index + 1}")
-        if (isinstance(binding, ExchangeBinding) and isinstance(binding.question, QuestionRecord)
-                and (position := _event_position(binding.reply, log)) is not None and eligible(index, position)):
-            stored[index].append(position)
-    assign(stored)
-    assign({index: [position] for index in range(len(replies))
-            if eligible(index, position := fields.get("reply_log_positions", {}).get(str(index), -1))})
-    assign({index: [position for position, event in enumerate(log)
-                    if event.feedback_request_id == question_path.answer_log_id(identity) and eligible(index, position)]
-            for index, reply in enumerate(replies) if (identity := reply.get("question_id"))})
-    timed: dict[int, list[int]] = {}
-    for index, reply in enumerate(replies):
-        if index in positions:
-            continue
+        origin = binding.reply if isinstance(binding, ExchangeBinding) else ReplyWithoutEvent.NATIVE_RECORD
         stamp = reply.get("replied_at") or (fields.get("answered_at") if index == len(replies) - 1 else None)
-        if stamp is not None:
-            time = review_items.moment(stamp, zone)
-            timed[index] = [position for position, event in enumerate(log)
-                            if not event.feedback_request_id and event.time == time and eligible(index, position)]
-    assign(timed)
+        time = review_items.moment(stamp, zone) if stamp is not None else TimeNotRecorded.ABSENT
+        initial = (index == 0 and source is Source.SCOPED_REPLY
+                   and _same_prompt(fields.get("question", fields["text"]), text))
+        request = verifier.native_request(text, tag, strength, initial=initial)
+        author = record.owner if initial and strength is ReplyProof.INTERVAL else _AnswererEvidence.NOT_RECORDED
+        evidence = ReplyEvidence(reply["reply"], time, author, locators.get(str(index)), origin)
+        if verifier.verify(request, position, strength, tag=tag, evidence=evidence) is Verification.VERIFIED:
+            return _VerifiedReply(position, request)
+        return None
 
-    prompts = _question_prompts(log)
-    windows = _reply_windows(log, prompts, include_tagged=True)
-    tagged_events: dict[str, list[int]] = defaultdict(list)
-    for position, event in enumerate(log):
-        if event.feedback_request_id:
-            tagged_events[event.feedback_request_id].append(position)
-    bound = {prompt.identity for question, prompt in prompts.items()
-             for index, position in positions.items()
-             if position in windows[question] and _same_prompt(prompt.text, replies[index]["followup"])}
-    intervals: dict[int, tuple[int, int]] = {}
-    for index, reply in enumerate(replies):
-        binding = saved.get(f"followup:{index + 1}")
-        if (index in positions or index in disputed_replies or index in timed
-                or str(index) in fields.get("reply_log_positions", {})
-                or isinstance(binding, ExchangeBinding) and isinstance(binding.reply, (LoggedReply, TaggedReply))):
-            continue
-        tag = reply.get("question_id", "")
-        tagged_questions = tagged_events.get(tag, [])
-        if tag and (tagged_events.get(question_path.answer_log_id(tag))
-                    or any(position not in prompts or not _same_prompt(prompts[position].text, reply["followup"])
-                           for position in tagged_questions)):
-            continue
-        if index == 0 and source is Source.SCOPED_REPLY and not tagged_questions and _same_prompt(
-                fields.get("question", fields["text"]), reply["followup"]):
-            boundary = _first_request_boundary(log)
-            early = [position for position in range(boundary) if _answer_event(log[position])]
-            if early:
-                position = early[0]
-                if (len(early) == 1 and not log[position].feedback_request_id and eligible(index, position)
-                        and _is_answerer(log[position], record.owner, members)):
-                    intervals[index] = (-1, position)
+    for strength in (ReplyProof.SAVED, ReplyProof.LOCATOR, ReplyProof.TAG, ReplyProof.TIME):
+        candidates: dict[int, list[tuple[int, _VerifiedReply]]] = defaultdict(list)
+        for index in range(len(replies)):
+            if index in positions:
                 continue
-        questions = [question for question, prompt in prompts.items() if _same_prompt(prompt.text, reply["followup"])]
-        if len(questions) != 1:
-            continue
-        question = questions[0]
-        origin = prompts[question].origin
-        if (isinstance(origin, QuestionSlot) and origin.identity != tag
-                or tagged_questions and tagged_questions != [question]):
-            continue
-        matches = windows[question]
-        if len(matches) == 1 and not log[matches[0]].feedback_request_id and eligible(index, matches[0]):
-            intervals[index] = (question, matches[0])
+            binding = saved.get(f"followup:{index + 1}")
+            if strength is ReplyProof.SAVED:
+                located = _event_position(binding.reply, log) if isinstance(binding, ExchangeBinding) else None
+                events = () if located is None else (located,)
+            elif strength is ReplyProof.LOCATOR:
+                located = locators.get(str(index))
+                events = () if located is None else (located,)
+            elif strength is ReplyProof.TAG:
+                events = verifier.tagged_replies.get(tags[index][0], ())
+            else:
+                events = verifier.answers
+            for position in events:
+                if (verified := candidate(index, position, strength)) is not None:
+                    candidates[position].append((index, verified))
+        totals: dict[int, int] = defaultdict(int)
+        for claims in candidates.values():
+            for index, _ in claims:
+                totals[index] += 1
+        for position, claims in sorted(candidates.items()):
+            if len(claims) != 1:
+                verifier.disputed.add(position)
+                continue
+            index, verified = claims[0]
+            if totals[index] != 1:
+                verifier.disputed.add(position)
+                continue
+            positions[index] = verified
+            verifier.claim(position, verified.request)
 
-    candidates: dict[int, list[int]] = defaultdict(list)
-    for index, (_, position) in intervals.items():
-        candidates[position].append(index)
-    for index, (question, position) in sorted(intervals.items()):
-        if (len(candidates[position]) == 1
-                and (question < 0 or not _competing_request(log, question, bound=bound))
-                and all((other < index) == (known < position) for other, known in positions.items())):
-            positions[index] = position
-            if question >= 0:
-                bound.add(prompts[question].identity)
+    for position in verifier.answers:
+        matches = [(index, verified) for index in range(len(replies)) if index not in positions
+                   and (verified := candidate(index, position, ReplyProof.INTERVAL)) is not None]
+        if len(matches) == 1:
+            index, verified = matches[0]
+            if all((other < index) == (known.position < position) for other, known in positions.items()):
+                positions[index] = verified
+                verifier.claim(position, verified.request)
     return positions
 
 
@@ -198,22 +163,27 @@ def _is_answerer(event: ReviewLog, identity: staff.StaffId, members: staff.Staff
     return event.who == identity or _answerer(event.who, members) == identity
 
 
-def _staff_log_reply(fields: update_registration.OutstandingItem, log: tuple[ReviewLog, ...],
-                     asker: staff.StaffId, members: staff.StaffSnapshot) -> tuple[_Prompt, int] | None:
-    prompts = _question_prompts(log)
-    if len(prompts) != 1:
+def _staff_log_reply(fields: update_registration.OutstandingItem, verifier: ExchangeVerifier,
+                     asker: staff.StaffId, history: tuple[list_exchange.FiledExchange, ...]
+                     ) -> tuple[_Prompt, int] | None:
+    if len(verifier.prompts) != 1:
         return None
-    question, prompt = next(iter(prompts.items()))
-    if not _same_prompt(prompt.text, fields.get("waiting_why", "")) or _competing_request(log, question):
+    question, prompt = next(iter(verifier.prompts.items()))
+    if not _same_prompt(prompt.text, fields.get("waiting_why", "")):
         return None
-    matches = _reply_windows(log, prompts, include_tagged=True)[question]
-    if len(matches) != 1:
-        return None
-    position = matches[0]
-    event = log[position]
-    if not _is_answerer(event, asker, members) or not _request_owns_tag(prompt, event):
-        return None
-    return prompt, position
+    saved = next((value for value in history if value.exchange_id == "legacy-followup"), None)
+    evidence = ReplyEvidence(answerer=asker)
+    if saved is not None:
+        if (saved.question != prompt.text or saved.asked_at != prompt.time or saved.answerer != asker
+                or not isinstance(saved.answer, ExchangeAnswer)):
+            return None
+        binding = saved.binding.reply if isinstance(saved.binding, ExchangeBinding) else evidence.binding
+        evidence = ReplyEvidence(saved.answer.text, saved.answer.time, asker, binding=binding)
+    request = RequestInterval(prompt.text, question)
+    for position in verifier.windows[question]:
+        if verifier.verify(request, position, ReplyProof.INTERVAL, evidence=evidence) is Verification.VERIFIED:
+            return prompt, position
+    return None
 
 
 def _question_exchanges(record: update_registration.QuestionRecord, source: Source, key: str,
@@ -235,7 +205,7 @@ def _question_exchanges(record: update_registration.QuestionRecord, source: Sour
                            ReplyWithoutEvent.NATIVE_RECORD if isinstance(answer, ExchangeAnswer) else ReplyWithoutEvent.NO_ANSWER))
     replies = fields.get("followups", [])
     positions = _reply_positions(record, source, log, zone, members, history)
-    derived = (_staff_log_reply(fields, log, record.asker, members)
+    derived = (_staff_log_reply(fields, ExchangeVerifier(log, members), record.asker, history)
                if source is Source.STAFF_QUESTION and closed and not replies else None)
     if derived is not None:
         prompt, position = derived
@@ -245,29 +215,22 @@ def _question_exchanges(record: update_registration.QuestionRecord, source: Sour
                        prompt.time, Nate.USER, record.asker, answer, links,
                        binding=ExchangeBinding(prompt.origin, _reply_origin(position, event)))
     if unresolved is not None:
-        claimed = set(positions.values())
+        claimed = {verified.position for verified in positions.values()}
         if derived is not None:
             claimed.add(derived[1])
         if count := sum(index not in claimed and _answer_event(event) for index, event in enumerate(log)):
             unresolved.append((key, count))
     read_times = tuple(_read_times(log))
-    previous = 0
     for index, reply in enumerate(replies):
-        position = positions.get(index)
+        verified = positions.get(index)
+        position = verified.position if verified is not None else None
         stamp = reply.get("replied_at")
         if stamp is None and position is None and index == len(replies) - 1:
             stamp = fields.get("answered_at")
         answered_at = (log[position].time if position is not None else review_items.moment(stamp, zone)
                        if stamp is not None else TimeNotRecorded.ABSENT)
-        end = position if position is not None else min(
-            (pos for later, pos in positions.items() if later > index), default=len(log))
-        prompt = next((event for event in reversed(log[previous:end])
-                       if event.who == Nate.USER and event.words.partition(": ")[0].lower() in ("question", "followup")
-                       and _same_prompt(event.words.partition(": ")[2], reply["followup"])),
-                      None)
-        if position is not None:
-            previous = position + 1
-        asked_at = (prompt.time if prompt is not None else filed
+        start = verified.request.start if verified is not None else _SyntheticRequest.UNLOCATED
+        asked_at = (log[start].time if isinstance(start, int) else filed
                     if source is Source.SCOPED_REPLY and index == 0 and _same_prompt(reply["followup"], initial)
                     else TimeNotRecorded.ABSENT)
         answer = ExchangeAnswer(reply["reply"], answered_at, _read_state(answered_at, read_times, acknowledged=closed))
@@ -288,13 +251,13 @@ class _Prompt:
     time: datetime
 
 
-def _event_digest(event: ReviewLog) -> str:
+def event_digest(event: ReviewLog) -> str:
     parts = (event.time.astimezone(UTC).isoformat(), event.who, event.feedback_request_id, event.words)
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
 def _reply_origin(position: int, event: ReviewLog) -> TaggedReply | LoggedReply:
-    return TaggedReply(event.feedback_request_id) if event.feedback_request_id else LoggedReply(position, _event_digest(event))
+    return TaggedReply(event.feedback_request_id) if event.feedback_request_id else LoggedReply(position, event_digest(event))
 
 
 def _answer_event(event: ReviewLog) -> bool:
@@ -303,9 +266,9 @@ def _answer_event(event: ReviewLog) -> bool:
 
 def _event_position(reply: ReplyOrigin, log: tuple[ReviewLog, ...]) -> int | None:
     if isinstance(reply, LoggedReply):
-        if 0 <= reply.position < len(log) and _event_digest(log[reply.position]) == reply.digest:
+        if 0 <= reply.position < len(log) and event_digest(log[reply.position]) == reply.digest:
             return reply.position
-        matches = [index for index, event in enumerate(log) if _answer_event(event) and _event_digest(event) == reply.digest]
+        matches = [index for index, event in enumerate(log) if _answer_event(event) and event_digest(event) == reply.digest]
         if len(matches) == 1:
             return matches[0]
     elif isinstance(reply, TaggedReply):
@@ -367,86 +330,224 @@ def _reply_windows(log: tuple[ReviewLog, ...], requests: Iterable[int], *,
     return {index: tuple(positions) for index, positions in windows.items()}
 
 
-def _request_owns_tag(prompt: _Prompt, event: ReviewLog) -> bool:
-    if not event.feedback_request_id:
-        return True
-    origin = prompt.origin
-    return isinstance(origin, QuestionSlot) and event.feedback_request_id in (
-        origin.identity, question_path.answer_log_id(origin.identity))
+class Verification(StrEnum):
+    VERIFIED = "the evidence agrees"
+    CONFLICT = "the evidence disagrees"
+    MISSING = "the evidence cannot establish ownership"
 
 
-def _competing_request(log: tuple[ReviewLog, ...], before: int, *,
-                       bound: Iterable[str] = ()) -> bool:
-    """Check for an earlier request that could also own an untagged reply."""
-    earlier = log[:before]
-    answered = {event.feedback_request_id.removeprefix("answer:") for event in earlier
-                if event.feedback_request_id and _answer_event(event)}
-    for index, event in enumerate(earlier):
-        label = event.words.partition(": ")[0].lower()
-        if event.who != Nate.USER or label not in ("question", "followup", "feedback"):
-            continue
-        tag = event.feedback_request_id
-        identity = "question:" + tag if tag else f"log:{index}"
-        if tag not in answered and identity not in bound:
+class ReplyProof(StrEnum):
+    SAVED = "stored binding"
+    LOCATOR = "native log position"
+    TAG = "stable reply tag"
+    TIME = "saved reply time"
+    INTERVAL = "sole reply in a request interval"
+
+
+class _SyntheticRequest(StrEnum):
+    INITIAL = "native initial question"
+    NATIVE_PAIR = "native question without a logged prompt"
+    SLOT = "current slot without a logged prompt"
+    UNLOCATED = "no unique request interval"
+
+
+class _AnswererEvidence(StrEnum):
+    NOT_RECORDED = "no saved author"
+    RESOLVED_STAFF = "a uniquely identified staff member"
+
+
+@dataclass(frozen=True)
+class RequestInterval:
+    text: str
+    start: int | _SyntheticRequest
+
+
+@dataclass(frozen=True)
+class _VerifiedReply:
+    position: int
+    request: RequestInterval
+
+
+@dataclass(frozen=True)
+class ReplyEvidence:
+    text: str = ""
+    time: datetime | TimeNotRecorded = TimeNotRecorded.ABSENT
+    answerer: staff.StaffId | RecordedAnswerer | Nate | _AnswererEvidence = _AnswererEvidence.NOT_RECORDED
+    locator: int | None = None
+    binding: ReplyOrigin = ReplyWithoutEvent.NATIVE_RECORD
+
+
+@dataclass(frozen=True)
+class QuestionSlotEvidence:
+    tag: str
+    text: str
+    reply: ReplyEvidence
+
+
+_NO_REPLY_EVIDENCE = ReplyEvidence()
+
+
+@final
+class ExchangeVerifier:
+    """Decide whether one request owns one reply and all evidence agrees."""
+
+    def __init__(self, log: tuple[ReviewLog, ...], members: staff.StaffSnapshot, *,
+                 native_tags: Iterable[tuple[str, str]] = (),
+                 slot: QuestionSlotEvidence | None = None) -> None:
+        self.log = log
+        self.members = members
+        self.prompts = _question_prompts(log)
+        self.windows = _reply_windows(log, self.prompts, include_tagged=True)
+        self.answers = tuple(index for index, event in enumerate(log) if _answer_event(event))
+        self.boundary = _first_request_boundary(log)
+        self.slot = slot
+        self.claimed: set[int] = set()
+        self.disputed: set[int] = set()
+        self.bound: set[int] = set()
+        self.tags: dict[str, list[int]] = defaultdict(list)
+        self.tagged_replies: dict[str, list[int]] = defaultdict(list)
+        self.native_tags: dict[str, list[str]] = defaultdict(list)
+        for index, event in enumerate(log):
+            tag = event.feedback_request_id
+            if tag:
+                self.tags[tag].append(index)
+                if index in self.answers:
+                    self.tagged_replies[tag.removeprefix("answer:")].append(index)
+        for tag, text in native_tags:
+            if tag:
+                self.native_tags[tag].append(text)
+
+    def claim(self, position: int, request: RequestInterval) -> None:
+        self.claimed.add(position)
+        if isinstance(request.start, int):
+            self.bound.add(request.start)
+
+    def native_request(self, text: str, tag: str, proof: ReplyProof, *,
+                       initial: bool) -> RequestInterval:
+        matches = [start for start, prompt in self.prompts.items() if _same_prompt(prompt.text, text)]
+        tagged = [start for start in matches if tag and self.log[start].feedback_request_id == tag]
+        if len(tagged) == 1 and (not initial or (tagged[0] == self.boundary and proof is not ReplyProof.INTERVAL)):
+            return RequestInterval(text, tagged[0])
+        if initial:
+            return RequestInterval(text, _SyntheticRequest.INITIAL)
+        if len(matches) == 1 and (proof is not ReplyProof.INTERVAL or not self.log[matches[0]].feedback_request_id):
+            return RequestInterval(text, matches[0])
+        if proof is not ReplyProof.INTERVAL and not matches:
+            return RequestInterval(text, _SyntheticRequest.NATIVE_PAIR)
+        return RequestInterval(text, _SyntheticRequest.UNLOCATED)
+
+    def _tags_agree(self, request: RequestInterval, position: int, tag: str) -> bool:
+        log_tag = self.log[position].feedback_request_id
+        if isinstance(request.start, int):
+            request_tag = self.log[request.start].feedback_request_id
+            if request_tag and tag and tag != request_tag:
+                return False
+            tag = tag or request_tag
+        if not tag:
+            return not log_tag
+        if self.native_tags[tag] and (len(self.native_tags[tag]) != 1
+                                     or not _same_prompt(self.native_tags[tag][0], request.text)):
+            return False
+        requests = [index for index in self.tags[tag] if index not in self.answers]
+        if requests and (requests != [request.start] or request.start not in self.prompts
+                         or not _same_prompt(self.prompts[requests[0]].text, request.text)):
+            return False
+        answers = self.tagged_replies[tag]
+        return (not log_tag or log_tag in (tag, question_path.answer_log_id(tag))) and (
+            not answers or answers == [position]) and all(
+                index == position for index in self.tags[question_path.answer_log_id(tag)])
+
+    def _reply_agrees(self, position: int, evidence: ReplyEvidence) -> bool:
+        event = self.log[position]
+        if evidence.text and event.words[8:].rstrip() != evidence.text.rstrip():
+            return False
+        if isinstance(evidence.time, datetime) and event.time != evidence.time:
+            return False
+        if isinstance(evidence.binding, (LoggedReply, TaggedReply)):
+            if _event_position(evidence.binding, self.log) != position:
+                return False
+        if evidence.locator is not None and evidence.locator != position and (
+                not isinstance(evidence.binding, LoggedReply) or evidence.locator in self.answers):
+            return False
+        author = evidence.answerer
+        if author is _AnswererEvidence.NOT_RECORDED:
             return True
-    return False
+        resolved = _answerer(event.who, self.members)
+        if author is _AnswererEvidence.RESOLVED_STAFF:
+            return not isinstance(resolved, RecordedAnswerer)
+        return event.who == author or resolved == author
+
+    def _competing(self, start: int) -> bool:
+        return any(index not in self.bound and event.who == Nate.USER
+                   and event.words.partition(": ")[0].lower() in ("question", "followup", "feedback")
+                   for index, event in enumerate(self.log[:start]))
+
+    def verify(self, request: RequestInterval, position: int, proof: ReplyProof, *, tag: str = "",
+               evidence: ReplyEvidence = _NO_REPLY_EVIDENCE, preserve_binding: bool = False) -> Verification:
+        if (position not in self.answers or position in self.claimed or position in self.disputed
+                or not self._tags_agree(request, position, tag) or not self._reply_agrees(position, evidence)):
+            return Verification.CONFLICT
+        start, event = request.start, self.log[position]
+        tagged = bool(event.feedback_request_id)
+        if isinstance(start, int):
+            if position <= start or (position not in self.windows[start] and not tagged):
+                return Verification.CONFLICT
+        elif start is _SyntheticRequest.INITIAL:
+            if position >= self.boundary or tagged:
+                return Verification.CONFLICT
+        elif start is _SyntheticRequest.NATIVE_PAIR:
+            if position >= self.boundary:
+                return Verification.CONFLICT
+        elif start is _SyntheticRequest.UNLOCATED or not tagged:
+            return Verification.MISSING
+
+        slot = self.slot
+        if slot is not None and (tag == slot.tag or (not preserve_binding and not tag
+                and _same_prompt(request.text, slot.text))):
+            if not _same_prompt(request.text, slot.text) or not self._reply_agrees(position, slot.reply):
+                return Verification.CONFLICT
+            if not tag and not tagged:
+                if not isinstance(slot.reply.time, datetime) and not isinstance(evidence.time, datetime):
+                    return Verification.MISSING
+                if sum(_same_prompt(prompt.text, slot.text) for prompt in self.prompts.values()) != 1:
+                    return Verification.MISSING
+
+        if proof is ReplyProof.SAVED and not isinstance(evidence.binding, (LoggedReply, TaggedReply)):
+            return Verification.MISSING
+        if proof is ReplyProof.LOCATOR and evidence.locator is None:
+            return Verification.MISSING
+        if proof is ReplyProof.TAG and not tagged:
+            return Verification.MISSING
+        if proof is ReplyProof.TIME and not isinstance(evidence.time, datetime):
+            return Verification.MISSING
+        if proof is ReplyProof.INTERVAL:
+            if start is _SyntheticRequest.INITIAL:
+                if sum(index < self.boundary for index in self.answers) != 1:
+                    return Verification.MISSING
+            elif isinstance(start, int):
+                if len(self.windows[start]) != 1 or self._competing(start):
+                    return Verification.MISSING
+            else:
+                return Verification.MISSING
+        return Verification.VERIFIED
 
 
 def _slot_prompt(slot: delivery_state.AnsweredQuestion, prompts: dict[int, _Prompt], filed: datetime) -> _Prompt:
     identity = "question:" + slot.question_id
     tagged = [prompt for prompt in prompts.values() if prompt.identity == identity]
-    if len(tagged) == 1:
+    if len(tagged) == 1 and _same_prompt(tagged[0].text, slot.text):
         return tagged[0]
     return _Prompt(QuestionSlot(slot.question_id), identity, slot.text, filed)
 
 
-def _legacy_reply(question: int, answer: ExchangeAnswer, author: staff.StaffId | RecordedAnswerer | Nate,
-                  log: tuple[ReviewLog, ...], windows: dict[int, tuple[int, ...]],
-                  members: staff.StaffSnapshot, *, bound: Iterable[str]) -> int | None:
-    """Use independent slot evidence before checking the reply text."""
-    positions = windows[question]
-    if isinstance(answer.time, datetime):
-        positions = tuple(position for position in positions if log[position].time == answer.time)
-    elif _competing_request(log, question, bound=bound):
-        return None
-    if not isinstance(author, (RecordedAnswerer, Nate)):
-        positions = tuple(position for position in positions if _answerer(log[position].who, members) == author)
-    if len(positions) == 1 and log[positions[0]].words == "Answer: " + answer.text:
-        return positions[0]
-    return None
-
-
-def _saved_scoped_exchange(saved: list_exchange.FiledExchange, log: tuple[ReviewLog, ...],
-                           prompts: dict[int, _Prompt], links: tuple[ListLink, ...],
-                           read_times: tuple[datetime, ...], acknowledged: bool,
-                           members: staff.StaffSnapshot) -> Exchange:
+def _saved_scoped_exchange(saved: list_exchange.FiledExchange, links: tuple[ListLink, ...],
+                           read_times: tuple[datetime, ...], acknowledged: bool) -> Exchange:
     answer = saved.answer
-    binding = saved.binding
-    asked_at, answerer = saved.asked_at, saved.answerer
-    if isinstance(binding, ExchangeBinding) and isinstance(answer, ExchangeAnswer):
-        if isinstance(binding.question, QuestionSlot):
-            prompt = _bound_prompt(binding.question, saved.question, prompts)
-            if prompt is not None:
-                asked_at = prompt.time
-        position = _event_position(binding.reply, log)
-        if position is not None and log[position].words == "Answer: " + answer.text:
-            answerer = _answerer(log[position].who, members)
-        state = _read_state(answer.time, read_times, acknowledged=acknowledged)
-        if state is AnswerRead.READ:
-            answer = replace(answer, read=state)
+    if isinstance(answer, ExchangeAnswer) and _read_state(
+            answer.time, read_times, acknowledged=acknowledged) is AnswerRead.READ:
+        answer = replace(answer, read=AnswerRead.READ)
     return Exchange(saved.source, saved.source_key, saved.exchange_id, saved.direction, saved.question,
-                    asked_at, saved.asker, answerer, answer, links, binding=binding)
-
-
-def _bound_prompt(origin: QuestionEvent | QuestionSlot, text: str, prompts: dict[int, _Prompt]) -> _Prompt | None:
-    if isinstance(origin, QuestionSlot):
-        matches = [prompt for prompt in prompts.values() if prompt.origin == origin]
-        prompt = matches[0] if len(matches) == 1 else None
-    else:
-        prompt = prompts.get(origin.position)
-        if prompt is not None and not isinstance(prompt.origin, QuestionEvent):
-            return None
-    return prompt if prompt is not None and prompt.text == text else None
+                    saved.asked_at, saved.asker, saved.answerer, answer, links, binding=saved.binding)
 
 
 def _bound_event_prompt(origin: QuestionEvent, exchange: list_exchange.Exchange, position: int,
@@ -465,50 +566,74 @@ def _bound_event_prompt(origin: QuestionEvent, exchange: list_exchange.Exchange,
     return prompt
 
 
-def _legacy_match(identity: str, text: str, answer: ExchangeAnswer,
-                  author: staff.StaffId | RecordedAnswerer | Nate, log: tuple[ReviewLog, ...],
-                  prompts: dict[int, _Prompt], windows: dict[int, tuple[int, ...]], members: staff.StaffSnapshot,
-                  bound: set[str]) -> tuple[_Prompt, int] | None:
-    matching = [(index, prompt) for index, prompt in prompts.items()
-                if prompt.identity not in bound and prompt.text == text]
-    exact = [(index, prompt) for index, prompt in matching if prompt.identity == identity]
-    if exact:
-        matching = exact
-    elif identity.startswith("question:") and isinstance(answer.time, datetime):
-        matching = [(index, prompt) for index, prompt in matching if isinstance(prompt.origin, QuestionEvent)]
+def _saved_reply_request(saved: list_exchange.Exchange, position: int, verifier: ExchangeVerifier
+                         ) -> RequestInterval | None:
+    binding, answer = saved.binding, saved.answer
+    if not isinstance(binding, ExchangeBinding) or not isinstance(answer, ExchangeAnswer):
+        return None
+    origin = binding.question
+    if isinstance(origin, QuestionEvent):
+        prompt = _bound_event_prompt(origin, saved, position, verifier.prompts, verifier.windows)
+        if prompt is None or not isinstance(prompt.origin, QuestionEvent):
+            return None
+        start = prompt.origin.position
+    elif isinstance(origin, QuestionSlot):
+        starts = [index for index, prompt in verifier.prompts.items() if prompt.origin == origin]
+        if len(starts) > 1:
+            return None
+        start = starts[0] if starts else _SyntheticRequest.SLOT
     else:
-        return None
-    if len(matching) != 1:
-        return None
-    index, prompt = matching[0]
-    if not exact and _competing_request(log, index, bound=bound):
-        return None
-    position = _legacy_reply(index, answer, author, log, windows, members, bound=bound)
-    if position is None:
-        return None
-    if not exact:
-        prompt = replace(prompt, origin=QuestionEvent(index, identity.removeprefix("question:")))
-    return prompt, position
+        start = _SyntheticRequest.INITIAL
+    request = RequestInterval(saved.question, start)
+    tag = origin.identity if isinstance(origin, QuestionSlot) else ""
+    evidence = ReplyEvidence(answer.text, answer.time, saved.answerer, binding=binding.reply)
+    if verifier.verify(request, position, ReplyProof.SAVED, tag=tag, evidence=evidence,
+                       preserve_binding=True) is Verification.VERIFIED:
+        return request
+    return None
 
 
-def _later_bug_answer(record: investigation.Investigation, last: int, log: tuple[ReviewLog, ...],
-                      prompts: dict[int, _Prompt], windows: dict[int, tuple[int, ...]],
-                      members: staff.StaffSnapshot) -> bool:
-    """Check whether a later verified pair accounts for the saved answer."""
-    if log[last].words[8:] != record.answer:
-        return False
-    bound: set[str] = set()
-    for index, prompt in prompts.items():
-        positions = windows[index]
-        if len(positions) != 1 or _competing_request(log, index, bound=bound):
+def _legacy_matches(saved: list_exchange.FiledExchange, verifier: ExchangeVerifier
+                    ) -> Iterator[tuple[_Prompt, _VerifiedReply]]:
+    answer = saved.answer
+    if not isinstance(answer, ExchangeAnswer):
+        return
+    old_slot = saved.exchange_id.removeprefix("question:") if saved.exchange_id.startswith("question:") else ""
+    if not old_slot and not isinstance(answer.time, datetime):
+        return
+    for start, prompt in verifier.prompts.items():
+        if prompt.text != saved.question:
             continue
-        position = positions[0]
-        event = log[position]
-        if _is_answerer(event, record.owner, members) and _request_owns_tag(prompt, event):
-            if position == last:
-                return True
-            bound.add(prompt.identity)
-    return False
+        if isinstance(prompt.origin, QuestionSlot):
+            if old_slot and old_slot != prompt.origin.identity:
+                continue
+        elif old_slot:
+            if not isinstance(answer.time, datetime):
+                continue
+            prompt = replace(prompt, origin=QuestionEvent(start, old_slot))
+        elif not isinstance(saved.asked_at, datetime) or prompt.time != saved.asked_at:
+            continue
+        request = RequestInterval(prompt.text, start)
+        evidence = ReplyEvidence(answer.text, answer.time, saved.answerer)
+        tag = verifier.log[start].feedback_request_id
+        positions = verifier.tagged_replies.get(tag, ()) if tag else ()
+        proof = ReplyProof.TAG if positions else ReplyProof.INTERVAL
+        if not positions:
+            positions = verifier.windows[start]
+        for position in positions:
+            if (not isinstance(answer.time, datetime) and not tag
+                    or verifier.verify(request, position, proof, tag=tag, evidence=evidence)
+                    is not Verification.VERIFIED):
+                continue
+            yield prompt, _VerifiedReply(position, request)
+
+
+def _new_event_id(prompt: _Prompt, event: ReviewLog) -> str:
+    if not isinstance(prompt.origin, QuestionEvent):
+        return prompt.identity
+    stamp = prompt.time.astimezone(UTC).isoformat()
+    digest = hashlib.sha256("\0".join((stamp, prompt.text, event_digest(event))).encode()).hexdigest()
+    return f"log:sha256:{digest}"
 
 
 def _completed_feedback_reply(source: review_items.ChangeSource, slot: review_items.CompletedFeedback,
@@ -534,21 +659,33 @@ def _completed_feedback_reply(source: review_items.ChangeSource, slot: review_it
     return None
 
 
+def _change_slot(source: review_items.ReviewSource, members: staff.StaffSnapshot) -> QuestionSlotEvidence | None:
+    if not isinstance(source, review_items.ChangeSource):
+        return None
+    slot = source.slots.question
+    if not isinstance(slot, (delivery_state.AnsweredQuestion, delivery_state.OpenQuestion)) or isinstance(
+            slot, (review_items.CompletedFeedback, review_items.OpenFeedback)):
+        return None
+    author = _answerer(source.answered_by, members) if source.answered_by else _AnswererEvidence.NOT_RECORDED
+    time = source.answered_at if isinstance(source.answered_at, datetime) else TimeNotRecorded.ABSENT
+    answer = slot.answer if isinstance(slot, delivery_state.AnsweredQuestion) else ""
+    return QuestionSlotEvidence(slot.question_id, slot.text, ReplyEvidence(answer, time, author))
+
+
 def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[ListLink, ...],
                           zone: ZoneInfo, members: staff.StaffSnapshot, history: tuple[list_exchange.FiledExchange, ...],
                           unresolved: list[tuple[str, int]] | None) -> Iterator[Exchange]:
-    """File verified reply origins and keep the saved pairing across later requests."""
+    """Keep filed pairs and verify each new log association."""
     source = item.source
     log = _native_log(item, zone)
-    prompts = _question_prompts(log)
-    reply_windows = _reply_windows(log, prompts, include_tagged=True)
-    windows = {question: tuple(position for position in replies if not log[position].feedback_request_id)
-               for question, replies in reply_windows.items()}
-    possible = {position for positions in windows.values() for position in positions}
+    slot = _change_slot(source, members)
+    verifier = ExchangeVerifier(log, members, slot=slot)
     read_times = tuple(_read_times(log))
     acknowledged = item.state is review_items.ReviewState.DONE
-    if isinstance(source, review_items.InvestigationSource) and source.record.read:
-        read_times += (review_items.moment(source.record.read, zone),)
+    record = source.record if isinstance(source, review_items.InvestigationSource) else None
+    if record is not None and record.read:
+        read_times += (review_items.moment(record.read, zone),)
+    legacy_bug = record is not None and record.kind is investigation.InvestigationKind.BUG and not record.belongs_on_list
 
     def exchange(prompt: _Prompt, author: staff.StaffId | RecordedAnswerer, answer: ExchangeAnswer,
                  reply: ReplyOrigin) -> Exchange:
@@ -559,201 +696,174 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
     def from_event(prompt: _Prompt, position: int) -> Exchange:
         event = log[position]
         state = _read_state(event.time, read_times, acknowledged=acknowledged)
-        return exchange(prompt, _answerer(event.who, members), ExchangeAnswer(event.words[8:], event.time, state),
-                        _reply_origin(position, event))
+        return exchange(replace(prompt, identity=_new_event_id(prompt, event)), _answerer(event.who, members),
+                        ExchangeAnswer(event.words[8:], event.time, state), _reply_origin(position, event))
 
     accepted: dict[str, Exchange] = {}
-    claimed: set[int] = set()
-    bound_prompts: set[str] = set()
     bound_slots: set[str] = set()
 
-    def accept(value: Exchange) -> None:
+    def keep(value: Exchange) -> None:
         accepted[value.exchange_id] = value
-        binding = value.binding
-        if isinstance(binding, ExchangeBinding):
-            if binding.slot_id:
-                bound_slots.add(binding.slot_id)
-            position = _event_position(binding.reply, log)
-            if isinstance(binding.question, QuestionEvent) and isinstance(binding.reply, LoggedReply):
-                prompt = (_bound_event_prompt(binding.question, value, position, prompts, windows)
-                          if position is not None else None)
-                if prompt is None:
-                    return
-                bound_prompts.add(prompt.identity)
-            elif isinstance(binding.question, (QuestionEvent, QuestionSlot)):
-                prompt = _bound_prompt(binding.question, value.question, prompts)
-                if prompt is not None:
-                    bound_prompts.add(prompt.identity)
+        if isinstance(value.binding, ExchangeBinding) and value.binding.slot_id:
+            bound_slots.add(value.binding.slot_id)
+
+    legacy = [saved for saved in history if saved.binding is UnboundExchange.LEGACY and saved.exchange_id != "initial"]
+    saved_initial = next((saved for saved in history if saved.exchange_id == "initial"), None)
+    prior_claims: dict[int, list[RequestInterval]] = defaultdict(list)
+    for saved in history:
+        if saved in legacy or saved is saved_initial:
+            continue
+        keep(_saved_scoped_exchange(saved, links, read_times, acknowledged))
+        if isinstance(saved.binding, ExchangeBinding):
+            position = _event_position(saved.binding.reply, log)
             if position is not None:
-                claimed.add(position)
+                request = _saved_reply_request(saved, position, verifier)
+                if request is None:
+                    verifier.disputed.add(position)
+                else:
+                    prior_claims[position].append(request)
+    for position, claims in prior_claims.items():
+        if len(claims) == 1 and position not in verifier.disputed:
+            verifier.claim(position, claims[0])
+        else:
+            verifier.disputed.add(position)
+
+    upgrades: dict[int, list[tuple[list_exchange.FiledExchange, _Prompt, RequestInterval]]] = defaultdict(list)
+    for saved in legacy:
+        matches = tuple(_legacy_matches(saved, verifier))
+        if len(matches) == 1:
+            prompt, match = matches[0]
+            if slot is not None and saved.exchange_id == f"question:{slot.tag}" and isinstance(prompt.origin, QuestionEvent):
+                prompt = replace(prompt, origin=QuestionEvent(prompt.origin.position, slot.tag))
+            upgrades[match.position].append((saved, prompt, match.request))
+    upgraded: set[str] = set()
+    for position, matches in upgrades.items():
+        if len(matches) != 1:
+            verifier.disputed.add(position)
+            continue
+        saved, prompt, request = matches[0]
+        keep(replace(from_event(prompt, position), exchange_id=saved.exchange_id))
+        verifier.claim(position, request)
+        upgraded.add(saved.exchange_id)
+    unbound = [saved for saved in legacy if saved.exchange_id not in upgraded]
+    for saved in unbound:
+        keep(_saved_scoped_exchange(saved, links, read_times, acknowledged))
+
+    author = (record.owner if legacy_bug and record is not None else _AnswererEvidence.RESOLVED_STAFF
+              if isinstance(source, review_items.ChangeSource) else _AnswererEvidence.NOT_RECORDED)
+    verified: dict[int, Exchange] = {}
+    for start, prompt in verifier.prompts.items():
+        if start in verifier.bound:
+            continue
+        tag = verifier.log[start].feedback_request_id
+        if tag in bound_slots or (slot is not None and not tag and slot.tag in bound_slots
+                                  and _same_prompt(slot.text, prompt.text)):
+            continue
+        tagged = verifier.tagged_replies.get(tag, ())
+        time = slot.reply.time if slot is not None and tag == slot.tag else TimeNotRecorded.ABSENT
+        proof = ReplyProof.TAG if tagged else ReplyProof.TIME if isinstance(time, datetime) else ReplyProof.INTERVAL
+        request = RequestInterval(prompt.text, start)
+        evidence = ReplyEvidence(time=time, answerer=author)
+        candidates = [position for position in tagged or verifier.windows[start]
+                      if verifier.verify(request, position, proof, tag=tag, evidence=evidence) is Verification.VERIFIED]
+        if len(candidates) != 1:
+            continue
+        position = candidates[0]
+        if any(saved.question == prompt.text and isinstance(saved.answer, ExchangeAnswer)
+               and saved.answer.text == log[position].words[8:]
+               and (not isinstance(saved.answer.time, datetime) or saved.answer.time == log[position].time)
+               for saved in unbound):
+            continue
+        if slot is not None and not tag and _same_prompt(slot.text, prompt.text):
+            prompt = replace(prompt, origin=QuestionEvent(start, slot.tag))
+        value = from_event(prompt, position)
+        if value.exchange_id in accepted:
+            continue
+        verified[position] = value
+        verifier.claim(position, request)
 
     initial = None
-    legacy_bug = False
-    if isinstance(source, review_items.InvestigationSource):
-        record = source.record
-        legacy_bug = record.kind is investigation.InvestigationKind.BUG and not record.belongs_on_list
-        if legacy_bug or (record.kind is investigation.InvestigationKind.INVESTIGATION and record.purpose in (
-                investigation.InvestigationPurpose.INVESTIGATE, investigation.InvestigationPurpose.LIST_INVESTIGATION)):
-            prompt = _Prompt(QuestionRecord("initial"), "initial", record.question, item.times.filed)
-            boundary = next((index for index, event in enumerate(log) if event.who == Nate.USER and
-                             event.words.partition(": ")[0].lower() in ("question", "followup", "feedback", "feedback sent")),
-                            len(log))
-            answers = [index for index, event in enumerate(log) if _answer_event(event)]
-            earlier = [index for index in answers if index < boundary and not log[index].feedback_request_id]
-            if len(earlier) == 1:
-                event = log[earlier[0]]
-                if not legacy_bug or (_is_answerer(event, record.owner, members)
-                        and sum(position < boundary for position in answers) == 1
-                        and (event.words[8:] == record.answer
-                             or _later_bug_answer(record, answers[-1], log, prompts, reply_windows, members))):
-                    initial = from_event(prompt, earlier[0])
-            elif not legacy_bug and not answers and boundary == len(log) and record.answer and record.answered:
-                time = review_items.moment(record.answered, zone)
-                state = _read_state(time, read_times, acknowledged=acknowledged)
-                initial = exchange(prompt, record.owner, ExchangeAnswer(record.answer, time, state),
-                                   ReplyWithoutEvent.NATIVE_RECORD)
-
-    saved_initial = next((value for value in history if value.exchange_id == "initial"), None)
+    initial_request = RequestInterval("", _SyntheticRequest.INITIAL)
     suspect = None
-    if isinstance(source, review_items.InvestigationSource):
-        if saved_initial is None:
-            if initial is not None:
-                accept(initial)
-        elif (initial is not None and initial.question == saved_initial.question
-              and isinstance(initial.answer, ExchangeAnswer) and isinstance(saved_initial.answer, ExchangeAnswer)
-              and initial.answer.text == saved_initial.answer.text
-              and (not isinstance(saved_initial.answer.time, datetime)
-                   or isinstance(initial.answer.time, datetime) and saved_initial.answer.time <= initial.answer.time)):
-            time = saved_initial.answer.time
-            if isinstance(time, datetime):
-                initial = replace(initial, answer=replace(initial.answer, time=time))
-            accept(initial)
-        elif isinstance(saved_initial.answer, ExchangeAnswer):
-            # Preserve the saved row for repair without assigning its answer to another question.
-            suspect = saved_initial.answer
-        possible.update(index for index, event in enumerate(log) if _answer_event(event))
-
-    legacy = {saved.exchange_id: saved for saved in history if saved.binding is UnboundExchange.LEGACY}
-    if isinstance(source, review_items.InvestigationSource):
-        _ = legacy.pop("initial", None)
-    for saved in history:
-        if isinstance(source, review_items.InvestigationSource) and saved.exchange_id == "initial":
-            continue
-        if isinstance(saved.binding, ExchangeBinding):
-            accept(_saved_scoped_exchange(saved, log, prompts, links, read_times, acknowledged, members))
-
-    slot = source.slots.question if isinstance(source, review_items.ChangeSource) else delivery_state.NoQuestion()
-    current_prompt = None
-    if isinstance(slot, delivery_state.AnsweredQuestion) and not isinstance(slot, review_items.CompletedFeedback):
-        current_prompt = _slot_prompt(slot, prompts, item.times.filed)
-    tagged: dict[str, list[int]] = defaultdict(list)
-    for position, event in enumerate(log):
-        if event.feedback_request_id and _answer_event(event):
-            tagged[event.feedback_request_id.removeprefix("answer:")].append(position)
-
-    recorded_digests = {saved.binding.reply.digest for saved in history
-                        if isinstance(saved.binding, ExchangeBinding) and isinstance(saved.binding.reply, LoggedReply)}
-
-    def first_filing(value: Exchange) -> None:
-        binding = value.binding
-        assert isinstance(binding, ExchangeBinding)
-        if isinstance(binding.reply, LoggedReply) and binding.reply.digest in recorded_digests:
-            return
-        aliases = (value.exchange_id, "question:" + binding.slot_id) if binding.slot_id else (value.exchange_id,)
-        old = [legacy[identity] for identity in dict.fromkeys(aliases) if identity in legacy]
-        if not old:
-            if value.exchange_id not in accepted:
-                accept(value)
-            elif isinstance(binding.question, QuestionEvent) and isinstance(binding.reply, LoggedReply):
-                identity = f"log:sha256:{binding.reply.digest}"
-                if identity not in accepted:
-                    accept(replace(value, exchange_id=identity))
-        elif len(old) == 1:
-            saved = old[0]
-            answer = saved.answer
-            if (saved.question == value.question and isinstance(answer, ExchangeAnswer)
-                    and isinstance(value.answer, ExchangeAnswer) and answer.text == value.answer.text):
-                del legacy[saved.exchange_id]
-                accept(replace(value, exchange_id=saved.exchange_id))
-
-    tagged_prompts: dict[str, list[_Prompt]] = defaultdict(list)
-    for prompt in prompts.values():
-        if prompt.identity.startswith("question:"):
-            tagged_prompts[prompt.identity.removeprefix("question:")].append(prompt)
-    if current_prompt is not None:
-        assert isinstance(slot, delivery_state.AnsweredQuestion)
-        if slot.question_id not in tagged_prompts:
-            tagged_prompts[slot.question_id].append(current_prompt)
-    for tag, matches in tagged_prompts.items():
-        positions = tagged.get(tag, [])
-        if len(matches) == len(positions) == 1 and tag not in bound_slots and matches[0].identity not in bound_prompts:
-            first_filing(from_event(matches[0], positions[0]))
-
-    # Upgrade old IDs only when one filed ID matches one verified event.
-    upgrades: dict[int, list[Exchange]] = defaultdict(list)
-    for saved in legacy.values():
-        if isinstance(saved.answer, ExchangeAnswer):
-            match = _legacy_match(saved.exchange_id, saved.question, saved.answer, saved.answerer,
-                                  log, prompts, windows, members, bound_prompts)
-            if match is not None and match[1] not in claimed:
-                prompt, position = match
-                upgrades[position].append(replace(from_event(prompt, position), exchange_id=saved.exchange_id))
-    for matches in upgrades.values():
-        if len(matches) == 1:
-            del legacy[matches[0].exchange_id]
-            accept(matches[0])
-    for saved in legacy.values():
-        accept(_saved_scoped_exchange(saved, log, prompts, links, read_times, acknowledged, members))
-
-    if not legacy_bug or initial is not None:
-        for index, prompt in prompts.items():
-            positions = reply_windows[index] if isinstance(source, review_items.ChangeSource) else windows[index]
-            if (len(positions) != 1 or positions[0] in claimed or prompt.identity in bound_prompts
-                    or _competing_request(log, index, bound=bound_prompts)):
+    if record is not None and (legacy_bug or (record.kind is investigation.InvestigationKind.INVESTIGATION
+            and record.purpose in (investigation.InvestigationPurpose.INVESTIGATE,
+                                   investigation.InvestigationPurpose.LIST_INVESTIGATION))):
+        prompt = _Prompt(QuestionRecord("initial"), "initial", record.question, item.times.filed)
+        initial_request = replace(initial_request, text=record.question)
+        last = verifier.answers[-1] if verifier.answers else -1
+        replacement_saved = last in verifier.claimed and log[last].words[8:] == record.answer
+        for position in (index for index in verifier.answers if index < verifier.boundary):
+            expected = record.answer if legacy_bug and not replacement_saved else ""
+            evidence = ReplyEvidence(expected, answerer=author)
+            if verifier.verify(initial_request, position, ReplyProof.INTERVAL, evidence=evidence) is not Verification.VERIFIED:
                 continue
-            position = positions[0]
-            if legacy_bug and isinstance(source, review_items.InvestigationSource):
-                if not _is_answerer(log[position], source.record.owner, members):
-                    continue
-            if isinstance(source, review_items.ChangeSource):
-                current_question = isinstance(slot, (delivery_state.OpenQuestion, delivery_state.AnsweredQuestion))
-                if (log[position].feedback_request_id
-                        or isinstance(_answerer(log[position].who, members), RecordedAnswerer)
-                        or (current_question and not isinstance(slot, (review_items.OpenFeedback, review_items.CompletedFeedback))
-                            and _same_prompt(prompt.text, slot.text))):
-                    continue
-            if suspect is None or log[position].words != "Answer: " + suspect.text:
-                first_filing(from_event(prompt, position))
+            if (saved_initial is not None and isinstance(saved_initial.binding, ExchangeBinding)
+                    and isinstance(saved_initial.binding.reply, (LoggedReply, TaggedReply))
+                    and _saved_reply_request(saved_initial, position, verifier) is None):
+                continue
+            initial = from_event(prompt, position)
+            break
+        if (initial is None and not legacy_bug and not verifier.answers and verifier.boundary == len(log)
+                and record.answer and record.answered):
+            time = review_items.moment(record.answered, zone)
+            state = _read_state(time, read_times, acknowledged=acknowledged)
+            initial = exchange(prompt, record.owner, ExchangeAnswer(record.answer, time, state), ReplyWithoutEvent.NATIVE_RECORD)
+        if saved_initial is not None and isinstance(saved_initial.answer, ExchangeAnswer):
+            old = saved_initial.answer
+            if (initial is None or initial.question != saved_initial.question
+                    or not isinstance(initial.answer, ExchangeAnswer) or initial.answer.text != old.text
+                    or isinstance(old.time, datetime)
+                    and (not isinstance(initial.answer.time, datetime) or old.time > initial.answer.time)):
+                initial = None
+                suspect = old
+            else:
+                initial = replace(initial, binding=saved_initial.binding if isinstance(saved_initial.binding, ExchangeBinding)
+                                  else initial.binding, answer=replace(initial.answer, time=old.time)
+                                  if isinstance(old.time, datetime) else initial.answer)
+        if initial is not None:
+            keep(initial)
+            if isinstance(initial.binding, ExchangeBinding):
+                position = _event_position(initial.binding.reply, log)
+                if position is not None:
+                    verifier.claim(position, initial_request)
 
-    if (isinstance(source, review_items.ChangeSource) and isinstance(slot, delivery_state.AnsweredQuestion)
-            and current_prompt is not None and slot.question_id not in bound_slots
-            and current_prompt.identity not in bound_prompts):
-        time = source.answered_at if isinstance(source.answered_at, datetime) else TimeNotRecorded.ABSENT
+    for position, value in verified.items():
+        if (legacy_bug and initial is None) or (suspect is not None and log[position].words == "Answer: " + suspect.text):
+            verifier.claimed.discard(position)
+        else:
+            keep(value)
+
+    if (isinstance(source, review_items.ChangeSource) and slot is not None
+            and isinstance(source.slots.question, delivery_state.AnsweredQuestion) and slot.tag not in bound_slots):
+        prompt = _slot_prompt(source.slots.question, verifier.prompts, item.times.filed)
+        prompt = replace(prompt, text=slot.text)
         reference = source.answered_by or (source.validators[0] if source.validators else "")
         author = _answerer(reference, members) if reference else RecordedAnswerer("Answerer not recorded")
-        answer = ExchangeAnswer(slot.answer, time, _read_state(time, read_times, acknowledged=acknowledged))
-        verified_author = author if source.answered_by else RecordedAnswerer("Answerer not recorded")
-        previous = legacy.get(current_prompt.identity)
-        evidence = answer
-        if previous is not None and isinstance(previous.answer, ExchangeAnswer) and previous.answer.text == answer.text:
-            evidence = replace(answer, time=previous.answer.time) if not isinstance(answer.time, datetime) else answer
-        match = _legacy_match(current_prompt.identity, current_prompt.text, evidence, verified_author,
-                              log, prompts, windows, members, bound_prompts)
-        if match is not None and match[1] not in claimed:
-            first_filing(from_event(*match))
-        else:
-            first_filing(exchange(current_prompt, author, answer, ReplyWithoutEvent.SLOT))
+        answer = ExchangeAnswer(slot.reply.text, slot.reply.time,
+                                _read_state(slot.reply.time, read_times, acknowledged=acknowledged))
+        for position in verifier.tagged_replies.get(slot.tag, ()):
+            request = RequestInterval(slot.text, _SyntheticRequest.SLOT)
+            if verifier.verify(request, position, ReplyProof.TAG, tag=slot.tag) is Verification.VERIFIED:
+                keep(from_event(prompt, position))
+                verifier.claim(position, request)
+                break
+        if slot.tag not in bound_slots:
+            keep(exchange(prompt, author, answer, ReplyWithoutEvent.SLOT))
 
     if unresolved is not None:
-        first_unbound = min((index for index, prompt in prompts.items() if prompt.identity not in bound_prompts),
-                            default=len(log))
-        possible.update(index for index in range(first_unbound + 1, len(log))
-                        if not log[index].feedback_request_id and _answer_event(log[index]))
-        if isinstance(source, review_items.ChangeSource) and isinstance(slot, review_items.CompletedFeedback):
-            feedback = _completed_feedback_reply(source, slot, log, prompts, members)
+        possible = {position for positions in verifier.windows.values() for position in positions}
+        if record is not None:
+            possible.update(verifier.answers)
+        if slot is not None:
+            possible.update(verifier.tagged_replies.get(slot.tag, ()))
+        first_unbound = min(set(verifier.prompts) - verifier.bound, default=len(log))
+        possible.update(index for index in verifier.answers if index > first_unbound and not log[index].feedback_request_id)
+        if isinstance(source, review_items.ChangeSource) and isinstance(feedback_slot := source.slots.question,
+                                                                       review_items.CompletedFeedback):
+            feedback = _completed_feedback_reply(source, feedback_slot, log, verifier.prompts, members)
             if feedback is not None:
                 possible.discard(feedback)
-        count = len(possible - claimed)
+        count = len(possible - verifier.claimed)
         if count or suspect is not None:
             unresolved.append((key, count or 1))
     yield from accepted.values()
@@ -1112,28 +1222,39 @@ def _handoff_content(exchange: list_exchange.FiledExchange,
         position = _event_position(binding.reply, log)
         if position is None:
             return None
-        binding = replace(binding, reply=replace(binding.reply, position=position))
+        question = binding.question
+        if isinstance(question, QuestionEvent):
+            prompts = _question_prompts(log)
+            prompt = _bound_event_prompt(question, exchange, position, prompts, _reply_windows(log, prompts))
+            if prompt is None or not isinstance(prompt.origin, QuestionEvent):
+                return None
+            question = replace(question, position=prompt.origin.position)
+        binding = replace(binding, question=question, reply=replace(binding.reply, position=position))
     if isinstance(answer, ExchangeAnswer):
         answer = replace(answer, read=AnswerRead.UNKNOWN)
     return replace(exchange, answer=answer, binding=binding, legacy_binding="")
 
 
 def _handoff_reply_events(item: review_items.ReviewItem, saved: Iterable[list_exchange.FiledExchange],
-                          zone: ZoneInfo) -> tuple[frozenset[int], str]:
+                          zone: ZoneInfo, members: staff.StaffSnapshot) -> tuple[frozenset[int], str]:
     log = _native_log(item, zone)
     offset = len(item.log) - len(log)
     positions: set[int] = set()
     filed_slot_id = ""
-    prompts = _question_prompts(log)
-    windows = _reply_windows(log, prompts)
-    for exchange in saved:
-        binding, answer = exchange.binding, exchange.answer
-        if not isinstance(binding, ExchangeBinding) or not isinstance(answer, ExchangeAnswer):
+    change = isinstance(item.source, review_items.ChangeSource)
+    verifier = ExchangeVerifier(log, members, slot=_change_slot(item.source, members))
+    saved_replies = [(exchange, exchange.binding, exchange.answer)
+                     for exchange in saved if isinstance(exchange.binding, ExchangeBinding)
+                     and isinstance(exchange.answer, ExchangeAnswer)]
+    located = [_event_position(binding.reply, log) for _, binding, _ in saved_replies]
+    for (exchange, binding, answer), position in zip(saved_replies, located, strict=True):
+        if position is not None and located.count(position) > 1:
             continue
-        position = _event_position(binding.reply, log)
-        if isinstance(binding.question, QuestionEvent) and isinstance(binding.reply, LoggedReply):
-            if position is None or _bound_event_prompt(binding.question, exchange, position, prompts, windows) is None:
+        if change and position is not None:
+            request = _saved_reply_request(exchange, position, verifier)
+            if request is None:
                 continue
+            verifier.claim(position, request)
         if binding.slot_id:
             slot = item.source.slots.question if isinstance(item.source, review_items.ChangeSource) else delivery_state.NoQuestion()
             if (isinstance(slot, delivery_state.AnsweredQuestion) and not isinstance(slot, review_items.CompletedFeedback)
@@ -1199,7 +1320,7 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
             if not matched:
                 projected.append(item)
                 continue
-            events, slot_id = _handoff_reply_events(item, matched, zone)
+            events, slot_id = _handoff_reply_events(item, matched, zone, members)
         ids = frozenset(exchange.exchange_id for exchange in matched if isinstance(exchange.answer, ExchangeAnswer))
         open_staff_question = any(exchange.direction is Direction.QUESTION_TO_NATE
                                   and exchange.answer is QuestionWithoutAnswer.OPEN for exchange in matched)

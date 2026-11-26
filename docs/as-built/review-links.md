@@ -2379,6 +2379,12 @@ A closed staff Question can recover one log pair from its saved reason.
 A legacy Bug can use its original question when one owner reply matches the saved answer before a later request.
 A different earlier Bug reply requires a later verified question and reply that match the saved answer.
 Change history files verified earlier pairs and checks the current slot separately.
+One verifier checks each proposed link between a request and a log reply.
+It reports verified ownership, conflicting evidence, or missing evidence.
+A conflicting or unverified log reply stays in Review.
+The native question and answer can still file when the log association remains unresolved.
+A verified exchange keeps its filed ID.
+New anonymous log exchanges use a digest of the prompt, its time, and the reply event.
 Verified Feedback replies remain in Review outside the unresolved question count.
 The preview reports each unresolved source key and its reply count.
 Review keeps an Investigation or native Question visible while an outgoing question waits or a reply remains unresolved.
