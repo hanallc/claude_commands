@@ -1204,6 +1204,192 @@ class AnswerSourceTests(unittest.TestCase):
                 self.assertEqual(self.migrate_change(item)[0], 0)
                 self.assertEqual(receipt.read_bytes(), before)
 
+    def legacy_report(self, number: int, log: tuple[ReviewLog, ...], *,
+                      answer: str = "Use the north route.", read: str = "",
+                      kind: investigation.InvestigationKind = investigation.InvestigationKind.BUG) -> str:
+        store = record_store.NumberedRecords(OWNER.id, "investigations", "I", "investigation",
+                                             investigation.InvestigationError)
+        store.folder().mkdir(parents=True, exist_ok=True)
+        identity = f"I{number}"
+        question = "Which route?"
+        answered_at = max(event.time for event in log if event.words.startswith("Answer: "))
+        store.write(identity, {"id": identity, "owner": OWNER.id, "title": "Choose a route", "kind": kind,
+                               "state": investigation.InvestigationState.READ if read else investigation.InvestigationState.ANSWER_READY,
+                               "filed": START.isoformat(), "answered": answered_at.isoformat(), "read": read,
+                               "question_length": str(len(question)), "review_log": encode(log)},
+                    question + record_store.section("Answer") + answer)
+        return f"investigation/{OWNER.id}/{identity}"
+
+    def test_legacy_bug_initial_reply_uses_native_question(self) -> None:
+        keys: list[str] = []
+        expected: dict[str, list_exchange.ExchangeAnswer] = {}
+        for number in (2, 3, 4):
+            read = number == 3
+            reply = f"Use route {number}."
+            log = (ReviewLog(START, "nate", "Sent"),
+                   ReviewLog(START + timedelta(minutes=1), OWNER.id, "Started checking."),
+                   ReviewLog(FIRST_REPLY, OWNER.name, "Answer: " + reply))
+            if read:
+                log += (ReviewLog(READ, "nate", "Marked read"),)
+            if number == 4:
+                log += (ReviewLog(READ, "nate", "feedback: Check the result."),)
+            key = self.legacy_report(number, log, answer=reply, read=READ.isoformat() if read else "")
+            keys.append(key)
+            expected[key] = list_exchange.ExchangeAnswer(
+                reply, FIRST_REPLY, list_exchange.AnswerRead.READ if read else list_exchange.AnswerRead.UNREAD)
+        self.assertEqual({item.key for item in review_items.read(self.review, members=MEMBERS)}, set(keys))
+        for _ in range(2):
+            self.assertEqual(self.migrate(apply=True)[0], 0)
+            exchanges = [entry for item in the_list.records(KEEPER.id) for entry in item.filed_exchanges]
+            self.assertEqual({entry.source_key for entry in exchanges}, set(keys))
+            self.assertEqual(len(exchanges), len(keys))
+            for entry in exchanges:
+                self.assertEqual((entry.exchange_id, entry.question, entry.asked_at, entry.answerer, entry.answer),
+                                 ("initial", "Which route?", START, OWNER.id, expected[entry.source_key]))
+            self.assertFalse(review_items.read(self.review, members=MEMBERS, show="open"))
+            archived = review_items.read(self.review, members=MEMBERS)
+            self.assertEqual({item.key for item in archived}, set(keys))
+            for item in archived:
+                handoff = item.exchange_handoff
+                assert isinstance(handoff, review_items.FiledReviewExchange)
+                self.assertTrue(handoff.hides_card)
+                self.assertEqual(handoff.answer_events, frozenset({3}))
+
+    def test_legacy_bug_initial_reply_rejects_conflicts(self) -> None:
+        answer = ReviewLog(FIRST_REPLY, OWNER.id, "Answer: Use the north route.")
+        cases = (
+            ((ReviewLog(START, "nate", "question: Which other route?"), answer), "Use the north route."),
+            ((ReviewLog(START, "nate", "feedback: Check the map."), answer), "Use the north route."),
+            ((replace(answer, who=ASKER.id),), "Use the north route."),
+            ((answer, replace(answer, time=SECOND_REPLY)), "Use the north route."),
+            ((answer,), "Use the west route."),
+        )
+        keys = {self.legacy_report(number, log, answer=body)
+                for number, (log, body) in enumerate(cases, 1)}
+        result, preview = self.migrate(apply=True)
+        self.assertEqual(result, 0)
+        self.assertIn("Unresolved legacy replies: 6", preview)
+        self.assertFalse(the_list.records(KEEPER.id))
+        visible = review_items.read(self.review, members=MEMBERS, show="open")
+        self.assertEqual({item.key for item in visible if item.unread_answer}, keys)
+
+    def test_legacy_bug_keeps_initial_and_followup_answers(self) -> None:
+        log = (ReviewLog(START, "nate", "Sent"),
+               ReviewLog(FIRST_REPLY, OWNER.id, "Answer: Use the north route."),
+               ReviewLog(SECOND_ASK, "nate", "question: How long?"),
+               ReviewLog(SECOND_REPLY, OWNER.id, "Answer: Ten minutes."))
+        _ = self.legacy_report(1, log, answer="Ten minutes.")
+        for _ in range(2):
+            self.assertEqual(self.migrate(apply=True)[0], 0)
+            row, = the_list.records(KEEPER.id)
+            self.assertEqual(self.saved_pairs(row), {"Which route?": "Use the north route.", "How long?": "Ten minutes."})
+            self.assertEqual({reply.exchange_id for reply in row.filed_exchanges}, {"initial", "log:2"})
+            self.assertFalse(review_items.read(self.review, members=MEMBERS, show="open"))
+
+    def test_native_interval_recovers_legacy_metadata(self) -> None:
+        for number, tag in enumerate(("", "Q1"), 1):
+            prompt = ReviewLog(SECOND_ASK, "nate", "followup: How long?", tag)
+            reply = ReviewLog(SECOND_REPLY, ASKER.name, "Answer: Ten minutes.")
+            log = (prompt, ReviewLog(SECOND_ASK + timedelta(minutes=1), OWNER.id, "Started checking."), reply)
+            followup: update_registration.FollowupExchange = {"followup": "How long?", "reply": "Ten minutes."}
+            if tag:
+                followup["question_id"] = tag
+                log += (ReviewLog(SECOND_REPLY + timedelta(minutes=1), "nate", "feedback sent: Thanks."),)
+            key = self.native(f"interval-{number}", {
+                "since": FILED, "text": "Choose a route", "question": "Which route?",
+                "followups": [followup], "review_log": encode(log),
+            })
+            self.assertEqual(self.migrate(apply=True)[0], 0)
+            saved, = (exchange for exchange in the_list.exchange_history(key) if exchange.exchange_id == "followup:1")
+            self.assertEqual((saved.question, saved.asked_at, saved.answerer, saved.answer),
+                             ("How long?", SECOND_ASK, ASKER.id, list_exchange.ExchangeAnswer(
+                                 "Ten minutes.", SECOND_REPLY,
+                                 list_exchange.AnswerRead.READ if tag else list_exchange.AnswerRead.UNREAD)))
+            self.assertFalse(review_items.read(self.review, members=MEMBERS, show="open"))
+
+    def test_native_interval_respects_stronger_evidence(self) -> None:
+        original: update_registration.FollowupExchange = {"followup": "How long?", "reply": "Ten minutes."}
+        prompt = ReviewLog(START, "nate", "question: How long?")
+        reply = ReviewLog(FIRST_REPLY, ASKER.id, "Answer: Ten minutes.")
+        timed: update_registration.FollowupExchange = {**original, "replied_at": SECOND_REPLY.isoformat()}
+        tagged: update_registration.FollowupExchange = {**original, "question_id": "Q1"}
+        cases = (
+            ((prompt, reply), [timed]),
+            ((replace(prompt, feedback_request_id="Q2"), reply), [tagged]),
+            ((prompt, replace(reply, feedback_request_id=question_path.answer_log_id("Q2"))), [tagged]),
+            ((prompt, replace(prompt, time=START + timedelta(minutes=1)), reply), [original]),
+            ((prompt, ReviewLog(START + timedelta(minutes=1), "nate", "feedback: Check again."), reply), [original]),
+            ((prompt, reply), [original, original]),
+        )
+        for number, (log, followups) in enumerate(cases, 1):
+            key = self.native(f"conflict-{number}", {
+                "since": FILED, "text": "Choose a route", "question": "Which route?",
+                "followups": followups, "review_log": encode(log),
+            })
+            self.assertEqual(self.migrate(apply=True)[0], 0)
+            pairs = [saved for saved in the_list.exchange_history(key) if saved.exchange_id.startswith("followup:")]
+            self.assertEqual([(pair.question, pair.answerer) for pair in pairs], [("How long?", OWNER.id)] * len(followups))
+            for pair in pairs:
+                assert isinstance(pair.answer, list_exchange.ExchangeAnswer)
+                assert isinstance(pair.binding, list_exchange.ExchangeBinding)
+                self.assertEqual(pair.answer.text, "Ten minutes.")
+                self.assertIs(pair.binding.reply, list_exchange.ReplyWithoutEvent.NATIVE_RECORD)
+            visible = {item.key: item for item in review_items.read(self.review, members=MEMBERS, show="open")}
+            handoff = visible[key].exchange_handoff
+            assert isinstance(handoff, review_items.FiledReviewExchange)
+            self.assertFalse(handoff.answer_events)
+            self.assertEqual(dict(answer_sources.read_exchanges(self.review, members=MEMBERS).unresolved)[key], 1)
+
+    def test_handoff_survives_reply_relocation(self) -> None:
+        reply = ReviewLog(FIRST_REPLY, OWNER.id, "Answer: Use the north route.")
+        key = self.legacy_report(1, (reply,), kind=investigation.InvestigationKind.INVESTIGATION)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        saved, = the_list.exchange_history(key)
+        with the_list.lock_exchange_source(key) as locked:
+            receipt = locked.reservation.with_suffix(".saved")
+        original = receipt.read_bytes()
+        note = ReviewLog(START, OWNER.id, "Started checking.")
+        _ = self.legacy_report(1, (note, reply), kind=investigation.InvestigationKind.INVESTIGATION)
+        self.assertFalse(review_items.read(self.review, members=MEMBERS, show="open"))
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        self.assertEqual(the_list.exchange_history(key), (saved,))
+        self.assertEqual(receipt.read_bytes(), original)
+        receipt.unlink()
+        item, = review_items.read(self.review, members=MEMBERS, show="open")
+        self.assertTrue(item.unread_answer)
+        self.assertIs(item.exchange_handoff, review_items.NoFiledReviewExchange.ABSENT)
+        _ = receipt.write_bytes(original)
+        _ = self.legacy_report(1, (note, reply, reply), kind=investigation.InvestigationKind.INVESTIGATION)
+        item, = review_items.read(self.review, members=MEMBERS, show="open")
+        self.assertTrue(item.unread_answer)
+        self.assertIs(item.exchange_handoff, review_items.NoFiledReviewExchange.ABSENT)
+        self.assertEqual(the_list.exchange_history(key), (saved,))
+        self.assertEqual(receipt.read_bytes(), original)
+
+    def test_moved_question_does_not_block_next_reply(self) -> None:
+        first_pair = (ReviewLog(SECOND_ASK, "nate", "question: How long?"),
+                      ReviewLog(SECOND_REPLY, OWNER.id, "Answer: Ten minutes."))
+        log = (ReviewLog(FIRST_REPLY, OWNER.id, "Answer: Use the north route."), *first_pair)
+        key = self.legacy_report(1, log, answer="Ten minutes.", kind=investigation.InvestigationKind.INVESTIGATION)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        before = the_list.exchange_history(key)
+        self.assertEqual({exchange.exchange_id for exchange in before}, {"initial", "log:1"})
+        second_pair = (ReviewLog(SECOND_REPLY + timedelta(minutes=1), "nate", "question: Which side?"),
+                       ReviewLog(SECOND_REPLY + timedelta(minutes=2), OWNER.id, "Answer: The east side."))
+        log = (ReviewLog(START, OWNER.id, "Started checking."), *log, *second_pair)
+        _ = self.legacy_report(1, log, answer="The east side.", kind=investigation.InvestigationKind.INVESTIGATION)
+        pending, = review_items.read(self.review, members=MEMBERS, show="open")
+        self.assertTrue(pending.unread_answer)
+        handoff = pending.exchange_handoff
+        assert isinstance(handoff, review_items.FiledReviewExchange)
+        self.assertEqual(handoff.answer_events, frozenset({2, 4}))
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        row, = the_list.records(KEEPER.id)
+        self.assertEqual(self.saved_pairs(row), {"Which route?": "Use the north route.",
+                                                "How long?": "Ten minutes.", "Which side?": "The east side."})
+        self.assertEqual(the_list.exchange_history(key)[:2], before)
+        self.assertFalse(review_items.read(self.review, members=MEMBERS, show="open"))
+
     def test_count_reports_bad_links_and_keeps_repeat_keys_without_writes(self) -> None:
         self.picture("000000000001", list_item="L29", list_keeper=KEEPER.id)
         self.picture("000000000002")

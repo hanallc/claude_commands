@@ -79,6 +79,7 @@ def _reply_positions(fields: update_registration.OutstandingItem, log: tuple[Rev
     positions: dict[int, int] = {}
     claimed: set[int] = set()
     disputed: set[int] = set()
+    disputed_replies: set[int] = set()
 
     def assign(candidates: dict[int, list[int]]) -> None:
         owners: dict[int, list[int]] = defaultdict(list)
@@ -87,6 +88,8 @@ def _reply_positions(fields: update_registration.OutstandingItem, log: tuple[Rev
                 owners[position].append(index)
         disputed.update(position for position, indexes in owners.items() if len(indexes) > 1)
         for index, matches in candidates.items():
+            if disputed.intersection(matches):
+                disputed_replies.add(index)
             if len(matches) == 1 and matches[0] not in disputed:
                 positions[index] = matches[0]
                 claimed.add(matches[0])
@@ -118,7 +121,46 @@ def _reply_positions(fields: update_registration.OutstandingItem, log: tuple[Rev
             timed[index] = [position for position, event in enumerate(log)
                             if not event.feedback_request_id and event.time == time and eligible(index, position)]
     assign(timed)
+
+    prompts = _question_prompts(log)
+    windows = _reply_windows(log, prompts, include_tagged=True)
+    answer_tags = {event.feedback_request_id for event in log if _answer_event(event)}
+    bound = {prompt.identity for question, prompt in prompts.items()
+             for index, position in positions.items()
+             if position in windows[question] and _same_prompt(prompt.text, replies[index]["followup"])}
+    intervals: dict[int, tuple[int, int]] = {}
+    for index, reply in enumerate(replies):
+        binding = saved.get(f"followup:{index + 1}")
+        if (index in positions or index in disputed_replies or index in timed
+                or str(index) in fields.get("reply_log_positions", {})
+                or isinstance(binding, ExchangeBinding) and isinstance(binding.reply, (LoggedReply, TaggedReply))):
+            continue
+        questions = [question for question, prompt in prompts.items() if _same_prompt(prompt.text, reply["followup"])]
+        if len(questions) != 1:
+            continue
+        question = questions[0]
+        tag = reply.get("question_id")
+        origin = prompts[question].origin
+        if (isinstance(origin, QuestionSlot) and origin.identity != tag
+                or tag and question_path.answer_log_id(tag) in answer_tags):
+            continue
+        matches = windows[question]
+        if len(matches) == 1 and not log[matches[0]].feedback_request_id and eligible(index, matches[0]):
+            intervals[index] = (question, matches[0])
+
+    candidates: dict[int, list[int]] = defaultdict(list)
+    for index, (_, position) in intervals.items():
+        candidates[position].append(index)
+    for index, (question, position) in sorted(intervals.items()):
+        if (len(candidates[position]) == 1 and not _competing_request(log, question, bound=bound)
+                and all((other < index) == (known < position) for other, known in positions.items())):
+            positions[index] = position
+            bound.add(prompts[question].identity)
     return positions
+
+
+def _same_prompt(first: str, second: str) -> bool:
+    return first.split() == second.split()
 
 
 def _answerer(reference: str, members: staff.StaffSnapshot) -> staff.StaffId | RecordedAnswerer:
@@ -165,8 +207,8 @@ def _question_exchanges(record: update_registration.QuestionRecord, source: Sour
         end = position if position is not None else min(
             (pos for later, pos in positions.items() if later > index), default=len(log))
         prompt = next((event for event in reversed(log[previous:end])
-                       if event.who == Nate.USER and event.words.partition(": ")[0] in ("question", "followup")
-                       and " ".join(event.words.partition(": ")[2].split()) == " ".join(reply["followup"].split())),
+                       if event.who == Nate.USER and event.words.partition(": ")[0].lower() in ("question", "followup")
+                       and _same_prompt(event.words.partition(": ")[2], reply["followup"])),
                       None)
         if position is not None:
             previous = position + 1
@@ -206,7 +248,7 @@ def _answer_event(event: ReviewLog) -> bool:
 
 def _event_position(reply: ReplyOrigin, log: tuple[ReviewLog, ...]) -> int | None:
     if isinstance(reply, LoggedReply):
-        if reply.position < len(log) and _event_digest(log[reply.position]) == reply.digest:
+        if 0 <= reply.position < len(log) and _event_digest(log[reply.position]) == reply.digest:
             return reply.position
         matches = [index for index, event in enumerate(log) if _answer_event(event) and _event_digest(event) == reply.digest]
         if len(matches) == 1:
@@ -246,7 +288,8 @@ def _question_prompts(log: tuple[ReviewLog, ...]) -> dict[int, _Prompt]:
     return prompts
 
 
-def _untagged_windows(log: tuple[ReviewLog, ...], prompts: dict[int, _Prompt]) -> dict[int, tuple[int, ...]]:
+def _reply_windows(log: tuple[ReviewLog, ...], prompts: dict[int, _Prompt], *,
+                   include_tagged: bool = False) -> dict[int, tuple[int, ...]]:
     """Find possible replies within each outgoing request's log interval."""
     windows: dict[int, list[int]] = {index: [] for index in prompts}
     question = -1
@@ -256,7 +299,7 @@ def _untagged_windows(log: tuple[ReviewLog, ...], prompts: dict[int, _Prompt]) -
         elif event.who == Nate.USER and event.words.partition(": ")[0].lower() in (
                 "feedback", "feedback sent", "approve", "decline", "answer"):
             question = -1
-        elif question >= 0 and not event.feedback_request_id and _answer_event(event):
+        elif question >= 0 and (include_tagged or not event.feedback_request_id) and _answer_event(event):
             windows[question].append(index)
     return {index: tuple(positions) for index, positions in windows.items()}
 
@@ -310,7 +353,7 @@ def _saved_scoped_exchange(saved: list_exchange.FiledExchange, log: tuple[Review
     binding = saved.binding
     asked_at, answerer = saved.asked_at, saved.answerer
     if isinstance(binding, ExchangeBinding) and isinstance(answer, ExchangeAnswer):
-        if isinstance(binding.question, (QuestionEvent, QuestionSlot)):
+        if isinstance(binding.question, QuestionSlot):
             prompt = _bound_prompt(binding.question, saved.question, prompts)
             if prompt is not None:
                 asked_at = prompt.time
@@ -333,6 +376,22 @@ def _bound_prompt(origin: QuestionEvent | QuestionSlot, text: str, prompts: dict
         if prompt is not None and not isinstance(prompt.origin, QuestionEvent):
             return None
     return prompt if prompt is not None and prompt.text == text else None
+
+
+def _bound_event_prompt(origin: QuestionEvent, exchange: list_exchange.Exchange, position: int,
+                        prompts: dict[int, _Prompt], windows: dict[int, tuple[int, ...]]) -> _Prompt | None:
+    """Recover the question in the verified reply's interval."""
+    matches = [prompt for index, prompt in prompts.items()
+               if position in windows[index] and isinstance(prompt.origin, QuestionEvent)
+               and prompt.text == exchange.question and prompt.time == exchange.asked_at]
+    if len(matches) != 1:
+        return None
+    prompt = matches[0]
+    if prompt.origin != QuestionEvent(origin.position):
+        if sum(candidate.text == prompt.text and candidate.time == prompt.time
+               for candidate in prompts.values()) != 1:
+            return None
+    return prompt
 
 
 def _legacy_match(identity: str, text: str, answer: ExchangeAnswer,
@@ -368,7 +427,7 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
     source = item.source
     log = _native_log(item, zone)
     prompts = _question_prompts(log)
-    windows = _untagged_windows(log, prompts)
+    windows = _reply_windows(log, prompts)
     possible = {position for positions in windows.values() for position in positions}
     read_times = tuple(_read_times(log))
     acknowledged = item.state is review_items.ReviewState.DONE
@@ -396,22 +455,29 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
         accepted[value.exchange_id] = value
         binding = value.binding
         if isinstance(binding, ExchangeBinding):
-            if isinstance(binding.question, (QuestionEvent, QuestionSlot)):
-                prompt = _bound_prompt(binding.question, value.question, prompts)
-                if prompt is not None:
-                    bound_prompts.add(prompt.identity)
             if binding.slot_id:
                 bound_slots.add(binding.slot_id)
             position = _event_position(binding.reply, log)
+            if isinstance(binding.question, QuestionEvent) and isinstance(binding.reply, LoggedReply):
+                prompt = (_bound_event_prompt(binding.question, value, position, prompts, windows)
+                          if position is not None else None)
+                if prompt is None:
+                    return
+                bound_prompts.add(prompt.identity)
+            elif isinstance(binding.question, (QuestionEvent, QuestionSlot)):
+                prompt = _bound_prompt(binding.question, value.question, prompts)
+                if prompt is not None:
+                    bound_prompts.add(prompt.identity)
             if position is not None:
                 claimed.add(position)
 
     initial = None
+    legacy_bug = False
     if isinstance(source, review_items.InvestigationSource):
         record = source.record
-        if (record.purpose in (investigation.InvestigationPurpose.INVESTIGATE,
-                              investigation.InvestigationPurpose.LIST_INVESTIGATION)
-                and record.kind is investigation.InvestigationKind.INVESTIGATION):
+        legacy_bug = record.kind is investigation.InvestigationKind.BUG and not record.belongs_on_list
+        if legacy_bug or (record.kind is investigation.InvestigationKind.INVESTIGATION and record.purpose in (
+                investigation.InvestigationPurpose.INVESTIGATE, investigation.InvestigationPurpose.LIST_INVESTIGATION)):
             prompt = _Prompt(QuestionRecord("initial"), "initial", record.question, item.times.filed)
             boundary = next((index for index, event in enumerate(log) if event.who == Nate.USER and
                              event.words.partition(": ")[0].lower() in ("question", "followup", "feedback", "feedback sent")),
@@ -419,8 +485,11 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
             answers = [index for index, event in enumerate(log) if _answer_event(event)]
             earlier = [index for index in answers if index < boundary and not log[index].feedback_request_id]
             if len(earlier) == 1:
-                initial = from_event(prompt, earlier[0])
-            elif not answers and boundary == len(log) and record.answer and record.answered:
+                event = log[earlier[0]]
+                owner_matches = event.who == record.owner or _answerer(event.who, members) == record.owner
+                if not legacy_bug or (owner_matches and (len(answers) > 1 or event.words[8:] == record.answer)):
+                    initial = from_event(prompt, earlier[0])
+            elif not legacy_bug and not answers and boundary == len(log) and record.answer and record.answered:
                 time = review_items.moment(record.answered, zone)
                 state = _read_state(time, read_times, acknowledged=acknowledged)
                 initial = exchange(prompt, record.owner, ExchangeAnswer(record.answer, time, state),
@@ -527,7 +596,7 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
     for saved in legacy.values():
         accept(_saved_scoped_exchange(saved, log, prompts, links, read_times, acknowledged, members))
 
-    if not isinstance(source, review_items.ChangeSource):
+    if not isinstance(source, review_items.ChangeSource) and (not legacy_bug or initial is not None):
         for index, prompt in prompts.items():
             positions = windows[index]
             if (len(positions) == 1 and positions[0] not in claimed and prompt.identity not in bound_prompts
@@ -892,11 +961,18 @@ def file_saved_picture(root: Path, identity: str) -> None:
         _file_live(partial(_reload_picture, root, identity, keepers, user_zone()), entries, staff.snapshot())
 
 
-def _handoff_content(exchange: list_exchange.FiledExchange) -> list_exchange.FiledExchange:
+def _handoff_content(exchange: list_exchange.FiledExchange,
+                     log: tuple[ReviewLog, ...]) -> list_exchange.FiledExchange | None:
     answer = exchange.answer
+    binding = exchange.binding
+    if isinstance(binding, ExchangeBinding) and isinstance(binding.reply, LoggedReply):
+        position = _event_position(binding.reply, log)
+        if position is None:
+            return None
+        binding = replace(binding, reply=replace(binding.reply, position=position))
     if isinstance(answer, ExchangeAnswer):
-        return replace(exchange, answer=replace(answer, read=AnswerRead.UNKNOWN), legacy_binding="")
-    return replace(exchange, legacy_binding="")
+        answer = replace(answer, read=AnswerRead.UNKNOWN)
+    return replace(exchange, answer=answer, binding=binding, legacy_binding="")
 
 
 def _handoff_reply_events(item: review_items.ReviewItem, saved: Iterable[list_exchange.FiledExchange],
@@ -905,10 +981,16 @@ def _handoff_reply_events(item: review_items.ReviewItem, saved: Iterable[list_ex
     offset = len(item.log) - len(log)
     positions: set[int] = set()
     filed_slot_id = ""
+    prompts = _question_prompts(log)
+    windows = _reply_windows(log, prompts)
     for exchange in saved:
         binding, answer = exchange.binding, exchange.answer
         if not isinstance(binding, ExchangeBinding) or not isinstance(answer, ExchangeAnswer):
             continue
+        position = _event_position(binding.reply, log)
+        if isinstance(binding.question, QuestionEvent) and isinstance(binding.reply, LoggedReply):
+            if position is None or _bound_event_prompt(binding.question, exchange, position, prompts, windows) is None:
+                continue
         if binding.slot_id:
             slot = item.source.slots.question if isinstance(item.source, review_items.ChangeSource) else delivery_state.NoQuestion()
             if (isinstance(slot, delivery_state.AnsweredQuestion) and not isinstance(slot, review_items.CompletedFeedback)
@@ -917,7 +999,6 @@ def _handoff_reply_events(item: review_items.ReviewItem, saved: Iterable[list_ex
                 synthetic_tag = question_path.answer_log_id(binding.slot_id)
                 positions.update(index for index, event in enumerate(item.log[:max(0, offset)])
                                  if event.feedback_request_id == synthetic_tag)
-        position = _event_position(binding.reply, log)
         if position is not None and offset >= 0 and log[position].words == "Answer: " + answer.text:
             native, displayed = log[position], item.log[offset + position]
             if (native.time, native.who, native.feedback_request_id) == (
@@ -957,18 +1038,20 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
         native_question = isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource))
         investigation_card = isinstance(source, review_items.InvestigationSource)
         with review_items.after_store_write(item.key):
+            log = _native_log(item, zone)
             if native_question or investigation_card:
                 unresolved: list[tuple[str, int]] = []
                 exchanges = tuple(exchange for exchange in _review_item_exchanges(
                     item, (), zone, members, tuple(saved), unresolved) if _eligible(exchange))
-                current = {_handoff_content(list_exchange.FiledExchange.from_exchange(exchange))
-                           for exchange in exchanges}
-                matched = tuple(exchange for exchange in saved if _handoff_content(exchange) in current)
+                current = {content for exchange in exchanges if (content := _handoff_content(
+                    list_exchange.FiledExchange.from_exchange(exchange), log)) is not None}
+                matched = tuple(exchange for exchange in saved if _handoff_content(exchange, log) in current)
                 waits = item.state is review_items.ReviewState.WAITING
                 hides_card = (bool(matched) and len(matched) == len(exchanges)
                               and not waits and not unresolved)
             else:
-                matched = tuple(exchange for exchange in saved if isinstance(exchange.binding, ExchangeBinding))
+                matched = tuple(exchange for exchange in saved if isinstance(exchange.binding, ExchangeBinding)
+                                and _handoff_content(exchange, log) is not None)
                 hides_card = False
             if not matched:
                 projected.append(item)
