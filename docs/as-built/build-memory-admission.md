@@ -538,6 +538,11 @@ A failed query raises `AdmissionUnavailable` within the query bound. Commands pr
 The Builds page shows the saved Mac idle alert first, in red.
 The feed reads it through `mac_idle.view_alert_line()`, which also checks the live Mac state, and sends its text in `mac_idle_alert`.
 An empty value hides the alert on the page.
+`scripts/buildlog/machine_watch.py` reads `notices.<machine>` in `build_targets.conf` when it prepares a phone push for a machine that does not answer.
+Set `notices.mac=off` to suppress that push for the Mac.
+The default is `on`.
+The Builds page continues to use the saved alert.
+
 The Build limits section shows one facts line under each machine heading, in `<div class="build-limit-facts">` below the state.
 The feed reads `machine_facts.read_facts(machine_facts.state_path())` once per render and passes it to `limits_view.build_limits(..., facts=)`.
 `limits_view.facts_line()` writes each line into `MachineLimits.facts` with the `facts_*` words in `PAGE_WORDS`.
