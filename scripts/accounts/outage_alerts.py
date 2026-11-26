@@ -134,6 +134,16 @@ def clear(session_id: str, observed_at: float) -> bool:
         return True
 
 
+def clear_prefix(prefix: str, observed_at: float) -> int:
+    """Remove matching entries that predate the observation."""
+    with _locked_entries() as entries:
+        keys = [key for key, entry in entries.items()
+                if key.startswith(prefix) and entry.get("at", 0) < observed_at]
+        for key in keys:
+            del entries[key]
+        return len(keys)
+
+
 @contextmanager
 def reserve(session_ids: Iterable[str]) -> Generator[dict[str, AlertClaim]]:
     """Release every unfinished claim when a sender finishes or fails."""
