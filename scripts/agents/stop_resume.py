@@ -48,7 +48,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.script_envelope import script_prompt
 from scripts.lib.transcripts import open_transcript, transcript_paths
 from scripts.message import session_records, session_send
-from scripts.agents import member_account, pane_record, producer_creation, remote, shutdown_record
+from scripts.agents import member_account, pane_record, producer_creation, remote, shutdown_record, worker_lifecycle
 from scripts.agents.launch_names import LaunchNames, LaunchNamesNotRead
 from scripts.agents.codex_trust import trust_arguments
 from scripts.herdr import pane_launch
@@ -1260,7 +1260,6 @@ def stop_unit_workers(unit: StaffId, record: StaffSnapshot, *,
                       keep_running: frozenset[StaffId] = NO_WORKERS_TO_KEEP_RUNNING,
                       failures: dict[StaffId, str] | None = None) -> list[str]:
     """Stop the selected workers concurrently and retain every staff row."""
-    from scripts.agents import worker_lifecycle
     from scripts.herdr import worker_panes
     from scripts.agents import restart
 
@@ -1439,8 +1438,16 @@ def _resume_liveness(identity: str) -> sessions.LiveSessionProcess | sessions.Se
     """Give a concurrent registry write another chance before a resume fails."""
     live = sessions.session_liveness(identity)
     if isinstance(live, sessions.SessionLivenessUnknown) and live.unreadable_registry:
-        time.sleep(operation_deadline.remaining(sessions.retry_policy().registry_delay_seconds))
-        return sessions.session_liveness(identity, registry=sessions.read_registry(for_session=identity))
+        delay = sessions.retry_policy().registry_delay_seconds
+        try:
+            if delay >= operation_deadline.remaining():
+                return live
+            time.sleep(delay)
+            operation_deadline.check()
+            registry = sessions.read_registry(for_session=identity, deadline=worker_lifecycle.effective_deadline())
+        except TimeoutError:
+            return live
+        return sessions.session_liveness(identity, registry=registry)
     return live
 
 
@@ -1758,11 +1765,15 @@ def heal_account_trust(
     return trust
 
 
-def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> unit_lookup.UnitOwner:
+def _unit_resume_owner(production: str, unit: StaffRow, record: StaffSnapshot) -> unit_lookup.UnitOwner:
     """Read the unit again while only non-agent holders block its pane."""
     from scripts.production import unit_lookup
 
-    owner = unit_lookup.checked_unit(production, unit, record=record)
+    def observe() -> unit_lookup.UnitOwner:
+        registry = sessions.read_registry(for_session=unit.current_session, deadline=worker_lifecycle.effective_deadline())
+        return unit_lookup.checked_unit(production, unit.name, record=record, registry=registry)
+
+    owner = observe()
     if not isinstance(owner, unit_lookup.NonAgentPaneHolders):
         return owner
     seconds = conf.read("shutdown").number("holder_exit_seconds")
@@ -1775,8 +1786,11 @@ def _unit_resume_owner(production: str, unit: str, record: StaffSnapshot) -> uni
         _ = wait.wait(min(herdr.PANE_POLL_SECONDS, remaining))
         if monotonic() >= deadline:
             break
-        with operation_deadline.within(deadline):
-            observed = unit_lookup.checked_unit(production, unit, record=record)
+        try:
+            with operation_deadline.within(deadline):
+                observed = observe()
+        except TimeoutError:
+            break
         if monotonic() >= deadline:
             break
         owner = observed
@@ -1877,7 +1891,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if row is not None and row.kind == "unit" and (parent := names.tab_record.parent_of(row)) is not None:
             from scripts.production import unit_lookup
 
-            match _unit_resume_owner(parent.name, row.name, names.tab_record):
+            match _unit_resume_owner(parent.name, row, names.tab_record):
                 case unit_lookup.UnknownUnit(reason=reason):
                     return ResumeFailed(identity, reason)
                 case unit_lookup.ProvedLiveUnit():
