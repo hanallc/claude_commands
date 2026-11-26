@@ -2416,10 +2416,10 @@ def _assignment_hold(row: staff.StaffRow, record: staff.StaffSnapshot, detached:
                         and passed.get("instance_id") == state.dispatch_id):
                     continue
                 return worker_panes.DispatchHoldsWorker("a pass is open")
-            if saved := pass_recorder.dispatch_delivery(passed).actions.status_file:
+            if saved := pass_recorder.assignment_status_file(passed):
                 statuses.add(Path(saved))
         for passed in (*current_passes, *pass_recorder.retained_passes(fields).values()):
-            if passed.get("worker_id") == row.id and (saved := pass_recorder.dispatch_delivery(passed).actions.status_file):
+            if passed.get("worker_id") == row.id and (saved := pass_recorder.assignment_status_file(passed)):
                 path = Path(saved)
                 started = pass_recorder.number(passed.get("started_at"), float("-inf"))
                 blocks_assignment = passed.get("status") != "canceled"
