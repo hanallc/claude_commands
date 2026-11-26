@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from functools import cache
 from pathlib import Path
-from typing import Protocol, TypedDict, cast
+from typing import NotRequired, Protocol, TypedDict, cast
 
 from scripts.agents.remote import local_machine, this_machine
 from scripts.lib import atomic_file, conf
@@ -1220,6 +1220,7 @@ class ListFilingRoute(TypedDict):
     producer: staff.StaffId
     unit: str
     source: str
+    unit_id: NotRequired[staff.StaffId]
 
 
 @dataclass(frozen=True)
@@ -1281,9 +1282,10 @@ def _plan_list_filing(assignee: ListCommandAssignee | ListWindowAssignee, recipi
     producer = _list_filing_producer(member, members)
     if isinstance(producer, ListFilingUnavailable):
         return replace(producer, assignee=assignee)
-    unit = member.name if member.kind == "unit" else ""
-    return ListFilingRoute(keeper=keeper.id, owner=recipient.id, producer=producer.id,
-                           unit=unit, source=source)
+    route = ListFilingRoute(keeper=keeper.id, owner=recipient.id, producer=producer.id, unit="", source=source)
+    if member.kind == "unit":
+        route["unit_id"] = member.id
+    return route
 
 
 def assigned_member(assignment: new_item_dialog.Assignment, recipient: staff.StaffRow,
@@ -1336,8 +1338,14 @@ def list_filing_route(saved: SavedSubmission) -> ListFilingRoute | ListFilingUna
     if not (isinstance(keeper, str) and isinstance(owner, str) and isinstance(producer, str)
             and isinstance(unit, str) and isinstance(source, str)):
         raise OSError(f"Invalid List route for request {saved.request_id}.")
-    return ListFilingRoute(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner), producer=staff.StaffId(producer),
+    route = ListFilingRoute(keeper=staff.StaffId(keeper), owner=staff.StaffId(owner), producer=staff.StaffId(producer),
                            unit=unit, source=source)
+    if "unit_id" in values:
+        unit_id = values["unit_id"]
+        if not isinstance(unit_id, str) or not unit_id:
+            raise OSError(f"Invalid List unit ID for request {saved.request_id}.")
+        route["unit_id"] = staff.StaffId(unit_id)
+    return route
 
 
 def retry_list_filing_route(saved: SavedSubmission, unavailable: ListFilingUnavailable,

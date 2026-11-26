@@ -32,7 +32,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO, Literal, NamedTuple, cast, override
-from urllib.parse import SplitResult, parse_qs, unquote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qs, unquote, urlsplit
 
 # Detect file changes before the first stamp, including changes during imports.
 STARTED_NS = time.time_ns()
@@ -53,7 +53,8 @@ from scripts.whoami import usage_store
 LISTEN_FD = "REVIEW_LINKS_LISTEN_FD"
 # Allow page state and rows in addition to the existing words and image budget.
 MAX_NEW_ITEM_BODY = (4 * ((new_item_dialog.MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 256 * 1024
-                     + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES)
+                     + new_item_dialog.MAX_PAGE_DATA_BYTES + new_item_dialog.MAX_BUG_PAGE_STATE_BYTES
+                     + new_item_dialog.MAX_LIVE_CAPTURE_BASE64_LENGTH)
 QUEUE_MOVE_PATH = "/console/builds/queue-move"
 # A send to one of these pages, or to a change browser, can wait for Undo. The largest is a New item with its images.
 HELD_SEND_PATHS = frozenset((review_page.PAGE_PATH, list_page.PAGE_PATH, studio_page.PAGE_PATH,
@@ -125,7 +126,7 @@ LIST_ACTION_PATHS = frozenset((list_page.PAGE_PATH, studio_page.PAGE_PATH))
 
 
 def capture_page_key(root: Path, place: str) -> str:
-    """Identify a console document that Firefox can open."""
+    """Identify the console document that supplied the snapshot."""
     route = urlsplit(place)
     if route.netloc or route.scheme:
         return ""
@@ -138,18 +139,6 @@ def capture_page_key(root: Path, place: str) -> str:
 def capture_matches_page(root: Path, place: str, page: str) -> bool:
     """Match a capture to its page, including old List requests."""
     return capture_page_key(root, place) == ("studio" if page == "list" else page)
-
-
-def deferred_capture_request(root: Path, page: str, value: object
-                             ) -> new_item_dialog.PageCaptureRequest | new_item_dialog.UnavailableCapture:
-    """Check if the saved item can get a screenshot."""
-    try:
-        request = new_item_dialog.read_page_capture(value)
-        if capture_matches_page(root, request.place, page):
-            return request
-    except ValueError:
-        pass
-    return new_item_dialog.UnavailableCapture.UNAVAILABLE
 
 
 def owned_document(content: bytes, page: str) -> bytes:
@@ -179,11 +168,104 @@ def gzip_content(content: bytes) -> bytes:
 _cached_gzip_content = lru_cache(maxsize=8)(gzip_content)
 
 
-def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCaptureRequest) -> bytes:
-    """Capture the console page in a clean Firefox profile."""
+_LAYOUT_CAPTURE = """
+function prepare(snapshot, source, depth = 0) {
+ const captured = new DOMParser().parseFromString(snapshot, 'text/html');
+ captured.querySelectorAll('script,base,meta[http-equiv],frame,object,embed,template,link:not([rel~="stylesheet"])')
+  .forEach(node => node.remove());
+ const base = captured.createElement('base');
+ base.href = source;
+ captured.head.prepend(base);
+ for (const frame of captured.querySelectorAll('iframe')) {
+  const document = frame.getAttribute('srcdoc');
+  const path = frame.dataset.captureFramePath;
+  frame.removeAttribute('src');
+  frame.removeAttribute('srcdoc');
+  if (!document || !path || depth >= 3) continue;
+  let address;
+  try { address = new URL(path, source); } catch (_) { continue; }
+  if (address.origin !== new URL(source).origin) continue;
+  frame.setAttribute('sandbox', 'allow-same-origin');
+  frame.removeAttribute('loading');
+  frame.srcdoc = prepare(document, address.href, depth + 1);
+ }
+ return '<!doctype html>' + captured.documentElement.outerHTML;
+}
+
+function layout(frame, main = false) {
+ const view = frame.contentWindow, doc = frame.contentDocument;
+ if (!doc) return;
+ if (main) {
+  const background = view.getComputedStyle(doc.body).backgroundColor;
+  frame.style.backgroundColor = background === 'rgba(0, 0, 0, 0)'
+   ? view.getComputedStyle(doc.documentElement).backgroundColor : background;
+  doc.documentElement.style.setProperty('scrollbar-color', 'transparent transparent');
+ }
+ const position = element => (element.dataset.captureScroll ?? '0 0').split(' ').map(Number);
+ const restore = () => {
+  for (const element of doc.querySelectorAll('[data-capture-scroll]')) {
+   if (element === doc.documentElement) continue;
+   const [left, top] = position(element);
+   element.scrollTo({left, top, behavior:'instant'});
+  }
+  const [left, top] = position(doc.documentElement);
+  view.scrollTo({left, top, behavior:'instant'});
+ };
+ const windows = [...doc.querySelectorAll('dialog[data-capture-modal][open]')];
+ windows.sort((first, second) => first.dataset.captureModal - second.dataset.captureModal);
+ for (const dialog of windows) {
+  dialog.removeAttribute('open');
+  dialog.showModal();
+ }
+ for (const input of doc.querySelectorAll('input[data-capture-indeterminate]')) input.indeterminate = true;
+ for (const child of doc.querySelectorAll('iframe[srcdoc]')) layout(child);
+ restore();
+ void doc.fonts.ready.then(restore);
+}
+
+function restoreFocus(frame) {
+ const target = frame.contentDocument?.querySelector('[data-capture-focus]');
+ if (!target) return;
+ target.focus({preventScroll:true, focusVisible:target.dataset.captureFocus === 'visible'});
+ if (target.matches('iframe[srcdoc]')) restoreFocus(target);
+}
+
+const frame = document.createElement('iframe');
+frame.setAttribute('sandbox', 'allow-same-origin');
+frame.addEventListener('load', () => {
+ layout(frame, true);
+ restoreFocus(frame);
+}, {once:true});
+frame.srcdoc = prepare(snapshot, source);
+document.body.append(frame);
+"""
+
+def _capture_markup(base: str, snapshot: str, dark: bool) -> str:
+    """Keep the supplied document in a frame that cannot run scripts."""
+    address = urlsplit(base)
+    origin = f"{address.scheme}://{address.netloc}"
+    nonce = secrets.token_urlsafe(16)
+    policy = (f"default-src 'none'; script-src 'nonce-{nonce}'; base-uri {origin}; "
+              f"img-src {origin} data:; font-src {origin} data:; style-src {origin} 'unsafe-inline'; "
+              "frame-src 'self'; form-action 'none'")
+    source, document = (json.dumps(value).replace("<", "\\u003c") for value in (base, snapshot))
+    theme = "dark" if dark else "light"
+    return ('<!doctype html><meta charset="utf-8">'
+            f'<meta name="color-scheme" content="{theme}">'
+            f'<meta http-equiv="Content-Security-Policy" content="{html.escape(policy)}">'
+            '<style>body{margin:0}iframe{display:block;width:100vw;height:100vh;border:0}</style>'
+            f'<body><script nonce="{nonce}">const source={source},snapshot={document};'
+            f'{_LAYOUT_CAPTURE}</script>')
+
+
+def page_screenshot(firefox: str, base: str, capture: new_item_dialog.LivePageCapture) -> bytes:
+    """Render the live snapshot at its original viewport size."""
+    request = capture.request
     with tempfile.TemporaryDirectory(prefix="console-capture-") as folder:
         profile = Path(folder)
         output = profile / "page.png"
+        document = profile / "page.html"
+        _ = document.write_text(_capture_markup(base, capture.document, request.dark), encoding="utf-8")
         theme = int(request.dark)
         _ = (profile / "user.js").write_text(
             f'user_pref("ui.systemUsesDarkTheme", {theme});\n'
@@ -191,7 +273,7 @@ def page_screenshot(firefox: str, url: str, request: new_item_dialog.PageCapture
             + 'user_pref("ui.prefersReducedMotion", 1);\n'
             + 'user_pref("network.proxy.type", 0);\n', encoding="utf-8")
         run_process_group([firefox, "--headless", "--no-remote", "--profile", folder,
-                           "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), url],
+                           "--window-size", f"{request.width},{request.height}", "--screenshot", str(output), document.as_uri()],
                           timeout=15).check_returncode()
         with output.open("rb") as stream:
             image = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
@@ -209,12 +291,12 @@ PAGE_ATTACHMENT_RETRY_SECONDS = 5
 
 @dataclass(frozen=True)
 class PageCapturePending:
-    request: new_item_dialog.PageCaptureRequest
+    capture: new_item_dialog.LivePageCapture
 
 
 @dataclass(frozen=True)
 class PageCaptureToResume:
-    request: new_item_dialog.PageCaptureRequest
+    capture: new_item_dialog.LivePageCapture
 
 
 class NoPageCaptureToResume(Enum):
@@ -288,7 +370,12 @@ class PageCaptures:
                             | new_item_dialog.FiledPageScreenshot | UnavailableBoundCapture)
                     match values.get("kind"):
                         case "pending":
-                            state = PageCaptureToResume(new_item_dialog.read_page_capture(values.get("request")))
+                            request = new_item_dialog.read_page_capture(values.get("request"))
+                            document = stream.read(new_item_dialog.MAX_LIVE_CAPTURE_DOCUMENT_BYTES + 1)
+                            if len(document) > new_item_dialog.MAX_LIVE_CAPTURE_DOCUMENT_BYTES or not document.strip():
+                                raise ValueError("Invalid saved live page.")
+                            capture = new_item_dialog.LivePageCapture(request, document.decode("utf-8"))
+                            state = PageCaptureToResume(capture)
                         case "ready":
                             viewport = new_item_dialog.read_capture_viewport(values.get("viewport"))
                             png = stream.read(new_item_dialog.MAX_IMAGE_BYTES + 1)
@@ -329,11 +416,12 @@ class PageCaptures:
             target = capture.target
             header["target"] = new_item_dialog.submission_key(
                 target.kind, target.recipient_id, target.item_id, target.request_id)
-        png = b""
+        payload = b""
         match state:
-            case PageCapturePending(request) | PageCaptureToResume(request):
-                header.update(kind="pending", request=asdict(request))
-            case new_item_dialog.PageScreenshot(png, viewport):
+            case PageCapturePending(live) | PageCaptureToResume(live):
+                header.update(kind="pending", request=asdict(live.request))
+                payload = live.document.encode("utf-8")
+            case new_item_dialog.PageScreenshot(payload, viewport):
                 header.update(kind="ready", viewport=asdict(viewport))
             case new_item_dialog.FiledPageScreenshot(digest):
                 header.update(kind="filed", digest=digest)
@@ -344,7 +432,7 @@ class PageCaptures:
                 return
         try:
             self._folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-            atomic_file.write_bytes_atomic(self._folder / key, json.dumps(header).encode() + b"\n" + png, mode=0o600)
+            atomic_file.write_bytes_atomic(self._folder / key, json.dumps(header).encode() + b"\n" + payload, mode=0o600)
         except OSError as error:
             print(f"review-links page capture save: {error}", file=sys.stderr)
 
@@ -368,12 +456,12 @@ class PageCaptures:
         with self._lock:
             self._expire()
 
-    def start(self, request: new_item_dialog.PageCaptureRequest) -> str:
+    def start(self, capture: new_item_dialog.LivePageCapture) -> str:
         """Reserve space for a dialog capture."""
         key = secrets.token_hex(16)
-        return key if self.reserve(key, request) is CaptureReservation.STARTED else ""
+        return key if self.reserve(key, PageCapturePending(capture)) is CaptureReservation.STARTED else ""
 
-    def reserve(self, key: str, request: new_item_dialog.PageCaptureRequest) -> CaptureReservation:
+    def reserve(self, key: str, pending: PageCapturePending | PageCaptureToResume) -> CaptureReservation:
         """Reserve one worker for the key from the dialog."""
         with self._lock:
             self._expire()
@@ -383,7 +471,7 @@ class PageCaptures:
                 capture.state, (new_item_dialog.FiledPageScreenshot, UnavailableBoundCapture)))
             if active >= MAX_PAGE_CAPTURES:
                 return CaptureReservation.FULL
-            capture = self._sessions[key] = PageCapture(time.time() + PAGE_CAPTURE_TTL_SECONDS, PageCapturePending(request))
+            capture = self._sessions[key] = PageCapture(time.time() + PAGE_CAPTURE_TTL_SECONDS, pending)
             self._save(key, capture)
             return CaptureReservation.STARTED
 
@@ -394,14 +482,15 @@ class PageCaptures:
             return capture.target if capture is not None else new_item_dialog.NoBoundCaptureTarget.UNBOUND
 
     def bind(self, key: str, submitted_draft_id: str,
-             target: new_item_dialog.ScopedSubmissionKey) -> new_item_dialog.SubmissionScreenshot:
+             target: new_item_dialog.ScopedSubmissionKey
+             ) -> new_item_dialog.SubmissionScreenshot | UnavailableBoundCapture:
         """Keep the item with the capture so the worker can attach the screenshot."""
         if not new_item_dialog.capture_key_matches_draft(key, submitted_draft_id):
             raise new_item_dialog.SubmissionConflict("The screenshot belongs to another draft.")
         with self._lock:
             capture = self._active(key)
             if capture is None:
-                return new_item_dialog.NO_PAGE_SCREENSHOT
+                return UnavailableBoundCapture.UNAVAILABLE
             if capture.target not in (new_item_dialog.NoBoundCaptureTarget.UNBOUND, target):
                 raise new_item_dialog.SubmissionConflict("This screenshot belongs to another item.")
             if capture.target is new_item_dialog.NoBoundCaptureTarget.UNBOUND:
@@ -469,7 +558,7 @@ class PageCaptures:
             if capture is None or not isinstance(capture.state, PageCaptureToResume):
                 return NoPageCaptureToResume.ABSENT
             resume = capture.state
-            capture.state = PageCapturePending(resume.request)
+            capture.state = PageCapturePending(resume.capture)
             return resume
 
     def discard(self, key: str) -> None:
@@ -1799,7 +1888,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 return
             if "page_capture" in fields:
                 key = new_item_dialog.read_capture_key(fields["capture_key"]) if "capture_key" in fields else ""
-                self.new_item_capture(new_item_dialog.read_page_capture(fields["page_capture"]), key)
+                self.new_item_capture(new_item_dialog.read_live_page_capture(fields["page_capture"]), key)
                 return
             if "discard_capture" in fields:
                 server.page_captures.discard(new_item_dialog.read_capture_key(fields["discard_capture"]))
@@ -1849,7 +1938,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         raise new_item_dialog.SubmissionError("The screenshot belongs to another draft.")
                     if has_capture_metadata and isinstance(page, str) and page in page_frame.OWNER_PAGES:
                         deferred = new_item_dialog.DeferredCaptureIntent(
-                            key, draft, deferred_capture_request(server.root, page, fields["defer_capture"]))
+                            key, draft, server.stage_page_capture(key, page, fields["defer_capture"]))
             except new_item_dialog.SubmissionError as error:
                 if not list_draft_id:
                     raise
@@ -2022,7 +2111,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                         server.attach_page_screenshot(saved, screenshot.png)
                 if saved.kind == new_item_dialog.SubmissionKind.BUG and (
                         details.page_state is not None or (main_request is not None and main_request.page_state is not None)):
-                    server.finish_bug_evidence(created, main_request, self.headers.get("Host", ""), screenshot)
+                    server.finish_bug_evidence(created, main_request, screenshot)
             if not respond_first:
                 self.new_item_saved(response, saved.id, edited, deliver=send, claim=claim)
         finally:
@@ -2088,10 +2177,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 server = cast(ReviewLinksServer, self.server)
                 _ = server.start_new_item_delivery(deliver, claim=claim)
 
-    def new_item_capture(self, capture: new_item_dialog.PageCaptureRequest, key: str) -> None:
+    def new_item_capture(self, capture: new_item_dialog.LivePageCapture, key: str) -> None:
         """Start a screenshot only for a known page on this server."""
         server = cast(ReviewLinksServer, self.server)
-        if not capture_page_key(server.root, capture.place):
+        if not capture_page_key(server.root, capture.request.place):
             self.json_response(400, {"error": "Select a console document."})
             return
         if key:
@@ -3162,19 +3251,36 @@ class ReviewLinksServer(ThreadingHTTPServer):
             return cache.linked_records()
         return list_page.LinkedReviewRead.FROM_DISK
 
-    def ensure_page_capture(self, key: str, request: new_item_dialog.PageCaptureRequest) -> bool:
+    def ensure_page_capture(self, key: str, capture: new_item_dialog.LivePageCapture) -> bool:
         """Start the capture once, even if Send arrives first."""
         firefox = shutil.which("firefox")
         if not firefox:
             return False
-        match self.page_captures.reserve(key, request):
+        match self.page_captures.reserve(key, PageCapturePending(capture)):
             case CaptureReservation.STARTED:
-                return self.launch_page_capture(key, firefox, request, queued=not self.capture_slot.acquire(blocking=False))
+                return self.launch_page_capture(key, firefox, capture, queued=not self.capture_slot.acquire(blocking=False))
             case CaptureReservation.PRESENT:
                 self.resume_page_capture(key)
             case CaptureReservation.FULL:
                 return False
         return True
+
+    def stage_page_capture(self, key: str, page: str, value: object
+                           ) -> new_item_dialog.PageCaptureRequest | new_item_dialog.UnavailableCapture:
+        """Keep a pending document outside the native item before Send files it."""
+        try:
+            if isinstance(value, dict) and "document_gzip" not in value and "document" not in value:
+                legacy = new_item_dialog.read_page_capture(cast(dict[str, object], value))
+                if capture_matches_page(self.root, legacy.place, page):
+                    return legacy
+            else:
+                capture = new_item_dialog.read_live_page_capture(cast(object, value))
+                if capture_matches_page(self.root, capture.request.place, page):
+                    _ = self.page_captures.reserve(key, PageCaptureToResume(capture))
+                    return capture.request
+        except ValueError:
+            pass
+        return new_item_dialog.UnavailableCapture.UNAVAILABLE
 
     def process_committed_capture(self, target: new_item_dialog.ScopedSubmissionKey,
                                   intent: new_item_dialog.DeferredCaptureIntent, *, attached: bool) -> None:
@@ -3189,23 +3295,13 @@ class ReviewLinksServer(ThreadingHTTPServer):
             if attached and self.page_captures.target(key) is new_item_dialog.NoBoundCaptureTarget.UNBOUND:
                 image = review_submissions.read_attached_page_screenshot(target, request)
                 self.page_captures.restore_ready(key, target, image)
-            match self.page_captures.reserve(key, request):
-                case CaptureReservation.STARTED:
-                    _ = self.page_captures.bind(key, draft, target)
-                    firefox = shutil.which("firefox")
-                    if not firefox or not capture_page_key(self.root, request.place):
-                        self.page_captures.unavailable(key, target)
-                        return
-                    queued = not self.capture_slot.acquire(blocking=False)
-                    _ = self.launch_page_capture(key, firefox, request, queued=queued)
-                case CaptureReservation.PRESENT:
-                    image = self.page_captures.bind(key, draft, target)
-                    if isinstance(image, new_item_dialog.PageScreenshot):
-                        self.launch_bound_attachment(key, target, image)
-                    else:
-                        self.resume_page_capture(key)
-                case CaptureReservation.FULL:
+            match self.page_captures.bind(key, draft, target):
+                case new_item_dialog.PageScreenshot() as image:
+                    self.launch_bound_attachment(key, target, image)
+                case UnavailableBoundCapture.UNAVAILABLE:
                     self.page_captures.unavailable(key, target)
+                case _:
+                    self.resume_page_capture(key)
         except (OSError, ValueError, RuntimeError) as error:
             print(f"review-links screenshot for {target.item_id}: {error}", file=sys.stderr)
 
@@ -3214,18 +3310,19 @@ class ReviewLinksServer(ThreadingHTTPServer):
         capture = self.page_captures.resume(key)
         if isinstance(capture, PageCaptureToResume):
             firefox = shutil.which("firefox")
-            if firefox and capture_page_key(self.root, capture.request.place):
-                _ = self.launch_page_capture(key, firefox, capture.request, queued=True)
+            if firefox and capture_page_key(self.root, capture.capture.request.place):
+                _ = self.launch_page_capture(key, firefox, capture.capture, queued=True)
             else:
                 _ = self.page_captures.complete(key, new_item_dialog.NO_PAGE_SCREENSHOT)
 
-    def launch_page_capture(self, key: str, firefox: str, capture: new_item_dialog.PageCaptureRequest, *,
+    def launch_page_capture(self, key: str, firefox: str, capture: new_item_dialog.LivePageCapture, *,
                             queued: bool = False) -> bool:
         """Start the capture worker with a reserved slot or wait for a slot."""
-        url = f"http://{self.bound_address}:{self.server_port}{capture.place}"
+        path = urlsplit(capture.request.place).path
+        base = f"http://{self.bound_address}:{self.server_port}{path}"
         worker = self.capture_queued_page if queued else self.capture_page
         try:
-            threading.Thread(target=worker, args=(key, firefox, url, capture), daemon=True).start()
+            threading.Thread(target=worker, args=(key, firefox, base, capture), daemon=True).start()
         except (OSError, RuntimeError) as error:
             if not queued:
                 self.capture_slot.release()
@@ -3234,8 +3331,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             return False
         return True
 
-    def capture_queued_page(self, key: str, firefox: str, url: str,
-                            capture: new_item_dialog.PageCaptureRequest) -> None:
+    def capture_queued_page(self, key: str, firefox: str, base: str,
+                            capture: new_item_dialog.LivePageCapture) -> None:
         """Use the capture slot when Firefox becomes free."""
         if not self.capture_slot.acquire(timeout=PAGE_CAPTURE_TTL_SECONDS):
             _ = self.page_captures.complete(key, new_item_dialog.NO_PAGE_SCREENSHOT)
@@ -3243,13 +3340,14 @@ class ReviewLinksServer(ThreadingHTTPServer):
         if not self.page_captures.queued(key):
             self.capture_slot.release()
             return
-        self.capture_page(key, firefox, url, capture)
+        self.capture_page(key, firefox, base, capture)
 
-    def capture_page(self, key: str, firefox: str, url: str, capture: new_item_dialog.PageCaptureRequest) -> None:
+    def capture_page(self, key: str, firefox: str, base: str, capture: new_item_dialog.LivePageCapture) -> None:
         image: new_item_dialog.PageScreenshot | new_item_dialog.NoPageScreenshot = new_item_dialog.NO_PAGE_SCREENSHOT
         try:
-            png = page_screenshot(firefox, url, capture)
-            image = new_item_dialog.PageScreenshot(png, new_item_dialog.PageViewport(capture.width, capture.height, capture.dark))
+            png = page_screenshot(firefox, base, capture)
+            request = capture.request
+            image = new_item_dialog.PageScreenshot(png, new_item_dialog.PageViewport(request.width, request.height, request.dark))
         except (OSError, subprocess.SubprocessError):
             pass
         finally:
@@ -3289,7 +3387,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
                 print(f"review-links screenshot for {target.item_id}: {error}", file=sys.stderr)
 
     def finish_bug_evidence(self, created: review_page.PublishedSubmission, request: new_item_dialog.NewItemRequest | None,
-                            host: str, screenshot: new_item_dialog.SubmissionScreenshot) -> None:
+                            screenshot: new_item_dialog.SubmissionScreenshot) -> None:
         """Save the evidence after the response and delivery."""
         saved = created.saved
         if (request is not None and request.page_state is not None
@@ -3297,10 +3395,10 @@ class ReviewLinksServer(ThreadingHTTPServer):
             request = replace(request, page_state=replace(
                 request.page_state, viewport=screenshot.viewport, include_screenshot=True))
 
-        def capture(page: str, state: new_item_dialog.BugPageState) -> bool:
+        def capture(_page: str, _state: new_item_dialog.BugPageState) -> bool:
             if isinstance(screenshot, new_item_dialog.PageScreenshot):
                 return self.review_cache.attach_page_screenshot(saved, screenshot.png)
-            return request is not None and self.capture_bug_screenshot(saved, page, state, host)
+            return False
 
         try:
             if review_submissions.save_bug_page_state(saved, created.key, request, capture):
@@ -3308,37 +3406,6 @@ class ReviewLinksServer(ThreadingHTTPServer):
         except Exception as error:
             self.review_cache.invalidate()
             print(f"review-links Bug evidence for {saved.id}: {' '.join(str(error).splitlines())}", file=sys.stderr)
-
-    def capture_bug_screenshot(self, saved: review_submissions.SavedSubmission, page: str,
-                               state: new_item_dialog.BugPageState, host: str) -> bool:
-        """Capture the reported viewport before the case record becomes visible."""
-        if state.viewport is None:
-            return False
-        try:
-            address = urlsplit(state.url)
-            if (address.scheme not in ("http", "https") or not address.hostname or address.username is not None
-                    or address.netloc.casefold() != host.casefold() or re.search(r"[\\\x00-\x20\x7f]", state.url)):
-                return False
-            place = urlunsplit(("", "", address.path, address.query, address.fragment))
-            capture = new_item_dialog.read_page_capture({
-                "place": place, "width": state.viewport.width, "height": state.viewport.height,
-                "dark": state.viewport.dark,
-            })
-        except ValueError:
-            return False
-        if not capture_matches_page(self.root, capture.place, page):
-            return False
-        firefox = shutil.which("firefox")
-        if not firefox or not self.capture_slot.acquire(blocking=False):
-            return False
-        try:
-            url = f"http://{self.bound_address}:{self.server_port}{capture.place}"
-            image = page_screenshot(firefox, url, capture)
-        except (OSError, subprocess.SubprocessError):
-            return False
-        finally:
-            self.capture_slot.release()
-        return self.review_cache.attach_page_screenshot(saved, image)
 
     def attach_page_screenshot(self, saved: review_submissions.SavedSubmission, image: bytes) -> None:
         try:

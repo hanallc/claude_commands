@@ -553,7 +553,7 @@ class NewItemTests(ServerFixture):
         self.server.list_number = None
         code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
         self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
-        self.assertEqual(output, "Bug → bob. Filed as I7. The console server returned no List number.\n")
+        self.assertEqual(output, "Bug → bob. Filed as I7 in Review. No List row was filed.\n")
 
     def test_enhancement_with_no_producer_saves_nothing(self) -> None:
         code, output, errors = self.run_main("enhancement", "tile", "Show the next check in the row.")
@@ -573,7 +573,7 @@ class NewItemTests(ServerFixture):
         self.server.list_number = None
         code, output, errors = self.run_main("bug", "bob", "A waiting row has no drag grip.")
         self.assertEqual((code, errors), (new_item.Outcome.FILED, ""))
-        self.assertEqual(output, "Bug → bob. Filed as I7. The console server returned no List number.\n")
+        self.assertEqual(output, "Bug → bob. Filed as I7 in Review. No List row was filed.\n")
 
     def test_a_list_write_failure_after_filing_keeps_the_draft(self) -> None:
         def exchange(address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
@@ -592,6 +592,117 @@ class NewItemTests(ServerFixture):
                              (new_item.Outcome.FILED, "Bug → bob. List item 3.\n", ""))
         self.assertEqual(len(self.server.posts), 3)
         self.assertEqual(self.server.posts, [self.server.posts[0]] * 3)
+
+    def test_retry_keeps_the_assignee_id_after_the_old_name_is_reused(self) -> None:
+        def exchange(address: for_you.ConsoleAddress, method: Literal["GET", "POST"], target: str,
+                     body: bytes = b"") -> new_item.ServerReply:
+            reply = self.server.exchange(address, method, target, body)
+            if method == "POST" and len(self.server.posts) <= 2:
+                raise new_item.ServerUnavailable(new_item.MAY_BE_FILED)
+            return reply
+
+        arguments = ("bug", "bob", "Check the chart.")
+        renamed = replace(BOB, name="build-producer")
+        replacement = replace(DWIGHT, name=BOB.name)
+        changed = replace(MEMBERS, rows=(renamed, replacement, *ROWS[2:]))
+        with mock.patch.object(new_item, "exchange", side_effect=exchange):
+            code, _, error = self.run_main(*arguments)
+            self.assertEqual(code, new_item.Outcome.FAILED)
+            self.assertIn(new_item.MAY_BE_FILED, error)
+            with mock.patch.object(staff, "snapshot", return_value=changed):
+                result = self.run_main(*arguments)
+        self.assertEqual(self.server.posts, [self.server.posts[0]] * 3)
+        self.assertEqual(result, (new_item.Outcome.FILED, "Bug → build-producer. List item 3.\n", ""))
+
+
+    def stage_legacy_draft(self, assignee: str, words: str) -> tuple[Path, str]:
+        request_id = "r6-" + uuid4().hex
+        path = new_item.draft_path(ADDRESS, "another-session", staff.StaffId(assignee), new_item.ItemType.BUG, words, legacy=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(f"{request_id}\n{BOB.id}\n", encoding="utf-8")
+        return path, request_id
+
+    def test_legacy_draft_refuses_a_reused_assignee_name(self) -> None:
+        words = "Check the chart."
+        renamed = replace(BOB, name="build-producer")
+        replacement = replace(DWIGHT, name=BOB.name)
+        changed = replace(MEMBERS, rows=(renamed, replacement, *ROWS[2:]))
+        path, _ = self.stage_legacy_draft(BOB.name, words)
+        with mock.patch.object(staff, "snapshot", return_value=changed):
+            code, _, error = self.run_main("bug", "bob", words)
+            self.assertEqual((code, self.server.posts), (new_item.Outcome.REFUSED, []))
+            self.assertIn("Retry with the original fixed staff ID or the new name.", error)
+            self.assertTrue(path.exists())
+            path.unlink()
+            path, request_id = self.stage_legacy_draft(BOB.id, words)
+            self.assertEqual(self.run_main("bug", renamed.name, words),
+                             (new_item.Outcome.FILED, "Bug → build-producer. List item 3.\n", ""))
+        post, = self.server.posts
+        self.assertEqual((post["request_id"], post["list_assignee"], post["recipient_id"]),
+                         (request_id, BOB.id, BOB.id))
+        self.assertFalse(path.exists())
+
+    def test_legacy_draft_blocks_a_reused_name_after_staff_removal(self) -> None:
+        words = "Check the chart."
+        replacement = replace(DWIGHT, name=BOB.name)
+        changed = replace(MEMBERS, rows=(replacement, *ROWS[2:]))
+        for reference in ("bob", "Bob"):
+            with self.subTest(reference=reference):
+                path, _ = self.stage_legacy_draft(reference, words)
+                self.addCleanup(path.unlink, missing_ok=True)
+                with mock.patch.object(staff, "snapshot", return_value=changed):
+                    code, _, error = self.run_main("bug", "Bob", words)
+                self.assertEqual((code, self.server.reads, self.server.posts), (new_item.Outcome.REFUSED, 0, []))
+                self.assertIn('Cannot prove the assignee of the pending New item draft for "bob".', error)
+                path.unlink()
+
+    def test_legacy_draft_retries_by_the_fixed_id_after_staff_removal(self) -> None:
+        words = "Check the chart."
+        path, request_id = self.stage_legacy_draft(BOB.id, words)
+        replacement = replace(DWIGHT, name=BOB.name)
+        changed = replace(MEMBERS, rows=(replacement, *ROWS[2:]))
+        with mock.patch.object(staff, "snapshot", return_value=changed):
+            self.assertEqual(self.run_main("bug", BOB.id, words),
+                             (new_item.Outcome.FILED, f"Bug → {BOB.id}. List item 3.\n", ""))
+        post, = self.server.posts
+        self.assertEqual((post["request_id"], post["list_assignee"], post["recipient_id"]),
+                         (request_id, BOB.id, BOB.id))
+        self.assertFalse(path.exists())
+
+    def test_unrelated_legacy_draft_does_not_block_a_new_request(self) -> None:
+        path, request_id = self.stage_legacy_draft(BOB.id, "Check Bob's chart.")
+        words = "Check Dwight's report."
+        self.assertEqual(self.run_main("bug", "dwight", words),
+                         (new_item.Outcome.FILED, "Bug → dwight. List item 3.\n", ""))
+        post, = self.server.posts
+        self.assertEqual((post["assignee_id"], post["recipient_id"], post["words"]), (DWIGHT.id, DWIGHT.id, words))
+        self.assertNotEqual(post["request_id"], request_id)
+        self.assertEqual(path.read_text(encoding="utf-8"), f"{request_id}\n{BOB.id}\n")
+
+    def test_retry_finds_the_saved_assignee_id_after_staff_removal(self) -> None:
+        words = "Check the chart."
+        with mock.patch.object(new_item, "exchange", side_effect=[
+            new_item.ServerReply(200, {"token": "fixture-token", "recipients": [
+                {"id": BOB.id, "name": BOB.name, "proposal": False}]}),
+            new_item.ServerUnavailable(new_item.MAY_BE_FILED),
+            new_item.ServerUnavailable(new_item.MAY_BE_FILED),
+        ]):
+            first, _, error = self.run_main("bug", BOB.name, words)
+        self.assertEqual(first, new_item.Outcome.FAILED)
+        self.assertIn(new_item.MAY_BE_FILED, error)
+        scope = new_item.draft_scope(ADDRESS, "another-session", new_item.ItemType.BUG, words)
+        path, = scope.glob("*.draft")
+        request_id, recipient, routing, assignee, reference = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(routing, new_item_dialog.PageRecipient.PRODUCER)
+        self.assertEqual((recipient, assignee, reference), (BOB.id, BOB.id, BOB.name))
+        remaining = replace(MEMBERS, rows=tuple(row for row in ROWS if row.id != BOB.id))
+        with mock.patch.object(staff, "snapshot", return_value=remaining):
+            self.assertEqual(self.run_main("bug", BOB.id, words),
+                             (new_item.Outcome.FILED, f"Bug → {BOB.id}. List item 3.\n", ""))
+        post, = self.server.posts
+        self.assertEqual((post["request_id"], post["assignee_id"], post["recipient_id"]),
+                         (request_id, assignee, recipient))
+        self.assertFalse(path.exists())
 
 
 class NewItemServerTests(unittest.TestCase):
@@ -973,6 +1084,100 @@ function storedRecipient(id) {
             self.assertNotIn(key, queued_keys)
             self.assertIn(b"Open List item", snapshot.body(key))
             self.assertEqual((snapshot.records[key].owner, snapshot.records[key].title), (bob.id, words))
+
+
+class ListFilingRecoveryTests(unittest.TestCase):
+    keeper: staff.StaffId = staff.StaffId("")
+    producer: staff.StaffId = staff.StaffId("")
+    unit: staff.StaffId = staff.StaffId("")
+    body: bytes = b""
+    notices: Path = Path()
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.server: test_serve.ReviewLinksServerTests = test_serve.ReviewLinksServerTests()
+
+    @override
+    def setUp(self) -> None:
+        self.addCleanup(self.server.doCleanups)
+        self.server.setUp()
+        case = self.server.review_fixture()
+        owner = case.ready_submission_recipient()
+        self.keeper = fixture_member("producer", name="morty").id
+        self.producer = fixture_member("producer", name="list-producer").id
+        self.unit = fixture_member("unit", name="old-layout", parent=owner.id).id
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={self.keeper}\n")
+        _ = conf.path("producer_map").write_text(f"{self.unit} = {self.producer}\n", encoding="utf-8")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        _ = self.enterContext(mock.patch.object(self.server.server, "review_cache", cache))
+        _ = self.enterContext(mock.patch.object(self.server.server, "delivery_status", case.status))
+        self.notices = self.enterContext(test_serve.new_item_notice_log(self.server.root, self.keeper))
+        request = replace(case.submission_request(new_item_dialog.SubmissionKind.BUG, owner.id),
+                          page="list", request_id="r6-" + uuid4().hex,
+                          page_recipient=new_item_dialog.PageRecipient.SELECTED)
+        fields = cast(dict[str, object], json.loads(self.server.new_item_body(request)))
+        self.body = json.dumps({**fields, "list_assignee": self.unit}).encode()
+
+    def stage_pending_filing(self) -> None:
+        with mock.patch("scripts.production.the_list._save", side_effect=OSError("The List write stopped.")):
+            reply = self.server.new_item_http(self.body, finished=True)
+        self.assertEqual(reply.status, 503, reply.body)
+        self.assertEqual(the_list.records(self.keeper), [])
+        self.assertEqual(test_serve.read_new_item_notices(self.notices), [])
+
+    def test_resumed_list_filing_uses_the_renamed_unit(self) -> None:
+        self.stage_pending_filing()
+        _ = staff.rename(self.unit, "new-layout")
+        reply = self.server.new_item_http(self.body, finished=True)
+        self.assertEqual(reply.status, 200, reply.body)
+        row, = the_list.records(self.keeper)
+        self.assertEqual(row.unit, "new-layout")
+
+    def test_missing_staff_record_keeps_list_filing_pending(self) -> None:
+        self.stage_pending_filing()
+        status = self.server.server.delivery_status
+        pending, = review_submissions.pending_initial_deliveries(status.root)
+        members = staff.snapshot()
+        path = staff.record_path()
+        original = path.read_bytes()
+        path.unlink()
+        try:
+            with staff.supplied_snapshot(members), redirect_stderr(io.StringIO()) as errors:
+                review_actions.recover_submission_deliveries(status, review_page.PAGE_PATH)
+            self.assertIn("cannot read staff record", errors.getvalue())
+            self.assertEqual(list(review_submissions.pending_initial_deliveries(status.root)), [pending])
+            self.assertEqual(the_list.records(self.keeper), [])
+            self.assertEqual(test_serve.read_new_item_notices(self.notices), [])
+        finally:
+            _ = path.write_bytes(original)
+        reply = self.server.new_item_http(self.body, finished=True)
+        self.assertEqual(reply.status, 200, reply.body)
+        row, = the_list.records(self.keeper)
+        notice, = test_serve.read_new_item_notices(self.notices)
+        self.assertEqual(notice["rows"], [row.id])
+
+    def test_readable_staff_record_without_the_producer_permanently_skips_the_row(self) -> None:
+        self.stage_pending_filing()
+        members = staff.snapshot()
+        absent = replace(members, rows=tuple(row for row in members.rows if row.id != self.producer))
+        path = staff.record_path()
+        _ = path.write_text(absent.encode(), encoding="utf-8")
+        with redirect_stderr(io.StringIO()) as errors:
+            reply = self.server.new_item_http(self.body, finished=True)
+        self.assertEqual(reply.status, 200, reply.body)
+        saved = cast(dict[str, object], json.loads(reply.body))
+        self.assertNotIn("list_number", saved)
+        self.assertIn(f"{self.producer}: The producer has no current producer staff row.", errors.getvalue())
+        _ = path.write_text(members.encode(), encoding="utf-8")
+        retry = self.server.new_item_http(self.body, finished=True)
+        self.assertEqual(retry.status, 200, retry.body)
+        repeated = cast(dict[str, object], json.loads(retry.body))
+        self.assertEqual(repeated["id"], saved["id"])
+        self.assertNotIn("list_number", repeated)
+        self.assertEqual(the_list.records(self.keeper), [])
+        notice, = test_serve.read_new_item_notices(self.notices)
+        self.assertEqual(notice["rows"], [])
 
 
 if __name__ == "__main__":
