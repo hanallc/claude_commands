@@ -1449,6 +1449,11 @@ def _resume_liveness(identity: str, *, deadline: float = math.inf
             return live
         try:
             registry = sessions.read_registry(for_session=identity, deadline=deadline)
+        except session_records.RegistryReadExpired as error:
+            if not error.registry.entries:
+                return live
+            observed = sessions.session_liveness(identity, registry=error.registry)
+            return observed if isinstance(observed, sessions.LiveSessionProcess) else live
         except TimeoutError:
             return live
         return sessions.session_liveness(identity, registry=registry)
