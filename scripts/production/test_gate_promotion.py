@@ -219,6 +219,8 @@ sys.meta_path.insert(0, NoRepositoryModules())
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 1)
 
     def test_promotion_refuses_missing_or_stale_ci_for_the_exact_tip(self) -> None:
+        self.write(self.unit / ".github/workflows/ci.yml", "name: CI\n")
+        self.checkpoint = self.commit(self.unit, "add CI workflow")
         _ = self.publish_for_promotion()
         receipt = self.save_ci_receipt(self.checkpoint)
         receipt.unlink()
