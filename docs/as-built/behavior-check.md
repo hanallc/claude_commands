@@ -22,7 +22,7 @@ A clear record names the saved reviewer reply.
 The reviewer filters transcript files before parsing them and runs each command in one tool call without `write_stdin`.
 The gate checks each changed test for no user decision or a verified request from Nate.
 The check accepts typed Claude turns, sent List Tell feedback from Nate, and Nate's saved List or Question answers.
-It also accepts Nate's Images answers from List log entries with the source `nate via Images`.
+For List entries with source `nate via Images`, the check requires `image_answer.signed` to be `true`.
 The Images store keeps standalone answers in `.review-link-image-decisions/*.json` under the configured review links directory.
 The check reads `answer` and `feedback` as Nate's words. The reviewer uses `image_text` for context.
 The check matches consecutive full sentences or lines and treats each run of whitespace as one space.

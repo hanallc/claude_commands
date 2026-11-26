@@ -34,8 +34,26 @@ class BehaviorRequestImagesTests(TestCase):
         words = f"Image abcdef123456: your image is approved.\n{feedback}"
         _ = the_list.save_image_answer(keeper.id, item.id, "review:" + "a" * 64, words,
                                        image_id="abcdef123456", approved=True, signed_at=moment)
+        entry = the_list.load(keeper.id, item.id).log[-1]
+        assert isinstance(entry, the_list.ImageAnswerChange)
+        self.assertTrue(entry.signed)
         source = the_list.folder(keeper.id) / f"{item.id}.md"
         self.assertEqual(behavior_request.verified_dates(source, {feedback}), {feedback: date(2026, 11, 23)})
+
+    def test_a_list_answer_without_the_signed_mark_cannot_verify(self) -> None:
+        keeper = fixture_member("producer", name="morty")
+        item = the_list.add(keeper.id, "Check the picture", owner=keeper.id, source="nate", changes={})
+        source = the_list.folder(keeper.id) / f"{item.id}.md"
+        title = "Title: Remove the red row."
+        words = "From the user (via the Images page): your image is approved.\n" + title
+        legacy_entry = {"time": "2026-11-23T19:40:00+00:00", "source": "nate via Images", "note": words,
+                        "image_answer": {"key": "review:" + "a" * 64, "producer": item.producer}}
+        with source.open("a", encoding="utf-8") as file:
+            _ = file.write("\n- " + json.dumps(legacy_entry) + "\n")
+        entry = the_list.load(keeper.id, item.id).log[-1]
+        assert isinstance(entry, the_list.ImageAnswerChange)
+        self.assertIn(title, entry.what)
+        self.assertEqual(behavior_request.verified_dates(source, {title}), {})
 
     def test_only_a_stored_images_answer_with_the_right_source_verifies(self) -> None:
         folder = images.decision_root(self.root)

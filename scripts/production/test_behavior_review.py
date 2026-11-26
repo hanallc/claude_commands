@@ -152,7 +152,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("rg --search-zip --files-with-matches --hidden --no-ignore", prompt)
         self.assertIn("Parse only those files for matching user turns.", prompt)
         self.assertIn(f"Nate's Images page answers in {images.decision_root(review_root)}/*.json.", prompt)
-        self.assertIn('A log entry with source "nate via Images" contains Nate\'s words.', prompt)
+        self.assertIn('the source is "nate via Images" and `image_answer.signed` is true.', prompt)
         self.assertIn("Use `image_text` for context. Quote only `answer` and `feedback`.", prompt)
         self.assertIn("You can cite Nate's Images page answer from the store or the List log.", prompt)
         self.assertIn("Find Nate's newest words that set each affected behavior.", prompt)

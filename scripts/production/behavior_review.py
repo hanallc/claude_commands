@@ -149,7 +149,7 @@ If a search times out, split its input into smaller groups and search each group
 
 Use these sources:
 1. List records and their questions and answers in {state_root()}/*/list/L*.md.
-   A log entry with source "nate via Images" contains Nate's words.
+   Cite Images answers in the log only if the source is "nate via Images" and `image_answer.signed` is true.
 2. Question records from scripts/production/update_registration.py and change review verdicts.
    Follow the store paths in the showrunner documents and the showrunner state root.
 3. User turns in Claude session transcripts. Do not count assistant, tool, or peer messages.

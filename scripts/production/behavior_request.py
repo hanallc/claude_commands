@@ -116,7 +116,8 @@ def list_words(path: Path, keeper: staff.StaffId) -> Iterator[NateWords]:
         if (event.source == the_list.PAGE_SOURCE and isinstance(feedback, the_list.PageFeedback)
                 and feedback.action == "tell" and feedback.state == "sent"):
             yield NateWords(feedback.words, event.time)
-        elif isinstance(event, the_list.ImageAnswerChange) and event.source == the_list.IMAGE_ANSWER_SOURCE:
+        elif (isinstance(event, the_list.ImageAnswerChange) and event.source == the_list.IMAGE_ANSWER_SOURCE
+              and event.signed):
             yield NateWords(event.what, event.time)
     for question in item.questions:
         answer = question.answer

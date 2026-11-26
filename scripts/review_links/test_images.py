@@ -1,7 +1,9 @@
 """Test image registration, the Images page, deletes and feedback in private folders."""
 from __future__ import annotations
 
+import hashlib
 import html
+from inspect import signature
 import json
 import os
 import re
@@ -913,6 +915,68 @@ class ImagesTests(ImagesFixture):
                 self.assertEqual(list(archive.glob(f"{identity}-*.json")), [path])
                 self.assertEqual(path.read_bytes(), original)
 
+    def test_signed_correction_in_the_same_round_has_its_own_record(self) -> None:
+        record = self.register()
+        round_id = images.feedback_round(set())
+        keep = self.feedback_body(record, "Keep the red row.") + f"&feedback_round={round_id}"
+        remove = self.feedback_body(record, "Remove the red row.") + f"&feedback_round={round_id}"
+        self.submit(keep)
+        archive = images.decision_root(self.root)
+        path, = archive.glob(f"{record['id']}-*.json")
+        original = path.read_bytes()
+        old_key = hashlib.sha256(json.dumps((record["registered_at"], round_id)).encode()).hexdigest()
+        path = path.rename(archive / f"{record['id']}-{old_key}.json")
+        self.submit(keep)
+        self.submit(remove)
+        self.submit(remove)
+        self.assertEqual(path.read_bytes(), original)
+        decisions = [images.read_image_decision(self.root, path) for path in archive.glob(f"{record['id']}-*.json")]
+        self.assertEqual(len(decisions), 2)
+        self.assertEqual({decision.feedback for decision in decisions if isinstance(decision, images.ImageDecision)},
+                         {"Keep the red row.", "Remove the red row."})
+
+    def test_linked_forms_with_or_without_a_round_share_one_list_entry(self) -> None:
+        keeper, _, item = self.list_item()
+        record = images.register(self.shot, "Check the rows", self.owner_id(), "Phase check", list_item=item.id)
+        body = self.feedback_body(record, "Keep the red row.")
+        self.submit(body)
+        self.submit(body + f"&feedback_round={images.feedback_round(set())}")
+        saved = the_list.load(keeper.id, item.id)
+        entry, = (entry for entry in saved.log if isinstance(entry, the_list.ImageAnswerChange))
+        self.assertIn("Keep the red row.", entry.what)
+
+    def test_signed_resubmission_with_a_legacy_marker_creates_a_record(self) -> None:
+        record = self.register()
+        identity = record["id"]
+        words = "Keep the red row."
+        directory = images.images_root(self.root)
+        folder = directory / identity
+        key = change_page.review_delivery_key(folder / image_store.RECORD, identity,
+                                              json.dumps([record["registered_at"], "feedback", words]))
+        marker = folder / (".review-link-feedback-" + key.removeprefix("review:"))
+        _ = marker.write_text("")
+        body = self.feedback_body(record, words)
+        self.submit(body)
+        path, = images.decision_root(self.root).glob(f"{identity}-*.json")
+        decision = images.read_image_decision(self.root, path)
+        assert isinstance(decision, images.ImageDecision)
+        self.assertEqual(decision.feedback, words)
+
+    def test_public_sender_cannot_choose_the_signed_path(self) -> None:
+        self.assertNotIn("origin", signature(images.send_answer).parameters)
+        record = self.register()
+        _ = images.send_answer(self.root, record["id"], "approved", "")
+        self.assertFalse(images.decision_root(self.root).exists())
+        pending = self.register()
+        body = self.feedback_body(pending, "Keep the red row.")
+        with patch.object(images, "_save_image_decision", side_effect=OSError("disk unavailable")):
+            with self.assertRaisesRegex(images.AnswerNotSent, "disk unavailable"):
+                self.submit(body)
+        _ = images.send_answer(self.root, pending["id"], "feedback", "Keep the red row.")
+        self.assertFalse(images.decision_root(self.root).exists())
+        self.submit(body)
+        self.assertEqual(len(list(images.decision_root(self.root).glob("*.json"))), 1)
+
     def test_retry_of_a_failed_list_write_keeps_the_original_signed_time(self) -> None:
         keeper, _, item = self.list_item()
         record = images.register(self.shot, "Check the rows", self.owner_id(), "Phase check", list_item=item.id)
@@ -1388,12 +1452,16 @@ sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringi
 
     def test_a_retry_does_not_date_an_older_answer(self) -> None:
         record = self.register()
+        identity = record["id"]
         words = "Use a larger title."
-        _ = images.send_answer(self.root, record["id"], "feedback", words)
-        body = self.feedback_body(record, words)
-        self.submit(body)
-        self.submit(body + f"&feedback_round={images.feedback_round(set())}")
+        _ = images.send_answer(self.root, identity, "feedback", words)
+        key, = image_store.read_answers(images.images_root(self.root), identity)["attempts"]
+        images.delete(self.root, identity)
+        token = images.request_token(images.console_token(self.root), identity)
+        self.submit(urlencode({"image": identity, "token": token, "action": "retry", "retry_key": key}))
         self.assertFalse(images.decision_root(self.root).exists())
+        self.submit(self.feedback_body(record, words))
+        self.assertEqual(len(list(images.decision_root(self.root).glob(f"{identity}-*.json"))), 1)
 
 
 class ImageQuestionTests(ImagesFixture):
