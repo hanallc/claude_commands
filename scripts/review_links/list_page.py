@@ -912,10 +912,11 @@ class ListProgress(NamedTuple):
             return '<p>' + self.repair_producer_html + ' repairs it again</p>'
         if not self.show_next_step:
             return ""
-        text = (self.next_step or "Not recorded").replace("\r\n", "\n").replace("\r", "\n")
+        original = self.next_step or "Not recorded"
         label = NEXT_STEP_COMMAND_LABEL
-        if label not in text:
-            return item_text_html(text, paragraphs=True, link_urls=link_urls)
+        if label not in original:
+            return item_text_html(original, paragraphs=True, link_urls=link_urls)
+        text = original.replace("\r\n", "\n").replace("\r", "\n")
         fences = list(NEXT_STEP_FENCE.finditer(text))
         paragraphs: list[str] = []
         start = 0
@@ -937,7 +938,7 @@ class ListProgress(NamedTuple):
                 prose = item_text_html(text[:start], paragraphs=True, link_urls=link_urls)
                 code = page_frame.copy_code_block(command)
                 return prose + '<div class="list-command">' + code + '</div>'
-        return item_text_html(text, paragraphs=True, link_urls=link_urls)
+        return item_text_html(original, paragraphs=True, link_urls=link_urls)
 
 
 def item_progress(item: the_list.ListItem, names: staff_names.StaffNames, schedule: DisplayedSchedule) -> ListProgress:

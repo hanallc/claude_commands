@@ -3878,6 +3878,45 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
                 block = '<div class="list-command">' + page_frame.copy_code_block("printf x\nprintf y") + '</div>'
                 self.assertEqual(progress.next_step_html(), f'<p>{label}</p>' + block)
 
+    def test_next_step_keeps_original_prose_line_endings(self) -> None:
+        prose = "Check the result.\rRead the log."
+        expected = "<p>Check the result.</p><p>Read the log.</p>"
+        for source, markup in ((prose, expected),
+                               (prose + "\rRun this command:", expected + "<p>Run this command:</p>")):
+            with self.subTest(source=source):
+                progress = list_page.ListProgress("", NOW, source, "", True)
+                self.assertEqual(progress.next_step_html(), markup)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for this browser test")
+    def test_browser_next_step_fences_keep_each_copy_button_with_its_code(self) -> None:
+        label = "Run this command:\n\n"
+        first = 'printf "<x> & y"'
+        second = "printf z"
+        example = "Example\n\n" + label + first
+        cases = (
+            (f"{label}```sh\n```\n```sh\n{first}\n```", ["", first]),
+            (f"{label}```sh\n{first}\n```\n```sh\n{second}\n```", [first, second]),
+            (f"```text\n{example}\n```", [example]),
+        )
+        sections = "".join(
+            "<section>" + list_page.ListProgress("", NOW, source, "", True).next_step_html() + "</section>"
+            for source, _ in cases
+        )
+        probe = r'''
+const failures=[];
+const expected=EXPECTED_CODES;
+for(const [index,section] of [...document.querySelectorAll('section')].entries()){
+ const codes=[...section.querySelectorAll('[data-copy-code]')].map(button=>
+  button.closest('.code-block')?.querySelector('pre code')?.textContent);
+ if(JSON.stringify(codes)!==JSON.stringify(expected[index]))
+  failures.push('Unexpected code for case '+index+': '+JSON.stringify(codes));
+ if(section.querySelector('.list-command')) failures.push('Unexpected Studio command for case '+index);
+}
+void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+'''.replace("EXPECTED_CODES", json.dumps([codes for _, codes in cases]))
+        page = f"<!doctype html><meta charset=utf-8>{sections}<script>{probe}</script>"
+        self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_studio_copies_the_next_step_command_once_after_refresh(self) -> None:
         root = self.root / "reviews"
