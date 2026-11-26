@@ -104,11 +104,12 @@ class ChangedTests:
     tests: tuple[TestChange, ...]
     repository: str
     files: tuple[ChangedFile, ...]
+    commit_messages: bytes
 
     @property
     def key(self) -> str:
         changes = sorted((change.test, change.old, change.new) for change in self.tests)
-        fields = (self.repository, sorted(self.files), changes)
+        fields = (self.repository, sorted(self.files), changes, hashlib.sha256(self.commit_messages).hexdigest())
         return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -366,7 +367,9 @@ def changed_tests(change: GitRange, *, timeout: float | None = None) -> ChangedT
             edits_to_tests.append(TestChange(test, text, new.get(test, "")))
     if not edits_to_tests:
         return NoChangedTests.EMPTY
-    return ChangedTests(tuple(edits_to_tests), change.origin_identity(timeout), tuple(files))
+    messages = change.git("log", "--format=%B", "-z", "--no-notes", "--no-show-signature", "--encoding=UTF-8",
+                          f"{change.base}..{change.commit}", "--", timeout=timeout)
+    return ChangedTests(tuple(edits_to_tests), change.origin_identity(timeout), tuple(files), messages)
 
 
 class Approval(StrEnum):

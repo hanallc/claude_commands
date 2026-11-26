@@ -87,7 +87,7 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
         self.assertIn('let braces = r#"}"#;', result.tests[0].new)
         self.assertIn('assert!(false)', result.tests[0].new)
 
-    def test_merge_commit_keeps_the_key_for_the_same_patch(self) -> None:
+    def test_merge_message_and_reworded_messages_change_the_review_key(self) -> None:
         test = self.repo / "test_example.py"
         _ = self.write(test, "def test_example():\n    assert 1\n")
         base = self.commit_files()
@@ -100,7 +100,19 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
         main = self.commit_files()
         _ = self.git("merge", "--no-ff", "--no-edit", "topic")
         merged = self.git("rev-parse", "HEAD").stdout.strip()
-        self.assertEqual(self.changes(main, merged).key, changes.key)
+        merged_changes = self.changes(main, merged)
+        self.assertEqual((merged_changes.files, merged_changes.tests), (changes.files, changes.tests))
+        self.assertNotEqual(merged_changes.key, changes.key)
+
+        _ = self.git("commit", "--amend", "--no-edit", "--date=2025-01-01T00:00:00Z")
+        rebuilt = self.git("rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(rebuilt, merged)
+        self.assertEqual(self.changes(main, rebuilt).key, merged_changes.key)
+
+        _ = self.git("commit", "--amend", "-m", "Keep the current work before a move.")
+        reworded = self.changes(main, self.git("rev-parse", "HEAD").stdout.strip())
+        self.assertEqual((reworded.files, reworded.tests), (merged_changes.files, merged_changes.tests))
+        self.assertNotEqual(reworded.key, merged_changes.key)
 
     def test_record_round_trip_keeps_a_negative_answer_and_its_time(self) -> None:
         key = "f" * 64

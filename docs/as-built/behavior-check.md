@@ -7,8 +7,9 @@ Run `scripts/lib/py scripts/production/behavior_check.py find --repo CHECKOUT --
 The finder reads Python test functions and Rust functions with test attributes. It skips new tests and tests that move with the same text.
 It includes the attributes of enclosing Rust modules in the test text.
 
-The key hashes the origin identity, the changed files, and the old and new test text.
+The key hashes the origin identity, the changed files, the old and new test text, and the commit messages in the range.
 Each changed file contributes its path, its old and new Git modes, and its old and new Git object IDs.
+A change to a commit message requires a new review, even when the patch is the same.
 
 `land_main.py` and direct checkpoint pushes read the default branch from origin.
 They check default-branch pushes against the fetched tip.
@@ -31,12 +32,15 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 5. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.
 
 The question title names the behavior and the date of the decision.
-The point quotes the user's words and says what the change does.
+The point quotes the user's words, gives the reason for the change, and says what the change does.
+The reviewer reads the commit messages in the range for the reason.
+If the messages give no reason, the reviewer uses "The change gives no reason."
 Each additional finding gives one fact line. The recommendation and choices give the result of each answer.
 
 A retry starts a new review if the prior reviewer process ended before it saved a valid reply.
-Run the check again if the saved reply has no name for the behavior.
+Run the check again if the saved reply has no behavior name or reason field.
 The collector reads the first word of the answer. It ignores letter case and punctuation at the end of that word.
-If the Console review holds the question, the command reports the hold and says Nate was not asked. The land stays refused.
+If the Console review holds the question, the command reports the hold. The land stays refused.
+The command then prints "Nate was not asked. Give the reason for the change in the commit message, then run the check again."
 If the first word is neither Yes nor No, `behavior_check.py run` quotes the answer and the land stays refused.
 A missing review, an incomplete review, a question without an answer, and a No answer stop the land. Review errors also stop the land.

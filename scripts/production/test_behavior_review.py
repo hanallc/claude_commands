@@ -23,6 +23,7 @@ from scripts.review_links import review_events
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
 REVIEWER = "fixture-reviewer"
+MOVE_REASON = "An immediate move can lose work."
 
 
 class BehaviorReviewTests(ScriptRepositoryTestCase):
@@ -48,15 +49,15 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         _ = self.enterContext(mock.patch.object(update_registration, "user_zone", return_value=ZoneInfo("UTC")))
         self.seed()
 
-    def commit(self, path: str, content: str) -> str:
+    def commit(self, path: str, content: str, message: str = "fixture") -> str:
         _ = self.write(self.repo / path, content)
         _ = self.git("add", path)
-        _ = self.git("commit", "-m", "fixture")
+        _ = self.git("commit", "-m", message)
         return self.git("rev-parse", "HEAD").stdout.strip()
 
-    def changed_range(self) -> tuple[list[str], str]:
-        base = self.commit("test_fixture.py", "def test_move():\n    assert 'move now'\n")
-        commit = self.commit("test_fixture.py", "def test_move():\n    assert 'wait first'\n")
+    def changed_range(self, message: str = MOVE_REASON) -> tuple[list[str], str]:
+        base = self.commit("test_fixture.py", "def test_move():\n    assert 'move now'\n", "Set the current behavior.")
+        commit = self.commit("test_fixture.py", "def test_move():\n    assert 'wait first'\n", message)
         tests = behavior_check.changed_tests(behavior_check.GitRange(self.repo, base, commit))
         assert isinstance(tests, behavior_check.ChangedTests)
         key = tests.key
@@ -216,6 +217,10 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         prompt = cast(str, runner.call_args.args[1])
         self.assertIn("write one sentence about what Nate would see change", prompt)
         self.assertIn("Omit test names, file names, and function names", prompt)
+        messages = self.folder / "commit-messages.txt"
+        self.assertIn(f"Read the commit messages for the range under review in {messages}.", prompt)
+        self.assertIn('If the messages give no reason, use exactly "The change gives no reason."', prompt)
+        self.assertEqual(messages.read_text(), MOVE_REASON + "\n")
         text_check.assert_called_once()
         self.assertEqual(behavior_check.read_record(key), waiting)
         records = update_registration.question_records_for_owner(self.producer.id, strict=True)
@@ -223,8 +228,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         question = records[0]
         self.assertEqual(question.item.get("parts"), {
             "ask": "Allow a change to immediate moves? (2026-11-23)",
-            "context": ('On 2026-11-23 you said, "Move at once." If you say Yes, the move waits for the current step. '
-                        + 'The merge waits for your answer.'),
+            "context": ('On 2026-11-23 you said, "Move at once." An immediate move can lose work. '
+                        + 'If you say Yes, the move waits for the current step.\n\nThe merge waits for your answer.'),
             "items": [],
             "recommend": "No, because you keep immediate moves.",
             "choices": ["Yes (the move waits for the current step)", "No (the change stays out and you keep immediate moves)"],
@@ -233,23 +238,26 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertNotIn("test_fixture.py", question.item.get("question", ""))
         return args, key, waiting, question
 
-    def specified_move_reply(self) -> None:
+    def specified_move_reply(self, reason: str = MOVE_REASON) -> None:
         source = self.write(self.root / "decision.md", "Move at once.")
         self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": "Move at once.",
                                 "source": str(source), "date": "2026-11-23", "behavior": "immediate moves",
-                                "change": "If you say Yes, the move waits for the current step."}]))
+                                "reason": reason, "change": "If you say Yes, the move waits for the current step."}]))
 
     def test_a_console_hold_reports_that_nate_was_not_asked_and_refuses_land(self) -> None:
-        args, key = self.changed_range()
-        self.specified_move_reply()
+        args, key = self.changed_range("Change move timing.")
+        self.specified_move_reply("The change gives no reason.")
         hold = review.QuestionAwaitingFacts("draft", ("Explain the wait.",))
         with (mock.patch.object(astra_review, "run_review", return_value=0),
               mock.patch.object(review, "review_question", return_value=hold) as text_check):
             code, output = self.cli("run", *args, "--production", self.producer.name)
         text_check.assert_called_once()
+        draft = cast(str, text_check.call_args.args[1])
+        self.assertIn('"Move at once." The change gives no reason. If you say Yes,', draft)
         self.assertEqual(code, 1)
         self.assertIn("question held for review", output)
-        self.assertIn("Explain the wait.\nNate was not asked.\n", output)
+        self.assertIn("Explain the wait.\nNate was not asked. Give the reason for the change in the commit message, "
+                      + "then run the check again.\n", output)
         self.assertEqual(update_registration.question_records_for_owner(self.producer.id, strict=True), [])
         self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
         self.assertEqual(self.cli("check", *args)[0], 1)
@@ -305,7 +313,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         evidence = behavior_review.SpecifiedBehavior("test_fixture.py::test_move", "Move at once.",
                                                       self.root / "decision.md", date(2026, 11, 23),
                                                       "If you say Yes, the move waits for the current step.",
-                                                      "immediate moves")
+                                                      "immediate moves", MOVE_REASON)
         extra = replace(evidence, test="other.py::test_stop", quote="Restart the work", day=date(2026, 11, 24),
                         change="If you say Yes, the work stays stopped.", behavior="work restarts")
         second_key = "e" * 64
@@ -337,7 +345,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         parts = third_item.get("parts")
         assert parts is not None
         self.assertEqual(parts["items"], [
-            'On 2026-11-24 you said, "Restart the work". If you say Yes, the work stays stopped.',
+            'On 2026-11-24 you said, "Restart the work". An immediate move can lose work. If you say Yes, the work stays stopped.',
         ])
         self.assertEqual(parts["choices"], ["Yes (all the changes go in)",
                                             "No (the changes stay out and the behaviors you set stay)"])
