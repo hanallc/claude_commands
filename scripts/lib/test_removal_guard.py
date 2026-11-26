@@ -304,7 +304,7 @@ class RemovalGuardTests(unittest.TestCase):
                                         removal_guard.ProvedCopyCleanup], removal_guard.ProvedCopyCleanup)
             with self.assertRaises((TypeError, removal_guard.ChangedEntry)):
                 removal_guard.remove_proved_copy(checked, source_only(candidate, entries), checked.published_copy_path,
-                                                 before_delete=lambda: None)
+                                                 before_delete=lambda: None, after_copy_check=lambda: None)
         self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux copy verifier")
@@ -329,7 +329,8 @@ class RemovalGuardTests(unittest.TestCase):
                     checked, source, removal_guard.CopyDestination(destination, copied), entries)
             approved_target = destination.parent.parent / candidate.name
             with self.assertRaisesRegex(removal_guard.ChangedEntry, "final target path"):
-                removal_guard.remove_proved_copy(checked, proof, approved_target, before_delete=lambda: None)
+                removal_guard.remove_proved_copy(checked, proof, approved_target,
+                                                 before_delete=lambda: None, after_copy_check=lambda: None)
         self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux copy verifier")
@@ -358,7 +359,8 @@ class RemovalGuardTests(unittest.TestCase):
             target = removal_guard.CleanupTarget(checked_extra, extra_approval)
             remove_with_extra = cast(Callable[..., None], removal_guard.remove_proved_copy)
             with self.assertRaises(TypeError):
-                remove_with_extra(checked, proof, destination, target, before_delete=lambda: None)
+                remove_with_extra(checked, proof, destination, target,
+                                  before_delete=lambda: None, after_copy_check=lambda: None)
             with self.assertRaisesRegex(removal_guard.ChangedEntry, "approved move target"):
                 removal_guard.remove_cleanup(checked, cast(removal_guard.ApprovedCleanup, cast(object, proof)), target)
             proof_target = removal_guard.CleanupTarget(checked, cast(removal_guard.ApprovedCleanup, cast(object, proof)))
@@ -389,14 +391,78 @@ class RemovalGuardTests(unittest.TestCase):
             saved = destination.rename(destination.with_name("saved"))
             _ = shutil.copytree(saved, destination)
             with self.assertRaisesRegex(ValueError, "parent changed during the move"):
-                removal_guard.remove_proved_copy(checked, proof, destination, before_delete=lambda: None)
+                removal_guard.remove_proved_copy(checked, proof, destination,
+                                                 before_delete=lambda: None, after_copy_check=lambda: None)
             self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
             with session_move.open_directory(destination) as replacement:
                 current = removal_guard.ProvedCopyCleanup(
                     checked, source, removal_guard.CopyDestination(destination, replacement), entries)
-                removal_guard.remove_proved_copy(checked, current, destination, before_delete=lambda: None)
+                removal_guard.remove_proved_copy(checked, current, destination,
+                                                 before_delete=lambda: None, after_copy_check=lambda: None)
         self.assertFalse(candidate.exists())
         self.assertEqual((destination / head.relative_to(candidate)).read_text(), "ref: refs/heads/main\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux copy verifier")
+    def test_proved_copy_keeps_the_source_when_the_destination_changes_during_the_final_scan(self) -> None:
+        candidate = self.home / "old"
+        head = candidate / "nested/.git/HEAD"
+        head.parent.mkdir(parents=True)
+        _ = head.write_text("ref: refs/heads/main\n")
+        destination = self.root / "claude/resources/shm-moved" / candidate.name
+        _ = shutil.copytree(candidate, destination)
+        copied_head = destination / head.relative_to(candidate)
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate,)), bounds,
+                                                       mount_reader=lambda: (Path("/"),))
+
+        with (guard.check(candidate) as checked, session_move.open_directory(candidate) as source,
+              session_move.open_directory(destination) as copied):
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            proof = removal_guard.ProvedCopyCleanup(
+                checked, source, removal_guard.CopyDestination(destination, copied), entries)
+            with self.assertRaisesRegex(removal_guard.ChangedEntry, "the published copy changed during verification"):
+                removal_guard.remove_proved_copy(checked, proof, destination,
+                                                 before_delete=copied_head.unlink, after_copy_check=lambda: None)
+
+        self.assertFalse(copied_head.exists())
+        self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux copy verifier")
+    def test_proved_copy_runs_after_copy_check_before_source_deletion(self) -> None:
+        candidate = self.home / "old"
+        candidate.mkdir()
+        payload = candidate / "payload"
+        _ = payload.write_text("original content\n")
+        destination = self.root / "claude/resources/shm-moved" / candidate.name
+        _ = shutil.copytree(candidate, destination)
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate,)), bounds,
+                                                       mount_reader=lambda: (Path("/"),))
+        events: list[str] = []
+        check_destination = removal_guard.ProvedCopyCleanup.require_unchanged_destination
+
+        def record_copy_check(proof: removal_guard.ProvedCopyCleanup, approved_target: Path) -> None:
+            check_destination(proof, approved_target)
+            events.append("copy check")
+
+        def after_copy_check() -> None:
+            self.assertEqual(payload.read_text(), "original content\n")
+            events.append("after_copy_check")
+
+        with (guard.check(candidate) as checked, session_move.open_directory(candidate) as source,
+              session_move.open_directory(destination) as copied):
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            proof = removal_guard.ProvedCopyCleanup(
+                checked, source, removal_guard.CopyDestination(destination, copied), entries)
+            with mock.patch.object(removal_guard.ProvedCopyCleanup, "require_unchanged_destination", record_copy_check):
+                removal_guard.remove_proved_copy(checked, proof, destination,
+                                                 before_delete=lambda: events.append("before_delete"),
+                                                 after_copy_check=after_copy_check)
+
+        self.assertEqual(events, ["copy check", "before_delete", "copy check", "after_copy_check"])
+        self.assertFalse(candidate.exists())
 
     def test_each_form_checks_depth_and_number(self) -> None:
         cases = (
