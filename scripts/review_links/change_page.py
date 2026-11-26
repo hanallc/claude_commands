@@ -61,7 +61,7 @@ from scripts.review_links import (console_theme, image_store, new_item_dialog, p
                                   reply_tokens, review_link, staff_names)
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
 from scripts.review_links.review_items import (
-    CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
+    CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback, ReviewItem, NO_SAVED_CHANGE_ANSWERER,
     change_on_list, decode_change_delivery, read_change_delivery, validation_recipients, validation_request_words,
 )
 
@@ -134,6 +134,7 @@ class StoredAnsweredQuestion(TypedDict):
 class StoredDeliverySlots(TypedDict, total=False):
     handed_at: str
     answered_at: str
+    answered_by: str
     waiting_why: str
     validation: StoredValidationIntent | StoredValidationRequested
     verdict: StoredDeliveryIntent
@@ -147,18 +148,18 @@ CHANGE_HANDOFFS = frozenset(("validate", "question", "feedback"))
 VALIDATION_QUESTION = "validation-question"
 
 
-def saved_delivery_times(path: Path) -> dict[str, str]:
-    """Read the saved handoff and answer times."""
+def saved_delivery_metadata(path: Path) -> dict[str, str]:
+    """Read the saved handoff time, answer time and answerer."""
     try:
         fields = delivery_state.read_fields(path)
     except (FileNotFoundError, ValueError):
         return {}
-    return {key: value for key in ("handed_at", "answered_at")
+    return {key: value for key in ("handed_at", "answered_at", "answered_by")
             if isinstance(value := fields.get(key), str)}
 
 
 def read_handed_at(path: Path) -> str | None:
-    return saved_delivery_times(path).get("handed_at")
+    return saved_delivery_metadata(path).get("handed_at")
 
 
 def require_user_turn(slots: DeliverySlots) -> None:
@@ -1557,7 +1558,8 @@ class DeliveryStatus:
         return page
 
     def write_slots(self, page: ReviewPage, row: str, slots: DeliverySlots, *,
-                    new_handoff: bool = False, answered_at: AnswerTime = NO_ANSWER_TIME) -> None:
+                    new_handoff: bool = False, answered_at: AnswerTime = NO_ANSWER_TIME,
+                    answered_by: staff.StaffId = NO_SAVED_CHANGE_ANSWERER) -> None:
         """Write both slots while the caller holds the delivery lock."""
         fields: StoredDeliverySlots = {}
         if slots.waiting_why:
@@ -1589,16 +1591,20 @@ class DeliveryStatus:
             saved_question["kind"] = "feedback"
         path = self.path(page, row)
         if fields and re.fullmatch(r"C\d+", row):
-            saved_times = {} if new_handoff else saved_delivery_times(path)
+            saved_metadata = {} if new_handoff else saved_delivery_metadata(path)
             if new_handoff:
                 fields["handed_at"] = datetime.fromtimestamp(time.time(), user_zone()).isoformat()
-            elif (saved := saved_times.get("handed_at")) is not None:
+            elif (saved := saved_metadata.get("handed_at")) is not None:
                 fields["handed_at"] = saved
             if isinstance(question, AnsweredQuestion):
                 if isinstance(answered_at, datetime):
                     fields["answered_at"] = answered_at.isoformat()
-                elif (saved := saved_times.get("answered_at")) is not None:
+                    if answered_by:
+                        fields["answered_by"] = answered_by
+                elif (saved := saved_metadata.get("answered_at")) is not None:
                     fields["answered_at"] = saved
+                    if saved_by := saved_metadata.get("answered_by"):
+                        fields["answered_by"] = saved_by
         published = False
         try:
             if fields:
@@ -1721,7 +1727,8 @@ class DeliveryStatus:
         """Save an answer once and preserve the delivery record's other slots."""
         return isinstance(self.save_question_answer(page, row, question_id, text), datetime)
 
-    def save_question_answer(self, page: ReviewPage, row: str, question_id: str, text: str) -> AnswerTime:
+    def save_question_answer(self, page: ReviewPage, row: str, question_id: str, text: str, *,
+                             author: staff.StaffId = NO_SAVED_CHANGE_ANSWERER) -> AnswerTime:
         """Return the saved reply time when a new answer is written."""
         if not text.strip():
             raise question_record.AnswerRefused("enter an answer")
@@ -1748,7 +1755,7 @@ class DeliveryStatus:
                                                     feedback_request_id=question.question_id)
             answered_at = datetime.now(user_zone())
             self.write_slots(page, row, replace(slots, question=completed(question_id, question.text, text)),
-                             answered_at=answered_at)
+                             answered_at=answered_at, answered_by=author)
             return answered_at
 
     @staticmethod
@@ -3489,6 +3496,37 @@ def resend_submission_reply(reference: str) -> str:
     return scoped.item_id
 
 
+def _change_answer_item(status: DeliveryStatus, page: ReviewPage, row: str,
+                        members: staff.StaffSnapshot) -> ReviewItem | None:
+    from scripts.review_links import review_items
+
+    path = page.review_list
+    key = path.stem.removeprefix(change_review.PREFIX) + "/" + row
+    selection = review_items.ExactReviewRecord(path, key, staff.StaffId(""))
+    items = review_items.change_items(status.root, members, zone=user_zone(), sources=[], selection=selection)
+    return next((item for item in items if item.key == key), None)
+
+
+def _save_and_file_change_reply(status: DeliveryStatus, page: ReviewPage, row: str, question_id: str,
+                                words: str, author: staff.StaffId) -> bool:
+    from scripts.review_links import review_items
+
+    answered_at = status.save_question_answer(page, row, question_id, words, author=author)
+    changed = isinstance(answered_at, datetime)
+    with review_items.after_store_write(f"{page.review_list}/{row}"):
+        if author and isinstance(answered_at, datetime):
+            change_review.record_review_log(page.review_list, row, 'Answer: ' + words.strip(),
+                                            row_production(page, answer_row(page, row)), author,
+                                            feedback_request_id=answer_log_id(question_id), event_time=answered_at)
+        members = staff.snapshot()
+        current = _change_answer_item(status, page, row, members)
+        if current is not None:
+            file_saved_review = cast(Callable[[review_items.ReviewItem, staff.StaffSnapshot], None],
+                                     import_module("scripts.review_links.answer_sources").file_saved_review)
+            file_saved_review(current, members)
+    return changed
+
+
 def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) -> bool:
     from scripts.review_links import decision_store, efficiency_reviews, review_items, review_submissions
     if key.startswith(review_submissions.KEY_PREFIX):
@@ -3559,13 +3597,7 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
     if isinstance(source,review_items.ChangeSource):
         assert isinstance(source.assignment.production,Path)
         page = ReviewPage(source.path,source.assignment.production,(source.row['#'],),'')
-        answered_at = status.save_question_answer(page, source.row['#'], question_id, words)
-        if not isinstance(answered_at, datetime):
-            return False
-        change_review.record_review_log(source.path, source.row['#'], 'Answer: ' + words, page.production, who,
-                                        feedback_request_id=answer_log_id(question_id), event_time=answered_at)
-        file_exchange()
-        return True
+        return _save_and_file_change_reply(status, page, source.row['#'], question_id, words, item.owner)
     raise question_record.AnswerRefused('this item cannot receive an answer')
 
 
@@ -3618,8 +3650,16 @@ def main(arguments: list[str]) -> int:
                                                review_list=cast(Path, args.list))
             shown = change_review.row_display_id(target.path, target.row)
             page = ReviewPage(target.path, change_review.production_doc(cast(str, args.production)), (target.row,), "")
-            changed = DeliveryStatus(review_link.review_root()).answer_question(
-                page, page.rows[0], cast(str, args.question), cast(str, args.text))
+            status = DeliveryStatus(review_link.review_root())
+            from scripts.review_links import review_items
+
+            author = NO_SAVED_CHANGE_ANSWERER
+            with review_items.after_store_write(str(page.review_list)):
+                item = _change_answer_item(status, page, page.rows[0], staff.snapshot())
+                if item is not None:
+                    author = item.owner
+            changed = _save_and_file_change_reply(status, page, page.rows[0], cast(str, args.question),
+                                                 cast(str, args.text), author)
         except (OSError, ValueError, change_review.ChangeReviewError, Refusal, subprocess.SubprocessError,
                 update_registration.RegistrationFailure) as error:
             print(f"change page: {error}", file=sys.stderr)

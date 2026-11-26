@@ -1057,14 +1057,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 if 'body' in fields:
                     view = (review_page.ReviewBodyView.CARD if fields.get('view') == ['card']
                             else review_page.ReviewBodyView.TABLE)
+                    if view is review_page.ReviewBodyView.CARD and fields.get('from') == ['studio-question']:
+                        view = review_page.ReviewBodyView.STUDIO_QUESTION
                     try:
                         key = fields['body'][0]
-                        include_done = view is review_page.ReviewBodyView.CARD or fields.get('saved') == ['1']
+                        include_done = view is not review_page.ReviewBodyView.TABLE or fields.get('saved') == ['1']
                         content = (snapshot.linked_card(root, key, view=view) if include_done else snapshot.body(key))
                     except LookupError as error:
                         message = str(error)
                         content = (change_page.document(page_frame.action_failure("review-card-failure", message), 'Review card')
-                                   if view is review_page.ReviewBodyView.CARD else html.escape(message).encode())
+                                   if view is not review_page.ReviewBodyView.TABLE else html.escape(message).encode())
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version, status=404)
                     else:
                         self.review_response(content, 'text/html; charset=utf-8', version=snapshot.version)

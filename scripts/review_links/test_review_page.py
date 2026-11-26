@@ -5866,7 +5866,8 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 until = now + timedelta(days=1)
                 if item.type == review_items.ReviewType.CHANGE:
                     review_later.save(key, until)
-                self.assertEqual(change_page.main(args),0)
+                with patch.object(the_list, "_save", side_effect=OSError("The List save failed.")):
+                    self.assertEqual(change_page.main(args),0)
                 returned = next(item for item in review_items.read(self.root) if item.key == key)
                 self.assertEqual(returned.state, review_items.ReviewState.OPEN)
                 self.assertEqual(sum('The second case passes.' in entry.words for entry in returned.log),1)

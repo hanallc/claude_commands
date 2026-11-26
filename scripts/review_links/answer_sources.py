@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -34,12 +36,12 @@ type ListLink = investigation.ListDestination | LegacyListLink
 
 
 @dataclass(frozen=True)
-class Exchange(list_exchange.FiledExchange):
+class Exchange(list_exchange.Exchange):
     list_links: tuple[ListLink, ...]
+    reply_event: ReviewLog | None = field(default=None, compare=False)
 
-    def filed(self) -> list_exchange.FiledExchange:
-        return list_exchange.FiledExchange(self.source, self.source_key, self.exchange_id, self.direction,
-                                           self.question, self.asked_at, self.asker, self.answerer, self.answer)
+
+type ReloadExchanges = Callable[[], Iterable[Exchange]]
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,7 @@ class ExchangeInventory:
     exchanges: tuple[Exchange, ...]
     list_items: frozenset[investigation.ListDestination]
     filed: tuple[tuple[investigation.ListDestination, list_exchange.FiledExchange], ...] = ()
+    reload: dict[str, ReloadExchanges] = field(default_factory=dict, compare=False)
 
 
 def _read_state(answered: datetime | TimeNotRecorded, read_times: Iterable[datetime],
@@ -96,8 +99,17 @@ def _reply_positions(fields: update_registration.OutstandingItem, log: tuple[Rev
     return positions
 
 
+def _answerer(reference: str, members: staff.StaffSnapshot) -> staff.StaffId | RecordedAnswerer:
+    member = members.by_member_reference(reference)
+    if member is None:
+        matches = [row for row in (*members.rows, *members.retired_producers)
+                   if reference in (row.id, row.name)]
+        member = matches[0] if len(matches) == 1 else None
+    return member.id if member is not None else RecordedAnswerer(reference)
+
+
 def _question_exchanges(record: update_registration.QuestionRecord, source: Source, key: str,
-                        links: tuple[ListLink, ...], zone: ZoneInfo) -> Iterator[Exchange]:
+                        links: tuple[ListLink, ...], zone: ZoneInfo, members: staff.StaffSnapshot) -> Iterator[Exchange]:
     fields = record.item
     initial = fields.get("question", fields["text"])
     filed = review_items.moment(fields["since"], zone)
@@ -133,8 +145,10 @@ def _question_exchanges(record: update_registration.QuestionRecord, source: Sour
                     if source is Source.SCOPED_REPLY and index == 0 and reply["followup"] == initial
                     else TimeNotRecorded.ABSENT)
         answer = ExchangeAnswer(reply["reply"], answered_at, _read_state(answered_at, read_times, acknowledged=closed))
+        event = log[position] if position is not None else None
+        author = _answerer(event.who, members) if event is not None else record.owner
         yield Exchange(source, key, f"followup:{index + 1}", Direction.ANSWER_TO_NATE, reply["followup"],
-                       asked_at, Nate.USER, record.owner, answer, links)
+                       asked_at, Nate.USER, author, answer, links, event)
 
 
 @dataclass(frozen=True)
@@ -145,8 +159,8 @@ class _LoggedQuestion:
 
 
 def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[ListLink, ...],
-                          zone: ZoneInfo) -> Iterator[Exchange]:
-    """Require a question before accepting a scoped reply from a non-Question record."""
+                          zone: ZoneInfo, members: staff.StaffSnapshot) -> Iterator[Exchange]:
+    """Match each saved reply to its question."""
     source = item.source
     pending: _LoggedQuestion | None = None
     if isinstance(source, review_items.InvestigationSource):
@@ -171,39 +185,82 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
     log = tuple(ReviewLog(review_items.aware(event.time, zone), event.who, event.words, event.feedback_request_id)
                 for event in events)
     read_times = (*_read_times(log), *extra_reads)
+    prompts = {index: _LoggedQuestion("question:" + event.feedback_request_id if event.feedback_request_id
+                                     else f"log:{index}", event.words.partition(": ")[2], event.time)
+               for index, event in enumerate(log) if event.who == Nate.USER and
+               event.words.partition(": ")[0].lower() in ("question", "followup")
+               and event.words.partition(": ")[2].strip()}
+    named = {prompt.identity.removeprefix("question:"): prompt for prompt in prompts.values()
+             if prompt.identity.startswith("question:")}
+    slot = source.slots.question if isinstance(source, review_items.ChangeSource) else delivery_state.NoQuestion()
+    slot_prompt: _LoggedQuestion | None = None
+    if isinstance(slot, delivery_state.AnsweredQuestion) and not isinstance(slot, review_items.CompletedFeedback):
+        legacy = next((prompt.time for prompt in reversed(tuple(prompts.values()))
+                       if prompt.identity.startswith("log:") and prompt.text == slot.text), item.times.filed)
+        original = named.get(slot.question_id)
+        slot_prompt = _LoggedQuestion("question:" + slot.question_id, slot.text,
+                                      legacy if original is None else original.time)
+        named[slot.question_id] = slot_prompt
+    slot_reply_position = -1
+    if slot_prompt is not None and isinstance(slot, delivery_state.AnsweredQuestion):
+        tagged = {slot.question_id, question_path.answer_log_id(slot.question_id)}
+        matching = [index for index, event in enumerate(log) if event.words == "Answer: " + slot.answer
+                    and event.who != Nate.USER and event.feedback_request_id in (*tagged, "")]
+        exact = [index for index in matching if log[index].feedback_request_id in tagged]
+        legacy = [index for index in matching if not log[index].feedback_request_id]
+        if exact:
+            slot_reply_position = exact[0]
+        elif len(legacy) == 1:
+            slot_reply_position = legacy[0]
+    seen: set[str] = set()
+    matched_slot = False
     for index, event in enumerate(log):
         label, _, words = event.words.partition(": ")
-        action = label.lower()
-        if event.who == Nate.USER and action in ("question", "followup") and words.strip():
-            identity = f"question:{event.feedback_request_id}" if event.feedback_request_id else f"log:{index}"
-            pending = _LoggedQuestion(identity, words, event.time)
-        elif event.who == Nate.USER and action in ("answer", "approve", "decline", "feedback", "feedback sent",
-                                                   "marked read", "read"):
+        if index in prompts:
+            pending = prompts[index] if not event.feedback_request_id else None
+            continue
+        if event.who == Nate.USER and label.lower() in ("answer", "approve", "decline", "feedback",
+                                                        "feedback sent", "marked read", "read"):
             pending = None
-        elif label == "Answer" and event.who != Nate.USER and words.strip() and pending is not None:
-            state = _read_state(event.time, read_times, acknowledged=item.state is review_items.ReviewState.DONE)
-            answer = ExchangeAnswer(words, event.time, state)
-            yield Exchange(Source.SCOPED_REPLY, key, pending.identity, Direction.ANSWER_TO_NATE, pending.text,
-                           pending.time, Nate.USER, item.owner, answer, links)
-            pending = None
-    if isinstance(source, review_items.ChangeSource):
-        slot = source.slots.question
-        if not isinstance(slot, delivery_state.AnsweredQuestion) or isinstance(slot, review_items.CompletedFeedback):
-            return
-        if any(event.words == "Answer: " + slot.answer for event in log):
-            return
-        if pending is not None and pending.text == slot.text and isinstance(item.answer_time, datetime):
-            answer = ExchangeAnswer(slot.answer, item.answer_time, _read_state(item.answer_time, read_times))
-            yield Exchange(Source.SCOPED_REPLY, key, pending.identity, Direction.ANSWER_TO_NATE, pending.text,
-                           pending.time, Nate.USER, item.owner, answer, links)
+        if label != "Answer" or event.who == Nate.USER or not words.strip():
+            continue
+        if index == slot_reply_position:
+            prompt = slot_prompt
+        elif event.feedback_request_id:
+            prompt = named.get(event.feedback_request_id.removeprefix("answer:"))
+        else:
+            prompt, pending = pending, None
+        if prompt is None or prompt.identity in seen:
+            continue
+        seen.add(prompt.identity)
+        matched_slot = matched_slot or prompt == slot_prompt
+        state = _read_state(event.time, read_times, acknowledged=item.state is review_items.ReviewState.DONE)
+        yield Exchange(Source.SCOPED_REPLY, key, prompt.identity, Direction.ANSWER_TO_NATE, prompt.text,
+                       prompt.time, Nate.USER, _answerer(event.who, members),
+                       ExchangeAnswer(words, event.time, state), links, event)
+    if (slot_prompt is not None and isinstance(slot, delivery_state.AnsweredQuestion) and not matched_slot):
+        reference = ""
+        if isinstance(source, review_items.ChangeSource):
+            reference = source.answered_by or (source.validators[0] if source.validators else "")
+        answered_at = item.answer_time if isinstance(item.answer_time, datetime) else TimeNotRecorded.ABSENT
+        answer = ExchangeAnswer(slot.answer, answered_at, _read_state(answered_at, read_times,
+                                acknowledged=item.state is review_items.ReviewState.DONE))
+        author = _answerer(reference, members) if reference else RecordedAnswerer("Answerer not recorded")
+        yield Exchange(Source.SCOPED_REPLY, key, slot_prompt.identity, Direction.ANSWER_TO_NATE, slot_prompt.text,
+                       slot_prompt.time, Nate.USER, author, answer, links)
 
 
-def _review_exchanges(root: Path, members: staff.StaffSnapshot, links: dict[str, list[ListLink]],
-                      zone: ZoneInfo) -> Iterator[Exchange]:
-    kinds = (*review_items.QUESTION_TYPES, *review_items.INVESTIGATION_TYPES, review_items.ReviewType.PROPOSAL,
-             review_items.ReviewType.CHANGE, review_items.ReviewType.EFFICIENCY)
-    for item in review_items.read(root, members=members, kinds=kinds, zone=zone, include_filed=True):
-        yield from _review_item_exchanges(item, links.get(item.key, ()), zone)
+_REVIEW_SOURCE_KINDS = (*review_items.QUESTION_TYPES, *review_items.INVESTIGATION_TYPES,
+                       review_items.ReviewType.PROPOSAL, review_items.ReviewType.CHANGE, review_items.ReviewType.EFFICIENCY)
+
+
+def _reload_review(root: Path, item: review_items.ReviewItem, members: staff.StaffSnapshot,
+                   links: Iterable[ListLink], zone: ZoneInfo) -> Iterator[Exchange]:
+    try:
+        current = review_items.read_current(root, item, members, include_filed=True)
+    except review_items.ReviewRecordMissing:
+        return
+    yield from _review_item_exchanges(current, links, zone, members)
 
 
 def _review_source_key(item: review_items.ReviewItem) -> str:
@@ -217,7 +274,7 @@ def _review_source_key(item: review_items.ReviewItem) -> str:
 
 
 def _review_item_exchanges(item: review_items.ReviewItem, linked: Iterable[ListLink],
-                           zone: ZoneInfo) -> Iterator[Exchange]:
+                           zone: ZoneInfo, members: staff.StaffSnapshot) -> Iterator[Exchange]:
     source = item.source
     destinations = list(linked)
     if (isinstance(source, review_items.InvestigationSource)
@@ -226,15 +283,15 @@ def _review_item_exchanges(item: review_items.ReviewItem, linked: Iterable[ListL
         destinations.append(destination)
     key = _review_source_key(item)
     if isinstance(source, (review_items.QuestionSource, review_items.UnownedQuestionSource)):
-        yield from _native_question_exchanges(source.record, key, tuple(destinations), zone)
+        yield from _native_question_exchanges(source.record, key, tuple(destinations), zone, members)
     else:
-        yield from _scoped_log_exchanges(item, key, tuple(destinations), zone)
+        yield from _scoped_log_exchanges(item, key, tuple(destinations), zone, members)
 
 
 def _native_question_exchanges(record: update_registration.QuestionRecord, key: str, links: tuple[ListLink, ...],
-                               zone: ZoneInfo) -> Iterator[Exchange]:
+                               zone: ZoneInfo, members: staff.StaffSnapshot) -> Iterator[Exchange]:
     kind = Source.SCOPED_REPLY if "review_submission" in record.item else Source.STAFF_QUESTION
-    yield from _question_exchanges(record, kind, key, links, zone)
+    yield from _question_exchanges(record, kind, key, links, zone, members)
 
 
 def _list_exchanges(entry: list_page.ListRecord, members: staff.StaffSnapshot, zone: ZoneInfo) -> Iterator[Exchange]:
@@ -302,6 +359,24 @@ def _picture_exchanges(root: Path, keepers: dict[int, list[staff.StaffId]], zone
                            question.recipient_id(staff.StaffId(record["owner"])), ExchangeAnswer(answer.text, time, state), links)
 
 
+def _reload_list(keeper: staff.StaffId, identity: str, members: staff.StaffSnapshot,
+                 zone: ZoneInfo) -> Iterator[Exchange]:
+    try:
+        item = the_list.load(keeper, identity)
+    except FileNotFoundError:
+        return
+    yield from _list_exchanges(list_page.ListRecord(keeper, item), members, zone)
+
+
+def _reload_picture(root: Path, identity: str, keepers: dict[int, list[staff.StaffId]],
+                    zone: ZoneInfo) -> Iterator[Exchange]:
+    try:
+        current = image_store.read_record(images.images_root(root) / identity)
+    except FileNotFoundError:
+        return
+    yield from _picture_exchanges(root, keepers, zone, (current,))
+
+
 def read_exchanges(root: Path, *, members: staff.StaffSnapshot) -> ExchangeInventory:
     """Read one inventory without changing the records or reserving List numbers."""
     zone = user_zone()
@@ -319,15 +394,29 @@ def read_exchanges(root: Path, *, members: staff.StaffSnapshot) -> ExchangeInven
             keys.add(item.report.evidence_key)
         for key in keys:
             links[key].append(destination)
-    exchanges = [
-        *_review_exchanges(root, members, links, zone),
-        *(exchange for entry in entries for exchange in _list_exchanges(entry, members, zone)),
-        *_picture_exchanges(root, keepers, zone, images.records(root)),
-    ]
+    exchanges: list[Exchange] = []
+    reload: dict[str, ReloadExchanges] = {}
+    for item in review_items.read(root, members=members, kinds=_REVIEW_SOURCE_KINDS, zone=zone,
+                                 sources=[], include_filed=True):
+        linked = tuple(links.get(item.key, ()))
+        candidates = tuple(_review_item_exchanges(item, linked, zone, members))
+        if candidates:
+            reload[candidates[0].source_key] = partial(_reload_review, root, item, members, linked, zone)
+            exchanges.extend(candidates)
+    for entry in entries:
+        candidates = tuple(_list_exchanges(entry, members, zone))
+        if candidates:
+            reload[candidates[0].source_key] = partial(_reload_list, entry.keeper, entry.item.id, members, zone)
+            exchanges.extend(candidates)
+    for record in images.records(root):
+        candidates = tuple(_picture_exchanges(root, keepers, zone, (record,)))
+        if candidates:
+            reload[candidates[0].source_key] = partial(_reload_picture, root, record["id"], keepers, zone)
+            exchanges.extend(candidates)
     exchanges.sort(key=lambda exchange: (exchange.source, exchange.source_key, exchange.exchange_id))
     filed = tuple((investigation.ListDestination(entry.keeper, entry.item.number), exchange)
                   for entry in entries for exchange in entry.item.filed_exchanges)
-    return ExchangeInventory(tuple(exchanges), frozenset(list_items), filed)
+    return ExchangeInventory(tuple(exchanges), frozenset(list_items), filed, reload)
 
 
 def _count(inventory: ExchangeInventory) -> Iterator[str]:
@@ -358,6 +447,7 @@ def _eligible(exchange: Exchange) -> bool:
 class FilingPlan:
     exchanges: tuple[Exchange, ...]
     destinations: tuple[ListLink, ...]
+    previously_filed: bool
 
 
 def _plans(exchanges: Iterable[Exchange], filed: Iterable[tuple[investigation.ListDestination, list_exchange.FiledExchange]]
@@ -372,35 +462,47 @@ def _plans(exchanges: Iterable[Exchange], filed: Iterable[tuple[investigation.Li
     for key, group in groups.items():
         links = tuple(dict.fromkeys(link for exchange in group for link in exchange.list_links))
         destinations = tuple(dict.fromkeys((*links, *existing[key])))
-        yield FilingPlan(tuple(group), destinations)
+        yield FilingPlan(tuple(group), destinations, bool(existing[key]))
 
 
-def file_source(plan: FilingPlan, members: staff.StaffSnapshot) -> investigation.ListDestination:
-    """File the exchanges after their original record has saved."""
-    first = next((exchange for exchange in plan.exchanges if exchange.direction is Direction.QUESTION_TO_NATE),
-                 plan.exchanges[0])
-    destinations = plan.destinations
-    if len(destinations) > 1 or any(isinstance(link, LegacyListLink) for link in destinations):
-        raise the_list.ListError("The source has no unique List destination.")
-    link = destinations[0] if destinations else the_list.NextNumber.AVAILABLE
-    assert not isinstance(link, LegacyListLink)
-    actor = first.asker if first.direction is Direction.QUESTION_TO_NATE else first.answerer
-    if not isinstance(link, investigation.ListDestination) and isinstance(actor, (Nate, RecordedAnswerer)):
-        raise the_list.ListError("The source has no staff ID for the List owner.")
-    owner = staff.StaffId(actor) if not isinstance(actor, RecordedAnswerer) else staff.StaffId("")
-    if not first.question.strip():
-        raise the_list.ListError("The source question has no text.")
-    return the_list.file_exchanges(tuple(exchange.filed() for exchange in plan.exchanges),
-                                   review_submissions.submission_title(first.question), linked=link, owner=owner, members=members)
+class NoExchangeFiling(StrEnum):
+    SOURCE_NO_LONGER_ELIGIBLE = "The source no longer has eligible exchanges."
 
 
-def _file_live(exchanges: Iterable[Exchange], entries: Iterable[list_page.ListRecord],
+def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadExchanges
+                ) -> investigation.ListDestination | NoExchangeFiling:
+    """Read the current source under its filing lock before saving to the List."""
+    key = plan.exchanges[0].source_key
+    with the_list.lock_exchange_source(key) as source:
+        exchanges = tuple(exchange for exchange in reload()
+                          if exchange.source_key == key and (_eligible(exchange) or plan.previously_filed))
+        if not exchanges:
+            return NoExchangeFiling.SOURCE_NO_LONGER_ELIGIBLE
+        first = next((exchange for exchange in exchanges if exchange.direction is Direction.QUESTION_TO_NATE),
+                     exchanges[0])
+        destinations = tuple(dict.fromkeys((*plan.destinations, *(link for exchange in exchanges
+                                                                 for link in exchange.list_links))))
+        if len(destinations) > 1 or any(isinstance(link, LegacyListLink) for link in destinations):
+            raise the_list.ListError("The source has no unique List destination.")
+        link = destinations[0] if destinations else the_list.NextNumber.AVAILABLE
+        assert not isinstance(link, LegacyListLink)
+        actor = first.asker if first.direction is Direction.QUESTION_TO_NATE else first.answerer
+        if not isinstance(link, investigation.ListDestination) and isinstance(actor, (Nate, RecordedAnswerer)):
+            raise the_list.ListError("The source has no staff ID for the List owner.")
+        owner = staff.StaffId(actor) if not isinstance(actor, RecordedAnswerer) else staff.StaffId("")
+        if not first.question.strip():
+            raise the_list.ListError("The source question has no text.")
+        return the_list.file_exchanges(source, exchanges, review_submissions.submission_title(first.question),
+                                       linked=link, owner=owner, members=members)
+
+
+def _file_live(reload: ReloadExchanges, entries: Iterable[list_page.ListRecord],
                members: staff.StaffSnapshot) -> None:
     filed = ((investigation.ListDestination(entry.keeper, entry.item.number), exchange)
              for entry in entries for exchange in entry.item.filed_exchanges)
-    for plan in _plans(exchanges, filed):
+    for plan in _plans(reload(), filed):
         try:
-            _ = file_source(plan, members)
+            _ = file_source(plan, members, reload)
         except (OSError, ValueError) as error:
             key = plan.exchanges[0].source_key
             print(f"List exchange {key}: {error}", file=sys.stderr)
@@ -418,9 +520,18 @@ def file_saved_question(record: update_registration.QuestionRecord, members: sta
     physical = review_items.question_record_key(record)
     with review_items.after_store_write(physical):
         entries = list_page.records(include_closed=True)
-        origin = record.item.get("review_submission")
-        key = f"submission/question/{new_item_dialog.read_submission(origin).request_id}" if origin is not None else physical
-        _file_live(_native_question_exchanges(record, key, _linked_items(physical, entries), user_zone()), entries, members)
+        links = _linked_items(physical, entries)
+        zone = user_zone()
+
+        def reload() -> Iterator[Exchange]:
+            for current in update_registration.selected_question_records(
+                    [record.path], ("open", "closed"), None, owner=record.owner):
+                origin = current.item.get("review_submission")
+                key = (f"submission/question/{new_item_dialog.read_submission(origin).request_id}"
+                       if origin is not None else physical)
+                yield from _native_question_exchanges(current, key, links, zone, members)
+
+        _file_live(reload, entries, members)
 
 
 def file_saved_submission(scoped: new_item_dialog.ScopedSubmissionKey, members: staff.StaffSnapshot) -> None:
@@ -437,31 +548,31 @@ def file_saved_investigation(record: investigation.Investigation) -> None:
         file_saved_review(review_items.investigation_item(record, members, path), members)
 
 
-def file_saved_review(item: review_items.ReviewItem, members: staff.StaffSnapshot) -> None:
-    exchanges = tuple(_review_item_exchanges(item, (), user_zone()))
-    if not exchanges:
+def file_saved_review(item: review_items.ReviewItem, members: staff.StaffSnapshot, *,
+                      root: Path | None = None) -> None:
+    zone = user_zone()
+    if not tuple(_review_item_exchanges(item, (), zone, members)):
         return
     entries = list_page.records(include_closed=True)
     linked = _linked_items(item.key, entries)
-    _file_live((replace(exchange, list_links=tuple(dict.fromkeys((*exchange.list_links, *linked))))
-                for exchange in exchanges), entries, members)
+    _file_live(partial(_reload_review, root or change_routing.review_root(), item, members, linked, zone),
+               entries, members)
 
 
 def file_saved_list(keeper: staff.StaffId, item: the_list.ListItem) -> None:
     with review_items.after_store_write(f"{keeper}/{item.id}"):
         members = staff.snapshot()
         entry = list_page.ListRecord(keeper, item)
-        _file_live(_list_exchanges(entry, members, user_zone()), (entry,), members)
+        _file_live(partial(_reload_list, keeper, item.id, members, user_zone()), (entry,), members)
 
 
 def file_saved_picture(root: Path, identity: str) -> None:
     with review_items.after_store_write(f"image/{identity}"):
-        record = image_store.read_record(images.images_root(root) / identity)
         entries = list_page.records(include_closed=True)
         keepers: dict[int, list[staff.StaffId]] = defaultdict(list)
         for entry in entries:
             keepers[entry.item.number].append(entry.keeper)
-        _file_live(_picture_exchanges(root, keepers, user_zone(), (record,)), entries, staff.snapshot())
+        _file_live(partial(_reload_picture, root, identity, keepers, user_zone()), entries, staff.snapshot())
 
 
 def _handoff_content(exchange: list_exchange.FiledExchange) -> list_exchange.FiledExchange:
@@ -472,22 +583,27 @@ def _handoff_content(exchange: list_exchange.FiledExchange) -> list_exchange.Fil
 
 
 def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, *,
-                          sources: list[Path] | None = None) -> list[review_items.ReviewItem]:
+                          sources: list[Path] | None = None,
+                          members: staff.StaffSnapshot | None = None) -> list[review_items.ReviewItem]:
     """Use List exchanges that match the current native record."""
+    members = staff.snapshot() if members is None else members
     candidates: dict[str, tuple[Exchange, ...]] = {}
     for item in items:
         with review_items.after_store_write(item.key):
-            candidates[item.key] = tuple(exchange for exchange in _review_item_exchanges(item, (), zone)
+            candidates[item.key] = tuple(exchange for exchange in _review_item_exchanges(item, (), zone, members)
                                          if _eligible(exchange))
     if not any(candidates.values()):
         return items
     index: dict[str, list[tuple[investigation.ListDestination, set[list_exchange.FiledExchange]]]] = defaultdict(list)
     for entry in list_page.records(include_closed=True, sources=sources):
-        by_source: dict[str, set[list_exchange.FiledExchange]] = defaultdict(set)
+        by_source: dict[str, list[list_exchange.FiledExchange]] = defaultdict(list)
         for exchange in entry.item.filed_exchanges:
-            by_source[exchange.source_key].add(_handoff_content(exchange))
+            by_source[exchange.source_key].append(exchange)
+        destination = investigation.ListDestination(entry.keeper, entry.item.number)
         for key, saved in by_source.items():
-            index[key].append((investigation.ListDestination(entry.keeper, entry.item.number), saved))
+            confirmed = the_list.confirmed_exchanges(key, destination, saved, sources=sources)
+            if confirmed:
+                index[key].append((destination, {_handoff_content(exchange) for exchange in confirmed}))
     projected: list[review_items.ReviewItem] = []
     for item in items:
         exchanges = candidates.get(item.key, ())
@@ -496,26 +612,46 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
             projected.append(item)
             continue
         destination, saved = filed[0]
-        if not all(_handoff_content(exchange.filed()) in saved for exchange in exchanges):
+        matched = tuple(exchange for exchange in exchanges
+                        if _handoff_content(list_exchange.FiledExchange.from_exchange(exchange)) in saved)
+        if not matched:
             projected.append(item)
             continue
         standalone = (item.type in review_items.QUESTION_TYPES
                       or item.type is review_items.ReviewType.INVESTIGATION)
-        answers = frozenset(exchange.answer.text for exchange in exchanges
-                            if isinstance(exchange.answer, ExchangeAnswer))
+        ids = frozenset(exchange.exchange_id for exchange in matched if isinstance(exchange.answer, ExchangeAnswer))
+        answer_events: set[int] = set()
+        for exchange in matched:
+            reply = exchange.reply_event
+            question_id = (exchange.exchange_id.removeprefix("question:")
+                           if exchange.exchange_id.startswith("question:") else "")
+            for position, event in enumerate(item.log):
+                if position in answer_events:
+                    continue
+                if (event == reply or
+                        (reply is not None and reply.feedback_request_id
+                         and event.feedback_request_id == reply.feedback_request_id)
+                        or (question_id and event.feedback_request_id == question_path.answer_log_id(question_id))):
+                    answer_events.add(position)
+                    break
         open_staff_question = any(exchange.direction is Direction.QUESTION_TO_NATE
-                                  and exchange.answer is QuestionWithoutAnswer.OPEN for exchange in exchanges)
-        handoff = review_items.FiledReviewExchange(destination, standalone, answers, open_staff_question)
+                                  and exchange.answer is QuestionWithoutAnswer.OPEN for exchange in matched)
+        handoff = review_items.FiledReviewExchange(destination, standalone and len(matched) == len(exchanges),
+                                                  frozenset(answer_events), ids, open_staff_question)
         projected.append(replace(item, exchange_handoff=handoff))
     return projected
 
 
 def migrate(inventory: ExchangeInventory, members: staff.StaffSnapshot, *, apply: bool) -> int:
-    saved = {exchange: destination for destination, exchange in inventory.filed}
+    groups: dict[tuple[str, investigation.ListDestination], list[list_exchange.FiledExchange]] = defaultdict(list)
+    for destination, exchange in inventory.filed:
+        groups[exchange.source_key, destination].append(exchange)
+    saved = {exchange for (key, destination), group in groups.items()
+             for exchange in the_list.confirmed_exchanges(key, destination, group)}
     failures = 0
     for source in Source:
         plans = tuple(_plans((exchange for exchange in inventory.exchanges if exchange.source is source), inventory.filed))
-        pending = tuple(plan for plan in plans if not all(exchange.filed() in saved for exchange in plan.exchanges))
+        pending = tuple(plan for plan in plans if not all(list_exchange.FiledExchange.from_exchange(exchange) in saved for exchange in plan.exchanges))
         print(f"{source}: sources={len(pending)} exchanges={sum(len(plan.exchanges) for plan in pending)} "
               + f"linked={sum(bool(plan.destinations) for plan in pending)} "
               + f"new-rows={sum(not plan.destinations for plan in pending)} unchanged={len(plans) - len(pending)}")
@@ -524,12 +660,13 @@ def migrate(inventory: ExchangeInventory, members: staff.StaffSnapshot, *, apply
         for plan in pending:
             key = plan.exchanges[0].source_key
             try:
-                link = file_source(plan, members)
+                link = file_source(plan, members, inventory.reload[key])
             except (OSError, ValueError) as error:
                 failures += 1
                 print(f"  {key}: {error}", file=sys.stderr)
             else:
-                print(f"  {key} -> {link.keeper}/L{link.number}")
+                if isinstance(link, investigation.ListDestination):
+                    print(f"  {key} -> {link.keeper}/L{link.number}")
     return int(bool(failures))
 
 

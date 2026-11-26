@@ -2171,7 +2171,7 @@ def _check_links(number: int, changes: ItemChanges, *, require_related: Callable
 def create_records(keeper: staff.StaffId, items: Sequence[ListItem]) -> None:
     """Create complete typed records after checking the whole batch under one lock."""
     store = _store(keeper)
-    with store.list_allocation():
+    with _list_allocation(store):
         next_number = store.next_number()
         for item in items:
             if item.number < next_number:
@@ -2254,7 +2254,7 @@ def add(keeper: staff.StaffId, title: str, *, owner: ItemOwner, source: str,
     def require_related(number: int) -> None:
         _ = read_reference(number, scope=AllItems.INCLUDED)
 
-    with store.list_allocation():
+    with _list_allocation(store):
         next_number = store.next_number()
         chosen = next_number if isinstance(number, NextNumber) else number
         identity = f"L{chosen}"
@@ -2334,7 +2334,7 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
     if isinstance(number, int) and store.path(f"L{number}").is_file():
         sync_folder(store.folder())
         return number
-    with store.list_allocation():
+    with _list_allocation(store):
         number = reserved_review_number(reservation)
         if isinstance(number, int) and store.path(f"L{number}").is_file():
             sync_folder(store.folder())
@@ -2385,66 +2385,150 @@ def _save_exchange_reservation(path: Path, destination: investigation.ListDestin
     write_text_atomic(path, f"{mode} {destination.keeper}/L{destination.number}\n", new_file_mode=0o600)
 
 
-def file_exchanges(exchanges: tuple[list_exchange.FiledExchange, ...], title: str, *,
+def _exchange_path(key: str) -> Path:
+    return record_store.state_root() / ".list-exchanges" / hashlib.sha256(key.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class LockedExchangeSource:
+    key: str
+    reservation: Path
+
+
+@contextmanager
+def lock_exchange_source(key: str) -> Generator[LockedExchangeSource]:
+    reservation = _exchange_path(key)
+    reservation.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive(reservation.with_suffix(".lock")):
+        yield LockedExchangeSource(key, reservation)
+
+
+def _exchange_receipt_line(destination: investigation.ListDestination, exchange: list_exchange.FiledExchange) -> str:
+    digest = hashlib.sha256(list_exchange.encode((exchange,)).encode()).hexdigest()
+    return f"{destination.keeper}/L{destination.number} {digest}"
+
+
+def confirmed_exchanges(key: str, destination: investigation.ListDestination,
+                        exchanges: Iterable[list_exchange.FiledExchange],
+                        *, sources: list[Path] | None = None) -> frozenset[list_exchange.FiledExchange]:
+    path = _exchange_path(key).with_suffix(".saved")
+    if sources is not None:
+        sources.append(path)
+    try:
+        receipt = set(path.read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        return frozenset()
+    return frozenset(exchange for exchange in exchanges if _exchange_receipt_line(destination, exchange) in receipt)
+
+
+def _recover_exchange_allocation(store: record_store.NumberedRecords, journal: Path) -> None:
+    try:
+        value = journal.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    saved = re.fullmatch(r"([a-f0-9]{64}) ([^ /\n]+)/L([1-9][0-9]*)\n", value)
+    if saved is None:
+        raise ListError(f"{journal}: invalid exchange allocation")
+    digest, keeper, number_text = saved.groups()
+    destination = investigation.ListDestination(staff_id(keeper, "List keeper"), int(number_text))
+    reservation = journal.parent / ".list-exchanges" / digest
+    previous = _exchange_reservation(reservation)
+    if isinstance(previous, ExchangeDestination) and previous != ExchangeDestination(destination, True):
+        raise ListError(f"{journal}: the exchange already has a different reservation")
+    sync_folder(journal.parent)
+    if store.next_number() <= destination.number:
+        store.reserve_number(destination.number)
+    else:
+        sync_folder(store.folder())
+    _save_exchange_reservation(reservation, destination, "new")
+    journal.unlink()
+    sync_folder(journal.parent)
+
+
+@contextmanager
+def _list_allocation(store: record_store.NumberedRecords) -> Generator[Path]:
+    """Complete an interrupted exchange reservation before allocating another number."""
+    with store.list_allocation():
+        journal = record_store.state_root() / ".list-exchange-allocation"
+        _recover_exchange_allocation(store, journal)
+        yield journal
+
+
+def _reserve_exchange_number(store: record_store.NumberedRecords, reservation: Path) -> ExchangeDestination:
+    with _list_allocation(store) as journal:
+        current = _exchange_reservation(reservation)
+        if isinstance(current, ExchangeDestination):
+            return current
+        destination = investigation.ListDestination(store.owner, store.next_number())
+        write_text_atomic(journal, f"{reservation.name} {destination.keeper}/L{destination.number}\n",
+                          new_file_mode=0o600)
+        _recover_exchange_allocation(store, journal)
+        return ExchangeDestination(destination, True)
+
+
+def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.Exchange, ...], title: str, *,
                    linked: investigation.ListDestination | NextNumber,
                    owner: staff.StaffId, members: staff.StaffSnapshot) -> investigation.ListDestination:
-    """Save one source on its List item under a lock that follows the source."""
-    key = exchanges[0].source_key
-    if any(exchange.source_key != key for exchange in exchanges):
+    """Save one source and publish its receipt after the List row is durable."""
+    key, reservation = source.key, source.reservation
+    if not exchanges or any(exchange.source_key != key for exchange in exchanges):
         raise ListError("File one exchange source at a time.")
-    directory = record_store.state_root() / ".list-exchanges"
-    directory.mkdir(parents=True, exist_ok=True)
-    reservation = directory / hashlib.sha256(key.encode()).hexdigest()
-    with exclusive(reservation.with_suffix(".lock")):
-        reserved = _exchange_reservation(reservation)
-        if isinstance(linked, investigation.ListDestination):
-            if isinstance(reserved, ExchangeDestination):
-                if reserved.destination != linked:
-                    raise ListError("The exchange source has two List destinations.")
-            else:
-                _save_exchange_reservation(reservation, linked, "linked")
-                reserved = ExchangeDestination(linked, False)
+    filed = tuple(list_exchange.FiledExchange.from_exchange(exchange) for exchange in exchanges)
+    reserved = _exchange_reservation(reservation)
+    if isinstance(linked, investigation.ListDestination) and isinstance(reserved, NextNumber):
+        if (record_store.state_root() / ".list-exchange-allocation").exists():
+            keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
+            if keeper is None:
+                raise ListError("The List keeper is unavailable.")
+            with _list_allocation(_store(keeper.id)):
+                reserved = _exchange_reservation(reservation)
+    if isinstance(linked, investigation.ListDestination):
         if isinstance(reserved, ExchangeDestination):
-            destination = reserved.destination
-            store = _store(destination.keeper)
-            with store.locked():
-                identity = f"L{destination.number}"
-                if reserved.reserved_new_item and not store.path(identity).exists():
-                    _save_new_exchanges(store, destination.number, title, owner, report_route(owner, members), exchanges)
-                else:
-                    item = load(destination.keeper, identity)
-                    if reserved.reserved_new_item and not any(exchange.source_key == key for exchange in item.filed_exchanges):
-                        raise ListError(f"{identity} holds a different source.")
-                    _save_linked_exchanges(store, item, exchanges)
-            return destination
-
+            if reserved.destination != linked:
+                raise ListError("The exchange source has two List destinations.")
+        else:
+            _save_exchange_reservation(reservation, linked, "linked")
+            reserved = ExchangeDestination(linked, False)
+    if isinstance(reserved, NextNumber):
         route = report_route(owner, members)
-        store = _store(route.keeper)
-        with store.list_allocation():
-            number = store.next_number()
-            store.reserve_number(number)
-            destination = investigation.ListDestination(route.keeper, number)
-            _save_exchange_reservation(reservation, destination, "new")
-            _save_new_exchanges(store, number, title, owner, route, exchanges)
-        return destination
+        reserved = _reserve_exchange_number(_store(route.keeper), reservation)
+    destination = reserved.destination
+    store = _store(destination.keeper)
+    with store.locked():
+        identity = f"L{destination.number}"
+        if reserved.reserved_new_item and not store.path(identity).exists():
+            item = _save_new_exchanges(store, destination.number, title, owner, report_route(owner, members), filed)
+        else:
+            item = load(destination.keeper, identity)
+            if reserved.reserved_new_item and not any(exchange.source_key == key for exchange in item.filed_exchanges):
+                raise ListError(f"{identity} holds a different source.")
+            item = _save_linked_exchanges(store, item, filed)
+        saved = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
+        if frozenset(saved) != confirmed_exchanges(key, destination, saved):
+            receipt = "".join(_exchange_receipt_line(destination, exchange) + "\n" for exchange in saved)
+            write_text_atomic(reservation.with_suffix(".saved"), receipt, new_file_mode=0o600)
+    return destination
 
 
 def _save_linked_exchanges(store: record_store.NumberedRecords, item: ListItem,
-                           exchanges: tuple[list_exchange.FiledExchange, ...]) -> None:
+                           exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
     changed = _with_filed_exchanges(item, exchanges)
     if changed != item:
         with record_store.keep_file_on_error(store.path(item.id)):
             _save(store, changed)
     else:
         sync_folder(store.folder())
+    return changed
 
 
 def _save_new_exchanges(store: record_store.NumberedRecords, number: int, title: str, owner: staff.StaffId,
-                        route: ReportRoute, exchanges: tuple[list_exchange.FiledExchange, ...]) -> None:
+                        route: ReportRoute, exchanges: tuple[list_exchange.FiledExchange, ...]) -> ListItem:
     item = _new_item(number, title, owner, store.owner, PAGE_SOURCE, {"producer": route.producer, "unit": route.unit})
     _require_active_open_producers((item,))
+    item = _with_filed_exchanges(replace(item, unread_since=NoTimestamp.UNSET), exchanges)
     with record_store.keep_file_on_error(store.path(item.id)):
-        _save(store, _with_filed_exchanges(replace(item, unread_since=NoTimestamp.UNSET), exchanges))
+        _save(store, item)
+    return item
 
 
 def investigation_report_kind(record: investigation.Investigation) -> ReportKind | NoListReport:
@@ -2572,7 +2656,7 @@ class ReservedReportNumber:
 def reserve_moved_report(keeper: staff.StaffId, evidence_key: str) -> ReservedReportNumber:
     """Select the number for a source marker before the source writer runs."""
     store = _store(keeper)
-    with store.list_allocation():
+    with _list_allocation(store):
         items = records(keeper, include_closed=True)
         for item in items:
             if isinstance(item.report, ListReport) and item.report.evidence_key == evidence_key:
@@ -2593,7 +2677,7 @@ def file_report(keeper: staff.StaffId, report: ListReport, title: str, *, owner:
                 retry: ReportRetry = ReportRetry.KEEP) -> int:
     """File a report once, or add its evidence to an existing linked List item."""
     store = _store(keeper)
-    with store.list_allocation():
+    with _list_allocation(store):
         reserved = reserved_review_number(reservation) if isinstance(reservation, Path) else reservation
         if isinstance(reserved, ReservedReportNumber):
             reserved = reserved.number

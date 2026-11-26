@@ -65,6 +65,7 @@ CARD_ERROR = b'<p role="status" data-review-card-unavailable>This card is not av
 class ReviewBodyView(Enum):
     TABLE = 'table'
     CARD = 'card'
+    STUDIO_QUESTION = 'studio-question'
 
 
 def card_url(key: str, *, studio_question: bool = False) -> str:
@@ -169,6 +170,7 @@ class ReviewBodyInputs:
     assets: Mapping[str, str]
     zone: ZoneInfo
     names: staff_names.StaffNames
+    view: ReviewBodyView = ReviewBodyView.TABLE
 
 
 @dataclass(frozen=True)
@@ -229,7 +231,7 @@ class ReviewSnapshot:
         item = self.records.get(key)
         if item is None:
             raise LookupError('This item is not in the current snapshot.')
-        body = self.render_body(item, self.assets)
+        body = self.render_body(item, self.assets, view=view)
         if view is ReviewBodyView.TABLE:
             if body == CARD_ERROR:
                 return body
@@ -269,18 +271,19 @@ class ReviewSnapshot:
         item = review_items.normalize_times(item, self.zone)
         assets: dict[str, str] = {}
         retain_asset(item, assets)
-        body = self.render_body(item, assets)
+        body = self.render_body(item, assets, view=view)
         if view is ReviewBodyView.TABLE:
             return body
         entry = card_entry(item, self.members, self.names, self.zone)
         return render_card(self, entry, body.decode(), waiting_why=item.waiting_why)
 
-    def render_body(self, item: ReviewItem, assets: Mapping[str, str]) -> bytes:
+    def render_body(self, item: ReviewItem, assets: Mapping[str, str], *,
+                    view: ReviewBodyView = ReviewBodyView.TABLE) -> bytes:
         body = CARD_ERROR
         if item.key not in self.unavailable_cards:
             try:
                 body = details(item, ReviewBodyInputs(self.browser, self.members, self.words_rows,
-                    assets, self.zone, self.names)).encode()
+                    assets, self.zone, self.names, view)).encode()
             except Exception as error:
                 logging.getLogger(__name__).warning('Review card %s: %s', item.key, error)
         return body
@@ -1050,8 +1053,11 @@ def assign_menu(item: ReviewItem, names: staff_names.StaffNames) -> str:
 
 def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, revision: str, *,
          owner: str = '', validator: str = '', assignment: str = '', routes: str = '',
-         names: staff_names.StaffNames | None = None) -> str:
-    if (review_items.on_list(item) or item.state == ReviewState.DONE
+         names: staff_names.StaffNames | None = None, view: ReviewBodyView = ReviewBodyView.TABLE) -> str:
+    studio_answer = (view is ReviewBodyView.STUDIO_QUESTION and review_items.on_list(item)
+                     and isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
+                     and item.exchange_handoff.open_staff_question and 'answer' in item.actions)
+    if ((review_items.on_list(item) and not studio_answer) or item.state == ReviewState.DONE
             or (item.type == ReviewType.FOR_YOU and not item.actions)):
         return ''
     fields = {'row': item.key, 'token': change_browser.row_token(browser, item.key), 'revision': revision}
@@ -1069,8 +1075,9 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         labels.update(read='Got it', question='Ask a follow-up')
     elif validator:
         labels['question'] = 'Ask a question'
-    for index, action in enumerate(item.actions):
-        if action == 'read' and isinstance(item.exchange_handoff, review_items.FiledReviewExchange):
+    for index, action in enumerate(("answer",) if studio_answer else item.actions):
+        if (action == 'read' and isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
+                and not item.unread_answer):
             continue
         primary = index == 0 and not validator
         if action in (page_frame.VerdictAction.WORKS, page_frame.VerdictAction.NOT_FIXED):
@@ -1084,7 +1091,7 @@ def form(item: ReviewItem, browser: change_page.ReviewBrowser, words_rows: int, 
         if action == 'approve':
             closes.append(assignment)
     later = ''
-    if (item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
+    if (not studio_answer and item.state not in (ReviewState.DONE, ReviewState.VALIDATING)
             and item.type not in (ReviewType.RESPONSE, ReviewType.FOR_YOU) and not waiting_change(item)):
         later = record_table.park_control('Later', field='later', action='outcome', value='later')
     words = ''
@@ -1126,10 +1133,9 @@ def log_html(item: ReviewItem, inputs: ReviewBodyInputs, owner: str) -> str:
         time = entry.time.isoformat()
         words = entry.words
         handoff = item.exchange_handoff
-        if (isinstance(handoff, review_items.FiledReviewExchange) and entry.who != 'nate'
-                and words.startswith('Answer: ') and words.removeprefix('Answer: ') in handoff.answers):
+        if isinstance(handoff, review_items.FiledReviewExchange) and index in handoff.answer_events:
             words = 'Answer filed on the List'
-        if index in item.body_answer_events and words != 'Answered the question':
+        elif index in item.body_answer_events and words != 'Answered the question':
             words = 'Answered'
         actor = inputs.names.html(entry.who, owner if response is not None and entry.who == item.owner else entry.who)
         rows.append(f'<li data-log-index="{index}"><time datetime="{time}">'
@@ -1250,7 +1256,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         question = source.slots.question
         filed_answer = (isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
                         and isinstance(question, change_page.AnsweredQuestion)
-                        and question.answer in item.exchange_handoff.answers)
+                        and f"question:{question.question_id}" in item.exchange_handoff.exchange_ids)
         if validator:
             duration = (' · Validating for <time data-validating-age datetime="'
                         +source.handed_at.isoformat()+'"></time>') if source.handed_at is not None else ''
@@ -1276,9 +1282,8 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         body = section('You asked', source.record.question)
         if isinstance(destination, investigation.ListDestination):
             body = f'<p><a href="{report_url(destination)}">Open List item {destination.number}</a></p>' + body
-        if source.record.answer and not (
-                isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
-                and source.record.answer in item.exchange_handoff.answers):
+        if source.record.answer and not (isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
+                                         and "initial" in item.exchange_handoff.exchange_ids):
             body += answer_section(source.record.answer)
     elif isinstance(source, review_items.ProposalSource):
         body = ('<section><h3>Proposal</h3><div data-proposal-body>'
@@ -1299,6 +1304,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
             +'<div class="review-log-column">'+record_table.log_panel(log_id, log_html(item, inputs, owner))+exchange+'</div>'
             +form(item, inputs.browser, inputs.words_rows, record_revision(item, inputs.assets),
                   owner=owner, validator=validator, routes=review_toast_routes(item, inputs.members), names=names,
+                  view=inputs.view,
                   assignment=assign_menu(item, names) if 'approve' in item.actions else '')+footer+'</div>')
 
 
@@ -1422,7 +1428,8 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     def validate_revision(current: ReviewItem) -> ReviewItem:
         handoff = current.exchange_handoff
         if review_items.on_list(current) and (
-                not isinstance(handoff, review_items.FiledReviewExchange) or not handoff.open_staff_question):
+                not isinstance(handoff, review_items.FiledReviewExchange) or not handoff.open_staff_question
+                or outcome != "answer"):
             raise review_items.ReviewRecordChanged('Open the report on the List.')
         if current.state == ReviewState.DONE:
             raise review_items.ReviewRecordChanged('This item is already Done.')
