@@ -34,6 +34,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, Protocol, TypedDict, cast
+from uuid import uuid4
 
 from scripts.notify import push_reference, push_texts, reply_asks, text_asks
 
@@ -667,12 +668,19 @@ def code_failures(draft: Draft) -> list[RuleFailure]:
     return failures
 
 
+type ConsoleQuoteScope = Literal["draft"] | int
+
+
 class UnmatchedConsoleQuote(ValueError):
-    """A Console review cites text absent from the draft."""
+    """A Console review cites text absent from the checked scope."""
+
+    def __init__(self, rule: str, quote: str, scope: ConsoleQuoteScope) -> None:
+        label = scope if scope == "draft" else f"part {scope}"
+        super().__init__(f'The reviewer gave a quote that does not match the draft: {rule}: "{quote}" ({label})')
 
 
 def supported_failures(value: object, draft: Draft, *, reply: bool = False,
-                       console: bool = False) -> list[RuleFailure]:
+                       console: bool = False, scope: ConsoleQuoteScope = "draft") -> list[RuleFailure]:
     if not isinstance(value, list):
         raise ValueError("failed_rules")
     original = [draft.body] if reply else [draft.title, first_line(draft.action, draft.session) + "\n" + draft.body]
@@ -688,7 +696,7 @@ def supported_failures(value: object, draft: Draft, *, reply: bool = False,
             raise ValueError("A failed rule needs a name.")
         matched = bool(quote) and any(quote in text for text in original)
         if console and not matched:
-            raise UnmatchedConsoleQuote("The reviewer gave a quote that does not match the draft.")
+            raise UnmatchedConsoleQuote(rule, quote, scope)
         if rule in CODE_RULES:
             continue
         if rule and matched and all(item.rule != rule for item in failures):
@@ -890,11 +898,11 @@ def question_parts(text: str) -> list[QuestionPart]:
     return parts
 
 
-def part_verdict(record: dict[str, object], draft: Draft) -> QuestionPartVerdict:
+def part_verdict(record: dict[str, object], draft: Draft, scope: ConsoleQuoteScope = "draft") -> QuestionPartVerdict:
     questions = _strings(record.get("questions"), "questions")
     if len(questions) > 3 or any(not question.strip() for question in questions):
         raise ValueError("The reviewer returned invalid questions for a part.")
-    failures = supported_failures(record.get("failed_rules"), draft, reply=True, console=True)
+    failures = supported_failures(record.get("failed_rules"), draft, reply=True, console=True, scope=scope)
     return QuestionPartVerdict(tuple(questions), tuple(failures))
 
 
@@ -902,8 +910,8 @@ def question_part_digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def independent_verdict(record: dict[str, object], draft: Draft) -> QuestionPartVerdict:
-    verdict = part_verdict(record, draft)
+def independent_verdict(record: dict[str, object], draft: Draft, scope: ConsoleQuoteScope) -> QuestionPartVerdict:
+    verdict = part_verdict(record, draft, scope)
     if any(failure.rule not in PART_RULES for failure in verdict.failures):
         raise ValueError("A draft rule was reported as a part rule.")
     return verdict
@@ -919,7 +927,7 @@ def read_part_verdicts(rows: object, pending: dict[int, QuestionPart], draft: Dr
         if (row.keys() != {"number", "questions", "failed_rules"} or type(number) is not int
                 or number not in pending or number in verdicts):
             raise ValueError("The reviewer returned an unexpected part number.")
-        verdicts[number] = independent_verdict(row, replace(draft, body=pending[number]["text"]))
+        verdicts[number] = independent_verdict(row, replace(draft, body=pending[number]["text"]), number)
     if verdicts.keys() != pending.keys():
         raise ValueError("The reviewer did not return a verdict for each requested part.")
     return verdicts
@@ -939,6 +947,32 @@ def expire_question_verdicts(folder: Path, deadline: float) -> None:
         if probe_existing_exclusive(lock) is LockAvailability.AVAILABLE:
             record.unlink(missing_ok=True)
             lock.unlink(missing_ok=True)
+
+
+def save_console_reply(context: QuestionReview, system_prompt: str, prompt: str, answer: StructuredAnswer) -> None:
+    """Save the Console answer before verdict validation."""
+    folder = state_path() / "console-replies"
+    now = datetime.now().astimezone()
+    record = {
+        "time": now.isoformat(),
+        "key": context.key.name,
+        "kind": context.console_kind,
+        "system_prompt": system_prompt,
+        "prompt": prompt,
+        "reply": answer.value,
+    }
+    try:
+        write_text_atomic(folder / f"{uuid4().hex}.json", json.dumps(record) + "\n", new_file_mode=0o600)
+        cutoff = now.timestamp() - QUESTION_VERDICT_MAX_AGE.total_seconds()
+        for path in folder.glob("*.json"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                continue
+    except (OSError, TypeError, ValueError):
+        # A diagnostic failure must not change the verdict.
+        pass
 
 
 @contextmanager
@@ -995,7 +1029,8 @@ def review_console_question(draft: Draft, key: QuestionKey, system_prompt: str, 
                 saved = {}
             read_verdict = part_verdict if whole else independent_verdict
             reused = {
-                number: read_verdict(_object(saved[digest]), replace(draft, body=parts[number - 1]["text"]))
+                number: read_verdict(_object(saved[digest]), replace(draft, body=parts[number - 1]["text"]),
+                                     "draft" if whole else number)
                 for number, digest in fingerprints.items() if digest in saved
             }
             if whole and reused:
@@ -1162,6 +1197,8 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
                                    system_prompt=system_prompt, schema=schema, prompt=text,
                                    deadline=started + timeout)
             model = call.model
+            if isinstance(context, QuestionReview) and context.console_kind and isinstance(call.outcome, StructuredAnswer):
+                save_console_reply(context, system_prompt, text, call.outcome)
             return call.outcome
 
         system_prompt = f"{guide.stdout}\n{prompt}"

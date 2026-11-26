@@ -113,6 +113,19 @@ class ConsoleTextCheckTests(unittest.TestCase):
                     self.assertEqual(check.check(text, kind), review.QuestionAccepted(text))
             reviewer.assert_not_called()
 
+    def test_cli_prints_the_full_quote_mismatch(self) -> None:
+        text = "Retry the download?\n\n1. The download stopped.\n\nRecommended: Yes."
+        reason = ('The reviewer gave a quote that does not match the draft: '
+                  'console-standard-5: "The download stopped." (part 3)')
+        with TemporaryDirectory() as folder:
+            draft = Path(folder) / "question.md"
+            _ = draft.write_text(text)
+            errors = StringIO()
+            with (redirect_stderr(errors),
+                  patch.object(review, "review_question", return_value=review.QuestionReviewFailed(text, (reason,)))):
+                self.assertEqual(check.main(["--kind", "question", "--file", str(draft)]), 1)
+            self.assertEqual(errors.getvalue(), f"Console text: Revise the question draft. {reason}\n")
+
     def test_console_reader_holds_a_rewrite_with_its_quote(self) -> None:
         text = "Step B finished."
         key = review.QuestionKey("example", "Review the layout")
