@@ -3906,11 +3906,13 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         first = 'printf "<x> & y"'
         second = "printf z"
         example = "Example\n\n" + label + first
-        cases = (
+        lf_cases = (
             (f"{label}```sh\n```\n```sh\n{first}\n```", ["", first]),
             (f"{label}```sh\n{first}\n```\n```sh\n{second}\n```", [first, second]),
             (f"```text\n{example}\n```", [example]),
         )
+        cases = lf_cases + tuple((source.replace("\n", "\r\n") + ending, codes)
+                                for source, codes in lf_cases for ending in ("", "\r\n"))
         sections = "".join(
             "<section>" + list_page.ListProgress("", NOW, source, "", True).next_step_html() + "</section>"
             for source, _ in cases
@@ -3918,16 +3920,19 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         probe = r'''
 const failures=[];
 const expected=EXPECTED_CODES;
+const copied=[];
+Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{copied.push(text);}}});
 for(const [index,section] of [...document.querySelectorAll('section')].entries()){
- const codes=[...section.querySelectorAll('[data-copy-code]')].map(button=>
-  button.closest('.code-block')?.querySelector('pre code')?.textContent);
+ const start=copied.length;
+ for(const button of section.querySelectorAll('[data-copy-code]')) button.click();
+ const codes=copied.slice(start);
  if(JSON.stringify(codes)!==JSON.stringify(expected[index]))
   failures.push('Unexpected code for case '+index+': '+JSON.stringify(codes));
  if(section.querySelector('.list-command')) failures.push('Unexpected Studio command for case '+index);
 }
 void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
 '''.replace("EXPECTED_CODES", json.dumps([codes for _, codes in cases]))
-        page = f"<!doctype html><meta charset=utf-8>{sections}<script>{probe}</script>"
+        page = f"<!doctype html><meta charset=utf-8>{sections}<script>{page_frame.COPY_SCRIPT}\n{probe}</script>"
         self.assertEqual(firefox_probe_results(page.encode()), [[]])
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")

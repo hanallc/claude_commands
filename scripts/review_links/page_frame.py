@@ -542,13 +542,31 @@ function createPageRefresh(load,seconds=()=>0,hold=()=>'',initial){
 }
 '''
 
-CODE_BLOCK = re.compile(r"(?m)^[ \t]*```[^`\n]*\n((?:(?![ \t]*```[ \t]*$)[^\n]*\n)*)[ \t]*```[ \t]*$"
-                        + r"|^[ \t]*`([^`\n]+)`[ \t]*(?=\n|$)")
+CODE_FENCE_CLOSE = r"[ \t]*```[ \t]*\r?$"
+CODE_BLOCK = re.compile(
+    rf"(?m)^[ \t]*```[^`\n]*\n((?:(?!{CODE_FENCE_CLOSE})[^\n]*\n)*){CODE_FENCE_CLOSE}"
+    + r"|^[ \t]*`([^`\n]+)`[ \t]*\r?$"
+)
+
+
+def code_block_run(text: str) -> tuple[re.Match[str], ...]:
+    """Find consecutive code blocks when the text has no prose."""
+    blocks: list[re.Match[str]] = []
+    start = 0
+    for block in CODE_BLOCK.finditer(text):
+        if text[start:block.start()].strip():
+            return ()
+        blocks.append(block)
+        start = block.end()
+    return () if text[start:].strip() else tuple(blocks)
 
 
 def code_block_html(block: re.Match[str]) -> str:
     """Build a code block with the shared copy button."""
-    text = block[1].removesuffix("\n") if block[1] is not None else block[2]
+    text = block[1]
+    if text is None:
+        return copy_code_block(block[2])
+    text = text[:-2] if text.endswith("\r\n") else text.removesuffix("\n")
     return copy_code_block(text)
 
 
