@@ -107,6 +107,12 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             self.assertEqual(code, 0, output)
             self.assertEqual(self.cli("run", *args), (0, output))
         runner.assert_called_once()
+        prompt = cast(str, runner.call_args.args[1])
+        self.assertIn("Run each shell command to completion in one tool call.", prompt)
+        self.assertIn("`timeout --kill-after=1s 20s` and set `yield_time_ms` to 25000", prompt)
+        self.assertIn("Never call `write_stdin`.", prompt)
+        self.assertIn("rg --search-zip --files-with-matches --hidden --no-ignore", prompt)
+        self.assertIn("Parse only those files for matching user turns.", prompt)
         self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
         self.assertIn("move now", (self.folder / "tests.json").read_text())
         self.assertIn("+    assert 'wait first'", (self.folder / "code.diff").read_text())
@@ -348,6 +354,22 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                 self.assertEqual(self.cli("status", "--key", key)[0], 0 if approval is behavior_check.Approval.YES else 1)
                 self.assertEqual(behavior_check.read_record(key),
                                  behavior_check.Answered(waiting.question_id, waiting.owner, approval, words, event.time))
+
+    def test_status_collects_an_answer_when_only_review_saved_the_question(self) -> None:
+        args, key, waiting, question = self.filed_question()
+        behavior_check.record_path(key).unlink()
+        self.assertEqual(self.cli("status", "--key", key), (1, f"The land waits for Nate's Yes or No on {waiting.question_id}.\n"))
+        self.assertEqual(behavior_check.read_record(key), waiting)
+
+        behavior_check.record_path(key).unlink()
+        update_registration.write_question_record(replace(question, status="closed"))
+        update_registration.record_review_log(question, "answer: Yes")
+        self.assertEqual(self.cli("status", "--key", key), (0, f"{key} yes ({waiting.question_id})\n"))
+        saved = behavior_check.read_record(key)
+        assert isinstance(saved, behavior_check.Answered)
+        self.assertEqual(saved.approval, behavior_check.Approval.YES)
+        self.assertEqual(saved.question_id, waiting.question_id)
+        self.assertEqual(self.cli("check", *args), (0, ""))
 
     def test_the_first_word_sets_the_verdict_and_other_answers_record_a_refusal(self) -> None:
         args, key, waiting, question = self.filed_question()
