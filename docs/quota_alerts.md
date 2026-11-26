@@ -27,8 +27,11 @@ It divides the weekly percentage left by the hourly usage rate and adds that dur
 The rate divides the total usage rise by the observed hours in the window.
 The setting `rate.lookback_minutes` defaults to 60 minutes.
 The window ends at the current time.
-The rate skips refills, gaps over 15 minutes, time at 100% used, and time at 0% used before usage starts.
-The alert needs a positive rate, a reading at most 15 minutes old, and a known future reset.
+The rate needs a reading at or before the window start and a newest reading at most 15 minutes old.
+The reading at or before the window start can be any age.
+The rate skips refills and gaps over 15 minutes, including gaps that cross the window start.
+It also skips spans that start at 100% used or have two readings at 0% used.
+The alert needs a positive rate and a known future reset.
 The quota check sends `quota.claude_expiry` when the forecast is before the reset and fewer than `claude_expiry.alert_hours` away.
 Scheduled moves suppress the push when they cover every group on that account.
 Consumed moves give no coverage.

@@ -13,6 +13,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts, next_moves, role_map
+from scripts.lib import conf
 from scripts.notify import push_texts, pushover, review, silence
 from scripts.notify.user_action import ActionRequired
 from scripts.review_links import accounts_page
@@ -119,7 +120,9 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
         self.assertEqual(self.expiry_accounts(), ["claude2"])
 
     def test_a_short_rise_after_refill_can_send_an_expiry_push(self) -> None:
-        readings = [run_out.Reading(self.now - timedelta(minutes=10), 98),
+        lookback = conf.read("accounts").whole("rate.lookback_minutes")
+        readings = [run_out.Reading(self.now - timedelta(minutes=lookback), 100),
+                    run_out.Reading(self.now - timedelta(minutes=10), 98),
                     run_out.Reading(self.now - timedelta(minutes=5), 19),
                     run_out.Reading(self.now, 20)]
         with mock.patch.object(run_out, "read_readings", return_value={"claude2": readings}):

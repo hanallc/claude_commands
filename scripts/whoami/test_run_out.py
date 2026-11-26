@@ -125,7 +125,7 @@ class RunOutTests(unittest.TestCase):
             (30, [2, 20, 22, 24, 26, 28, 30, 32, 90], run_out.UsageRate(12)),
             (30, [2, 20, 22, 24, 26, 27, 28, 29, 90], run_out.UsageRate(6)),
             (50, [2, 20, 22, 24, 26, 27, 28, 29, 90], run_out.UsageRate(8.4)),
-            (55, [2, 20, 22, 24, 26, 28, 30, 32, 90], run_out.UsageRate(12)),
+            (55, [2, 20, 24, 26, 28, 30, 32, 34, 90], run_out.UsageRate(144 / 11)),
         )
         with patch.dict(os.environ, {"CONF_DIR": str(folder)}):
             for minutes, usage, expected in cases:
@@ -156,7 +156,7 @@ class RunOutTests(unittest.TestCase):
     def test_refill_starts_a_new_stretch_and_the_one_before_still_counts(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = folder / "accounts.conf"
-        _ = config.write_text("# whole: 1..\nrate.lookback_minutes=75\n")
+        _ = config.write_text("# whole: 1..\nrate.lookback_minutes=70\n")
         readings = climb([50, 52, 54, 56, 0, 1, 2, 3])
         self.assertEqual(run_out.hourly_usage_rate(readings, readings[-1].at, account_config=conf.read(config)),
                          run_out.UsageRate(9))
@@ -164,7 +164,7 @@ class RunOutTests(unittest.TestCase):
     def test_time_at_full_is_skipped(self) -> None:
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         config = folder / "accounts.conf"
-        _ = config.write_text("# whole: 1..\nrate.lookback_minutes=75\n")
+        _ = config.write_text("# whole: 1..\nrate.lookback_minutes=70\n")
         readings = climb([96, 98, 100, 100, 100, 0, 2, 4])
         self.assertEqual(run_out.hourly_usage_rate(readings, readings[-1].at, account_config=conf.read(config)),
                          run_out.UsageRate(12))
@@ -174,13 +174,14 @@ class RunOutTests(unittest.TestCase):
         config = folder / "accounts.conf"
         _ = config.write_text("# whole: 1..\nrate.lookback_minutes=65\n")
         settings = conf.read(config)
-        end = START + timedelta(hours=1)
+        end = START + timedelta(minutes=65)
+        before_gap = climb([5, 14, 23], start=START - timedelta(hours=1))
+        after_gap = [Reading(end - timedelta(minutes=age), 80 - age) for age in (49, 35, 20, 5, 0)]
         cases = (
             ("exact gap limit", [Reading(end - timedelta(minutes=age), 80 - age)
-                                 for age in (60, 45, 30, 15, 0)], run_out.UsageRate(60)),
-            ("long gap", [Reading(START, 10), *[Reading(end - timedelta(minutes=age), 80 - age)
-                          for age in (44, 30, 15, 0)]], run_out.UsageRate(60)),
-            ("only a long gap", [Reading(end - timedelta(minutes=16), 37), Reading(end, 40)], run_out.NoUsageRate()),
+                                 for age in (65, 50, 35, 20, 5, 0)], run_out.UsageRate(60)),
+            ("gap across the window start", before_gap + after_gap, run_out.UsageRate(60)),
+            ("only a long gap", [Reading(START, 37), Reading(end, 40)], run_out.NoUsageRate()),
         )
         for case, readings, expected in cases:
             with self.subTest(case=case):
@@ -195,13 +196,15 @@ class RunOutTests(unittest.TestCase):
         readings = climb([30, 40, 40, 40, 40, 40, 40])
         self.assertEqual(run_out.hourly_usage_rate(readings, now, account_config=settings), run_out.NoUsageRate())
         readings = climb([28, 30, 32, 34, 36, 38, 40])
-        for age in (timedelta(microseconds=1), timedelta(minutes=16)):
+        for age in (timedelta(microseconds=1), run_out.MAX_GAP):
             with self.subTest(age=age):
                 rate = run_out.hourly_usage_rate(readings, readings[-1].at + age, account_config=settings)
                 assert isinstance(rate, run_out.UsageRate)
                 self.assertAlmostEqual(rate.points_per_hour, 12)
         short = [Reading(now - timedelta(minutes=5), 39), Reading(now, 40)]
-        self.assertEqual(run_out.hourly_usage_rate(short, now, account_config=settings), run_out.UsageRate(12))
+        self.assertEqual(run_out.hourly_usage_rate(short, now, account_config=settings), run_out.NoUsageRate())
+        stale_at = readings[-1].at + run_out.MAX_GAP + timedelta(microseconds=1)
+        self.assertEqual(run_out.hourly_usage_rate(readings, stale_at, account_config=settings), run_out.NoUsageRate())
 
 
 if __name__ == "__main__":

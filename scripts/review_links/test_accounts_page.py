@@ -2872,12 +2872,13 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                 self.assertEqual(first, replace(original, id=first.id, measure=next_moves.QuotaMeasure.FABLE))
                 self.assertEqual((second, third), (later, other))
                 with redirect_stderr(io.StringIO()) as errors:
-                    status, body = post({**settings, "percent": "nan"})
-                    self.assertEqual((status, json.loads(body)), (400, {}))
-                    status, body = post({**settings, "measure": "weekly"})
-                    self.assertEqual((status, json.loads(body)), (400, {}))
-                    self.assertEqual(errors.getvalue().count("next: percent must be from 0 to 100"), 1)
-                    self.assertEqual(errors.getvalue().count("next: measure must be all-models or fable"), 1)
+                    for invalid, reason in (
+                        ({"percent": "nan"}, "next: percent must be from 0 to 100"),
+                        ({"measure": "weekly"}, "next: measure must be all-models or fable"),
+                    ):
+                        status, body = post({**settings, **invalid})
+                        self.assertEqual((status, json.loads(body)), (400, {"reason": reason}))
+                        self.assertEqual(errors.getvalue().count(reason), 1)
                 self.assertEqual(post({**settings, "move_now": "claude4"})[0], 400)
                 self.assertEqual(post({"to": "claude4"})[0], 400)
                 before = next_moves.next_moves_file().read_bytes()
@@ -2900,6 +2901,8 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
                     self.assertEqual(errors.getvalue().count("fixture launch failure"), 1)
                 self.assertEqual(next_moves.next_moves_file().read_bytes(), before)
                 self.assertEqual(post({"clear": "first"})[0], 200)
+                status, body = post({"group": "producers", "clear": "first"})
+                self.assertEqual((status, json.loads(body)), (400, {"reason": "The group has no next move."}))
                 self.assertEqual(next_moves.read_next_moves(), (later, other))
             finally:
                 server.shutdown()
