@@ -143,6 +143,27 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
             "test_original.py::test_second": f"{removed} Remove the second test.",
         })
 
+    def test_a_phase_merge_that_combines_edits_names_its_unit(self) -> None:
+        test = self.repo / "test_fixture.py"
+        original = "def test_move():\n    assert 1\n    assert 2\n    assert 3\n    assert 4\n"
+        _ = self.write(test, original)
+        _ = self.commit_files()
+        _ = self.git("switch", "-c", "moves")
+        _ = self.write(test, original.replace("assert 4", "assert 40"))
+        tip = self.commit_files("Change the final assertion.")
+        _ = self.git("switch", "main")
+        _ = self.write(test, original.replace("assert 1", "assert 10"))
+        main = self.commit_files("Change the first assertion.")
+        _ = self.git("merge", "--no-ff", "moves", "-m", f"Merge moves phase 7 ({tip[:7]}) into production")
+        _ = self.write(self.repo / "application.txt", "A change after the merge.\n")
+        head = self.commit_files("Change the application.")
+        tests = self.changes(main, head)
+        self.assertEqual([finding.new for finding in tests.tests],
+                         [original.replace("assert 1", "assert 10").replace("assert 4", "assert 40")])
+        change = behavior_check.GitRange(self.repo, main, head)
+        name = "test_fixture.py::test_move"
+        self.assertEqual(behavior_check.question_authors(change, tests, {name}), {name: "Ask moves (phase 7)"})
+
     def test_record_round_trip_keeps_a_negative_answer_and_its_time(self) -> None:
         key = "f" * 64
         answer = behavior_check.Answered("Q2", "owner", behavior_check.Approval.NO, "No", datetime.now(timezone.utc))

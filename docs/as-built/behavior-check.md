@@ -32,8 +32,11 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 6. Ask the author to write the question and run the same command with `--question FILE`.
 7. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.
 
+`status` recovers a filed question if `run` stopped before it saved the local record.
+
 The command traces each finding to the commit that last changed the test in the range.
-It names the unit and phase from the first-parent phase merge whose merged side contains that commit.
+If that commit is a phase merge, the command names its unit and phase.
+For other commits, the command looks for a first-parent phase merge that brought in the commit.
 If there is no such merge, it prints the commit hash and subject.
 If the lookup fails, the command prints the range tip's hash and subject.
 If the command cannot read the subject, it prints `Ask the author of COMMIT`.

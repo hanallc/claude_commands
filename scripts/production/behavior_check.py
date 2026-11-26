@@ -380,6 +380,12 @@ class TestHistoryCommit(NamedTuple):
     parents: list[str]
     subject: str
 
+    def phase_author(self) -> str:
+        if len(self.parents) < 2:
+            return ""
+        merge = re.fullmatch(r"Merge (\S+) phase (\S+) \([0-9a-fA-F]{7,64}\) into \S+", self.subject)
+        return f"Ask {merge[1]} (phase {merge[2]})" if merge else ""
+
 
 def describe_tip(change: GitRange) -> str:
     subject = change.git("show", "-s", "--format=%s", "--no-notes", "--no-show-signature", change.commit, "--")
@@ -441,12 +447,10 @@ def question_authors(change: GitRange, tests: ChangedTests, findings: set[str]) 
                 break
             if on_first_parent and parent != step.parents[0]:
                 on_first_parent = False
-                merge = re.fullmatch(r"Merge (\S+) phase (\S+) \([0-9a-fA-F]{7,64}\) into \S+", step.subject)
-                if merge:
-                    unit = f"Ask {merge[1]} (phase {merge[2]})"
+                unit = step.phase_author()
             commit = parent
             path = previous_path
-        authors[finding.test] = unit or f"{commit} {step.subject}"
+        authors[finding.test] = step.phase_author() or unit or f"{commit} {step.subject}"
     return authors
 
 
