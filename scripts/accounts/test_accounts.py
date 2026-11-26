@@ -134,6 +134,10 @@ def accounts_reader_calls(source: str) -> dict[str, set[str]]:
     return readers
 
 
+# No code reads these keys. Each stays in accounts.conf until Nate approves its removal.
+KEPT_UNREAD_KEYS = frozenset({"login_sitting_window_days"})
+
+
 class AccountsConfigurationTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
@@ -155,7 +159,9 @@ class AccountsConfigurationTests(unittest.TestCase):
                         continue
                     for key, kinds in accounts_reader_calls(source.read_text()).items():
                         readers.setdefault(key, set()).update(kinds)
-                self.assertEqual(set(configured), set(readers))
+                self.assertEqual(KEPT_UNREAD_KEYS & set(readers), set())
+                self.assertLessEqual(KEPT_UNREAD_KEYS, set(configured))
+                self.assertEqual(set(configured) - KEPT_UNREAD_KEYS, set(readers))
                 for key, kinds in readers.items():
                     with self.subTest(key=key):
                         self.assertEqual(len(kinds), 1)
