@@ -84,19 +84,14 @@ class OffloadForwardTests(OffloadCommandFixture):
     def test_default_remote_command_is_byte_equal_and_fetch_alone_keeps_artifacts(self) -> None:
         request = offload.OffloadRequest(self.repository, "hana", "call-forward", offload.NO_RESULT_FILE, ("--workspace",), owner="verify", holder_session="fixture-session")
         config = eligibility.read_config(self.config_path)
-        guarded_setup = (
-            'cd .local/state/mac-test/test-mirror/hana && { "$HOME/.claude/scripts/lib/py" -c '
-            + shlex.quote('import sys; from pathlib import Path; '
-                          + 'from scripts.lib.build_folders import require_no_fixed_build_folders; '
-                          + 'require_no_fixed_build_folders(Path(sys.argv[1]))')
-            + ' "$HOME"/.local/state/mac-test/test-mirror/hana/target >/dev/null 2>&1 && '
-            + '{ find "$HOME"/.local/state/mac-test/test-mirror/hana/target -maxdepth 5 -type d '
+        setup = (
+            'cd .local/state/mac-test/test-mirror/hana && { find "$HOME"/.local/state/mac-test/test-mirror/hana/target -maxdepth 5 -type d '
             + r"\( -name deps -o -name build -o -name .fingerprint -o -name examples \) -prune -o "
             + f"-type d -name 's-*-working' -mmin +{config.abandoned_session_minutes} -prune "
-            + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } || :; } && "
+            + "-exec sh -c 'for session do rm -rf -- \"$session\" \"${session%-working}.lock\"; done' sh {} + >/dev/null 2>&1 || :; } && "
         )
         expected = (
-            guarded_setup
+            setup
             + nextest_log.capture_function(nextest_log.output_limits(config.settings)) + " && "
             + 'PATH="$HOME/.claude/scripts/mac_test/cargo_gate/bin:$HOME/.cargo/bin:$PATH" '
             + "BUILDLOG_CALLER=verify-mac BUILDLOG_PINNED_TARGET='' BUILDLOG_CALL_ID=call-forward BUILDLOG_SYNC=1 "
@@ -143,7 +138,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             )
             + " target/shots && "
         )
-        self.assertTrue(fetch.startswith(guarded_setup + guarded_fetch + "run_nextest_logged() "))
+        self.assertTrue(fetch.startswith(setup + guarded_fetch + "run_nextest_logged() "))
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
         self.assertNotIn("rm -rf -- target/shots", expected)

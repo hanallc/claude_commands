@@ -3976,6 +3976,18 @@ with (patch.object(conf, 'read', read_config),
         self.assertFalse((self.guest_home / 'other-build').exists())
         self.assertFalse((self.guest_home / 'build').exists())
 
+    def test_run_guest_refuses_a_build_root_inside_its_checkout(self) -> None:
+        config = self.repo / 'config/build_folders.conf'
+        _ = write_config_fixture(config, 'roots.build=~/.claude/build\n')
+        _ = self.git('commit', '-qam', 'configure an invalid guest build root')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+        result = self.route()
+
+        self.assertIn('inside a Git checkout', self.not_started(result))
+        self.assertFalse((self.guest_home / '.claude/build').exists())
+        self.assertFalse((self.guest_home / 'build').exists())
+
     def test_run_guest_keeps_output_in_a_folder_without_a_worktree(self) -> None:
         checkout = self.guest_home / 'build/claude/mac-linux'
         output = checkout / 'target/fixture-output'

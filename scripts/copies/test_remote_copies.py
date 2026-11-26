@@ -209,6 +209,21 @@ class RemoteCopiesTests(unittest.TestCase):
             self.assertEqual(output.read_text(), "Cargo output\n")
             self.assertEqual(keep.read_text(), "The transfer holds this checkout.\n")
 
+    def test_mirror_receive_accepts_an_ordinary_lease_named_file(self) -> None:
+        mirror = self.remote(path=str(self.mirror))
+        self.mirror.mkdir(parents=True)
+        payload = self.mirror / "fixtures/ordinary.lease.json"
+        payload.parent.mkdir()
+        _ = payload.write_text("[]\n")
+        received = self.mirror / "received"
+        args = mirror_arguments(mirror, "mirror-receive")
+        args.command = [sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+                        str(received)]
+        with mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())):
+            self.assertEqual(copies.mirror_run(args), 0)
+        self.assertTrue(received.is_file())
+        self.assertEqual(payload.read_text(), "[]\n")
+
     def test_mirror_receive_refuses_a_staged_fixed_checkout(self) -> None:
         with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
             output = folder / "compiled"

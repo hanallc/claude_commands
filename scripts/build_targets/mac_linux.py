@@ -2943,8 +2943,13 @@ def run_guest(request_path: Path) -> int:
     request = guest_request(request_path)
     main = Path.cwd()
     repository = build_folders.repo_word(main)
-    with (build_folders.inherit_build_lock(RUN_LOCK_FD),
-          build_folders.fixed_repository_build_folder(repository, machine=TARGET, unit=request['unit']) as checkout):
+    with ExitStack() as allocation:
+        _ = allocation.enter_context(build_folders.inherit_build_lock(RUN_LOCK_FD))
+        try:
+            checkout = allocation.enter_context(
+                build_folders.fixed_repository_build_folder(repository, machine=TARGET, unit=request['unit']))
+        except build_folders.InvalidFixedBuildRoot as error:
+            return refuse_run(str(error), request['attempt'])
         save_guest_build_folder(main, checkout, request['attempt'])
         target = prepare_guest_folder(main, checkout, request['commit'], request['attempt'])
         with build_folders.tool_folder(TARGET, target) as runtime:

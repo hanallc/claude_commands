@@ -63,7 +63,7 @@ class FolderFormTests(unittest.TestCase):
 
     def write_config(self, *, alias: str = "claude", machine_root: str = "disk") -> None:
         _ = self.config.write_text(
-            "roots.workspace=~/worktrees\nroots.build=~/build\n"
+            "roots.workspace=~/worktrees\nroots.build=~/build\nroots.session=~/session\nroots.session.natedev=~/session\n"
             + f"roots.build.natedev=~/{machine_root}\nrepo_word.claude_commands={alias}\n"
             + "forms.build.natedev=per-unit\nforms.build.mac=per-repository\n"
             + "# whole: 1..\nfolders.unused_days=2\n# range: 0..60\nlocks.probe_wait_seconds=0.25\n"
@@ -874,6 +874,31 @@ class FolderFormTests(unittest.TestCase):
                 self.assertEqual(reused, path)
                 self.assertEqual((reused / "proof").read_text(encoding="utf-8"), "saved")
                 self.assertEqual(folders.folder_lease_fields(reused)["unit"], "verify")
+
+    def test_fixed_build_root_refuses_a_checkout_ancestor(self) -> None:
+        checkout = self.root / "checkout"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+        self.write_config(machine_root="checkout/build")
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "inside a Git checkout"):
+            _ = folders.build_root(form=folders.FixedRepositoryBuildFolders("mac"))
+        with self.assertRaisesRegex(folders.InvalidFolderForm, "inside a Git checkout"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted a build root inside a checkout.")
+        with (mock.patch.object(folders, "build_root", return_value=checkout / "build"),
+              self.assertRaisesRegex(folders.InvalidFolderForm, "inside a Git checkout")):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted an unchecked build root.")
+        self.assertFalse((checkout / "build").exists())
+
+    def test_fixed_build_root_refuses_a_cargo_output_ancestor(self) -> None:
+        output = self.root / "cargo-output"
+        output.mkdir()
+        self.write_config(machine_root="cargo-output/build")
+        with (mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": str(output)}),
+              self.assertRaisesRegex(folders.InvalidFolderForm, "inside a Cargo target directory")):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted a build root inside a Cargo target directory.")
+        self.assertFalse((output / "build").exists())
 
     def test_mac_uses_the_common_build_root(self) -> None:
         with mock.patch("socket.gethostname", return_value="Nates-MacBook-Pro-2023.local"):

@@ -2797,12 +2797,7 @@ def remote_test_command(
         cleanup_command = remote_cleanup_command(config, request, repository)
     abandoned_sessions = ""
     if not custom_target:
-        program = ("import sys; from pathlib import Path; "
-                   "from scripts.lib.build_folders import require_no_fixed_build_folders; "
-                   "require_no_fixed_build_folders(Path(sys.argv[1]))")
-        guard = f'"$HOME/.claude/scripts/lib/py" -c {shlex.quote(program)} {target}'
-        prune = removal_script(target, config.abandoned_session_minutes)
-        abandoned_sessions = f"{{ {guard} >/dev/null 2>&1 && {prune} || :; }} && "
+        abandoned_sessions = removal_script(target, config.abandoned_session_minutes) + " && "
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     remove_folder = ""
     if isinstance(request.fetch, FetchFolder):
@@ -2919,7 +2914,6 @@ def fetch_folder(
         for entry in fetched.iterdir():
             if entry.lstat().st_mtime < oldest:
                 if entry.is_dir() and not entry.is_symlink():
-                    build_folders.require_no_fixed_build_folders(entry)
                     shutil.rmtree(entry)
                 else:
                     entry.unlink()
@@ -2966,7 +2960,6 @@ def fetch_folder(
     finally:
         if owns_partial and partial.exists():
             try:
-                build_folders.require_no_fixed_build_folders(partial)
                 shutil.rmtree(partial)
             except (OSError, ValueError) as error:
                 print(f"mac_test: kept {partial}: {error}", file=sys.stderr)

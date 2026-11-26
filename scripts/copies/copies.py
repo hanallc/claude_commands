@@ -3206,12 +3206,7 @@ def publish_files(tree: Path, paths: Sequence[str], before: Sequence[Publication
         repository = repository_name(tree)
         with ExitStack() as cleanup:
             publication = scratch.new(word="gate-binary", throwaway=True)
-
-            def discard_publication() -> None:
-                check_mirror_removal(publication)
-                shutil.rmtree(publication)
-
-            _ = cleanup.callback(discard_publication)
+            _ = cleanup.callback(shutil.rmtree, publication)
             for source in sources:
                 destination = publication / source.name
                 temporary = publication / f".{source.name}.tmp"

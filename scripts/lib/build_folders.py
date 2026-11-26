@@ -530,13 +530,6 @@ def _parse_number(name: str) -> int:
     return int(name)
 
 
-def build_root(*, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Path:
-    """Return the configured root for the local build folders."""
-    if isinstance(settings, UseConfiguredValue):
-        settings = _settings()
-    return Path(settings.text("roots.build")).expanduser()
-
-
 @final
 @dataclass(frozen=True)
 class PerUnitBuildFolders:
@@ -549,6 +542,92 @@ class FixedRepositoryBuildFolders:
     """Use one build folder for each repository on this machine."""
 
     machine: str
+
+
+_PER_UNIT_BUILD_FOLDERS = PerUnitBuildFolders()
+
+
+class InvalidFixedBuildRoot(InvalidFolderForm):
+    """The configured root cannot hold fixed checkouts."""
+
+
+_CI_ADMISSION_DIRECTORY = re.compile(r"build-admission-ci-[0-9]+-")
+
+
+def _entry_exists(path: Path) -> bool:
+    try:
+        _ = path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _check_fixed_build_root(root: Path, settings: ConfigRead) -> Path:
+    """Check the placement before fixed checkouts can use the root."""
+    from scripts.lib import cargo_target_config, session_folder
+    from scripts.build_targets import target_config
+    from scripts.production.land_runs import DEFAULT_STATE_DIR
+
+    if not root.is_absolute():
+        raise InvalidFixedBuildRoot(f"{root}: the fixed build root must be absolute")
+    try:
+        canonical = root.resolve()
+        cargo = cargo_target_config.cargo_folder_settings([], os.getcwd(), os.environ)
+        for key, output in cargo.items():
+            try:
+                target = (Path(cargo_target_config.cargo_build_folder(
+                    output, [], os.getcwd(), os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))))
+                    if key == "build-dir" else (output.base / output.value).resolve())
+            except cargo_target_config.NoCargoManifest:
+                continue
+            if canonical.is_relative_to(target):
+                raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a Cargo target directory ({target})")
+        for ancestor in (canonical, *canonical.parents):
+            if ancestor.name == "target" or _entry_exists(ancestor / ".rustc_info.json"):
+                raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a Cargo target directory ({ancestor})")
+            if _entry_exists(ancestor / ".git"):
+                raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a Git checkout ({ancestor})")
+            if _CI_ADMISSION_DIRECTORY.match(ancestor.name) or ancestor.name == "typecheck-venv":
+                raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a scratch root ({ancestor})")
+
+        scratch_roots = [
+            Path("/tmp/claude"), session_folder.former_root(),
+            target_config.ssh_target_state_directory("mac") / "fetched", target_config.build_targets_state_root(),
+            Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier"),
+            Path(DEFAULT_STATE_DIR), Path("~/.local/state/merge-gate"),
+        ]
+        session = os.environ.get(session_folder.ROOT_ENV) or settings.value("roots.session", str, default="")
+        if session:
+            scratch_roots.append(Path(session))
+        for key in ("roots.scratch", "roots.copies", "roots.temporary", "roots.gate", "roots.workspace"):
+            if value := settings.value(key, str, default=""):
+                scratch_roots.append(Path(os.path.expandvars(value.replace("${TMPDIR}", str(inherited_temporary_parent())))))
+        for name in ("SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "GATE_STATE_DIR"):
+            if value := os.environ.get(name):
+                scratch_roots.append(Path(value))
+        if value := os.environ.get("SCRATCH_ROOT"):
+            scratch_roots.extend(Path(value).parent / name for name in ("unit", "delegate"))
+        for location in scratch_roots:
+            scratch = location.expanduser().resolve()
+            if canonical.is_relative_to(scratch):
+                raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a scratch root ({scratch})")
+    except (OSError, RuntimeError) as error:
+        raise InvalidFixedBuildRoot(f"{root}: cannot verify the fixed build root: {error}") from error
+    return canonical
+
+
+def build_root(*, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT,
+               form: PerUnitBuildFolders | FixedRepositoryBuildFolders = _PER_UNIT_BUILD_FOLDERS) -> Path:
+    """Read the build root. Check placement for the fixed layout."""
+    if isinstance(settings, UseConfiguredValue):
+        settings = _settings()
+    if isinstance(form, PerUnitBuildFolders):
+        return Path(settings.text("roots.build")).expanduser()
+    try:
+        root = Path(settings.text("roots.build", recover_invalid=False)).expanduser()
+    except (RuntimeError, Unusable) as error:
+        raise InvalidFixedBuildRoot(f"roots.build: {error}") from error
+    return _check_fixed_build_root(root, settings)
 
 
 def build_folder_form(machine: str, *, settings: ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
@@ -564,7 +643,7 @@ def build_folder_form(machine: str, *, settings: ConfigRead | UseConfiguredValue
         raise InvalidFolderForm(str(error)) from error
     match value:
         case "per-unit":
-            return PerUnitBuildFolders()
+            return _PER_UNIT_BUILD_FOLDERS
         case "per-repository":
             return FixedRepositoryBuildFolders(machine)
         case "":
@@ -1193,7 +1272,16 @@ def _is_configured_fixed_build_folder(path: Path, root: Path) -> bool:
     return False
 
 
-def _has_fixed_build_lease(path: Path, parent: int) -> bool:
+def _has_fixed_build_lease(path: Path, parent: int, *, layout: Path, build: Path) -> bool:
+    if not _is_configured_fixed_build_folder(layout, build):
+        # The marked sibling identifies lease metadata under a former build root.
+        lock = path.name + ".lock"
+        try:
+            status = os.stat(lock, dir_fd=parent, follow_symlinks=False)
+            if not build_folder_lock.is_marked_lock(lock, parent, status):
+                return False
+        except FileNotFoundError:
+            return False
     try:
         fields = _read_folder_lease(path, parent)
     except FileNotFoundError:
@@ -1201,18 +1289,19 @@ def _has_fixed_build_lease(path: Path, parent: int) -> bool:
     except ValueError as error:
         raise ValueError(f"{lease_path(path)}: invalid build folder lease: {error}") from error
     # Numbered copies record their last use. Fixed leases record the machine and repository.
-    return ("last_use" not in fields and isinstance(fields.get("machine"), str)
-            and isinstance(fields.get("repository"), str))
+    return ("last_use" not in fields and fields.get("machine") == layout.name
+            and fields.get("repository") == layout.parent.name)
 
 
 def is_fixed_build_folder(path: Path) -> bool:
     """Check whether the path names a fixed repository build folder."""
     folder = path.resolve()
-    if _is_configured_fixed_build_folder(folder, build_root().resolve()):
+    build = build_root().resolve()
+    if _is_configured_fixed_build_folder(folder, build):
         return True
     try:
         with build_folder_lock.folder_parent(folder, folder.parent, create=False) as parent:
-            return _has_fixed_build_lease(folder, parent)
+            return _has_fixed_build_lease(folder, parent, layout=folder, build=build)
     except FileNotFoundError:
         return False
 
@@ -1224,12 +1313,13 @@ class FixedBuildFolderRemovalRefused(PermissionError):
         super().__init__(f"{folder}: cannot remove a fixed build folder")
 
 
-def _require_no_fixed_leases(path: Path, parent: int, entries: Iterable[str]) -> None:
+def _require_no_fixed_leases(path: Path, parent: int, entries: Iterable[str], *, layout: Path, build: Path) -> None:
     for name in entries:
         if name.endswith(".lease.json"):
             source = path / name.removesuffix(".lease.json")
-            if _has_fixed_build_lease(source, parent):
-                raise FixedBuildFolderRemovalRefused(source)
+            original = layout / source.name
+            if _has_fixed_build_lease(source, parent, layout=original, build=build):
+                raise FixedBuildFolderRemovalRefused(original)
 
 
 def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir_fd: int | None = None,
@@ -1259,7 +1349,7 @@ def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir
                         leases.append(entry.name)
                     if entry.is_dir(follow_symlinks=False):
                         children.append(entry.name)
-            _require_no_fixed_leases(folder, directory, leases)
+            _require_no_fixed_leases(folder, directory, leases, layout=original, build=build)
             for name in children:
                 visit(folder / name, directory, original / name, check_form=True)
 
@@ -1270,12 +1360,22 @@ def require_no_fixed_build_folders(path: Path, *, include_root: bool = True, dir
             except FileNotFoundError:
                 return
         if include_root:
-            if _is_configured_fixed_build_folder(layout, build) or _has_fixed_build_lease(source, dir_fd):
+            if (_is_configured_fixed_build_folder(layout, build)
+                    or _has_fixed_build_lease(source, dir_fd, layout=layout, build=build)):
                 raise FixedBuildFolderRemovalRefused(layout)
             if original_path is None and _HIDDEN_REMOVAL.fullmatch(tree.name) is not None:
                 # A legacy stage can have its original lease next to it.
-                _require_no_fixed_leases(tree.parent, dir_fd, os.listdir(dir_fd))
+                _require_no_fixed_leases(tree.parent, dir_fd, os.listdir(dir_fd), layout=tree.parent, build=build)
         visit(tree, dir_fd, layout, check_form=False)
+
+
+def require_build_tree_move_allowed(path: Path) -> None:
+    """Refuse a move that contains the configured build root or a fixed folder."""
+    source = path.resolve()
+    build = build_root().resolve()
+    if build.is_relative_to(source):
+        raise PermissionError(f"{source}: contains the configured build root ({build})")
+    require_no_fixed_build_folders(source)
 
 
 def gate_folder_lease_fields(path: Path, root: Path) -> dict[str, object]:
@@ -3004,7 +3104,14 @@ def fixed_repository_build_folder(repo: str, *, machine: str, unit: str) -> Gene
     form = build_folder_form(machine, settings=settings)
     if not isinstance(form, FixedRepositoryBuildFolders):
         raise InvalidFolderForm(f"forms.build.{machine}: the build folder form must be per-repository")
-    request = _FixedRepositoryFolder(form, build_root(settings=settings), _form_name(repo), _unit_name(unit))
+    root = build_root(settings=settings, form=form)
+    repository, owner = _form_name(repo), _unit_name(unit)
+    parent = root / repository
+    if _check_fixed_build_root(parent, settings) != parent:
+        raise InvalidFixedBuildRoot(f"{parent}: the fixed checkout parent must not be a symbolic link")
+    if _CI_ADMISSION_DIRECTORY.match(machine) or machine == "typecheck-venv":
+        raise InvalidFixedBuildRoot(f"{parent / machine}: the fixed checkout cannot use a scratch directory name")
+    request = _FixedRepositoryFolder(form, root, repository, owner)
     with leased_build_folder(request) as path:
         yield path
 
