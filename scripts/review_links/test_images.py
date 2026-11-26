@@ -1299,6 +1299,67 @@ class ImagesTests(ImagesFixture):
         self.assertEqual(len({key for _, key in calls}), 1)
         self.assertNotIn(record["id"], images.render(self.status).decode())
 
+    def test_conflicting_words_leave_the_accepted_request_open_for_the_producer(self) -> None:
+        keeper, producer, item = self.list_item()
+        record = images.register(self.shot, "Check the rows", self.owner_id(), "Phase check", list_item=item.id)
+        words = "Keep the red row."
+        request = "&answer_request=" + "a" * 32
+        original = self.feedback_body(record, words) + request
+        conflict = self.feedback_body(record, "Remove the red row.") + request
+        online = False
+        deliveries: list[tuple[str, str]] = []
+
+        def send(_recipient: str, _sender: str, message: str, *, key: str,
+                 recipient_key: str) -> Literal["pending"] | None:
+            self.assertIn(words, message)
+            deliveries.append((recipient_key, key))
+            return "pending" if recipient_key == producer.id and not online else None
+
+        with patch.object(change_page, "send_message", side_effect=send):
+            with self.assertRaisesRegex(images.AnswerNotSent, "has not confirmed"):
+                self.submit(original)
+            with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
+                self.submit(conflict)
+            online = True
+            self.submit(original)
+        self.assertEqual([recipient for recipient, _ in deliveries], [self.owner_id(), *([producer.id] * 4)])
+        self.assertEqual(len({key for _, key in deliveries}), 1)
+        saved = image_store.read_answers(images.images_root(self.root), record["id"])
+        attempt, = saved["attempts"].values()
+        self.assertCountEqual(attempt["confirmed"], [self.owner_id(), producer.id])
+        entry, = (entry for entry in the_list.load(keeper.id, item.id).log
+                  if isinstance(entry, the_list.ImageAnswerChange))
+        self.assertIn(words, entry.what)
+
+    def test_accepted_request_retries_its_saved_recipient_when_the_list_is_unavailable(self) -> None:
+        _, producer, item = self.list_item()
+        record = images.register(self.shot, "Check the rows", self.owner_id(), "Phase check", list_item=item.id)
+        post = self.feedback_body(record, "Keep the red row.") + "&answer_request=" + "a" * 32
+
+        def send(_recipient: str, _sender: str, _message: str, *, recipient_key: str,
+                 **_delivery: str) -> Literal["pending"] | None:
+            return "pending" if recipient_key == producer.id else None
+
+        with (patch.object(change_page, "send_message", side_effect=send),
+              self.assertRaisesRegex(images.AnswerNotSent, "has not confirmed")):
+            self.submit(post)
+        with patch.object(the_list, "save_image_answer", side_effect=OSError("The List is unavailable.")):
+            self.submit(post)
+        self.assertEqual([recipient for recipient, _, _ in self.sent], [f"session:{producer.current_session}"])
+
+    def test_accepted_request_retries_its_owner_when_the_archive_is_unavailable(self) -> None:
+        record = self.register()
+        post = self.feedback_body(record, "Keep the red row.") + "&answer_request=" + "a" * 32
+        with (patch.object(change_page, "send_message", side_effect=RuntimeError("owner offline")),
+              self.assertRaisesRegex(images.AnswerNotSent, "owner offline")):
+            self.submit(post)
+        paths = set(images.decision_root(self.root).glob(f"{record['id']}-*.json"))
+        self.assertEqual(len(paths), 1)
+        with patch.object(images, "_save_image_decision", side_effect=OSError("The archive is unavailable.")):
+            self.submit(post)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(set(images.decision_root(self.root).glob(f"{record['id']}-*.json")), paths)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
     def test_browser_keeps_words_for_a_removed_picture_until_send_succeeds(self) -> None:
         record = self.register()
@@ -1781,7 +1842,7 @@ class ImageQuestionTests(ImagesFixture):
         paths = images.decision_root(self.root).glob(f"{identity}-*.json")
         self.assertEqual(len(list(paths)), 3)
 
-    def test_stale_request_id_keeps_its_refusal_without_a_round(self) -> None:
+    def test_refusing_a_stale_post_does_not_bind_a_new_request_id(self) -> None:
         record = self.register()
         self.ask(record)
         identity = record["id"]
@@ -1790,18 +1851,15 @@ class ImageQuestionTests(ImagesFixture):
         token = images.request_token(images.console_token(self.root), identity)
         post = {"image": identity, "token": token, "action": "feedback", "feedback": "Keep the red row.",
                 "answer_request": "a" * 32}
-        with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
-            self.submit(urlencode({**post, "feedback_round": images.feedback_round(set())}))
-
-        current = {**post, "feedback_round": images.feedback_round({"Q1"})}
+        stale = {**post, "feedback_round": images.feedback_round(set())}
         with patch.object(image_store, "write_answers", wraps=image_store.write_answers) as write:
-            for repeat in (post, current):
+            for _ in range(2):
                 with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
-                    self.submit(urlencode(repeat))
+                    self.submit(urlencode(stale))
             write.assert_not_called()
         self.assertEqual(self.sent, [])
         self.assertFalse(images.decision_root(self.root).exists())
-        self.submit(urlencode({**current, "answer_request": "b" * 32}))
+        self.submit(urlencode({**post, "feedback_round": images.feedback_round({"Q1"})}))
         self.assertEqual(len(self.sent), 1)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
@@ -1846,8 +1904,6 @@ async (find, whenPageShows, check) => {
  await whenPageShows('the refreshed list', () => !oldList.isConnected);
  const savedDrafts = () => sessionStorage.getItem('images.answer-drafts:' + location.pathname) ?? '';
  check(savedDrafts().includes(words), 'Storage keeps the draft words.');
- const status = document.getElementById('image-action-failure');
- check(!status.hidden && status.textContent.includes('This page is stale'), 'The page shows the refusal.');
  check(find('Other fixture').querySelector('textarea').value === 'Keep this draft.', 'The other draft remains.');
  if (ALREADY_ANSWERED) {
   check(!document.getElementById(stale.id), 'An answered image has no stale form.');
@@ -1867,6 +1923,8 @@ async (find, whenPageShows, check) => {
   return;
  }
  const fresh = find('Stale fixture').querySelector('form');
+ const status = fresh.querySelector('[data-image-status]');
+ check(!status.hidden && status.textContent.includes('This page is stale'), 'The form shows the refusal.');
  check(fresh !== form && fresh.elements.feedback.value === words, 'The current form keeps the draft words.');
  check(fresh.elements.feedback_round.value === CURRENT_ROUND, 'The form uses the current round.');
  if (!fresh.elements.feedback.value) return;
@@ -1887,6 +1945,44 @@ async (find, whenPageShows, check) => {
                                  .replace("ANSWERED_PAGE", json.dumps(answered.decode()).replace("<", r"\u003c")))
                 script = f"<script>{self.question_probe(browser_probe)}</script>".encode()
                 self.assertEqual(firefox_probe_results(page.replace(b"</body>", script + b"</body>")), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_browser_explains_an_answered_round_after_stale_approval_without_words(self) -> None:
+        record = self.register("Approval fixture")
+        old_page = images.render(self.status)
+        self.ask(record)
+        identity = record["id"]
+        images.answer_question(self.root, identity, "Q1", "The gate passed.")
+        token = images.request_token(images.console_token(self.root), identity)
+        approval = {"image": identity, "token": token, "action": "approved", "feedback": ""}
+        self.submit(urlencode({**approval, "feedback_round": images.feedback_round({"Q1"})}))
+        with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale") as refusal:
+            self.submit(urlencode({**approval, "feedback_round": images.feedback_round(set())}))
+        error = json.dumps(json.dumps({"reason": str(refusal.exception)}))
+        probe = r'''
+async (find, whenPageShows, check) => {
+ const realFetch = window.fetch.bind(window);
+ window.fetch = (url, options) => {
+  if (url !== location.pathname) return realFetch(url, options);
+  return Promise.resolve(options?.method === 'POST' ? new Response(ERROR_BODY, {status: 400}) : new Response(FRESH_PAGE));
+ };
+ const list = document.querySelector('[data-images]');
+ const form = find('Approval fixture').querySelector('form');
+ form.requestSubmit(form.querySelector('button[value=approved]'));
+ await whenPageShows('the refreshed list', () => !list.isConnected);
+ const notice = document.querySelector('[data-image-stale-drafts] section');
+ check(notice?.textContent.includes('Feedback for this round was already sent.'), 'The notice says the round was answered.');
+ check(!find('Approval fixture'), 'The answered round has no form.');
+ check(!/try again/i.test(document.body.innerText), 'The page gives no retry instruction.');
+ check(!notice?.querySelector('[data-draft-copy]:not([hidden])'), 'The notice has no empty words to copy.');
+}'''
+        for removed in (False, True):
+            with self.subTest(removed=removed):
+                if removed:
+                    images.delete(self.root, identity)
+                fresh = json.dumps(images.render(self.status).decode()).replace("<", r"\u003c")
+                script = f"<script>{self.question_probe(probe.replace('ERROR_BODY', error).replace('FRESH_PAGE', fresh))}</script>"
+                self.assertEqual(firefox_probe_results(old_page.replace(b"</body>", script.encode() + b"</body>")), [[]])
 
     def test_confirmed_feedback_retry_hides_the_image_after_a_failed_write(self) -> None:
         record = self.register()

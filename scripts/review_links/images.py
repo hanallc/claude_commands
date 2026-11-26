@@ -401,9 +401,11 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + '</article>')
 
 
-def _pending_answer_cards(root: Path, token: str) -> list[str]:
+def _removed_image_reviews(root: Path, token: str) -> tuple[list[str], set[str]]:
+    """Return the pending cards and the images with confirmed feedback for the last round."""
     directory = images_root(root)
     cards: list[str] = []
+    answered: set[str] = set()
     for identity in image_store.deleted_answer_ids(directory):
         try:
             saved = image_store.read_answers(directory, identity)
@@ -416,6 +418,10 @@ def _pending_answer_cards(root: Path, token: str) -> list[str]:
                    else _card_heading({"title": removed, "look_for": []}))
         for key, answer in saved["attempts"].items():
             if answer["recipients"] and set(answer["recipients"]) <= set(answer["confirmed"]):
+                proof = answer.get("signed_answer")
+                round_id = proof["round_id"] if proof is not None else feedback_round(set(answer["answered"]))
+                if round_id == saved.get("deleted_feedback_round"):
+                    answered.add(identity)
                 continue
             words = html.escape(answer.get("words", answer["message"]))
             cards.append(f'<article>{details}'
@@ -427,7 +433,7 @@ def _pending_answer_cards(root: Path, token: str) -> list[str]:
                          + '<span role="status" data-image-status>Not sent yet</span>'
                          + '<div><button type="submit" name="action" value="retry">Retry</button></div>'
                          + '</form></article>')
-    return cards
+    return cards, answered
 
 
 def render(status: change_page.DeliveryStatus) -> bytes:
@@ -440,19 +446,22 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     rows = settings.whole("feedback_rows")
     card_motion = page_frame.CardMotion.read(settings)
     waiting: list[str] = []
-    answered: list[str] = []
+    answered: set[str] = set()
     cards: list[str] = []
     refresh_needed = False
     for record in records(root):
         review = image_review(status, record)
         if review.visible():
             cards.append(card(record, token, members, rows, names, open_questions=review.open_questions))
-        elif review.open_questions:
-            waiting.append(record['id'])
-        elif "feedback_at" in record:
-            answered.append(record["id"])
+        else:
+            if review.open_questions:
+                waiting.append(record["id"])
+            if "feedback_at" in record:
+                answered.add(record["id"])
         refresh_needed |= review.refresh()
-    cards.extend(_pending_answer_cards(root, token))
+    removed_cards, removed_answered = _removed_image_reviews(root, token)
+    cards.extend(removed_cards)
+    answered.update(removed_answered)
     answer_refresh_seconds = settings.number("page_refresh_seconds")
     refresh_seconds = answer_refresh_seconds if refresh_needed else 0
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
@@ -465,9 +474,9 @@ def render(status: change_page.DeliveryStatus) -> bytes:
                + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
                + f' {card_motion.attributes()}'
                + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}"'
-               + f' data-answered-images="{" ".join(answered)}">'
+               + f' data-answered-images="{" ".join(sorted(answered))}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
-               + '<template data-image-stale-draft><section><p data-draft-reason></p>'
+               + '<template data-image-stale-draft><section><p data-draft-reason role="status"></p>'
                + '<p class="image-answer-words" data-draft-words></p><div class="answer-actions">'
                + '<button type="button" data-draft-copy>Copy</button>'
                + '<button type="button" data-draft-dismiss>Dismiss</button>'
@@ -645,9 +654,6 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
     answer, feedback, round_id = draft.action, draft.words, draft.round_id
     signed_form = origin is _ImageAnswerOrigin.SIGNED_FORM
     form_key = draft.request_key(folder, saved) if signed_form and draft.request_id else ""
-    stale_requests = saved.get("stale_form_request_keys", [])
-    if form_key and form_key in stale_requests:
-        raise question_record.AnswerRefused(STALE_ANSWER)
     form_retry = draft.form_attempt_key(folder, saved) if form_key else None
     answered: set[str] = answered_question_ids(record) if record is not None else set()
     current_round = feedback_round(answered) if record is not None else saved.get("deleted_feedback_round")
@@ -659,9 +665,6 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         stale = (not draft.matches_answer(attempts[form_retry]) if form_retry is not None else
                  signed_form and round_id is not None and current_round is not None and round_id != current_round)
         if stale:
-            if form_key:
-                saved["stale_form_request_keys"] = [*stale_requests, form_key]
-                image_store.write_answers(directory, saved)
             raise question_record.AnswerRefused(STALE_ANSWER)
         key = form_retry or form_key or draft.key(folder, saved)
     attempt: image_store.ImageAnswer | None = attempts.get(key)
@@ -719,11 +722,13 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         atomic_file.sync_folder(directory)
 
     signed = attempt.get("signed_answer") if signed_form else None
-    if signed is not None and "list_item" not in saved:
-        _save_image_decision(directory.parent, saved, signed)
     needs_recipients = not attempt["recipients"]
+    # A legacy attempt can have saved recipients before it has signed evidence.
+    needs_publication = needs_recipients or (signed is not None and "form_request_key" not in signed)
+    if signed is not None and "list_item" not in saved and needs_publication:
+        _save_image_decision(directory.parent, saved, signed)
     recipients = [saved["owner"]]
-    if "list_item" in saved and (needs_recipients or signed is not None):
+    if "list_item" in saved and needs_publication:
         item = saved["list_item"]
         if signed is not None:
             approved = signed["answer"] == "approved"
@@ -880,7 +885,7 @@ let list = document.querySelector('[data-images]');
 const motion = createCardMotion(() => list);
 let refreshRequest = 0;
 const staleAnswerReason = __STALE_ANSWER__;
-let staleAnswerNotice = '';
+const answeredRoundNotice = 'Feedback for this round was already sent.';
 const refreshSeconds = () => list.dataset.refreshSeconds;
 const imageLink = () => new URLSearchParams(location.hash.slice(1));
 function apply() {
@@ -934,7 +939,6 @@ function pictureState(image) {
 try {
   for (const [image, draft] of JSON.parse(sessionStorage.getItem(draftStorageKey) || '[]')) {
     pictureState(image).draft = draft;
-    if (draft.needsCurrentForm) staleAnswerNotice = 'Not sent: ' + staleAnswerReason;
   }
 } catch { /* The browser may block storage. */ }
 function preventDraftLoss(event) {
@@ -944,7 +948,7 @@ function preventDraftLoss(event) {
 function saveDrafts() {
   const drafts = [];
   for (const [image, {draft}] of pictureStates) {
-    if (draft && (draft.words || draft.retryAction)) drafts.push([image, draft]);
+    if (draft && (draft.words || draft.retryAction || draft.needsCurrentForm)) drafts.push([image, draft]);
   }
   try {
     if (drafts.length) sessionStorage.setItem(draftStorageKey, JSON.stringify(drafts));
@@ -985,21 +989,19 @@ async function copyStaleDraft(words, status) {
   }
   status.textContent = 'Copied.';
 }
-function showStaleDraft(state, alreadyAnswered) {
+function showStaleNotice(state, reason) {
   const draft = staleDraftTemplate.content.firstElementChild.cloneNode(true);
-  draft.querySelector('[data-draft-reason]').textContent = alreadyAnswered
-    ? 'Feedback for this round was already sent.' : 'This image has no feedback form.';
+  draft.querySelector('[data-draft-reason]').textContent = reason;
   const words = draft.querySelector('[data-draft-words]');
   words.textContent = state.draft.words;
+  words.hidden = !words.textContent;
   const status = draft.querySelector('[data-draft-copy-status]');
-  draft.querySelector('[data-draft-copy]').addEventListener('click', () => void copyStaleDraft(words, status));
+  const copy = draft.querySelector('[data-draft-copy]');
+  copy.hidden = words.hidden;
+  copy.addEventListener('click', () => void copyStaleDraft(words, status));
   draft.querySelector('[data-draft-dismiss]').addEventListener('click', () => {
     clearDraft(state);
     draft.remove();
-    if (![...pictureStates.values()].some(other => other.draft?.needsCurrentForm)) {
-      staleAnswerNotice = '';
-      showActionFailure(actionFailure);
-    }
   });
   staleDrafts.append(draft);
 }
@@ -1042,10 +1044,10 @@ function restoreForms(root, previous = []) {
     }
     if (form) {
       if (draft) form.elements.feedback.value = draft.words;
-      showActionFailure(formStatus(form), state.draftError);
-    } else if (draft?.needsCurrentForm && draft.words) {
-      showStaleDraft(state, answered.has(image));
-    } else if (!state.attempts.size && !draft?.needsCurrentForm) {
+      showActionFailure(formStatus(form), draft?.needsCurrentForm ? 'Not sent: ' + staleAnswerReason : state.draftError);
+    } else if (draft?.needsCurrentForm) {
+      showStaleNotice(state, answered.has(image) ? answeredRoundNotice : 'This image has no feedback form.');
+    } else if (!state.attempts.size) {
       pictureStates.delete(image);
     }
   }
@@ -1082,10 +1084,6 @@ async function submit(event) {
     state.draftError = question ? 'Enter a question first.' : 'Enter feedback first.';
     showActionFailure(status, state.draftError);
     return;
-  }
-  if (staleAnswerNotice) {
-    staleAnswerNotice = '';
-    showActionFailure(actionFailure);
   }
   const {retryAction, retryRound, requestId} = draft ?? {};
   const body = new URLSearchParams(new FormData(form, event.submitter));
@@ -1165,9 +1163,7 @@ async function submit(event) {
       state.draft = {words: field.value, needsCurrentForm: true};
       saveDrafts();
       card.remove();
-      if (state.draft.words) showStaleDraft(state, false);
-      staleAnswerNotice = message;
-      showActionFailure(actionFailure, message);
+      showStaleNotice(state, 'This page is stale.');
     } else if (request.key) state.attempts.set(request.key, message);
     else {
       state.draftError = message;
@@ -1214,7 +1210,7 @@ async function refresh(_supersede=false,current=()=>true) {
       return;
     }
     const facts = pageRefreshFacts(page);
-    showActionFailure(actionFailure, staleAnswerNotice);
+    showActionFailure(actionFailure);
     restoreForms(fresh, previous);
     const top = scrollY;
     const wasWaiting = !waiting.hidden;
@@ -1248,7 +1244,6 @@ addEventListener('hashchange', () => {
   scrollToLinkedImage(true);
 });
 const pageRefresh = createPageRefresh(refresh, refreshSeconds);
-showActionFailure(actionFailure, staleAnswerNotice);
 restoreForms(list);
 bind(list);
 // An image link opens its image at once.

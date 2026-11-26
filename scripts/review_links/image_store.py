@@ -76,7 +76,6 @@ class ImageAnswer(TypedDict):
 class ImageAnswers(ImageReference):
     heading: NotRequired[ImageHeading]
     deleted_feedback_round: NotRequired[str]
-    stale_form_request_keys: NotRequired[list[str]]
     attempts: dict[str, ImageAnswer]
 
 
@@ -180,8 +179,6 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
         if not isinstance(round_id, str) or re.fullmatch(r"[0-9a-f]{64}", round_id) is None:
             raise ValueError(f"{identity}: Invalid feedback round for the removed image.")
         answers["deleted_feedback_round"] = round_id
-    if "stale_form_request_keys" in fields:
-        answers["stale_form_request_keys"] = _texts(fields["stale_form_request_keys"])
     for key, attempt in cast(dict[str, object], attempts).items():
         if not isinstance(attempt, dict):
             raise ValueError(f"{identity}: invalid image answer attempt")
