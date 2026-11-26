@@ -380,10 +380,11 @@ def icon_svg(name: str) -> str:
 def title(text: str, page: str, version: str = "", *, status_companion: str = "") -> str:
     """Build the title and refresh status with a script version and an optional control."""
     settings = conf.read_or_repository("console")
+    status_page = "list" if page == "studio" else page
     options = {"roundTripLimit": settings.number("status.round_trip_limit_seconds"),
                "renderLimit": settings.number("status.render_limit_seconds"),
                "readingDelay": settings.number("status.reading_delay_seconds"),
-               "ageLimit": settings.number(f"status.{page}.age_limit_seconds"), "zone": str(user_zone())}
+               "ageLimit": settings.number(f"status.{status_page}.age_limit_seconds"), "zone": str(user_zone())}
     icons = ''.join(f'<span data-status-icon="{state}"' + ('' if state == 'Reading' else ' hidden')
                     + '>' + icon_svg(icon) + '</span>' for state, icon in (
                         ('Live', 'radio'), ('Reading', 'loader-circle'), ('Late', 'clock-alert'),

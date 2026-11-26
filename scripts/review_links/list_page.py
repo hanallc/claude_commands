@@ -2263,7 +2263,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{studio_page.PAGE_PATH}?{html.escape(counts_query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    content = (STYLE + studio_page.STYLE + page_frame.title(studio_page.TITLE, "list", SCRIPT_VERSION)
+    content = (STYLE + studio_page.STYLE + page_frame.title(studio_page.TITLE, "studio", SCRIPT_VERSION)
                + '<p data-review-refresh-error role="status" hidden></p>'
                + f'<div data-list data-list-path="{studio_page.PAGE_PATH}" data-refresh-seconds="{seconds}"'
                + f' data-zone="{html.escape(zone.key, quote=True)}"'

@@ -678,7 +678,7 @@ document.body.append(result);
 
     def check_live_window_send(self, *, lose_reply: bool, kind: str = "investigation") -> None:
         root = self.root / "reviews"
-        _ = write_config_fixture(conf.path("console"), f"page.list.owner={MORTY.id}\n")
+        _ = write_config_fixture(conf.path("console"), f"page.list.owner={MORTY.id}\npage.studio.owner={MORTY.id}\n")
         _ = write_config_fixture(conf.path("producer_map"))
         words = "Keep the wait time next to the queue name."
         saved: list[tuple[int, Mapping[str, object]]] = []
@@ -702,17 +702,19 @@ document.body.append(result);
   const send=dialog.querySelector('[type="submit"]');
   const words=dialog.querySelector('textarea');
   const error=dialog.querySelector('.new-item-error');
-  document.querySelector('[data-owner-new]').click();
+  const button=document.querySelector('[data-page-owner="studio"] [data-owner-new]');
+  if(!button) throw new Error('The Studio owner button is missing.');
+  button.click();
   const includePage=dialog.querySelector('[name="include_page"]');
   if(includePage.checked) includePage.click();
   const producer=()=>[...dialog.querySelectorAll('[name="recipient_id"]')]
    .find(input=>input.value===__PRODUCER__);
   await until(dialog,producer);
+  if(!producer().checked) throw new Error('New item did not select the Studio producer.');
   dialog.querySelector('[name="kind"][value="'+__KIND__+'"]').click();
   words.value=__WORDS__;
   words.dispatchEvent(new Event('input',{bubbles:true}));
-  if(!send.disabled) throw new Error('Send is available before a producer is selected.');
-  producer().click();
+  if(send.disabled) throw new Error('Send is disabled with the Studio producer selected.');
   let filed=false;
   document.addEventListener('review-item-created',()=>{filed=true;},{once:true});
   const settled=()=>filed || dialog.open && !error.hidden && !send.disabled;
@@ -1486,7 +1488,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         with (patch.object(list_page, "read_linked_reviews", return_value=[change]),
               patch.object(list_page, "counts_strip", return_value="")):
             markup = list_page.render(self.root / "reviews")
-        page = page_frame.with_owner(markup, "list", MORTY, staff.StaffSnapshot((MORTY,)), new_item_dialog.render)
+        page = page_frame.with_owner(markup, "studio", MORTY, staff.StaffSnapshot((MORTY,)), new_item_dialog.render)
         probe = r'''
 (async()=>{
  if(nested) return;
@@ -1523,6 +1525,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
   await painted();
   const copy=dialog.querySelector('[data-page-window-actions] [data-owner-new]');
   const box=copy.getBoundingClientRect();
+  check(copy.closest('[data-page-owner]').dataset.pageOwner==='studio','The copy uses the Studio owner.');
   check(box.top>=0 && box.bottom<=innerHeight && onTop(copy),'The New item copy is clickable on the phone.');
   check(dialog.getBoundingClientRect().top>=box.bottom-1,'The phone review box starts below the New item copy.');
   copy.click();
