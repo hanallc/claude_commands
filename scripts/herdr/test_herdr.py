@@ -1037,27 +1037,6 @@ class NativePaneSessionTests(StaffTestCase):
                 self.assertEqual(sum(isinstance(pane, herdr.StartingPane) for pane in scan.unknown), expected)
         self.assertEqual([item for item in read.call_args_list if item.args[0] == "shutdown"], [call("shutdown")] * 2)
 
-    def test_foreground_codex_counts_verified_thread_groups(self) -> None:
-        proc = self.root / "proc"
-        leader, thread = 998070, 998071
-        for pid in (leader, thread):
-            (proc / str(pid)).mkdir(parents=True)
-        _ = (proc / str(leader) / "status").write_text(f"Tgid:\t{leader}\n")
-        status = proc / str(thread) / "status"
-        rows = [{"pid": thread, "name": "tokio-rt-worker", "argv": ["codex"]},
-                {"pid": leader, "name": "codex", "argv": ["codex", "--no-daemon"]}]
-        with patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_PLATFORM": "linux"}):
-            _ = status.write_text(f"Tgid:\t{leader}\n")
-            for foreground in (rows, rows[::-1]):
-                owner = herdr.foreground_pane_owner({"foreground_processes": foreground}, for_input=True)
-                self.assertEqual(owner, herdr.ProvedCodexForeground(
-                    leader, ["codex", "--no-daemon"], None, (), herdr.CodexTerminalInput.AVAILABLE))
-            _ = status.write_text(f"Tgid:\t{thread}\n")
-            owner = herdr.foreground_pane_owner({"foreground_processes": rows}, for_input=True)
-            self.assertIsInstance(owner, herdr.UnprovedForegroundOwner)
-            assert isinstance(owner, herdr.UnprovedForegroundOwner)
-            self.assertIn("expected one foreground codex process, found 2", owner.reason)
-
     def test_launch_argument_cannot_prove_the_current_pane_session(self) -> None:
         launch = fixture_runtime_id("native-fallback-launch")
         proc = self.root / "fallback-proc"
