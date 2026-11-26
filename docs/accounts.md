@@ -204,6 +204,10 @@ An unavailable local staff record supplies no group membership.
 
 
 Each problem below the table uses this form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`.
+Accounts Problems hides pane launch warnings.
+The record at `~/.local/state/accounts/launch_warnings.json` shows the first time, last time, and number of reads for each warning kind that day.
+A detached sender files one bug report per warning kind per PST calendar day with brain.
+Each status read retries pending reports, including reports from earlier days.
 An MCP server difference uses one line for each account, server, and direction.
 It counts only projects that differ from the same project in `~/.claude`.
 For example:

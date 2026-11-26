@@ -31,10 +31,12 @@ from contextvars import Context, ContextVar
 from collections.abc import Callable, Collection, Generator, Iterable, Mapping, Sequence
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
+from enum import Enum
 from functools import cached_property
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
+from time import time_ns
 from typing import override, TYPE_CHECKING, BinaryIO, Literal, NamedTuple, NotRequired, Protocol, TypedDict, TextIO, cast, overload
 from importlib import import_module
 from uuid import UUID
@@ -50,6 +52,7 @@ from scripts.herdr import herdr_types  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, conf, file_lock, models_registry, registry_rows, transcripts  # noqa: E402
 from scripts.lib.agent_program import resolve_program as resolve_program
+from scripts.lib.process_failure import failure_detail
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts  # noqa: E402
@@ -65,6 +68,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 
 from scripts.accounts import next_moves
 from scripts.agents import remote, stop_results
+from scripts.message import send_result
 from scripts.message.session_records import latest_transcript
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
@@ -634,6 +638,10 @@ class SelectableCodexAccount:
 def accounts_home() -> Path:
     """The account root selected from HOME for this call."""
     return Path.home()
+
+
+def _accounts_state_dir() -> Path:
+    return accounts_home() / ".local/state/accounts"
 
 
 def main_config_dir() -> Path:
@@ -6036,6 +6044,311 @@ class DiagnosticStream(io.StringIO):
         return self.terminal.isatty()
 
 
+class LaunchWarningKind(Enum):
+    ROW_PANE_STARTING = (r"herdr (?P<location>[^:\s]+:\S+): pane is starting", "pane is starting")
+    CODEX_PANE_STARTING = (r"herdr (?P<location>pid [0-9]+): pane is starting", "pane is starting")
+    ROW_PANE_EVIDENCE_UNKNOWN = (
+        r"herdr (?P<location>[^:\s]+:\S*) tab \S*: pane evidence is unknown: .*; row placement retained",
+        "pane evidence is unknown; row placement retained",
+    )
+    WORKER_PANE_EVIDENCE_INCOMPLETE = (
+        r"anomaly: [^:\r\n]+: pane evidence is incomplete; absence is unproved; correct the evidence and retry",
+        "pane evidence is incomplete; absence is unproved; correct the evidence and retry",
+    )
+
+    def __init__(self, pattern: str, message: str) -> None:
+        self.pattern = re.compile(pattern)
+        self.message = message
+
+    def example(self, location: str) -> str:
+        if re.fullmatch(r"(?:[A-Za-z0-9_.-]+:w[0-9]+:p[A-Za-z0-9]+|pid [0-9]+)", location):
+            return f"herdr {location}: {self.message}"
+        return self.message
+
+    def stored_example(self, line: str) -> str:
+        match = self.pattern.fullmatch(line)
+        location = (match.groupdict().get("location", "") if match else
+                    line.removeprefix("herdr ").removesuffix(f": {self.message}"))
+        return self.example(location)
+
+
+@dataclass(frozen=True)
+class LaunchWarningReportKey:
+    day: date
+    kind: LaunchWarningKind
+
+
+@dataclass(frozen=True)
+class DailyLaunchWarning:
+    first_line: str
+    first_seen: datetime
+    last_seen: datetime
+    read_count: int
+    reported: bool = False
+
+    def include_capture(self, example: str, seen_at: datetime, *, first_in_read: bool) -> DailyLaunchWarning:
+        return replace(self, first_line=example if seen_at < self.first_seen else self.first_line,
+                       first_seen=min(self.first_seen, seen_at), last_seen=max(self.last_seen, seen_at),
+                       read_count=self.read_count + int(first_in_read))
+
+
+@dataclass
+class LaunchWarningRecord:
+    day: date
+    warnings: dict[LaunchWarningReportKey, DailyLaunchWarning] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LaunchWarningReport:
+    kind: LaunchWarningKind
+    day: date
+    text: str
+
+
+_LAUNCH_WARNING_ZONE = timezone(timedelta(hours=-8), "PST")
+
+
+def _launch_warning_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class LaunchWarningStream(DiagnosticStream):
+    """Save each launch warning when the stream captures it."""
+
+    def __init__(self, terminal: TextIO) -> None:
+        super().__init__(terminal)
+        self.launch_lines: set[str] = set()
+        self._record_path: Path = _launch_warning_record()
+        self._counted: set[LaunchWarningReportKey] = set()
+        self._record_errors: list[OSError] = []
+        self._partial: str = ""
+
+    @override
+    def write(self, text: str) -> int:
+        *lines, self._partial = (self._partial + text).split("\n")
+        for line in lines:
+            self._observe(line.removesuffix("\r"))
+        return super().write(text)
+
+    def finish(self) -> None:
+        if self._partial:
+            self._observe(self._partial.removesuffix("\r"))
+        for error in self._record_errors:
+            _launch_warning_error("could not record observations", error)
+        _retry_launch_warning_reports(self._record_path)
+
+    def _observe(self, line: str) -> None:
+        for kind in LaunchWarningKind:
+            match = kind.pattern.fullmatch(line)
+            if match is None:
+                continue
+            seen_at = _launch_warning_now()
+            self.launch_lines.add(line)
+            example = kind.example(match.groupdict().get("location", ""))
+            try:
+                _record_launch_warning(self._record_path, kind, example, seen_at, self._counted)
+            except OSError as error:
+                self._record_errors.append(error)
+            return
+
+
+def _launch_warning_record() -> Path:
+    return _accounts_state_dir() / "launch_warnings.json"
+
+
+def _stored_launch_warning_time(text: str, day: date) -> datetime:
+    seen_at = _stored_time(text)
+    if seen_at is None:
+        raise ValueError("invalid launch warning time")
+    try:
+        pst_day = seen_at.astimezone(_LAUNCH_WARNING_ZONE).date()
+    except OverflowError as error:
+        raise ValueError("invalid launch warning time") from error
+    if pst_day != day:
+        raise ValueError("launch warning time does not match its PST day")
+    return seen_at
+
+
+def _load_launch_warning_record(path: Path, day: date) -> LaunchWarningRecord:
+    try:
+        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return LaunchWarningRecord(day)
+    if not isinstance(raw, dict):
+        raise ValueError("expected a launch warning record")
+    fields = cast(dict[str, object], raw)
+    stored_day, past = fields.get("day"), fields.get("pending", {})
+    if not isinstance(stored_day, str) or not isinstance(past, dict):
+        raise ValueError("expected a day and pending launch warnings")
+    record = LaunchWarningRecord(date.fromisoformat(stored_day))
+    days = {date.fromisoformat(key): value for key, value in cast(dict[str, object], past).items()}
+    if any(key >= record.day for key in days):
+        raise ValueError("expected pending launch warnings from earlier days")
+    days[record.day] = fields.get("warnings")
+    sanitized = False
+    for observed_day, warnings in days.items():
+        if not isinstance(warnings, dict):
+            raise ValueError("expected launch warnings for the day")
+        for name, value in cast(dict[str, object], warnings).items():
+            kind = LaunchWarningKind[name]
+            if not isinstance(value, dict):
+                raise ValueError("expected a launch warning observation")
+            observation = cast(dict[str, object], value)
+            line, first, last, count, reported = (observation.get(key) for key in
+                ("first_line", "first_seen", "last_seen", "read_count", "reported"))
+            if not (isinstance(line, str) and isinstance(first, str) and isinstance(last, str)
+                    and isinstance(count, int) and not isinstance(count, bool) and count > 0 and isinstance(reported, bool)):
+                raise ValueError("invalid launch warning observation")
+            first_seen = _stored_launch_warning_time(first, observed_day)
+            last_seen = _stored_launch_warning_time(last, observed_day)
+            if first_seen > last_seen:
+                raise ValueError("invalid launch warning times")
+            example = kind.stored_example(line)
+            sanitized |= example != line
+            record.warnings[LaunchWarningReportKey(observed_day, kind)] = DailyLaunchWarning(
+                example, first_seen, last_seen, count, reported)
+    if sanitized:
+        _save_launch_warning_record(path, record)
+    return record
+
+
+def _save_launch_warning_record(path: Path, record: LaunchWarningRecord) -> None:
+    days: dict[str, dict[str, object]] = {}
+    for key, item in record.warnings.items():
+        days.setdefault(key.day.isoformat(), {})[key.kind.name] = {
+            "first_line": item.first_line, "first_seen": item.first_seen.isoformat(), "last_seen": item.last_seen.isoformat(),
+            "read_count": item.read_count, "reported": item.reported,
+        }
+    day = record.day.isoformat()
+    current = days.pop(day, {})
+    data: dict[str, object] = {"day": day, "warnings": current}
+    if days:
+        data["pending"] = days
+    atomic_file.write_text_atomic(path, json.dumps(data) + "\n", new_file_mode=0o600)
+
+
+def _launch_warning_error(action: str, error: Exception) -> None:
+    print(f"accounts: launch warnings: {action}: {' '.join(str(error).splitlines())}", file=sys.stderr)
+
+
+def _send_launch_warning(report: LaunchWarningReport) -> None:
+    key = f"accounts-launch-warning:{report.kind.name}:{report.day.isoformat()}"
+    result = subprocess.run([sys.executable, str(SCRIPTS / "message/send.py"), "--to", "brain", "--from", "accounts",
+                             "--key", key, "--once-per-key", "--text", report.text],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
+    outcome = send_result.send_outcome(result.returncode, result.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        header = outcome.header
+        if header.outcome in ("sent", "skipped", "queued") or (
+                header.outcome == "kept" and header.detail.startswith("durable acceptance. ")):
+            return
+    raise OSError(failure_detail(result))
+
+
+def _launch_warning_report(key: LaunchWarningReportKey, item: DailyLaunchWarning) -> LaunchWarningReport:
+    name = key.kind.name.lower().replace("_", " ")
+    stamp = item.first_seen.astimezone(_LAUNCH_WARNING_ZONE).strftime("%Y-%m-%d %H:%M:%S %Z")
+    return LaunchWarningReport(key.kind, key.day,
+        "accounts to brain: bug to track (Accounts page launch warning, item 483): "
+        + f"{name} seen; example: {item.first_line}; first seen {stamp}. The page shows no launch warning; "
+        + "the record ~/.local/state/accounts/launch_warnings.json has the first time and the count for each kind.")
+
+
+def _deliver_launch_warnings(path: Path) -> int:
+    """Send pending reports under the inherited sender lock."""
+    lock = path.with_suffix(".lock")
+    day = _launch_warning_now().astimezone(_LAUNCH_WARNING_ZONE).date()
+    failed = False
+    try:
+        with file_lock.exclusive(lock):
+            record = _load_launch_warning_record(path, day)
+            pending = [key for key, item in record.warnings.items() if not item.reported]
+        for key in pending:
+            with file_lock.exclusive(lock):
+                record = _load_launch_warning_record(path, day)
+                item = record.warnings.get(key)
+                if item is None or item.reported:
+                    continue
+            try:
+                _send_launch_warning(_launch_warning_report(key, item))
+            except (OSError, subprocess.SubprocessError) as error:
+                _launch_warning_error("could not report to brain", error)
+                failed = True
+                continue
+            with file_lock.exclusive(lock):
+                record = _load_launch_warning_record(path, day)
+                if (item := record.warnings.get(key)) is not None:
+                    if key.day == record.day:
+                        record.warnings[key] = replace(item, reported=True)
+                    else:
+                        del record.warnings[key]
+                    _save_launch_warning_record(path, record)
+    except (OSError, ValueError, KeyError) as error:
+        _launch_warning_error("could not report to brain", error)
+        failed = True
+    return int(failed)
+
+
+def _start_launch_warning_report(path: Path) -> None:
+    claim = file_lock.take_exclusive(path.with_suffix(".sender.lock"))
+    if not isinstance(claim, file_lock.ExclusiveLock):
+        return
+    with closing(claim), os.fdopen(os.open(path.with_suffix(".log"),
+            os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600), "ab") as log:
+        child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "launch-warning-report", str(path)],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 pass_fds=(claim.descriptor,), start_new_session=True)
+    Thread(target=child.wait, daemon=True).start()
+
+
+def _load_current_launch_warning_record(path: Path, day: date) -> tuple[LaunchWarningRecord, bool]:
+    """Load under the record lock. Return whether the day changed or the record needs repair."""
+    try:
+        record = _load_launch_warning_record(path, day)
+    except (ValueError, KeyError):
+        _ = path.rename(path.with_name(f"{path.name}.{time_ns()}.corrupt"))
+        return LaunchWarningRecord(day), True
+    if record.day >= day:
+        return record, False
+    record.day = day
+    record.warnings = {key: item for key, item in record.warnings.items() if not item.reported}
+    return record, True
+
+
+def _record_launch_warning(path: Path, kind: LaunchWarningKind, example: str, seen_at: datetime,
+                           counted: set[LaunchWarningReportKey]) -> None:
+    day = seen_at.astimezone(_LAUNCH_WARNING_ZONE).date()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock.exclusive(path.with_suffix(".lock")):
+        record, _ = _load_current_launch_warning_record(path, day)
+        key = LaunchWarningReportKey(day, kind)
+        prior = record.warnings.get(key)
+        record.warnings[key] = (DailyLaunchWarning(example, seen_at, seen_at, 1) if prior is None else
+                                prior.include_capture(example, seen_at, first_in_read=key not in counted))
+        _save_launch_warning_record(path, record)
+        counted.add(key)
+
+
+def _retry_launch_warning_reports(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        with file_lock.exclusive(path.with_suffix(".lock")):
+            day = _launch_warning_now().astimezone(_LAUNCH_WARNING_ZONE).date()
+            record, changed = _load_current_launch_warning_record(path, day)
+            if changed:
+                _save_launch_warning_record(path, record)
+            pending = any(not item.reported for item in record.warnings.values())
+    except OSError as error:
+        _launch_warning_error("could not record observations", error)
+        return
+    if pending:
+        try:
+            _start_launch_warning_report(path)
+        except OSError as error:
+            _launch_warning_error("could not start report to brain", error)
+
+
 @role_map.role_map_command
 def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = False, include_models: bool = False,
                 account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
@@ -6045,7 +6358,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     diagnostics = enclosing if isinstance(enclosing, StatusDiagnostics) else StatusDiagnostics()
     token = _status_diagnostics.set(diagnostics)
     tty = sys.stderr.isatty()
-    held = DiagnosticStream(sys.stderr)
+    held = LaunchWarningStream(sys.stderr)
     try:
         with (redirect_stderr(held), role_map.observe_map_reads(_observe_map_provenance),
               role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext()):
@@ -6058,6 +6371,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
         raise
     finally:
         _status_diagnostics.reset(token)
+        held.finish()
     diagnostics.retain_raw(held.getvalue(), delivered=tty)
     for problem in _map_provenance_problem(role_map.observed_map_provenance()):
         diagnostics.observe(problem)
@@ -6066,8 +6380,9 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
     notes = list(reading.notes)
     warning_groups: dict[tuple[str, str], list[str]] = {}
-    for line in dict.fromkeys(held.getvalue().splitlines()):
-        if not line.strip() or line in represented or line in diagnostics.delivered:
+    warnings = tuple(dict.fromkeys(held.getvalue().splitlines()))
+    for line in warnings:
+        if not line.strip() or line in represented or line in diagnostics.delivered or line in held.launch_lines:
             continue
         mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
         if mcp and any(note.startswith(mcp[1][1:] + " turns ") and " where ~/.claude does not: " in note for note in notes):
@@ -6999,7 +7314,7 @@ class MachineSessionCounts(TypedDict):
 
 
 def _session_counts_cache() -> Path:
-    return accounts_home() / ".local/state/accounts/peer_session_counts.json"
+    return _accounts_state_dir() / "peer_session_counts.json"
 
 
 def _session_counts_machine() -> str:
@@ -7740,4 +8055,7 @@ def main(argv: list[str], *, account_config: conf.ConfigRead | ReadCurrentAccoun
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["launch-warning-report"]:
+        path, = sys.argv[2:]
+        raise SystemExit(_deliver_launch_warnings(Path(path)))
     raise SystemExit(main(sys.argv[1:]))
