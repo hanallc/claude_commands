@@ -1661,9 +1661,14 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         target = f"run {submitted.run_number} of item {item.number}" if one_run else f"item {item.number}"
         saved_words = submitted.receipt_words(action, words) if submitted.scope else words
         recipient = prefix.recipient if item.state is the_list.ItemState.SCHEDULED else the_list.LegacyFeedbackRecipient.KEEPER
-        notice = the_list.PageItemNotice(request, f"List page: nate removed {target}.", "remove", saved_words,
-                                        recipient=recipient)
-        changed = the_list.close(keeper, identity, "Removed by nate on the List page.", source=the_list.PAGE_SOURCE,
+        message = f"Studio: nate removed {target}." + (f"\n\n{words}" if words else "")
+        # Use the saved message on a retry. The writer still checks the submitted words.
+        message = next((event.words for entry in reversed(item.log)
+                        if entry.source == the_list.PAGE_SOURCE
+                        and isinstance(event := entry.what, (the_list.PageFeedback, the_list.PageRequest))
+                        and event.request == request and event.action == "remove"), message)
+        notice = the_list.PageItemNotice(request, message, "remove", saved_words, recipient=recipient)
+        changed = the_list.close(keeper, identity, words or "Removed by nate on the Studio.", source=the_list.PAGE_SOURCE,
                                  notice=notice, schedule_scope=submitted.scope, expected_schedule=expected)
     elif action == "park":
         if until != the_list.ParkUntilDelivered.DELIVERED and the_list.ISO_TIME.fullmatch(until) is None:
