@@ -1948,6 +1948,29 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(self.moves.calls, [])
         self.assertEqual(self.notifications, [])
 
+    def test_a_delivered_continuation_survives_an_interrupted_pass(self) -> None:
+        _ = self.groups()
+        _ = self.owner("refused-unit", host="unit")
+        _ = self.transcript("refused-unit", "You've hit your session limit")
+        reset = NOW + timedelta(minutes=19)
+        self.reading(SOURCE_LOGIN, 80, five=0, five_reset=reset)
+        _ = self.cli()
+        waited, = moves.read_moves()
+        self.assertEqual(waited["kind"], "waited")
+        self.next_entries(self.hold_rule())
+        WatchTime.at = reset
+
+        with patch.object(restart_support, "send_message", return_value=restart_support.MessageSent(kind="sent")) as delivery:
+            with (patch.object(refusal_watch, "_reading_values_fingerprint", side_effect=RuntimeError("fixture interruption")),
+                  self.assertRaisesRegex(RuntimeError, "fixture interruption")):
+                _ = self.cli()
+            saved = refusal_watch._load_state()["sessions"]["refused-unit"]  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual((saved["state"], saved["move_id"]), ("continued", waited["move_id"]))
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+        delivery.assert_called_once_with("session:refused-unit", "Quota wait ended", "Continue where you stopped.",
+            key="quota-continue-refused-unit-refusal-one")
+
     def test_pending_head_waits_for_a_known_refusal_reset_and_continues_without_choosing_an_account(self) -> None:
         for window in ("five_hour", "weekly"):
             with self.subTest(window=window):
