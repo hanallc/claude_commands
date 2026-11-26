@@ -1187,12 +1187,13 @@ async function heldFetch(url,init={},receiver,onHold){
 }
 function sendActionReceiver(form,data){
  const action=data.get('outcome');
- const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
  if(action==='approve' && data.get('assignee')){
   const option=form.elements.assignee?.selectedOptions[0];
   return option?.value===data.get('assignee') ? option.dataset.sendReceiver : undefined;
  }
- return JSON.parse(form.dataset.sendLabels || '{}')[verdict];
+ const labels=JSON.parse(form.dataset.sendLabels || '{}');
+ const withWords=action+'-with-words';
+ return labels[data.get('feedback')?.trim() && Object.hasOwn(labels,withWords) ? withWords : action];
 }
 window.SendUndone=SendUndone;window.heldFetch=heldFetch;window.sendActionReceiver=sendActionReceiver;
 })();

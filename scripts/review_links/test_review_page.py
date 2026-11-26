@@ -426,14 +426,18 @@ window.fetch=(url,options)=>{
   'The Response shows both labeled actions and Your words.');
  check(form.querySelector('.review-action-group:last-child [data-color-text="role.showrunner"]')?.textContent==='page-owner',
   'The Response action heading shows the showrunner color.');
- check(form.elements.feedback.placeholder==='Type your words for Ask a follow-up.',
-  'The placeholder says which action sends the words.');
+ check(form.elements.feedback.placeholder==='Got it sends your words and closes the item. Ask a follow-up sends a question.',
+  'The placeholder explains both actions.');
+ const data=new URLSearchParams({outcome:'read'});
+ check(sendActionReceiver(form,data)===null,'Got it without words has no receiver.');
+ data.set('feedback','Thank you.');
+ check(sendActionReceiver(form,data)==='page-owner','Got it with words names the owner.');
  const id=recordFromDetail(form).dataset.key;
  if(action==='question') form.elements.feedback.value='Can I use it on a phone?';
  form.requestSubmit(form.querySelector('[value="'+action+'"]'));
  const motion=copy(id)?.getAnimations()[0];
  if(!motion || !posts.has(row.dataset.key)) throw new Error('The Response save must start the fade.');
- posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',state,type:action==='read'?'response':'question',later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',words_saved:action==='question',state,type:action==='read'?'response':'question',later:0})});
  motion.finish();await frame();
  check(postCount===1 && !rows().some(item=>item.dataset.type==='response'),
   'The Response leaves the view after one submit.');
@@ -441,6 +445,287 @@ window.fetch=(url,options)=>{
   selected('type')===responses && selected('show')===chip('show','all') && words.value==='which layout',
   'The Response submit keeps each filter and the sort.');
 """)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_response_followup_hides_the_card_when_undo_shows(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=30\n')
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,posts,until}=fixtureUndo(),failures=[];
+ const check=(ok,message)=>{if(!ok) failures.push(message);};
+ const respond=window.fetch;
+ let releaseHold;
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST' && !String(url).endsWith('/undo'))
+   return new Promise(resolve=>{releaseHold=()=>resolve(respond(url,options));});
+  return respond(url,options);
+ };
+ try{
+  frameElement.style.width='1280px';frameElement.style.height='820px';
+  const row=()=>document.querySelector('[data-list-item][data-type="response"]');
+  row().querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row());
+  const words='Can I use it on a phone?';
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  await until(()=>releaseHold,'The follow-up did not request a hold.');
+  check(row()?.isConnected && recordIsOpen(row()),'The Response stays open until the Undo toast shows.');
+  releaseHold();
+  const toast=()=>window.top.document.querySelector('[data-send-undo]');
+  await until(()=>toast()?.querySelector('button'),'The follow-up Undo toast did not show.');
+  check(!row() && toast().querySelector('span').textContent==='Sent to page-owner.',
+   'The response leaves the table when the toast names the owner.');
+  check(toast().getAnimations().some(animation=>animation.effect.getKeyframes().at(-1).opacity==='0'),
+   'The toast fades out.');
+  toast().querySelector('button').click();
+  await until(()=>recordIsOpen(row()) && !toast(),'Undo did not return the Response.');
+  const restored=await readyReviewCard(row());
+  check(restored.elements.feedback.value===words && posts.length===1 && posts[0].get('outcome')==='question',
+   'Undo restores the draft and sends no second follow-up.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_response_delivery_failure_keeps_the_card_and_words(self) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=30\n')
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),heldFetch=window.fetch,failures=[];
+ const content=document.querySelector('[data-review]'),message='Delivery failed: The owner is offline.';
+ const row=()=>content.querySelector('[data-list-item][data-type="response"]');
+ const empty={version:'after-save',index:{n:[],r:[]},facts:pageRefreshFacts()};
+ window.fetch=(url,options)=>{
+  if(String(url).endsWith('/'+'a'.repeat(24)))
+   return Promise.resolve(Response.json({answer:'feedback sent',words_saved:true,detail_closed:true,send_failure:message}));
+  const query=new URL(url,location.href).searchParams;
+  if(query.get('version')==='1' || query.has('index')) return Promise.resolve(Response.json(empty));
+  return heldFetch(url,options);
+ };
+ try{
+  row().querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row()),words='Thank you for the answer.';
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  const toast=()=>top.document.querySelector('[data-send-undo]');
+  await until(()=>toast()?.getAnimations().length,'The Undo toast did not show.');
+  toast().getAnimations()[0].finish();
+  await until(()=>content.dataset.version===empty.version,'The refreshed index did not arrive.');
+  const current=row() && recordDetails(row()).querySelector('[data-review-form]');
+  if(!current?.isConnected || !recordIsOpen(row()) || current.elements.feedback.value!==words ||
+   current.querySelector('[data-send-status]').textContent!==message)
+   failures.push('A failed delivery keeps the Response, the words, and the failure after refresh.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_review_words_require_explicit_save_confirmation(self) -> None:
+        ready = self.investigation()
+        investigation_key = f'investigation/{ready.owner}/{ready.id}'
+        question = self.question()
+        change = 'page-owner/C1'
+        delivery, _ = review_page.submit(self.root, self.body(change, 'question', 'Did the check pass?'), self.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        pending = self.status.slots(delivery.page, delivery.row).question
+        assert isinstance(pending, change_page.OpenQuestion)
+        self.assertTrue(change_page.answer_item(change, 'The check passed.', pending.question_id, self.status))
+        markup = browser_markup(self.root)
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[];
+ const {key,action,words,result,expected}=CASE,content=document.querySelector('[data-review]');
+ const fetchPage=window.fetch;
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST') return Promise.resolve(Response.json(result));
+  const query=new URL(url,location.href).searchParams;
+  if(query.get('version')==='1')
+   return Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}));
+  return fetchPage(url,options);
+ };
+ try{
+  const row=content.querySelector('[data-list-item][data-key="'+CSS.escape(key)+'"]');
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row),field=form.elements.feedback;
+  field.value=words;field.dispatchEvent(new Event('input',{bubbles:true}));
+  const button=form.querySelector('[value="'+action+'"]');
+  if(!button) throw new Error('The action is missing.');
+  form.requestSubmit(button);
+  await until(()=>!form.dataset.sending,'The save did not finish.');
+  const copy=content.querySelector('[data-unsaved-review-key="'+CSS.escape(key)+'"] textarea');
+  if(expected==='cleared' && (field.value || copy))
+   failures.push('The confirmed words clear from the field and the notice.');
+  if(expected==='retained' && copy?.value!==words)
+   failures.push('The acknowledgement leaves the words in the notice.');
+  if(expected==='unconfirmed' && (!field.isConnected || field.value!==words ||
+    !form.querySelector('[data-send-status]').textContent.includes('Could not confirm the save.')))
+   failures.push('A missing or invalid confirmation keeps the form and its words.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        for key, action, words, fields, expected in (
+            (investigation_key, 'read', 'The repair passed.', {'words_saved': True}, 'cleared'),
+            (question, 'answer', 'marked read', {'words_saved': True}, 'cleared'),
+            (change, 'read', 'Keep this draft.', {'words_saved': False, 'state': 'Open'}, 'retained'),
+            (question, 'answer', 'Keep this answer.', {'answer': 'Keep this answer.'}, 'unconfirmed'),
+            (question, 'answer', 'Keep this reply.', {'answer': 'Keep this reply.', 'words_saved': 'true'}, 'unconfirmed'),
+        ):
+            with self.subTest(key=key, fields=fields, expected=expected):
+                result = {'answer': 'marked read', 'detail_closed': True, 'state': 'Done', **fields}
+                case = dict(key=key, action=action, words=words, result=result, expected=expected)
+                page = markup.replace('</body>', probe.replace('CASE', json.dumps(case))+'</body>')
+                self.assertEqual(firefox_probe_results(page.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_refresh_keeps_unsent_words_when_a_response_disappears(self) -> None:
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),failures=[];
+ const content=document.querySelector('[data-review]');
+ const row=content.querySelector('[data-list-item][data-type="response"]');
+ const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
+ const fresh={version:'after-close',index:{...index,r:index.r.filter(entry=>entry[0]!==row.dataset.key)},
+  facts:pageRefreshFacts()};
+ try{
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row),words='These words are still unsent.';
+  form.elements.feedback.value=words;
+  form.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  window.fetch=(url,options)=>{
+   const query=new URL(url,location.href).searchParams;
+   if(query.has('index') || query.get('version')==='1') return Promise.resolve(Response.json(fresh));
+   return realFetch(url,options);
+  };
+  dispatchEvent(new MessageEvent('message',{source:parent,origin:location.origin,data:'console-shown'}));
+  await until(()=>content.dataset.version===fresh.version,'The index did not refresh.');
+  const draft=content.querySelector('textarea[data-review-draft]');
+  if(form.isConnected || !draft?.getClientRects().length || draft.value!==words)
+   failures.push('Refresh shows the unsent words when the Response closes in another tab.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_missing_response_shows_the_refusal_with_a_copy_of_the_words(self) -> None:
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        markup = browser_markup(self.root)
+        probe = r"""<script>
+(async()=>{
+ const realFetch=window.fetch,failures=[],content=document.querySelector('[data-review]');
+ const reason='This item is already Done.',empty={version:'after-close',index:{n:[],r:[]},facts:pageRefreshFacts()};
+ window.fetch=(url,options)=>{
+  if(options?.method==='POST') return Promise.resolve(Response.json({reason},{status:409}));
+  const query=new URL(url,location.href).searchParams;
+  if(query.get('version')==='1' || query.has('index')) return Promise.resolve(Response.json(empty));
+  return realFetch(url,options);
+ };
+ try{
+  const row=content.querySelector('[data-list-item][data-type="response"]');
+  row.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(row),words='Keep these words.\nAnd this second line.';
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  const findDraft=()=>content.querySelector('textarea[data-review-draft]');
+  const end=performance.now()+8000;
+  while((content.dataset.version!==empty.version || !findDraft()?.closest('section')?.textContent.includes(reason))
+   && performance.now()<end)
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  const draft=findDraft();
+  if(form.isConnected || content.dataset.version!==empty.version || !draft?.getClientRects().length ||
+   !draft.readOnly || draft.value!==words ||
+   !draft.closest('section')?.textContent.includes(reason))
+   failures.push('When the stale card leaves Review, the refusal shows a visible copy of its words.');
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        self.assertEqual(firefox_probe_results(markup.replace('</body>', probe+'</body>').encode()), [[]])
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_refused_response_shows_its_words_while_another_card_is_open(self) -> None:
+        self.check_response_refusal_notice(retry=False)
+
+    @unittest.skipUnless(shutil.which('firefox'), 'Firefox is required for browser checks')
+    def test_confirmed_response_retry_removes_the_refusal_notice(self) -> None:
+        self.check_response_refusal_notice(retry=True)
+
+    def check_response_refusal_notice(self, *, retry: bool) -> None:
+        _ = write_config_fixture(self.fixture.temporary / 'config/review_links.conf', 'undo_seconds=30\n')
+        owner = self.ready_submission_recipient()
+        sent = review_submissions.submit(self.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+        probe = '<script>' + UNDO_ACTION_SCRIPT + r"""
+(async()=>{
+ const {realFetch,until}=fixtureUndo(),heldFetch=window.fetch,failures=[];
+ const retry=RETRY,content=document.querySelector('[data-review]'),reason='This item changed.';
+ const responseRow=()=>content.querySelector('[data-list-item][data-type="response"]');
+ const first=responseRow(),key=first.dataset.key;
+ const index=JSON.parse(content.querySelector('[data-review-index]').textContent);
+ const fresh={version:'after-close',index:retry ? index : {...index,r:index.r.filter(row=>row[0]!==key)},facts:pageRefreshFacts()};
+ const other=()=>content.querySelector('[data-list-item][data-key="page-owner/C1"]');
+ const toast=()=>top.document.querySelector('[data-send-undo]');
+ let refused=false;
+ window.fetch=(url,options)=>{
+  if(String(url).endsWith('/'+'a'.repeat(24))){
+   if(refused) return Promise.resolve(Response.json({answer:'feedback sent',words_saved:true,detail_closed:true,state:'Done'}));
+   refused=true;
+   return Promise.resolve(Response.json({reason},{status:409}));
+  }
+  const query=new URL(url,location.href).searchParams;
+  if(refused && (query.has('index') || query.get('version')==='1')) return Promise.resolve(Response.json(fresh));
+  return heldFetch(url,options);
+ };
+ try{
+  first.querySelector('.list-toggle').click();
+  const form=await readyReviewCard(first),words='These words belong to the Response.';
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  await until(()=>toast()?.getAnimations().length,'The Undo toast did not show.');
+  other().querySelector('.list-toggle').click();
+  const otherForm=await readyReviewCard(other()),otherWords='These words belong to the Change.';
+  otherForm.elements.feedback.value=otherWords;
+  otherForm.elements.feedback.dispatchEvent(new Event('input',{bubbles:true}));
+  toast().getAnimations()[0].finish();
+  await until(()=>content.dataset.version===fresh.version,'The index did not refresh after the refusal.');
+  const notice=()=>content.querySelector('[data-unsaved-review-key="'+CSS.escape(key)+'"]');
+  const draft=notice()?.querySelector('textarea[data-review-draft]');
+  if(!draft?.getClientRects().length || draft.value!==words || !draft.closest('section')?.textContent.includes(reason))
+   failures.push('The refused Response shows its words after the user opens another card.');
+  if(!recordIsOpen(other()) || recordDetails(other()).querySelector('[name="feedback"]').value!==otherWords)
+   failures.push('The other card keeps its own words.');
+  if(retry){
+   responseRow().querySelector('.list-toggle').click();
+   const recovered=await readyReviewCard(responseRow());
+   if(recovered.elements.feedback.value!==words) failures.push('The form restores the refused words.');
+   recovered.requestSubmit(recovered.querySelector('[value="read"]'));
+   await until(()=>toast()?.getAnimations().length,'The retry did not request a hold.');
+   if(notice()?.querySelector('textarea')?.value!==words)
+    failures.push('The notice keeps the words until the retry is confirmed.');
+   toast().getAnimations()[0].finish();
+   await until(()=>!recovered.dataset.sending,'The retry did not finish.');
+   if(notice()) failures.push('The confirmed retry removes the refusal notice for its words.');
+  }
+ }catch(error){failures.push(String(error));}
+ await realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();</script>"""
+        markup = browser_markup(self.root).replace('</body>', probe.replace('RETRY', json.dumps(retry))+'</body>')
+        self.assertEqual(firefox_probe_results(markup.encode()), [[]])
 
     def test_page_feedback_uses_the_native_review_reply_and_keeps_its_data(self) -> None:
         owner = self.ready_submission_recipient()
@@ -1649,7 +1934,7 @@ window.fetch=(url,options)=>{
  const fetchPage=window.fetch,content=document.querySelector('[data-review]');
  const row=()=>content.querySelector('[data-list-item][data-key="page-owner/C1"]');
  const toggle=()=>row().querySelector('.list-toggle');
- const close=()=>toggle().click(),error=()=>row()?.querySelector('[data-record-error]');
+ const close=()=>toggle().click();
  let finishPost;
  window.fetch=(url,options)=>{
   if(options?.method==='POST') return new Promise(resolve=>{finishPost=resolve;});
@@ -1676,7 +1961,7 @@ window.fetch=(url,options)=>{
    ask(first);
    edit(words,'Which check ran?');edit(words,'Which check passed?');
    words.focus();words.setSelectionRange(3,7);
-   finishPost(Response.json({answer:'question saved'}));await settled(first);
+   finishPost(Response.json({answer:'question saved',words_saved:true}));await settled(first);
    check(words.value==='Which check passed?' && document.activeElement===words &&
     words.selectionStart===3 && words.selectionEnd===7,
     'A saved Ask preserves words edited during the save and keeps their selection.');
@@ -1700,18 +1985,18 @@ window.fetch=(url,options)=>{
   toggle().click();
   const reopened=await readyReviewCard(row());
   edit(reopened.elements.feedback,'Keep these later words.');
-  finishPost(Response.json({answer:'question saved'}));await settled(sent);
+  finishPost(Response.json({answer:'question saved',words_saved:true}));await settled(sent);
   check(recordIsOpen(row()) && reopened.elements.feedback.value==='Keep these later words.' &&
    !reopened.querySelector('[data-send-status]').textContent.includes('Saved:'),
    'A response from before Close leaves the reopened item and its draft in place.');
   if(VALIDATING){
    ask(reopened);edit(reopened.elements.feedback,'Keep the words after Ask.');
    finishPost(new Response('Unreadable result'));await settled(reopened);
-   check(!error().hidden && error().textContent==='Saved; the item could not refresh.' &&
+   check(reopened.querySelector('[data-send-status]').textContent.includes('Could not confirm the save.') &&
     reopened.elements.feedback.value==='Keep the words after Ask.',
-    'An unreadable successful response reports a display error and keeps the draft.');
+    'An unreadable response reports an unconfirmed save and keeps the draft.');
    ask(reopened);finishPost(Response.json({reason:'The save failed.'},{status:400}));await settled(reopened);
-   check(error().hidden && reopened.querySelector('[data-send-status]').textContent==='Not saved: The save failed.' &&
+   check(reopened.querySelector('[data-send-status]').textContent==='Not saved: The save failed.' &&
     reopened.elements.feedback.value==='Keep the words after Ask.',
     'A failed save reports a save error and keeps the draft.');
   }
@@ -1742,7 +2027,7 @@ window.fetch=(url,options)=>{
  window.fetch=(url,options)=>{
   const query=new URL(url,location.href).searchParams;
   if(options?.method==='POST') return Promise.resolve(Response.json({
-   answer:'question saved',version,detail_unavailable:true,delivery_pending:false}));
+   answer:'question saved',words_saved:true,version,detail_unavailable:true,delivery_pending:false}));
   if(query.has('body')){
    const saved=query.has('saved');
    if(!saved) bodyReads++;
@@ -1828,7 +2113,7 @@ window.fetch=(url,options)=>{
   const query=new URL(url,location.href).searchParams;
   if(options?.method==='POST'){
    pageVersion='own';
-   const reply={answer:'saved',version:'own',delivery_pending:true,delivery:'fixture-delivery',detail_revision:'own-revision'};
+   const reply={answer:'saved',words_saved:true,version:'own',delivery_pending:true,delivery:'fixture-delivery',detail_revision:'own-revision'};
    reply.state=completed ? 'Done' : action==='feedback' ? 'Waiting' : undefined;
    if(action==='feedback'){
     const saved=document.createElement('template');saved.innerHTML=body('own-revision','The saved words.');
@@ -1909,7 +2194,7 @@ window.fetch=(url,options)=>{
  const opened=()=>content.querySelector('[data-record-inline-view]');
  window.fetch=(url,options)=>{
   if(options?.method==='POST')
-   return Promise.resolve(Response.json({answer:'parked',detail_unavailable:true,delivery_pending:false}));
+   return Promise.resolve(Response.json({answer:'parked',words_saved:false,detail_unavailable:true,delivery_pending:false}));
   const query=new URL(url,location.href).searchParams;
   if(query.get('version')==='1')
    return Promise.resolve(Response.json({version:content.dataset.version,facts:pageRefreshFacts()}));
@@ -2644,7 +2929,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   window.fetch=(url,options={})=>{
    const query=new URL(url,location.href).searchParams;
    if(options.method==='POST')
-    return new Promise(resolve=>{reply=()=>resolve(Response.json({answer:'saved',version:snapshots.fresh.version,
+    return new Promise(resolve=>{reply=()=>resolve(Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,
      state:validating ? 'Validating' : 'Waiting',detail_revision:'saved',delivery_pending:false}));});
    if(query.has('saved')){
     reads.push(query.get('saved'));
@@ -2838,7 +3123,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
   window.fetch=async(url,options={})=>{
    if(options.method!=='POST') return pageFetch(url,options);
    shown='fresh';
-   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',REPLY});
+   return Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',REPLY});
   };
   row(2).querySelector('.list-toggle').click();
   const form=await readyReviewCard(row(2));
@@ -2892,7 +3177,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
    saved.content.querySelector('form').remove();
    saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
-   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+   return Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
     detail_html:saved.innerHTML});
   };
   row(15).querySelector('.list-toggle').click();
@@ -2951,7 +3236,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
    saved.content.querySelector('form').remove();
    saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
-   return Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+   return Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
     detail_html:saved.innerHTML});
   };
   OPENER
@@ -3004,7 +3289,7 @@ const measuredFetch=fetch;window.fetch=async(url,options)=>{
    const saved=document.createElement('template');saved.innerHTML=snapshots.initial.bodies['change-15'];
    saved.content.querySelector('form').remove();
    saved.content.querySelector('[data-review-body]').insertAdjacentHTML('afterbegin','<p>The saved words.</p>');
-   const reply=Response.json({answer:'saved',version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
+   const reply=Response.json({answer:'saved',words_saved:true,version:snapshots.fresh.version,delivery_pending:false,state:'Waiting',
     detail_html:saved.innerHTML});
    return new Promise(resolve=>{finishSave=()=>resolve(reply);});
   };
@@ -3412,7 +3697,7 @@ return (Math.max(ink, fill) + 0.05) / (Math.min(ink, fill) + 0.05);
 window.copied='';
 Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{window.copied=text;}}});
 window.fetch=async(_url,options)=>options?.method==='POST'
- ? Response.json({answer:'Done',state:'Done'})
+ ? Response.json({answer:'Done',words_saved:false,state:'Done'})
  : new Response(null,{status:304});
 </script>""", 1)
         pages = (console.ConsolePage('review', 'Review', 'inbox', 'Review',
@@ -4173,7 +4458,7 @@ window.clearInterval=()=>{};
 window.refreshRequests=[];
 const showPages=PAGES;
 window.fetch=async(url,options)=>{
- if(options?.method==='POST') return {headers:new Headers(),ok:true,json:async()=>({answer:'saved'})};
+ if(options?.method==='POST') return {headers:new Headers(),ok:true,json:async()=>({answer:'saved',words_saved:true})};
  window.refreshRequests.push(url);
  const show=new URL(url,location.href).searchParams.get('show') || 'open';
  return {ok:true,text:async()=>showPages[show]};
@@ -4524,7 +4809,7 @@ const nativeFetch=fetch,nativeTimeout=setTimeout;
 window.setInterval=()=>0;window.clearInterval=()=>{};
 const showPages=PAGES;
 window.fetch=async(url,options)=>{
- if(options?.method==='POST'){window.didSave=true;return {headers:new Headers(),ok:true,json:async()=>({answer:'saved'})};}
+ if(options?.method==='POST'){window.didSave=true;return {headers:new Headers(),ok:true,json:async()=>({answer:'saved',words_saved:true})};}
  const show=new URL(url,location.href).searchParams.get('show') || 'open';
  const page=new DOMParser().parseFromString(showPages[show],'text/html');
  if(window.didSave){const payload=page.querySelector('[data-review-index]'),entries=JSON.parse(payload.textContent);
@@ -4696,7 +4981,7 @@ window.fetch=async(url,options)=>{
  const refreshResponse=new Promise(resolve=>{releaseRefresh=resolve;});
  window.fetch=(url,options)=>{
   if(options?.method==='POST' && options.body.get('row')===answered && options.body.get('outcome')==='question')
-   return Promise.resolve(Response.json({answer:'question sent',state:'Waiting',type:'question',later:0}));
+   return Promise.resolve(Response.json({answer:'question sent',words_saved:true,state:'Waiting',type:'question',later:0}));
   const params=new URL(url,location.href).searchParams;
   if(params.has('version') && !params.has('body')) return refreshResponse;
   return fetchPage(url,options);
@@ -4784,7 +5069,7 @@ window.fetch=async(url,options)=>{
  const fetchPage=window.fetch;
  window.fetch=(url,options)=>{
   if(options?.method==='POST' && options.body.get('row')===question && options.body.get('outcome')==='later')
-   return Promise.resolve(Response.json({answer:'later',state:'Open',later:Date.now()+3600000}));
+   return Promise.resolve(Response.json({answer:'later',words_saved:false,state:'Open',later:Date.now()+3600000}));
   const params=new URL(url,location.href).searchParams;
   if(params.has('version') && !params.has('body'))
    return Promise.resolve(Response.json({version:review.dataset.version,facts:pageRefreshFacts()}));
@@ -7142,7 +7427,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const clip=copy(panel),exit=clip.getAnimations()[0];
  halfway(exit);
  const position=top(clip);
- posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'later',state:'Open',later:Date.now()+3600000})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'later',words_saved:false,state:'Open',later:Date.now()+3600000})});
  await frame();
  check(selected()===owner && !owner.hidden,'The last owner stays selected and visible during the fade.');
  check(copy(panel)===clip && near(top(clip),position) && !rows().length,
@@ -7184,7 +7469,7 @@ if(REDUCED) window.matchMedia=()=>({matches:true});
  const staysOpen=['feedback','question'].includes(action.outcome);
  if(!posts.has(row.dataset.key) || (staysOpen ? !recordIsOpen(row) : !motion))
   throw new Error('The save did not start with the expected row state.');
- posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',state:action.state,later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'saved',words_saved:Boolean(form.elements.feedback.value.trim()),state:action.state,later:0})});
  motion?.finish();await frame();
  if(action.state==='Done') check(!rows().some(item=>item.dataset.key===row.dataset.key),
   'The completed item leaves Review.');
@@ -7283,7 +7568,7 @@ window.fetch=async(url,options)=>{
  posts.push(new URLSearchParams(options.body));
  if(posts.length===1)
   return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
- return Response.json({answer:'works',state:'Done',later:0});
+ return Response.json({answer:'works',words_saved:true,state:'Done',later:0});
 };
 </script>"""
         probe = r"""<script>
@@ -7444,7 +7729,7 @@ window.fetch=async(url,options)=>{
  halfway(exit);
  const position=top(clip),following=top(next);
  check(top(first)<position && position<following,'The departing card starts between its neighbors.');
- posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ posts.get(row.dataset.key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',words_saved:true,state:'Done',later:0})});
  await frame();
  check(copy(panel)===clip && near(top(clip),position),'The saved card keeps its position during the fade.');
  check(near(top(next),following),'The next card keeps its position when the save completes.');
@@ -7475,7 +7760,7 @@ window.fetch=async(url,options)=>{
  if(!remounted || remounted===row) throw new Error('The pending row must mount again.');
  const form=await readyReviewCard(remounted);
  check(form.dataset.sending==='true','The remounted form shows the pending save.');
- posts.get(key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',state:'Done',later:0})});
+ posts.get(key)({headers:new Headers(),ok:true,json:async()=>({answer:'works',words_saved:true,state:'Done',later:0})});
  await frame();
  check(!current(),'The completed row leaves the table.');
  const exit=copy(panel)?.getAnimations()[0];
@@ -7529,7 +7814,7 @@ Element.prototype.animate=function(...args){
 const sendProbe=fetch;
 window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
- if(options.method==='POST') return Promise.resolve(Response.json({answer:'works'}));
+ if(options.method==='POST') return Promise.resolve(Response.json({answer:'works',words_saved:true}));
  return sendProbe(url,options);
 };
 if(!sessionStorage.getItem('review-reload')) history.replaceState(null,'','#'+new URLSearchParams({item:INITIAL_ITEM}));
@@ -7671,7 +7956,7 @@ let finishSave,savedState;
 window.setInterval=()=>0;
 window.fetch=(url,options={})=>{
  if(options.method!=='POST') return sendProbe(url,options);
- return new Promise(resolve=>{finishSave=()=>resolve(Response.json({answer:'saved',state:savedState}));});
+ return new Promise(resolve=>{finishSave=()=>resolve(Response.json({answer:'saved',words_saved:true,state:savedState}));});
 };
 </script>"""
         probe = r"""<script>
@@ -7772,7 +8057,7 @@ window.fetch=(url,options={})=>{
   form.requestSubmit(form.querySelector('[value="'+action+'"]'));
   return form;
  }
- async function settle(key,form,response=Response.json({answer:'saved',state:'Done'})){
+ async function settle(key,form,response=Response.json({answer:'saved',words_saved:true,state:'Done'})){
   finishSave.get(key)(response);
   while(form.dataset.sending) await new Promise(resolve=>requestAnimationFrame(resolve));
  }
@@ -7901,10 +8186,10 @@ window.fetch=(url,options={})=>{
  if(options.method!=='POST') return nativeFetch(url,options);
  const fields=new URLSearchParams(options.body);
  if(fields.get('row').startsWith('question/') && fields.get('outcome')==='answer')
-  return Promise.resolve(Response.json({answer:'answered',state:'Done'}));
+  return Promise.resolve(Response.json({answer:'answered',words_saved:true,state:'Done'}));
  if(!['page-owner/C1','page-owner/C2'].includes(fields.get('row')) || fields.get('outcome')!=='works')
   throw new Error('The form did not submit a verdict for the expected Change.');
- const result=()=>Response.json({answer:'works',state:'Done'});
+ const result=()=>Response.json({answer:'works',words_saved:true,state:'Done'});
  if(fields.get('row')==='page-owner/C1') return new Promise(resolve=>{finishVerdict=()=>resolve(result());});
  return Promise.resolve(result());
 };
@@ -8071,9 +8356,10 @@ window.posts=[];
 let nextPost;
 window.fetch=async(_url,options={})=>{
  if(options.method==='POST'){
-  window.posts.push(new URLSearchParams(options.body));
+  const form=new URLSearchParams(options.body);
+  window.posts.push(form);
   if(nextPost){const post=nextPost;nextPost=null;return post;}
-  return {headers:new Headers(),ok:true,json:async()=>({answer:'works'})};
+  return {headers:new Headers(),ok:true,json:async()=>({answer:'works',words_saved:Boolean(form.get('feedback').trim())})};
  }
  window.refreshRequests.push(_url);return {ok:true,text:async()=>window.refreshMarkup};
 };
@@ -8086,7 +8372,8 @@ window.fetch=async(_url,options={})=>{
  const shown=()=>rows().filter(row=>!row.hidden);
  const holdPost=()=>{
   let finish;nextPost=new Promise(resolve=>{finish=resolve;});
-  return {save:()=>finish({headers:new Headers(),ok:true,json:async()=>({answer:'works'})}),
+  return {save:()=>finish({headers:new Headers(),ok:true,json:async()=>({
+     answer:'works',words_saved:Boolean(window.posts.at(-1).get('feedback').trim())})}),
    refuse:reason=>finish({headers:new Headers(),ok:false,json:async()=>({reason})})};
  };
  const visibleStatus=text=>[...document.querySelectorAll('[data-send-status],[data-hidden-action-status]')]
@@ -8471,7 +8758,7 @@ window.setInterval=()=>0;
 Date.now=()=>Date.parse('2026-11-30T15:00:00Z');
 window.fetch=async(_url,options={})=>{
  if(options.method==='POST') posts.push(new URLSearchParams(options.body));
- return {ok:true,json:async()=>({answer:'later'})};
+ return {ok:true,json:async()=>({answer:'later',words_saved:false})};
 };
 </script>"""
         probe = r"""<script>
@@ -8543,7 +8830,7 @@ window.setInterval=()=>0;window.clearInterval=()=>{};
 window.posts=[];
 window.fetch=async(_url,options={})=>{
  if(options.method==='POST'){
-  window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'later'})};
+  window.posts.push(new URLSearchParams(options.body));return {ok:true,json:async()=>({answer:'later',words_saved:false})};
  }
  return {ok:true,text:async()=>MARKUP};
 };

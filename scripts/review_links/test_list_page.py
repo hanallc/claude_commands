@@ -47,7 +47,7 @@ from scripts.production.update_registration import QuestionStaff
 from scripts.review_links import (browser_test_support, console, go_ledger, list_page, page_frame, serve, staff_names,
                                   studio_page)
 from scripts.review_links import change_browser, change_page, new_item_dialog, page_question, question_record
-from scripts.review_links import review_items, review_link, review_page, search_fold, send_hold
+from scripts.review_links import review_items, review_link, review_page, review_submissions, search_fold, send_hold
 from scripts.review_links.browser_test_support import UNDO_ACTION_SCRIPT, assert_status_states, firefox_probe_results
 from scripts.review_links.server_test_support import started_review_server
 from scripts.review_links.test_change_page import BrowserForms
@@ -1550,6 +1550,179 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         self.assertEqual(window_probe_results(
             {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
 
+    def linked_response_documents(self) -> tuple[bytes, bytes]:
+        """Render the List and its linked Response from private records."""
+        root = self.root / "reviews"
+        doc = self.root / "sdlc.md"
+        _ = doc.write_text('# Production\n> **Status: PRODUCTION — running.**\n'
+                           + f'- **Showrunner checkout:** `{self.root}`\n- **Proposals:** `{self.root / "proposals"}`\n'
+                           + '- **Merge branch:** main\n- **Log:** progress.log\n')
+        owner = replace(OWNER, doc=staff.LiveDoc(local_machine(), doc))
+        members = staff.StaffSnapshot((MORTY, owner))
+        with (patch.object(staff, "snapshot", return_value=members),
+              patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})):
+            sent = review_submissions.submit(new_item_dialog.NewItemRequest(
+                f'r1-{uuid4().hex}-question-{owner.id}', new_item_dialog.SubmissionKind.QUESTION, owner.id,
+                'Which layout should I use?', new_item_dialog.NoEvidence()))
+            self.assertTrue(review_submissions.answer(sent.key, 'Use the wide layout.', sent.reply_token))
+            item = self.add("Check the linked Response")
+            key = review_items.submission_review_key(sent)
+            _ = the_list.link(MORTY.id, item.id, (key,), source="morty")
+            snapshot = review_page.build_snapshot(root)
+            page = list_page.render(root, include_counts=False, review_records=snapshot.records)
+            card = snapshot.body(key, view=review_page.ReviewBodyView.CARD)
+        return page, card
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_linked_response_stays_open_until_the_undo_toast_shows(self) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        page, card = self.linked_response_documents()
+        probe = br'''<script>
+(async()=>{
+ const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
+ const dialog=document.querySelector('[data-list-review-dialog]');
+ const toast=()=>top.document.querySelector('[data-send-undo]');
+ const until=async(ready,label)=>{
+  const end=performance.now()+8000;
+  while(!ready()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ try{
+  document.querySelector('[data-list-review-card]').click();
+  const frame=dialog.querySelector('iframe');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const view=frame.contentWindow,form=frame.contentDocument.querySelector('[data-review-form]');
+  const words='Can I use it on a phone?';
+  let releaseHold;
+  view.fetch=url=>String(url).endsWith('/undo') ? Promise.resolve(view.Response.json({outcome:'undone'})) :
+   new Promise(resolve=>{releaseHold=()=>resolve(view.Response.json({hold:'a'.repeat(24),seconds:30},
+    {status:202,headers:{'X-Send-Hold':'held'}}));});
+  form.elements.feedback.value=words;
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  await until(()=>releaseHold,'The follow-up did not request a hold.');
+  check(dialog.open && !frame.hidden && !toast(),'The List dialog stays open until the hold response.');
+  releaseHold();
+  await until(()=>toast()?.querySelector('button'),'The Undo toast did not show.');
+  check(!dialog.open && frame.hidden && toast().querySelector('span').textContent==='Sent to sdlc.',
+   'The List dialog closes when the toast names the owner.');
+  toast().querySelector('button').click();
+  await until(()=>dialog.open && !frame.hasAttribute('data-saving'),'Undo did not reopen the Response.');
+  check(!frame.hidden && form.elements.feedback.value===words,'Undo returns the same Response and words.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = page.replace(b"</body>", probe + b"</body>", 1)
+        self.assertEqual(window_probe_results(
+            {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_linked_response_closes_after_got_it_with_whitespace(self) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        page, card = self.linked_response_documents()
+        probe = br'''<script>
+(async()=>{
+ const failures=[],dialog=document.querySelector('[data-list-review-dialog]');
+ try{
+  document.querySelector('[data-list-review-card]').click();
+  const frame=dialog.querySelector('iframe');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const view=frame.contentWindow,form=frame.contentDocument.querySelector('[data-review-form]');
+  const result=new Promise(resolve=>{
+   frame.addEventListener('review-card-saved',()=>resolve('saved'),{once:true});
+   frame.addEventListener('review-card-saved-with-draft',()=>resolve('draft'),{once:true});
+  });
+  view.fetch=()=>Promise.resolve(view.Response.json({answer:'marked read',words_saved:false,detail_closed:true}));
+  form.elements.feedback.value=' \n\t\u0085';
+  form.requestSubmit(form.querySelector('[value="read"]'));
+  if(await result!=='saved' || dialog.open || document.querySelector('[data-unsaved-review-key]'))
+   failures.push('Got it closes the List dialog with no unsent words.');
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = page.replace(b"</body>", probe + b"</body>", 1)
+        self.assertEqual(window_probe_results(
+            {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_linked_response_keeps_words_edited_during_a_successful_send(self) -> None:
+        self.check_linked_response_with_later_words(readable=True)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
+    def test_unreadable_linked_response_result_keeps_the_draft(self) -> None:
+        self.check_linked_response_with_later_words(readable=False)
+
+    def check_linked_response_with_later_words(self, *, readable: bool) -> None:
+        from scripts.review_links.test_page_frame import window_probe_results
+
+        page, card = self.linked_response_documents()
+        probe = br'''<script>
+(async()=>{
+ const readable=READABLE,failures=[],dialog=document.querySelector('[data-list-review-dialog]');
+ const toast=()=>top.document.querySelector('[data-send-undo]');
+ const until=async(ready,label)=>{
+  const end=performance.now()+8000;
+  while(!ready()){
+   if(performance.now()>end) throw new Error(label);
+   await new Promise(resolve=>requestAnimationFrame(resolve));
+  }
+ };
+ try{
+  document.querySelector('[data-list-review-card]').click();
+  const frame=dialog.querySelector('iframe');
+  await new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  const view=frame.contentWindow,doc=frame.contentDocument,form=doc.querySelector('[data-review-form]');
+  const sent='Can I use it on a phone?',draft='Can I use it on a narrow tablet?';
+  const hold='a'.repeat(24),posts=[];
+  let releaseHold,completed=false;
+  view.fetch=(url,options)=>{
+   if(String(url).endsWith('/'+hold)){
+    completed=true;
+    return Promise.resolve(readable ? view.Response.json({answer:'follow-up sent',words_saved:true,state:'Waiting',type:'question'})
+     : new view.Response('{"answer":'));
+   }
+   posts.push(new URLSearchParams(options.body).get('feedback'));
+   return new Promise(resolve=>{releaseHold=()=>resolve(view.Response.json({hold,seconds:30},
+    {status:202,headers:{'X-Send-Hold':'held'}}));});
+  };
+  const field=form.elements.feedback;
+  field.value=sent;
+  form.requestSubmit(form.querySelector('[value="question"]'));
+  await until(()=>releaseHold,'The follow-up did not request a hold.');
+  field.value=draft;field.dispatchEvent(new view.Event('input',{bubbles:true}));
+  releaseHold();
+  await until(()=>toast()?.getAnimations().length,'The Undo toast did not show.');
+  toast().getAnimations()[0].finish();
+  await until(()=>completed && !frame.hasAttribute('data-saving'),'The follow-up did not finish.');
+  const message=doc.querySelector('[data-review-card-notice]').textContent;
+  if(!dialog.open || frame.hidden || !field.isConnected || field.value!==draft ||
+   (readable ? message!=='Saved. Your newer words are unsent.' : !message.includes('Could not confirm')))
+   failures.push('The send result returns the dialog with the newer, unsent words.');
+  if(posts.length!==1 || posts[0]!==sent) failures.push('Only the original words were sent.');
+  if(!readable){
+   dialog.querySelector('[data-close]').click();
+   const copy=document.querySelector('[data-unsaved-review-key] textarea');
+   if(dialog.open || !copy?.getClientRects().length || copy.value!==draft)
+    failures.push('Close shows a visible copy of the unconfirmed draft.');
+   document.querySelector('[data-list-review-card]').click();
+   const reopened=dialog.querySelector('iframe');
+   await new Promise(resolve=>reopened.addEventListener('load',resolve,{once:true}));
+   if(reopened.contentDocument.querySelector('[name="feedback"]').value!==draft)
+    failures.push('Reopening the card restores the unconfirmed draft.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        page = page.replace(b"</body>", probe.replace(b"READABLE", json.dumps(readable).encode()) + b"</body>", 1)
+        self.assertEqual(window_probe_results(
+            {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_review_links_open_one_card_without_leaving_the_list(self) -> None:
         root = self.root / "reviews"
@@ -1852,14 +2025,15 @@ async function inspect(){
    }
    return fetchList(url,options);
   };
-  savedWindow.fetch=()=>Promise.resolve(new savedWindow.Response('Invalid JSON'));
+  savedWindow.fetch=(_url,options)=>Promise.resolve(savedWindow.Response.json({
+   answer:'works',words_saved:Boolean(options.body.get('feedback').trim()),detail_unavailable:true}));
   savedForm.requestSubmit(savedForm.querySelector('[value=works]'));
   await reading;
   check(!dialog.open && doc.activeElement===link('sdlc/C1'),
    'The card stays closed and returns focus during the List refresh.');
   const notice=doc.querySelector('[data-review-refresh-error]');
   check(!notice.hidden && notice.textContent==='Saved; the item could not refresh.',
-   'The List reports the unreadable response from a confirmed save.');
+   'The List reports the unavailable detail from a confirmed save.');
   const currentSearch=doc.querySelector('#list-search');
   currentSearch.focus();
   check(doc.activeElement===currentSearch,'Search stays available during the List refresh.');

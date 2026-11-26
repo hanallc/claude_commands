@@ -71,7 +71,7 @@ from scripts.review_links import (
 )
 from scripts.review_links import (
     accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
-    placement_disk, review_actions, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
+    placement_disk, review_actions, review_events, review_later, review_page, review_items, send_hold, serve, studio_page, test_review_page,
 )
 from scripts.lib import atomic_file, conf, file_lock, process_start, scratch, urgency
 from scripts.feature_log import feature_log
@@ -1387,6 +1387,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             status, hold, answer = self.held_http("GET", f"{send_hold.HOLD_PATH}/{fields['hold']}")
             self.assertEqual((status, hold), (200, ""), answer)
             self.assertTrue({"answer", "version", "delivery_pending"} <= answer.keys(), answer)
+            self.assertIs(answer["words_saved"], True)
             self.assertTrue(self.review_posts.wait_until_none_run())
             save.assert_called_once()
         rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
@@ -1409,6 +1410,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual((status, hold, answer.get("answer")), (200, "", "not works: The proof failed."))
             self.assertEqual(answer.get("send_failure"), "Delivery failed: The owner is offline.")
             self.assertFalse(answer["delivery_pending"])
+            self.assertIs(answer["words_saved"], True)
         rows = {row["#"]: row for row in change_review.review_rows(case.fixture.review_list)}
         self.assertEqual(rows["C1"]["Verdict"], "not works: The proof failed.")
 
@@ -5320,7 +5322,8 @@ class ReviewLinksServerTests(unittest.TestCase):
                                              case.card_body(cache.get(), key, outcome, words) + extra,
                                              headers={"Accept-Encoding": "gzip"})
                     self.assertEqual(status, 200, body)
-                    self.assertIsInstance(cast(object, json.loads(body)), dict)
+                    result = cast(dict[str, object], json.loads(body))
+                    self.assertIs(result['words_saved'], bool(words))
         self.assertNotIn(answer, cache.get().records)
         self.assertIsInstance(cache.get().records[later].times.later, datetime)
 
@@ -5552,6 +5555,47 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(question.question_id, asked.question_id)
         self.assertTrue(change_page.answer_item(key, 'The layout changed.', asked.question_id, recovered))
 
+    def test_review_reports_whether_each_action_saved_words(self) -> None:
+        case = self.review_fixture(changes=2)
+        report = case.investigation()
+        investigation_key = f'investigation/{report.owner}/{report.id}'
+        question = case.question()
+        change = 'page-owner/C2'
+        delivery, _ = review_page.submit(case.root, case.body(change, 'question', 'Did the check pass?'), case.status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        pending = case.status.slots(delivery.page, delivery.row).question
+        assert isinstance(pending, change_page.OpenQuestion)
+        self.assertTrue(change_page.answer_item(change, 'The check passed.', pending.question_id, case.status))
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              patch.object(change_page, 'deliver')):
+            for key, action, words, expected in (
+                (investigation_key, 'read', 'I checked the repair.', True),
+                (question, 'answer', 'marked read', True),
+                (change, 'read', 'These words are still a draft.', False),
+            ):
+                with self.subTest(key=key, action=action):
+                    form = case.card_body(cache.get(), key, action, words)
+                    status, body = self.post(review_page.PAGE_PATH, form)
+                    self.assertEqual(status, 200, body)
+                    result = cast(dict[str, object], json.loads(body))
+                    self.assertEqual(result['answer'], 'marked read')
+                    self.assertIs(result.get('words_saved'), expected)
+            form = case.card_body(cache.get(), 'page-owner/C1', 'works', 'The saved verdict.')
+            with patch.object(cache, 'publish_record', side_effect=OSError('Publication failed.')):
+                status, body = self.post(review_page.PAGE_PATH, form)
+            self.assertEqual(status, 200, body)
+            result = cast(dict[str, object], json.loads(body))
+            self.assertIs(result['detail_unavailable'], True)
+            self.assertIs(result.get('words_saved'), True)
+        saved = investigation.load(report.owner, report.id)
+        self.assertEqual(saved.log[-1].words, 'Marked read: I checked the repair.')
+        item = cache.get().records[change]
+        self.assertFalse(item.unread_answer)
+        self.assertNotIn('These words are still a draft.', [event.words for event in item.log])
+
     def test_response_followup_uses_the_same_owner_and_got_it_closes_the_question(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
@@ -5586,8 +5630,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             post = case.card_body(response, key, 'question', followup)
             status, body = self.post(review_page.PAGE_PATH, post)
             self.assertEqual(status, 200, body)
-            result = cast(dict[str, str], json.loads(body))
+            result = cast(dict[str, object], json.loads(body))
             self.assertEqual((result['type'], result['state']), ('question', 'Waiting'))
+            self.assertIs(result['words_saved'], True)
             send.assert_called_once_with(owner.id, change_page.SENDER, ANY)
             message = cast(str, send.call_args.args[2])
             self.assertIn(followup, message)
@@ -5611,11 +5656,69 @@ class ReviewLinksServerTests(unittest.TestCase):
 
             status, body = self.post(review_page.PAGE_PATH, case.card_body(returned, key, 'read'))
             self.assertEqual(status, 200, body)
-            self.assertEqual(cast(dict[str, str], json.loads(body))['state'], 'Done')
+            result = cast(dict[str, object], json.loads(body))
+            self.assertEqual(result['state'], 'Done')
+            self.assertIs(result['words_saved'], False)
             self.assertNotIn(key, cache.get().records)
-            self.assertEqual(update_registration.read_review_question(path, owner.id).status, 'closed')
+            closed = update_registration.read_review_question(path, owner.id)
+            self.assertEqual(closed.status, 'closed')
+            self.assertEqual(review_events.decode(closed.item.get('review_log', ''))[-1].words, 'Marked read')
             self.assertEqual(self.request(card_url).status, 404)
             send.assert_called_once()
+
+    def test_response_got_it_sends_words_and_closes_the_question(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member('producer', name='item-producer')
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        request = case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id)
+        created = cache.create_submission(request)
+        sent = created.saved
+        self.assertTrue(change_page.answer_item(sent.key, 'Use the wide layout.', sent.reply_token, case.status))
+        response, _ = cache.publish_record(cache.get(), created.key)
+        self.assertEqual(response.records[created.key].type, review_items.ReviewType.RESPONSE)
+
+        words = 'Thank you. I will use the wide layout.'
+        with (patch.object(self.server, 'review_cache', cache),
+              patch.object(self.server, 'delivery_status', case.status),
+              capture_sender('send_to_staff') as send):
+            status, body = self.post(review_page.PAGE_PATH, case.card_body(response, created.key, 'read', words))
+        self.assertEqual(status, 200, body)
+        result = cast(dict[str, object], json.loads(body))
+        self.assertEqual(result['state'], 'Done')
+        self.assertIs(result['words_saved'], True)
+        send.assert_called_once_with(owner.id, change_page.SENDER, ANY)
+        message = cast(str, send.call_args.args[2])
+        self.assertIn(words, message)
+        self.assertNotIn(' answer-question ', message)
+        self.assertNotIn(created.key, cache.get().records)
+        closed = update_registration.read_review_question(sent.path, owner.id)
+        self.assertEqual(closed.status, 'closed')
+        self.assertEqual(review_events.decode(closed.item.get('review_log', ''))[-1].words, 'feedback sent: '+words)
+
+    def test_response_reports_delivery_failure_with_undo_off(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member('producer', name='item-producer')
+        _ = write_config_fixture(conf.path("review_links"), "undo_seconds=0\n")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        created = cache.create_submission(case.submission_request(new_item_dialog.SubmissionKind.QUESTION, owner.id))
+        sent = created.saved
+        self.assertTrue(change_page.answer_item(sent.key, 'Use the wide layout.', sent.reply_token, case.status))
+        response, _ = cache.publish_record(cache.get(), created.key)
+        words = 'Thank you for the answer.'
+        form = case.card_body(response, created.key, 'read', words)
+        marked = {send_hold.HOLD_HEADER: "1", "Content-Type": "application/x-www-form-urlencoded"}
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status),
+              patch.object(change_page, "send_to_staff", side_effect=OSError("The owner is offline.")) as send):
+            status, hold, result = self.held_http("POST", review_page.PAGE_PATH, form.encode(), headers=marked)
+            self.assertTrue(self.review_posts.wait_until_none_run())
+        self.assertEqual((status, hold), (200, ""), result)
+        self.assertEqual(result.get("send_failure"), "Delivery failed: The owner is offline.")
+        self.assertIs(result["delivery_pending"], False)
+        self.assertIs(result["words_saved"], True)
+        self.assertIn(words, cast(str, send.call_args.args[2]))
+        saved = update_registration.read_review_question(sent.path, owner.id)
+        self.assertEqual(review_events.decode(saved.item.get('review_log', ''))[-1].words, 'feedback sent: '+words)
 
     def test_review_waits_for_directory_sync_and_list_commit_before_feature_closeout(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)
@@ -5811,6 +5914,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertEqual(code, 200, body)
                 result = cast(dict[str, object], json.loads(body))
                 self.assertIn('Which check passed?', cast(str, result['detail_html']))
+                self.assertIs(result['words_saved'], True)
                 self.assertIs(result['delivery_pending'], True)
                 version_path = review_page.PAGE_PATH + '?' + urlencode({'version': '1', 'delivery': result['delivery']})
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
@@ -6572,7 +6676,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.addCleanup(cache.close)
         snapshot = cache.get()
         self.assertIn(b'<code>github-warmup</code>', snapshot.body(action.key))
-        request = case.card_body(snapshot, action.key, 'done')
+        request = case.card_body(snapshot, action.key, 'done', 'These words are not a completion note.')
         with (patch.object(self.server, 'review_cache', cache),
               patch.object(self.server, 'delivery_status', case.status)):
             status, reply = self.post(review_page.PAGE_PATH, request.replace('token=', 'token=wrong'))
@@ -6581,7 +6685,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             with patch.object(atomic_file, 'sync_folder', side_effect=OSError('The action directory sync failed.')):
                 status, reply = self.post(review_page.PAGE_PATH, request)
             self.assertEqual(status, 200, reply)
-            self.assertEqual(json.loads(reply)['state'], 'Done')
+            result = cast(dict[str, object], json.loads(reply))
+            self.assertEqual(result['state'], 'Done')
+            self.assertIs(result['words_saved'], False)
             completed = store.get(action.key)
             self.assertEqual(completed.status, 'done')
             self.assertTrue(completed.completed_at)
@@ -6589,7 +6695,9 @@ class ReviewLinksServerTests(unittest.TestCase):
             with patch.object(ActionStore, 'mark_done', side_effect=AssertionError('Done must not write again.')):
                 status, reply = self.post(review_page.PAGE_PATH, request)
             self.assertEqual(status, 200, reply)
-            self.assertEqual(json.loads(reply)['state'], 'Done')
+            result = cast(dict[str, object], json.loads(reply))
+            self.assertEqual(result['state'], 'Done')
+            self.assertIs(result['words_saved'], False)
             self.assertEqual(store.get(action.key), completed)
         self.assertNotIn(b'value="done"', cache.get().body(action.key))
 

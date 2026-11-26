@@ -3426,7 +3426,7 @@ const reviewMotion=createCardMotion(()=>content);
 const listHost=window.frameElement?.matches('iframe[data-console-page="list"],iframe[data-console-page="studio"]')
  ? window.frameElement : null;
 let activeReview,refreshingReview=false;
-const savedReviews=new Set(),returnedReviews=[];
+const savedReviews=new Set(),returnedReviews=[],linkedReviewDrafts=new Map();
 const reviewRefreshError=document.querySelector('[data-review-refresh-error]');
 function fitReviewDialog(){
  const phone=(listHost?.ownerDocument.defaultView || window).matchMedia(''' + json.dumps(console.PHONE_QUERY) + r''');
@@ -3471,6 +3471,7 @@ function restoreReviewLink({key,selector,detail,position}){
 function showReviewCard(card){
  activeReview=card;
  card.frame.hidden=false;
+ card.frame.reviewDraft?.reveal();
  card.restoreHost=fitReviewDialog();
  reviewClose.disabled=card.frame.hasAttribute('data-saving');
  reviewDialog.showModal();
@@ -3481,6 +3482,7 @@ function showReviewCard(card){
 }
 function hideReviewCard(card){
  if(activeReview!==card) return;
+ card.frame.reviewDraft?.hide(reviewRefreshError);
  activeReview=null;
  reviewDialog.close();
  card.restoreHost();
@@ -3495,6 +3497,7 @@ function closeReviewCard(){
  if(!card || card.frame.hasAttribute('data-saving')) return;
  reviewMotion.finish();
  hideReviewCard(card);
+ card.frame.reviewDraft?.release();
  card.frame.remove();
  reviewClose.disabled=false;
  reopenReturnedReview();
@@ -3520,10 +3523,7 @@ async function refreshSavedReview(){
 }
 if(listHost) new MutationObserver(()=>{
  if(!listHost.hidden) return;
- const doc=activeReview?.frame.contentDocument;
- const form=doc?.querySelector('[data-review-form]');
- if(!form?.elements.feedback?.value && !form?.elements.later?.value && !doc?.querySelector('[data-review-draft]'))
-  closeReviewCard();
+ if(!activeReview?.frame.reviewDraft?.hasDraft()) closeReviewCard();
 }).observe(listHost,{attributes:true,attributeFilter:['hidden']});
 bindConsoleDialog(reviewDialog,closeReviewCard);
 document.addEventListener('click',event=>{
@@ -3534,6 +3534,7 @@ document.addEventListener('click',event=>{
  if(activeReview || [...reviewDialog.querySelectorAll('iframe[data-saving]')].some(frame=>frame.src===href)) return;
  const frame=document.createElement('iframe');
  frame.title='Review card';
+ frame.linkedReviewDrafts=linkedReviewDrafts;
  frame.src=href;
  const card={frame,link:reviewLinkPlace(link)};
  activeReview=card;
@@ -3566,6 +3567,10 @@ document.addEventListener('click',event=>{
   reviewSaveVersion++;
   savedReviews.add(card);
   refreshAfterListSave(false);
+ });
+ frame.addEventListener('review-card-saved-with-draft',()=>{
+  reviewSaveVersion++;
+  refreshAfterListSave(true);
  });
  reviewDialog.append(frame);
  showReviewCard(card);

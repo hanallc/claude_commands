@@ -948,9 +948,11 @@ An efficiency card shows its ledger line.
 
 Questions offer Answer and Send feedback in the closing group.
 A Response shows the original Question, the owner's latest answer, its time and the log.
-**Got it** closes the native Question.
+**Got it** sends Your words to the owner as feedback and closes the native Question.
+With an empty field, **Got it** marks the Question read and closes it.
 **Ask a follow-up** sends Your words to the same owner with a new reply token for the same key.
-The Your words placeholder names **Ask a follow-up** as the action that sends the text.
+The Your words placeholder explains what each button does.
+When Undo is enabled, the Response stays visible until the follow-up Undo toast appears.
 The Question waits for that reply, then returns as a Response with the same key.
 Both actions retain the current filters.
 
@@ -2841,15 +2843,24 @@ The toast uses the console colors.
 The toast moves to the top open modal dialog, or to the page, so no dialog covers it or makes it inert.
 The toast stays clear for the first half of the time and then fades out. The bar becomes shorter over the full time.
 Images, Review, and List hide the item while the Undo toast is available.
+A Response follow-up in a List dialog stays open until the Undo toast appears.
+The Review save response uses the Boolean `words_saved` to confirm that it saved the submitted words.
+A confirmed send clears only the draft that it sent.
+Review and the List keep newer words in the card or in a copy beside a notice.
 **Undo** posts `/send-hold/<id>/undo`. The server replaces the saved request with an undone mark and answers 200.
 A repeated Undo, after a lost answer, also gets 200.
 The page then shows "Undone. Edit and send again." and keeps the draft.
 **Undo** restores the item. If the item is still open, **Undo** focuses its editable draft field.
 A failed send restores the item and its draft with the failure message.
+Review keeps the draft when the server saves the record and reports a delivery failure.
+Response sends report delivery failures when Undo is off.
+When Review hides or removes a card, the notice shows its unsaved words.
+The notice uses the current draft. A confirmed retry clears the refusal for that draft.
 The New item dialog and the linked Review card reopen with the draft.
 You can open a new draft or another linked card while a send waits.
 The List keeps a separate recovery slot for each unresolved draft in the browser tab.
-If the server confirms a linked card save and its response is unreadable, the List shows the refresh error.
+An unreadable save response keeps the draft and shows that the save is unconfirmed.
+If a confirmed save has unavailable detail, the List shows the refresh error.
 A successful List refresh clears the error.
 A change browser answer goes back in the list with an **Open it** button.
 **Undo** restores the Review or List row in the current sort order.

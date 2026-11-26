@@ -2166,7 +2166,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.browser_failure(503, "The answer could not be saved.", error)
             return
         pending = isinstance(saved.delivery, change_page.MessageDelivery)
-        result: dict[str, object] = {'answer':saved.answer, 'version':saved.version, 'delivery_pending':pending}
+        result: dict[str, object] = {'answer':saved.answer, 'words_saved':saved.words_saved,
+                                     'version':saved.version, 'delivery_pending':pending}
         if isinstance(saved.detail, review_page.ConfirmedReviewDetail):
             result.update(detail_html=saved.detail.body, detail_revision=saved.detail.revision)
         elif isinstance(saved.detail, review_page.ClosedReviewDetail):
@@ -2177,7 +2178,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             later = saved.item.times.later
             result.update(state=saved.item.state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+        response_send = (pending and saved.submitted_type == review_items.ReviewType.RESPONSE
+                         and self.headers.get(send_hold.HOLD_HEADER) == "1")
+        if self.headers.get(send_hold.REPLAY_HEADER) == "1" or response_send:
             delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)
             outcome = self.deliver_review(server, delivery, report_outcome=True)
             result.update(held_delivery_result(outcome, not pending))
