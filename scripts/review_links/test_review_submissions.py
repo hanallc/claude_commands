@@ -2606,7 +2606,7 @@ class PageOwnerReasonTests(unittest.TestCase):
         return route
 
     def test_reason_names_the_owner_that_takes_the_item(self) -> None:
-        for page, owner, expected in (("list", self.morty, "(why morty? because morty owns the List page!)"),
+        for page, owner, expected in (("list", self.morty, "(why morty? because morty owns the Studio page!)"),
                                       ("builds", self.builds, "(why builds? because builds owns the Builds page!)")):
             with self.subTest(page=page):
                 route = self.route(page, owner.id, self.members)

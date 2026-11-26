@@ -115,7 +115,7 @@ The dialog offers Bug, Question, Feedback, Proposal, Investigation, Enhancement,
 The **To** row offers chips for all eligible producers and showrunners in the staff record.
 For a new draft, **To** selects the page owner or the showrunner who receives items for that unit.
 On an unavailable AWS Machines page owned by the AWS unit, **To** selects its showrunner, builds.
-On the **To** line, at its right side, a muted reason says why the server chose that recipient, such as `(why morty? because morty owns the List page!)` and a duck emoji.
+On the **To** line, at its right side, a muted reason says why the server chose that recipient, such as `(why morty? because morty owns the Studio page!)` and a duck emoji.
 The reason shows only while that chip is selected; a long reason wraps onto more lines, aligned right.
 The To group's accessible description reads the reason without the emoji.
 The active List producer appears in the row when `page.list.owner` names its staff ID.
@@ -241,7 +241,7 @@ Selected-row links with `--production NAME C27` still open their own signed `cha
 The console sends `Cache-Control: no-store`, a same-origin content policy, and permits same-origin framing.
 Its title is **Hana console**, followed by the selected page title.
 
-The left navigation has icons and labels for Accounts, AWS, AWS Machines, Builds, Disks, Images, List, Studio, Review and Placement disk POC.
+The navigation shows Accounts, AWS, AWS Machines, Builds, Disks, Images, Studio, Review and Placement disk POC.
 The desktop has no top bar: each page shows its title once, as its own heading.
 Every page uses `page_frame.STYLE`, except the Placement disk POC page.
 That page is a standalone document with its own layout and styles, and it has no status line.
@@ -407,7 +407,7 @@ Review retains typed text across refresh and holds replacement during an active 
 
 The title uses bold 26px text.
 At 560px or less, the edge space is 24px at the top and 16px at the sides.
-Accounts, AWS, Builds, Disks, Images, List, Studio and Review put the title and status line in the same place.
+Accounts, AWS, Builds, Disks, Images, Studio and Review put the title and status line in the same place.
 Its toggle collapses the labels into an icon rail.
 Hover and keyboard focus show each collapsed label.
 The browser stores the collapse state in `localStorage`.
@@ -1349,7 +1349,9 @@ Images has no interval timer.
 The shared status line shows the last server render time.
 The render value's hover text shows the median of at most 10 successful renders.
 
-### The List page
+### List records in the Studio
+
+The Studio shows the numbered List records.
 
 Select a List row to expand its detail below the summary.
 A refresh applies the new data immediately.
@@ -1377,8 +1379,7 @@ An unconfirmed action keeps the row expanded.
 If the current state is unavailable, the row shows the last confirmed state.
 If a refresh removes an open item, its row closes.
 
-`/console/list.html` reads the numbered List records on each request.
-The navigation label is List, and the page title is The List.
+`/console/studio.html` reads the numbered List records on each request.
 The page uses the shared status line in `page_frame.py`.
 The page owner button opens the shared New item dialog.
 For a new draft, **To** selects the owner configured in `page.list.owner`.
@@ -1589,7 +1590,7 @@ If the record disappears, the dialog shows a message.
 Escape, Close, and a click outside the card close the dialog.
 Focus returns to the List link.
 The dialog reaches the right edge of the List column, so it meets the action area and starts below it (`--page-window-top`).
-At the console's phone breakpoint, the dialog fills the screen below the action area, including on the direct List page.
+At the console's phone breakpoint, the dialog fills the screen below the action area, including in the Studio.
 On a desktop, the List centers the dialog horizontally, 16 px below the action area.
 On a page without an action area, the phone dialog fills the screen and the desktop dialog is 16 px from the top.
 The dialog dims the List with a 90 percent black backdrop and a 3 px blur.
@@ -2006,7 +2007,7 @@ A successful send appends the same request ID with the sent state.
 Exhausted tries alert the item owner's showrunner.
 The request becomes alerted only when at least one showrunner receives the alert.
 Failed alerts leave the request pending for repeated POSTs and startup recovery.
-An alerted request shows `not sent to <recipient>; <showrunner> told` until the next item update outside the List page.
+An alerted request shows `not sent to <recipient>; <showrunner> told` until the next item update outside the Studio.
 The server startup hook retries pending List requests separately from change and question recovery.
 A repeated POST retries a pending request without adding another pending log entry.
 Sent and alerted requests do not send again.
@@ -2136,21 +2137,21 @@ A Go sends immediately.
 ### The Studio page
 
 `/console/studio.html` shows the List rows with one picture tab for each producer.
-The navigation label is Studio, with the Lucide `clapperboard` icon, and the page title is The Studio.
-Its `config/console.conf` block follows the List block.
-`studio_page.STUDIO_VIEW` is a `list_page.ListView`, so the page uses the List rows, filters, script and status line.
-`list_page.LIST_VIEW` keeps the List output unchanged.
+The menu shows Studio with the Lucide `clapperboard` icon.
+The page title is The Studio.
+`list_page.render` provides the rows, filters, script and status line.
+The Studio menu entry uses `list_page.waiting_updates` for its New badge.
+The first news request moves the saved List seen set to Studio and keeps any unread updates.
 The Studio shows the Producer row as picture tabs above the filters.
 The Owner and Show rows and the words box stay below the tabs.
-`ListView.placement` puts the List Producer chips beside the words box and the Studio tabs above the filters.
 A render failure gives a 503 page with **The Studio page is not available.** and logs `review-links studio:`.
 
 The tabs are the List Producer filter: `record_table.chip_row('Producer', ...)` with `data-filter-row="producer"`.
-They use the same `staff:<id>` values and the same `#producer=<id>` fragment as the List.
+The tabs use `staff:<id>` values and the `#producer=<id>` fragment.
 All is first. Then each active producer that is not retired follows in name order, also with a count of 0.
 A producer that has rows but no active staff row also gets a tab.
 Each tab shows a picture with the name and the item count on it. A click filters the rows to that producer.
-The counts change with the Owner, Show and words filters, as on the List.
+The counts change with the Owner, Show and words filters.
 
 `studio_avatar_root` in `config/review_links.conf` names the picture folder.
 The All tab reads the folder `all`. A producer tab reads the folder named by its staff ID.
@@ -2168,15 +2169,20 @@ Any other name, a link below the root, a missing file, or a file over 64 KB gets
 A picture goes out as `image/webp` with `Cache-Control: max-age=86400`.
 
 On the Studio, `data-list-path` on `[data-list]` sets the path for row actions and item-state reads to `/console/studio.html`.
-The List uses `location.pathname` for these requests.
-`serve.LIST_VIEWS` maps each path to its view, so both paths use one POST handler with the same Tailscale, origin and form-token checks.
-The view sets the item panels in an action answer, so a Studio action keeps the Studio panel.
-A page refresh reads `location.pathname`, so the Studio refreshes as the Studio.
-Both pages use the shared HTML gzip response.
+The Studio uses the shared HTML gzip response.
+An old List page request redirects to the Studio with the original query.
+The browser keeps the item fragment.
+The console translates `page=list` and `at.list` to `page=studio` and `at.studio` with the same query and fragment.
+When `page=list`, the console opens a valid `at.list` place first.
+If that place is empty or invalid, the console opens a valid `at.studio` place.
+If neither place is valid, the console shows the open Studio frame or opens the Studio home.
+The news endpoint treats `open=list` from an old tab as `open=studio`.
+Review and message links to List items open the Studio.
+The old List path accepts the same POST actions, item-state reads and count reads as the Studio path.
+Both paths use the same Tailscale, origin and form-token checks.
 See [Undo after Send](#undo-after-send) for the actions that use the send hold.
 
 Each producer has one top priority item: the `top_item` List number in its staff row.
-`ListView.top_priority` is `TopPriority.SHOWN` for the Studio and `TopPriority.HIDDEN` for the List, so the List does not change.
 `list_page.top_priority_mark` reads the mark at render time.
 An item is the top item when it is open, its producer is an active producer row, and that row names its number.
 A Closed or missing item reads as no top item, and the page writes nothing when an item closes.
@@ -2792,7 +2798,7 @@ The setting starts at 8765.
 Use `--list-fixture FOLDER` to serve a private List from an existing folder.
 The page owner button on the practice List opens the shared dialog with Send disabled.
 The server reads List records from `FOLDER/records` and staff records from `FOLDER/staff.json`.
-Open `/console/list.html` on the fixture port.
+Open `/console/studio.html` on the fixture port.
 Remove uses the normal List save path in the fixture store.
 The fixture reads dialog recipients from the private staff file.
 Remove is the only action that the fixture accepts.
@@ -2868,7 +2874,7 @@ The Builds page reads these results at `page_refresh_seconds` intervals through 
 The following actions wait so the user can undo them.
 
 1. Review items hold all answers, Later, and Validate.
-2. The List and the Studio hold Tell, Ask question, both Park choices, Unpark, Mark read, and Remove.
+2. The Studio holds Tell, Ask question, both Park choices, Unpark, Mark read, and Remove.
 3. Images holds Approved, Send Feedback, and Ask question.
 4. The New item dialog waits on each console page.
 5. The change browser holds each answer and the question Skip action.
@@ -2958,7 +2964,7 @@ If the server cannot write the result after a replay, the page reads that result
 After a restart, that page reads "may have left".
 If the server cannot write the undone mark, the Undo answers 503 and the send still leaves.
 A page can read a result again until the sweep deletes it, 10 minutes after the send.
-A New item that waited through a restart gets the stale token answer. The List page shows it.
+A New item that waited through a restart gets the stale token answer. The Studio shows it.
 Other pages load a new token and send again, with a new Undo time.
 The `.review-link-` prefix keeps the folder private: a GET of a saved request gets 404.
 An undo needs the console host and origin, as other POST requests do.

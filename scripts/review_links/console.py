@@ -165,6 +165,9 @@ def news(root: Path, pages: tuple[ConsolePage, ...], opened: str) -> tuple[str, 
                 for page, keys in cast(dict[str, object], stored).items() if isinstance(keys, list)}
         fresh: list[str] = []
         updated = dict(seen)
+        identities = {page.identity for page in pages}
+        if "list" in seen and "list" not in identities and "studio" in identities:
+            _ = updated.setdefault("studio", updated.pop("list"))
         request = NewsRequest(root)
         for page in pages:
             if page.items is None or not isinstance(page.destination, AvailablePage):
@@ -175,9 +178,9 @@ def news(root: Path, pages: tuple[ConsolePage, ...], opened: str) -> tuple[str, 
                 print(f"review-links news: {page.identity}: {error}", file=sys.stderr)
                 continue
             # A page with no record starts from its present items, so a first visit marks nothing as new.
-            if page.identity == opened or page.identity not in seen:
+            if page.identity == opened or page.identity not in updated:
                 updated[page.identity] = items
-            elif items - seen[page.identity]:
+            elif items - updated[page.identity]:
                 fresh.append(page.identity)
         if updated != seen:
             atomic_file.write_text_atomic(folder / SEEN_NAME, json.dumps(
@@ -655,6 +658,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
   const placeKey = identity => 'at.' + identity;
   const legacyTypes = new Map([['changes','change'],['questions','question'],['investigations','investigation']]);
   const reviewEntry = entries.find(entry => entry.dataset.page === 'review');
+  const studioEntry = entries.find(entry => entry.dataset.page === 'studio');
   const storageKey = 'admin-console.navigation-collapsed';
   let desktopCollapsed = false;
   try { desktopCollapsed = localStorage.getItem(storageKey) === 'true'; } catch (_) {}
@@ -673,17 +677,38 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
       try { localStorage.setItem(storageKey, String(value)); } catch (_) {}
     }
   }
-  function placeOf(entry, stored) {
+  function validPlace(entry, stored, oldPath = '') {
     const base = entry.dataset.url;
-    if (!base || !stored) return base;
+    if (!base || !stored?.trim()) return;
     try {
       const target = new URL(stored, location.href);
       // A recorded place stays on the page's own path, so a link cannot frame another page.
-      if (target.origin === location.origin && target.pathname === new URL(base, location.href).pathname) {
-        return target.pathname + target.search + target.hash;
+      const path = new URL(base, location.href).pathname;
+      if (target.origin === location.origin && (target.pathname === path || target.pathname === oldPath)) {
+        return path + target.search + target.hash;
       }
     } catch (_) {}
-    return base;
+  }
+  const placeOf = (entry, stored) => validPlace(entry, stored) ?? entry.dataset.url;
+  function studioPlace(url) {
+    if (!studioEntry || entries.some(entry => entry.dataset.page === 'list')) return false;
+    const params = url.searchParams;
+    const openStudio = params.get('page') === 'list';
+    const oldKey = placeKey('list');
+    const key = placeKey('studio');
+    if (!openStudio && !params.has(oldKey)) return false;
+    const listPlace = validPlace(studioEntry, params.get(oldKey), '/console/list.html');
+    if (openStudio) {
+      params.set('page', 'studio');
+      const requested = listPlace ?? validPlace(studioEntry, params.get(key));
+      const place = requested ?? (frames.has('studio') ? '' : studioEntry.dataset.url);
+      if (place) params.set(key, place);
+      else params.delete(key);
+    } else if (listPlace && !params.has(key)) {
+      params.set(key, listPlace);
+    }
+    params.delete(oldKey);
+    return true;
   }
   function record(entry) {
     let place, state = history.state;
@@ -865,6 +890,7 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     if (!link || link.hasAttribute('download')) return;
     const url = new URL(link.href);
     if (url.origin !== location.origin || url.pathname !== '/console/') return;
+    studioPlace(url);
     const identity = url.searchParams.get('page');
     if (reviewEntry && legacyTypes.has(identity)) {
       event.preventDefault();
@@ -921,7 +947,9 @@ aria-controls="console-nav" aria-expanded="false" aria-label="Open navigation"><
     const review = pages.find(entry => entry.dataset.page === 'review');
     if (review) openConsolePlace(review, url);
   });
-  select(new URL(location.href).searchParams.get('page'));
+  const start = new URL(location.href);
+  if (studioPlace(start)) history.replaceState(history.state, '', start);
+  select(start.searchParams.get('page'));
   function refresh() { loadRebuilds(); loadNews(); actions.refresh(); }
   function scheduleRebuilds() {
     clearInterval(rebuildTimer);

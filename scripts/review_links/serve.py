@@ -92,8 +92,8 @@ CONSOLE_DOCUMENTS = {
     placement_disk.PAGE_PATH: "placement_disk", studio_page.PAGE_PATH: "list",
 }
 
-# Each List view answers its page, its item-state reads and its item actions at its own path.
-LIST_VIEWS = {view.path: view for view in (list_page.LIST_VIEW, studio_page.STUDIO_VIEW)}
+# Keep the old action path for open tabs and held sends.
+LIST_ACTION_PATHS = frozenset((list_page.PAGE_PATH, studio_page.PAGE_PATH))
 
 
 def capture_page_key(root: Path, place: str) -> str:
@@ -942,7 +942,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         route = urlsplit(self.path)
         fixture_options = route.path == review_page.NEW_ITEM_PATH and route.query == "page=list"
         held = route.path.startswith(send_hold.HOLD_PATH + "/")
-        if server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH and not fixture_options and not held:
+        fixture_page = route.path in LIST_ACTION_PATHS or route.path.startswith(f"{studio_page.AVATAR_PATH}/")
+        if server.mode is ServerMode.LIST_FIXTURE and not fixture_page and not fixture_options and not held:
             self.send_error(404)
             return None
         if held:
@@ -1056,8 +1057,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             prepared = snapshot.page_gzip if content is snapshot.page and owned is content else b""
             self.encoded_response(200, owned, "text/html; charset=utf-8", {}, prepared, cache_gzip=True)
             return None
-        if route.path in LIST_VIEWS:
-            self.list_document(route.query, LIST_VIEWS[route.path])
+        if route.path in LIST_ACTION_PATHS:
+            self.list_document(route.path, route.query)
             return None
         if route.path.startswith(f"{studio_page.AVATAR_PATH}/"):
             return self.studio_avatar(route.path.removeprefix(f"{studio_page.AVATAR_PATH}/"))
@@ -1285,7 +1286,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         server = cast(ReviewLinksServer, self.server)
         route = urlsplit(self.path)
-        if (server.mode is ServerMode.LIST_FIXTURE and route.path != list_page.PAGE_PATH
+        if (server.mode is ServerMode.LIST_FIXTURE and route.path not in LIST_ACTION_PATHS
                 and not route.path.startswith(send_hold.HOLD_PATH + "/")):
             self.send_error(404)
             return
@@ -1345,9 +1346,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if route.path == investigations_page.PAGE_PATH:
             self._write_post(self.investigation_post)
             return
-        if route.path in LIST_VIEWS:
-            view = LIST_VIEWS[route.path]
-            self._write_post(lambda: self.list_post(view))
+        if route.path in LIST_ACTION_PATHS:
+            self._write_post(self.list_post)
             return
         if route.path == go_ledger.GO_PATH:
             self._write_post(self.go_post)
@@ -2101,15 +2101,18 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             return None
         return self.attachment_response(content, media)
 
-    def list_document(self, query: str, view: list_page.ListView) -> None:
-        """Answer a List view: the page, or the List counts and item state it reads."""
+    def list_document(self, path: str, query: str) -> None:
+        """Serve the Studio document and the List read routes."""
         server = cast(ReviewLinksServer, self.server)
         if query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
             self.list_counts(include_linked_reviews=query == list_page.COUNTS_AND_LINKS_QUERY)
             return
         fields = parse_qs(query)
         if "item-state" in fields:
-            self.list_action_state(fields, view)
+            self.list_action_state(fields)
+            return
+        if path == list_page.PAGE_PATH:
+            self.redirect(studio_page.PAGE_PATH + (f"?{query}" if query else ""))
             return
         delivery = server.item_delivery_pending(fields.get('delivery', [''])[0])
         try:
@@ -2120,12 +2123,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                            status=server.delivery_status, query=query,
                                            review_records=(list_page.LinkedReviewRead.AFTER_RENDER
                                                            if live and reviews is list_page.LinkedReviewRead.FROM_DISK
-                                                           else reviews),
-                                           view=view)
+                                                           else reviews))
                 content = owned_document(content, "list")
         except (OSError, ValueError) as error:
-            print(f"review-links {view.log_name}: {error}", file=sys.stderr)
-            self.html_response(503, change_page.document(f"<p>{html.escape(view.title)} page is not available.</p>"))
+            print(f"review-links studio: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document(f"<p>{studio_page.TITLE} page is not available.</p>"))
             return
         self.html_response(200, content, delivery_pending=delivery)
 
@@ -2415,7 +2417,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     content += '<template data-list-review-read-error></template>'
             self.html_response(200, content.encode())
 
-    def list_action_state(self, fields: dict[str, list[str]], view: list_page.ListView) -> None:
+    def list_action_state(self, fields: dict[str, list[str]]) -> None:
         """Read the current item after an action response is lost."""
         server = cast(ReviewLinksServer, self.server)
         try:
@@ -2428,7 +2430,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                                                        park_request=park_request, include_detail=True,
                                                        not_fixed_request=not_fixed_request,
                                                        review_records=server.list_review_records(),
-                                                       top_priority=view.top_priority)
+                                                       top_priority=list_page.TopPriority.SHOWN)
         except ValueError as error:
             self.browser_failure(400, "The List item is unavailable.", error)
         except OSError as error:
@@ -2436,8 +2438,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         else:
             self.json_response(200, current)
 
-    def list_post(self, view: list_page.ListView) -> None:
-        """Save a List view's item action before the shared sender starts."""
+    def list_post(self) -> None:
+        """Save a List item action before the shared sender starts."""
         server = cast(ReviewLinksServer, self.server)
         fixture = server.mode is ServerMode.LIST_FIXTURE
         fields: dict[str, list[str]] = {}
@@ -2453,7 +2455,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 submission, current = list_page.save_action(
                     server.root, body, server.delivery_status,
                     review_records=server.list_review_records(), include_detail=True,
-                    top_priority=view.top_priority)
+                    top_priority=list_page.TopPriority.SHOWN)
         except the_list.RepairCheckRefused as error:
             if fields.get("action") == [the_list.ReportVerdict.NOT_FIXED]:
                 receipt = list_page.NotFixedReceipt(request=error.request, state=list_page.NotFixedReceiptState.REFUSED)
@@ -2523,7 +2525,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 raise ValueError("invalid List Go size")
             body = self.rfile.read(length).decode("utf-8")
             with server.list_store_access():
-                go_id, current = list_page.save_go(server.root, server.store_folder, body, client, views=LIST_VIEWS,
+                go_id, current = list_page.save_go(server.root, server.store_folder, body, client,
                                                    review_records=server.list_review_records())
         except ValueError as error:
             self.browser_failure(400, str(error), error)
@@ -2628,10 +2630,16 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     elif page.items is images.waiting_images:
                         page = replace(page, items=partial(images.waiting_images, status=server.delivery_status))
                     pages.append(page)
-                # Rebuilds has no navigation entry, so its request uses an empty name.
-                if len(opened) != 1 or opened[0] not in {"", *(page.identity for page in pages)}:
+                if len(opened) != 1:
                     raise ValueError("name one console page or none")
-                fresh = console.news(server.root, tuple(pages), opened[0])
+                identities = {page.identity for page in pages}
+                identity = opened[0]
+                if identity == "list" and "list" not in identities and "studio" in identities:
+                    identity = "studio"
+                # Rebuilds has no navigation entry, so its request uses an empty name.
+                if identity and identity not in identities:
+                    raise ValueError("name one console page or none")
+                fresh = console.news(server.root, tuple(pages), identity)
         except ValueError as error:
             self.browser_failure(400, "Name one console page.", error)
             return
