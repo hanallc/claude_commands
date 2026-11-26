@@ -18,7 +18,7 @@ from scripts.lib import process_start, unit_runs
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.notify import review
 from scripts.production import behavior_check, behavior_review, session_staff, staff, update_registration, worker
-from scripts.review_links import review_events
+from scripts.review_links import reply_proofs, review_events
 
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
@@ -419,11 +419,30 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         scope = update_registration.ProducerQuestions(self.producer)
         records = update_registration.native_question_records(scope, self.identities, strict=True)
         by_id = {record.item.get("review_id"): record for record in records}
-        self.assertEqual(by_id[first.question_id].item.get("request_key"), key)
-        self.assertEqual(by_id[second.question_id].item.get("request_key"), second_key)
+        self.assertTrue(update_registration.question_request(by_id[first.question_id]) == key)
+        self.assertTrue(update_registration.question_request(by_id[second.question_id]) == second_key)
+        self.assertTrue(all("request_key" not in record.path.read_text() for record in records))
         self.assertEqual(by_id[second.question_id].item["text"], title)
         self.assertTrue(all(record.status == "open" for record in records))
 
+
+    def test_move_restores_staff_question_retry_and_answer(self) -> None:
+        _, key, waiting, question = self.filed_question()
+        clean = question.path.read_text()
+        identity = reply_proofs.StaffQuestionIdentity(question.owner, waiting.question_id)
+        reply_proofs.path_for(identity).unlink()
+        old = clean.replace("registration: {", "registration: {" + json.dumps({"request_key": key})[1:-1] + ", ", 1)
+        _ = question.path.write_text(old)
+        with self.assertRaisesRegex(behavior_check.BehaviorCheckError, "Cannot read the behavior question"):
+            _ = behavior_review.question_answer(key, waiting.owner, waiting.question_id)
+        self.assertEqual(update_registration.move_reply_proof(question.path, dry_run=True), 1)
+        self.assertTrue(question.path.read_text() == old)
+        self.assertFalse(reply_proofs.path_for(identity).exists())
+        self.assertEqual(update_registration.move_reply_proof(question.path, dry_run=False), 1)
+        self.assertEqual(update_registration.move_reply_proof(question.path, dry_run=False), 0)
+        self.assertFalse("request_key" in question.path.read_text())
+        self.assertEqual(behavior_review.ask(key, MOVE_QUESTION, self.producer.name), waiting)
+        self.assertEqual(behavior_review.question_answer(key, waiting.owner, waiting.question_id), waiting)
 
     def test_yes_requires_the_original_closed_question_and_the_users_yes(self) -> None:
         args, key, waiting, question = self.filed_question()

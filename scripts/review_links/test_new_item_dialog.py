@@ -2246,20 +2246,20 @@ window.fetch = (path, options) => {
                 probe = script.replace("__LIST__", json.dumps(page == "list"))
                 self.assertEqual(firefox_probe_results(bug_fixture_page(script=probe)), [[]])
 
-    def test_legacy_reply_token_has_the_same_digest_as_the_stored_proof(self) -> None:
-        token = "a" * 43
-        details = new_item_dialog.ReviewSubmission("fixture", "b" * 64, new_item_dialog.NoEvidence(), (),
-                                                  reply_tokens.digest(token))
+    def test_submission_metadata_never_supplies_a_reply_proof(self) -> None:
+        token = reply_tokens.RawReplyToken("a" * 43)
+        proof = reply_tokens.LegacyReplyProof(reply_tokens.digest(token))
+        details = new_item_dialog.ReviewSubmission(
+            "fixture", "b" * 64, new_item_dialog.NoEvidence(), (), reply_proof=proof)
         fields = new_item_dialog.stored_submission(details)
-        self.assertEqual(fields.get("reply_token_sha256"), reply_tokens.digest(token))
-        self.assertNotIn(token, json.dumps(fields))
-        del fields["reply_token_sha256"]
+        self.assertFalse("reply_token_sha256" in fields)
+        self.assertFalse("reply_proof" in fields)
         fields["reply_token"] = token
+        fields["reply_token_sha256"] = proof.sha256
         restored = new_item_dialog.read_submission(fields)
-        self.assertEqual(restored, details)
-        new_item_dialog.require_reply_token(restored, token)
         with self.assertRaises(new_item_dialog.SubmissionError):
-            new_item_dialog.require_reply_token(restored, "b" * 43)
+            new_item_dialog.require_reply_token(restored, token)
+        new_item_dialog.require_reply_token(restored.with_reply_proof(proof), token)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_list_token_refresh_clears_a_retired_recipient(self) -> None:

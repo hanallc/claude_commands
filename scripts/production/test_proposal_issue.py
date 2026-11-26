@@ -100,7 +100,8 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(proposal_issue.number([original], date(2026, 11, 17)), ["number a proposal.md: P1"])
         recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
         token = "r" + "b" * 42
-        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), token)
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (),
+            reply_proof=reply_tokens.LegacyReplyProof(reply_tokens.digest(reply_tokens.RawReplyToken(token))))
         with self.assertRaisesRegex(proposal_issue.Refusal, "omit-file-path: /tmp/layout.png"):
             _ = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Read /tmp/layout.png.",
                                                     "hana answers this", details)
@@ -109,8 +110,8 @@ class ProposalIssueTests(unittest.TestCase):
                                                     "hana answers this", details)
         self.assertEqual(issue.value("proposal_id"), "P2")
         note = issue.path.read_text(encoding="utf-8")
-        self.assertNotIn(token, note)
-        self.assertIn(reply_tokens.digest(token), note)
+        self.assertFalse(token in note)
+        self.assertFalse("reply_token_sha256" in note)
         self.assertEqual(proposal_issue.number([issue.path], date(2026, 11, 17)), ["number next proposal.md: P2"])
         archive = self.root / proposal_issue.ARCHIVE
         archive.mkdir(parents=True)
@@ -129,7 +130,8 @@ class ProposalIssueTests(unittest.TestCase):
         former.mkdir()
         legacy = former / "legacy.md"
         _ = legacy.write_text(VAULT_ISSUE.replace("---\n", "---\nproposal_id: P8\n", 1))
-        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (),
+            reply_proof=reply_tokens.LegacyReplyProof(reply_tokens.digest(reply_tokens.RawReplyToken("a" * 43))))
         prepared: list[tuple[str, Path]] = []
 
         def file() -> Issue:
@@ -152,7 +154,8 @@ class ProposalIssueTests(unittest.TestCase):
     def test_approve_clears_the_waiting_mark_of_a_review_submission(self) -> None:
         folder = self.root / "issues"
         recipient = next(row.id for row in staff.snapshot().rows if row.name == "hana")
-        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        details = new_item_dialog.ReviewSubmission("request-1", "a" * 64, new_item_dialog.NoEvidence(), (),
+            reply_proof=reply_tokens.LegacyReplyProof(reply_tokens.digest(reply_tokens.RawReplyToken("a" * 43))))
         today = date(2026, 11, 17)
         issue = proposal_issue.file_review_proposal(folder, recipient, "Next proposal", "Words",
                                                     "hana answers this", details)
@@ -165,18 +168,21 @@ class ProposalIssueTests(unittest.TestCase):
                                                    issue.value("proposal_id"), details.request_id)
         self.assertFalse(reply_tokens.path().exists())
         with self.assertRaisesRegex(new_item_dialog.SubmissionError, "no longer accepts"):
-            _ = proposal_issue.reply_to_submission(issue.path, key, "Stale reply", details.reply_token, owner=key.recipient_id)
+            _ = proposal_issue.reply_to_submission(issue.path, key, "Stale reply", "a" * 43, owner=key.recipient_id)
 
-    def test_number_replaces_a_legacy_reply_token_with_its_hash(self) -> None:
+    def test_move_replaces_a_legacy_proposal_token_with_a_private_hash(self) -> None:
         token = "r" + "b" * 42
         fields: dict[str, object] = {"request_id": "request-1", "request_digest": "a" * 64,
                                      "evidence": {"kind": "none"}, "images": [], "reply_token": token}
         text, _ = proposal_issue.set_fields(VAULT_ISSUE, {"review_submission": json.dumps(fields)}, self.issue)
         _ = self.issue.write_text(text)
 
-        self.assertEqual(proposal_issue.number([self.issue], date(2026, 11, 17)), ["number a proposal.md: P1"])
+        self.assertEqual(proposal_issue.move_reply_proof(self.issue, dry_run=True), 1)
+        self.assertEqual(proposal_issue.move_reply_proof(self.issue, dry_run=False), 1)
+        self.assertEqual(proposal_issue.move_reply_proof(self.issue, dry_run=False), 0)
         note = self.issue.read_text()
-        self.assertNotIn(token, note)
+        self.assertFalse("reply_token" in note)
+        self.assertFalse(token in note)
         origin = proposal_issue.review_submission(Issue(self.issue, frontmatter(self.issue)))
         assert isinstance(origin, new_item_dialog.ReviewSubmission)
         self.assertTrue(new_item_dialog.matches_reply_token(origin, token))

@@ -31,7 +31,7 @@ class ScopedWait:
     proof: reply_tokens.ReplyTokenProof = field(default_factory=reply_tokens.mint)
 
     def command(self) -> change_page.ScopedReplyCommand:
-        return {"key": self.key, "token_sha256": self.proof.sha256}
+        return {"key": self.key, "exchange": reply_tokens.exchange_id(self.proof.sha256)}
 
 
 @dataclass(frozen=True)
@@ -172,7 +172,7 @@ def sent_question_action(item: review_items.ReviewItem, record: update_registrat
         'message':message,'kind':action}
     if isinstance(scoped, ScopedWait):
         command = scoped.command()
-        saved['question_id'] = command['token_sha256']
+        saved['question_id'] = change_page.scoped_reply_exchange(command)
         saved['question_text'] = words
         saved['scoped_reply'] = command
         saved['message'] = message.replace(change_page.reply_command(item.key),
@@ -268,7 +268,7 @@ def send(item: review_items.ReviewItem, path: Path, row: str, message: str, save
         if isinstance(scoped, ScopedWait):
             command = scoped.command()
             saved['scoped_reply'] = command
-            identity = command['token_sha256']
+            identity = change_page.scoped_reply_exchange(command)
             reply = change_page.reply_command(scoped.key)
         else:
             identity = secrets.token_hex(4)
@@ -354,9 +354,14 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
             review_submissions.clear_initial_delivery(address)
             return change_page.NoMessageDelivery()
 
-        command: change_page.ScopedReplyCommand = {'key': saved.key, 'token_sha256': saved.details.reply_token_sha256}
+        proof = saved.details.reply_proof
+        if isinstance(proof, reply_tokens.MissingReplyProof):
+            raise reply_tokens.UnavailableReplyToken("The item has no proof for delivery.")
+        command: change_page.ScopedReplyCommand = {'key': saved.key, 'exchange': reply_tokens.exchange_id(proof.sha256)}
+        saved_command = stored.saved.get('scoped_reply') if isinstance(stored, change_page.ReviewMessagePage) else None
         if (isinstance(stored, change_page.ReviewMessagePage) and stored.saved.get('submission_request') == row
-                and stored.saved.get('scoped_reply') == command):
+                and saved_command is not None and saved_command['key'] == saved.key
+                and new_item_dialog.matches_reply_reference(saved.details, change_page.scoped_reply_exchange(saved_command))):
             page = stored
         else:
             evidence = ""

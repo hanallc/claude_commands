@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from datetime import date, datetime, timezone
@@ -37,7 +37,7 @@ from scripts.production import change_review, investigation, next_item, producti
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
 from scripts.production.staff_test_support import fixture_runtime_id
-from scripts.review_links import change_browser, change_page, image_store, new_item_dialog, question_record, reply_tokens, review_actions, review_events, review_items, review_page, review_submissions as submissions
+from scripts.review_links import change_browser, change_page, image_store, new_item_dialog, question_record, reply_proofs, reply_tokens, review_actions, review_events, review_items, review_page, review_submissions as submissions
 
 OWNER = staff.StaffId("builds-staff")
 PRODUCER = staff.StaffId("producer-staff")
@@ -207,9 +207,10 @@ class ReviewSubmissionTests(unittest.TestCase):
                 token = submitted.reply_token
                 self.assertTrue(token)
                 note = submitted.path.read_text(encoding="utf-8")
-                self.assertIn(reply_tokens.digest(token), note)
-                self.assertIn(submitted.details.reply_token_nonce, note)
-                self.assertNotIn(token, note)
+                self.assertFalse(any(name in note for name in reply_proofs.SUBMISSION_FIELDS))
+                proof = submissions.current_reply_proof(submitted.key)
+                self.assertTrue(reply_tokens.matches(proof.sha256, reply_tokens.RawReplyToken(token)))
+                self.assertFalse(token in note)
         question, = self.questions()
         self.assertEqual((question.item.get("review_id"), question.owner, question.item.get("question")),
                          ("Q1", OWNER, request().words))
@@ -231,6 +232,39 @@ class ReviewSubmissionTests(unittest.TestCase):
         self.assertEqual([item.id for item in investigation.records(OWNER, sources=sources)], ["I1", "I2"])
         self.assertIn(investigation.folder(OWNER), sources)
         self.assertIn(investigation.folder(OWNER) / "I2.md", sources)
+
+    def test_question_filing_keeps_peer_note_and_saves_proof_after_a_path_collision(self) -> None:
+        scope = read_production(OWNER, self.members)
+        kind = submissions.SubmissionKind.QUESTION
+
+        def file(title: str, before_write: Callable[[str, Path], None]) -> update_registration.QuestionRecord:
+            payload = request(kind, title)
+            details = new_item_dialog.ReviewSubmission(payload.request_id, "a" * 64, payload.evidence, (),
+                                                        reply_proof=reply_tokens.mint())
+            parts = update_registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
+            return update_registration.ask(
+                scope, title, parts, "", update_registration.Ranking(), identities=self.identities,
+                outgoing=update_registration.QuestionFromReview(title, "The owner answers.", details, before_write))
+
+        peer = file("First question", lambda _number, _path: None)
+        peer.item["followups"] = [{"followup": "First question", "reply": "The peer answered."}]
+        update_registration.write_question_record(peer)
+        original = peer.path.read_bytes()
+        occupied: list[Path] = []
+
+        def occupy(_number: str, path: Path) -> None:
+            if not occupied:
+                occupied.append(peer.path.rename(path))
+
+        saved = file("Second question", occupy)
+        collision, = occupied
+        self.assertTrue(collision.read_bytes() == original)
+        self.assertEqual(saved.path, collision.with_stem(collision.stem + "-2"))
+        self.assertEqual(saved.item.get("review_id"), "Q2")
+        self.assertFalse("reply_token_sha256" in saved.path.read_text())
+        origin = update_registration.review_submission(saved)
+        self.assertIsInstance(origin.reply_proof, reply_tokens.ReplyTokenProof)
+        self.assertTrue(new_item_dialog.matches_reply_token(origin, origin.reply_token))
 
     def test_producer_uses_its_default_and_configured_stores(self) -> None:
         question = submissions.submit(request(submissions.SubmissionKind.QUESTION, recipient=PRODUCER))
@@ -505,6 +539,7 @@ class ReviewSubmissionTests(unittest.TestCase):
         key = reply_tokens.path()
         original_key = key.read_bytes()
         original_token = second.reply_token
+        second_proof = submissions.current_reply_proof(second.key)
         self.assertEqual(key.stat().st_mode & 0o777, 0o600)
         home = self.root / "fixture-home"
         inside = self.root / "review" / "state"
@@ -527,7 +562,7 @@ class ReviewSubmissionTests(unittest.TestCase):
                 _ = overlapping_key.write_bytes(original_key)
                 overlapping_key.chmod(0o600)
                 with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "outside the served Review Links root"):
-                    _ = reply_tokens.derive(second.details.reply_proof)
+                    _ = reply_tokens.derive(second_proof)
         served = self.root / "review"
         spelling = self.root / "review-alias"
         spelling.symlink_to(served, target_is_directory=True)
@@ -554,12 +589,12 @@ class ReviewSubmissionTests(unittest.TestCase):
             self.assertFalse(mac_key.exists())
             ssh.side_effect = subprocess.CalledProcessError(1, "ssh")
             with self.assertRaisesRegex(reply_tokens.UnavailableReplyToken, "Cannot copy the reply key from natedev"):
-                _ = reply_tokens.derive(second.details.reply_proof)
+                _ = reply_tokens.derive(second_proof)
             self.assertFalse(mac_key.exists())
             ssh.side_effect = None
             ssh.reset_mock()
             ssh.return_value = subprocess.CompletedProcess([], 0, original_key, b"")
-            self.assertEqual(reply_tokens.derive(second.details.reply_proof), original_token)
+            self.assertEqual(reply_tokens.derive(second_proof), original_token)
             proof = reply_tokens.mint()
             token = reply_tokens.derive(proof)
             ssh.assert_called_once()
@@ -575,7 +610,7 @@ class ReviewSubmissionTests(unittest.TestCase):
 
             mac_key.unlink()
             ssh.side_effect = copy_with_race
-            self.assertEqual(reply_tokens.derive(second.details.reply_proof), original_token)
+            self.assertEqual(reply_tokens.derive(second_proof), original_token)
             self.assertEqual(mac_key.read_bytes(), original_key)
         self.assertEqual(reply_tokens.derive(proof), token)
 
@@ -586,12 +621,12 @@ class ReviewSubmissionTests(unittest.TestCase):
             with (self.subTest(kind=kind), patch.object(review, "review_question", side_effect=accept) as reader):
                 first = submissions.submit(request(kind, kind))
                 reader.reset_mock()
-                proof = first.details.reply_proof
+                proof = submissions.current_reply_proof(first.key)
                 token = reply_tokens.derive(proof)
                 self.assertEqual(token, first.reply_token)
                 self.assertEqual(key.read_bytes(), original_key)
-                for invalid in ("", second.reply_token, "✓"):
-                    with self.subTest(token=invalid):
+                for invalid in ("", second.reply_token, proof.sha256, "✓"):
+                    with self.subTest(invalid=bool(invalid)):
                         with self.assertRaisesRegex(question_record.AnswerRefused, "token does not match"):
                             _ = change_page.answer_item(first.key, "An answer", invalid, status)
                 with patch.object(reply_tokens, "path", return_value=key.with_suffix(".absent")):
@@ -621,73 +656,181 @@ class ReviewSubmissionTests(unittest.TestCase):
                             _ = change_page.answer_item(first.key, "An answer", first.reply_token, status)
         self.assertEqual(investigation.load(OWNER, second.id), untouched)
 
-    def test_scrub_preserves_notes_and_legacy_replies_without_a_key(self) -> None:
-        opened = [submissions.submit(request(kind, "open")) for kind in submissions.SubmissionKind]
-        archived = opened[-1]
-        archive = archived.path.parent / "archive"
-        archive.mkdir(exist_ok=True)
-        opened[-1] = replace(archived, path=archived.path.rename(archive / archived.path.name))
-        closed = submissions.submit(request(submissions.SubmissionKind.QUESTION, "closed"))
+    def put_proof_in_old_note(self, saved: submissions.SavedSubmission, *, raw: bool = False) -> str:
+        proof = submissions.current_reply_proof(saved.key)
+        token = reply_tokens.derive(proof)
+        identity = reply_proofs.SubmissionIdentity(saved.id, saved.request_id)
+        reply_proofs.path_for(identity).unlink()
+        original = saved.path.read_bytes()
+        old_fields = {"reply_token": token} if raw else {
+            "reply_token_sha256": proof.sha256, "reply_token_nonce": proof.nonce,
+        }
+        fields = ', ' + json.dumps(old_fields)[1:-1]
+        if saved.kind in (submissions.SubmissionKind.INVESTIGATION, submissions.SubmissionKind.BUG):
+            marker = json.dumps('"images": []')[1:-1]
+            fields = json.dumps(fields)[1:-1]
+        else:
+            marker = '"images": []'
+        self.assertTrue(marker.encode() in original)
+        _ = saved.path.write_bytes(original.replace(marker.encode(), (marker + fields).encode(), 1))
+        return token
+
+    def test_proof_move_writes_without_scanning_and_restart_reads_only_headers(self) -> None:
+        saved = submissions.submit(request(submissions.SubmissionKind.INVESTIGATION))
+        _ = self.put_proof_in_old_note(saved)
+        proof_path = reply_proofs.path_for(saved.details.proof_identity(saved.id))
+        staging = proof_path.with_name(f".{proof_path.name}.0.locked.tmp")
+        _ = staging.write_bytes(b"Interrupted write")
+        iterdir = Path.iterdir
+
+        def list_directory(path: Path) -> Iterator[Path]:
+            if path == proof_path.parent:
+                raise AssertionError("A proof write scanned its siblings.")
+            return iterdir(path)
+
+        with patch.object(Path, "iterdir", autospec=True, side_effect=list_directory):
+            self.assertEqual(submissions.move_reply_proofs(self.members, dry_run=False), (1, 2))
+        self.assertTrue(proof_path.is_file())
+        self.assertFalse(staging.exists())
+        read_text = Path.read_text
+
+        def read(path: Path, encoding: str | None = None, errors: str | None = None,
+                 newline: str | None = None) -> str:
+            if path == saved.path:
+                raise AssertionError("The restart read the whole note.")
+            return read_text(path, encoding=encoding, errors=errors, newline=newline)
+
+        with patch.object(Path, "read_text", autospec=True, side_effect=read):
+            self.assertEqual(submissions.move_reply_proofs(self.members, dry_run=False), (0, 0))
+
+    def test_move_uses_the_legacy_question_and_investigation_owners(self) -> None:
+        scope = read_production(OWNER, self.members)
+        title = "Which check passed?"
+        parts = update_registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
+        key = reply_proofs.StaffQuestionRequestKey("fixture-request")
+        outgoing = update_registration.KeyedStaffQuestion(key)
+        with patch.object(update_registration, "review_open_question",
+                          return_value=update_registration.ReviewedQuestion(title, title)):
+            question = update_registration.ask(scope, title, parts, "", update_registration.Ranking(),
+                                               identities=self.identities, outgoing=outgoing)
+        self.assertEqual(question.path.parent, self.issues)
+        identity = reply_proofs.StaffQuestionIdentity(OWNER, question.item.get("review_id", ""))
+        reply_proofs.path_for(identity).unlink()
+        note = question.path.read_text().replace(f"production_id: {OWNER}\n", "")
+        legacy_key = json.dumps({"request_key": key})[1:-1]
+        _ = question.path.write_text(note.replace("registration: {", f"registration: {{{legacy_key}, ", 1))
+
+        report = submissions.submit(request(submissions.SubmissionKind.INVESTIGATION))
+        token = self.put_proof_in_old_note(report)
+        note = report.path.read_bytes()
+        owner_line = f"owner: {json.dumps(str(OWNER))}\n".encode()
+        self.assertTrue(owner_line in note)
+        _ = report.path.write_bytes(note.replace(owner_line, b"", 1))
+
+        self.assertEqual(submissions.move_reply_proofs(self.members, dry_run=False), (2, 3))
+        found = update_registration.keyed_question(scope, self.identities, key)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.path, found.owner), (question.path, OWNER))
+        self.assertTrue(submissions.answer(report.key, "The check passed.", token))
+
+    def test_move_keeps_existing_replies_for_vault_and_state_notes(self) -> None:
+        kinds = submissions.SubmissionKind
+        vault = submissions.submit(request(kinds.QUESTION, "vault"))
+        state = submissions.submit(request(kinds.QUESTION, "state", recipient=PRODUCER))
+        proposal = submissions.submit(request(kinds.PROPOSAL, "vault"))
+        report = submissions.submit(request(kinds.INVESTIGATION, "state"))
+        bug = submissions.submit(request(kinds.BUG, "state"))
+        archive = bug.path.parent / "archive"
+        archive.mkdir()
+        notes = (vault, state, proposal, report, replace(bug, path=bug.path.rename(archive / bug.path.name)))
+        self.assertEqual(vault.path.parent, self.issues)
+        self.assertEqual(state.path.parent, record_store.default_question_folder(PRODUCER))
+        clean = {item.path: item.path.read_bytes() for item in notes}
+        tokens = [self.put_proof_in_old_note(item) for item in notes]
+        old = {item.path: item.path.read_bytes() for item in notes}
+
+        for item, token in zip(notes, tokens, strict=True):
+            with self.subTest(kind=item.kind), self.assertRaisesRegex(submissions.SubmissionError, "token does not match"):
+                _ = submissions.answer(item.key, "The proof must be in the store.", token)
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(submissions.main(["move-reply-proofs", "--dry-run"]), 0)
+        self.assertEqual(output.getvalue(), "5 notes, 10 fields\n")
+        self.assertFalse(tuple(reply_proofs.folder().glob("*.json")))
+        self.assertTrue(all(item.path.read_bytes() == old[item.path] for item in notes))
+
+        self.assertEqual(submissions.move_reply_proofs(self.members, dry_run=False), (5, 10))
+        self.assertTrue(all(item.path.read_bytes() == clean[item.path] for item in notes))
+        before = {item.path: item.path.stat().st_mtime_ns for item in notes}
+        self.assertEqual(submissions.move_reply_proofs(self.members, dry_run=False), (0, 0))
+        self.assertEqual({item.path: item.path.stat().st_mtime_ns for item in notes}, before)
+
+        reply_tokens.path().unlink()
+        for item, token in zip(notes, tokens, strict=True):
+            with self.subTest(kind=item.kind):
+                self.assertTrue(submissions.answer(item.key, "The old link works.", token))
+                self.assertFalse(submissions.answer(item.key, "The old link works.", token))
+
+    def test_move_command_scans_an_extra_root_and_dry_run_only_counts(self) -> None:
+        saved = submissions.submit(request(submissions.SubmissionKind.QUESTION))
+        self.assertEqual(saved.path.parent, self.issues)
+        clean = saved.path.read_bytes()
+        token = self.put_proof_in_old_note(saved)
+        legacy = saved.path.read_bytes()
+        proof = reply_proofs.path_for(saved.details.proof_identity(saved.id))
+        registration = record_store.state_root() / "review-folders" / OWNER / "question.json"
+        registration.unlink()
+        command = ["move-reply-proofs", "--root", str(self.issues)]
+
+        with redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
+            self.assertEqual(submissions.main(["move-reply-proofs", "--dry-run"]), 0)
+        self.assertEqual(output.getvalue(), "0 notes, 0 fields\n")
+        self.assertEqual(errors.getvalue(), "")
+
+        with redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
+            self.assertEqual(submissions.main([*command, "--dry-run"]), 0)
+        self.assertEqual(output.getvalue(), "1 notes, 2 fields\n")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertTrue(saved.path.read_bytes() == legacy)
+        self.assertFalse(proof.exists())
+
+        with redirect_stdout(StringIO()) as output, redirect_stderr(StringIO()) as errors:
+            self.assertEqual(submissions.main(command), 0)
+        self.assertEqual(output.getvalue(), "1 notes, 2 fields\n")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertTrue(saved.path.read_bytes() == clean)
+        self.assertTrue(proof.is_file())
+        self.assertTrue(submissions.answer(saved.key, "The restored link works.", token))
+
+    def test_moved_legacy_raw_token_keeps_its_reply_and_closed_refusal(self) -> None:
+        kind = submissions.SubmissionKind.QUESTION
+        opened = submissions.submit(request(kind, "open"))
+        closed = submissions.submit(request(kind, "closed"))
         self.assertTrue(submissions.answer(closed.key, "The owner replied.", closed.reply_token))
         record = update_registration.read_review_question(closed.path)
         update_registration.review_sent_question(record, read_production(OWNER, self.members), "read", "")
-        notes = [*opened, closed]
-        tokens = {item.key: item.reply_token for item in notes}
-        originals: dict[Path, bytes] = {}
-        for item in notes:
-            blob = item.path.read_bytes()
-            for quote in ('"', r'\"'):
-                blob = blob.replace(
-                    f', {quote}reply_token_nonce{quote}: {quote}{item.details.reply_token_nonce}{quote}'.encode(), b"")
-            self.assertNotIn(b"reply_token_nonce", blob)
-            originals[item.path] = blob
-            legacy = blob.replace(b"reply_token_sha256", b"reply_token", 1)
-            _ = item.path.write_bytes(legacy.replace(item.details.reply_token_sha256.encode(),
-                                                      tokens[item.key].encode(), 1))
+        open_token = self.put_proof_in_old_note(opened, raw=True)
+        closed_token = self.put_proof_in_old_note(closed, raw=True)
+        self.assertEqual(submissions.move_reply_proofs(self.members, dry_run=False), (2, 2))
+        reply_tokens.path().unlink()
+        self.assertTrue(submissions.answer(opened.key, "The old link works.", open_token))
+        with self.assertRaisesRegex(submissions.SubmissionError, "no longer accepts"):
+            _ = submissions.answer(closed.key, "The owner replied.", closed_token)
 
-        key = reply_tokens.path()
-        previous_key = key.with_suffix(".previous")
-        _ = key.rename(previous_key)
-        note = update_registration.read_review_question(opened[0].path)
-        legacy_details = new_item_dialog.read_submission(note.item.get("review_submission"))
-        new_item_dialog.require_reply_token(legacy_details, tokens[opened[0].key])
+    def test_moved_hash_only_wait_can_retry_delivery(self) -> None:
+        payload = request(submissions.SubmissionKind.PROPOSAL)
+        saved = submissions.submit(payload)
+        original = self.put_proof_in_old_note(saved, raw=True)
+        self.assertEqual(submissions.move_reply_proofs(self.members, dry_run=False), (1, 1))
+        status = change_page.DeliveryStatus(self.root / "review")
+        delivery = review_actions.prepare_submission_delivery(saved, saved.words, status)
+        assert isinstance(delivery, change_page.MessageDelivery)
+        token = submissions.submit(payload).reply_token
+        self.assertTrue(token != original)
+        self.assertTrue(change_page.reply_command(saved.key, token) in change_page.outbound_review_message(delivery).text)
         with self.assertRaisesRegex(submissions.SubmissionError, "token does not match"):
-            new_item_dialog.require_reply_token(legacy_details, tokens[closed.key])
-
-        with redirect_stdout(StringIO()) as output:
-            self.assertEqual(submissions.main(["scrub-reply-tokens"]), 0)
-        self.assertCountEqual(output.getvalue().splitlines(), [f"Rewrote {item.path}" for item in notes])
-        for item in notes:
-            self.assertEqual(item.path.read_bytes(), originals[item.path])
-        before = {item.path: item.path.stat().st_mtime_ns for item in notes}
-        with redirect_stdout(StringIO()) as output:
-            self.assertEqual(submissions.main(["scrub-reply-tokens"]), 0)
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual({item.path: item.path.stat().st_mtime_ns for item in notes}, before)
-        self.assertFalse(key.exists())
-
-        archived = opened[-1]
-        self.assertTrue(submissions.answer(archived.key, "Reply while archived.", tokens[archived.key]))
-        status = change_page.DeliveryStatus(key.parent)
-        for item in opened[:-1]:
-            with self.subTest(kind=item.kind):
-                saved = submissions.submit(request(item.kind, "open"))
-                self.assertEqual(saved.details.reply_token_nonce, "")
-                delivery = review_actions.prepare_submission_delivery(saved, saved.words, status)
-                assert isinstance(delivery, change_page.MessageDelivery)
-                current = submissions.submit(request(item.kind, "open"))
-                self.assertTrue(reply_tokens.valid_nonce(current.details.reply_token_nonce))
-                token = current.reply_token
-                self.assertIn(change_page.reply_command(current.key, token), change_page.outbound_review_message(delivery).text)
-                self.assertNotIn(token.encode(), current.path.read_bytes())
-                with self.assertRaisesRegex(submissions.SubmissionError, "token does not match"):
-                    _ = submissions.answer(current.key, "The old token fails.", tokens[item.key])
-                self.assertTrue(submissions.answer(current.key, "The new token works.", token))
-                with patch.object(reply_tokens, "path", return_value=key.with_suffix(".absent")):
-                    answered = submissions.submit(request(item.kind, "open"))
-                    self.assertIsInstance(review_actions.prepare_submission_delivery(answered, answered.words, status),
-                                          change_page.NoMessageDelivery)
-        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+            _ = submissions.answer(saved.key, "A stale answer.", original)
+        self.assertTrue(submissions.answer(saved.key, "The new link works.", token))
 
     def test_f001_generated_reply_command_uses_the_derived_token(self) -> None:
         saved = submissions.submit(request())
@@ -944,18 +1087,39 @@ class ReviewSubmissionTests(unittest.TestCase):
         assert isinstance(delivery, change_page.MessageDelivery)
         return shlex.split(change_page.outbound_review_message(delivery).text.splitlines()[-1])[2:]
 
+    def test_interrupted_followup_keeps_the_proof_for_the_saved_wait(self) -> None:
+        class Interrupted(BaseException):
+            pass
+
+        writers = {
+            submissions.SubmissionKind.QUESTION: (update_registration, "write_question_record"),
+            submissions.SubmissionKind.PROPOSAL: (proposal_issue, "write_issue"),
+            submissions.SubmissionKind.INVESTIGATION: (investigation.Investigations, "write"),
+            submissions.SubmissionKind.BUG: (investigation.Investigations, "write"),
+        }
+        status = change_page.DeliveryStatus(self.root / "review")
+        for kind, (module, writer) in writers.items():
+            with self.subTest(kind=kind):
+                saved = submissions.submit(request(kind))
+                previous = submissions.current_reply_proof(saved.key)
+                with patch.object(module, writer, side_effect=Interrupted), self.assertRaises(Interrupted):
+                    _ = self.replace_review_wait(saved, "Check again", status)
+                self.assertTrue(submissions.current_reply_proof(saved.key) == previous)
+                self.assertTrue(change_page.answer_item(saved.key, "The original reply", saved.reply_token, status))
+
     def test_f013_replacement_voids_the_first_token(self) -> None:
         status = change_page.DeliveryStatus(self.root / "review")
         for kind in submissions.SubmissionKind:
             with self.subTest(kind=kind):
                 saved = submissions.submit(request(kind))
                 original = saved.reply_token
+                previous_proof = submissions.current_reply_proof(saved.key)
                 command = self.replace_review_wait(saved, "Check again", status)
                 token = command[command.index("--question") + 1]
                 current = submissions.submit(request(kind))
                 self.assertEqual(current.reply_token, token)
                 self.assertNotEqual(token, original)
-                self.assertNotEqual(current.details.reply_token_nonce, saved.details.reply_token_nonce)
+                self.assertTrue(submissions.current_reply_proof(current.key) != previous_proof)
                 before = saved.path.read_bytes()
                 with self.assertRaisesRegex(question_record.AnswerRefused, "token does not match"):
                     _ = change_page.answer_item(saved.key, "Stale reply", original, status)

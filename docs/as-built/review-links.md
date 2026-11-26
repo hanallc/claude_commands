@@ -956,13 +956,16 @@ Both actions retain the current filters.
 
 #### Reply tokens for New item
 
-The native Question, Proposal, Investigation or Bug stores `review_submission.reply_token_nonce` and
-`review_submission.reply_token_sha256`.
+Review stores each reply proof in `review-reply-proofs` under the showrunner state folder.
+The default folder is `~/.local/state/showrunner/review-reply-proofs`.
+The proof stays with the item number and request ID when the item changes folder or owner.
+Each follow-up selects a proof by the reply wait revision in the note.
+Review saves the new proof before it changes the note and retains the previous proof.
+The store also holds staff question request keys for retry.
 Each new item or wait gets a random nonce.
 Review derives a 43-character token from the nonce and the shared key with HMAC-SHA256.
-The note stores only the nonce and the SHA-256 hash for this token.
 The reply command hashes its token and compares the hashes in constant time.
-Either machine can verify a reply from the note alone.
+A missing proof refuses the reply.
 
 Each server stores the 32-byte secret key in `$XDG_STATE_HOME/review-links/reply-token.key` with mode `0600`.
 The default path is `~/.local/state/review-links/reply-token.key`.
@@ -973,23 +976,34 @@ natedev creates the key once when it needs to mint a token.
 On first use, the Mac copies the key from natedev over SSH and checks its size before saving it.
 If another process saves the key first, the Mac reads that file.
 Both servers keep the existing key if they cannot read it or if it has an invalid size.
-New delivery records store the submission key and hash.
-The sender reads the nonce from the note and checks the derived token against the hash before sending it.
+New delivery records store the submission key and a reply exchange ID.
+The sender reads the proof from the state store and checks the derived token before sending it.
 If token derivation fails during delivery, the server records a delivery failure and returns HTTP 503.
 Send uses the transport result even if the server cannot save the delivery failure.
 The dialog shows the error and keeps the draft for another Send.
 A retry after the wait ends returns the existing item without sending another message.
 
-From the repository, run `scripts/lib/py -m scripts.review_links.review_submissions scrub-reply-tokens`.
-The command finds native records in their current folders, former folders and archives.
-It replaces each old `reply_token` field with its SHA-256 hash.
-It changes no other fields and creates no nonce.
-It prints each note it changes.
-A second scrub makes no changes.
-The old token still verifies after the scrub.
-A Send that needs to deliver a legacy wait writes a new nonce and hash.
-A replacement wait also writes a new nonce and hash.
-The old token stops working when the note gets the new hash.
+Run `scripts/lib/py -m scripts.review_links.review_submissions move-reply-proofs --dry-run` to count legacy notes and fields.
+A wrap saves a legacy proof under the transfer locks before it publishes the destination note without proof fields.
+The server finishes interrupted transfers before it moves legacy proofs.
+The move holds the same transfer lock as wrap through the pending transfer check and the scan.
+The server checks note headers and reads the full record for each note with a legacy proof field.
+The move scans the vaults in `staff.producer_folder_root` and `issue_score.vault_root`.
+It also scans the native state stores, the stores in the local folder registry, and both archive layouts.
+After you restore an external or former store, run this command with its root.
+
+```sh
+scripts/lib/py -m scripts.review_links.review_submissions move-reply-proofs --root <folder>
+```
+
+Add `--dry-run` to count the notes and fields without moving them.
+The move skips source notes that vanish during discovery or a read.
+The move requests remote staff records only to resolve an unknown legacy Question owner.
+The server moves legacy proofs under the record writers' locks before it binds its socket.
+The move syncs the proof folder in its parent before it removes the fields from the note.
+A failed move stops the server before it can serve requests.
+Run the move before serving notes that still hold proof fields.
+Each server that handles scoped replies needs the proof store for the records it serves.
 
 #### Other Review actions
 

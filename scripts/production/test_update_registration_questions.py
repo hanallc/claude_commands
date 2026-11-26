@@ -17,7 +17,7 @@ from typing import ClassVar, cast, override
 from unittest import mock
 
 from scripts.production import proposal_issue, proposals_folder, staff
-from scripts.review_links import new_item_dialog, reply_tokens
+from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
 from scripts.production.cli_fixture import invoke_cli
@@ -47,12 +47,14 @@ class RegistrationTests(RegistrationFixture):
     def test_f079_new_question_keeps_the_answer_at_a_late_collision(self) -> None:
         identities = registration.QuestionStaff.read()
         scope = registration.question_scope(self.owner_id, identities.record)
-        token = "r" + "b" * 42
+        token = reply_tokens.RawReplyToken("r" + "b" * 42)
+        proof = reply_tokens.LegacyReplyProof(reply_tokens.digest(token))
 
         def file(title: str, before_write: Callable[[str, Path], None]) -> registration.QuestionRecord:
             nonce = hashlib.sha256(title.encode()).hexdigest()[:32]
             request = f"r1-{nonce}-question-{self.owner_id}"
-            details = new_item_dialog.ReviewSubmission(request, "a" * 64, new_item_dialog.NoEvidence(), (), token)
+            details = new_item_dialog.ReviewSubmission(request, "a" * 64, new_item_dialog.NoEvidence(), (),
+                                                       reply_proof=proof)
             parts = registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
             return registration.ask(
                 scope, title, parts, "", registration.Ranking(), identities=identities,
@@ -71,19 +73,23 @@ class RegistrationTests(RegistrationFixture):
 
         saved = file("Second question", sync_answer)
         collision, = occupied
-        self.assertEqual(collision.read_bytes(), original)
+        self.assertTrue(collision.read_bytes() == original)
         self.assertEqual(saved.path, collision.with_stem(collision.stem + "-2"))
         self.assertEqual(saved.item.get("review_id"), "Q2")
         note = saved.path.read_text(encoding="utf-8")
-        self.assertNotIn(token, note)
-        self.assertIn(reply_tokens.digest(token), note)
+        self.assertFalse(token in note)
+        self.assertFalse(proof.sha256 in note)
+        self.assertFalse(any(field in note for field in reply_proofs.SUBMISSION_FIELDS))
+        details = new_item_dialog.read_submission(saved.item.get("review_submission"))
+        identity = reply_proofs.SubmissionIdentity("Q2", details.request_id)
+        self.assertTrue(reply_proofs.read(identity).reply == proof)
 
     def test_f072_question_numbering_scans_the_former_folder(self) -> None:
         identities = registration.QuestionStaff.read()
         scope = registration.question_scope(self.owner_id, identities.record)
 
-        def file(title: str, token: str) -> registration.QuestionRecord:
-            details = new_item_dialog.ReviewSubmission(token, "a" * 64, new_item_dialog.NoEvidence(), (), "a" * 43)
+        def file(title: str, request_id: str) -> registration.QuestionRecord:
+            details = new_item_dialog.ReviewSubmission(request_id, "a" * 64, new_item_dialog.NoEvidence(), ())
             parts = registration.QuestionParts(ask=title, context="", items=[], recommend="", choices=[])
             _ = registration.ask(scope, title, parts, "", registration.Ranking(), identities=identities,
                                  outgoing=registration.QuestionFromReview(title, "The owner answers.", details, lambda _id, _path: None))

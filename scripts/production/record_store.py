@@ -21,7 +21,7 @@ from typing import NamedTuple, cast
 
 from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, prepared_replacement, sync_folder, write_bytes_atomic, write_text_atomic
 from scripts.lib.file_lock import exclusive
-from scripts.lib import git_files
+from scripts.lib import conf, git_files
 from scripts.lib.showrunner_state import state_root as state_root
 from scripts.agents.remote import local_machine
 from scripts.production import issues, staff
@@ -442,6 +442,79 @@ def stored_paths(folders: Iterable[Path], *, strict: bool = False,
                 raise
 
 
+def _configured_vault(stem: str, key: str) -> Iterator[Path]:
+    settings = conf.read(stem)
+    if not settings.repository_allowed:
+        try:
+            _ = settings.source.stat()
+        except FileNotFoundError:
+            return
+    yield Path(settings.text(key)).expanduser().resolve()
+
+
+@dataclass(frozen=True)
+class ReviewScanFolder:
+    path: Path
+    recursive: bool
+
+
+def _review_scan_entries(folder: Path) -> tuple[os.DirEntry[str], ...]:
+    with os.scandir(folder) as stream:
+        return tuple(stream)
+
+
+def local_review_paths(extra_roots: Iterable[Path] = ()) -> Iterator[Path]:
+    """Scan configured vaults, native stores, and registered or explicit stores."""
+    vaults = (*_configured_vault("staff", "producer_folder_root"), *_configured_vault("issue_score", "vault_root"))
+    state = state_root()
+    native = owner_state_paths(state, "questions", "investigations", "proposals", strict=True)
+    archives = owner_state_paths(state, "archive", strict=True)
+    registrations = owner_state_paths(state / "review-folders", *(kind.value + ".json" for kind in RecordKind), strict=True)
+    registered = (folder for registration in registrations for folder in _registered_folders(registration))
+    stores = tuple(dict.fromkeys(path.expanduser().resolve() for path in chain(native, registered, extra_roots)))
+    pending = [
+        *(ReviewScanFolder(path, False) for path in stores),
+        *(ReviewScanFolder(path, True) for path in (*archive_folders(stores), *(path.resolve() for path in archives))),
+        *(ReviewScanFolder(path, True) for path in vaults),
+    ]
+    visited: set[ReviewScanFolder] = set()
+    notes: set[Path] = set()
+    while pending:
+        folder = pending.pop()
+        if folder in visited:
+            continue
+        visited.add(folder)
+        try:
+            entries = _review_scan_entries(folder.path)
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            try:
+                if folder.recursive and entry.name != ".git" and entry.is_dir(follow_symlinks=False):
+                    pending.append(ReviewScanFolder(Path(entry.path), True))
+                    continue
+                if not entry.name.endswith(".md") or not entry.is_file(follow_symlinks=False):
+                    continue
+            except FileNotFoundError:
+                continue
+            path = Path(entry.path)
+            if path not in notes:
+                notes.add(path)
+                yield path
+
+
+@dataclass(frozen=True)
+class VanishedReviewNote:
+    """A writer removed the note before the migration could read it."""
+
+
+def read_note_for_proof_move(path: Path) -> str | VanishedReviewNote:
+    try:
+        return path.read_text(encoding="utf-8", newline="")
+    except FileNotFoundError:
+        return VanishedReviewNote()
+
+
 def read_header(path: Path, *, sources: list[Path] | None = None, keys: frozenset[str] = ALL_FIELDS,
                 select: Callable[[Issue], bool] | None = None, strict: bool = False) -> dict[str, list[str]]:
     """Read a header. A source collector requires readable files."""
@@ -456,15 +529,20 @@ def read_header(path: Path, *, sources: list[Path] | None = None, keys: frozense
 def number_fields(path: Path, keys: frozenset[str]) -> Issue:
     """Read every byte and report a file that cannot supply its fields."""
     try:
-        first, _, tail = path.read_text(encoding="utf-8").partition("\n")
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise OSError(f"Cannot read record {path}: {error}") from error
+    return record_text_fields(path, text, keys)
+
+
+def record_text_fields(path: Path, text: str, keys: frozenset[str] = ALL_FIELDS) -> Issue:
+    first, _, tail = text.partition("\n")
     if first.strip() == "---":
         header: list[str] = []
         for line in tail.split("\n"):
             if line.strip() == "---":
                 return Issue(path, header_fields(header, keys))
-            header.append(line)
+            header.append(line.removesuffix("\r"))
     return Issue(path, {})
 
 
@@ -881,6 +959,9 @@ class NumberedRecords:
             raise self.error_type(f"{identity}: no {self.noun} for owner {self.owner}") from None
         except UnicodeDecodeError as error:
             raise self.invalid(identity, error) from None
+        return self.parse_text(identity, text)
+
+    def parse_text(self, identity: str, text: str) -> RecordText:
         try:
             if not text.startswith("---\n"):
                 raise ValueError("missing frontmatter")
