@@ -2296,8 +2296,10 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
+               + '<div class="studio-tab-row">'
                + studio_page.tabs(producer_chips, producer_selected)
                + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
+               + '</div>'
                + top_bands(top_items, today, names)
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)

@@ -83,7 +83,12 @@ def tabs(chips: Iterable[record_table.Chip], selected: str) -> str:
 
 
 STYLE = '''<style>
-.studio-tabs .record-filter-row{display:block;margin-bottom:12px}
+.studio-tab-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-bottom:12px}
+.studio-tab-row>.record-filter-words{margin-block:0}
+.studio-tab-row>.record-filter-words input{display:block}
+@media(max-width:620px){.studio-tab-row>.record-filter-words{width:100%}}
+.studio-tabs{max-width:100%}
+.studio-tabs .record-filter-row{display:block;margin-bottom:0}
 .studio-tabs .record-filter-row>span{display:none}
 .studio-tabs .record-filter-row>div{gap:10px}
 .studio-tabs [data-filter-row] button{position:relative;display:block;width:88px;height:88px;padding:0;
