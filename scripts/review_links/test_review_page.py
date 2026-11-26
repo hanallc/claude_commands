@@ -386,7 +386,8 @@ class ReviewPageTests(unittest.TestCase):
             with self.subTest(key=created.key):
                 self.assertEqual(snapshot.records[created.key], cache.get().records[created.key])
                 self.assertNotIn(created.key, {item.key for item in review_items.read_open(self.root)})
-                self.assertTrue(change_page.answer_item(created.saved.key, 'The check passed.', created.saved.reply_token, self.status))
+                with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+                    self.assertTrue(change_page.answer_item(created.saved.key, 'The check passed.', created.saved.reply_token, self.status))
         open_keys = {item.key for item in review_items.read_open(self.root)}
         new_keys = {item.key for item in published}
         self.assertEqual(open_keys & new_keys, {item.key for item in published[:2]})
@@ -403,7 +404,8 @@ class ReviewPageTests(unittest.TestCase):
         cache = review_page.ReviewSnapshotCache(self.root, start_worker=False)
         created = cache.create_submission(request)
         before = cache.get().render(show='all').decode()
-        self.assertTrue(review_submissions.answer(created.saved.key, 'Use the wide layout.', created.saved.reply_token))
+        with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+            self.assertTrue(review_submissions.answer(created.saved.key, 'Use the wide layout.', created.saved.reply_token))
         fresh = review_page.build_snapshot(self.root)
         self.assertEqual(fresh.records[created.key].type, review_items.ReviewType.RESPONSE)
 

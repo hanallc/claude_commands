@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
-from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -59,6 +57,63 @@ class ExchangeAnswer:
 
 
 @dataclass(frozen=True)
+class QuestionRecord:
+    identity: str
+
+
+@dataclass(frozen=True)
+class QuestionSlot:
+    identity: str
+
+
+@dataclass(frozen=True)
+class QuestionEvent:
+    position: int
+    tag: str = ""
+    slot_id: str = ""
+
+
+type QuestionOrigin = QuestionRecord | QuestionSlot | QuestionEvent
+
+
+@dataclass(frozen=True)
+class TaggedReply:
+    tag: str
+
+
+@dataclass(frozen=True)
+class LoggedReply:
+    position: int
+    digest: str
+
+
+class UnloggedReply(StrEnum):
+    IN_SLOT = "answer held only in the slot"
+    NO_ANSWER = "no saved answer"
+
+
+type ReplyOrigin = TaggedReply | LoggedReply | UnloggedReply
+
+
+@dataclass(frozen=True)
+class ExchangeBinding:
+    question: QuestionOrigin
+    reply: ReplyOrigin
+
+    @property
+    def slot_id(self) -> str:
+        if isinstance(self.question, QuestionSlot):
+            return self.question.identity
+        if isinstance(self.question, QuestionEvent):
+            return self.question.slot_id or self.question.tag
+        return ""
+
+
+class UnboundExchange(StrEnum):
+    LEGACY = "no binding recorded"
+
+
+@dataclass(frozen=True)
 class Exchange:
     source: Source
     source_key: str
@@ -69,7 +124,7 @@ class Exchange:
     asker: StaffId | Nate
     answerer: StaffId | Nate | RecordedAnswerer
     answer: ExchangeAnswer | QuestionWithoutAnswer
-    mirrored_slot_exchange_id: str = field(default="", compare=False, kw_only=True)
+    binding: ExchangeBinding | UnboundExchange = field(default=UnboundExchange.LEGACY, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -79,51 +134,82 @@ class FiledExchange(Exchange):
     @classmethod
     def from_exchange(cls, value: Exchange) -> FiledExchange:
         return cls(value.source, value.source_key, value.exchange_id, value.direction, value.question,
-                   value.asked_at, value.asker, value.answerer, value.answer)
+                   value.asked_at, value.asker, value.answerer, value.answer, binding=value.binding)
+
+    def updated(self, current: Exchange) -> FiledExchange:
+        """Keep the saved answer and binding as the source changes."""
+        incoming = self.from_exchange(current)
+        binding = incoming.binding
+        if isinstance(self.binding, ExchangeBinding):
+            if not isinstance(binding, ExchangeBinding) or self.binding.question != binding.question:
+                return self
+            if isinstance(self.answer, ExchangeAnswer):
+                if self.binding.reply != binding.reply and not isinstance(binding.question, QuestionRecord):
+                    return self
+                binding = self.binding
+        if isinstance(self.answer, QuestionWithoutAnswer):
+            return incoming
+        if not isinstance(incoming.answer, ExchangeAnswer) or self.answer.text != incoming.answer.text:
+            return self
+        time = self.answer.time if isinstance(self.answer.time, datetime) else incoming.answer.time
+        return replace(incoming, answer=ExchangeAnswer(self.answer.text, time, incoming.answer.read), binding=binding)
 
 
-def _legacy_content(exchange: Exchange, answer: ExchangeAnswer) -> FiledExchange:
-    return replace(FiledExchange.from_exchange(exchange), exchange_id="", answer=replace(answer, read=AnswerRead.UNKNOWN))
+def _store_binding(binding: ExchangeBinding) -> dict[str, dict[str, str | int]]:
+    match binding.question:
+        case QuestionEvent(position, tag, slot_id):
+            question: dict[str, str | int] = {"kind": "event", "position": position, "tag": tag, "slot_id": slot_id}
+        case QuestionSlot(identity):
+            question = {"kind": "slot", "id": identity}
+        case QuestionRecord(identity):
+            question = {"kind": "record", "id": identity}
+    match binding.reply:
+        case TaggedReply(tag):
+            reply: dict[str, str | int] = {"kind": "tag", "tag": tag}
+        case LoggedReply(position, digest):
+            reply = {"kind": "event", "position": position, "digest": digest}
+        case UnloggedReply() as unlogged:
+            reply = {"kind": unlogged}
+    return {"question": question, "reply": reply}
 
 
-def retain_legacy_ids[Entry: Exchange](exchanges: tuple[Entry, ...], saved: Iterable[FiledExchange]) -> tuple[Entry, ...]:
-    """Keep the filed ID when one anonymous log exchange matches one old slot exchange."""
-    current_ids = {(exchange.source_key, exchange.exchange_id) for exchange in exchanges}
-    saved_ids: set[tuple[str, str]] = set()
-    old_ids: set[tuple[str, str]] = set()
-    old_slots: dict[FiledExchange, list[str]] = defaultdict(list)
-    for exchange in saved:
-        key = exchange.source_key, exchange.exchange_id
-        saved_ids.add(key)
-        if (exchange.source is Source.SCOPED_REPLY and exchange.exchange_id.startswith("question:")
-                and key not in current_ids and isinstance(exchange.answer, ExchangeAnswer)):
-            old_ids.add(key)
-            old_slots[_legacy_content(exchange, exchange.answer)].append(exchange.exchange_id)
-    if not old_ids:
-        return exchanges
-    identified = list(exchanges)
-    claimed: set[tuple[str, str]] = set()
-    log_entries: dict[FiledExchange, list[int]] = defaultdict(list)
-    for index, exchange in enumerate(exchanges):
-        if (exchange.source is not Source.SCOPED_REPLY or not exchange.exchange_id.startswith("log:")
-                or not isinstance(exchange.answer, ExchangeAnswer)):
-            continue
-        content = _legacy_content(exchange, exchange.answer)
-        log_entries[content].append(index)
-        alias = exchange.source_key, exchange.mirrored_slot_exchange_id
-        if alias in old_ids and alias not in claimed and (exchange.source_key, exchange.exchange_id) not in saved_ids:
-            identified[index] = replace(exchange, exchange_id=alias[1])
-            claimed.add(alias)
-    for content, positions in log_entries.items():
-        identities = old_slots.get(content)
-        if identities is not None and len(positions) == len(identities) == 1:
-            index = positions[0]
-            current = exchanges[index]
-            key = current.source_key, current.exchange_id
-            previous = current.source_key, identities[0]
-            if identified[index] is current and previous not in claimed and key not in saved_ids:
-                identified[index] = replace(current, exchange_id=previous[1])
-    return tuple(identified)
+def _fields(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("invalid exchange binding")
+    return cast(dict[str, object], value)
+
+
+def _position(fields: dict[str, object]) -> int:
+    value = fields["position"]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("invalid exchange event position")
+    return value
+
+
+def _read_binding(value: object) -> ExchangeBinding:
+    fields = _fields(value)
+    question, reply = _fields(fields["question"]), _fields(fields["reply"])
+    match _field(question, "kind"):
+        case "event":
+            origin: QuestionOrigin = QuestionEvent(_position(question), _field(question, "tag"),
+                                                   _field(question, "slot_id"))
+        case "slot":
+            origin = QuestionSlot(_nonempty_field(question, "id"))
+        case "record":
+            origin = QuestionRecord(_nonempty_field(question, "id"))
+        case _:
+            raise ValueError("invalid exchange question origin")
+    match _field(reply, "kind"):
+        case "tag":
+            answer: ReplyOrigin = TaggedReply(_nonempty_field(reply, "tag"))
+        case "event":
+            digest = _field(reply, "digest")
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ValueError("invalid exchange event digest")
+            answer = LoggedReply(_position(reply), digest)
+        case kind:
+            answer = UnloggedReply(kind)
+    return ExchangeBinding(origin, answer)
 
 
 def _time_text(time: datetime | TimeNotRecorded) -> str:
@@ -135,7 +221,7 @@ def _read_time(value: str) -> datetime | TimeNotRecorded:
 
 
 def encode(exchanges: tuple[FiledExchange, ...]) -> str:
-    rows: list[dict[str, str | dict[str, str]]] = []
+    rows: list[dict[str, object]] = []
     for exchange in exchanges:
         answer = exchange.answer
         answerer = exchange.answerer
@@ -146,6 +232,8 @@ def encode(exchanges: tuple[FiledExchange, ...]) -> str:
             else answerer, "answer": {"text": answer.text, "time": _time_text(answer.time), "read": answer.read}
             if isinstance(answer, ExchangeAnswer) else answer,
         })
+        if isinstance(exchange.binding, ExchangeBinding):
+            rows[-1]["binding"] = _store_binding(exchange.binding)
     return json.dumps(rows, ensure_ascii=False)
 
 
@@ -153,6 +241,13 @@ def _field(row: dict[str, object], key: str) -> str:
     value = row[key]
     if not isinstance(value, str):
         raise ValueError(f"invalid exchange field {key}")
+    return value
+
+
+def _nonempty_field(row: dict[str, object], key: str) -> str:
+    value = _field(row, key)
+    if not value:
+        raise ValueError(f"empty exchange field {key}")
     return value
 
 
@@ -189,5 +284,6 @@ def decode(raw: str) -> tuple[FiledExchange, ...]:
             raise ValueError("invalid filed answerer")
         exchanges.append(FiledExchange(Source(_field(row, "source")), key, identity,
             Direction(_field(row, "direction")), _field(row, "question"), _read_time(_field(row, "asked_at")),
-            Nate.USER if asker == Nate.USER else StaffId(asker), answerer, answer))
+            Nate.USER if asker == Nate.USER else StaffId(asker), answerer, answer,
+            binding=_read_binding(row["binding"]) if "binding" in row else UnboundExchange.LEGACY))
     return tuple(exchanges)

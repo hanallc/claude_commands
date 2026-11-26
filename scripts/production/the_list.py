@@ -2362,13 +2362,11 @@ def add_review_item(keeper: staff.StaffId, title: str, *, owner: staff.StaffId, 
 
 def _with_filed_exchanges(item: ListItem, exchanges: tuple[list_exchange.Exchange, ...]) -> ListItem:
     saved = {(exchange.source_key, exchange.exchange_id): exchange for exchange in item.filed_exchanges}
-    for exchange in list_exchange.retain_legacy_ids(exchanges, item.filed_exchanges):
+    for exchange in exchanges:
         key = (exchange.source_key, exchange.exchange_id)
         previous = saved.get(key)
-        if (previous is not None and isinstance(previous.answer, list_exchange.ExchangeAnswer)
-                and isinstance(exchange.answer, list_exchange.QuestionWithoutAnswer)):
-            continue
-        saved[key] = list_exchange.FiledExchange.from_exchange(exchange)
+        saved[key] = (previous.updated(exchange) if previous is not None
+                      else list_exchange.FiledExchange.from_exchange(exchange))
     return replace(item, filed_exchanges=tuple(saved.values()))
 
 
@@ -2410,6 +2408,44 @@ def lock_exchange_source(key: str) -> Generator[LockedExchangeSource]:
     reservation.parent.mkdir(parents=True, exist_ok=True)
     with exclusive(reservation.with_suffix(".lock")):
         yield LockedExchangeSource(key, reservation)
+
+
+def _read_pending_exchanges(reservation: Path) -> tuple[list_exchange.FiledExchange, ...]:
+    try:
+        return list_exchange.decode(reservation.with_suffix(".pending").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+
+
+def pending_exchanges(key: str) -> tuple[list_exchange.FiledExchange, ...]:
+    return _read_pending_exchanges(_exchange_path(key))
+
+
+def exchange_history(key: str) -> tuple[list_exchange.FiledExchange, ...]:
+    """Read the destination row and any changes that still need a receipt."""
+    reservation = _exchange_path(key)
+    destination = _exchange_reservation(reservation)
+    saved: tuple[list_exchange.FiledExchange, ...] = ()
+    if isinstance(destination, ExchangeDestination):
+        keeper, identity = destination.destination.keeper, f"L{destination.destination.number}"
+        path = _store(keeper).path(identity)
+        try:
+            row = load(keeper, identity)
+        except ListError:
+            if path.exists():
+                raise
+        else:
+            saved = tuple(exchange for exchange in row.filed_exchanges if exchange.source_key == key)
+    return combine_exchange_history(saved, _read_pending_exchanges(reservation))
+
+
+def combine_exchange_history(saved: tuple[list_exchange.FiledExchange, ...],
+                             pending: tuple[list_exchange.FiledExchange, ...]) -> tuple[list_exchange.FiledExchange, ...]:
+    history = {exchange.exchange_id: exchange for exchange in saved}
+    for exchange in pending:
+        previous = history.get(exchange.exchange_id)
+        history[exchange.exchange_id] = previous.updated(exchange) if previous is not None else exchange
+    return tuple(history.values())
 
 
 def _exchange_receipt_line(destination: investigation.ListDestination, exchange: list_exchange.FiledExchange) -> str:
@@ -2505,17 +2541,28 @@ def file_exchanges(source: LockedExchangeSource, exchanges: tuple[list_exchange.
     store = _store(destination.keeper)
     with store.locked():
         identity = f"L{destination.number}"
-        if reserved.reserved_new_item and not store.path(identity).exists():
-            item = _save_new_exchanges(store, destination.number, title, owner, report_route(owner, members), filed)
+        new_row = reserved.reserved_new_item and not store.path(identity).exists()
+        item = None if new_row else load(destination.keeper, identity)
+        if item is None:
+            history: tuple[list_exchange.FiledExchange, ...] = ()
         else:
-            item = load(destination.keeper, identity)
-            if reserved.reserved_new_item and not any(exchange.source_key == key for exchange in item.filed_exchanges):
+            history = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
+            if reserved.reserved_new_item and not history:
                 raise ListError(f"{identity} holds a different source.")
-            item = _save_linked_exchanges(store, item, exchanges)
+        pending_path = reservation.with_suffix(".pending")
+        pending = _read_pending_exchanges(reservation)
+        candidate = combine_exchange_history(combine_exchange_history(history, pending), filed)
+        if candidate != history and candidate != pending:
+            write_text_atomic(pending_path, list_exchange.encode(candidate), new_file_mode=0o600)
+        if item is None:
+            item = _save_new_exchanges(store, destination.number, title, owner, report_route(owner, members), candidate)
+        else:
+            item = _save_linked_exchanges(store, item, candidate)
         saved = tuple(exchange for exchange in item.filed_exchanges if exchange.source_key == key)
         if frozenset(saved) != confirmed_exchanges(key, destination, saved):
             receipt = "".join(_exchange_receipt_line(destination, exchange) + "\n" for exchange in saved)
             write_text_atomic(reservation.with_suffix(".saved"), receipt, new_file_mode=0o600)
+        pending_path.unlink(missing_ok=True)
     return destination
 
 

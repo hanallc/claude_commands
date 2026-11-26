@@ -7020,7 +7020,8 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_review_shows_only_current_question_failures(self) -> None:
         case = self.review_fixture(changes=1)
-        report = case.investigation()
+        with patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")):
+            report = case.investigation()
         investigation_key = f'investigation/{report.owner}/{report.id}'
         proposal, efficiency = case.decisions()
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)

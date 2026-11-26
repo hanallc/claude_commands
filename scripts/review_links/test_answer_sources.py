@@ -147,10 +147,12 @@ class AnswerSourceTests(unittest.TestCase):
         destination = investigation.ListDestination(KEEPER.id, 7)
         self.assertEqual(inbound, answer_sources.Exchange(answer_sources.Source.STAFF_QUESTION, native, "initial",
             answer_sources.Direction.QUESTION_TO_NATE, "Which plan?", START, ASKER.id, answer_sources.Nate.USER,
-            answer_sources.QuestionWithoutAnswer.OPEN, (destination,)))
+            answer_sources.QuestionWithoutAnswer.OPEN, (destination,),
+            binding=list_exchange.ExchangeBinding(list_exchange.QuestionRecord("initial"), list_exchange.UnloggedReply.NO_ANSWER)))
         self.assertEqual(inline_read, answer_sources.Exchange(answer_sources.Source.LIST, f"list/{KEEPER.id}/L7", "Q1",
             answer_sources.Direction.ANSWER_TO_NATE, "Question Q1?", START, answer_sources.Nate.USER, OWNER.id,
-            answer_sources.ExchangeAnswer("Answer Q1.", FIRST_REPLY, answer_sources.AnswerRead.READ), (destination,)))
+            answer_sources.ExchangeAnswer("Answer Q1.", FIRST_REPLY, answer_sources.AnswerRead.READ), (destination,),
+            binding=list_exchange.ExchangeBinding(list_exchange.QuestionRecord("Q1"), list_exchange.UnloggedReply.IN_SLOT)))
         self.assertEqual((inline_unread.exchange_id, inline_unread.answerer, inline_unread.answer), ("Q2", KEEPER.id,
                          answer_sources.ExchangeAnswer("Answer Q2.", SECOND_REPLY, answer_sources.AnswerRead.UNREAD)))
 
@@ -629,23 +631,245 @@ class AnswerSourceTests(unittest.TestCase):
                     projected, = answer_sources.apply_review_handoffs([item], user_zone())
                     handoff = projected.exchange_handoff
                     assert isinstance(handoff, review_items.FiledReviewExchange)
-                    slot_has_answer = bool(tag) and current is original
-                    self.assertEqual(handoff.answer_events, frozenset() if slot_has_answer else frozenset({1}))
-                    self.assertEqual(projected.unread_answer, slot_has_answer)
+                    self.assertEqual(handoff.answer_events, frozenset({1}))
+                    self.assertFalse(projected.unread_answer)
 
-    def test_older_tagged_question_uses_its_first_untagged_reply(self) -> None:
-        log = (ReviewLog(START, "nate", "question: Which side?", "saved"),
-               ReviewLog(START + timedelta(minutes=1), "nate", "Marked read"),
-               ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side."),
-               ReviewLog(READ, ASKER.id, "Answer: The layout looks good."),
-               ReviewLog(SECOND_ASK, "nate", "question: How long?", "later"),
-               ReviewLog(SECOND_REPLY, ASKER.id, "Answer: Ten minutes."))
+    def test_older_tagged_question_reports_an_unresolved_untagged_reply(self) -> None:
+        log = (ReviewLog(START, "nate", "feedback: Check the result."),
+               ReviewLog(SECOND_ASK, "nate", "question: Which side?", "saved"),
+               ReviewLog(SECOND_REPLY, OWNER.id, "Answer: The east side."),
+               ReviewLog(SECOND_REPLY + timedelta(hours=1), "nate", "question: How long?", "later"))
         item = self.change_with_log(log, delivery_state.OpenQuestion("later", "How long?", delivery_state.NoDelivery()))
-        with patch.object(review_items, "read", return_value=[item]):
-            exchange, = answer_sources.read_exchanges(self.review, members=MEMBERS).exchanges
-        self.assertEqual((exchange.exchange_id, exchange.answerer), ("question:saved", OWNER.id))
-        self.assertEqual(exchange.answer, answer_sources.ExchangeAnswer(
-            "The east side.", FIRST_REPLY, answer_sources.AnswerRead.UNREAD))
+        result, preview = self.migrate_change(item, apply=False)
+        self.assertEqual(result, 0)
+        self.assertIn("Unresolved legacy replies: 1", preview)
+        self.assertIn(f"  {item.key}: 1", preview)
+        self.assertNotIn("The east side.", preview)
+        self.assertEqual(self.migrate_change(item)[0], 0)
+        self.assertEqual(the_list.records(KEEPER.id), [])
+        projected, = answer_sources.apply_review_handoffs([item], user_zone(), members=MEMBERS)
+        self.assertTrue(projected.unread_answer)
+        self.assertEqual(projected.log, log)
+
+    def migrate_change(self, item: review_items.ReviewItem, *, apply: bool = True) -> tuple[int, str]:
+        with (patch.object(review_items, "read", return_value=[item]),
+              patch.object(review_items, "read_current", return_value=item)):
+            return self.migrate(apply=apply)
+
+    def check_change_handoff(self, item: review_items.ReviewItem, positions: frozenset[int], *,
+                             unread: bool) -> review_items.FiledReviewExchange:
+        projected, = answer_sources.apply_review_handoffs([item], user_zone(), members=MEMBERS)
+        handoff = projected.exchange_handoff
+        self.assertIsInstance(handoff, review_items.FiledReviewExchange)
+        assert isinstance(handoff, review_items.FiledReviewExchange)
+        self.assertEqual(handoff.answer_events, positions)
+        self.assertEqual(projected.unread_answer, unread)
+        return handoff
+
+    def test_filed_untagged_reply_survives_another_question_and_feedback(self) -> None:
+        log = (ReviewLog(START, "nate", "question: Which side?", "saved"),
+               ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side."))
+        original = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
+        assert isinstance(original.source, review_items.ChangeSource)
+        original = replace(original, source=replace(original.source, answered_at=FIRST_REPLY, answered_by=OWNER.id))
+        self.assertEqual(self.migrate_change(original)[0], 0)
+        row, = the_list.records(KEEPER.id)
+        saved, = row.filed_exchanges
+        later = self.change_with_log((*log,
+            ReviewLog(SECOND_ASK, "nate", "question: How long?", "later"),
+            ReviewLog(SECOND_REPLY, "nate", "feedback: Check the result.", "feedback")),
+            review_items.OpenFeedback("feedback", "Check the result.", delivery_state.NoDelivery()))
+        for _ in range(2):
+            handoff = self.check_change_handoff(replace(later, answer_time=FIRST_REPLY), frozenset({1}), unread=False)
+            self.assertEqual(handoff.destination.number, row.number)
+            self.assertEqual(self.migrate_change(later)[0], 0)
+            current, = the_list.records(KEEPER.id)
+            self.assertEqual(current.filed_exchanges, (saved,))
+        self.assertEqual(saved.exchange_id, "question:saved")
+
+    def test_delayed_feedback_cannot_replace_a_filed_slot_answer(self) -> None:
+        log = (ReviewLog(START, "nate", "feedback: Check the result."),
+               ReviewLog(SECOND_ASK, "nate", "question: Which side?", "saved"),
+               ReviewLog(SECOND_REPLY, ASKER.id, "Answer: The east side."))
+        original = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Which side?", "The west side."))
+        saved_at = SECOND_REPLY + timedelta(minutes=10)
+        assert isinstance(original.source, review_items.ChangeSource)
+        original = replace(original, source=replace(original.source, answered_at=saved_at, answered_by=OWNER.id))
+        self.assertEqual(self.migrate_change(original)[0], 0)
+        row, = the_list.records(KEEPER.id)
+        saved, = row.filed_exchanges
+        later = self.change_with_log((*log,
+            ReviewLog(saved_at + timedelta(hours=1), "nate", "question: How long?", "later")),
+            delivery_state.OpenQuestion("later", "How long?", delivery_state.NoDelivery()))
+        self.assertEqual(self.migrate_change(later)[0], 0)
+        current, = the_list.records(KEEPER.id)
+        self.assertEqual(current.filed_exchanges, (saved,))
+        self.assertEqual(saved.answer, list_exchange.ExchangeAnswer("The west side.", saved_at, list_exchange.AnswerRead.UNREAD))
+        _ = self.check_change_handoff(later, frozenset(), unread=True)
+
+    def test_filed_id_survives_later_feedback_with_partial_legacy_metadata(self) -> None:
+        asked_at = START + timedelta(minutes=25)
+        log = (ReviewLog(asked_at, "nate", "question: Which side?"),
+               ReviewLog(FIRST_REPLY, OWNER.name, "Answer: The east side."),
+               ReviewLog(READ, "nate", "Marked read"),
+               ReviewLog(SECOND_ASK, "nate", "feedback: Check the result.", "feedback"),
+               ReviewLog(SECOND_REPLY, OWNER.name, "Answer: The east side."))
+        for number, (has_author, has_time) in enumerate(((True, False), (False, True), (True, True), (False, False)), 1):
+            with self.subTest(author=has_author, time=has_time):
+                original = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
+                assert isinstance(original.source, review_items.ChangeSource)
+                key = f"fixture/C{number}"
+                original = replace(original, key=key, answer_time=SECOND_REPLY,
+                    source=replace(original.source, answered_by=OWNER.id if has_author else staff.StaffId(""),
+                        answered_at=FIRST_REPLY if has_time else question_path.NO_ANSWER_TIME))
+                old = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "question:saved",
+                    list_exchange.Direction.ANSWER_TO_NATE, "Which side?", START, list_exchange.Nate.USER, OWNER.id,
+                    list_exchange.ExchangeAnswer("The east side.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD))
+                with the_list.lock_exchange_source(key) as locked:
+                    row = the_list.file_exchanges(locked, (old,), "Which side?", linked=the_list.NextNumber.AVAILABLE,
+                                                  owner=OWNER.id, members=MEMBERS)
+                self.assertEqual(self.migrate_change(original)[0], 0)
+                saved_exchanges = the_list.load(row.keeper, f"L{row.number}").filed_exchanges
+                self.assertEqual(len(saved_exchanges), 1)
+                saved, = saved_exchanges
+                self.assertEqual((saved.exchange_id, saved.asked_at, saved.answerer), ("question:saved", asked_at, OWNER.id))
+                self.assertEqual(saved.answer, list_exchange.ExchangeAnswer(
+                    "The east side.", FIRST_REPLY, list_exchange.AnswerRead.READ))
+                _ = self.check_change_handoff(original, frozenset({1}), unread=True)
+                later = self.change_with_log((*log,
+                    ReviewLog(SECOND_REPLY + timedelta(hours=1), "nate", "question: How long?", "later"),
+                    ReviewLog(SECOND_REPLY + timedelta(hours=2), "nate", "feedback: Check again.", "again")),
+                    review_items.OpenFeedback("again", "Check again.", delivery_state.NoDelivery()))
+                later = replace(later, key=key)
+                self.assertEqual(self.migrate_change(later)[0], 0)
+                self.assertEqual(the_list.load(row.keeper, f"L{row.number}").filed_exchanges, (saved,))
+                _ = self.check_change_handoff(later, frozenset({1}), unread=True)
+
+    def test_old_filed_id_gains_its_log_locator_after_slot_replacement(self) -> None:
+        asked_at = START + timedelta(minutes=10)
+        log = (ReviewLog(asked_at, "nate", "question: Which side?"),
+               ReviewLog(FIRST_REPLY, OWNER.name, "Answer: The east side."),
+               ReviewLog(SECOND_ASK, "nate", "question: How long?", "later"),
+               ReviewLog(SECOND_REPLY, "nate", "feedback: Check the result.", "feedback"))
+        later = self.change_with_log(log, review_items.OpenFeedback("feedback", "Check the result.",
+                                                                   delivery_state.NoDelivery()))
+        later = replace(later, answer_time=FIRST_REPLY)
+        old = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, later.key, "question:saved",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which side?", START, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.ExchangeAnswer("The east side.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD))
+        with the_list.lock_exchange_source(later.key) as locked:
+            row = the_list.file_exchanges(locked, (old,), "Which side?", linked=the_list.NextNumber.AVAILABLE,
+                                          owner=OWNER.id, members=MEMBERS)
+        for _ in range(2):
+            self.assertEqual(self.migrate_change(later)[0], 0)
+            recorded = the_list.load(row.keeper, f"L{row.number}").filed_exchanges
+            self.assertEqual(len(recorded), 1)
+            saved, = recorded
+            self.assertEqual((saved.exchange_id, saved.asked_at), ("question:saved", asked_at))
+            self.assertEqual(saved.answer, old.answer)
+            _ = self.check_change_handoff(later, frozenset({1}), unread=False)
+
+    def test_slot_without_a_question_event_keeps_its_id_after_replacement(self) -> None:
+        original = self.change_with_log((), delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
+        assert isinstance(original.source, review_items.ChangeSource)
+        original = replace(original, source=replace(original.source, answered_by=OWNER.id, answered_at=FIRST_REPLY))
+        self.assertEqual(self.migrate_change(original)[0], 0)
+        row, = the_list.records(KEEPER.id)
+        saved, = row.filed_exchanges
+        later = self.change_with_log((ReviewLog(SECOND_ASK, "nate", "question: Which side?", "later"),),
+                                     delivery_state.OpenQuestion("later", "Which side?", delivery_state.NoDelivery()))
+        self.assertEqual(self.migrate_change(later)[0], 0)
+        self.assertEqual(self.migrate_change(later)[0], 0)
+        rows_after = the_list.records(KEEPER.id)
+        self.assertEqual(rows_after, [row])
+        self.assertEqual(saved.exchange_id, "question:saved")
+        _ = self.check_change_handoff(replace(later, answer_time=question_path.NO_ANSWER_TIME), frozenset(), unread=False)
+
+    def test_unconfirmed_change_binding_survives_slot_replacement_and_retry(self) -> None:
+        for number, fail_receipt in enumerate((False, True), 1):
+            with self.subTest(receipt=fail_receipt):
+                log = (ReviewLog(START, "nate", "question: Which side?", "saved"),
+                       ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side."))
+                original = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
+                assert isinstance(original.source, review_items.ChangeSource)
+                key = f"fixture/C{number}"
+                original = replace(original, key=key, answer_time=FIRST_REPLY,
+                    source=replace(original.source, answered_at=FIRST_REPLY, answered_by=OWNER.id))
+                write = atomic_file.write_text_atomic
+
+                def write_receipt(path: Path, words: str, *, new_file_mode: int) -> None:
+                    if path.suffix == ".saved":
+                        raise OSError("The receipt write failed.")
+                    write(path, words, new_file_mode=new_file_mode)
+
+                failure = (patch.object(the_list, "write_text_atomic", write_receipt) if fail_receipt
+                           else patch.object(the_list, "_save", side_effect=OSError("The List write failed.")))
+                with failure:
+                    self.assertEqual(self.migrate_change(original)[0], 1)
+                projected, = answer_sources.apply_review_handoffs([original], user_zone(), members=MEMBERS)
+                self.assertIs(projected.exchange_handoff, review_items.NoFiledReviewExchange.ABSENT)
+                self.assertTrue(projected.unread_answer)
+                later = self.change_with_log((*log,
+                    ReviewLog(SECOND_ASK, "nate", "question: How long?", "later"),
+                    ReviewLog(SECOND_REPLY, "nate", "feedback: Check the result.", "feedback")),
+                    review_items.OpenFeedback("feedback", "Check the result.", delivery_state.NoDelivery()))
+                later = replace(later, key=key, answer_time=FIRST_REPLY)
+                for _ in range(2):
+                    self.assertEqual(self.migrate_change(later)[0], 0)
+                    handoff = self.check_change_handoff(later, frozenset({1}), unread=False)
+                    self.assertEqual(handoff.destination.number, number)
+                row = the_list.load(KEEPER.id, f"L{number}")
+                self.assertEqual([exchange.exchange_id for exchange in row.filed_exchanges], ["question:saved"])
+
+    def test_filed_staff_question_keeps_its_identity_when_answered(self) -> None:
+        fields: update_registration.OutstandingItem = {"since": FILED, "text": "Choose a plan",
+                                                        "question": "Which plan?"}
+        key = self.native("answered-after-filing", fields)
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        before, = the_list.records(KEEPER.id)
+        _ = self.native("answered-after-filing", {**fields, "review_log": encode((
+            ReviewLog(FIRST_REPLY, "nate", "answer: Use plan A."),))}, status="closed")
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        after, = the_list.records(KEEPER.id)
+        saved, = after.filed_exchanges
+        self.assertEqual((before.id, before.filed_exchanges[0].exchange_id), (after.id, saved.exchange_id))
+        self.assertEqual(saved.source_key, key)
+        self.assertEqual(saved.answer, list_exchange.ExchangeAnswer("Use plan A.", FIRST_REPLY, list_exchange.AnswerRead.NOT_TRACKED))
+
+    def test_filed_reply_round_trips_its_verified_origins(self) -> None:
+        log = (ReviewLog(START, "nate", "question: Which side?", "saved"),
+               ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side."))
+        original = self.change_with_log(log, delivery_state.AnsweredQuestion("saved", "Which side?", "The east side."))
+        self.assertEqual(self.migrate_change(original)[0], 0)
+        row, = the_list.records(KEEPER.id)
+        filed, = row.filed_exchanges
+        binding = filed.binding
+        self.assertIsInstance(binding, list_exchange.ExchangeBinding)
+        assert isinstance(binding, list_exchange.ExchangeBinding)
+        self.assertEqual(binding.question, list_exchange.QuestionEvent(0, "saved"))
+        self.assertIsInstance(binding.reply, list_exchange.LoggedReply)
+        assert isinstance(binding.reply, list_exchange.LoggedReply)
+        self.assertEqual(binding.reply.position, 1)
+        self.assertEqual(len(binding.reply.digest), 64)
+
+    def test_repeated_questions_without_a_locator_keep_their_own_ids(self) -> None:
+        log = (ReviewLog(START, "nate", "question: Which side?"),
+               ReviewLog(FIRST_REPLY, OWNER.id, "Answer: The east side."),
+               ReviewLog(SECOND_ASK, "nate", "question: Which side?"),
+               ReviewLog(SECOND_REPLY, OWNER.id, "Answer: The east side."))
+        original = self.change_with_log(log, delivery_state.AnsweredQuestion("second", "Which side?", "The east side."))
+        assert isinstance(original.source, review_items.ChangeSource)
+        original = replace(original, source=replace(original.source, answered_by=OWNER.id, answered_at=SECOND_REPLY))
+        old = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, original.key, "question:first",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which side?", START, list_exchange.Nate.USER, OWNER.id,
+            list_exchange.ExchangeAnswer("The east side.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD))
+        with the_list.lock_exchange_source(original.key) as locked:
+            row = the_list.file_exchanges(locked, (old,), "Which side?", linked=the_list.NextNumber.AVAILABLE,
+                                          owner=OWNER.id, members=MEMBERS)
+        self.assertEqual(self.migrate_change(original)[0], 0)
+        saved = the_list.load(row.keeper, f"L{row.number}").filed_exchanges
+        self.assertEqual([exchange.exchange_id for exchange in saved], ["question:first", "question:second"])
+        _ = self.check_change_handoff(original, frozenset(), unread=True)
 
     def test_migration_retains_the_id_already_filed_for_a_legacy_reply(self) -> None:
         log = (ReviewLog(START, "nate", "question: Which side?"),
