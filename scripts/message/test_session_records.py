@@ -4,6 +4,7 @@ from collections.abc import Iterator
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 import unittest
 from typing import final
 from unittest.mock import patch
@@ -77,3 +78,42 @@ class SessionRegistryFolderTests(unittest.TestCase):
             self.assertEqual(registry, session_records.RegistryRead((), (directory,)))
             self.assertEqual(session_records.session_liveness("absent", registry),
                              session_records.SessionLivenessUnknown(f"session registry unreadable: {directory}"))
+
+    def test_liveness_keeps_the_target_record_when_a_later_retry_cannot_start(self) -> None:
+        directory = Path(self.enterContext(TemporaryDirectory()))
+        target, unreadable = directory / "123.json", directory / "other.json"
+        _ = target.write_text(json.dumps({
+            "pid": 123, "sessionId": "known", "name": "fixture", "messagingSocketPath": "", "updatedAt": 1,
+        }))
+        _ = unreadable.write_text("{")
+        with (patch.object(session_records, "sessions_dir", return_value=directory),
+              patch.object(Path, "iterdir", return_value=iter((target, unreadable))),
+              patch.object(session_records, "retry_policy", return_value=session_records.SessionRetryPolicy(2, 0.5)),
+              patch.object(session_records, "running_session", return_value=True),
+              patch.object(time, "monotonic", return_value=0.5),
+              patch.object(time, "sleep") as sleep):
+            self.assertEqual(session_records.session_liveness("known", deadline=0.75),
+                             session_records.LiveSessionProcess(123))
+            sleep.assert_not_called()
+
+    def test_liveness_reports_the_unreadable_path_when_the_last_read_finishes_late(self) -> None:
+        directory = Path(self.enterContext(TemporaryDirectory()))
+        unreadable = directory / "unfinished.json"
+        now = 0.25
+
+        def read() -> str:
+            nonlocal now
+            now = 0.5
+            return "{"
+
+        with (patch.object(session_records, "sessions_dir", return_value=directory),
+              patch.object(Path, "iterdir", return_value=iter((unreadable,))),
+              patch.object(Path, "read_text", side_effect=read) as read_text,
+              patch.object(session_records, "retry_policy", return_value=session_records.SessionRetryPolicy(1, 0.125)),
+              patch.object(time, "monotonic", lambda: now)):
+            result = session_records.session_liveness("known", deadline=0.375)
+        self.assertIsInstance(result, session_records.SessionLivenessUnknown)
+        assert isinstance(result, session_records.SessionLivenessUnknown)
+        self.assertEqual(result.reason, f"session registry unreadable: {unreadable}")
+        self.assertEqual(result.unreadable_registry, (unreadable,))
+        read_text.assert_called_once_with()
