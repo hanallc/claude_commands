@@ -971,6 +971,59 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
             self.assertEqual(state.get("codex_zero", {})["codex1"]["notice"]["id"], "quota.codex_refused")
         self.assertEqual(quota_alert.registry_assignments()["direct"], "codex")
 
+    def test_zero_refusal_waits_while_the_picker_finds_a_codex_account(self) -> None:
+        _ = self.note(1, "off")
+        self.swap.side_effect = accounts.AccountsError("fixture move failed")
+        with mock.patch.object(quota_alert, "edit_registry", return_value="fixture switch failed"):
+            _ = self.alert(spare_left=50)
+            _ = self.alert(self.now + timedelta(minutes=2), spare_left=50)
+            self.assertEqual(self.zero_pushes(), [])
+            with quota_alert.state_file() as state:
+                self.assertEqual(state.get("codex_zero", {})["codex1"]["phone"], "due")
+            _ = self.alert(self.now + timedelta(minutes=4), spare_left=0)
+            _ = self.alert(self.now + timedelta(minutes=6), spare_left=0)
+        self.swap.assert_called_once()
+        self.assertEqual([push.id for push in self.zero_pushes()], ["quota.codex_refused"])
+
+    def test_pending_refusal_waits_when_saved_usage_shows_the_selected_account_recovered(self) -> None:
+        _ = self.note(1, "off")
+        self.phone.return_value = quota_alert.PushFailed("offline")
+        with mock.patch.object(quota_alert, "edit_registry", return_value="fixture switch failed"):
+            _ = self.alert(balance="0")
+        self.assertEqual([push.id for push in self.zero_pushes()], ["quota.codex_refused"])
+        self.phone.reset_mock()
+        self.phone.return_value = quota_alert.PushSent()
+
+        retry = self.now + timedelta(minutes=2)
+        recovered = self.readings(retry, left=50, balance="0")
+        usage_store.save([checked.report for checked in recovered.checked_homes], retry)
+        no_reports = quota_alert.CodexAlertPassReadings(recovered.workers, recovered.selected_account, ())
+        with mock.patch.object(self, "readings", return_value=no_reports):
+            _ = self.alert(retry)
+
+        self.assertEqual(self.zero_pushes(), [])
+        with quota_alert.state_file() as state:
+            self.assertEqual(state.get("codex_zero", {})["codex1"]["phone"], "due")
+
+    def test_pending_refusal_uses_the_balance_when_credits_are_on(self) -> None:
+        _ = self.note(1, "off")
+        self.phone.return_value = quota_alert.PushFailed("offline")
+        with mock.patch.object(quota_alert, "edit_registry", return_value="fixture switch failed"):
+            _ = self.alert(balance="0")
+        self.assertEqual([push.id for push in self.zero_pushes()], ["quota.codex_refused"])
+        self.phone.reset_mock()
+        self.phone.return_value = quota_alert.PushSent()
+
+        _ = self.note(1, "on")
+        _ = self.alert(self.now + timedelta(minutes=2), balance="5")
+        self.assertEqual(self.zero_pushes(), [])
+        retry = self.now + timedelta(minutes=4)
+        _ = self.alert(retry, balance="0")
+
+        self.assertEqual([push.id for push in self.zero_pushes()], ["quota.codex_refused"])
+        with quota_alert.state_file() as state:
+            self.assertEqual(state.get("codex_zero", {})["codex1"]["phone"], retry.isoformat())
+
     def test_failed_swap_keeps_accounts_diagnostics_off_the_phone(self) -> None:
         """F006: account command diagnostics belong in the journal, not on the phone."""
         _ = self.note(1, "off")
@@ -1130,31 +1183,24 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         self.phone.assert_not_called()
 
     def test_on_credits_notice_handles_a_destination_losing_room_during_the_pass(self) -> None:
-        """F009: an account disappearing between placement reads does not abort the alert."""
-        pick = accounts.pick
-        chosen = False
+        """F009: the selected account can use paid credits when the destination loses room."""
+        reason = "fixture destination lost included room"
+        self.swap.side_effect = accounts.AccountsError(reason)
 
-        def room_changes(tool: str, now: datetime, *, exclude: frozenset[str], keep: accounts.NoKeep,
-                         prefer_weekly_room: bool = False) -> accounts.PickedAccount | accounts.NoAccountWithRoom:
-            nonlocal chosen
-            self.assertEqual(tool, "codex")
-            if chosen:
-                return accounts.NoAccountWithRoom(accounts.EarliestReset(self.now + timedelta(days=2)), ())
-            chosen = True
-            first = pick("codex", now, exclude=exclude, keep=keep, prefer_weekly_room=prefer_weekly_room)
-            self.assertIsInstance(first, accounts.PickedAccount)
-            assert isinstance(first, accounts.PickedAccount)
-            self.assertGreater(first.weekly_left, 0)
-            return first
-
-        with mock.patch.object(accounts, "pick", side_effect=room_changes) as changing_pick:
+        with mock.patch.object(accounts, "pick", wraps=accounts.pick) as pick:
             _ = self.alert(spare_left=50)
-        self.assertGreaterEqual(changing_pick.call_count, 2)
-        push = self.zero_pushes()[-1]
+        pick.assert_called_once()
+        self.swap.assert_called_once_with("workers", "codex2",
+            why="codex1 weekly usage used; move to room", cause="auto", included_only=True, worker_moves="detach")
+        entries = moves.read_moves()
+        requested, = [entry for entry in entries if entry["kind"] == "requested"]
+        failed, = [entry for entry in entries if entry["kind"] == "failed"]
+        self.assertEqual((failed["move_id"], failed["reason"]), (requested["move_id"], reason))
+        push, = self.zero_pushes()
         self.assertEqual(push.id, "quota.paid_credits")
         self.assertEqual(push.title, "codex1 now spends paid credits: 6,370 left")
         self.assertEqual(push.body, "")
-        self.swap.assert_not_called()
+        self.assertEqual(quota_alert.registry_assignments()["direct"], "codex")
 
     def test_zero_credits_off_prefers_weekly_room_over_a_sooner_reset_on_paid_credits(self) -> None:
         _ = self.note(1, "off")

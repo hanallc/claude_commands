@@ -47,6 +47,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.environment.pop("CONF_DIR", None)
         self.environment["SHOWRUNNER_STATE_DIR"] = str(self.root / "showrunner")
         self.environment["ASTRA_ROLES_STATE"] = str(self.root / "astra-roles")
         self.folder = self.root / "review-run"
@@ -118,7 +119,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         return finding
 
     def new_list_record(self) -> tuple[record_store.NumberedRecords, str]:
-        keeper = replace(self.producer, name="morty")
+        keeper = self.producer
+        _ = self.write(self.home / ".claude/config/console.conf", f"page.list.owner={keeper.id}\n")
         with staff.supplied_snapshot(staff.StaffSnapshot((keeper,))):
             item = the_list.add(keeper.id, "Set the move timing", owner=keeper.id, source="nate", changes={})
         return list_draft.list_records(keeper.id), item.id

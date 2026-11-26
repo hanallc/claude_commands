@@ -27,7 +27,7 @@ from types import SimpleNamespace
 from typing import Literal, cast, final, override
 from unittest.mock import patch
 
-from scripts.accounts import refusals
+from scripts.accounts import accounts, refusal_watch, refusals
 from scripts.agents import detached_run_process, detached_runs, restart, shutdown_record, worker_lifecycle
 from scripts.astra import astra_roles
 from scripts.direct import assign, progress_history
@@ -351,6 +351,47 @@ class TurnEndTests(unittest.TestCase):
                 blocked.assert_called_once_with([], account, window=refusals.UnknownWindow(),
                     refused_at=quota_alert.RefusedAt(datetime.fromisoformat(refused_at)),
                     stopped=quota_alert.StoppedWorker(str(self.case.fixture.parent.current_session), row.name))
+
+    def test_a_codex_worker_fable_weekly_refusal_keeps_its_window(self) -> None:
+        root = self.case.fixture.root
+        _ = write_registry(root / "conf/models.conf", {"assignments": {"direct": "codex"}})
+        _ = copy_config_file_fixture(Path(__file__).resolve().parents[2] / "config/accounts.conf",
+                                     root / "conf/accounts.conf")
+        self.case.agent.finish_after = 1
+        self.assertIs(self.case.dispatch(), worker.DispatchSubmission.SUBMITTED)
+        row = self.case.agent.row(self.case.agent.submitted[-1][0])
+        backend = staff.backend(row)
+        assert isinstance(backend, staff.CodexBackend)
+        account = agent_accounts.KnownCodexAccount(backend.codex_home, "worker@example.invalid", "codex1")
+        refused_at = datetime.fromisoformat("2026-11-10T19:30:00+00:00")
+        window = refusals.FableWeeklyWindow()
+        refusal = refusal_watch.TranscriptRefusal("fixture-refusal", quota_alert.RefusedAt(refused_at),
+                                                  window, "Fable weekly limit")
+        workers = accounts.CodexWorkersAccount("codex2", root / "codex2")
+        no_workers = agent_accounts.NoWorkersHome("fixture has no workers home reading")
+        readings = quota_alert.CodexAlertPassReadings(no_workers, no_workers, ())
+        weekly = refusals.ReadingWindow(0, refusals.KnownReset(refused_at + timedelta(days=6)), refused_at)
+        five_hour = refusals.ReadingWindow(0, refusals.KnownReset(refused_at + timedelta(hours=4)),
+                                          refused_at + timedelta(seconds=1))
+        reading = refusals.FreshReading(weekly, five_hour, "")
+        with (patch.object(refusal_watch, "transcript_refusal", return_value=refusal),
+              patch.object(agent_accounts, "codex_account", return_value=account),
+              patch.object(note_file, "read_notes", return_value=iter(())),
+              patch.object(quota_alert, "resolve_codex_readings", return_value=readings),
+              patch.object(quota_alert, "_save_codex_readings"),
+              patch.object(quota_alert, "_finish_workers_transitions"),
+              patch.object(quota_alert, "workers_entry_pending", return_value=False),
+              patch.object(quota_alert, "STATE", root / "quota-alert.json"),
+              patch.object(quota_alert, "relay", return_value=None),
+              patch.object(accounts, "role_account", return_value=workers),
+              patch.object(refusals, "stored_reading", return_value=reading),
+              patch.object(refusals, "store_file", return_value=root / "refusals.json")):
+            lines = turn_end.report_quota_refusals()
+            self.assertIn(f"quota relay {row.name} -> {self.case.fixture.parent.current_session}: sent", lines)
+            saved = refusals.load()
+            self.assertEqual(len(saved), 1)
+            stored = next(iter(saved.values()))
+        self.assertEqual((stored.window, stored.reset, stored.at), (window, refusals.NoResetKnown(), refused_at))
 
     def test_turn_end_completes_a_dispatch_outside_the_run_root(self) -> None:
         original_run = self.case.run_dir

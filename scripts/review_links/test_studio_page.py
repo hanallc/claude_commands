@@ -61,7 +61,7 @@ class StudioPageTests(unittest.TestCase):
             _ = (self.avatars / folder / f"{number}-{size}.webp").write_bytes(b"RIFF" + number.encode())
 
     def markup(self, producers: Counter[the_list.ItemOwner]) -> str:
-        identities = studio_page.STUDIO_VIEW.producer_ids(MEMBERS, producers)
+        identities = studio_page.producer_ids(MEMBERS, producers)
         counts = Counter({f"staff:{identity}": count for identity, count in producers.items()})
         counts["all"] = producers.total()
         return studio_page.tabs(list_page.staff_chips(MEMBERS, identities, counts), "all")

@@ -23,6 +23,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from functools import partial
@@ -60,7 +61,7 @@ from scripts.review_links import (console_theme, image_store, new_item_dialog, p
 from scripts.review_links.question_record import AnswerRefused as AnswerRefused
 from scripts.review_links.review_items import (
     CompletedFeedback as CompletedFeedback, OpenFeedback as OpenFeedback,
-    decode_change_delivery, read_change_delivery, validation_recipients,
+    change_on_list, decode_change_delivery, read_change_delivery, validation_recipients, validation_request_words,
 )
 
 MANIFEST = ".review-link-changes.json"
@@ -187,6 +188,13 @@ def scoped_reply_exchange(command: ScopedReplyCommand) -> str:
     return command.get("exchange", command.get("token_sha256", ""))
 
 
+class ReviewActionFeedback(TypedDict):
+    """Keep the result of an action while its words await confirmation."""
+
+    answer: str
+    delivered: bool
+
+
 class StoredReviewMessage(TypedDict):
     saved: bool
     source: str
@@ -197,6 +205,7 @@ class StoredReviewMessage(TypedDict):
     image_question_dispatch: NotRequired[ImageQuestionDispatch]
     submission_request: NotRequired[str]
     submission_delivered: NotRequired[bool]
+    action_feedback: NotRequired[ReviewActionFeedback]
     scoped_reply: NotRequired[ScopedReplyCommand]
 
 
@@ -309,6 +318,25 @@ class AssignedReviewPage(ReviewPage):
     owner: change_routing.ChangeOwner
 
 
+type ChangeWorkFiling = Callable[[ReviewPage, dict[str, str], change_routing.ChangeAssignment, str, str],
+                                 investigation.ListDestination | investigation.NoListDestination]
+
+
+_change_work_filing: ContextVar[ChangeWorkFiling] = ContextVar(
+    "change_work_filing", default=lambda _page, _row, _assignment, _outcome, _words:
+    investigation.NoListDestination.ABSENT)
+
+
+@contextmanager
+def file_change_actions(filing: ChangeWorkFiling) -> Generator[None]:
+    """Use the same List filing path for live change forms."""
+    token = _change_work_filing.set(filing)
+    try:
+        yield
+    finally:
+        _change_work_filing.reset(token)
+
+
 @dataclass(frozen=True)
 class UserQuestionPage(ReviewPage):
     """A filed user question and its saved answer share one delivery record."""
@@ -334,6 +362,13 @@ class ReviewMessagePage(ReviewPage):
     """A Review record and its saved message use the existing delivery slots."""
 
     saved: StoredReviewMessage
+
+    def needs_confirmation(self) -> bool:
+        return bool(self.saved.get("submission_request")) or "action_feedback" in self.saved
+
+    def delivery_confirmed(self) -> bool:
+        feedback = self.saved.get("action_feedback")
+        return bool(self.saved.get("submission_delivered")) or (feedback is not None and feedback["delivered"])
 
 
 class QuestionAnswerRefused(question_record.AnswerRefused):
@@ -866,13 +901,13 @@ def _legacy_list_question_store(listing: record_store.NumberedRecords,
         inferred = replace(listing, owner=staff.StaffId(folder.parent.name))
         if inferred.path(source.item_id).resolve() == path:
             return inferred
-    keepers = record_store.morty_ids(staff.snapshot())
-    if len(keepers) != 1:
+    keeper = record_store.list_keeper(conf.read_or_repository("console"), staff.snapshot())
+    if keeper is None:
         raise ValueError("The List keeper is unavailable.")
-    morty = replace(listing, owner=keepers[0])
-    if morty.path(source.item_id).resolve() != path:
+    configured = replace(listing, owner=keeper.id)
+    if configured.path(source.item_id).resolve() != path:
         raise ValueError("The List question source has moved.")
-    return morty
+    return configured
 
 
 def _open_list_question(listing: record_store.NumberedRecords,
@@ -1413,7 +1448,7 @@ class DeliveryStatus:
                       file=sys.stderr)
                 return False
             failed = fields.get("failed_delivery")
-            if not (isinstance(page, ReviewMessagePage) and page.saved.get("submission_request")
+            if not (isinstance(page, ReviewMessagePage) and page.needs_confirmation()
                     and failed is not None and failed["attempt"] == intent.attempt):
                 self.finish_intent_locked(delivery, slots, intent)
                 return False
@@ -1644,7 +1679,7 @@ class DeliveryStatus:
                     tracked_question = is_change_question(delivery, slots, current)
                     self.record_result_locked(delivery, result, alerts, question_relayed=question_relayed)
                     if isinstance(result, FailedDelivery) and ((tracked_question and not question_relayed) or (
-                            isinstance(page, ReviewMessagePage) and page.saved.get("submission_request"))):
+                            isinstance(page, ReviewMessagePage) and page.needs_confirmation())):
                         return
                     self.finish_intent_locked(delivery, slots, current)
                     return
@@ -1655,8 +1690,12 @@ class DeliveryStatus:
             updated = replace(slots, validation=ValidationRequested(intent.attempt, intent.feedback))
         else:
             updated = slots.updated(intent.kind, NoDelivery())
-        if intent.kind == "verdict" and isinstance(page, ReviewMessagePage) and page.saved.get("submission_request"):
-            page = replace(page, saved={**page.saved, "submission_delivered": True})
+        if intent.kind == "verdict" and isinstance(page, ReviewMessagePage):
+            if "action_feedback" in page.saved:
+                feedback: ReviewActionFeedback = {**page.saved["action_feedback"], "delivered": True}
+                page = replace(page, saved={**page.saved, "action_feedback": feedback})
+            elif page.saved.get("submission_request"):
+                page = replace(page, saved={**page.saved, "submission_delivered": True})
         self.write_slots(page, row, updated)
         if is_change_question(delivery, slots, intent) or (
                 intent.kind == "verdict" and isinstance(page, (ReviewMessagePage, UserQuestionPage))):
@@ -1795,11 +1834,6 @@ class DeliveryReadView:
         return self.status.slots(page, row)
 
 
-def script_version(script: str) -> str:
-    """Name a page script by its content; an open page reloads, not updates, when the server's script differs."""
-    return hashlib.sha256(script.encode()).hexdigest()[:12]
-
-
 CHANGE_IMAGE_STYLE = """main:not(:has(>.page-status)):has(.change-image){max-width:1056px}
 :is(section[data-type="changes"],section[data-change-card]){max-width:680px}:is(section[data-type="changes"],section[data-change-card]):has(>.change-image){max-width:992px;display:grid;grid-template-columns:minmax(0,680px) 280px;gap:32px;align-items:start}
 .change-text{min-width:0}.change-image{display:block;width:280px;max-width:100%}
@@ -1844,6 +1878,10 @@ summary{min-height:44px;align-content:center;cursor:pointer}button:focus-visible
         + page_frame.CONSOLE_READY_SCRIPT + "</script></body></html>").encode("utf-8")
 
 
+# The static style and script that `document` puts around each page, for `page_version.script_version`.
+DOCUMENT_ASSETS = document("", "").decode()
+
+
 def answer_notice(page: ReviewPage, body: str, reason: str) -> AnswerNotice:
     fields = parse_qs(body, keep_blank_values=True)
     row = fields.get("row", [""])[0]
@@ -1860,8 +1898,11 @@ def answer_form(page: ReviewPage, notice: AnswerNotice, feedback_rows: int) -> s
     row = notice.row if notice.row in page.rows else page.rows[0]
     row_id = html.escape(row)
     buttons: list[str] = []
-    for value, label in (("works", "Works"), ("not works", "Does not work"),
-                         ("validate", "Ask showrunner to check"), ("question", "Ask a question"), ("feedback", "Send feedback")):
+    for verdict in page_frame.VerdictAction:
+        buttons.append(page_frame.verdict_button(page_frame.VerdictItemType.CHANGE, verdict,
+                                                selected=notice.outcome == verdict))
+    for value, label in (("validate", "Ask showrunner to check"), ("question", "Ask a question"),
+                         ("feedback", "Send feedback")):
         if value in ("validate", "question", "feedback") and isinstance(page, AssignedReviewPage) and isinstance(page.owner, change_routing.UnroutedChange):
             continue
         selected = 'aria-pressed="true" ' if notice.outcome == value else ""
@@ -2157,7 +2198,8 @@ def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO
             warning = "Not saved: " + notice.reason
         alert = page_frame.action_failure("change-save-failure", warning) if warning else ""
         form_notice = notice if notice.row == row["#"] else AnswerNotice(row["#"])
-        answer = answer_form(page, form_notice, feedback_rows) if slots.waits_for_user(bool(verdict)) else ""
+        answer = (answer_form(page, form_notice, feedback_rows)
+                  if slots.waits_for_user(bool(verdict)) and not change_on_list(row) else "")
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         content = f'''{alert}
 <h1>{html.escape(row["Change"])}</h1>
@@ -2407,9 +2449,23 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         raise question_record.AnswerRefused("the production document is not available")
     message_page = replace(page, production=assignment.production)
     recipients = owner.showrunner_recipients
+    filing = _change_work_filing.get()
+
+    def file_work(current: dict[str, str]) -> investigation.ListDestination | investigation.NoListDestination:
+        if outcome not in ("validate", "feedback", "not works"):
+            return investigation.NoListDestination.ABSENT
+        return filing(page, current, assignment, outcome, feedback)
+
+    def mark_moved(destination: investigation.ListDestination | investigation.NoListDestination) -> None:
+        if isinstance(destination, investigation.ListDestination):
+            change_review.record_review_log(page.review_list, row_id, f"moved to List item {destination.number}",
+                                            message_page.production)
+
     if outcome in CHANGE_HANDOFFS:
-        with status.locked():
+        with change_review.checked_review_write(page.review_list, status.root, lambda: None):
             current = answer_row(page, row_id)
+            if change_on_list(current):
+                raise ChangeHandoffRefused("Open the report on the List.")
             if current.get("Verdict"):
                 raise ChangeHandoffRefused("this row already has a saved answer")
             slots = status.slots(page, row_id)
@@ -2433,10 +2489,11 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
             if during_validation and sender is None:
                 raise question_record.AnswerRefused("the saved validator is unavailable")
             _ = row_production(page, row)
+            destination = file_work(current)
             if outcome == "validate":
                 _ = next_item.move_to_end(next_item.CHANGE, page.production, key=queue_key(page, row_id), prepared=prepared)
                 change_review.record_review_log(page.review_list, row_id,
-                    "validate" + (": " + feedback if feedback else ""), message_page.production)
+                    validation_request_words(feedback), message_page.production)
                 attempt = status.begin_locked(page, row_id, slots, "validation", feedback, recipients=recipients,
                     waiting_why=feedback.strip() or "The user asked the showrunner to validate this change.")
                 message = validation_message(message_page, row, attempt, feedback)
@@ -2460,6 +2517,11 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
                 attempt = intent.attempt
                 message = _request_message(message_page, row, intent.question_id, intent.text, request_feedback,
                                            sender=sender)
+            try:
+                mark_moved(destination)
+            except (OSError, ValueError, RuntimeError):
+                _ = status.request_attempts.pop(attempt, None)
+                raise
         return MessageDelivery(message_page, row_id, recipients, message, attempt, recipients)
 
     if row.get("Verdict"):
@@ -2479,6 +2541,7 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         with status.locked():
             if attempt and status.slots(page, row_id).verdict != slots.verdict:
                 status.write_slots(page, row_id, slots)
+            _ = status.request_attempts.pop(attempt, None)
 
     if recipients and not defer_verdict_cleanup:
         attempt = status.begin(page, row_id, "verdict", recipients=recipients, user_verdict=True)
@@ -2489,14 +2552,18 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         production_name = unit_lookup.doc_owner(page.production, staff.snapshot()).name
         production = change_review.production_doc(production_name)
         with change_review.checked_review_write(page.review_list, status.root, lambda: None):
-            recorded = answer_row(page, row_id).get('Verdict')
+            current = answer_row(page, row_id)
+            recorded = current.get('Verdict')
             if recorded == verdict:
                 cancel_preparation()
                 return NoMessageDelivery()
             if recorded:
                 raise AnswerRefused("this row already has a different saved answer")
+            if change_on_list(current):
+                raise ChangeHandoffRefused("Open the report on the List.")
             cleanup = replace(change_review.PendingVerdictCleanup.for_row(status.root, page.review_list, row_id),
                               verdict=verdict, feature_review=review, require_git_commit=defer_verdict_cleanup or bool(review))
+            destination = file_work(current)
             try:
                 cleanup.save()
                 result = change_review.save_verdict(page.review_list, row_id, verdict, production, cleanup=cleanup)
@@ -2505,6 +2572,11 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
                 raise
             if isinstance(result, change_review.VerdictRefused) or isinstance(result.cleanup, change_review.NoVerdictCleanup):
                 cleanup.intent.unlink(missing_ok=True)
+            if not isinstance(result, change_review.VerdictRefused):
+                try:
+                    mark_moved(destination)
+                except (OSError, ValueError, RuntimeError) as error:
+                    print(f"review-links {row_id}: the List report is saved. Source log: {error}", file=sys.stderr)
     except change_review.VerdictDurabilityUnconfirmed:
         with status.locked():
             _ = status.request_attempts.pop(attempt, None)
@@ -2656,6 +2728,10 @@ class DeliveryFailure:
     error: str
 
 
+class UnconfirmedDelivery(DeliveryFailure):
+    """The sender has no final result for this recipient."""
+
+
 def review_delivery_key(source: Path, row: str, attempt: str, *, purpose: str = "message") -> str:
     """Identify one send across retries and server restarts."""
     identity = json.dumps((str(source.resolve()), row, attempt, purpose))
@@ -2665,6 +2741,7 @@ def review_delivery_key(source: Path, row: str, attempt: str, *, purpose: str = 
 def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], message: str, tries: int,
                       pause: float, *, key: str,
                       skipped: set[staff.StaffId] | None = None,
+                      pending_recipients: set[staff.StaffId] | None = None,
                       errors: tuple[type[Exception], ...] = SEND_ERRORS,
                       confirm: bool = False) -> list[DeliveryFailure]:
     """Retry only failed sends. The sender keeps queued and unconfirmed sends."""
@@ -2677,12 +2754,18 @@ def send_with_retries(sender: str, recipients: tuple[staff.StaffId, ...], messag
         for target in remaining:
             try:
                 result = send_to_staff(target, sender, message, key=key)
-                if result == "pending" and confirm:
-                    failures.append(DeliveryFailure(target, "The sender has not confirmed delivery."))
+                if result == "pending":
+                    if confirm:
+                        failures.append(UnconfirmedDelivery(target, "The sender has not confirmed delivery."))
+                    elif pending_recipients is not None:
+                        pending_recipients.add(target)
                 if result == "skipped" and skipped is not None:
                     skipped.add(target)
-            except errors as error:
-                failures.append(DeliveryFailure(target, str(error)))
+            except Exception as error:
+                if not isinstance(error, errors):
+                    raise
+                failure = UnconfirmedDelivery if confirm and isinstance(error, UnconfirmedSend) else DeliveryFailure
+                failures.append(failure(target, str(error)))
         remaining = tuple(failure.recipient for failure in failures if isinstance(failure.recipient, str))
         if remaining and attempt + 1 < tries:
             time.sleep(pause)
@@ -2784,6 +2867,53 @@ class OutboundReviewMessage:
         return error.replace(self.token, "[reply token]") if self.token else error
 
 
+def scoped_reply_message(key: str, proof: reply_tokens.ReplyTokenProof, prefix: str = "") -> OutboundReviewMessage:
+    """Build the reply command from a native proof."""
+    token = reply_tokens.derive(proof)
+    return OutboundReviewMessage(prefix + reply_command(key, token), token)
+
+
+class ReportAwaitingList(OSError):
+    """Keep the first notice until its current report and List row are available."""
+
+
+def require_report_list_item(record: investigation.Investigation
+                             ) -> investigation.ListDestination | investigation.NoListDestination:
+    """Require the List row for a native report."""
+    destination = record.list_destination
+    if not record.belongs_on_list:
+        return destination
+    if not isinstance(destination, investigation.ListDestination):
+        raise ReportAwaitingList("The report still needs a List item.")
+    try:
+        matches = investigation.list_destination_has_submission(destination, record.submission_scope)
+    except (OSError, ValueError) as error:
+        raise ReportAwaitingList("The List item is unavailable.") from error
+    if not matches:
+        raise ReportAwaitingList("The List item does not match the report.")
+    return destination
+
+
+def list_report_delivery_prefix(record: investigation.Investigation, prefix: str) -> str:
+    """Open the report evidence on the List."""
+    destination = require_report_list_item(record)
+    if not isinstance(destination, investigation.ListDestination):
+        return prefix
+    text, separator, evidence = prefix.rpartition("\n\nEvidence in Review\n")
+    if not separator:
+        return prefix
+    try:
+        route = urlsplit(evidence)
+    except ValueError:
+        return prefix
+    item_key = parse_qs(route.fragment).get("item", [])
+    if (route.path != f"/{CONSOLE_FOLDER}/review.html" or not route.netloc or len(item_key) != 1
+            or re.fullmatch(r"investigation/[^/]+/" + re.escape(record.id), item_key[0]) is None):
+        return prefix
+    url = route._replace(path=page_frame.STUDIO_PAGE_PATH,
+                         fragment=page_frame.list_item_fragment(destination.keeper, destination.number)[1:])
+    return text + "\n\nEvidence on the List\n" + url.geturl()
+
 def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
     """Derive the token from the current reply proof."""
     from scripts.review_links import review_submissions
@@ -2795,11 +2925,23 @@ def outbound_review_message(delivery: MessageDelivery) -> OutboundReviewMessage:
     prefix, separator, command = delivery.message.rpartition("\n")
     if command != reply_command(scoped["key"]):
         raise ValueError("The saved Review reply command does not match its key.")
-    proof = review_submissions.current_reply_proof(scoped["key"])
+    key = scoped["key"]
+    if (isinstance(page, ReviewMessagePage) and page.saved.get("submission_request")
+            and key.startswith(("submission/bug/", "submission/investigation/"))):
+        try:
+            with review_submissions.scoped_submission(new_item_dialog.read_submission_key(key)) as current:
+                proof = current.details.reply_proof
+                if isinstance(current.record, investigation.Investigation):
+                    prefix = list_report_delivery_prefix(current.record, prefix)
+        except review_submissions.SavedSubmissionMissing as error:
+            raise ReportAwaitingList("The current report is unavailable.") from error
+    else:
+        proof = review_submissions.current_reply_proof(key)
+    if not isinstance(proof, reply_tokens.ReplyTokenProof):
+        raise reply_tokens.UnavailableReplyToken("The item has no proof for delivery.")
     if not reply_tokens.matches_reference(proof.sha256, reply_tokens.read_reference(scoped_reply_exchange(scoped))):
         raise reply_tokens.UnavailableReplyToken("The reply proof changed.")
-    token = reply_tokens.derive(proof)
-    return OutboundReviewMessage(prefix + separator + reply_command(scoped["key"], token), token)
+    return scoped_reply_message(key, proof, prefix + separator)
 
 
 def deliver_review_question(delivery: MessageDelivery, status: DeliveryStatus, intent: DeliveryIntent,
@@ -2924,7 +3066,7 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
         return deliver_page_question(delivery, status)
     tracked_review = False
     page = delivery.page
-    confirm = isinstance(page, ReviewMessagePage) and bool(page.saved.get("submission_request"))
+    confirm = isinstance(page, ReviewMessagePage) and page.needs_confirmation()
     tries, pause = 0, 0.0
     with status.locked():
         slots = status.slots(delivery.page, delivery.row)
@@ -2958,6 +3100,10 @@ def deliver_with_outcome(delivery: MessageDelivery | NoMessageDelivery, status: 
         return deliver_review_question(delivery, status, intent, question)
     try:
         outbound = outbound_review_message(delivery)
+    except ReportAwaitingList as error:
+        status.release_recovery_claims((delivery.attempt,))
+        print(f"review-links delivery {delivery.row}: {error}", file=sys.stderr)
+        return DeliveryUnconfirmed()
     except (OSError, ValueError) as error:
         reason = " ".join(str(error).splitlines())
         failures = [DeliveryFailure(recipient, reason) for recipient in delivery.recipients]
@@ -3206,13 +3352,13 @@ def recover_review_messages(status: DeliveryStatus) -> None:
                 saved = fields.get('review_message')
                 if saved is None:
                     continue
-                if saved.get('submission_delivered'):
-                    continue
                 source = Path(saved['source'])
                 row = saved.get('row',source.stem)
                 if row.startswith((IMAGE_QUESTION_ROW_PREFIX, "List item ")):
                     continue
                 page = ReviewMessagePage(source,source.parent,(row,),'',saved)
+                if page.delivery_confirmed():
+                    continue
                 slots = status.slots(page,row)
                 if not saved['saved']:
                     if row.startswith(IMAGE_QUESTION_ROW_PREFIX):
@@ -3333,6 +3479,48 @@ def reply_command(key: str, question: str = '') -> str:
     return ('~/.claude/scripts/lib/py ~/.claude/scripts/review_links/change_page.py answer-question '
             + '--item '+shlex.quote(key)+(' --question '+shlex.quote(question) if question else '')+machine
             + " --text '<your answer>'")
+
+
+def resend_submission_reply(reference: str) -> str:
+    """Send the reply command to the current owner of a waiting item."""
+    from scripts.review_links import review_items, review_submissions
+
+    key = reference
+    if not reference.startswith(new_item_dialog.KEY_PREFIX):
+        kinds = {review_items.ReviewType.BUG: new_item_dialog.SubmissionKind.BUG,
+                 review_items.ReviewType.QUESTION: new_item_dialog.SubmissionKind.QUESTION,
+                 review_items.ReviewType.RESPONSE: new_item_dialog.SubmissionKind.QUESTION,
+                 review_items.ReviewType.INVESTIGATION: new_item_dialog.SubmissionKind.INVESTIGATION,
+                 review_items.ReviewType.PROPOSAL: new_item_dialog.SubmissionKind.PROPOSAL}
+        matches: list[str] = []
+        for item in review_items.read(review_link.review_root(), kinds=tuple(kinds)):
+            identity = item.id.rsplit("/", 1)[-1]
+            if reference not in (identity, item.id, item.key):
+                continue
+            details = review_items.submission_origin(item)
+            if isinstance(details, new_item_dialog.ReviewSubmission):
+                matches.append(new_item_dialog.submission_key(kinds[item.type], item.owner, identity, details.request_id))
+        if not matches:
+            raise question_record.AnswerRefused("No sent item has that ID.")
+        if len(matches) > 1:
+            raise question_record.AnswerRefused("More than one sent item has that ID. Use its full key.")
+        key, = matches
+    scoped = new_item_dialog.read_submission_key(key)
+    with review_submissions.scoped_submission(scoped) as located:
+        saved = review_submissions.renew_legacy_reply(located)
+        if not saved.awaiting_reply:
+            raise question_record.AnswerRefused("The item is not waiting for a reply.")
+        if isinstance(saved.record, investigation.Investigation):
+            _ = require_report_list_item(saved.record)
+        proof = saved.details.reply_proof
+        if not isinstance(proof, reply_tokens.ReplyTokenProof):
+            raise question_record.AnswerRefused("The item has no proof for delivery.")
+        command = scoped_reply_message(saved.key, proof)
+        try:
+            send_to_staff(saved.owner, SENDER, f"Reply command for {saved.id}.\n\n{command.text}")
+        except SEND_ERRORS as error:
+            raise question_record.AnswerRefused(command.redact(str(error))) from None
+    return scoped.item_id
 
 
 def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) -> bool:

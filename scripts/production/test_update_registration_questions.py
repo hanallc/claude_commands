@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import proposal_issue, proposals_folder, staff
 from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens
 from scripts.production.issues import Issue, frontmatter
@@ -36,6 +37,7 @@ class RegistrationTests(RegistrationFixture):
         config = self.root / "title-config"
         config.mkdir()
         _ = (config / "production.conf").write_text("# whole: 20..\nquestion_title_max_chars=100\n")
+        _ = write_config_fixture(config / "notify.conf")
         self.env["CONF_DIR"] = str(config)
         self.env["REVIEW_LINKS_ROOT"] = str(self.root / "review-links")
         self.env["XDG_STATE_HOME"] = str(self.root / "key-state")

@@ -639,8 +639,7 @@ def move_reply_proof(path: Path, *, run: reply_proofs.ProofMoveRun) -> int:
         removal = reply_proofs.prepare_note_removal(text, reply_proofs.ProofNoteLayout.PROPOSAL)
         if not removal.fields:
             return 0
-        details = new_item_dialog.read_submission(removal.submission)
-        identity = details.proof_identity(issue.value(NUMBER_FIELD))
+        identity = new_item_dialog.read_submission_proof_identity(issue.value(NUMBER_FIELD), removal.submission)
         return run.apply(path, text, removal, [(identity, removal.proof)],
                          lambda changed: write_issue(path, changed, preview=run.dry_run),
                          open_item=not review_is_done(issue))

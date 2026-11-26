@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import subprocess
-import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import BinaryIO, Literal, cast, overload
 
 
 class LedgerError(ValueError):
@@ -126,19 +126,32 @@ def parse_tree_listing(listing: str) -> dict[str, TreeEntry]:
     return entries
 
 
-def blob_contents(repo: Path, blobs: Mapping[str, str]) -> Iterator[tuple[str, bytes]]:
-    """Read each path's blob through one Git batch process."""
-    with tempfile.TemporaryFile() as contents:
-        command = ("git", "-C", str(repo), "cat-file", "--batch")
-        _ = run_git(command, input="".join(f"{blob}\n" for blob in blobs.values()).encode(), output=contents)
-        _ = contents.seek(0)
-        for path, blob in blobs.items():
-            reply = read_batch_blob(contents)
-            if isinstance(reply, TruncatedBlobReply):
-                raise GitReadFailed(command, 0, f"{path}: incomplete Git blob response")
-            if not isinstance(reply, GitBlob) or reply.object_id != blob:
-                raise GitReadFailed(command, 0, f"{path}: invalid Git blob response")
-            yield path, reply.content
+@overload
+def blob_contents(repo: Path, blobs: Mapping[str, str], *,
+                  report_missing: Literal[False] = False) -> Iterator[tuple[str, bytes]]: ...
+
+
+@overload
+def blob_contents(repo: Path, blobs: Mapping[str, str], *,
+                  report_missing: Literal[True]) -> Iterator[tuple[str, bytes | MissingBlob]]: ...
+
+
+def blob_contents(repo: Path, blobs: Mapping[str, str], *,
+                  report_missing: bool = False) -> Iterator[tuple[str, bytes | MissingBlob]]:
+    """Read a Git batch in memory. Yield missing blobs only when the caller requests them."""
+    command = ("git", "-C", str(repo), "cat-file", "--batch")
+    request = "".join(f"{blob}\n" for blob in blobs.values()).encode()
+    contents = BytesIO(run_git(command, input=request).stdout)
+    for path, blob in blobs.items():
+        reply = read_batch_blob(contents)
+        if report_missing and isinstance(reply, MissingBlob):
+            yield path, reply
+            continue
+        if isinstance(reply, TruncatedBlobReply):
+            raise GitReadFailed(command, 0, f"{path}: incomplete Git blob response")
+        if not isinstance(reply, GitBlob) or reply.object_id != blob:
+            raise GitReadFailed(command, 0, f"{path}: invalid Git blob response")
+        yield path, reply.content
 
 
 def parse_status_z(output: str) -> set[str]:

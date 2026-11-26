@@ -122,6 +122,8 @@ class ReviewSubmissionTests(unittest.TestCase):
             "REVIEW_LINKS_ROOT": str(self.root / "review")})))
         conf.path("machines").parent.mkdir(parents=True, exist_ok=True)
         _ = write_config_fixture(conf.path("machines"))
+        _ = write_config_fixture(conf.path("review_links"))
+        _ = write_config_fixture(conf.path("user_zone"))
 
     @property
     def identities(self) -> update_registration.QuestionStaff:
@@ -3270,6 +3272,15 @@ class ReviewSubmissionTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(submissions.SubmissionError):
                     _ = submissions.submit(invalid)
+        _ = write_config_fixture(conf.path("review_links"), "# whole: 1..4\nnew_item.max_images=1\n")
+        _ = write_config_fixture(conf.path("console"), f"page.review.owner={OWNER}\n")
+        draft = "r6-" + "a" * 32
+        capture = new_item_dialog.DeferredCaptureIntent(
+            draft + "b" * 32, draft, new_item_dialog.PageCaptureRequest("/console/review.html", 876, 640, True))
+        with self.assertRaisesRegex(submissions.SubmissionError,
+                                    "The screenshot and pasted images exceed the attachment limits."):
+            _ = submissions.submit(replace(request(), request_id=draft, page="review", images=(IMAGE,)),
+                                   capture_intent=capture)
         self.assertEqual(investigation.records(OWNER), [])
         self.assertEqual(self.questions(), [])
         self.assertEqual(self.proposals(), [])
@@ -3312,7 +3323,7 @@ class PageOwnerReasonTests(unittest.TestCase):
         return route
 
     def test_reason_names_the_owner_that_takes_the_item(self) -> None:
-        for page, owner, expected in (("list", self.morty, "(why morty? because morty owns the List page!)"),
+        for page, owner, expected in (("list", self.morty, "(why morty? because morty owns the Studio page!)"),
                                       ("builds", self.builds, "(why builds? because builds owns the Builds page!)")):
             with self.subTest(page=page):
                 route = self.route(page, owner.id, self.members)

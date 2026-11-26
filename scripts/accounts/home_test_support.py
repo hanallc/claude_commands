@@ -65,6 +65,7 @@ def scratch_accounts_config() -> Generator[Path]:
             + "role_map_timeout_seconds=20\ntranscript_chunk_bytes=65536\nrefusal_reset_wait_minutes=20\n"
             + "login_renewal_interval_minutes=60\noutage_claim_lease_seconds=900\n"
             + "nixos_repository_root=/etc/nixos\nnotes_directory=~/rust/hanadocs/agents\nhome_nixos_repository_root=~/nixos\n")
+        _ = write_config_fixture(config / "user_zone.conf")
         write_credit_accounts(config / "accounts.conf", TEST_CREDIT_ACCOUNTS)
         clear_notes_directory_cache()
         try:

@@ -1,9 +1,9 @@
-"""Find an agent executable without loading its launch shell."""
+"""Find an agent executable without loading its launch shell, and recognize a running agent."""
 from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -31,3 +31,26 @@ def resolve_program(tool: Literal["claude", "codex"], *, environment: Mapping[st
     raise FileNotFoundError(f"{tool} program not found (looked in PATH and {installed})")
 
 
+def is_agent_process(arguments: Sequence[str], kind: str) -> bool:
+    """The argv is a `kind` agent process, native or through node."""
+    if not arguments:
+        return False
+    executable = Path(arguments[0]).name
+    if executable == kind:
+        return True
+    # The npm installations run a specific script through node, not a bare executable.
+    script = arguments[1] if len(arguments) > 1 else ""
+    return executable in {"node", "nodejs"} and (
+        kind == "claude" and script.endswith("/@anthropic-ai/claude-code/cli.js")
+        or kind == "codex" and script.endswith("/@openai/codex/bin/codex.js")
+    )
+
+
+def is_claude_process(arguments: Sequence[str]) -> bool:
+    """The argv is a Claude Code process, native or through node."""
+    return is_agent_process(arguments, "claude")
+
+
+def is_codex_process(arguments: Sequence[str]) -> bool:
+    """The argv is a Codex process, native or through node."""
+    return is_agent_process(arguments, "codex")
