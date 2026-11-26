@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass
+from functools import cache
 from importlib.metadata import packages_distributions
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -580,13 +581,57 @@ class RepositoryDirectory:
     path: str
 
 
+type ScanScopeKey = tuple[str, str]
+type ResolvedDirectory = RepositoryDirectory | UnrootedPath | OutsideRepository
+type ScanBindings = frozenset[tuple[str, ResolvedDirectory]]
+
+
+def scan_components(predecessors: dict[ScanScopeKey, set[ScanScopeKey]],
+                    successors: dict[ScanScopeKey, set[ScanScopeKey]],
+                    roots: set[ScanScopeKey]) -> dict[ScanScopeKey, frozenset[ScanScopeKey]]:
+    """Find components of scopes that can reach a scan."""
+    finished: list[ScanScopeKey] = []
+    visited: set[ScanScopeKey] = set()
+    for root in roots:
+        if root in visited:
+            continue
+        visited.add(root)
+        stack = [(root, iter(predecessors[root]))]
+        while stack:
+            key, edges = stack[-1]
+            parent = next(edges, None)
+            if parent is None:
+                finished.append(key)
+                _ = stack.pop()
+            elif parent not in visited:
+                visited.add(parent)
+                stack.append((parent, iter(predecessors[parent])))
+
+    components: dict[ScanScopeKey, frozenset[ScanScopeKey]] = {}
+    for root in reversed(finished):
+        if root not in visited:
+            continue
+        pending = [root]
+        members = {root}
+        visited.remove(root)
+        while pending:
+            key = pending.pop()
+            new = successors[key] & visited
+            visited.difference_update(new)
+            members.update(new)
+            pending.extend(new)
+        component = frozenset(members)
+        components.update((key, component) for key in component)
+    return components
+
+
 def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_modules: dict[str, set[str]]
                           ) -> dict[str, frozenset[RepositoryScan]]:
     """Resolve scoped scans without following imports beyond a called helper."""
     repository_root = repo.resolve()
     scopes = {path: {scope.name: scope for scope in source.scan_scopes} for path, source in facts.items()}
 
-    def symbols(source: str, target: str) -> Iterator[tuple[str, str]]:
+    def find_symbols(source: str, target: str) -> Iterator[ScanScopeKey]:
         level = len(target) - len(target.lstrip("."))
         parts = target.lstrip(".").split(".")
         if level:
@@ -603,12 +648,38 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
                     yield path, ".".join(parts[size:])
                 return
 
+    @cache
+    def symbols(source: str, target: str) -> tuple[ScanScopeKey, ...]:
+        return tuple(find_symbols(source, target))
+
+    all_scopes = {(path, scope.name): scope for path, names in scopes.items() for scope in names.values()}
+    predecessors: dict[ScanScopeKey, set[ScanScopeKey]] = {key: set() for key in all_scopes}
+    successors: dict[ScanScopeKey, set[ScanScopeKey]] = {key: set() for key in all_scopes}
+    calls: dict[ScanScopeKey, list[tuple[ScanCall, bool, tuple[ScanScopeKey, ...]]]] = {}
+    for key, scope in all_scopes.items():
+        source = key[0]
+        resolved: list[tuple[ScanCall, bool, tuple[ScanScopeKey, ...]]] = []
+        for call in scope.calls:
+            local = call.target in scopes[source]
+            targets = (((source, call.target),) if local else
+                       tuple(target for target in symbols(source, call.target) if target in all_scopes))
+            if targets:
+                resolved.append((call, local, targets))
+                successors[key].update(targets)
+                for target in targets:
+                    predecessors[target].add(key)
+        if resolved:
+            calls[key] = resolved
+    components = scan_components(predecessors, successors, {key for key, scope in all_scopes.items() if scope.scans})
+    calls = {key: [(call, local, reachable) for call, local, targets in invocations
+                   if (reachable := tuple(target for target in targets if target in components))]
+             for key, invocations in calls.items() if key in components}
+
     def directory(source: str, value: ScanPath | UnrootedPath | OutsideRepository,
-                  parameters: dict[str, RepositoryDirectory | UnrootedPath | OutsideRepository], seen: frozenset[tuple[str, str]]
-                  ) -> RepositoryDirectory | UnrootedPath | OutsideRepository:
+                  parameters: dict[str, ResolvedDirectory], seen: frozenset[ScanScopeKey]) -> ResolvedDirectory:
         if isinstance(value, (UnrootedPath, OutsideRepository)):
             return value
-        origin: RepositoryDirectory | UnrootedPath | OutsideRepository = UnrootedPath()
+        origin: ResolvedDirectory = UnrootedPath()
         match value.root:
             case SourceFileRoot():
                 origin = RepositoryDirectory(source)
@@ -640,11 +711,12 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
             return OutsideRepository()
         return origin
 
-    def called_scans(source: str, scope: ScanScope, parameters: dict[str, RepositoryDirectory | UnrootedPath | OutsideRepository],
-                     follow_imports: bool, seen: frozenset[tuple[str, str]]) -> set[RepositoryScan]:
-        key = source, scope.name
-        if key in seen:
-            return set()
+    @cache
+    def called_scans(key: ScanScopeKey, bindings: ScanBindings,
+                     follow_imports: bool, seen: frozenset[ScanScopeKey]) -> frozenset[RepositoryScan]:
+        source = key[0]
+        scope = all_scopes[key]
+        parameters = dict(bindings)
         seen = seen | {key}
         result: set[RepositoryScan] = set()
         for scan in scope.scans:
@@ -653,23 +725,29 @@ def repository_scan_graph(repo: Path, facts: dict[str, SourceFacts], bare_module
                 result.add(RepositoryScan(".", scan.pattern, True))
             elif isinstance(root, RepositoryDirectory):
                 result.add(RepositoryScan(root.path, scan.pattern, scan.recursive))
-        for call in scope.calls:
+        for call, local, targets in calls.get(key, ()):
+            if not local and not follow_imports:
+                continue
             arguments = [directory(source, value, parameters, frozenset()) for value in call.arguments]
             keywords = {name: directory(source, value, parameters, frozenset()) for name, value in call.keywords}
-            targets = [(source, call.target)] if call.target in scopes[source] else []
-            local = bool(targets)
-            if not local and follow_imports and any(isinstance(value, RepositoryDirectory) for value in (*arguments, *keywords.values())):
-                targets = list(symbols(source, call.target))
-            for path, name in targets:
-                callee = scopes[path].get(name)
-                if callee is not None:
-                    bound = {**dict(zip(callee.parameters, arguments)), **keywords}
-                    result.update(called_scans(path, callee, bound, follow_imports and local, seen))
-        return result
+            if not local and not any(isinstance(value, RepositoryDirectory) for value in (*arguments, *keywords.values())):
+                continue
+            for target in targets:
+                if target not in seen:
+                    bound = {**dict(zip(all_scopes[target].parameters, arguments)), **keywords}
+                    # A path can return to a visited scope only within the same component.
+                    result.update(called_scans(target, frozenset(bound.items()), follow_imports and local,
+                                               seen & components[target]))
+        return frozenset(result)
 
-    return {path: frozenset(scan for scope in source.scan_scopes
-                            for scan in called_scans(path, scope, {}, True, frozenset()))
-            for path, source in facts.items()}
+    no_bindings: ScanBindings = frozenset()
+    no_visited: frozenset[ScanScopeKey] = frozenset()
+    graph = {path: frozenset(scan for scope in source.scan_scopes
+                             if (key := (path, scope.name)) in components
+                             for scan in called_scans(key, no_bindings, True, no_visited))
+             for path, source in facts.items()}
+    called_scans.cache_clear()
+    return graph
 
 
 def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: set[str],
@@ -697,9 +775,10 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
                 cached[blob] = facts
         if isinstance(facts.syntax, InvalidPython) and is_test_module(path):
             raise SyntaxError(f"{facts.syntax.message} ({path})")
-        tokens[path] = facts.tokens
-        config_reads[path] = facts.config_reads
-        scan_facts[path] = facts
+        if worktree:
+            tokens[path] = facts.tokens
+            config_reads[path] = facts.config_reads
+            scan_facts[path] = facts
         dependencies: set[str] = set()
         for level, module, names in facts.imports:
             if level:
@@ -715,7 +794,8 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
 
         dependencies.discard(path)
         graph[path] = dependencies
-    return SourceGraph(graph, tokens, config_reads, repository_scan_graph(repo, scan_facts, bare_modules))
+    scans = repository_scan_graph(repo, scan_facts, bare_modules) if worktree else {}
+    return SourceGraph(graph, tokens, config_reads, scans)
 
 
 MODULE_HISTORY_SQL = (

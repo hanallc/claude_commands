@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import posixpath
 import subprocess
 import sqlite3
 import tempfile
@@ -176,6 +177,77 @@ class AffectedModulesTests(unittest.TestCase):
                     self.write(path, "from scripts.production import staff\n" if label == "added accessor" else "changed\n")
                 _ = self.commit()
                 self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
+
+    def test_scan_graph_reuses_shared_acyclic_calls(self) -> None:
+        caller = "scripts/checks/test_caller.py"
+        helper = "scripts/lib/audit.py"
+        leaf = "scripts/lib/leaf.py"
+        facts = {
+            caller: affected.extract_facts("""
+from pathlib import Path
+from scripts.lib import audit
+ROOT = Path(__file__).parent
+
+def shared(folder):
+    return (folder / "marker").glob("*.txt")
+
+def first():
+    return shared(ROOT)
+
+def second():
+    return shared(folder=ROOT)
+
+def different():
+    return shared(ROOT / "other")
+
+def cycle_a(folder):
+    cycle_b(folder / "a")
+    return folder.glob("*.a")
+
+def cycle_b(folder):
+    cycle_a(folder / "b")
+    return folder.glob("*.b")
+
+def from_a():
+    return cycle_a(ROOT)
+
+def from_b():
+    return cycle_b(ROOT)
+
+FILES = audit.collect(ROOT)
+""", caller),
+            helper: affected.extract_facts("""
+from pathlib import Path
+from scripts.lib import leaf
+
+def collect(folder):
+    leaf.deep(folder)
+    return folder.glob("*.remote")
+
+FILES = collect(Path(__file__).parent)
+""", helper),
+            leaf: affected.extract_facts('def deep(folder):\n    return folder.glob("*.deep")\n', leaf),
+        }
+        normalize = posixpath.normpath
+        marker_calls: list[str] = []
+
+        def count_marker_paths(path: str | bytes) -> str | bytes:
+            if isinstance(path, str) and path.endswith("/marker"):
+                marker_calls.append(path)
+            return normalize(path)
+
+        with mock.patch.object(posixpath, "normpath", count_marker_paths):
+            scans = affected.repository_scan_graph(self.repo, facts, {})
+        self.assertEqual(scans, {
+            caller: frozenset(affected.RepositoryScan(folder, pattern, False) for folder, pattern in (
+                ("scripts/checks/marker", "*.txt"), ("scripts/checks/other/marker", "*.txt"),
+                ("scripts/checks", "*.remote"), ("scripts/checks", "*.a"), ("scripts/checks", "*.b"),
+                ("scripts/checks/a", "*.b"), ("scripts/checks/b", "*.a"),
+            )),
+            helper: frozenset(affected.RepositoryScan("scripts/lib", pattern, False) for pattern in ("*.remote", "*.deep")),
+            leaf: frozenset(),
+        })
+        self.assertEqual(len(marker_calls), 2)
 
     def test_source_audits_select_changed_file_kinds_without_scan_records(self) -> None:
         scans = (
@@ -966,6 +1038,54 @@ class AffectedModulesTests(unittest.TestCase):
         self.assertEqual(result.changed_files,
                          ("scripts/component/deleted.py", "scripts/component/new.py", "scripts/component/old.py",
                           "scripts/component/renamed.py", "scripts/component/subject.py"))
+
+    def test_deletion_uses_base_imports_without_a_base_scan_graph(self) -> None:
+        self.write("scripts/component/deleted.py", "VALUE = 1\n")
+        self.add_test("checks/test_reader.py", "import scripts.component.deleted\n")
+        self.certify()
+        (self.repo / "scripts/component/deleted.py").unlink()
+        self.write("scripts/checks/test_reader.py", "VALUE = 1\n")
+        _ = self.commit()
+        with mock.patch.object(affected, "repository_scan_graph", wraps=affected.repository_scan_graph) as scans:
+            self.assertEqual(self.selection().modules, (self.repo / "scripts/checks/test_reader.py",))
+        scans.assert_called_once()
+
+    def test_invalid_historical_test_still_requires_a_full_suite(self) -> None:
+        self.add_test("checks/test_deleted.py", "broken (\n")
+        self.certify()
+        deleted = self.repo / "scripts/checks/test_deleted.py"
+        deleted.unlink()
+        self.modules.remove(deleted)
+        _ = self.commit()
+        result = affected.select_affected(self.repo, self.base, self.modules, set())
+        self.assertIsInstance(result, affected.FullSuite)
+        assert isinstance(result, affected.FullSuite)
+        self.assertIn("scripts/checks/test_deleted.py", result.reason)
+
+    def test_optimized_selection_matches_baseline(self) -> None:
+        self.write("scripts/component/deleted.py", "VALUE = 1\n")
+        self.write("scripts/shared.py", "VALUE = 1\n")
+        self.add_test("checks/test_scans.py", "from pathlib import Path\n"
+                      + "def scan(root):\n    return (root / 'assets').rglob('*.txt')\n"
+                      + "FILES = scan(Path(__file__).parents[2])\n")
+        self.add_test("checks/test_shared.py", "from scripts import shared\n")
+        self.add_test("checks/test_historical.py", "import scripts.component.deleted\n")
+        self.add_test("checks/test_unrelated.py", "VALUE = 1\n")
+        self.certify()
+        files = tuple(f"assets/data-{number:03}.txt" for number in range(298))
+        for path in files:
+            self.write(path, "fixture\n")
+        self.write("scripts/shared.py", "VALUE = 2\n")
+        (self.repo / "scripts/component/deleted.py").unlink()
+        _ = self.commit()
+        expected = affected.AffectedSelection(
+            self.base, (*files, "scripts/component/deleted.py", "scripts/shared.py"),
+            tuple(self.repo / f"scripts/checks/test_{name}.py" for name in ("scans", "shared", "historical")),
+        )
+        for cache in ("cold", "warm"):
+            with self.subTest(cache=cache):
+                self.assertEqual(affected.select_affected(self.repo, self.base, self.modules, set(),
+                                                          state_dir=self.cache_dir()), expected)
 
     def test_removed_python_sources_reuse_both_graphs_without_parsing_or_cache_writes(self) -> None:
         self.write("scripts/component/subject.py", "VALUE = 1\n")
