@@ -1765,39 +1765,264 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertFalse(handoff.answer_events)
         self.assertIn(changed, item.log)
 
+    def file_fixture_exchange(self, exchange: list_exchange.Exchange) -> None:
+        with the_list.lock_exchange_source(exchange.source_key) as locked:
+            _ = the_list.file_exchanges(locked, (exchange,), exchange.question, linked=the_list.NextNumber.AVAILABLE,
+                                       owner=OWNER.id, members=MEMBERS)
+
+    def test_copied_reply_digest_cannot_file_under_another_request(self) -> None:
+        first = (ReviewLog(START, "nate", "question: Which side?"),
+                 ReviewLog(FIRST_REPLY, OWNER.id, "Answer: East."))
+        other = ReviewLog(SECOND_ASK, "nate", "question: Which road?")
+        slot = delivery_state.OpenQuestion("current", "When?", delivery_state.NoDelivery())
+        for number, legacy in enumerate((False, True), 1):
+            key = f"fixture/C{number}"
+            original = replace(self.change_with_log(first, slot), key=key, answer_time=FIRST_REPLY)
+            if legacy:
+                self.file_fixture_exchange(list_exchange.Exchange(
+                    list_exchange.Source.SCOPED_REPLY, key, "log:2", list_exchange.Direction.ANSWER_TO_NATE,
+                    "Which side?", START, list_exchange.Nate.USER, OWNER.id,
+                    list_exchange.ExchangeAnswer("East.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD)))
+            else:
+                self.assertEqual(self.migrate_change(original)[0], 0)
+            old, = the_list.exchange_history(key)
+            later = replace(self.change_with_log((*first, other, first[1]), slot), key=key, answer_time=FIRST_REPLY)
+            status, preview = self.migrate_change(later)
+            self.assertEqual(status, 0)
+            self.assertIn(f"  {key}: 1", preview)
+            saved, = the_list.exchange_history(key)
+            self.assertEqual((saved.exchange_id, saved.question, saved.answer), (old.exchange_id, old.question, old.answer))
+            self.assertEqual(saved.binding, list_exchange.ExchangeBinding(list_exchange.QuestionEvent(0),
+                             list_exchange.LoggedReply(1, answer_sources.event_digest(first[1]))))
+            _ = self.check_change_handoff(later, frozenset({1}), unread=True)
+
+    def test_slot_only_filing_reserves_the_reply_against_a_late_log_copy(self) -> None:
+        item = self.change_with_log((), delivery_state.AnsweredQuestion("saved", "Which side?", "East."))
+        assert isinstance(item.source, review_items.ChangeSource)
+        item = replace(item, source=replace(item.source, answered_by=OWNER.id, answered_at=FIRST_REPLY))
+        self.assertEqual(self.migrate_change(item)[0], 0)
+        old, = the_list.exchange_history(item.key)
+        self.assertEqual(old.exchange_id, "question:saved")
+        log = (ReviewLog(START, "nate", "question: Which road?"),
+               ReviewLog(FIRST_REPLY, OWNER.name, "Answer: East."))
+        slot = delivery_state.OpenQuestion("current", "When?", delivery_state.NoDelivery())
+        later = replace(self.change_with_log(log, slot), answer_time=FIRST_REPLY)
+        status, preview = self.migrate_change(later)
+        self.assertEqual(status, 0)
+        self.assertIn(f"  {item.key}: 1", preview)
+        self.assertEqual(the_list.exchange_history(item.key), (old,))
+        handoff = self.check_change_handoff(later, frozenset(), unread=True)
+        self.assertFalse(handoff.filed_slot_id)
+
+    def test_foreign_filed_replacement_cannot_prove_a_bug_initial_reply(self) -> None:
+        first = ReviewLog(FIRST_REPLY, OWNER.id, "Answer: North.")
+        prompt = ReviewLog(SECOND_ASK, "nate", "question: Which side?", "Q1")
+        reply = ReviewLog(SECOND_REPLY, ASKER.id, "Answer: East.", "answer:Q1")
+        binding = list_exchange.ExchangeBinding(list_exchange.QuestionSlot("Q1"), list_exchange.TaggedReply("answer:Q1"))
+        for number, prior in enumerate((binding, list_exchange.UnboundExchange.LEGACY), 1):
+            with self.subTest(binding=prior):
+                key = self.legacy_report(number, (first, prompt, reply), answer="East.")
+                old = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "question:Q1",
+                    list_exchange.Direction.ANSWER_TO_NATE, "Which side?", SECOND_ASK, list_exchange.Nate.USER, ASKER.id,
+                    list_exchange.ExchangeAnswer("East.", SECOND_REPLY, list_exchange.AnswerRead.UNREAD), binding=prior)
+                self.file_fixture_exchange(old)
+                status, preview = self.migrate(apply=True)
+                self.assertEqual(status, 0)
+                self.assertIn(f"  {key}: 2", preview)
+                self.assertEqual(the_list.exchange_history(key), (list_exchange.FiledExchange.from_exchange(old),))
+                visible = {item.key: item for item in review_items.read(self.review, members=MEMBERS, show="open")}
+                self.assertTrue(visible[key].unread_answer)
+                self.assertIn(reply, visible[key].log)
+                handoff = visible[key].exchange_handoff
+                if isinstance(handoff, review_items.FiledReviewExchange):
+                    self.assertFalse(handoff.answer_events)
+                    self.assertFalse(handoff.filed_investigation_answer)
+
+    def test_open_change_slot_keeps_its_tagged_reply_visible_even_with_a_receipt(self) -> None:
+        prompt = ReviewLog(START, "nate", "question: Which side?", "current")
+        reply = ReviewLog(FIRST_REPLY, OWNER.id, "Answer: East.", "answer:current")
+        open_slot = delivery_state.OpenQuestion("current", "Which side?", delivery_state.NoDelivery())
+        item = replace(self.change_with_log((prompt, reply), open_slot), answer_time=FIRST_REPLY)
+        status, preview = self.migrate_change(item)
+        self.assertEqual(status, 0)
+        self.assertIn(f"  {item.key}: 1", preview)
+        self.assertFalse(the_list.exchange_history(item.key))
+        answer = delivery_state.AnsweredQuestion("current", "Which side?", "East.")
+        self.assertEqual(self.migrate_change(self.change_with_log((prompt, reply), answer))[0], 0)
+        saved, = the_list.exchange_history(item.key)
+        self.assertEqual((saved.exchange_id, saved.question), ("question:current", "Which side?"))
+        self.assertEqual(saved.answer, list_exchange.ExchangeAnswer("East.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD))
+        self.assertEqual(self.migrate_change(item)[0], 0)
+        self.assertEqual(the_list.exchange_history(item.key), (saved,))
+        handoff = self.check_change_handoff(item, frozenset(), unread=True)
+        self.assertFalse(handoff.filed_slot_id)
+
+    def test_submitted_tagged_initial_requires_owner_and_respects_terminal_boundaries(self) -> None:
+        prompt = ReviewLog(START, "nate", "question: Which route?", "Q1")
+        reply = ReviewLog(SECOND_REPLY, OWNER.id, "Answer: North.", "answer:Q1")
+        cases = (((), ASKER.id), *(((ReviewLog(READ, "nate", words),), OWNER.id) for words in (
+            "approve: Continue.", "decline: Stop.", "Superseded followup: Which route?",
+            "User chose approve before the answer; superseded the previous wait.",
+            "Review C1: works superseded the question Q1 before the answer arrived.")))
+        for number, (events, author) in enumerate(cases, 1):
+            with self.subTest(events=events, author=author):
+                name, request = f"tagged-initial-{number}", f"request-123456789{number}"
+                fields: update_registration.OutstandingItem = {
+                    "since": FILED, "text": "Choose a route", "question": "Which route?", "review_id": f"Q{number}",
+                    "review_submission": new_item_dialog.stored_submission(origin(request)),
+                    "review_log": encode((prompt, reply)),
+                    "followups": [{"followup": "Which route?", "reply": "North.", "question_id": "Q1"}],
+                }
+                key = self.native(name, fields)
+                self.assertEqual(self.migrate(apply=True)[0], 0)
+                source_key = f"submission/question/{request}"
+                saved, = the_list.exchange_history(source_key)
+                self.assertEqual((saved.exchange_id, saved.question, saved.answerer), ("followup:1", "Which route?", OWNER.id))
+                self.assertEqual(saved.answer, list_exchange.ExchangeAnswer(
+                    "North.", SECOND_REPLY, list_exchange.AnswerRead.UNREAD))
+                wrong = replace(reply, who=author)
+                _ = self.native(name, {**fields, "review_log": encode((prompt, *events, wrong))})
+                status, preview = self.migrate(apply=True)
+                self.assertEqual(status, 0)
+                self.assertIn(f"  {source_key}: 1", preview)
+                self.assertEqual(the_list.exchange_history(source_key), (saved,))
+                visible = {item.key: item for item in review_items.read(self.review, members=MEMBERS, show="open")}
+                self.assertTrue(visible[key].unread_answer)
+                self.assertIn(wrong, visible[key].log)
+                handoff = visible[key].exchange_handoff
+                if isinstance(handoff, review_items.FiledReviewExchange):
+                    self.assertFalse(handoff.answer_events)
+                    self.assertFalse(handoff.hides_card)
+
+    def test_scoped_tagged_reply_after_supersession_cannot_file_or_claim(self) -> None:
+        prompt = ReviewLog(START, "nate", "question: Which side?", "Q1")
+        reply = ReviewLog(SECOND_REPLY, OWNER.id, "Answer: East.", "answer:Q1")
+        boundary = ReviewLog(READ, "nate", "Superseded followup: Which side?")
+        slot = delivery_state.OpenQuestion("current", "When?", delivery_state.NoDelivery())
+        for number, filing in enumerate(("new", "bound", "legacy"), 1):
+            key = f"fixture/C{number}"
+            original = replace(self.change_with_log((prompt, reply), slot), key=key)
+            if filing == "bound":
+                self.assertEqual(self.migrate_change(original)[0], 0)
+            elif filing == "legacy":
+                self.file_fixture_exchange(list_exchange.Exchange(
+                    list_exchange.Source.SCOPED_REPLY, key, "question:Q1", list_exchange.Direction.ANSWER_TO_NATE,
+                    "Which side?", START, list_exchange.Nate.USER, OWNER.id,
+                    list_exchange.ExchangeAnswer("East.", SECOND_REPLY, list_exchange.AnswerRead.UNREAD)))
+            before = the_list.exchange_history(key)
+            changed = replace(self.change_with_log((prompt, boundary, reply), slot), key=key)
+            status, preview = self.migrate_change(changed)
+            self.assertEqual(status, 0)
+            self.assertIn(f"  {key}: 1", preview)
+            self.assertEqual(the_list.exchange_history(key), before)
+            projected, = answer_sources.apply_review_handoffs([changed], user_zone(), members=MEMBERS)
+            self.assertTrue(projected.unread_answer)
+            self.assertIn(reply, projected.log)
+            handoff = projected.exchange_handoff
+            if isinstance(handoff, review_items.FiledReviewExchange):
+                self.assertFalse(handoff.answer_events)
+
+    def test_same_tag_cannot_restore_a_staff_reply_after_supersession(self) -> None:
+        prompt = ReviewLog(START, "nate", "question: Which side?", "Q1")
+        reply = ReviewLog(SECOND_REPLY, ASKER.id, "Answer: East.", "answer:Q1")
+        approval = ReviewLog(SECOND_REPLY + timedelta(minutes=1), "nate", "answer: Proceed.")
+        superseded = ReviewLog(READ, "nate", "Superseded followup: Which side?")
+        fields: update_registration.OutstandingItem = {
+            "since": FILED, "text": "Choose a route", "question": "Which route?", "waiting_why": "Which side?",
+            "review_log": encode((prompt, reply, approval)),
+        }
+        key = self.native("staff-tag-supersession", fields, status="closed")
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        saved = the_list.exchange_history(key)
+        self.assertEqual([exchange.exchange_id for exchange in saved], ["initial", "legacy-followup"])
+        _ = self.native("staff-tag-supersession", {**fields, "review_log": encode((prompt, superseded, reply, approval))},
+                        status="closed")
+        status, preview = self.migrate(apply=True)
+        self.assertEqual(status, 0)
+        self.assertIn(f"  {key}: 1", preview)
+        self.assertEqual(the_list.exchange_history(key), saved)
+        item, = review_items.read(self.review, members=MEMBERS)
+        self.assertIn(reply, item.log)
+        handoff = item.exchange_handoff
+        assert isinstance(handoff, review_items.FiledReviewExchange)
+        self.assertFalse(handoff.answer_events)
+        self.assertFalse(handoff.hides_card)
+
+    def test_tagged_replacement_after_supersession_cannot_prove_a_bug_initial_reply(self) -> None:
+        first = ReviewLog(FIRST_REPLY, OWNER.id, "Answer: North.")
+        prompt = ReviewLog(SECOND_ASK, "nate", "question: Which side?", "Q1")
+        boundary = ReviewLog(SECOND_ASK + timedelta(minutes=1), "nate", "Superseded followup: Which side?")
+        reply = ReviewLog(SECOND_REPLY, OWNER.id, "Answer: East.", "answer:Q1")
+        for number, prior in enumerate((False, True), 1):
+            key = self.legacy_report(number, (first, prompt, reply), answer="East.")
+            if prior:
+                self.assertEqual(self.migrate(apply=True)[0], 0)
+            before = the_list.exchange_history(key)
+            self.assertEqual([entry.exchange_id for entry in before], ["initial", "question:Q1"] if prior else [])
+            _ = self.legacy_report(number, (first, prompt, boundary, reply), answer="East.")
+            status, preview = self.migrate(apply=True)
+            self.assertEqual(status, 0)
+            self.assertIn(f"  {key}: 2", preview)
+            self.assertEqual(the_list.exchange_history(key), before)
+            visible = {item.key: item for item in review_items.read(self.review, members=MEMBERS, show="open")}
+            self.assertTrue(visible[key].unread_answer)
+            self.assertIn(reply, visible[key].log)
+
     def test_shared_verifier_applies_conflicts_to_all_reply_proofs(self) -> None:
-        prompt = ReviewLog(START, "nate", "question: Which side?")
+        tag = "Q1"
+        prompt = ReviewLog(START, "nate", "question: Which side?", tag)
         reply = ReviewLog(FIRST_REPLY, OWNER.id, "Answer: East.")
         note = ReviewLog(START + timedelta(minutes=1), OWNER.id, "I checked the map.")
-        boundary = replace(note, who="nate", words="approve: Continue.")
+        boundary = replace(note, who="nate", words="Superseded followup: Which side?")
+        open_slot = delivery_state.OpenQuestion(tag, "Which side?", delivery_state.NoDelivery())
+        answered = delivery_state.AnsweredQuestion(tag, "Which side?", "East.")
+        key = self.legacy_report(90, (prompt, reply), answer="East.")
+        bug, = (item for item in review_items.read(self.review, members=MEMBERS, include_filed=True, sources=[])
+                if item.key == key)
+        assert isinstance(bug.source, review_items.InvestigationSource)
         for proof in answer_sources.ReplyProof:
-            tag = "Q1"
-            tagged_prompt = replace(prompt, feedback_request_id=tag)
             qualified = replace(reply, feedback_request_id="answer:Q1") if proof is answer_sources.ReplyProof.TAG else reply
+            tagged = replace(reply, feedback_request_id="answer:Q1")
             cases = {
-                "valid": ((tagged_prompt, note, qualified), "East.", False),
-                "duplicate tag": ((tagged_prompt, note, qualified, replace(tagged_prompt, words="question: When?")),
-                                  "East.", True),
-                "foreign author": ((tagged_prompt, note, replace(qualified, who=ASKER.id)), "East.", True),
-                "request boundary": ((tagged_prompt, boundary, reply), "East.", True),
-                "slot has another answer": ((tagged_prompt, note, qualified), "West.", True),
+                "valid": ((prompt, note, qualified), answered, False),
+                "duplicate tag": ((prompt, note, qualified, replace(prompt, words="question: When?")), answered, True),
+                "foreign author": ((prompt, note, replace(qualified, who=ASKER.id)), answered, True),
+                "foreign Bug replacement": ((prompt, note, replace(qualified, who=ASKER.id)), answered, True),
+                "tagged after supersession": ((prompt, boundary, tagged), answered, True),
+                "open slot": ((prompt, note, tagged), open_slot, True),
+                "slot has another answer": ((prompt, note, qualified), replace(answered, answer="West."), True),
+                "copied digest": ((prompt, note, qualified), answered, True),
             }
-            for name, (log, saved_answer, conflict) in cases.items():
+            for name, (log, slot, conflict) in cases.items():
                 with self.subTest(proof=proof, case=name):
-                    slot = answer_sources.QuestionSlotEvidence(tag, "Which side?",
-                                                               answer_sources.ReplyEvidence(saved_answer))
-                    verifier = answer_sources.ExchangeVerifier(log, MEMBERS, slot=slot)
-                    evidence = answer_sources.ReplyEvidence(
-                        "East.", FIRST_REPLY, OWNER.id, 2, list_exchange.TaggedReply("answer:Q1")
-                        if log[2].feedback_request_id else list_exchange.LoggedReply(2, answer_sources.event_digest(log[2])))
-                    result = verifier.verify(answer_sources.RequestInterval("Which side?", 0), 2, proof,
-                                             tag=tag, evidence=evidence)
+                    item = self.change_with_log(log, slot)
+                    if name == "foreign Bug replacement":
+                        item = replace(bug, source=replace(bug.source, record=replace(bug.source.record, log=log)))
+                    binding = (list_exchange.TaggedReply(log[2].feedback_request_id) if log[2].feedback_request_id
+                               else list_exchange.LoggedReply(2, answer_sources.event_digest(log[2])))
+                    previous = ()
+                    if name == "copied digest":
+                        old = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, item.key, "log:1",
+                            list_exchange.Direction.ANSWER_TO_NATE, "Which road?", START, list_exchange.Nate.USER, OWNER.id,
+                            list_exchange.ExchangeAnswer("East.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD),
+                            binding=list_exchange.ExchangeBinding(list_exchange.QuestionEvent(0),
+                                list_exchange.LoggedReply(1, answer_sources.event_digest(log[2]))))
+                        previous = (list_exchange.FiledExchange.from_exchange(old),)
+                    verifier = answer_sources.ExchangeVerifier(item, user_zone(), MEMBERS, previous)
+                    evidence = (answer_sources.ReplyEvidence("East.", FIRST_REPLY, locator=2, binding=binding)
+                                if name == "foreign Bug replacement" else
+                                answer_sources.ReplyEvidence("East.", FIRST_REPLY, OWNER.id, 2, binding))
+                    result = verifier._verify(  # pyright: ignore[reportPrivateUsage]
+                        answer_sources.RequestInterval("Which side?", 0), 2, proof,
+                        "question:Q1", tag=tag, evidence=evidence)
                     self.assertIs(result, answer_sources.Verification.CONFLICT if conflict
                                   else answer_sources.Verification.VERIFIED)
-        verifier = answer_sources.ExchangeVerifier((prompt, reply), MEMBERS, slot=answer_sources.QuestionSlotEvidence(
-            "Q1", "Which side?", answer_sources.ReplyEvidence("East.")))
-        self.assertIs(verifier.verify(answer_sources.RequestInterval("Which side?", 0), 1,
-                      answer_sources.ReplyProof.INTERVAL), answer_sources.Verification.MISSING)
+        item = self.change_with_log((replace(prompt, feedback_request_id=""), reply), answered)
+        verifier = answer_sources.ExchangeVerifier(item, user_zone(), MEMBERS)
+        result = verifier._verify(  # pyright: ignore[reportPrivateUsage]
+            answer_sources.RequestInterval("Which side?", 0), 1, answer_sources.ReplyProof.INTERVAL,
+            "log:0", evidence=answer_sources.ReplyEvidence())
+        self.assertIs(result, answer_sources.Verification.MISSING)
 
     def test_count_reports_bad_links_and_keeps_repeat_keys_without_writes(self) -> None:
         self.picture("000000000001", list_item="L29", list_keeper=KEEPER.id)

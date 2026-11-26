@@ -2379,8 +2379,12 @@ A closed staff Question can recover one log pair from its saved reason.
 A legacy Bug can use its original question when one owner reply matches the saved answer before a later request.
 A different earlier Bug reply requires a later verified question and reply that match the saved answer.
 Change history files verified earlier pairs and checks the current slot separately.
-One verifier checks each proposed link between a request and a log reply.
+One verifier reads the source owner, terminal events, slot state, saved pairs, tags, and reply digests.
 It reports verified ownership, conflicting evidence, or missing evidence.
+Approval, decline, or supersession ends the request for every type of reply proof.
+An open slot cannot supply proof of an answer.
+One exchange can claim a reply digest in each source.
+A saved slot answer also reserves the reply by its author, time, and words.
 A conflicting or unverified log reply stays in Review.
 The native question and answer can still file when the log association remains unresolved.
 A verified exchange keeps its filed ID.
