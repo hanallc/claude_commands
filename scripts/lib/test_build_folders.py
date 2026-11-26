@@ -1,6 +1,7 @@
 """Build folder allocation preserves parent, ownership, and cleanup rules."""
 from __future__ import annotations
 
+import ast
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Never, cast, override
+from typing import Never, cast, final, override
 from unittest import mock
 from contextlib import AbstractContextManager, chdir, nullcontext, redirect_stdout
 
@@ -3410,6 +3411,97 @@ os._exit(0)
         removed = self.command("remove", str(parent / "verify"))
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertEqual(list(parent.iterdir()), [])
+
+
+@final
+class MacMirrorHoldScanTests(unittest.TestCase):
+    """Every Mac mirror lease goes through build_folders.mac_mirror_hold."""
+
+    LEASE_NAMES = frozenset({
+        "mac_floor_shared_lease", "mac_floor_removal_lease", "upgrade_mac_floor_lease",
+        "inherited_mac_floor_lease", "mac_floor_lease_file", "mac_floor_lease_path", "MacFloorLeaseFile",
+        "_mac_floor_shared_lease", "_mac_floor_removal_lease", "_upgrade_mac_floor_lease",
+        "_inherited_mac_floor_lease", "_mac_floor_lease_file", "_mac_floor_lease_path",
+    })
+    # These functions read the mirror root but use no mirror folder themselves.
+    ROOT_READERS = {
+        ("scripts/lib/build_folders.py", "mac_mirror_folder"): "the lease key itself",
+        ("scripts/lint/sweep.py", "form_folder_use"): "passes the root to the claim check",
+        ("scripts/lint/sweep.py", "mac_floor_settings"): "lists the approved removal roots",
+        ("scripts/lint/sweep.py", "assess"): "passes the root to the floor policy; each group holds it exclusive",
+    }
+
+    def modules(self) -> list[tuple[str, ast.Module]]:
+        root = Path(__file__).resolve().parents[2]
+        found: list[tuple[str, ast.Module]] = []
+        for path in sorted((root / "scripts").rglob("*.py")):
+            if path.name.startswith("test_") or path.name.endswith("_test_support.py"):
+                continue
+            found.append((path.relative_to(root).as_posix(), ast.parse(path.read_text(), str(path))))
+        return found
+
+    def test_no_mirror_lease_is_taken_outside_the_one_function(self) -> None:
+        outside: list[str] = []
+        for name, module in self.modules():
+            if name == "scripts/lib/build_folders.py":
+                continue
+            for node in ast.walk(module):
+                if isinstance(node, ast.Attribute):
+                    used, line = node.attr, node.lineno
+                elif isinstance(node, ast.Name):
+                    used, line = node.id, node.lineno
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    used, line = node.value, node.lineno
+                else:
+                    continue
+                if used in self.LEASE_NAMES or used in (".floor-group", ".floor-waiters"):
+                    outside.append(f"{name}:{line}: {used}")
+        self.assertEqual(outside, [])
+
+    def test_each_mirror_root_reader_holds_the_mirror(self) -> None:
+        outside: list[str] = []
+        for name, module in self.modules():
+            for function in ast.walk(module):
+                if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef) or function.name == "local_path":
+                    continue
+                calls = {node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+                         for node in ast.walk(function) if isinstance(node, ast.Call)}
+                if ("local_path" in calls and "mac_mirror_hold" not in calls
+                        and (name, function.name) not in self.ROOT_READERS):
+                    outside.append(f"{name}:{function.lineno}: {function.name}")
+        self.assertEqual(outside, [])
+
+    def test_a_path_outside_every_mirror_takes_no_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory) / "work" / "repository"
+            outside.mkdir(parents=True)
+            root = Path(directory) / "mirror"
+            with folders.mac_mirror_hold(outside, folders.MacMirrorHold.EXCLUSIVE, root=root) as held:
+                self.assertIsInstance(held, folders.NotInMacMirror)
+            self.assertEqual(sorted(path.name for path in outside.parent.iterdir()), ["repository"])
+
+    def test_a_shared_user_blocks_the_exclusive_hold_of_the_same_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mirror = Path(directory) / "mirror" / "repository"
+            mirror.mkdir(parents=True)
+            with mock.patch.object(folders, "mac_mirror_folder", return_value=mirror):
+                with folders.mac_mirror_hold(mirror / "target" / "debug", folders.MacMirrorHold.SHARED) as held:
+                    self.assertIsInstance(held, int)
+                    with self.assertRaises(BlockingIOError):
+                        with folders.mac_mirror_hold(mirror, folders.MacMirrorHold.EXCLUSIVE):
+                            pass
+                with folders.mac_mirror_hold(mirror, folders.MacMirrorHold.EXCLUSIVE) as held:
+                    self.assertIsInstance(held, int)
+
+    def test_upgrade_without_the_shared_hold_of_the_caller_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mirror = Path(directory) / "mirror" / "repository"
+            mirror.mkdir(parents=True)
+            with (mock.patch.object(folders, "mac_mirror_folder", return_value=mirror),
+                  mock.patch.dict(os.environ, {"COPIES_MIRROR_LEASE_FDS": ""})):
+                with self.assertRaisesRegex(OSError, "no inherited Mac floor lease"):
+                    with folders.mac_mirror_hold(mirror, folders.MacMirrorHold.UPGRADE):
+                        pass
 
 
 if __name__ == "__main__":

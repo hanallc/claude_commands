@@ -1809,12 +1809,10 @@ _MAC_DISK_PROBE = (
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
-    from scripts.copies import copies
-
     if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
         from scripts.mac_test import linux_runner
         return linux_runner.probe_script(remote_mirror(repository, target, slot))
-    return copies.mirror_probe_setup(remote_mirror(repository, target, slot)) + "\n" + _MAC_DISK_PROBE
+    return _MAC_DISK_PROBE
 
 
 def parse_probe(output: str) -> ProbeResult:
@@ -2197,19 +2195,57 @@ def _probe_failure_reason(result: CapturedCommandResult, timeout_s: float) -> st
     return "the probe answer could not be read"
 
 
+def prepare_mac_probe_mirrors(root: str, wait_seconds: float, mirrors: Sequence[str]) -> None:
+    """Prepare mirrors under leases with one deadline for the batch."""
+    from scripts.copies import copies
+
+    deadline = build_folders.MacFloorWaitDeadline(time.monotonic() + wait_seconds)
+    directory = MacMirrorRoot(root).local_path()
+    timed_out = False
+    for request in mirrors:
+        index, _, mirror = request.partition(":")
+        path = directory / mirror
+        try:
+            with build_folders.mac_mirror_hold(path, build_folders.MacMirrorHold.SHARED, deadline=deadline, root=directory):
+                copies.probe_remote_folder(str(path))
+        except TimeoutError as error:
+            if not timed_out:
+                print(error, file=sys.stderr)
+                timed_out = True
+            print(f"mirror_setup={index}\tfailed")
+        except (copies.CopyError, OSError) as error:
+            print(error, file=sys.stderr)
+            print(f"mirror_setup={index}\tfailed")
+        else:
+            print(f"mirror_setup={index}\tready")
+
+
 def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSettings, target: str,
                    mirrors: Sequence[str], *, setup_mirrors: Sequence[eligibility.LegacyMirrorName] = (),
                    ) -> MacHostProbeSnapshot | UnavailableProbe:
     """Read disk space, prepare step mirrors, and scan saved mirrors in one SSH command."""
-    from scripts.copies import copies
-
     script: list[str] = []
+    timeout = config.probe_timeout_s
     if setup_mirrors:
-        root = mac_mirror_root()
+        # Admission keeps a reading for one probe time limit, so the floor wait stays inside it.
+        # Half of the limit is for the wait; the other half is for the disk and process readings.
+        wait_seconds = min(config.configuration.number("floor_sweep_timeout_s"), timeout / 2)
+        root = mac_mirror_root().relative
+        script.append("set --")
         for index, mirror in enumerate(setup_mirrors):
-            setup = copies.mirror_probe_setup(f"{root.relative}/{mirror}")
-            script.extend((f"if ( {setup} ); then", f"printf 'mirror_setup={index}\\tready\\n'",
-                           "else", f"printf 'mirror_setup={index}\\tfailed\\n'", "fi"))
+            mark = shlex.quote(str(Path(root) / mirror / floor_claims.MIRROR_MARK))
+            request = shlex.quote(f"{index}:{mirror}")
+            script.append(f'test -f "$HOME"/{mark} && printf \'mirror_setup={index}\\tready\\n\' || set -- "$@" {request}')
+        program = ("import sys; from scripts.mac_test.offload import prepare_mac_probe_mirrors; "
+                   + "prepare_mac_probe_mirrors(sys.argv[1], float(sys.argv[2]), sys.argv[3:])")
+        setup = "~/.claude/scripts/lib/py " + shlex.join([
+            "-B", "-c", program, root, str(wait_seconds),
+        ])
+        script.extend((
+            f'if [ "$#" -gt 0 ] && ! {setup} "$@"; then',
+            'for request in "$@"; do printf \'mirror_setup=%s\\tfailed\\n\' "${request%%:*}"; done',
+            "fi",
+        ))
     script.append(_MAC_DISK_PROBE)
     if mirrors:
         script.append('if mac_cwd_records=$(lsof -a -u "$(id -u)" -d cwd -Fpn); then')
@@ -2222,7 +2258,11 @@ def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSe
                 "done", ")"))
         script.append("fi")
     started_ns = time.time_ns()
-    result = controller.capture([*ssh_prefix(config), "\n".join(script)], CommandTimeLimit(config.probe_timeout_s))
+    result = controller.capture([*ssh_prefix(config), "\n".join(script)], CommandTimeLimit(timeout))
+    if isinstance(result, CommandOutput):
+        for line in result.stderr.splitlines():
+            if line.startswith(("mac_test: waiting for the Mac floor sweep", build_folders.MAC_FLOOR_WAIT_TIMEOUT)):
+                print(line, file=sys.stderr, flush=True)
     if isinstance(result, CommandOutput) and result.status == 0:
         disk = parse_probe(result.stdout)
         if isinstance(disk, ProbeSnapshot):
@@ -2245,7 +2285,7 @@ def probe_mac_host(controller: ProcessController, config: eligibility.SshProbeSe
                     if pid_text.isascii() and pid_text.isdecimal() and int(pid_text) > 0 and start_time.strip():
                         _ = processes.setdefault(mirrors[index], MacMirrorProcess(int(pid_text), start_time.strip()))
             return MacHostProbeSnapshot(disk, processes, setups)
-    return _record_probe_failure(target, _probe_failure_reason(result, config.probe_timeout_s))
+    return _record_probe_failure(target, _probe_failure_reason(result, timeout))
 
 
 def probe_mac(
@@ -2355,7 +2395,7 @@ class SweepShort:
 
 @dataclass(frozen=True)
 class SweepFailed:
-    """The sweep or its final disk reading failed."""
+    """The final disk reading failed."""
 
     cause: str
 
@@ -2425,20 +2465,21 @@ def ensure_mac_disk_floor(
                 _ = lock.write(cause)
                 lock.flush()
             _ = lock.seek(0)
-            cause = lock.read()
-            if cause != "ok":
-                return SweepFailed(cause or f"floor sweep result missing. {MAC_FLOOR_CLEANUP_UNCONFIRMED}")
-            after = probe_mac(controller, config, repository, target, slot)
-            if not isinstance(after, ProbeSnapshot):
-                return SweepFailed("Mac disk reading failed after the floor sweep")
-            disk = check_mac_disk_floor(after, floor)
-            if isinstance(disk, MacDiskShort):
-                return SweepShort(disk.free_gib)
-            return disk
+            cause = lock.read() or f"floor sweep result missing. {MAC_FLOOR_CLEANUP_UNCONFIRMED}"
+    except (OSError, ValueError) as error:
+        cause = f"floor sweep unavailable: {error}"
+    if cause != "ok":
+        print(f"mac_test: {cause}", file=sys.stderr, flush=True)
+    try:
+        after = probe_mac(controller, config, repository, target, slot)
     except (OSError, ValueError) as error:
         if isinstance(error, conf.Unusable) and isinstance(config, eligibility.SshProbeSettings):
             raise
-        return SweepFailed(f"floor sweep unavailable: {error}")
+        return SweepFailed(f"Mac disk reading failed after the floor sweep: {error}")
+    if not isinstance(after, ProbeSnapshot):
+        return SweepFailed("Mac disk reading failed after the floor sweep")
+    disk = check_mac_disk_floor(after, floor)
+    return SweepShort(disk.free_gib) if isinstance(disk, MacDiskShort) else disk
 
 
 def ignored_paths(
@@ -2492,6 +2533,23 @@ def mirror_exclude_file(ignored: tuple[str, ...]) -> Generator[Path, None, None]
             exclude_path.unlink(missing_ok=True)
 
 
+def after_mac_floor_group(mirror_path: str, command: str) -> str:
+    program = ("import sys; from scripts.lint.sweep import run_after_mac_floor_group; "
+               + "run_after_mac_floor_group(sys.argv[1], sys.argv[2:])")
+    arguments = shlex.join(["-B", "-c", program, mirror_path])
+    return f"~/.claude/scripts/lib/py {arguments} {command}"
+
+
+def mac_floor_rsync(mirror_path: str, arguments: list[str]) -> list[str]:
+    """Take the shared lease in the remote rsync receiver or sender."""
+    prefix = "--rsync-path="
+    for index, value in enumerate(arguments):
+        if value.startswith(prefix):
+            remote = after_mac_floor_group(mirror_path, value.removeprefix(prefix))
+            return [*arguments[:index], prefix + remote, *arguments[index + 1:]]
+    return [*arguments[:-2], prefix + after_mac_floor_group(mirror_path, "rsync"), *arguments[-2:]]
+
+
 def copy_tree(
     controller: ProcessController,
     config: OffloadConfig,
@@ -2507,8 +2565,14 @@ def copy_tree(
     mirror = request_mirror(config, request, repository)
     try:
         with mirror_exclude_file(ignored) as exclude_path:
-            result = controller.capture_copy(copies.remote_rsync(
-                request.source_root, mirror, exclude_path, ssh_options(config.connection)))
+            arguments = copies.remote_rsync(request.source_root, mirror, exclude_path, ssh_options(config.connection))
+            if target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform):
+                arguments = mac_floor_rsync(mirror.path, arguments)
+            result = controller.capture_copy(arguments)
+            if isinstance(result, CommandOutput):
+                for line in result.stderr.splitlines():
+                    if line.startswith("mac_test: waiting for the Mac floor sweep"):
+                        print(line, file=sys.stderr, flush=True)
             return isinstance(result, CommandOutput) and result.status == 0
     except OSError as error:
         controller.copy_failure_detail = f"copy: {error}"
@@ -2557,9 +2621,8 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
         'import sys; from scripts.lint import sweep; from scripts.lib import conf; '
         'config = conf.read("lint"); '
         'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
-        'config.number(sweep.RECENT_KEY)))'
+        'config.number(sweep.RECENT_KEY), mac_trim=sweep.MacRunTrim.LEASED_MIRROR))'
     )
-    floor = shlex.quote(f"{config.free_floor_gib:g}")
     return (
         f'{{ if cd "$HOME"/{shlex.quote(remote_mirror(repository, request.target, request.slot))}; then '
         + 'trim_started=$(date +%s); '
@@ -2571,19 +2634,12 @@ def remote_cleanup_command(config: OffloadConfig, request: OffloadRequest, repos
         + 'trim_size=${trim_size%%[[:space:]]*}; '
         + f'over_budget=$(awk -v size="$trim_size" -v budget={shlex.quote(budget)} '
         + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
-        + 'else over_budget=unknown; fi; '
-        + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
-        + '"$trim_status" "$trim_elapsed" "$over_budget"; '
-        + 'if free_gib=$(df -g "$HOME"); then '
-        + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
-        + 'else free_gib=; fi; '
-        + f'if awk -v free="$free_gib" -v floor={floor} '
-        + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-        + f'if size_kib=$(du -sk "$HOME"/{target} 2>/dev/null); then '
-        + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-        + f'if rm -rf -- "$HOME"/{target}; then '
-        + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-        + "else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; "
+        + 'else trim_size=unknown; over_budget=unknown; fi; '
+        + 'if [ "$over_budget" = yes ] && [ "$trim_status" -eq 0 ]; then trim_status=1; fi; '
+        + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s size_kib=%s budget_gib=%s\\n' "
+        + f'"$trim_status" "$trim_elapsed" "$over_budget" "$trim_size" {shlex.quote(budget)}; '
+        + 'if [ "$trim_status" -eq 0 ]; then echo mac_cleanup=kept; '
+        + 'else echo mac_cleanup="$trim_status"; fi; '
         + "else echo mac_cleanup=$?; fi; } 2>/dev/null"
     )
 
@@ -2729,15 +2785,22 @@ def fetch_folder(
                     entry.unlink()
         if destination.exists() or destination.is_symlink() or partial.exists() or partial.is_symlink():
             return FetchFailed("the fetched destination already exists")
+        mirror = remote_mirror(repository, request.target, request.slot)
+        mac = target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
         quoted = shlex.quote(folder.value)
         size_command = (
-            f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
+            f"cd {shlex.quote(mirror)} && "
             + f"if [ -d {quoted} ]; then "
             + f"if size=$(du -sk {quoted}); then "
             + "printf 'fetch_kib=%s\\nrc=0\\n' \"${size%%[[:space:]]*}\"; else exit 1; fi; "
             + "else printf 'fetch=missing\\nrc=0\\n'; fi"
         )
-        size = controller.capture([*ssh_prefix(config), size_command], CommandTimeLimit(config.probe_timeout_s))
+        timeout = config.probe_timeout_s
+        if mac:
+            settings = eligibility.config_path() if isinstance(config.source, DefaultMacSettings) else config.source
+            timeout += conf.read(settings).number("floor_sweep_timeout_s")
+            size_command = after_mac_floor_group(mirror, shlex.join(["/bin/sh", "-c", size_command]))
+        size = controller.capture([*ssh_prefix(config), size_command], CommandTimeLimit(timeout))
         if not isinstance(size, CommandOutput) or size.status != 0:
             return FetchFailed("the Mac folder size could not be read")
         if size.stdout.strip() == "fetch=missing\nrc=0":
@@ -2752,10 +2815,11 @@ def fetch_folder(
         owns_partial = True
         landing = partial / folder.value
         landing.mkdir(parents=True)
-        copied = controller.capture([
+        arguments = [
             "rsync", "-rlp", "--compress", "--safe-links", "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
-            f"{config.host}:{remote_mirror(repository, request.target, request.slot)}/{folder.value}/", f"{landing}/",
-        ])
+            f"{config.host}:{mirror}/{folder.value}/", f"{landing}/",
+        ]
+        copied = controller.capture(mac_floor_rsync(mirror, arguments) if mac else arguments)
         if not isinstance(copied, CommandOutput) or copied.status != 0:
             return FetchFailed("the folder copy from the Mac failed")
         if destination.exists() or destination.is_symlink():
@@ -2792,6 +2856,8 @@ def return_fix(
         return fix_return.FixFailed("git did not list the ignored paths")
     mirror = remote_mirror(repository, request.target, request.slot)
     transport = ["-e", shlex.join(["ssh", *ssh_options(config.connection)])]
+    if target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform):
+        transport.append("--rsync-path=" + after_mac_floor_group(mirror, "rsync"))
     metadata = [f"--exclude=/{name}" for name in floor_claims.MIRROR_METADATA]
     root = request.repo_root
     try:
@@ -3159,6 +3225,9 @@ def claimed_run(
     sync_after_release = False
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
+    evidence.cleanup = "unconfirmed"
+    evidence.unresolved_count = UnresolvedLeftoverCount()
+    evidence.evidence_at = 0.0
     try:
         linux = not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(request.target or "mac").platform)
         if linux and request.verb == "mend-fix":
@@ -3281,7 +3350,10 @@ def claimed_run(
                 return MacCleanupUnconfirmed(elapsed_seconds(started), "launch authorization has no confirmed reply")
         release_allowed = False
         identity = controller.claim_identity
-        command = copies.remote_use_command(request_mirror(config, request, repository), step_command)
+        mirror = request_mirror(config, request, repository)
+        command = copies.remote_use_command(mirror, step_command)
+        if not linux:
+            command = after_mac_floor_group(mirror.path, command)
         if isinstance(identity, claim_state.ClaimIdentity):
             command = fenced_start_command(identity, request.target, command, scope_key=controller.claim_scope_key)
         arguments = [*ssh_prefix(config), command]
@@ -3298,6 +3370,7 @@ def claimed_run(
                 settlement = settle_pending_start(controller, config, config.host, repository, request.target, request.slot)
                 if isinstance(settlement, StartUnsettled):
                     observe_cleanup(evidence, settlement.leftovers)
+                    evidence.cleanup = "unconfirmed"
                     report_leftover_check(settlement.leftovers, request)
                     return LostMacRun(elapsed_seconds(started), "remote startup has no acknowledgement")
                 checked = settlement.leftovers
@@ -3324,9 +3397,9 @@ def claimed_run(
                    if not setup_failed and isinstance(request.fetch, FetchFolder) else FetchNotRun())
         if (not linux and isinstance(remote_status, ReportedMacStatus) and isinstance(request.fetch, FetchFolder)
                 and not isinstance(remote_status.cleanup, CleanupStreamTimedOut)):
-            arguments = [*ssh_prefix(config),
-                copies.remote_use_command(request_mirror(config, request, repository),
-                    f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository))]
+            cleanup_command = copies.remote_use_command(
+                mirror, f"echo mac_exit={remote_status.status}; " + remote_cleanup_command(config, request, repository))
+            arguments = [*ssh_prefix(config), after_mac_floor_group(mirror.path, cleanup_command)]
             cleanup = (controller.stream_mac_run(arguments, CleanupOnly(config.leftover_timeout_s))
                        if routed_mac_command else controller.stream_mac_run(arguments))
             remote_status = replace(remote_status, cleanup=(
@@ -3367,10 +3440,8 @@ def claimed_run(
             report_leftover_check(checked, request)
         raise
     finally:
-        evidence.cleanup = "confirmed" if release_allowed else "unconfirmed"
-        evidence.evidence_at = time.time()
-        if release_allowed:
-            evidence.unresolved_count = 0
+        if not evidence.evidence_at:
+            evidence.evidence_at = time.time()
         if release_allowed and isinstance(controller.pending, SettledDispatchOperations):
             if isinstance(controller.claim_identity, claim_state.ClaimIdentity):
                 _ = release_claim(controller, request.target)
@@ -3388,11 +3459,17 @@ def hana_source_key(source_root: Path) -> execution_identity.SourceIdentity:
             else execution_identity.SourceKeyUnavailable('The caller source key is unavailable'))
 
 
+class NoHanaReceiverObservation:
+    """The receiver has supplied no observation since the last publication."""
+
+
 class MeasuredHanaObjects:
     """Measure application bytes without changing execution or spending authority."""
     def __init__(self, objects: hana_execution.ExecutionObjects, traffic: transfer_bytes.TransferLedger):
         self.objects: hana_execution.ExecutionObjects = objects
         self.traffic: transfer_bytes.TransferLedger = traffic
+        self.receiver_observation: hana_protocol.HanaExecutionObservation | NoHanaReceiverObservation = (
+            NoHanaReceiverObservation())
 
     def boot_control_deadline(self, key: hana_result.HanaAttemptKey) -> int:
         return self.objects.boot_control_deadline(key)
@@ -3401,6 +3478,7 @@ class MeasuredHanaObjects:
         return self.objects.execution_access(key)
 
     def publish_execution(self, content: bytes) -> None:
+        self.receiver_observation = NoHanaReceiverObservation()
         row: transfer_bytes.TransferBytes = {'operation': 'hana-control-put', 'sent_bytes': len(content),
             'received_bytes': 0, 'complete': False}
         self.traffic.transfers.append(row)
@@ -3416,6 +3494,7 @@ class MeasuredHanaObjects:
         self.traffic.transfers.append(row)
         observation = self.objects.observe_execution(key, timeout_s=timeout_s)
         row.update(received_bytes=len(encode_observation(observation)), complete=True)
+        self.receiver_observation = observation
         return observation
 
     def execution_result(self, key: hana_result.HanaAttemptKey) -> bytes:
@@ -3497,11 +3576,13 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
     if isinstance(checked, hana.HanaClaimRefused) or checked != transport:
         return declined('state', started)
     lifecycle = hana.controller_for(transport)
-    objects = MeasuredHanaObjects(cast(execution.ExecutionObjects, cast(object, lifecycle.provider)),
-                                  controller.attempt_evidence.traffic)
-    configuration = conf.read(transport.settings)
     evidence = controller.attempt_evidence
     evidence.slot = request.slot
+    evidence.cleanup = "unconfirmed"
+    evidence.unresolved_count = UnresolvedLeftoverCount()
+    evidence.evidence_at = 0.0
+    objects = MeasuredHanaObjects(cast(execution.ExecutionObjects, cast(object, lifecycle.provider)), evidence.traffic)
+    configuration = conf.read(transport.settings)
     controller.placement = request.placement
 
     def release() -> hana.HanaClaimRelease:
@@ -3526,8 +3607,6 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             controller.pending = SettledDispatchOperations()
             evidence.provider = reference
             evidence.execution = closed.evidence
-            evidence.cleanup = 'confirmed'
-            evidence.unresolved_count = 0
             return HanaCommandAdmissionRefused(closed.outcome.reason, elapsed_seconds(started))
         if isinstance(closed, execution.HanaSettlementPending):
             pending = remember_pending_refusal(reference, closed.reason)
@@ -3548,8 +3627,6 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
             controller.hana_settlement = execution.HanaAdmissionRefusalSettled(
                 refusal, execution_identity.ExecutionNotStarted())
             evidence.execution = controller.hana_settlement.evidence
-            evidence.cleanup = 'confirmed'
-            evidence.unresolved_count = 0
             return HanaCommandAdmissionRefused(refusal.reason, elapsed_seconds(started))
 
     controller.pending = PendingHanaOperation()
@@ -3741,8 +3818,14 @@ def hana_claimed_run(controller: ProcessController, transport: hana_placement.Ha
                 controller.hana_settlement = settlement
                 controller.pending = SettledDispatchOperations()
                 evidence.execution = settlement.evidence
-                evidence.cleanup = 'confirmed'
-                evidence.unresolved_count = 0
+                observed = (execution.read_dispatch_observation(lifecycle.directory, prepared)
+                            if isinstance(objects.receiver_observation, NoHanaReceiverObservation)
+                            else objects.receiver_observation)
+                if (not isinstance(observed, execution.HanaObservationUnavailable) and observed.lease_free
+                        and observed.key == prepared.key and observed.slot == prepared.slot
+                        and (observed.terminated or observed.fenced and not observed.accepted)):
+                    evidence.cleanup = "confirmed"
+                    evidence.unresolved_count = 0
             elif isinstance(settlement, execution.HanaCleanupPending) and isinstance(settlement.command.outcome,
                     (placement.AttemptCompleted, execution_identity.HanaCommandAdmissionRefused)):
                 controller.pending = PendingHanaOperation(settlement.command.outcome, settlement.reason)

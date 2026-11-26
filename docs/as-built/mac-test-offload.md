@@ -2,7 +2,7 @@
 
 ## What it is
 
-`verify.sh test` tries the first free eligible build target: the Mac first; a Mac pass or failure ends the call. It waits when every eligible target is held or full. The Mac takes one claim per repository: a hana run and a cargo-liner run can share it, two runs of one repository never do. A block is the Mac's hold: it admits its holder session's own claims and refuses other sessions' new claims for every repository, turns off hana's CI use of the Mac, names skipped macOS runs on release, and sends its holder one free message when existing work ends. Expiry attempts to remove the block; a failed CI restore leaves it in force. A claim whose Mac has run nothing for 15 minutes is released and its holder told. Each offloaded run removes the mirror's build output afterwards only when the Mac is below its free-space floor. `/build:page` prints the shared build page link. The `buildlog` CLI retains coordination state, hold intervals, and detailed Mac step tables.
+`verify.sh test` tries the Mac first. A Mac pass or failure ends the call. The call waits when every eligible target is held or full. The Mac permits one claim per repository. A Mac hold admits its holder's claims and blocks other sessions' new claims. It disables hana's Mac CI and reports skipped runs when the hold ends. A failed CI restore keeps the hold active. The Mac releases an inactive claim after 15 minutes and tells its holder. After an offloaded run, the Mac trims the mirror target to its budget. `/build:page` prints the shared build page link. The `buildlog` CLI retains coordination state, hold intervals, and Mac step records.
 
 Converted verify steps execute only at the destination assigned by the queue.
 The queue preserves configured target order.
@@ -555,7 +555,7 @@ The remote claim stays available for recovery until the runner confirms cleanup.
   A Linux step skips this removal when `--target-dir` selects another folder.
   A Linux step checks tool versions before this removal.
   A missing target or a failed removal does not stop the build.
-- **Cleanup.** After `echo mac_exit=$?` the remote command runs a cleanup step whatever the tests returned. When the verb arguments name `--target-dir` (or `--target-dir=`), it prints `mac_cleanup=skipped`. Otherwise it reads free GiB with `df -g "$HOME"`: below `free_floor_gib` it runs `rm -rf -- "$HOME"/.local/state/mac-test/mirror/<repo>/target` and prints `mac_cleanup=0` or the `rm` status; at or above the floor, or when `df` gives no number, it prints `mac_cleanup=kept` and the output stays for the next run. That path is the only thing it removes.
+- **Cleanup.** The remote command trims the mirror target after it reports the verdict. A custom `--target-dir` produces `mac_cleanup=skipped`. A request that fetches output keeps the mirror target. The trim uses `mac_budget_gib.<repo>` or the default `mac_budget_gib`. It holds the exclusive mirror lease and uses the shared removal guard. It removes Cargo groups and loose files in `deps`, `build`, `.fingerprint`, and `incremental` by access time. It checks for open files before each removal. It removes the oldest output first and keeps the target directory. The `mac_trim` record gives the status, elapsed seconds, remaining size in KiB, and budget in GiB. The command reports a nonzero cleanup status if the output remains over budget.
 - **Nextest output.** The Mac saves both output streams in a private file under `~/.local/state/mac-test/logs`.
   After success, the runner sends the full output and deletes the file.
   After failure, it reports the saved path and sends a tail of `nextest_failure_tail_bytes` bytes (65,536 by default).
@@ -772,7 +772,11 @@ A new block writes one `hold_event` `began`; record removal in `expire_block` or
 `fetch_retention_days` sets the retention period for completed and partial fetch folders (default 14 days).
 Both values use the existing configuration reader.
 
-`offload=on`; `host=mac`; `free_floor_gib=100`; `mac_budget_gib=24` and `mac_budget_gib.hana=56` (size limits of each mirror's build folder, not memory); `linux_only.hana=hana_video,hana_clerestory`; `linux_only.cargo-liner=`, `linux_only.bevy_brp=` and `linux_only..claude=` (empty: each key sends that repository to the Mac); `mac_skip.hana=test(world_panel_words_match_drawn_pixels)`; `ci_repo=hanallc/hana`, `ci_variable=MACOS_CI`, `ci_workflow=ci.yml`, `ci_job=macOS: Compile and Test`; `gh_timeout_s`, `block_hours`, `block_max_hours`, `block_warn_minutes`; `claim_idle_minutes=15`, `claim_poll_seconds=60`. `leftover_timeout_s` is not set, so the leftover check uses 10 s. `free_floor_gib` serves both the probe's disk decline and the cleanup's keep-or-remove test. A repository needs a `linux_only.<repo>` key, even empty, before it runs on the Mac. `MAC_TEST_CONFIG` selects another file.
+`offload=on` enables runs on `host=mac`. The probe requires `free_floor_gib=100`. The floor sweep targets `sweep_floor_gib=150`. The default output budget is `mac_budget_gib=24`, and `mac_budget_gib.hana=56` is the hana budget. The floor sweep requires a `cull_idle_hours` value of at least 48.
+
+Each repository needs a `linux_only.<repo>` key to use the Mac. An empty value sends all supported packages to the Mac. `linux_only.hana=hana_video,hana_clerestory` names two Linux-only packages. `mac_skip.hana=test(world_panel_words_match_drawn_pixels)` skips one test on the Mac.
+
+The CI settings are `ci_repo=hanallc/hana`, `ci_variable=MACOS_CI`, `ci_workflow=ci.yml`, and `ci_job=macOS: Compile and Test`. The hold settings include `gh_timeout_s`, `block_hours`, `block_max_hours`, and `block_warn_minutes`. The claim watcher uses `claim_idle_minutes=15` and `claim_poll_seconds=60`. The leftover check uses 10 seconds when `leftover_timeout_s` is absent. `MAC_TEST_CONFIG` selects another file.
 
 ## Invariants
 
@@ -780,7 +784,7 @@ Both values use the existing configuration reader.
 - Before CI either machine answers a test. A Mac pass writes a pass record marked `host=mac`, which every call but `--local` reuses.
 - A printed `mac_exit=<n>` followed by nothing but `mac_cleanup=` markers is the result of a finished test even if ssh failed afterward. With no such line, a run is lost; reach and control checks require their own `rc=<n>` answer.
 - Tests run nothing on the Mac: stand-in `ssh`, `rsync`, `gh` on `PATH`, state under `MAC_TEST_STATE_DIR`, config under `MAC_TEST_CONFIG`. Tests set these variables for a checkout's scripts; installed scripts refuse to run with either set. A test reaching the footer sets `MAC_TEST_STATE_DIR` too.
-- On the Mac the feature writes and removes only under `~/.local/state/mac-test/`. The cleanup removes nothing but the mirror's `target` folder, and only below `free_floor_gib`; `/tmp` and the user's clones are never touched. Only step records are written there; call records are written on natedev only.
+- The Mac stores its mirrors under `mirror_root`. The floor sweep can also remove Cargo output under `~/build`. It keeps the source checkouts and their target links. The Mac writes step records. Natedev writes call records.
 - The claim files live on natedev. Process-bound claims expire when their owner ends. Remote claims require release.
   The watcher releases a kept claim when its saved mirror is empty and its exact fence settles, or when the Mac idle rule permits release.
 - One live claim can hold a repository. A whole-Mac claim in `run.json` excludes all other claims.
@@ -920,7 +924,8 @@ Existing waits keep their place on natedev until then.
 
 `ensure_mac_disk_floor` returns `MacDiskReady`, `SweepShort`, or `SweepFailed`.
 Below the required floor, it runs one shared floor sweep.
-It reads free space again after a successful sweep.
+The disk probe reads free space without creating a mirror.
+The offload reads free space again after the sweep ends. It logs sweep errors and uses the new reading for admission.
 The per-host `floor-sweep-<host>.lock` serializes sweeps.
 A direct caller that finds a running sweep waits for its result.
 The sweep uses a dedicated SSH terminal. The terminal sends `SIGHUP` when the SSH connection closes.
@@ -935,7 +940,7 @@ The supervisor sends a cleanup record after the worker exits. It also sends one 
 If `SIGKILL` ends the worker, the supervisor exits with status 137 and sends no record.
 Natedev reports an unsuccessful sweep without that record as unconfirmed cleanup.
 Natedev also reports unconfirmed cleanup if SSH times out, loses the connection, or leaves no result.
-An SSH retry waits for `floor.lock` within its deadline before it reads mirror leases and claims.
+An SSH retry waits for `floor.lock` within its deadline before it reads claims.
 A standalone sweep skips an occupied floor lock and returns status 0.
 The sweep publishes a complete review file with an atomic rename.
 A later publication removes temporary files from writers that have exited.
@@ -953,6 +958,21 @@ The worker reports pending disk recovery while a separate thread runs the sweep.
 The Mac stays excluded during recovery even when a probe reports enough free space.
 When the sweep ends, the worker probes all subscribed Mac keys again.
 The sweep holds no admission or claim lock while it lists output.
+
+The sweep orders repositories by the latest file modification time or saved mirror run time.
+File access times set the order of groups within a trim.
+Build output in a numbered copy contributes to its repository's age.
+It visits the oldest repository first.
+A repository with any output used in the last `cull_idle_hours` keeps all of its target directories.
+The sweep trims its Cargo groups to the repository budget while free space remains below `sweep_floor_gib`.
+A repository idle for longer than `cull_idle_hours` can lose its whole mirror target and Cargo output folders under `~/build`.
+The guard checks each selected entry and its parents. It refuses mount crossings, symbolic links in the path, and source trees.
+It unlinks nested symbolic links without following them.
+The sweep checks free space after each group or whole folder and succeeds when it reaches the floor.
+After the sweep, the offload checks free space against its admission minimum.
+The SSH attempt record confirms cleanup only after a successful receiver check.
+`--dry-run` lists the candidates. The Natedev floor still publishes a manual review list.
+
 `floor_claims.serve()` reads claims and mirror leases under `state.lock`.
 It builds the reply under the lock and prints after the lock closes.
 It exits without reading stdin.
@@ -960,20 +980,35 @@ It exits without reading stdin.
 A lost SSH session cannot retain the state lock while the sweep runs.
 An unavailable or unreadable claim reply protects all output.
 
-`mirror_sweep_leases()` reports acquired leases separately from busy mirrors.
-Discovery still walks all three configured roots.
-The alert still measures folders under those roots when a disk alert is due.
-Mirror leases and the claim snapshot protect busy mirrors during candidate selection.
-The sweep holds acquired leases while it lists output.
-For output outside those leases, it reads claims again before it adds each group to the list.
-A new claim or an unreadable reply keeps that output.
-Cargo locks, scratch busy locks, and process checks retain their existing roles.
+The sweep takes a repository's mirror leases for one removal group at a time.
+It skips a repository with a busy lease.
+It reads local and natedev claims again under the lease before each removal.
+The source copy, remote steps, artifact reads, fix reads, and post-fetch cleanup take the shared repository lease.
+The per-run trim converts the same lease to exclusive before removing output.
+The trim keeps the output if another process holds the shared lease.
+The trim restores the shared lease before the caller measures the remaining output.
+Mirror removal and recovery of an interrupted removal also require the exclusive lease.
+Hand-made Mac commands take the same lease before copying and again before running.
+The Mac queue uses the resolved working directory on the Mac to select the lease.
+The queued probe uses one deadline for all mirror waits.
+The probe reads an existing mirror marker before it starts the setup helper.
+The probe caps setup waits at half the admission waiting pass interval.
+The SSH limit adds that wait to the configured probe timeout.
+The numbered copy takes the lease before allocation and holds it through release.
+Copy readers also pass the lease descriptor to child processes.
+A shared holder waits only for an exclusive sweep and reports the bounded wait.
+Before whole-folder removal, the sweep discovers numbered copies and mirrors again under the lease. It checks their latest build times.
+When that check changes a repository's age, the sweep puts the repository in its new place in the order.
+After each whole-folder removal, the sweep reads the remaining repository ages again if free space is below the floor.
+The sweep also holds folder and Cargo locks during removal.
+It checks for open files immediately before each group or whole folder removal.
+An unreadable claim or process check keeps the output.
+The alert still measures folders under the configured alert roots.
 
-| Path class | Protection during listing or removal |
+| Path class | Protection during removal |
 | --- | --- |
-| Mirror build units, orphan files, and whole targets | The sweep holds the Mac-side mirror lease while it lists output. |
-| Registered mirror clones outside the mirror root | The sweep holds their registered Mac-side mirror leases while it lists output. |
-| Marked gate caches and other output outside acquired leases | The sweep reads claims again before listing each group and holds existing output locks. |
+| Mac mirror targets | The per-run trim and the floor sweep hold the mirror lease exclusive during removal. |
+| Cargo output under `~/build` | The floor sweep checks claims and holds existing folder and Cargo locks. |
 | `mirror-remove` payload, metadata, and removal authority | `local_mirror_lease` covers the operation; the record lock serializes metadata changes. |
 | A registered task clone's parent folder | An outside mirror lease survives parent removal and blocks concurrent `mirror-use`. No parent busy lock applies. |
 | `mirror-receive` cleanup of interrupted removal | The mirror lease and record lock cover the old payload and metadata. |

@@ -11,10 +11,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from scripts.lib import removal_guard
 from scripts.lib.removal_bwrap_test_support import LINUX_CHECKOUT, BuildMount, RemovalSandbox
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.mac_test import floor_claims
 
 CANARY = "keep this content\n"
 BUILD = "scripts/lint/sweep.py"
@@ -73,6 +76,112 @@ raise SystemExit(cleanup.run_cli(arguments, run_ssh=fake_ssh))
 
 
 class RemovalProofTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "requires bubblewrap")
+    def test_mac_cull_can_write_only_to_approved_output_on_the_mirror_mount(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="mac-cull-proof-"))).resolve()
+        home = base / "home"
+        mirror = home / "mirrors"
+        mirror.mkdir(parents=True)
+        environment = config_environment(base)
+        _ = write_config_fixture(Path(environment["CONF_DIR"]) / "mac_test.conf",
+                                 "mirror_root=~/mirrors\n# range: 5e-324..\nmac_budget_gib.recent=0.0001\n")
+        program = """
+import errno
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts.lib import conf
+from scripts.lint import sweep
+from scripts.mac_test import floor_claims
+
+home = Path.home()
+mirror = home / "mirrors"
+keep = home / "rust" / "sample" / "source.rs"
+try:
+    keep.unlink()
+except OSError as error:
+    assert error.errno == errno.EROFS, error
+else:
+    raise AssertionError("the source tree is writable")
+
+settings = sweep.MacCullSettings(conf.read("mac_test"), 48 * 3600)
+claims = floor_claims.ClaimSnapshot(frozenset({"claimed"}))
+leased = frozenset(path for path in mirror.iterdir() if path.name != "leased")
+policy = sweep.MacFloor((str(mirror),), claims, mirror, frozenset({mirror / "leased"}), leased)
+with (patch.object(sweep, "free_bytes", return_value=0),
+      patch.object(sweep, "mac_output_in_use", return_value=False),
+      patch.object(floor_claims, "read_claims", return_value=claims)):
+    result = sweep.cull_mac_floor(policy, settings, 1, 0, str(home), False, lint_settings=conf.read("lint"))
+assert result.status == 0, result
+assert result.removed > 0, result
+"""
+        checkout = Path(__file__).resolve().parents[2]
+        bwrap = shutil.which("bwrap")
+        self.assertIsNotNone(bwrap)
+        assert bwrap is not None
+        source = home / "rust" / "sample"
+        source.mkdir(parents=True)
+        _ = (source / "source.rs").write_text(CANARY)
+        _ = (source / ".git").write_text(CANARY)
+        mounted = mirror / "mounted/target/debug/deps/mount"
+        mounted.mkdir(parents=True)
+
+        def unit_file(repo: str, name: str, value: str, age: int) -> Path:
+            workspace = mirror / repo
+            tree = workspace / "target/debug"
+            fingerprint = tree / ".fingerprint" / f"{name}-{value}"
+            fingerprint.mkdir(parents=True)
+            payload = tree / "deps" / f"{name}-{value}"
+            payload.parent.mkdir(exist_ok=True)
+            _ = payload.write_bytes(os.urandom(64 * 1024))
+            _ = (workspace / floor_claims.MIRROR_MARK).write_text("registered remote mirror")
+            _ = (tree.parent / ".rustc_info.json").write_text("{}")
+            used = time.time() - age * 86_400
+            os.utime(payload, (used, used))
+            return payload
+
+        recent = unit_file("recent", "recent", "0123456789abcdef", 0)
+        old_unit = unit_file("recent", "old-unit", "1111111111111111", 3)
+        idle = unit_file("idle", "idle", "0123456789abcdef", 3)
+        claimed = unit_file("claimed", "claimed", "0123456789abcdef", 3)
+        leased = unit_file("leased", "leased", "0123456789abcdef", 3)
+        bound = unit_file("mounted", "mounted", "0123456789abcdef", 3)
+        mirror_git = mirror / "recent/.git/HEAD"
+        mirror_git.parent.mkdir()
+        head = "ref: refs/heads/main\n"
+        _ = mirror_git.write_text(head)
+        linked = mirror / "linked"
+        linked.mkdir()
+        _ = (linked / floor_claims.MIRROR_MARK).write_text("registered remote mirror")
+        (linked / "target").symlink_to(source)
+        outside_target = mirror / "keep.txt"
+        _ = outside_target.write_text(CANARY)
+        idle_target = mirror / "idle/target"
+        nested_link = idle_target / "debug/nested-link"
+        nested_link.symlink_to(outside_target)
+        old_time = time.time() - 3 * 86_400
+        for path in (idle_target, *idle_target.rglob("*")):
+            os.utime(path, (old_time, old_time), follow_symlinks=False)
+        command = [bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev",
+                   "--proc", "/proc", "--bind", str(mirror), str(mirror),
+                   "--ro-bind", str(source), str(mounted), "--", sys.executable, "-B", "-c", program]
+        result = subprocess.run(command, cwd=checkout, env={
+            **os.environ, **environment, "HOME": str(home), "PYTHONPATH": str(checkout),
+            "CLAUDE_DISABLE_DATACLASS_CODE_CACHE": "1",
+        }, text=True, capture_output=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(old_unit.exists(), result.stdout + result.stderr)
+        self.assertFalse(idle_target.exists())
+        self.assertFalse(os.path.lexists(nested_link))
+        self.assertEqual(outside_target.read_text(), CANARY)
+        self.assertTrue((linked / "target").is_symlink())
+        for path in (recent, claimed, leased, bound):
+            self.assertTrue(path.is_file(), path)
+        for path in (source / "source.rs", source / ".git"):
+            self.assertEqual(path.read_text(), CANARY)
+        self.assertEqual(mirror_git.read_text(), head)
+        self.assertFalse(idle.exists())
+
     def sandbox(self) -> RemovalSandbox:
         parent = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="removal-proof-"))).resolve()
         sandbox = RemovalSandbox(parent / "fixture")

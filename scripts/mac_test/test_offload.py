@@ -1170,6 +1170,41 @@ fi
         self.assertEqual(self.local_runs(), [])
 
 
+class HanaCleanupEvidenceTests(unittest.TestCase):
+    def test_rejected_local_inputs_leave_hana_cleanup_unconfirmed(self) -> None:
+        from scripts.aws_target import hana_box, hana_placement, hana_transport
+        from scripts.buildlog import record
+
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scope = claim_state.RepositoryScope("hana", "github.com/hanallc/hana")
+        assigned = placement.PlacementAssignment("episode", "attempt",
+            placement.PlacementDestination("ssh", "fixture-target", "fixture-host", scope, 1),
+            execution_identity.SourceKeyKnown("source"), placement.SubmittingOwner("local", 1, "started"),
+            NoOwningSession(), time.time())
+        settings = root / "hana.conf"
+        _ = settings.write_text("execution_transport=hana-control\n")
+        transport = hana_placement.HanaControlTransport(settings, "fixture-host")
+        lifecycle = hana_box.HanaController(root, root / "account.conf", settings, hana_box.ProviderNotInstalled())
+        request = offload.OffloadRequest(root, "hana", "refused-inputs", offload.NO_RESULT_FILE, (),
+                                         owner="", holder_session="", verb="check", target="fixture-target",
+                                         placement=offload.AssignedOffloadRequest(assigned))
+        controller = offload.ProcessController()
+        started = time.monotonic()
+        with (mock.patch.object(hana_placement, "validate_assignment", return_value=transport),
+              mock.patch.object(hana_placement, "controller_for", return_value=lifecycle),
+              mock.patch.object(hana_transport, "check_inputs", side_effect=ValueError("fixture inputs refused")),
+              mock.patch.object(hana_placement, "claim_assigned") as claim,
+              mock.patch.object(record, "ssh_attempt") as write):
+            outcome = offload.claimed_run(controller, transport, request, eligibility.KnownRepository("hana"), started)
+            offload.persist_attempt(request, outcome, controller.attempt_evidence, started)
+        claim.assert_not_called()
+        self.assertIsInstance(outcome, offload.HanaCommandAdmissionRefused)
+        write.assert_called_once()
+        attempt = cast(record.SshAttempt, write.call_args.args[0])
+        self.assertEqual(attempt["cleanup"], "unconfirmed")
+        self.assertIsNone(attempt["unresolved_count"])
+
+
 class OffloadCommandTests(OffloadCommandFixture):
     def test_waiter_hands_relative_path_claim_to_runner_for_cleanup_only(self) -> None:
         assignment = self.assignment_options(self.repository, "nextest", self.config_path, ())
@@ -1654,6 +1689,23 @@ class OffloadCommandTests(OffloadCommandFixture):
                 saved.assignment.episode, saved.assignment.attempt)].state, placement.ClosedAssignment)
                 for saved in assigned), assigned)
 
+    def test_copy_refusal_records_cleanup_without_receiver_proof_as_unconfirmed(self) -> None:
+        self.fixture["rsync_status"] = 23
+        self.sync_fixture()
+        result = self.command(call_id="copy-without-cleanup-proof",
+                              runner_options=("--target", "mac"), assigned_adapter=True)
+        self.assertEqual(result.returncode, 75, result.stdout)
+        self.assert_wire("declined", "copy")
+        self.assertFalse(self.claim_file.exists())
+        self.assertFalse(any("select_leftovers()" in event["args"][-1] for event in self.events_for("ssh")))
+        rows = [cast(dict[str, object], json.loads(line))
+                for path in (self.root / "buildlog").glob("*/*.jsonl")
+                for line in path.read_text().splitlines()]
+        attempt, = (row for row in rows if row.get("kind") == "ssh_attempt"
+                    and row.get("call_id") == "copy-without-cleanup-proof")
+        self.assertEqual(attempt["cleanup"], "unconfirmed")
+        self.assertIsNone(attempt["unresolved_count"])
+
     def test_copy_refusal_keeps_rsync_stderr_in_output_and_the_result(self) -> None:
         self.fixture["rsync_status"] = 23
         self.sync_fixture()
@@ -2012,7 +2064,10 @@ class OffloadCommandTests(OffloadCommandFixture):
             config = eligibility.read_config(self.config_path)
             cleanup = offload.remote_cleanup_command(config, request, repository)
             mirror = self.root / offload.remote_mirror(repository, request.target, request.slot)
-        # Linux df has no -g option and a missing mirror fails cd; the cleanup hides both error lines.
+        self.assertNotIn("df -g", cleanup)
+        self.assertNotIn("rm -rf", cleanup)
+        self.assertIn("MacRunTrim.LEASED_MIRROR", cleanup)
+        # The cleanup hides the error if the mirror is missing.
         for present in (False, True):
             with self.subTest(mirror_present=present):
                 if present:
@@ -2060,11 +2115,11 @@ class OffloadCommandTests(OffloadCommandFixture):
         self.assertEqual(probe[: len(ssh_arguments)], ssh_arguments)
         probe_script = probe[len(ssh_arguments)]
         for fragment in (
-            ".local/state/mac-test/test-mirror/hana",
             'df -g "$HOME"',
             "hostname -s",
         ):
             self.assertIn(fragment, probe_script)
+        self.assertNotIn(".local/state/mac-test/test-mirror/hana", probe_script)
         self.assertNotIn("loadavg", probe_script)
         self.assertNotIn("pgrep", probe_script)
         self.assertNotIn("procs", probe_script)
@@ -2078,11 +2133,13 @@ class OffloadCommandTests(OffloadCommandFixture):
         )
         session = (self.environment.get("CLAUDE_CODE_SESSION_ID")
                    or self.environment.get("CODEX_THREAD_ID") or f"pid-{os.getpid()}")
-        receiver_argument = (
-            "--rsync-path=~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-receive "
+        receiver_command = (
+            "~/.claude/scripts/lib/py ~/.claude/scripts/copies/copies.py mirror-receive "
             + shlex.join(["--path", ".local/state/mac-test/test-mirror/hana", "--owner", "verify",
                           "--repository", "hana", "--session", session, "--", "rsync"])
         )
+        receiver_argument = "--rsync-path=" + offload.after_mac_floor_group(
+            ".local/state/mac-test/test-mirror/hana", receiver_command)
         self.assertEqual(
             copy["args"],
             [
