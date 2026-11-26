@@ -3437,10 +3437,59 @@ fi
         for status, output in ((255, ""), (0, "leftovers=0\nrc=0\n")):
             with self.subTest(status=status), self.watch_mirror(mac_test.MacIdle(), remote=lambda *args, **kwargs:
                     subprocess.CompletedProcess(args, status, output, "")) as check:
-                _ = self.watch_once()
+                diagnostic = self.watch_once()
+                self.assertIn(f"exit={status}", diagnostic)
             self.assertTrue(path.exists())
             self.assertTrue(fence.exists())
             check.assert_called_once()
+
+        def timed_out(*_args: object, **_options: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(["ssh"], 1, stderr=b"partial diagnostic\n")
+
+        with self.watch_mirror(mac_test.MacIdle(), remote=timed_out) as check:
+            diagnostic = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        self.assertIn('exit=not-reported stderr="partial diagnostic" detail="SSH leftover check timed out', diagnostic)
+        check.assert_called_once()
+
+    def test_kept_mirror_claim_reports_the_exact_check_reply(self) -> None:
+        expired = mac_test.timestamp(self.now - timedelta(minutes=15))
+        path, fence = self.saved_mirror_claim(pid=4317, cleanup_pending=True, idle_since=expired)
+        fence.parent.mkdir(parents=True)
+        fence.touch()
+        reply = subprocess.CompletedProcess(["ssh"], 1,
+            f"dispatch_mac_id={self.machine_id}\nleftovers=1\nrc=0\n", "remote work still holds the mirror\n")
+        with self.watch_mirror(mac_test.MacIdle(), remote=lambda *_args, **_options: reply) as check:
+            output = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        check.assert_called_once()
+        self.assertEqual(output, "Mac claim mirror check kept the claim: claim_id=fixture-claim pid=4317 "
+                         + 'what="alpha tests" result=LeftoverCheckFailed leftovers=1 rc=0 exit=1 '
+                         + 'stderr="remote work still holds the mirror"\n')
+
+    def test_kept_mirror_diagnostic_redacts_credentials_and_urls(self) -> None:
+        address = "https://bucket.invalid/object?X-Amz-Signature=fixture-signature"
+        path, fence = self.saved_mirror_claim(what=f"copy {address}")
+        fence.parent.mkdir(parents=True)
+        fence.touch()
+        reply = subprocess.CompletedProcess(["ssh"], 1,
+            f"dispatch_mac_id={self.machine_id}\nleftovers={address}\nrc=0\n",
+            f"lookup failed for {address}\n--password fixture-password\nghp_fixture_bare_token\n" + "x" * 160)
+        with self.watch_mirror(mac_test.MacIdle(), remote=lambda *_args, **_options: reply):
+            output = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertIn('what="copy [redacted URL]"', output)
+        self.assertIn("leftovers=invalid rc=0 exit=1", output)
+        self.assertIn('stderr="lookup failed for [redacted URL] [redacted credential] [redacted credential] ', output)
+        self.assertTrue(output.endswith('..."\n'))
+        self.assertNotIn("bucket.invalid", output)
+        self.assertNotIn("fixture-signature", output)
+        self.assertNotIn("fixture-password", output)
+        self.assertNotIn("fixture_bare_token", output)
 
     def test_active_pass_clears_idle_since_with_state_lock_released(self) -> None:
         record = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")
