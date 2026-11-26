@@ -5536,6 +5536,7 @@ class WorkerResultSubmission:
 
     wait_for_idle: bool = False
     before_input: Callable[[], object] = lambda: None
+    recheck_input: Callable[[], object] = lambda: None
     worker_only: bool = False
     before_holder: Callable[[], object] = lambda: None
 
@@ -5732,6 +5733,7 @@ def deliver_worker_text(worker: staff.StaffRow, membership: staff.StaffSnapshot,
                     except (OSError, ValueError, subprocess.SubprocessError) as error:
                         raise _WorkerResultReadinessFailure(f"worker transcript is unavailable: {error}") from error
                     check_readiness()
+                    _ = receipt.recheck_input()
                 attempting_input = True
 
             def check_message_status() -> None:
