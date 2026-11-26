@@ -2706,13 +2706,6 @@ def _deliver(record: RunRecord, result: CommandResult, *,
         park_acceptance = ParkedAssignmentAcceptance.UNRECORDED
 
         def validate_transport(*, pane_input: bool = False) -> dict[str, object]:
-            from scripts.herdr import worker_panes
-
-            if isinstance(input_lock, AcquireWorkerInputLock):
-                try:
-                    _ = locks.enter_context(worker_panes.worker_id_lock(worker.id))
-                except BlockingIOError as error:
-                    raise _WorkerPassDeliveryBlocked(WORKER_INPUT_LOCK_HELD) from error
             try:
                 current_membership = staff.local_snapshot()
             except staff.StaffUnreadable as error:
@@ -2797,6 +2790,13 @@ def _deliver(record: RunRecord, result: CommandResult, *,
                 separator = "" if text.endswith("\n") else "\n"
                 pane_text = (f"{text}{separator}End your final reply with this line alone: "
                              f"DONE {reply_instruction.completion_id}")
+            if isinstance(input_lock, AcquireWorkerInputLock):
+                from scripts.herdr import worker_panes
+
+                try:
+                    _ = locks.enter_context(worker_panes.worker_id_lock(worker.id))
+                except BlockingIOError as error:
+                    raise _WorkerPassDeliveryBlocked(WORKER_INPUT_LOCK_HELD) from error
             timeout = send_budget.seconds()
             with _keep_send_error(path):
                 delivery = send.deliver_worker_text(worker, membership, text,
@@ -2815,9 +2815,9 @@ def _deliver(record: RunRecord, result: CommandResult, *,
             if status in (OTHER_PASS_DELIVERY, COVERED_BY_DONE):
                 return _save_delivery(path, status)
             return save_deferral(status)
+        if isinstance(delivery, send.WorkerResultNotReady):
+            return _save_delivery(path, WORKER_READINESS_PENDING)
         if isinstance(delivery, send.WorkerResultNotSubmitted):
-            if delivery.detail == WORKER_INPUT_NOT_READY:
-                return _save_delivery(path, WORKER_READINESS_PENDING)
             return save_deferral(FAILED_WORKER_SUBMISSION + delivery.detail)
         if isinstance(delivery, send.WorkerResultUnconfirmed):
             prefix = UNCONFIRMED_RESULT_PUSH if saved.startswith(FAILED_RESULT_PUSH) else UNCONFIRMED_WORKER_RESULT

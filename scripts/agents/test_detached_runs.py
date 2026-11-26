@@ -7492,6 +7492,96 @@ class PaneRunDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.inputs), 1)
         self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
 
+    def test_supervisor_retry_rechecks_readiness_after_lock_and_before_input(self) -> None:
+        row = self.fixture.worker(family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        location = self.fixture.world.locations[pane]
+        worker_lock = worker_panes.worker_id_lock
+
+        for transition in ("at lock", "at checkpoint"):
+            with self.subTest(transition=transition):
+                record = self.record(row, f"result-{transition.replace(' ', '-')}")
+                path = Path(record["log"]).with_suffix(".json")
+                location["agent_status"] = "working"
+                self.inputs.clear()
+                attempts = 0
+
+                @contextlib.contextmanager
+                def start_at_lock(identity: staff.StaffId) -> Generator[None]:
+                    with worker_lock(identity):
+                        if attempts == 1 and transition == "at lock":
+                            location["agent_status"] = "working"
+                        yield
+
+                def start_at_checkpoint(target: Path, content: str) -> None:
+                    if (target == path and detached_runs.WORKER_INPUT_CHECKPOINT in content
+                            and attempts == 1 and transition == "at checkpoint"):
+                        location["agent_status"] = "working"
+                    write_text_atomic(target, content)
+
+                def before_retry(_seconds: float) -> None:
+                    nonlocal attempts
+                    attempts += 1
+                    self.assertLessEqual(attempts, 2)
+                    self.assertEqual(self.inputs, [])
+                    if attempts == 2:
+                        self.assertEqual(location["agent_status"], "working")
+                        saved = worker_lifecycle.read_json_object(path)
+                        expected = (detached_runs.BUSY_WORKER_RESULT if transition == "at lock"
+                                    else detached_runs.WORKER_READINESS_PENDING)
+                        self.assertEqual(saved.get("delivery"), expected)
+                        self.assertNotIn("delivered_at", saved)
+                    location["agent_status"] = "idle"
+
+                with (patch.object(worker_panes, "worker_id_lock", new=start_at_lock),
+                      patch.object(turn_end, "run_finished", return_value=detached_runs.CompletionReplay.RETRY),
+                      patch.object(detached_runs, "write_text_atomic", new=start_at_checkpoint),
+                      patch.object(time, "sleep", side_effect=before_retry)):
+                    self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+                self.assertEqual(len(self.inputs), 1)
+                self.assertEqual(attempts, 2, "the first retry sent input to a busy pane")
+                self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
+
+    def test_supervisor_retry_keeps_result_pending_when_a_pane_read_fails(self) -> None:
+        row = self.fixture.worker(family="codex")
+        pane = "w1:p1"
+        self.fixture.world.add(row, pane, family="codex")
+        self.fixture.world.locations[pane]["agent_status"] = "working"
+        record = self.record(row)
+        path = Path(record["log"]).with_suffix(".json")
+        attempts = 0
+        read_readiness = self.fixture.world.readiness
+
+        def readiness(target: str) -> herdr.WorkerReadiness:
+            if attempts == 2:
+                raise OSError("fixture readiness is unavailable")
+            return read_readiness(target)
+
+        def before_retry(_seconds: float) -> None:
+            nonlocal attempts
+            attempts += 1
+            self.assertLessEqual(attempts, 3)
+            self.assertEqual(self.notices, [])
+            self.assertEqual(self.inputs, [])
+            saved = worker_lifecycle.read_json_object(path)
+            expected = detached_runs.BUSY_WORKER_RESULT if attempts == 1 else detached_runs.WORKER_READINESS_PENDING
+            self.assertEqual(saved.get("delivery"), expected)
+            self.assertIs(saved.get("completion_pending"), True)
+            self.assertNotIn("push_retries", saved)
+            self.assertNotIn("delivered_at", saved)
+            self.fixture.world.unreadable = attempts == 1
+            self.fixture.world.locations[pane]["agent_status"] = "idle"
+
+        with (patch.object(turn_end, "run_finished", return_value=detached_runs.CompletionReplay.RETRY),
+              patch.object(self.fixture.world, "readiness", new=readiness),
+              patch.object(time, "sleep", side_effect=before_retry)):
+            self.assertEqual(detached_runs.main(["supervise", str(path)]), 0)
+        self.assertEqual(self.notices, [])
+        self.assertEqual(attempts, 3)
+        self.assertEqual(len(self.inputs), 1)
+        self.assertIn(f"Detached run: {record['run_id']}", self.inputs[0][1])
+
     def test_start_leaves_an_older_result_pending_when_the_pane_is_not_ready(self) -> None:
         _ = write_config_fixture(self.fixture.root / "conf/send.conf", "delivery_timeout=40\n")
         row = self.fixture.worker(family="codex")
