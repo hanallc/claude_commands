@@ -466,9 +466,9 @@ class ListPageTests(unittest.TestCase):
             + "# whole: 1..65535\nserver_port=8765\n"
             + "changes_first_root=natedev\nreview_attachments_root=review-attachments\n")
         _ = (config / "console.conf").write_text(
-            "page.list.label=List\npage.list.icon=list-checks\npage.list.title=The List\n"
-            + "page.list.url=python:scripts.review_links.list_page:page_url\n"
-            + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
+            "page.studio.label=Studio\npage.studio.icon=clapperboard\npage.studio.title=The Studio\n"
+            + "page.studio.url=python:scripts.review_links.studio_page:page_url\n"
+            + "page.studio.items=python:scripts.review_links.list_page:waiting_updates\n"
             + "# range: 0.001..86400\nstatus.round_trip_limit_seconds=1\n"
             + "# range: 0.001..86400\nstatus.render_limit_seconds=1\n"
             + "# range: 0.001..86400\nstatus.reading_delay_seconds=1\n"
@@ -734,7 +734,7 @@ document.body.append(result);
             def html_response(self, status: int, content: bytes, *, delivery_pending: bool | None = None,
                               builds_version: str = "", content_security_policy: str = "",
                               cache_gzip: bool = False) -> None:
-                if self.path == list_page.PAGE_PATH:
+                if self.path == studio_page.PAGE_PATH:
                     content = content.replace(b"</body>", probe.encode() + b"</body>", 1)
                 super().html_response(status, content, delivery_pending=delivery_pending, builds_version=builds_version,
                                       content_security_policy=content_security_policy, cache_gzip=cache_gzip)
@@ -760,7 +760,7 @@ document.body.append(result);
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
             try:
-                url = f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}"
+                url = f"http://127.0.0.1:{server.server_port}{studio_page.PAGE_PATH}"
                 result = self.chrome().dom(url, "probe-results", reduced_motion=True, window_size=(1280, 900))
             finally:
                 server.shutdown()
@@ -798,8 +798,9 @@ const created=__KEY__,owner=__OWNER__,fresh=__FRESH__,requests=[];
 let finishRowSave,reads=0;
 window.setInterval=()=>0;
 window.fetch=async (path,options={})=>{
+ if(options.method==='POST' && path===document.querySelector('[data-list]').dataset.listPath)
+  return new Promise(resolve=>{finishRowSave=resolve;});
  if(path===location.pathname){
-  if(options.method==='POST') return new Promise(resolve=>{finishRowSave=resolve;});
   reads++;
   return new Response(fresh);
  }
@@ -1199,26 +1200,19 @@ if(example.filterOn){
             (root / folder).mkdir(parents=True)
             for size in studio_page.SIZES:
                 _ = (root / folder / f"01-{size}.webp").write_bytes(b"RIFF")
-        with (self.root / "config/review_links.conf").open("a") as settings:
-            _ = settings.write(f"studio_avatar_root={root}\n")
         return root
 
-    def test_studio_view_swaps_the_producer_chip_row_for_picture_tabs(self) -> None:
-        _ = self.fixture_items()
+    def test_studio_shows_list_rows_and_one_set_of_producer_tabs(self) -> None:
+        items = self.fixture_items()
         _ = self.studio_avatars(DWIGHT.id)
-        listing = list_page.render(self.root / "reviews").decode()
-        studio = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
+        studio = list_page.render(self.root / "reviews").decode()
         row = '<div class="record-filter-row" role="group" aria-label="Producer" data-filter-row="producer">'
-        self.assertIn('<div class="list-producer-filter">' + row, listing)
-        self.assertIn('<h1 class="page-title">The List</h1>', listing)
-        self.assertIn('<title>The List</title>', listing)
-        self.assertNotIn('studio-tabs', listing)
         self.assertEqual(studio.count(row), 1)
         self.assertIn('<div class="studio-tabs">' + row, studio)
         self.assertIn('<div class="list-producer-filter"><div class="record-filter-words">', studio)
         self.assertIn('<h1 class="page-title">The Studio</h1>', studio)
         self.assertIn('<title>The Studio</title>', studio)
-        self.assertEqual(studio.count('<tbody data-list-item'), listing.count('<tbody data-list-item'))
+        self.assertEqual(studio.count('<tbody data-list-item'), len(items) - 1)
         tab = studio.split(f'data-filter-value="staff:{DWIGHT.id}"', 1)[1].split('</button>', 1)[0]
         self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/01-128.webp"', tab)
         self.assertIn('<span class="studio-name">dwight</span> <b>2</b>', tab)
@@ -1242,7 +1236,7 @@ if(example.filterOn){
  initial.click();
  check(JSON.stringify(activeChipLabels(document,'[data-filter-row="producer"] [aria-pressed="true"]'))
   ==='["Producer: morty"]','The filter label omits the initial.');
-'''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('MORTY', json.dumps(MORTY.id)), studio_page.STUDIO_VIEW)
+'''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('MORTY', json.dumps(MORTY.id)))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_studio_refresh_keeps_the_pictures_and_updates_the_tab_counts(self) -> None:
@@ -1253,7 +1247,7 @@ if(example.filterOn){
                 _ = (avatars / folder / f"02-{size}.webp").write_bytes(b"RIFF")
 
         def page() -> str:
-            return list_page.render(self.root / "reviews", include_counts=False, view=studio_page.STUDIO_VIEW).decode()
+            return list_page.render(self.root / "reviews", include_counts=False).decode()
 
         with patch.object(studio_page, "choice", side_effect=min):
             initial = page()
@@ -1284,17 +1278,14 @@ if(example.filterOn){
 '''.replace('DWIGHT', json.dumps(DWIGHT.id)).replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
         self.browser_action_sequence(steps, add_item=False, markup=initial)
 
-    def test_studio_marks_the_open_top_item_of_each_producer_and_the_list_shows_no_marks(self) -> None:
+    def test_studio_marks_the_open_top_item_of_each_producer(self) -> None:
         items = self.fixture_items()
         _ = self.studio_avatars(DWIGHT.id)
         status, latest, removed = items[1], items[2], items[5]
         _ = staff.set_producer_top_item(DWIGHT.id, staff.TopItem(status.number))
         # A Closed item reads as no top item.
         _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(removed.number))
-        listing = list_page.render(self.root / "reviews").decode()
-        studio = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
-        for mark in ("list-top", 'value="top"', "Make top priority"):
-            self.assertNotIn(mark, listing)
+        studio = list_page.render(self.root / "reviews").decode()
         rows: dict[int, str] = {}
         for part in studio.split('<tbody data-list-item')[1:]:
             row = part.split('</tbody>', 1)[0]
@@ -1322,7 +1313,7 @@ if(example.filterOn){
                       + '[data-top-band="none"]{display:flex}', bands)
         # A retired producer has no top item.
         _ = staff.set_producer_retirement(DWIGHT.id, staff.RetiredProducer("claude:sonnet:high"))
-        retired = list_page.render(self.root / "reviews", view=studio_page.STUDIO_VIEW).decode()
+        retired = list_page.render(self.root / "reviews").decode()
         self.assertNotIn('class="list-top-mark"', retired)
 
     def test_studio_waiting_item_has_the_make_top_priority_button(self) -> None:
@@ -1335,7 +1326,7 @@ if(example.filterOn){
                 self.fields(item, "question", words="Which check passed?")), status))
 
         def waiting_row() -> str:
-            studio = list_page.render(root, include_counts=False, status=status, view=studio_page.STUDIO_VIEW).decode()
+            studio = list_page.render(root, include_counts=False, status=status).decode()
             return studio.split(f'data-number="{item.number}"', 1)[1].split('</tbody>', 1)[0]
 
         self.assertIn('<form method="post" data-feedback-form data-waiting-actions>', waiting_row())
@@ -1353,7 +1344,7 @@ if(example.filterOn){
         second = self.add("Second item", number=2)
 
         def page() -> str:
-            return list_page.render(self.root / "reviews", include_counts=False, view=studio_page.STUDIO_VIEW).decode()
+            return list_page.render(self.root / "reviews", include_counts=False).decode()
 
         _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(second.number))
         initial = page()
@@ -1391,8 +1382,8 @@ if(example.filterOn){
         steps = steps.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
         self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=initial)
 
-    def browser_row_expansion(self, steps: str, view: list_page.ListView = list_page.LIST_VIEW) -> None:
-        markup = list_page.render(self.root / "reviews", include_counts=False, view=view).decode()
+    def browser_row_expansion(self, steps: str) -> None:
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         probe = r'''<script>
 (async()=>{
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
@@ -1478,8 +1469,8 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
                 cached.close()
         for browser in WINDOW_BROWSERS:
             with self.subTest(browser=browser):
-                self.assertEqual(window_probe_results({list_page.PAGE_PATH: page, review_page.PAGE_PATH: card},
-                                                      list_page.PAGE_PATH, browser), [[]])
+                self.assertEqual(window_probe_results({studio_page.PAGE_PATH: page, review_page.PAGE_PATH: card},
+                                                      studio_page.PAGE_PATH, browser), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_linked_review_send_blocks_a_second_form(self) -> None:
@@ -1549,7 +1540,7 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
 </script>'''
         page = page.replace(b"</body>", probe + b"</body>", 1)
         self.assertEqual(window_probe_results(
-            {list_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, list_page.PAGE_PATH, "firefox"), [[]])
+            {studio_page.PAGE_PATH: page, review_page.PAGE_PATH: card}, studio_page.PAGE_PATH, "firefox"), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for browser checks")
     def test_browser_review_links_open_one_card_without_leaving_the_list(self) -> None:
@@ -1584,12 +1575,12 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
         for key, value in (("page_request_timeout_seconds", 7), ("card_fade_out_ms", 180), ("card_fade_in_ms", 260)):
             overlay_settings = re.sub(rf"(?m)^{key}=.*$", f"{key}={value}", overlay_settings)
         _ = settings.write_text(overlay_settings)
-        pages = (console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH)),
+        pages = (console.ConsolePage("studio", "Studio", "clapperboard", "The Studio", console.AvailablePage(studio_page.PAGE_PATH)),
                  console.ConsolePage("review", "Review", "inbox", "Review", console.AvailablePage(review_page.PAGE_PATH)))
         shell = console.render(pages, console.UnavailablePage()).decode()
-        list_place = list_page.PAGE_PATH + '#' + urlencode({"show": "working", "item": f"{MORTY.id}/{item.id}"})
+        list_place = studio_page.PAGE_PATH + '#' + urlencode({"show": "working", "item": f"{MORTY.id}/{item.id}"})
         review_place = review_page.PAGE_PATH + '#' + urlencode({"show": "Done", "type": "question", "q": "keep"})
-        destination = "/proof" + console.place_query("list", list_place) + "&" + urlencode({"at.review": review_place})
+        destination = "/proof" + console.place_query("studio", list_place) + "&" + urlencode({"at.review": review_place})
         probe = r'''<script>
 const failures=[],check=(ok,text)=>{if(!ok) failures.push(text);};
 const params=new URLSearchParams(location.search);
@@ -1792,7 +1783,7 @@ async function inspect(){
   check(entries.some(entry=>entry[0]===waitingKey) && entries.every(entry=>entry[0]!=='sdlc/C2'),
    'The Review index includes the Waiting card and excludes the Done card.');
   check(listFrame.hidden && !dialog.open,'Changing the console page closes an idle card.');
-  document.querySelector('.nav-entry[data-page="list"]').click();
+  document.querySelector('.nav-entry[data-page="studio"]').click();
   await animationFrames(win);
   check(win.recordIsOpen(row()),'The List keeps the item open on return.');
   check(!listFrame.hidden && !dialog.open && !dialog.querySelector('iframe'),'Returning to List shows no old card.');
@@ -1822,7 +1813,7 @@ async function inspect(){
    if(String(url).includes('?counts=')){countsStarted();await heldCounts;}
    return fetchBeforeReturn(url,options);
   };
-  document.querySelector('.nav-entry[data-page="list"]').click();
+  document.querySelector('.nav-entry[data-page="studio"]').click();
   await readingCounts;
   check(doc.querySelector('[data-list]')!==listBeforeReturn && row()===beforeReturn && win.recordIsOpen(row()),
    'The List refreshes and keeps the open row node while it reads links.');
@@ -1882,7 +1873,7 @@ async function inspect(){
  const listRefresh=new Promise(resolve=>{releaseRefresh=resolve;});
  if(!phone){
   win.fetch=async(url,options)=>{
-   if(url===win.location.pathname){
+   if(url===win.location.pathname || url===doc.querySelector('[data-list]').dataset.listPath){
     if(options?.method==='POST') return listSave;
     if(delayRefresh){listReads++;await listRefresh;}
    }
@@ -2044,7 +2035,7 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                     def html_response(self, status: int, content: bytes, *,
                                       delivery_pending: bool | None = None, builds_version: str = "",
                                       content_security_policy: str = "", cache_gzip: bool = False) -> None:
-                        if self.path in (list_page.PAGE_PATH + "?direct=1", list_page.PAGE_PATH + "?direct=1&short=1"):
+                        if self.path in (studio_page.PAGE_PATH + "?direct=1", studio_page.PAGE_PATH + "?direct=1&short=1"):
                             content = content.replace(b'</body>', probe.encode() + b'</body>')
                         super().html_response(status, content, delivery_pending=delivery_pending,
                                               builds_version=builds_version,
@@ -2103,7 +2094,8 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
                         width, height = map(int, viewport.split(","))
                         route = destination
                         if size == "500,800":
-                            route = list_place.replace("#", "?direct=1&short=1#", 1)
+                            old_place = list_page.PAGE_PATH + list_place.removeprefix(studio_page.PAGE_PATH)
+                            route = old_place.replace("#", "?direct=1&short=1#", 1)
                         elif size == "1474,600":
                             route += "&short=1"
                         elif size == "390,900":
@@ -2169,7 +2161,7 @@ addEventListener('message',event=>{
  [...links].find(link=>link.textContent==='#'+event.data.clickListLink).click();
 });
 </script></body>''')
-        page = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(list_page.PAGE_PATH))
+        page = console.ConsolePage("studio", "Studio", "clapperboard", "The Studio", console.AvailablePage(studio_page.PAGE_PATH))
         shell = console.render((page,), console.UnavailablePage()).decode()
         probe = r'''<script>
 const params=new URLSearchParams(location.search),number=params.get('number'),scenario=params.get('case');
@@ -2184,6 +2176,16 @@ frame.addEventListener('load',async()=>{
   const doc=frame.contentDocument,win=frame.contentWindow;
   const row=id=>doc.querySelector('[data-number="'+id+'"]');
   const source=row(1),target=row(number),search=doc.querySelector('#list-search');
+  if(scenario==='open'){
+   const address=new URL(location.href);
+   const place=new URL(address.searchParams.get('at.studio'),location.href);
+   check(address.searchParams.get('page')==='studio' && !address.searchParams.has('at.list'),
+    'The console replaces the old List place with the Studio place.');
+   const filters=new URLSearchParams(place.hash.slice(1));
+   check(place.pathname===win.location.pathname && (place.searchParams.get('show') || filters.get('show'))==='working'
+    && filters.get('item')===source.dataset.key && win.recordIsOpen(source),
+    'The old List bookmark opens the same item and keeps its filters.');
+  }
   const chip=(name,value)=>doc.querySelector('[data-filter-row="'+name+'"] [data-filter-value="'+value+'"]');
   const selected=name=>doc.querySelector('[data-filter-row="'+name+'"] [aria-pressed="true"]').dataset.filterValue;
   const unread=doc.getElementById('list-unread');
@@ -2224,7 +2226,7 @@ frame.addEventListener('load',async()=>{
   if(pendingWords){params.set('q',pendingWords);original.hash=String(params);}
   const originalPlace=original.href;
   const debounced=pendingWords ? new Promise(done=>search.addEventListener('filterchange',done,{once:true})) : null;
-  const consolePlace=()=>new URL(new URLSearchParams(location.search).get('at.list'),location.href).href;
+  const consolePlace=()=>new URL(new URLSearchParams(location.search).get('at.studio'),location.href).href;
   const updated=new Promise(resolve=>{
    const done=()=>{
     clearTimeout(timeout);removeEventListener('message',record);resolve();
@@ -2368,7 +2370,7 @@ frame.addEventListener('load',async()=>{
                 path = urlsplit(self.path).path
                 if path == '/list-jump-ready':
                     _ = complete.wait(35)
-                body = listing if path == list_page.PAGE_PATH else shell.encode() if path == "/console/" else b'{}'
+                body = listing if path == studio_page.PAGE_PATH else shell.encode() if path == "/console/" else b'{}'
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8' if body != b'{}' else 'application/json')
                 self.end_headers()
@@ -2407,8 +2409,12 @@ frame.addEventListener('load',async()=>{
                             filters.update(owner=OWNER.id, producer=MORTY.id, q="linked item")
                         if case == "unread-words":
                             filters.update(unread="1", q="item")
-                        place = list_page.PAGE_PATH + "?show=working#" + urlencode(filters)
-                        url = "/console/" + console.place_query("list", place)
+                        place = studio_page.PAGE_PATH + "?show=working#" + urlencode(filters)
+                        if case == "open":
+                            old_place = list_page.PAGE_PATH + place.removeprefix(studio_page.PAGE_PATH)
+                            url = "/console/" + console.place_query("list", old_place)
+                        else:
+                            url = "/console/" + console.place_query("studio", place)
                         destination = f'http://127.0.0.1:{server.server_port}{url}&number={number}&case={case}'
                         if case == "proof" and proof:
                             result = self.firefox_view(destination, Path(proof), 1440, 1100, complete, dark=True)
@@ -2446,19 +2452,6 @@ frame.addEventListener('load',async()=>{
         shown = re.sub(r"<[^>]+>", "", log)
         for text in (OWNER.id, MORTY.id, "EtaRange(", "next_step", "latest_status"):
             self.assertNotIn(text, shown)
-
-    def test_producer_filter_and_both_tables_show_the_producer_label_color(self) -> None:
-        _ = self.add("Producer labels")
-        body = list_page.render(self.root / "reviews", include_counts=False).decode()
-        label = '<span class="staff-name" data-color-text="role.producer" style="color:#90fe42">Producer</span>'
-        self.assertIn(f'aria-label="Producer" data-filter-row="producer"><span aria-hidden="true">{label}</span>', body)
-        self.assertIn('<th scope="col" aria-sort="none" data-list-producer>'
-                      + '<button type="button" id="list-sort-2" data-sort="2">Producer', body)
-        self.assertIn('th[data-list-producer] button{color:var(--producer-label-color,inherit)}', body)
-        self.assertIn(f'<th scope="col">{label}</th>', body.split('<section data-linked-item', 1)[1])
-        self.assertIn('--producer-label-color:#90fe42', body)
-        self.assertIn('td[data-label="Producer"]::before{color:var(--producer-label-color,var(--ink-3))}', body)
-        self.assertIn('<td data-label="Producer">', body)
 
     def link_detail_panel(self, entry: list_page.ListRecord, sections: str, today: datetime,
                           names: staff_names.StaffNames, unread: frozenset[str]) -> str:
@@ -2574,13 +2567,16 @@ frame.addEventListener('load',async()=>{
         origin = "http://console.test:8765"
         self.assertEqual(urlsplit(image_link).netloc, "console.test:8765")
         relative_image = image_link.removeprefix(origin)
-        list_place = list_page.PAGE_PATH + list_page.item_link(MORTY.id, 210)
+        list_place = studio_page.PAGE_PATH + list_page.item_link(MORTY.id, 210)
         review_place = review_page.PAGE_PATH + "#key=sdlc%2FC1"
         for path, expected in (
             (relative_image, "Images page"),
             (images.PAGE_PATH + "#image=sample", "Images page"),
-            ("/console/" + console.place_query("list", list_place), "List item 210"),
+            ("/console/" + console.place_query("studio", list_place), "List item 210"),
             (list_place, "List item 210"),
+            (list_page.PAGE_PATH + list_page.item_link(MORTY.id, 210), "List item 210"),
+            ("/console/" + console.place_query("list", list_page.PAGE_PATH + list_page.item_link(MORTY.id, 210)),
+             "List item 210"),
             ("/console/" + console.place_query("review", review_place), "Review item"),
             (review_page.card_url("sdlc/C1"), "Review item"),
         ):
@@ -2766,6 +2762,19 @@ frame.addEventListener('load',async()=>{
  check(link?.getClientRects().length>1,'The inline link wraps at phone width.');
  check(section.clientWidth===section.scrollWidth,'The Links section fits at phone width.');
 """, add_item=False, reduced_motion=True, window_size=(390, 1000))
+
+    def test_studio_producer_tabs_and_both_tables_label_the_producer(self) -> None:
+        _ = self.add("Producer labels")
+        body = list_page.render(self.root / "reviews", include_counts=False).decode()
+        label = '<span class="staff-name" data-color-text="role.producer" style="color:#90fe42">Producer</span>'
+        self.assertIn('aria-label="Producer" data-filter-row="producer"><span aria-hidden="true">Producer</span>', body)
+        self.assertIn('<th scope="col" aria-sort="none" data-list-producer>'
+                      + '<button type="button" id="list-sort-2" data-sort="2">Producer', body)
+        self.assertIn('th[data-list-producer] button{color:var(--producer-label-color,inherit)}', body)
+        self.assertIn(f'<th scope="col">{label}</th>', body.split('<section data-linked-item', 1)[1])
+        self.assertIn('--producer-label-color:#90fe42', body)
+        self.assertIn('td[data-label="Producer"]::before{color:var(--producer-label-color,var(--ink-3))}', body)
+        self.assertIn('<td data-label="Producer">', body)
 
     def test_updated_log_shows_full_eta_and_shares_the_next_step_renderer(self) -> None:
         item = self.add("Log an update")
@@ -3194,6 +3203,8 @@ document.body.append(result);
         config = self.root / "config"
         changes = self.root / "change-reviews"
         _ = shutil.copytree(self.browser_root / "config", config)
+        with (config / "review_links.conf").open("a") as settings:
+            _ = settings.write(f"studio_avatar_root={self.root / 'avatars'}\n")
         _ = write_config_fixture(config / "console.conf", f"page.list.owner={MORTY.id}\n")
         _ = (config / "change_review.conf").write_text(
             f"lists_directory={changes}\nreview_links_directory={self.root / 'reviews'}\n")
@@ -3403,7 +3414,7 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
         self.assertNotIn('<select', controls)
         self.assertEqual(controls.count('type="search"'), 1)
         self.assertEqual([part.split('"', 1)[0] for part in controls.split('data-filter-row="')[1:]],
-                         ['owner', 'producer', 'show'])
+                         ['owner', 'show'])
         shows = controls.split('data-filter-row="show"', 1)[1].split('</div>', 1)[0]
         self.assertEqual(re.findall(r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>', shows),
                          [("all", "All"), ("needs-me", "Needs me"), ("producer-answering", "Producer answering"),
@@ -3411,11 +3422,12 @@ void fetch('/results',{method:'POST',body:JSON.stringify(failures)});
                           ("scheduled", "Scheduled")])
         self.assertIn('role="switch" id="list-unread" value="1">Unread only</label>', controls)
         owners = controls.split('data-filter-row="owner"', 1)[1].split('</div>', 1)[0]
-        producers = controls.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
+        producers = body.split('data-filter-row="producer"', 1)[1].split('</div>', 1)[0]
         chip = r'data-filter-value="([^"]+)"[^>]*>([^<]+) <b>(\d+)</b>'
         self.assertEqual(re.findall(chip, owners),
                          [('all', 'All', '5'), (f'staff:{OTHER.id}', 'builds', '1'), (f'staff:{OWNER.id}', 'sdlc', '4')])
-        self.assertEqual(re.findall(chip, producers),
+        tab = r'data-filter-value="([^"]+)"[^>]*>.*?<span class="studio-name">([^<]+)</span> <b>(\d+)</b>'
+        self.assertEqual(re.findall(tab, producers),
                          [('all', 'All', '5'), (f'staff:{DWIGHT.id}', 'dwight', '2'), (f'staff:{MORTY.id}', 'morty', '3')])
         self.assertEqual(body.count('<td data-label="Producer">dwight</td>'), 2)
         self.assertEqual(body.count('<td data-label="Producer">morty</td>'), 3)
@@ -3736,19 +3748,33 @@ result.textContent=JSON.stringify(failures);document.body.append(result);
         self.assertEqual(len(errors.getvalue().splitlines()), 2)
 
     def test_nav_marks_new_update_times_and_keeps_read_operations_out_of_the_page(self) -> None:
-        pages = tuple(page for page in console.read_pages() if page.identity == "list")
+        pages = tuple(page for page in console.read_pages() if page.identity == "studio")
         root = self.root / "reviews"
-        self.assertEqual(list_page.page_url(), '/console/list.html')
+        self.assertEqual(studio_page.page_url(), '/console/studio.html')
         self.assertEqual(console.news(root, pages, "changes"), ())
         item = self.add("Unread item")
-        self.assertEqual(console.news(root, pages, "changes"), ("list",))
-        self.assertEqual(console.news(root, pages, "list"), ())
+        self.assertEqual(console.news(root, pages, "changes"), ("studio",))
+        self.assertEqual(console.news(root, pages, "studio"), ())
         self.assertEqual(console.news(root, pages, "changes"), ())
         with patch.object(the_list, "now", return_value=NOW + timedelta(minutes=1)):
             _ = the_list.update(MORTY.id, item.id, {"latest_status": "A new result arrived."}, source="morty")
-        self.assertEqual(console.news(root, pages, "changes"), ("list",))
+        self.assertEqual(console.news(root, pages, "changes"), ("studio",))
         _ = the_list.mark_read(MORTY.id, item.id, source="nate")
         self.assertEqual(console.news(root, pages, "changes"), ())
+
+    def test_studio_news_keeps_the_seen_list_updates(self) -> None:
+        root = self.root / "reviews"
+        studio, = (page for page in console.read_pages() if page.identity == "studio")
+        old = replace(studio, identity="list", destination=console.AvailablePage(list_page.PAGE_PATH))
+        seen = self.add("Update seen on the List")
+        self.assertEqual(console.news(root, (old,), "list"), ())
+        unread = self.add("Update added after the last List visit")
+        self.assertEqual(console.news(root, (studio,), "review"), ("studio",))
+        saved = change_page.console_folder(root) / console.SEEN_NAME
+        self.assertEqual(json.loads(saved.read_text()), {"studio": [f"{MORTY.id}/{seen.id}/{NOW.isoformat()}"]})
+        self.assertEqual(console.news(root, (studio,), "studio"), ())
+        self.assertIn(unread.id, saved.read_text())
+        self.assertEqual(console.news(root, (studio,), "review"), ())
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_unread_excludes_legacy_closed_records(self) -> None:
@@ -4126,7 +4152,7 @@ window.fetch=async (url,options)=>{
  const result=document.createElement('p');
  result.id='probe-results';result.textContent=JSON.stringify(failures);document.body.append(result);
 })();
-</script>""".replace("REQUEST", json.dumps(f"{list_page.PAGE_PATH}?{query},no-store")).replace(
+</script>""".replace("REQUEST", json.dumps(f"{studio_page.PAGE_PATH}?{query},no-store")).replace(
                     "EXPECTED", json.dumps(expected))
                 self.browser_actions(markup, setup, probe)
 
@@ -5070,7 +5096,7 @@ window.fetch=async(_path,options={})=>{
         class FixtureList(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 url = urlsplit(self.path)
-                if url.path != list_page.PAGE_PATH:
+                if url.path != studio_page.PAGE_PATH:
                     self.send_error(404)
                     return
                 query = parse_qs(url.query)
@@ -5117,7 +5143,7 @@ window.fetch=async(_path,options={})=>{
                 _ = browser.command("Emulation.setEmulatedMedia", {"features": [
                     {"name": "prefers-color-scheme", "value": "dark"},
                     {"name": "prefers-reduced-motion", "value": "reduce"}]}, session)
-                browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}")
+                browser.navigate(f"http://127.0.0.1:{server.server_port}{studio_page.PAGE_PATH}")
                 proof = os.environ.get("LIST_SCHEDULE_PROOF")
 
                 def evaluate(expression: str) -> None:
@@ -6025,8 +6051,9 @@ window.fetch=async(_path,options={})=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_unpark_controls_layout_and_focus(self) -> None:
         parked = self.add("Parked item", number=1, next_check=NOW + timedelta(hours=1))
-        _ = self.add("Unparked item", number=2)
+        unparked = self.add("Unparked item", number=2)
         _ = the_list.park(MORTY.id, parked.id, NOW + timedelta(days=2), source="nate")
+        _ = staff.set_producer_top_item(MORTY.id, staff.TopItem(unparked.number))
         markup = list_page.render(self.root / "reviews", include_counts=False).decode()
         with patch.object(the_list, "now", return_value=NOW + timedelta(hours=2)):
             _ = the_list.unpark(MORTY.id, parked.id, source="nate")
@@ -6046,7 +6073,13 @@ window.fetch=async(_path,options={})=>{
   check(near(remove.left,box.left) && near(park.right,box.right) && near(remove.top,park.top),'one aligned control row');
   check(pick('[value=unpark]').hidden===(item===other),'Unpark only shows on the parked item');
   check(pick('[data-parked-detail]').hidden===(item===other),'parking line only shows on the parked item');
+  const padding=item===row ? '8px' : '12px';
+  check(['[value=remove]','[data-later-toggle]'].every(selector=>
+   getComputedStyle(pick(selector)).paddingInlineStart===padding),'The row uses its expected control padding.');
   if(item===row){
+   const top=pick('[value=top]');
+   check(top?.textContent==='Make top priority' && near(rectangle(top).top,remove.top),
+    'The parked row shows Make top priority on the control row.');
    check(near(park.left-rectangle(pick('[value=unpark]')).right,8),'parking controls are adjacent');
    check(recordDetails(item).querySelectorAll('[data-parked-detail]:not([hidden])').length===1,
     'The expanded row shows one parking line.');
@@ -6191,7 +6224,11 @@ window.fetch=async(_path,options={})=>{
   draft.dispatchEvent(new Event('input'));
   draft.focus();draft.setSelectionRange(5,14,'backward');
  };
- if(!parks){editOther();prior.querySelector('.list-toggle').click();}
+ if(!parks){
+  editOther();prior.querySelector('.list-toggle').click();
+  const unpark=recordDetails(prior).querySelector('[data-waiting-actions] [value="unpark"]');
+  check(getComputedStyle(unpark).paddingInlineStart==='12px','The waiting row keeps its control padding.');
+ }
  const methods=[];
  window.fetch=new Proxy(window.fetch,{apply(fetch,receiver,args){
   methods.push(args[1]?.method || 'GET');return Reflect.apply(fetch,receiver,args);
@@ -6566,7 +6603,7 @@ window.fetch=async(_path,options={})=>{
  check(scroller.scrollHeight===scroller.clientHeight,'The scroll removes all space below the list.');
 """
         self.browser_action_sequence(steps.replace("AFTER_PAGE", json.dumps(after).replace("</", r"<\/")),
-                                     reduced_motion=True, add_item=False, markup=before, window_size=(1280, 1200))
+                                     reduced_motion=True, add_item=False, markup=before, window_size=(1280, 1320))
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_browser_list_scroll_input_removes_the_top_space_on_a_short_page(self) -> None:
@@ -8704,7 +8741,7 @@ window.fetch=async(_url,options)=>{
   const expanded=item=>recordIsOpen(item);
   const linked=item=>!section().hidden && section().contains(item) && !item.hidden && expanded(item);
   const framePlace=()=>location.pathname+location.search+location.hash;
-  const consolePlace=()=>new URL(parent.location.href).searchParams.get('at.list');
+  const consolePlace=()=>new URL(parent.location.href).searchParams.get('at.studio');
   const reload=async next=>{
    if(consoleReload){
     if(consolePlace()!==framePlace()) await new Promise(resolve=>{
@@ -9230,7 +9267,7 @@ window.fetch=async(_url,options)=>{
             thread.start()
             chrome = self.chrome()
             try:
-                chrome.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}")
+                chrome.navigate(f"http://127.0.0.1:{server.server_port}{studio_page.PAGE_PATH}")
                 reply = chrome.command("Runtime.evaluate", {"expression": script, "awaitPromise": True,
                                        "returnByValue": True}, chrome.session)
                 self.assertNotIn("exceptionDetails", reply)
@@ -9777,11 +9814,11 @@ window.fetch=async(_url,options)=>{
         frame_url = frame_path
         console_shell = b""
         if reload_console or console_fragment:
-            frame_path = list_page.PAGE_PATH
-            listing = console.ConsolePage("list", "List", "list-checks", "The List", console.AvailablePage(frame_path))
+            frame_path = studio_page.PAGE_PATH
+            listing = console.ConsolePage("studio", "Studio", "clapperboard", "The Studio", console.AvailablePage(frame_path))
             console_shell = console.render((listing,), console.UnavailablePage())
             place = frame_path + (console_fragment or "#show=working")
-            frame_url = "/console/?" + urlencode({"page": "list", "at.list": place})
+            frame_url = "/console/?" + urlencode({"page": "studio", "at.studio": place})
             if console_fragment:
                 console_shell = console_shell.replace(b"</body>", b'<img hidden src="/complete"></body>')
         host_page = (f'<!doctype html><style>iframe{{border:0;width:100%;height:{height}}}'
@@ -9996,7 +10033,7 @@ const change=async path=>{
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();
-</script>""".replace('LIST_PATH', list_page.PAGE_PATH).encode()
+</script>""".replace('LIST_PATH', studio_page.PAGE_PATH).encode()
 
         class Probe(serve.ReviewLinksHandler):
             @override
@@ -10179,7 +10216,7 @@ const settle=async (done,message)=>{
  }catch(error){errors.push(String(error));}
  await fetch('/results',{method:'POST',body:JSON.stringify(errors)});
 })();
-</script>""".replace('LIST_PATH', list_page.PAGE_PATH).replace('KEY', key).encode()
+</script>""".replace('LIST_PATH', studio_page.PAGE_PATH).replace('KEY', key).encode()
 
         class Probe(serve.ReviewLinksHandler):
             @override
@@ -10962,7 +10999,7 @@ window.fetch=async(_path,options={})=>{
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
                 thread.start()
                 try:
-                    browser.navigate(f"http://127.0.0.1:{server.server_port}{list_page.PAGE_PATH}#show=needs-me")
+                    browser.navigate(f"http://127.0.0.1:{server.server_port}{studio_page.PAGE_PATH}#show=needs-me")
                     result = browser.command("Runtime.evaluate", {
                         "expression": r"""(async () => {
  const row=document.querySelector('[data-number="ITEM_NUMBER"]');
@@ -11204,7 +11241,7 @@ window.fetch=async(_path,options={})=>{
 (async()=>{
 const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
 try{
-const rows=[...document.querySelectorAll('[data-record-filters] [data-filter-row]')];
+const rows=['owner','producer','show'].map(name=>document.querySelector('[data-filter-row="'+name+'"]'));
 const left=row=>row.querySelector('button').getBoundingClientRect().left;
 for(const row of rows){
  const bounds=row.getBoundingClientRect();
@@ -11216,7 +11253,9 @@ for(const row of rows){
 const ownerChips=[...rows[0].querySelectorAll('button')];
 check(new Set(ownerChips.map(button=>button.getBoundingClientRect().top)).size>1,
  'The owner chips wrap onto more than one line.');
-check(rows.every(row=>Math.abs(left(row)-left(rows[0]))<1),'The three rows align.');
+const rowLeft=row=>row.getBoundingClientRect().left;
+check(rows.every(row=>Math.abs(rowLeft(row)-rowLeft(rows[0]))<1) && Math.abs(left(rows[2])-left(rows[0]))<1
+ && Math.abs(left(rows[1])-rowLeft(rows[1]))<1,'The filter rows align and the picture tabs start at the row edge.');
 check(document.documentElement.scrollWidth<=innerWidth,'The filter rows fit without horizontal scrolling.');
 const ownerName=number=>document.querySelector('[data-number="'+number+'"] .list-owner-name');
 const fits=name=>name.scrollWidth<=name.clientWidth;
@@ -11247,11 +11286,11 @@ if(innerWidth>960){
   'Item and Next step share the available width in their original proportion.');
 }
 const producerBox=rows[1].getBoundingClientRect(),words=document.getElementById('list-search').getBoundingClientRect();
-check(innerWidth>620 ? words.top<producerBox.bottom && words.left>=producerBox.right :
- words.top>=producerBox.bottom,'The words box sits beside Producer on desktop and wraps below it on a phone.');
+check(words.top>=producerBox.bottom,'The words box stays below the Producer tabs.');
 const allChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="all"]'));
 const staffChips=rows.slice(0,2).map(row=>row.querySelector('[data-filter-value="staff:all"]'));
-check(allChips.every(chip=>chip.textContent==='All 16') && staffChips.every(chip=>chip?.textContent==='all 1'),
+const chipText=chip=>chip?.querySelector('.studio-name') ? chip.querySelector('.studio-name').textContent+' '+chip.querySelector('b').textContent : chip?.textContent;
+check(allChips.every(chip=>chipText(chip)==='All 16') && staffChips.every(chip=>chipText(chip)==='all 1'),
  'Each staff row has distinct All and all chips with separate counts.');
 check(ownerChips[2].textContent==='builds 1' && ownerChips[3].textContent==='builds-support 1',
  'The owner chips omit the suffix and sort by the displayed name.');
@@ -11289,7 +11328,9 @@ for(const [number,label] of [['1','builds'],['2','-unit']]){
  const row=document.querySelector('[data-number="'+number+'"]'),id=row.dataset.owner;
  for(const name of ['owner','producer']){
   const chip=document.querySelector('[data-filter-row="'+name+'"] [data-filter-value="staff:'+id+'"]');
-  if(chip.textContent!==label+' 1') failures.push('The '+name+' chip shows '+label+' and its count.');
+  const tab=chip.querySelector('.studio-name');
+  const text=tab ? tab.textContent+' '+chip.querySelector('b').textContent : chip.textContent;
+  if(text!==label+' 1') failures.push('The '+name+' chip shows '+label+' and its count.');
   chip.click();
  }
  const place=new URLSearchParams(location.hash.slice(1));
@@ -11486,13 +11527,19 @@ try{
   return .2126*r+.7152*g+.0722*b;
  };
  show('working');select('owner',OWNER);select('producer',MORTY);
- check(pressed('owner').textContent==='sdlc 1' && pressed('producer').textContent==='morty 1',
-  'The selected staff chips show the names and counts.');
+ const tab=pressed('producer');
+ check(pressed('owner').textContent==='sdlc 1' && tab.querySelector('.studio-name').textContent==='morty'
+  && tab.querySelector('b').textContent==='1','The selected staff controls show the names and counts.');
  for(const themeName of ['light','dark']){
   document.documentElement.dataset.theme=themeName;
   for(const view of ['working','blocked']){
    show(view);
-   for(const control of [chip(view),pressed('owner'),pressed('producer')]){
+   const producer=pressed('producer'),initial=producer.querySelector('.studio-initial');
+   const scrim=getComputedStyle(producer,'::after').backgroundImage;
+   check(getComputedStyle(producer).opacity==='1' && scrim.startsWith('linear-gradient(')
+    && [...producer.querySelectorAll('.studio-name,b')].every(label=>getComputedStyle(label).color==='rgb(255, 255, 255)'),
+    'The selected picture tab keeps its label and count over the scrim.');
+   for(const control of [chip(view),pressed('owner'),initial]){
     const background=luminance(getComputedStyle(control).backgroundColor);
     for(const element of [control,...control.querySelectorAll('b')]){
      const ink=luminance(getComputedStyle(element).color);

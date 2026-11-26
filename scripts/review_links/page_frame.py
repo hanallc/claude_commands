@@ -21,6 +21,7 @@ from scripts.review_links import send_hold, setting_controls
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
 LIST_PAGE_PATH = "/console/list.html"
+STUDIO_PAGE_PATH = "/console/studio.html"
 
 
 def list_item_fragment(keeper: str, number: int) -> str:

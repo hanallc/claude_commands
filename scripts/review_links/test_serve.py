@@ -122,7 +122,7 @@ def write_server_config(configuration: Path) -> dict[str, str]:
     _ = write_config_fixture(configuration / "console.conf",
         "page.review.title=Review\npage.review.url=python:scripts.review_links.review_page:page_url\n"
         + "page.review.items=python:scripts.review_links.review_page:waiting_items\n"
-        + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
+        + "page.studio.items=python:scripts.review_links.list_page:waiting_updates\n"
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
     _ = write_config_fixture(configuration / "staff.conf",
@@ -417,7 +417,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     if mode == "remote" and now == finished:
                         for query in (list_page.COUNTS_QUERY, list_page.COUNTS_AND_LINKS_QUERY):
                             with self.subTest(query=query), patch.object(self.server, "root", case.root):
-                                response = self.request(f"{list_page.PAGE_PATH}?{query}")
+                                response = self.request(f"{studio_page.PAGE_PATH}?{query}")
                                 self.assertEqual(response.status, 200)
                                 if query == list_page.COUNTS_AND_LINKS_QUERY:
                                     self.assertIn(f">{change.id}</a>".encode(), response.body)
@@ -741,7 +741,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         config = conf.path("console")
         _ = write_config_fixture(config, f"page.review.owner={owner.id}\npage.aws_machines.owner={aws.id}\n"
                                  + f"page.list.owner={other.id}\npage.review.label=Review\n"
-                                 + "page.aws_machines.label=AWS Machines\npage.list.label=List\n")
+                                 + "page.aws_machines.label=AWS Machines\npage.studio.label=Studio\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
         with patch.object(self.server, "review_cache", cache):
             review = self.request(review_page.PAGE_PATH)
@@ -761,7 +761,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 ("review", owner, f"(why {owner.name}? because {owner.name} owns the Review page!)"),
                 ("aws_machines", builds,
                  "(why builds? because aws owns the AWS Machines page and builds is its showrunner!)"),
-                ("list", other, f"(why {other.name}? because {other.name} owns the List page!)")):
+                ("list", other, f"(why {other.name}? because {other.name} owns the Studio page!)")):
             with self.subTest(page=page):
                 options = self.new_item_http(query=f"?page={page}")
                 fields = cast(dict[str, object], json.loads(options.body))
@@ -1069,6 +1069,10 @@ class ReviewLinksServerTests(unittest.TestCase):
             for index, (page, path) in enumerate(pages.items(), start=800):
                 with self.subTest(page=page):
                     response = self.request(path)
+                    if page == "list":
+                        self.assertEqual(response.status, 303)
+                        self.assertEqual(response.headers["location"], studio_page.PAGE_PATH)
+                        response = self.request(response.headers["location"])
                     self.assertEqual(response.status, 200, response.body)
                     # The Studio document keeps the List New item flow.
                     owner_page = serve.CONSOLE_DOCUMENTS.get(path, page)
@@ -1476,7 +1480,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         morty = fixture_member("producer", name="morty")
         _ = write_config_fixture(conf.path("console"), f"page.list.owner={morty.id}\nowner.default={default.id}\n")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
-        listing = self.request(list_page.PAGE_PATH)
+        listing = self.request(studio_page.PAGE_PATH)
         self.assertEqual(listing.status, 200)
         self.assertIn(b'data-page-owner="list"', listing.body)
         self.assertNotIn(b'data-list-new', listing.body)
@@ -5365,10 +5369,10 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_console_page_gzip_matches_identity(self) -> None:
         page = b"<main><h1>The List</h1></main>"
         with patch.object(list_page, "render", return_value=page):
-            identity = self.request(list_page.PAGE_PATH)
+            identity = self.request(studio_page.PAGE_PATH)
             for encoding in ("gzip, br", "gzip;q=0.5"):
                 with self.subTest(encoding=encoding):
-                    reply = self.request(list_page.PAGE_PATH, headers={"Accept-Encoding": encoding})
+                    reply = self.request(studio_page.PAGE_PATH, headers={"Accept-Encoding": encoding})
                     self.assertEqual(reply.status, 200)
                     self.assertEqual(reply.headers.get("content-encoding"), "gzip")
                     self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
@@ -5380,7 +5384,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         with patch.object(list_page, "render", return_value=page):
             for headers in (None, {"Accept-Encoding": "br, gzip;q=0"}):
                 with self.subTest(headers=headers):
-                    reply = self.request(list_page.PAGE_PATH, headers=headers)
+                    reply = self.request(studio_page.PAGE_PATH, headers=headers)
                     self.assertEqual(reply.status, 200)
                     self.assertEqual(reply.body, page)
                     self.assertNotIn("content-encoding", reply.headers)
@@ -5407,8 +5411,8 @@ class ReviewLinksServerTests(unittest.TestCase):
     def test_console_html_accepts_wildcard_unless_gzip_is_excluded(self) -> None:
         page = b"<main><h1>The List</h1></main>"
         with patch.object(list_page, "render", return_value=page):
-            reply = self.request(list_page.PAGE_PATH, headers={"Accept-Encoding": "identity;q=0, *;q=1"})
-            refused = self.request(list_page.PAGE_PATH, headers={"Accept-Encoding": "*;q=1, gzip;q=0"})
+            reply = self.request(studio_page.PAGE_PATH, headers={"Accept-Encoding": "identity;q=0, *;q=1"})
+            refused = self.request(studio_page.PAGE_PATH, headers={"Accept-Encoding": "*;q=1, gzip;q=0"})
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.headers.get("content-encoding"), "gzip")
         self.assertEqual(reply.headers.get("vary"), "Accept-Encoding")
@@ -7738,6 +7742,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
         _ = self.enterContext(patch.object(change_browser, "waiting_changes", return_value=frozenset({"a/C1"})))
         questions = self.enterContext(patch.object(review_page, "waiting_items", return_value=frozenset({"q1"})))
+        studio = self.enterContext(patch.object(list_page, "waiting_updates", return_value=frozenset({"L1"})))
         self.assertEqual(self.post("/console/news", "open=images"), (200, b'{"new": []}'))
         questions.return_value = frozenset({"q1", "q2"})
         self.assertEqual(self.post("/console/news", "open=images"), (200, b'{"new": ["review"]}'))
@@ -7745,10 +7750,21 @@ class ReviewLinksServerTests(unittest.TestCase):
         # The Rebuilds page names no open page; the marks still follow new items.
         questions.return_value = frozenset({"q1", "q2", "q3"})
         self.assertEqual(self.post("/console/news", "open="), (200, b'{"new": ["review"]}'))
+        studio_items, review_questions = {"L1"}, {"q1", "q2", "q3"}
+        for body, item, question in (("open=studio", "L2", "q4"), ("open=list", "L3", "q5")):
+            with self.subTest(body=body):
+                self.assertEqual(self.post("/console/news", "open=review"), (200, b'{"new": []}'))
+                studio_items.add(item)
+                studio.return_value = frozenset(studio_items)
+                self.assertEqual(self.post("/console/news", "open=review"), (200, b'{"new": ["studio"]}'))
+                review_questions.add(question)
+                questions.return_value = frozenset(review_questions)
+                self.assertEqual(self.post("/console/news", body), (200, b'{"new": ["review"]}'))
         for body in ("open=nowhere", "", "open=images&open=review"):
             with self.subTest(body=body):
                 self.assertEqual(self.post("/console/news", body)[0], 400)
         self.assertEqual(self.request("/console/" + console.SEEN_NAME).status, 404)
+        self.assertEqual(self.post("/console/news", "open=review"), (200, b'{"new": []}'))
 
     def test_investigation_mark_read_saves_and_reports_refused_or_failed_requests(self) -> None:
         _ = self.enterContext(patch.object(serve, "tailscale_ip", return_value="127.0.0.1"))
@@ -7774,16 +7790,27 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(investigation.load(owner, item.id).state, investigation.InvestigationState.READ)
         item = the_list.add(morty.id, "Read the List page", owner=the_list.UnassignedOwner.NATE,
                             source="nate", changes={})
-        response = self.request(list_page.PAGE_PATH)
+        response = self.request(studio_page.PAGE_PATH)
         self.assertEqual(response.status, 200)
         self.assertIn(b"Read the List page", response.body)
         _ = the_list.update(morty.id, item.id, {"title": "Read the new List page"}, source="morty")
-        self.assertIn(b"Read the new List page", self.request(list_page.PAGE_PATH).body)
+        self.assertIn(b"Read the new List page", self.request(studio_page.PAGE_PATH).body)
         self.assertNotEqual(self.post(list_page.PAGE_PATH, "id=L1")[0], 200)
         with patch.object(list_page, "render", side_effect=OSError("fixture read failed")):
-            failed = self.request(list_page.PAGE_PATH)
+            failed = self.request(studio_page.PAGE_PATH)
             self.assertEqual(failed.status, 503)
-            self.assertIn(b"The List page is not available.", failed.body)
+            self.assertIn(b"The Studio page is not available.", failed.body)
+
+    def test_retired_list_redirect_preserves_bookmark_query(self) -> None:
+        _, item = self.list_keeper_item("Open a retired bookmark")
+        query = "?show=working&q=caf%C3%A9&key=a%2Fb&key=c%2Fd"
+        response = self.request(list_page.PAGE_PATH + query)
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.headers["location"], studio_page.PAGE_PATH + query)
+        self.assertEqual(response.body, b"")
+        no_query = self.request(list_page.PAGE_PATH)
+        self.assertEqual(no_query.headers["location"], studio_page.PAGE_PATH)
+        self.assertIn(item.title.encode(), self.request(no_query.headers["location"]).body)
 
     def test_studio_serves_the_list_rows_under_picture_tabs(self) -> None:
         _, item = self.list_keeper_item("Read the Studio page")
@@ -7831,7 +7858,8 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(staff, "set_producer_top_item", side_effect=name_top_item) as write):
             _ = the_list.close(morty.id, closed.id, "Done", source="nate")
-            refusals = ((list_page.PAGE_PATH, fields(item), "", 400), (studio_page.PAGE_PATH, fields(closed), "", 400),
+            refusals = ((list_page.PAGE_PATH, {**fields(item), "token": "bad"}, "", 400),
+                        (studio_page.PAGE_PATH, fields(closed), "", 400),
                         (studio_page.PAGE_PATH, {**fields(item), "token": "bad"}, "", 400),
                         (studio_page.PAGE_PATH, fields(item), "https://elsewhere.invalid", 403))
             for path, body, origin, status in refusals:
@@ -7841,15 +7869,38 @@ class ReviewLinksServerTests(unittest.TestCase):
                   patch.object(serve, "tailscale_ip", return_value="100.64.0.9")):
                 self.assertEqual(self.post(studio_page.PAGE_PATH, urlencode(fields(item)))[0], 403)
             write.assert_not_called()
-            code, body = self.post(studio_page.PAGE_PATH, urlencode(fields(item)))
-            self.assertEqual(code, 200, body)
-            page = self.request(studio_page.PAGE_PATH).body.decode()
-        write.assert_called_once_with(morty.id, staff.TopItem(item.number))
-        response = cast(dict[str, str], json.loads(body))
-        self.assertEqual(response["state"], "saved")
-        self.assertNotIn("Make top priority", response["detail_html"])
-        self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority"', page)
-        self.assertIn(f'<b>#{item.number} {item.title}</b>', page)
+            top = '<button name="action" value="top">Make top priority</button>'
+            for path, redirected in ((studio_page.PAGE_PATH, False), (list_page.PAGE_PATH, True)):
+                with self.subTest(path=path):
+                    record[0] = staff.StaffSnapshot((morty,))
+                    write.reset_mock()
+                    refreshed = self.request(path)
+                    if redirected:
+                        self.assertEqual(refreshed.status, 303)
+                        refreshed = self.request(refreshed.headers["location"])
+                    self.assertEqual(refreshed.status, 200)
+                    panel = re.search(r'<form method="post" data-feedback-form\b[^>]*>(.*?)</form>',
+                                      refreshed.body.decode(), re.S)
+                    assert panel is not None
+                    self.assertIn(top, panel[1])
+                    form = dict(re.findall(
+                        r'<input type="hidden" name="(keeper|id|request|token)" value="([^"]+)">', panel[1]))
+                    query = urlencode({"item-state": item.id, "keeper": morty.id})
+                    state = self.request(f"{path}?{query}")
+                    self.assertEqual(state.status, 200)
+                    self.assertIn(top, cast(dict[str, str], json.loads(state.body))["detail_html"])
+                    code, body = self.post(path, urlencode(form | {"action": "top", "words": "", "until": ""}))
+                    self.assertEqual(code, 200, body)
+                    write.assert_called_once_with(morty.id, staff.TopItem(item.number))
+                    response = cast(dict[str, str], json.loads(body))
+                    self.assertEqual(response["state"], "saved")
+                    self.assertNotIn("Make top priority", response["detail_html"])
+                    state = self.request(f"{path}?{query}")
+                    self.assertEqual(state.status, 200)
+                    self.assertNotIn(top, cast(dict[str, str], json.loads(state.body))["detail_html"])
+                    page = self.request(studio_page.PAGE_PATH).body.decode()
+                    self.assertIn('<span class="list-top-mark" role="img" aria-label="Top priority"', page)
+                    self.assertIn(f'<b>#{item.number} {item.title}</b>', page)
 
     def test_studio_pictures_are_guarded_named_files_under_the_avatar_root(self) -> None:
         avatars = self.root.parent.resolve() / "studio-avatars"
@@ -7895,13 +7946,13 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(list_page, "counts_strip", return_value=footer) as counts,
               patch.object(list_page, "read_linked_reviews", side_effect=AssertionError("The List read all reviews."))):
             encoding = {"Accept-Encoding": "gzip, br"}
-            page = self.request(list_page.PAGE_PATH, headers=encoding)
+            page = self.request(studio_page.PAGE_PATH, headers=encoding)
             self.assertEqual(page.status, 200)
             self.assertEqual(page.headers.get("content-encoding"), "gzip")
             markup = gzip.decompress(page.body)
             self.assertIn(b"Read the published review", markup)
             self.assertIn(b"1 change for you", markup)
-            self.assertIn(b'data-list-counts-url="/console/list.html?counts=1"', markup)
+            self.assertIn(b'data-list-counts-url="/console/studio.html?counts=1"', markup)
             self.assertNotIn(footer.encode(), markup)
             counts.assert_not_called()
             with patch.object(list_page, "records", side_effect=AssertionError("The counts request read the List.")):
@@ -7926,7 +7977,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         return keeper
 
     def list_filter_markup(self, query: str = "", *,
-                           path: str = list_page.PAGE_PATH) -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
+                           path: str = studio_page.PAGE_PATH) -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
         with patch.object(record_table, "count_filter_row", wraps=record_table.count_filter_row) as count:
             response = self.request(path + query)
         self.assertEqual(response.status, 200)
@@ -7941,9 +7992,14 @@ class ReviewLinksServerTests(unittest.TestCase):
 
     def test_list_applies_address_filters_before_javascript_runs(self) -> None:
         _ = self.add_list_filter_items()
+        query = "?show=parked&producer=pa&unread=1&q=parked"
         for path in (list_page.PAGE_PATH, studio_page.PAGE_PATH):
             with self.subTest(path=path):
-                visible, chips = self.list_filter_markup("?show=parked&producer=pa&unread=1&q=parked", path=path)
+                if path == list_page.PAGE_PATH:
+                    redirect = self.request(path + query)
+                    self.assertEqual(redirect.status, 303)
+                    self.assertEqual(redirect.headers["location"], studio_page.PAGE_PATH + query)
+                visible, chips = self.list_filter_markup(query)
                 self.assertEqual(visible, ["1"])
                 self.assertEqual(chips["show", "all"], ("false", "1"))
                 self.assertEqual(chips["show", "parked"], ("true", "1"))
@@ -8010,7 +8066,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             with (patch.object(self.server, "root", case.root), patch.object(self.server, "review_cache", cache),
                   patch.object(self.server, "delivery_status", case.status), patch.object(list_page, "deliver"),
                   patch.object(list_page, "read_linked_reviews", wraps=list_page.read_linked_reviews) as read):
-                page = self.request(list_page.PAGE_PATH)
+                page = self.request(studio_page.PAGE_PATH)
                 self.assertEqual(page.status, 200)
                 self.assertIn(b"Checking linked reviews", page.body)
                 self.assertNotIn(b"Reviews done", page.body)
@@ -8070,10 +8126,10 @@ class ReviewLinksServerTests(unittest.TestCase):
                             source="nate", changes={"producer": producer.id})
         _ = the_list.link(keeper, item.id, ("page-owner/C1", "page-owner/C2"), source="nate")
         with patch.object(self.server, "root", case.root):
-            self.assertEqual(self.request(list_page.PAGE_PATH).status, 200)
+            self.assertEqual(self.request(studio_page.PAGE_PATH).status, 200)
             change_routing.delivery_path(case.root, case.fixture.review_list, "C1").mkdir()
             with patch.object(list_page, "read_linked_reviews", wraps=list_page.read_linked_reviews) as read:
-                response = self.request(list_page.PAGE_PATH)
+                response = self.request(studio_page.PAGE_PATH)
                 read.assert_not_called()
                 self.assertEqual(response.status, 200)
                 self.assertIn(b"Read the linked changes", response.body)
@@ -9034,7 +9090,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                     try:
                         self.assertTrue(claiming.wait(TEST_HANG_GUARD_SECS))
                         with patch.object(change_page, "_question_lock_state") as probe:
-                            reply = self.request(list_page.PAGE_PATH)
+                            reply = self.request(studio_page.PAGE_PATH)
                             self.assertEqual(reply.status, 200)
                             self.assertIn(words.encode(), reply.body)
                             probe.assert_not_called()
@@ -9051,7 +9107,7 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertIs(reply_delivery["delivery_pending"], True)
                 self.assertTrue(started.wait(TEST_HANG_GUARD_SECS))
                 self.assertFalse(finished.is_set())
-                path = list_page.PAGE_PATH + "?" + urlencode({"delivery": reply_delivery["delivery"]})
+                path = studio_page.PAGE_PATH + "?" + urlencode({"delivery": reply_delivery["delivery"]})
                 response, headers, _ = self.head(path)
                 self.assertEqual(response, 200)
                 self.assertEqual(headers.get("x-item-delivery-pending"), "true")
@@ -9358,7 +9414,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS), "List question delivery did not finish.")
             saved = the_list.load(morty.id, item.id)
             self.assertEqual([(question.question_id, question.words) for question in saved.questions], [("Q1", words)])
-            opened = self.request(list_page.PAGE_PATH)
+            opened = self.request(studio_page.PAGE_PATH)
             self.assertEqual(opened.status, 200)
             markup = re.sub(r'<script\b[^>]*>.*?</script>', '', opened.body.decode(), flags=re.DOTALL)
             self.assertRegex(markup, r'<tbody data-list-item[^>]*data-waiting-for-answer="false"[^>]*">')
@@ -11014,7 +11070,7 @@ class ServerStartupTests(unittest.TestCase):
                     response = connection.getresponse()
                     self.assertEqual(response.status, 404)
                     _ = response.read()
-                    connection.request("GET", list_page.PAGE_PATH)
+                    connection.request("GET", studio_page.PAGE_PATH)
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     page = response.read()
@@ -11041,25 +11097,25 @@ class ServerStartupTests(unittest.TestCase):
                     fields = {"keeper": keeper, "id": item.id, "request": request, "words": "", "until": "",
                               "token": list_page.request_token(store, keeper, item.id, request)}
                     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-                    connection.request("POST", list_page.PAGE_PATH,
+                    connection.request("POST", studio_page.PAGE_PATH,
                                        urlencode(fields | {"action": "tell", "words": "Please check this item."}), headers)
                     response = connection.getresponse()
                     self.assertEqual(response.status, 400)
                     self.assertIn(b"Only Remove is available in this demo.", response.read())
-                    connection.request("POST", list_page.PAGE_PATH, urlencode(fields | {"action": "remove"}), headers)
+                    connection.request("POST", studio_page.PAGE_PATH, urlencode(fields | {"action": "remove"}), headers)
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     self.assertIn(b'"item_state": "Closed"', response.read())
                     with scratch.copy_record_lock(store):
                         console_folder = store / change_page.CONSOLE_FOLDER
                         shutil.rmtree(console_folder)
-                        connection.request("GET", list_page.PAGE_PATH)
+                        connection.request("GET", studio_page.PAGE_PATH)
                         response = connection.getresponse()
                         _ = response.read()
                         with self.subTest("a refresh during removal cannot recreate the console folder"):
                             self.assertFalse(console_folder.exists())
                             self.assertEqual(response.status, 503)
-                        connection.request("POST", list_page.PAGE_PATH,
+                        connection.request("POST", studio_page.PAGE_PATH,
                                            urlencode(fields | {"action": "remove"}), headers)
                         response = connection.getresponse()
                         _ = response.read()
