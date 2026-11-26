@@ -24,6 +24,7 @@ from scripts.accounts import accounts
 from scripts.lib import conf
 from scripts.lib.file_lock import exclusive
 from scripts.lib.user_zone import user_zone
+from scripts.production import list_exchange
 from scripts.production import change_review, delivery_state, footer_counts, record_store, repeat_rule, session_staff, staff, the_list
 from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
@@ -264,15 +265,18 @@ def top_priority_mark(shown: TopPriority, members: staff.StaffSnapshot, item: th
     return TopPriorityMark.TOP_ITEM if producer.top_item == staff.TopItem(item.number) else TopPriorityMark.MAKE_TOP
 
 
-def records(*, include_closed: bool = False) -> list[ListRecord]:
+def records(*, include_closed: bool = False, sources: list[Path] | None = None) -> list[ListRecord]:
     """Read the list folders even when a producer has no current staff row."""
+    root = record_store.state_root()
+    if sources is not None:
+        sources.append(root)
     try:
-        owners = sorted(record_store.state_root().iterdir())
+        owners = sorted(root.iterdir())
     except FileNotFoundError:
         return []
     found = [ListRecord(staff.StaffId(owner.name), item) for owner in owners
              if owner.is_dir() and not owner.is_symlink()
-             for item in the_list.records(staff.StaffId(owner.name), include_closed=include_closed)]
+             for item in the_list.records(staff.StaffId(owner.name), include_closed=include_closed, sources=sources)]
     return sorted(found, key=lambda entry: the_list.order(entry.item))
 
 
@@ -755,8 +759,8 @@ def feedback_form(entry: ListRecord, secret: str, *, members: staff.StaffSnapsho
             + '<template data-schedule-template>' + schedule_editor + '</template></form>')
 
 
-def review_card_link(key: str, label: str) -> str:
-    url = html.escape(review_page.card_url(key), quote=True)
+def review_card_link(key: str, label: str, *, studio_question: bool = False) -> str:
+    url = html.escape(review_page.card_url(key, studio_question=studio_question), quote=True)
     return f'<a href="{url}" data-list-review-card="" aria-haspopup="dialog">{html.escape(label)}</a>'
 
 
@@ -841,6 +845,28 @@ def panel_questions(item: the_list.ListItem, today: datetime, unread_answers: fr
             body += ('<h3>Answer <span class="question-unread">Unread</span></h3>'
                      + question_time_html(answer.answered_at, today) + f'<p>{item_text_html(answer.text)}</p>')
         sections.append(body + '</section>')
+    return ''.join(sections)
+
+
+def filed_exchange_sections(item: the_list.ListItem, today: datetime, names: staff_names.StaffNames) -> str:
+    sections: list[str] = []
+    for exchange in item.filed_exchanges:
+        if exchange.source is list_exchange.Source.LIST:
+            continue
+        asker = names.html(exchange.asker, owner_name(names.members, staff.StaffId(exchange.asker)))
+        asked = time_html(exchange.asked_at, today) if isinstance(exchange.asked_at, datetime) else ""
+        body = f'<h3>Question from {asker}</h3>{asked}<p>{item_text_html(exchange.question)}</p>'
+        answer = exchange.answer
+        if (answer is list_exchange.QuestionWithoutAnswer.OPEN
+                and exchange.direction is list_exchange.Direction.QUESTION_TO_NATE):
+            body += '<p>' + review_card_link(exchange.source_key, "Answer question", studio_question=True) + '</p>'
+        if isinstance(answer, list_exchange.ExchangeAnswer):
+            actor = exchange.answerer
+            answerer = html.escape(actor.name) if isinstance(actor, list_exchange.RecordedAnswerer) else names.html(actor, owner_name(names.members, staff.StaffId(actor)))
+            answered = time_html(answer.time, today) if isinstance(answer.time, datetime) else ""
+            unread = ' <span class="question-unread">Unread</span>' if answer.read is list_exchange.AnswerRead.UNREAD else ""
+            body += f'<h3>Answer from {answerer}{unread}</h3>{answered}<p>{item_text_html(answer.text)}</p>'
+        sections.append('<section class="page-question">' + body + '</section>')
     return ''.join(sections)
 
 
@@ -1086,7 +1112,7 @@ def detail_panel(entry: ListRecord, sections: str, today: datetime, names: staff
     report = review_page.list_report_details(item.report) if isinstance(item.report, the_list.ListReport) else ''
     links = item_links_html(entry, log, progress.next_step)
     return ('<div class="list-panel"><div>' + report + asks + '<div class="list-item-fields">' + fields
-            + '</div>' + links + '<div data-list-item-content>' + sections + '</div>'
+            + '</div>' + links + filed_exchange_sections(item, today, names) + '<div data-list-item-content>' + sections + '</div>'
             + '</div>' + record_table.log_panel(log_id, log.markup) + '</div>')
 
 

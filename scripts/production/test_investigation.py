@@ -48,6 +48,7 @@ class InvestigationTests(unittest.TestCase):
         _ = (configuration / "console.conf").write_text(f"page.list.owner={LIST_KEEPER.id}\n")
         _ = (configuration / "producer_map.conf").write_text("")
         _ = write_config_fixture(configuration / "notify.conf")
+        _ = write_config_fixture(configuration / "user_zone.conf")
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         _ = self.enterContext(patch.object(review, "reviewer_environment", side_effect=OSError("Fixture reviewer.")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {

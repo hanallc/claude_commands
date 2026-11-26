@@ -27,6 +27,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from functools import partial
+from importlib import import_module
 from pathlib import Path
 from typing import IO, Literal, NotRequired, TypedDict, cast, overload
 from urllib.parse import parse_qs, urlsplit
@@ -3501,6 +3502,13 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
         raise question_record.AnswerRefused('the Review item does not exist')
     source = item.source
     who = review_items.name(item.owner,staff.snapshot())
+
+    def file_exchange() -> None:
+        with review_items.after_store_write(item.key):
+            members = staff.snapshot()
+            file_saved_review = cast(Callable[[review_items.ReviewItem, staff.StaffSnapshot], None],
+                                     import_module("scripts.review_links.answer_sources").file_saved_review)
+            file_saved_review(review_items.read_current(status.root, item, members), members)
     if isinstance(source, (review_items.QuestionSource, review_items.InvestigationSource,
                            review_items.ProposalSource, review_items.EfficiencySource)):
         if isinstance(source, (review_items.QuestionSource, review_items.ProposalSource)):
@@ -3545,7 +3553,9 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
             if isinstance(question, OpenQuestion):
                 status.write_slots(page, row, replace(slots, question=AnsweredQuestion(question.question_id,
                                                                                        question.text, text)))
-            return changed
+        if isinstance(source, (review_items.ProposalSource, review_items.EfficiencySource)):
+            file_exchange()
+        return changed
     if isinstance(source,review_items.ChangeSource):
         assert isinstance(source.assignment.production,Path)
         page = ReviewPage(source.path,source.assignment.production,(source.row['#'],),'')
@@ -3554,6 +3564,7 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
             return False
         change_review.record_review_log(source.path, source.row['#'], 'Answer: ' + words, page.production, who,
                                         feedback_request_id=answer_log_id(question_id), event_time=answered_at)
+        file_exchange()
         return True
     raise question_record.AnswerRefused('this item cannot receive an answer')
 

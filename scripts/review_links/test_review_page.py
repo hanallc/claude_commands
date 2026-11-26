@@ -3717,6 +3717,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
                              review_page.waiting_items(console.NewsRequest(self.root))))
 
     def test_validating_question_keeps_the_handoff_and_returns_the_answer(self) -> None:
+        _ = self.enterContext(patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")))
         key = 'page-owner/C1'
         check, _ = review_page.submit(self.root, self.body(key, 'validate', 'Check the queued step.'), self.status)
         assert isinstance(check, change_page.MessageDelivery)
@@ -6354,6 +6355,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
                 self.assertEqual(review_later.times(), times_before)
 
     def test_review_projects_legacy_and_positioned_answers(self) -> None:
+        _ = self.enterContext(patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")))
         now = datetime.now(user_zone())
         before = now - timedelta(hours=2)
         read_at = now - timedelta(hours=1)
@@ -6658,6 +6660,7 @@ window.fetch=async()=>{reads++;throw new Error('An index filter requested the se
             self.assertEqual(reads.read_text().splitlines().count('user_zone'), 1)
 
     def test_an_answer_returns_a_later_investigation_until_mark_read(self) -> None:
+        _ = self.enterContext(patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")))
         for legacy_answer in (False, True):
             with self.subTest(legacy_answer=legacy_answer):
                 self.check_later_investigation_answer(legacy_answer)

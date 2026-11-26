@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
@@ -2903,9 +2904,14 @@ def answer(key: str, words: str, reply_token: str, *, members: staff.StaffSnapsh
         with scoped_submission(scoped, members=members) as current:
             if (current.destination.path, current.destination.owner) != (path, owner):
                 raise SubmissionError("The selected item changed.")
-            return save()
+            changed = save()
     except (investigation.InvestigationError, proposal_issue.Refusal, update_registration.RegistrationFailure) as error:
         raise SubmissionError(str(error)) from error
+    record = members if members is not None else staff.snapshot()
+    file_exchange = cast(Callable[[ScopedSubmissionKey, staff.StaffSnapshot], None],
+                         import_module("scripts.review_links.answer_sources").file_saved_submission)
+    file_exchange(scoped, record)
+    return changed
 
 
 def scrub_reply_tokens(members: staff.StaffSnapshot) -> int:

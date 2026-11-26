@@ -538,7 +538,15 @@ def prepare_answer(owner: staff.StaffId, identity: str, text: str, *,
                    question_id: str = '') -> Callable[[], Investigation]:
     """Review the answer and return a function that checks and saves it."""
     save = _prepare_answer(_store(owner), identity, text, question_id)
-    return lambda: save()[0]
+
+    def save_and_file() -> Investigation:
+        record, _ = save()
+        file_exchange = cast(Callable[[Investigation], None],
+                             import_module("scripts.review_links.answer_sources").file_saved_investigation)
+        file_exchange(record)
+        return record
+
+    return save_and_file
 
 
 @dataclass(frozen=True)

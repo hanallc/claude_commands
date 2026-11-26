@@ -2359,6 +2359,20 @@ Follow-ups share the source key of their original Question.
 The reader preserves missing times and reports answers whose read state is unknown.
 The command reads the existing stores and reserves no List numbers.
 
+Run `./scripts/lib/py -m scripts.review_links.answer_sources migrate` to preview List filing by source.
+Add `--apply` to file the exchanges and print their List numbers.
+Each source question has one List item.
+Follow-ups use that item and keep their own read state.
+An existing List item keeps its state and links.
+Closed staff questions without a saved answer stay outside the migration.
+
+New questions and answers use the same writer after the source saves.
+The writer saves the source key and exchange ID on the List item.
+A retry uses the recorded destination.
+Review hands off the question or answer after the List item contains the exchange.
+Review keeps a separate decision available.
+Old links to a filed Review answer open its Studio item.
+
 ### Images page
 
 `/console/images.html` shows registered images with their instructions, oldest first.
