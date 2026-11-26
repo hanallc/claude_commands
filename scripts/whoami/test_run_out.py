@@ -14,6 +14,7 @@ from unittest.mock import patch
 from scripts.lib import conf
 from scripts.whoami.run_out import Reading, read_readings
 from scripts.whoami import run_out
+from scripts.whoami.note_file import NoResetKnown, NumberedAccountLabel
 
 START = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 
@@ -205,6 +206,78 @@ class RunOutTests(unittest.TestCase):
         self.assertEqual(run_out.hourly_usage_rate(short, now, account_config=settings), run_out.NoUsageRate())
         stale_at = readings[-1].at + run_out.MAX_GAP + timedelta(microseconds=1)
         self.assertEqual(run_out.hourly_usage_rate(readings, stale_at, account_config=settings), run_out.NoUsageRate())
+
+
+    def test_page_rate_uses_the_whole_window_at_the_lookback_boundary(self) -> None:
+        lookback = timedelta(minutes=40)
+        readings = climb([10, 14, 18, 22, 26])
+        now = START + lookback
+        move = run_out.RoleArrival("units", NumberedAccountLabel("claude", 1),
+                                   NumberedAccountLabel("claude", 2), START)
+        rate = run_out.page_usage_rate("claude2", readings[-1], now, lookback=lookback,
+                                      histories={"claude2": readings}, current_reset=NoResetKnown(),
+                                      source_resets={}, arrivals=(move,))
+        assert isinstance(rate, run_out.WholeWindowRate)
+        self.assertEqual(rate.points_per_hour, 24)
+        self.assertEqual((rate.usage.first_reading_at, rate.usage.last_reading_at), (START, now))
+
+    def test_page_rate_sums_only_roles_with_a_same_tool_rate(self) -> None:
+        lookback = timedelta(minutes=40)
+        now = START + timedelta(minutes=4)
+        destination = NumberedAccountLabel("claude", 2)
+        moves = (run_out.RoleArrival("units", NumberedAccountLabel("claude", 1), destination, START),
+                 run_out.RoleArrival("showrunners", NumberedAccountLabel("claude", 3), destination, START),
+                 run_out.RoleArrival("producers", NumberedAccountLabel("claude", 4), destination, START),
+                 run_out.RoleArrival("workers", NumberedAccountLabel("codex", 1), destination, START))
+        histories = {"claude1": climb([10, 12, 14, 16, 18], start=START - lookback),
+                     "claude3": climb([10, 11, 12, 13, 14], start=START - lookback),
+                     "claude4": climb([10, 12], start=START - lookback),
+                     "codex1": climb([10, 20, 30, 40, 50], start=START - lookback)}
+        rate = run_out.page_usage_rate("claude2", Reading(now, 0), now, lookback=lookback,
+                                      histories=histories, current_reset=NoResetKnown(), source_resets={}, arrivals=moves)
+        assert isinstance(rate, run_out.LastKnownRate)
+        self.assertEqual(rate.points_per_hour, 18)
+        self.assertEqual([source.role for source in rate.sources], ["units", "showrunners"])
+
+    def test_page_rate_mixes_the_first_pair_in_proportion_to_its_coverage(self) -> None:
+        lookback = timedelta(minutes=40)
+        source = NumberedAccountLabel("claude", 1)
+        move = run_out.RoleArrival("units", source, NumberedAccountLabel("claude", 2), START)
+        source_history = climb([10, 12, 14, 16, 18], start=START - lookback)
+        before = run_out.page_usage_rate("claude2", Reading(START, 0), START, lookback=lookback,
+                                        histories={"claude1": source_history}, current_reset=NoResetKnown(),
+                                        source_resets={}, arrivals=(move,))
+        assert isinstance(before, run_out.LastKnownRate)
+        self.assertEqual(before.points_per_hour, 12)
+
+        for elapsed in (timedelta(seconds=1), timedelta(minutes=10), lookback - timedelta(seconds=1)):
+            with self.subTest(elapsed=elapsed):
+                now = START + elapsed
+                destination_history = [reading for reading in climb([0, 4, 8, 12], start=START)
+                                       if reading.at < now]
+                current = Reading(now, 24 * elapsed.total_seconds() / 3600)
+                rate = run_out.page_usage_rate("claude2", current, now, lookback=lookback,
+                                              histories={"claude1": source_history, "claude2": destination_history},
+                                              current_reset=NoResetKnown(), source_resets={}, arrivals=(move,))
+                assert isinstance(rate, run_out.PartialWindowRate)
+                self.assertEqual(rate.usage.duration, elapsed)
+                self.assertAlmostEqual(rate.points_per_hour, 12 + 12 * (elapsed / lookback))
+
+    def test_page_partial_rate_skips_invalid_spans_and_uses_the_latest_boundary(self) -> None:
+        lookback = timedelta(minutes=53)
+        now = START + timedelta(minutes=44)
+        reset = START + timedelta(days=7)
+        move = run_out.RoleArrival("units", run_out.UnknownMoveSource(), NumberedAccountLabel("claude", 2),
+                                   START - timedelta(minutes=3))
+        target_history = [Reading(START + timedelta(minutes=minute), used) for minute, used in
+                          ((-2, 96), (0, 98), (5, 100), (10, 100), (15, 10), (39, 12))]
+        rate = run_out.page_usage_rate("claude2", Reading(now, 14), now, lookback=lookback,
+                                      histories={"claude2": target_history}, current_reset=reset, source_resets={},
+                                      arrivals=(move,))
+        assert isinstance(rate, run_out.PartialWindowRate)
+        self.assertIsInstance(rate.prior, run_out.NoUsageRate)
+        self.assertEqual((rate.since, rate.usage.duration), (START, timedelta(minutes=10)))
+        self.assertEqual(rate.points_per_hour, 24)
 
 
 if __name__ == "__main__":

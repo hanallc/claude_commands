@@ -81,6 +81,13 @@ The text table puts counts in the Role cell, such as `units ✓ 21 (busy 5, idle
 A role appears on each account where its members run.
 `✓` marks its selected account, including when it has zero members.
 An account with one role or no role keeps its existing row.
+
+Hover over **used / hour** to see where the rate comes from.
+The tooltip shows **Whole last hour**, **Partial data**, or **Last known good**.
+After a role changes accounts, the page can use the last known rate from the previous account.
+As readings arrive, the page gives more weight to the measured rate.
+The **empty at** cell uses the displayed rate and a current weekly balance.
+
 In a terminal:
 
 ```sh
@@ -692,7 +699,7 @@ The table shows `units` and `showrunners` on separate rows for that account.
 `--hold-minutes N` accepts a finite, nonnegative duration.
 An omitted duration or zero moves the group immediately.
 `--hold half-point` estimates the time to use another 0.5 percentage point on the selected account.
-The hold uses the same hourly rate as the Accounts page and the Claude expiry push.
+The hold uses the whole-window rate. The Claude expiry push also uses this rate.
 The rate includes usage from all groups on the account.
 The key `rate.lookback_minutes` in `config/accounts.conf` sets the window to 60 minutes by default.
 The window ends at the current time.

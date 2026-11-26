@@ -28,7 +28,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from scripts.review_links.browser_test_support import assert_status_states, firefox_probe_results, newer_script_reload_results
-from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity, role_map
+from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity, role_map, worker_names
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.agents import remote, shutdown_record, stop_resume
 from scripts.agents.test_support import write_machine_config
@@ -1958,14 +1958,340 @@ realFetch('/probe',{method:'POST',body:JSON.stringify(failures)});
                 self.assertIn(f">{row.label}</span>", cells[1])
                 self.assertEqual(re.sub(r"<[^>]+>", "", cells[5]), rate)
                 self.assertEqual(re.sub(r"<[^>]+>", "", cells[6]), empty)
+                if row.label == "claude1":
+                    self.assertIn('title="Whole last hour: readings from Sun 11-15 09:10 EST to Sun 11-15 10:00 EST."', line)
                 if row.label == "claude2":
                     self.assertIn('title="Quota lasts until the weekly reset."', cells[6])
+                if row.label == "codex2":
+                    self.assertIn('title="The weekly reset time is unavailable."', cells[6])
                 if rate == "—":
                     for cell in cells[5:7]:
                         self.assertIn('title="No usage rate is available."', cell)
         order = rendered_sort_orders(markup, "accounts")
         self.assertEqual(order["used / hour"], [5, 0, 1, 4, 2, 3])
         self.assertEqual(order["empty at"], [4, 0, 1, 2, 3, 5])
+
+    def _write_rate_role_selections(self, *selections: tuple[str, str, datetime],
+                                    cause: moves.MoveCause = "by hand") -> None:
+        path = accounts.roles_history_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("".join(json.dumps({"group": group, "label": label, "at": at.isoformat(), "cause": cause})
+                                    + "\n" for group, label, at in selections), encoding="utf-8")
+
+    def _rate_after_units_move(self, *, partial: bool, read_at: datetime = AT,
+                               history: tuple[moves.MoveProgress, ...] = ()) -> str:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        moved_at = AT - timedelta(minutes=10)
+        source, destination = "claude1", "claude2"
+        previous_at = moved_at - timedelta(minutes=lookback)
+        self._write_rate_role_selections(("units", source, previous_at), ("units", destination, moved_at))
+        readings = {source: [run_out.Reading(moved_at - timedelta(minutes=age), 20 - age / 5)
+                             for age in range(lookback, -1, -10)]}
+        if partial:
+            readings[destination] = [run_out.Reading(moved_at, 0)]
+        member_count = sum(len(move.members) for move in history)
+        row = replace(status_row(destination), weekly_left_percent=96 if partial else 100, selected_roles=("units",),
+                      login="", read_at=read_at, role_counts=(accounts.RoleSessionCounts(member_count, 0, 0, 0),))
+        reading = accounts.StatusReading((row,), (), (), ZoneInfo("America/New_York"), AT)
+        with (patch.object(run_out, "read_readings", return_value=readings),
+              patch.object(accounts, "read_status", return_value=reading),
+              patch.object(moves, "read_move_progress", return_value=history) as read_moves):
+            markup = accounts_page.page().decode()
+        read_moves.assert_called_once_with()
+        return markup.split('data-account-row="claude2"', 1)[1].split("</tr>", 1)[0]
+
+    def test_partial_page_rate_tooltip_and_empty_at_use_the_mixed_rate(self) -> None:
+        line = self._rate_after_units_move(partial=True)
+        self.assertIn('title="Partial data: 10 min of readings since Sun 11-15 09:50 EST, '
+                      + 'mixed with last known good 12.0%/hour from units on claude1.">15.0%</td>', line)
+        self.assertIn(">Sun 11-15 16:24 EST</time>", line)
+
+    def test_rate_counts_the_final_pair_when_weekly_quota_reaches_zero(self) -> None:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        moved_at = AT - timedelta(minutes=10)
+        exhausted_at = moved_at + timedelta(minutes=5)
+        self._write_rate_role_selections(("units", "claude2", moved_at))
+        histories = {"claude2": [run_out.Reading(moved_at, 98), run_out.Reading(exhausted_at, 100)]}
+        with patch.object(run_out, "read_readings", return_value=histories):
+            for checked_at in (exhausted_at, AT):
+                with self.subTest(checked_at=checked_at):
+                    row = replace(status_row("claude2"), selected_roles=("units",), weekly_left_percent=0,
+                                  read_at=checked_at)
+                    reading = accounts.StatusReading((row,), (), (), timezone.utc, checked_at)
+                    with patch.object(accounts, "read_status", return_value=reading):
+                        markup = accounts_page.page().decode()
+                    line = markup.split('data-account-row="claude2"', 1)[1].split("</tr>", 1)[0]
+                    self.assertIn('title="Partial data: 5 min of readings since Sun 11-15 14:50 UTC.">24.0%</td>', line)
+                    self.assertIn('title="The weekly quota is used up."><span class="next-muted">—</span>',
+                                  line)
+                    self.assertNotIn("<time", line)
+
+    def test_last_known_page_rate_tooltip_and_empty_at_use_the_prior_rate(self) -> None:
+        started = AT - timedelta(minutes=10)
+        member = moves.MoveMember("fixture-unit", "fixture-unit")
+        progress = moves.MoveMemberProgress(member, moves.MemberMoving(started, "claude2"))
+        move = moves.MoveProgress("a" * 32, "units", "claude2", "", moves.MoveInitiator.HAND, started, (progress,))
+        line = self._rate_after_units_move(partial=False, history=(move,))
+        self.assertIn('title="Last known good: units used 12.0%/hour on claude1 until Sun 11-15 09:50 EST.">12.0%</td>',
+                      line)
+        self.assertIn(">Sun 11-15 18:20 EST</time>", line)
+
+    def test_first_automatic_move_can_name_its_source_in_the_rate_tooltip(self) -> None:
+        lookback = 43
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        moved_at = AT - timedelta(minutes=10)
+        member = moves.MoveMember("fixture-unit", "fixture-unit")
+        progress = moves.MoveMemberProgress(member, moves.MemberMoved(AT, AT - moved_at, target="claude2"))
+        move = moves.MoveProgress("a" * 32, "units", "claude2", "claude1 at 2%", moves.MoveInitiator.AUTOMATIC,
+                                  moved_at, (progress,), "auto")
+        self._write_rate_role_selections(("units", "claude3", moved_at - timedelta(days=1)),
+                                         ("units", "claude2", moved_at), cause="auto")
+        row = replace(status_row("claude2"), selected_roles=("units",), weekly_left_percent=100)
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+        ages = (*range(0, lookback, 10), lookback)
+        history = [run_out.Reading(moved_at - timedelta(minutes=age), 98 - age / 5) for age in reversed(ages)]
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(moves, "read_move_progress", return_value=(move,)),
+              patch.object(run_out, "read_readings", return_value={"claude1": history})):
+            markup = accounts_page.page().decode()
+        self.assertIn('title="Last known good: units used 12.0%/hour on claude1 until Sun 11-15 14:50 UTC."', markup)
+        self.assertIn(">Sun 11-15 23:20 UTC</time>", markup)
+
+    def test_console_refusal_does_not_hide_the_automatic_move_source(self) -> None:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        selected_at = AT - timedelta(minutes=10)
+        self._write_rate_role_selections(("units", "claude3", selected_at - timedelta(days=1)),
+                                         ("units", "claude2", selected_at), cause="auto")
+        refused_at = selected_at + timedelta(seconds=1)
+        refused = moves.MoveMemberProgress(moves.MoveMember("units", "units"),
+            moves.MemberMoveFailed(refused_at, timedelta(), "another operation holds this row", "claude2"),
+            moves.MoveMemberKind.REQUEST)
+        console = moves.MoveProgress("a" * 32, "units", "claude2", "", moves.MoveInitiator.CONSOLE,
+                                     refused_at, (refused,))
+        started = selected_at + timedelta(seconds=2)
+        moved = moves.MoveMemberProgress(moves.MoveMember("fixture-unit", "fixture-unit"),
+                                        moves.MemberMoved(AT, AT - started, target="claude2"))
+        automatic = moves.MoveProgress("b" * 32, "units", "claude2", "claude1 at 2%", moves.MoveInitiator.AUTOMATIC,
+                                       started, (moved,), "auto")
+        histories = {"claude1": [run_out.Reading(selected_at - timedelta(minutes=age), 98 - age / 5)
+                                 for age in range(lookback, -1, -10)]}
+        row = replace(status_row("claude2"), selected_roles=("units",), weekly_left_percent=100)
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(moves, "read_move_progress", return_value=(automatic, console)),
+              patch.object(run_out, "read_readings", return_value=histories)):
+            markup = accounts_page.page().decode()
+        line = markup.split('data-account-row="claude2"', 1)[1].split("</tr>", 1)[0]
+        self.assertIn('title="Last known good: units used 12.0%/hour on claude1 until Sun 11-15 14:50 UTC.">12.0%</td>',
+                      line)
+
+    def test_first_manual_move_uses_the_source_rate_from_role_history(self) -> None:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        moved_at = AT - timedelta(minutes=10)
+        member = moves.MoveMember("fixture-unit", "fixture-unit")
+        progress = moves.MoveMemberProgress(member, moves.MemberMoved(AT, AT - moved_at, target="claude2"))
+        move = moves.MoveProgress("a" * 32, "units", "claude2", "units moved by hand",
+                                  moves.MoveInitiator.HAND, moved_at + timedelta(seconds=1), (progress,))
+        path = accounts.roles_history_file()
+        self._write_rate_role_selections(
+            ("units", "claude1", moved_at - timedelta(days=1)),
+            ("showrunners", "claude3", moved_at - timedelta(minutes=2)),
+            ("units", "claude2", moved_at),
+            ("units", "claude4", AT + timedelta(minutes=1)),
+        )
+        readings = [run_out.Reading(moved_at - timedelta(minutes=age), 20 - age / 5)
+                    for age in range(lookback, -1, -10)]
+        row = replace(status_row("claude2"), selected_roles=("units",), weekly_left_percent=100)
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(moves, "read_move_progress", return_value=(move,)),
+              patch.object(run_out, "read_readings", return_value={"claude1": readings}),
+              patch.object(worker_names, "role_history_lines", wraps=worker_names.role_history_lines) as read_history):
+            markup = accounts_page.page().decode()
+        read_history.assert_called_once_with(path)
+        self.assertIn('title="Last known good: units used 12.0%/hour on claude1 until Sun 11-15 14:50 UTC.">12.0%</td>',
+                      markup)
+        self.assertIn(">Sun 11-15 23:20 UTC</time>", markup)
+
+    def test_role_move_with_no_members_carries_the_source_rate(self) -> None:
+        line = self._rate_after_units_move(partial=False)
+        self.assertIn('title="Last known good: units used 12.0%/hour on claude1 until Sun 11-15 09:50 EST.">12.0%</td>',
+                      line)
+
+    def test_later_member_move_does_not_restart_the_rate_lookback(self) -> None:
+        started = AT - timedelta(minutes=3)
+        member = moves.MoveMember("fixture-unit", "fixture-unit")
+        progress = moves.MoveMemberProgress(member, moves.MemberMoved(AT, AT - started, target="claude2"))
+        move = moves.MoveProgress("a" * 32, "units", "claude2", "", moves.MoveInitiator.HAND, started, (progress,))
+        line = self._rate_after_units_move(partial=True, history=(move,))
+        self.assertIn('title="Partial data: 10 min of readings since Sun 11-15 09:50 EST, '
+                      + 'mixed with last known good 12.0%/hour from units on claude1.">15.0%</td>', line)
+
+    def test_repeated_role_selection_keeps_later_move_source_out_of_the_prior_rate(self) -> None:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        selected_at = AT - timedelta(minutes=10)
+        repeated_at = AT - timedelta(minutes=3)
+        self._write_rate_role_selections(
+            ("units", "claude1", selected_at - timedelta(days=1)),
+            ("units", "claude2", selected_at),
+            ("units", "claude2", repeated_at),
+            cause="refusal",
+        )
+        member = moves.MoveMember("fixture-unit", "fixture-unit")
+        progress = moves.MoveMemberProgress(member, moves.MemberMoved(AT, AT - repeated_at, target="claude2"))
+        later = moves.MoveProgress("a" * 32, "units", "claude2", "claude3 refused: weekly limit",
+                                   moves.MoveInitiator.AUTOMATIC, repeated_at, (progress,), "refusal")
+        histories = {
+            label: [run_out.Reading(selected_at - timedelta(minutes=age), 60 - rate * age / 60)
+                    for age in range(lookback, -1, -10)]
+            for label, rate in (("claude1", 12), ("claude3", 30))
+        }
+        row = replace(status_row("claude2"), login="", selected_roles=("units",), weekly_left_percent=100)
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(moves, "read_move_progress", return_value=(later,)),
+              patch.object(run_out, "read_readings", return_value=histories)):
+            markup = accounts_page.page().decode()
+        line = markup.split('data-account-row="claude2"', 1)[1].split("</tr>", 1)[0]
+        self.assertIn('title="Last known good: units used 12.0%/hour on claude1 until Sun 11-15 14:50 UTC.">12.0%</td>',
+                      line)
+
+    def test_stale_destination_shows_the_source_rate_without_an_empty_time(self) -> None:
+        line = self._rate_after_units_move(partial=False, read_at=AT - timedelta(minutes=16))
+        self.assertIn('title="Last known good: units used 12.0%/hour on claude1 until Sun 11-15 09:50 EST.">12.0%</td>',
+                      line)
+        self.assertIn('title="No current weekly reading is available."><span class="next-muted">—</span>', line)
+        self.assertNotIn("<time", line)
+
+    def test_stale_destination_keeps_the_rate_from_saved_partial_readings(self) -> None:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        moved_at = AT - timedelta(minutes=26)
+        read_at = moved_at + timedelta(minutes=5)
+        self._write_rate_role_selections(("units", "claude1", moved_at - timedelta(days=1)),
+                                         ("units", "claude2", moved_at))
+        histories = {
+            "claude1": [run_out.Reading(moved_at - timedelta(minutes=age), 20 - age / 5)
+                        for age in range(lookback, -1, -10)],
+            "claude2": [run_out.Reading(moved_at, 40), run_out.Reading(read_at, 42)],
+        }
+        row = replace(status_row("claude2"), selected_roles=("units",), weekly_left_percent=58, read_at=read_at)
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(run_out, "read_readings", return_value=histories)):
+            markup = accounts_page.page().decode()
+        line = markup.split('data-account-row="claude2"', 1)[1].split("</tr>", 1)[0]
+        self.assertIn('title="Partial data: 5 min of readings since Sun 11-15 14:34 UTC, '
+                      + 'mixed with last known good 12.0%/hour from units on claude1.">13.5%</td>', line)
+        self.assertIn('title="No current weekly reading is available."><span class="next-muted">—</span>', line)
+        self.assertNotIn("<time", line)
+
+    def test_move_after_source_reset_excludes_readings_from_the_previous_week(self) -> None:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        reset = AT - timedelta(minutes=7)
+        history = [run_out.Reading(reset - timedelta(minutes=age), 40 - age / 5)
+                   for age in range(lookback + 10, 0, -10)]
+        status = accounts.AccountStatus("~/.claude1", self.review_root.parent / ".claude1", True, True, True,
+                                        "claude1", "fixture-source", "", (), (), accounts.McpServerDifferences())
+        weekly = usage_store.StoredWindow(left=62, at=history[-1].at.isoformat(), resets=reset.isoformat())
+        make_row = cast(Callable[..., accounts.StatusRow], getattr(accounts, "_status_row"))
+        source = replace(make_row(status, usage_store.StoredUsage(weekly=weekly), AT, ()), login="")
+        self.assertIsInstance(source.resets_at, accounts.StatusUnavailable)
+        destination = replace(status_row("claude2"), login="", selected_roles=("units",), weekly_left_percent=100)
+        reading = accounts.StatusReading((source, destination), (), (), timezone.utc, AT)
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(run_out, "read_readings", return_value={"claude1": history})):
+            for offset in (timedelta(minutes=-2), timedelta(minutes=2)):
+                with self.subTest(offset=offset):
+                    moved_at = reset + offset
+                    self._write_rate_role_selections(("units", "claude1", reset - timedelta(days=1)),
+                                                     ("units", "claude2", moved_at))
+                    markup = accounts_page.page().decode()
+                    line = markup.split('data-account-row="claude2"', 1)[1].split("</tr>", 1)[0]
+                    if moved_at < reset:
+                        self.assertIn('title="Last known good: units used 12.0%/hour on claude1 until '
+                                      + 'Sun 11-15 14:51 UTC.">12.0%</td>', line)
+                    else:
+                        self.assertEqual(line.count('title="No usage rate is available."'), 2)
+
+    def test_first_producers_move_uses_the_inherited_account_at_selection_time(self) -> None:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        moved_at = AT - timedelta(minutes=10)
+        self._write_rate_role_selections(
+            ("showrunners", "claude1", moved_at - timedelta(days=1)),
+            ("producers", "claude2", moved_at),
+            ("showrunners", "claude3", moved_at + timedelta(minutes=5)),
+        )
+        history = [run_out.Reading(moved_at - timedelta(minutes=age), 20 - age / 5)
+                   for age in range(lookback, -1, -10)]
+        destination = replace(status_row("claude2"), login="", roles=("producers",),
+                              selected_roles=("producers",), weekly_left_percent=100)
+        reading = accounts.StatusReading((destination,), (), (), timezone.utc, AT)
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(moves, "read_move_progress", return_value=()),
+              patch.object(run_out, "read_readings", return_value={"claude1": history})):
+            markup = accounts_page.page().decode()
+        line = markup.split('data-account-row="claude2"', 1)[1].split("</tr>", 1)[0]
+        self.assertIn('title="Last known good: producers used 12.0%/hour on claude1 until Sun 11-15 14:50 UTC.">12.0%</td>',
+                      line)
+
+    def test_first_producers_move_ignores_a_later_selection_with_the_same_time(self) -> None:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        moved_at = AT - timedelta(minutes=10)
+        self._write_rate_role_selections(
+            ("showrunners", "claude1", moved_at - timedelta(days=1)),
+            ("producers", "claude2", moved_at),
+            ("showrunners", "claude3", moved_at),
+        )
+        histories = {
+            label: [run_out.Reading(moved_at - timedelta(minutes=age), 60 - rate * age / 60)
+                    for age in range(lookback, -1, -10)]
+            for label, rate in (("claude1", 12), ("claude3", 30))
+        }
+        row = replace(status_row("claude2"), login="", roles=("producers",),
+                      selected_roles=("producers",), weekly_left_percent=100)
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(moves, "read_move_progress", return_value=()),
+              patch.object(run_out, "read_readings", return_value=histories)):
+            markup = accounts_page.page().decode()
+        line = markup.split('data-account-row="claude2"', 1)[1].split("</tr>", 1)[0]
+        self.assertIn('title="Last known good: producers used 12.0%/hour on claude1 until Sun 11-15 14:50 UTC.">12.0%</td>',
+                      line)
+
+    def test_role_selection_keeps_the_source_rate_after_its_move_progress_is_pruned(self) -> None:
+        lookback = 40
+        _ = write_config_fixture(conf.path("accounts"), f"rate.lookback_minutes={lookback}\n")
+        moved_at = AT - timedelta(minutes=10)
+        map_path = accounts.groups_file()
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        _ = map_path.write_text(json.dumps({"showrunners": "claude1"}))
+        with patch.object(role_map, "is_role_map_host", return_value=True):
+            role_map.write_role_map(role_map.RoleMapChange("producers", "claude2", "fixture move",
+                                                         moved_at.isoformat(), "fixture-selection"))
+        history = [run_out.Reading(moved_at - timedelta(minutes=age), 20 - age / 5)
+                   for age in range(lookback, -1, -10)]
+        row = replace(status_row("claude2"), login="", roles=("producers",),
+                      selected_roles=("producers",), weekly_left_percent=100)
+        reading = accounts.StatusReading((row,), (), (), timezone.utc, AT)
+        newer = moves.MoveProgress("a" * 32, "producers", "claude2", "claude3 refused: weekly limit",
+                                   moves.MoveInitiator.AUTOMATIC, AT, (), "refusal")
+        with (patch.object(accounts, "read_status", return_value=reading),
+              patch.object(run_out, "read_readings", return_value={"claude1": history})):
+            for batches in ((), (newer,)):
+                with self.subTest(batches=batches), patch.object(moves, "read_move_progress", return_value=batches):
+                    markup = accounts_page.page().decode()
+                    line = markup.split('data-account-row="claude2"', 1)[1].split("</tr>", 1)[0]
+                    self.assertIn('title="Last known good: producers used 12.0%/hour on claude1 until '
+                                  + 'Sun 11-15 14:50 UTC.">12.0%</td>', line)
 
     def test_weekly_forecast_excludes_history_before_a_reset_and_skips_the_refill_span(self) -> None:
         _ = write_config_fixture(conf.path("accounts"), "rate.lookback_minutes=50\n")

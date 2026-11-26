@@ -16,12 +16,12 @@ import sys
 import time
 from typing import Literal, TypedDict, cast
 
-from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity
+from scripts.accounts import accounts, login_sittings, moves, next_moves, role_activity, worker_names
 from scripts.agents import shutdown_record
 from scripts.production import staff
 from scripts.lib import atomic_file, conf, file_lock, waiting_rows
 from scripts.review_links import change_page, console_theme, page_frame, page_version, review_link
-from scripts.whoami import agent_accounts, mac_fallback_token, quota_alert, run_out, token_expiry
+from scripts.whoami import agent_accounts, mac_fallback_token, note_file, quota_alert, run_out, token_expiry
 # The alias keeps the module apart from this page's quota_state() path function.
 from scripts.whoami import quota_state as worker_quota_state
 
@@ -482,12 +482,9 @@ def _split_card(title: str, name: str, default: str, columns: Sequence[accounts.
             f'<tbody>{"".join(rows)}</tbody></table></div>{after}</section>')
 
 
-def _cell(content: str, css: str = "left") -> str:
-    return f'<td class="{css}">{content}</td>'
-
-
-def _timestamp(value: datetime | accounts.StatusUnavailable | None) -> float | None:
-    return value.timestamp() if isinstance(value, datetime) else None
+def _cell(content: str, css: str = "left", *, title: str = "") -> str:
+    tooltip = f' title="{html.escape(title, quote=True)}"' if title else ""
+    return f'<td class="{css}"{tooltip}>{content}</td>'
 
 
 def _forecast_dash(reason: str) -> str:
@@ -592,10 +589,154 @@ def _account_login_title(login: str) -> str:
     return login or fallback
 
 
+@dataclass(frozen=True)
+class RecordedRoleSelection:
+    role: str
+    account: note_file.NumberedAccountLabel
+    at: datetime
+    source: note_file.NumberedAccountLabel | run_out.UnknownMoveSource
+
+
+def _role_selections(lines: Sequence[str]) -> tuple[RecordedRoleSelection, ...]:
+    selections: list[RecordedRoleSelection] = []
+    for line in lines:
+        try:
+            decoded = cast(object, json.loads(line))
+            if not isinstance(decoded, dict):
+                continue
+            fields = cast(dict[str, object], decoded)
+            role = fields.get("group", fields.get("role"))
+            if role == "unit":
+                role = "units"
+            if not isinstance(role, str) or role not in (*accounts.CLAUDE_GROUPS, accounts.CODEX_ROLE):
+                continue
+            label = fields.get("account_label", fields.get("label"))
+            stamp = fields.get("at")
+            if not isinstance(label, str) or not isinstance(stamp, str):
+                continue
+            account = note_file.parse_account_label(label)
+            at = datetime.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if isinstance(account, note_file.NumberedAccountLabel) and at.tzinfo is not None:
+            source_field = fields.get("source_account")
+            source = note_file.parse_account_label(source_field) if isinstance(source_field, str) else run_out.UnknownMoveSource()
+            if not isinstance(source, note_file.NumberedAccountLabel) or source.tool != account.tool:
+                source = run_out.UnknownMoveSource()
+            selections.append(RecordedRoleSelection(role, account, at, source))
+    # Stable sorting keeps journal order when selections have the same time.
+    return tuple(sorted(selections, key=lambda selection: selection.at))
+
+
+def _recorded_move_source(
+    selection: RecordedRoleSelection, history: Sequence[moves.MoveProgress],
+) -> note_file.NumberedAccountLabel | run_out.UnknownMoveSource:
+    """Use the first valid source from a matching batch in the selection window."""
+    for move in history:
+        if move.group == selection.role and move.target == selection.account.label and selection.at <= move.started:
+            label, _, reason = move.reason.partition(" ")
+            if move.cause in ("auto", "refusal") and reason.startswith(("at ", "refused: ")):
+                source = note_file.parse_account_label(label)
+                if isinstance(source, note_file.NumberedAccountLabel) and source != selection.account:
+                    return source
+    return run_out.UnknownMoveSource()
+
+
+def _inherited_move_source(
+    arrival: RecordedRoleSelection, selections: Sequence[RecordedRoleSelection],
+) -> note_file.NumberedAccountLabel | run_out.UnknownMoveSource:
+    if arrival.role not in accounts.CLAUDE_GROUPS:
+        return run_out.UnknownMoveSource()
+    groups = accounts.GroupAccounts()
+    for selection in selections:
+        if selection is arrival:
+            break
+        if selection.role in accounts.CLAUDE_GROUPS and selection.role != arrival.role:
+            groups[selection.role] = selection.account.label
+    inherited = accounts.group_label(groups, arrival.role)
+    if isinstance(inherited, str):
+        account = note_file.parse_account_label(inherited)
+        if isinstance(account, note_file.NumberedAccountLabel):
+            return account
+    return run_out.UnknownMoveSource()
+
+
+def _role_arrivals(history: Sequence[moves.MoveProgress], selections: Sequence[RecordedRoleSelection],
+                   now: datetime) -> tuple[run_out.RoleArrival, ...]:
+    """Use account changes in the role history as arrivals."""
+    by_role: dict[str, list[RecordedRoleSelection]] = {}
+    for selection in selections:
+        if selection.at <= now:
+            by_role.setdefault(selection.role, []).append(selection)
+
+    batches = sorted((move for move in history if move.started <= now), key=lambda move: move.started)
+    arrivals: list[run_out.RoleArrival] = []
+    for role, role_selections in by_role.items():
+        index = len(role_selections) - 1
+        destination = role_selections[index].account
+        while index > 0 and role_selections[index - 1].account == destination:
+            index -= 1
+        arrival = role_selections[index]
+        window = batches
+        if index + 1 < len(role_selections):
+            end = role_selections[index + 1].at
+            window = [move for move in batches if move.started < end]
+        source = arrival.source
+        if isinstance(source, run_out.UnknownMoveSource):
+            source = _recorded_move_source(arrival, window)
+        if isinstance(source, run_out.UnknownMoveSource):
+            source = (role_selections[index - 1].account if index > 0 else _inherited_move_source(arrival, selections))
+        if source != destination:
+            arrivals.append(run_out.RoleArrival(role, source, destination, arrival.at))
+    return tuple(arrivals)
+
+
+def _usage_rate_title(rate: run_out.PageUsageRate, zone: tzinfo) -> str:
+    def stamp(at: datetime) -> str:
+        return at.astimezone(zone).strftime(quota_alert.WEEKLY_EMPTY_FORMAT)
+
+    if isinstance(rate, run_out.WholeWindowRate):
+        start, end = stamp(rate.usage.first_reading_at), stamp(rate.usage.last_reading_at)
+        return f"Whole last hour: readings from {start} to {end}."
+    if isinstance(rate, run_out.PartialWindowRate):
+        minutes = rate.usage.duration.total_seconds() / 60
+        detail = f"Partial data: {round(minutes)} min of readings since {stamp(rate.since)}"
+        if isinstance(rate.prior, run_out.LastKnownRate):
+            sources = [f"{source.points_per_hour:.1f}%/hour from {source.role} on {source.account.label}"
+                       for source in rate.prior.sources]
+            detail += f", mixed with last known good {_joined(sources)}"
+        return detail + "."
+    if isinstance(rate, run_out.LastKnownRate):
+        sources = [f"{source.role} used {source.points_per_hour:.1f}%/hour on {source.account.label} until {stamp(source.until)}"
+                   for source in rate.sources]
+        return f"Last known good: {'. '.join(sources)}."
+    return ""
+
+
+def _weekly_empty_cell(run_out_time: run_out.WeeklyRunOut, zone: tzinfo) -> str:
+    if isinstance(run_out_time, run_out.WeeklyRunOutAt):
+        empty = run_out_time.at
+        label = empty.astimezone(zone).strftime(quota_alert.WEEKLY_EMPTY_FORMAT)
+        return f'<time datetime="{empty.isoformat()}">{label}</time>'
+    reasons = {
+        run_out.WeeklyRunOutWithoutTime.NO_USAGE_RATE: "No usage rate is available.",
+        run_out.WeeklyRunOutWithoutTime.NO_CURRENT_BALANCE: "No current weekly reading is available.",
+        run_out.WeeklyRunOutWithoutTime.ALREADY_EMPTY: "The weekly quota is used up.",
+        run_out.WeeklyRunOutWithoutTime.NO_RESET_TIME: "The weekly reset time is unavailable.",
+        run_out.WeeklyRunOutWithoutTime.LASTS_UNTIL_RESET: "Quota lasts until the weekly reset.",
+    }
+    return _forecast_dash(reasons[run_out_time])
+
+
 def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, list[accounts.BoardRow]],
                     labels: dict[str, accounts.BoardSpan], alerts: Mapping[str, QuotaAlert],
-                    colors: Mapping[str, str]) -> str:
+                    colors: Mapping[str, str],
+                    arrivals: Mapping[str, Sequence[run_out.RoleArrival]]) -> str:
     histories = run_out.read_readings(run_out.READINGS_LOG)
+    lookback = timedelta(minutes=conf.read("accounts").whole("rate.lookback_minutes"))
+    source_resets = {row.label: row.resets_at for row in reading.rows if isinstance(row.resets_at, datetime)}
+    source_resets.update({row.label: row.stored_weekly_reset for row in reading.rows
+                          if isinstance(row.stored_weekly_reset, datetime)})
     rows: list[str] = []
     values: list[SortValues] = []
     labels_in_row_order: list[str] = []
@@ -621,28 +762,23 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
         reset_count_text = (
             '<span class="next-muted" title="Claude does not give this count to our tools.">—</span>'
             if row.tool == "claude" else DASH if reset_count is None else str(reset_count))
-        reset = row.resets_at if isinstance(row.resets_at, datetime) else None
-        forecast = (quota_alert.weekly_forecast(histories.get(label, []), reading.checked_at, reset,
-                    current=run_out.Reading(row.read_at, 100 - row.weekly_left_percent))
-                    if isinstance(row.read_at, datetime) and isinstance(row.weekly_left_percent, (int, float)) else None)
-        rate = forecast.used_per_hour if forecast else None
-        empty = forecast.empty_at if forecast else None
-        no_rate = _forecast_dash("No usage rate is available.")
-        if empty is not None:
-            empty_text = f'<time datetime="{empty.isoformat()}">{empty.astimezone(reading.zone):{quota_alert.WEEKLY_EMPTY_FORMAT}}</time>'
-        elif forecast is None:
-            empty_text = no_rate
-        elif forecast.lasts_to_deadline:
-            empty_text = _forecast_dash("Quota lasts until the weekly reset.")
-        elif reset is None:
-            empty_text = _forecast_dash("The weekly reset time is unavailable.")
-        else:
-            empty_text = _forecast_dash("The estimated run-out time has passed.")
+        reset = row.resets_at if isinstance(row.resets_at, datetime) else note_file.NoResetKnown()
+        current = (run_out.Reading(row.read_at, 100 - row.weekly_left_percent)
+                   if isinstance(row.read_at, datetime) and isinstance(row.weekly_left_percent, (int, float))
+                   else run_out.WeeklyReadingUnavailable())
+        forecast = run_out.page_usage_rate(label, current, reading.checked_at, lookback=lookback, histories=histories,
+                                           current_reset=reset, source_resets=source_resets, arrivals=arrivals.get(label, ()))
+        empty = run_out.weekly_run_out(forecast, reset, current, reading.checked_at)
+        empty_text = _weekly_empty_cell(empty, reading.zone)
+        rate = None if isinstance(forecast, run_out.NoUsageRate) else forecast.points_per_hour
+        rate_text = f"{rate:.1f}%" if rate is not None else _forecast_dash("No usage rate is available.")
+        rate_title = _usage_rate_title(forecast, reading.zone)
         account_values: SortValues = {
             "account": label.casefold(),
             "left": row.weekly_left_percent if isinstance(row.weekly_left_percent, (int, float)) else None,
-            "Fable left": fable, "used / hour": rate, "empty at": _timestamp(empty),
-            "resets": _timestamp(reset), "reset count": reset_count,
+            "Fable left": fable, "used / hour": rate,
+            "empty at": empty.at.timestamp() if isinstance(empty, run_out.WeeklyRunOutAt) else None,
+            "resets": reset.timestamp() if isinstance(reset, datetime) else None, "reset count": reset_count,
             "credits": float("inf") if row.credits == "unlimited" else
             row.credits if isinstance(row.credits, (int, float)) else None,
             "enabled": 1 if row.use_credits else None,
@@ -656,7 +792,7 @@ def _accounts_table(reading: accounts.StatusReading, rows_by_account: dict[str, 
             _cell(f'<span title="{dot}" aria-label="{dot}">{_spans(cells["dot"])}</span>')
             + f'<td class="left" data-account-name>{name}</td>'
             + _cell(_swatch(cells["label"])) + _cell(left, "right") + _cell(fable_text, "right")
-            + _cell(f"{rate:.1f}%" if rate is not None else no_rate, "right") + _cell(empty_text)
+            + _cell(rate_text, "right", title=rate_title) + _cell(empty_text)
         )
         reset_span_attributes = reset_attributes.get(label, ' class="weekly-reset-unknown"')
         reset_text = f'<span{reset_span_attributes}>{_spans(cells["resets"])}</span>'
@@ -905,7 +1041,8 @@ def _roles_table(reading: accounts.StatusReading, groups: dict[str, list[tuple[s
                        descending=ROLE_COUNT_COLUMNS, unsorted=(BUSY_LINE_HEADING,), attributes=' data-detail-columns="0,1,2"')
 
 
-def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | None = None) -> str:
+def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | None = None, *,
+          role_arrivals: Sequence[run_out.RoleArrival] = ()) -> str:
     """Render the account facts, roles, and problems from the same reading."""
     lines = accounts.status_board(reading, include_empty_total=True)["rows"]
     rows_by_account: dict[str, list[accounts.BoardRow]] = {}
@@ -924,7 +1061,17 @@ def board(reading: accounts.StatusReading, alerts: Mapping[str, QuotaAlert] | No
     selected = {row.label: row.selected_roles for row in reading.rows}
     colors = accounts.role_colors()
     samples = role_activity.read(reading.checked_at)
-    return (_accounts_table(reading, rows_by_account, labels, alerts or {}, colors)
+    latest_arrivals: dict[str, run_out.RoleArrival] = {}
+    for arrival in role_arrivals:
+        if arrival.at <= reading.checked_at and (arrival.role not in latest_arrivals
+                or latest_arrivals[arrival.role].at <= arrival.at):
+            latest_arrivals[arrival.role] = arrival
+    arrivals_by_account: dict[str, list[run_out.RoleArrival]] = {
+        row.label: [arrival for role in row.selected_roles if (arrival := latest_arrivals.get(role)) is not None
+                    and arrival.destination.label == row.label]
+        for row in reading.rows
+    }
+    return (_accounts_table(reading, rows_by_account, labels, alerts or {}, colors, arrivals_by_account)
             + _roles_table(reading, groups, labels, selected, lines[-1], colors, samples))
 
 
@@ -1283,8 +1430,14 @@ def page() -> bytes:
         reading = replace(reading, notes=(*reading.notes, str(error)))
         alerts = {}
     history = moves.read_move_progress()
+    try:
+        selections = _role_selections(worker_names.role_history_lines(accounts.roles_history_file()))
+    except (OSError, UnicodeError):
+        selections = ()
     body = (moves_board(history, reading.checked_at, reading.zone, retryable=_retryable_members(history, reading))
-            + logins_board(reading) + board(reading, alerts) + models_board(reading) + tokens_board(reading))
+            + logins_board(reading)
+            + board(reading, alerts, role_arrivals=_role_arrivals(history, selections, reading.checked_at))
+            + models_board(reading) + tokens_board(reading))
     settings = conf.read("review_links")
     refresh_seconds = settings.number("page_refresh_seconds")
     request_timeout = settings.whole("page_request_timeout_seconds")

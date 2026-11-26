@@ -1768,7 +1768,7 @@ def read_role_map(*, fresh: bool = False) -> RoleMap:
 
 def write_role_map(change: RoleMapChange | role_map.WorkersClaudeRouteChange) -> None:
     try:
-        role_map.write_role_map(change)
+        role_map.write_role_map(change, resolve_legacy_group_source=_legacy_group_source)
     except role_map.RoleMapWriteRefused as error:
         raise AccountsError(str(error)) from error
 
@@ -2615,9 +2615,7 @@ def group_model_families(group: ClaudeGroup) -> frozenset[refusals.ModelFamily |
 
 def group_label(groups: GroupAccounts, group: ClaudeGroup) -> str | GroupNotConfigured:
     """Use the showrunners account until the producers group has a selection."""
-    if group == "producers" and "producers" not in groups:
-        group = "showrunners"
-    label = groups.get(group, GROUP_NOT_CONFIGURED)
+    label = groups.get(role_map.effective_claude_group(groups, group), GROUP_NOT_CONFIGURED)
     return note_file.canonical_label(label) if isinstance(label, str) else label
 
 
@@ -2665,38 +2663,51 @@ def _group_accounts(stored: StoredGroupSelections) -> GroupAccounts:
         if isinstance(selection, GroupNotConfigured):
             continue
         label = selection["label"] if isinstance(selection, dict) else selection
-        stamp = ""
-        login = ""
-        evidence_label = label
-        if label in ("default", "~/.claude"):
-            try:
-                for line in roles_history_file().read_text(encoding="utf-8").splitlines():
-                    decoded = cast(object, json.loads(line))
-                    if not isinstance(decoded, dict):
-                        continue
-                    row = cast(dict[str, object], decoded)
-                    if row.get("group") != group and not (group == "units" and row.get("role") == "unit"):
-                        continue
-                    # Only the last assignment is in force; an earlier home
-                    # assignment cannot name a later, unrelated selection.
-                    stamp = ""
-                    login = ""
-                    evidence_label = label
-                    if row.get("label") != label:
-                        continue
-                    at, held_login = row.get("at"), row.get("login")
-                    if isinstance(at, str):
-                        stamp = at
-                    if isinstance(held_login, str):
-                        login = held_login
-                    recorded_label = row.get("account_label")
-                    if isinstance(recorded_label, str) and _label_is(recorded_label, "claude"):
-                        evidence_label = recorded_label
-            except (OSError, ValueError):
-                pass
-        resolved = resolve_history_label(evidence_label, stamp, login=login)
+        resolved = _resolve_group_selection_label(group, label)
         result[group] = resolved.label if isinstance(resolved, ResolvedHistoryLabel) else "home account unresolved"
     return result
+
+
+def _legacy_group_source(group: ClaudeGroup, label: str) -> role_map.SelectionSource:
+    resolved = _resolve_group_selection_label(group, label)
+    if isinstance(resolved, ResolvedHistoryLabel):
+        source = note_file.parse_account_label(resolved.label)
+        if isinstance(source, note_file.NumberedAccountLabel) and source.tool == "claude":
+            return source
+    return role_map.UnrecordedSelectionSource()
+
+
+def _resolve_group_selection_label(group: ClaudeGroup, label: str) -> ResolvedHistoryLabel | HistoricalAccountUnresolved:
+    """Resolve the selected Claude account from the last assignment."""
+    stamp = ""
+    login = ""
+    evidence_label = label
+    if label in ("default", "~/.claude"):
+        try:
+            for line in roles_history_file().read_text(encoding="utf-8").splitlines():
+                decoded = cast(object, json.loads(line))
+                if not isinstance(decoded, dict):
+                    continue
+                row = cast(dict[str, object], decoded)
+                if row.get("group") != group and not (group == "units" and row.get("role") == "unit"):
+                    continue
+                # Use evidence only from the last assignment.
+                stamp = ""
+                login = ""
+                evidence_label = label
+                if row.get("label") != label:
+                    continue
+                at, held_login = row.get("at"), row.get("login")
+                if isinstance(at, str):
+                    stamp = at
+                if isinstance(held_login, str):
+                    login = held_login
+                recorded_label = row.get("account_label")
+                if isinstance(recorded_label, str) and _label_is(recorded_label, "claude"):
+                    evidence_label = recorded_label
+        except (OSError, ValueError):
+            pass
+    return resolve_history_label(evidence_label, stamp, login=login)
 
 
 @dataclass(frozen=True)
@@ -4805,6 +4816,7 @@ class StatusRow:
         default_factory=lambda: agent_accounts.CodexWorkUnknown("no stored Codex reading"))
     has_running_claude_session: bool = False
     codex_weekly_freshness: CodexWeeklyFreshness = CodexWeeklyFreshness.NO_FRESH_WINDOW
+    stored_weekly_reset: datetime | NoResetKnown = field(default_factory=NoResetKnown)
 
 
 def weekly_quotas(rows: Iterable[StatusRow]) -> dict[str, WeeklyQuota]:
@@ -4984,6 +4996,7 @@ def _status_row(
     tool = "codex" if isinstance(status, CodexStatus) else "claude"
     weekly: float | StatusUnavailable | WeeklyNotReadSince = StatusUnavailable()
     resets: datetime | StatusUnavailable = StatusUnavailable()
+    stored_weekly_reset: datetime | NoResetKnown = NoResetKnown()
     credits: float | Literal["unlimited"] | StatusUnavailable = StatusUnavailable()
     read_at: datetime | StatusUnavailable = StatusUnavailable()
     on_credits = NO_VALUE
@@ -4994,19 +5007,20 @@ def _status_row(
     login = status.login if status.is_set_up and status.account_is_safe_to_inspect else ""
     if login:
         read_at = _read_at(usage) or StatusUnavailable()
+        held = usage or usage_store.StoredUsage()
+        window = held.get("weekly")
+        if window is not None:
+            stored_weekly_reset = _stored_time(window["resets"]) or NoResetKnown()
         if isinstance(status, CodexStatus) and isinstance(status.startup, agent_accounts.CodexStartupFailure):
             weekly = StatusUnavailable(status.startup.setup_command)
         else:
-            held = usage or usage_store.StoredUsage()
-            window = held.get("weekly")
             if window is not None and _is_current(window, now):
                 weekly = window["left"]
-                resets = _stored_time(window["resets"]) or StatusUnavailable()
+                resets = stored_weekly_reset if isinstance(stored_weekly_reset, datetime) else StatusUnavailable()
             else:
                 weekly = StatusUnavailable("unavailable")
                 resets = StatusUnavailable("unavailable")
-            if (window is not None and isinstance(read_at, datetime)
-                    and (reset := _stored_time(window["resets"])) is not None and reset <= now):
+            if isinstance(read_at, datetime) and isinstance(stored_weekly_reset, datetime) and stored_weekly_reset <= now:
                 weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
             if tool == "codex":
                 on_credits, credits = _credit_reading(held, now, account_config=account_config)
@@ -5024,7 +5038,7 @@ def _status_row(
         login_ends_at=agent_accounts.login_end_from_iso((usage or {}).get("login_ends_at"))
         if login and tool == "claude" else agent_accounts.LoginEndUnknown(),
         fable_left_percent=fable_left, codex_work_readiness=codex_readiness,
-        codex_weekly_freshness=codex_weekly_freshness)
+        codex_weekly_freshness=codex_weekly_freshness, stored_weekly_reset=stored_weekly_reset)
 
 
 def _codex_limit_reset_count(label: str) -> int | StatusUnavailable:
