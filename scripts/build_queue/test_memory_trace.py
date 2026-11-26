@@ -1,7 +1,7 @@
 """Test the memory trace boundary with private files and fixed times."""
 from __future__ import annotations
 
-from collections.abc import Buffer
+from collections.abc import Buffer, Iterator
 from dataclasses import replace
 from functools import cached_property
 from io import BytesIO, FileIO
@@ -73,6 +73,25 @@ class MemoryTraceTests(unittest.TestCase):
         _ = writer.append(traces.TestStarted(test_ms, 8))
         _ = writer.append(traces.TestSample(test_ms, 3))
         return writer.seal(traces.TraceEnd(ended_at_ms, elapsed_ms, status, coverage))
+
+    def test_peak_lookup_stops_when_it_finds_the_requested_reservations(self) -> None:
+        _ = self.finished("first")
+        _ = self.finished("second")
+        archive = self.root / "finished"
+        other = archive / ("f" * 64)
+        iterdir = Path.iterdir
+
+        def entries(path: Path) -> Iterator[Path]:
+            if path == archive:
+                yield archive / KEY
+                yield other
+            elif path == other:
+                self.fail("Peak lookup scanned another folder after it found both reservations.")
+            else:
+                yield from iterdir(path)
+
+        with mock.patch.object(Path, "iterdir", entries):
+            self.assertEqual(self.store.peaks_for({"first", "second"}), {"first": 5, "second": 5})
 
     def test_policy_uses_the_shared_reader_with_injected_settings(self) -> None:
         stored = POLICY_SETTINGS
