@@ -122,10 +122,12 @@ if [ -f "$TEST_HOOK_FAIL" ]; then exit 9; fi
                         result = land_main.land(self.repo, commit)
                 self.assertIsInstance(result.push, land_main.Pushed)
                 prefix = ["git", "-C", str(self.repo)]
-                for command in ([*prefix, "ls-remote", "--refs", "--", "origin", "refs/heads/main"],
+                for command in ([*prefix, "ls-remote", "--symref", "--", "origin", "HEAD", "refs/heads/main"],
                                 [*prefix, "push", "origin", f"{commit}:refs/heads/main"]):
                     commands.assert_any_call(command, capture_output=True, text=True, check=False,
                                              timeout=None, env=expected_environment)
+                self.assertEqual(sum("ls-remote" in cast(list[str], call.args[0])
+                                     for call in commands.call_args_list), 1)
                 self.assertEqual(os.environ["GIT_CONFIG_PARAMETERS"], inherited)
 
     def test_landing_refuses_hook_settings_before_running_git(self) -> None:

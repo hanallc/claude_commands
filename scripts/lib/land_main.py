@@ -184,14 +184,22 @@ def remote_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBr
     ref = "HEAD" if default else f"refs/heads/{branch}"
     query = run_git(checkout, "ls-remote", "--symref" if default else "--refs", "--", remote, ref,
                     time_limit=time_limit, environment=environment)
+    return _advertised_branch_tip(checkout, remote, branch, ref, git_output(query, "ls-remote"),
+                                  time_limit=time_limit, environment=environment)
+
+
+def _advertised_branch_tip(checkout: Path, remote: str, branch: str | RemoteDefaultBranch,
+                           ref: str, advertisement: str, *, time_limit: CommandTimeLimit | NoTimeLimit,
+                           environment: dict[str, str] | None) -> AdvertisedBranchTip:
     targets: list[str] = []
     matching_shas: list[str] = []
-    for row in git_output(query, "ls-remote").splitlines():
+    for row in advertisement.splitlines():
         value, _, advertised_ref = row.partition("\t")
         if not advertised_ref or "\t" in advertised_ref:
             raise LandError(f"{remote}: malformed ls-remote output for {ref}")
-        if default and advertised_ref == ref and value.startswith("ref: refs/heads/"):
-            targets.append(value.removeprefix("ref: refs/heads/"))
+        if advertised_ref == "HEAD" and value.startswith("ref: "):
+            if value.startswith("ref: refs/heads/"):
+                targets.append(value.removeprefix("ref: refs/heads/"))
             continue
         if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
             raise LandError(f"{remote}: malformed ls-remote output for {ref}")
@@ -233,8 +241,11 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
 
     with main_push_lock.main_push_lock(checkout):
         sha = checked("rev-parse", "--verify", f"{commit}^{{commit}}")
-        origin = remote_branch_commit(checkout, "origin", branch, time_limit=time_limit, environment=environment)
-        remote_default = default_branch(checked("ls-remote", "--symref", "--", "origin", "HEAD"))
+        ref = f"refs/heads/{branch}"
+        advertisement = checked("ls-remote", "--symref", "--", "origin", "HEAD", ref)
+        origin = _advertised_branch_tip(checkout, "origin", branch, ref, advertisement,
+                                        time_limit=time_limit, environment=environment).commit
+        remote_default = default_branch(advertisement)
         pushed: Pushed | AlreadyLanded
         if origin == sha:
             pushed = AlreadyLanded()
@@ -249,7 +260,7 @@ def land(checkout: Path, commit: str, branch: str = "main", *,
                     behavior_check.require_review(behavior_check.GitRange(checkout, origin, sha), timeout=git_timeout)
                 except (behavior_check.BehaviorCheckError, OSError) as error:
                     raise LandError(str(error)) from error
-            _ = checked("push", "origin", f"{sha}:refs/heads/{branch}")
+            _ = checked("push", "origin", f"{sha}:{ref}")
             pushed = Pushed()
         if branch != remote_default:
             return Landed(sha, branch, pushed, HookSkipped())
