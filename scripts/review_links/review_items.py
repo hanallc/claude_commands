@@ -6,6 +6,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
+from importlib import import_module
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 import re
 import sys
 from zoneinfo import ZoneInfo
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Protocol, cast, override
 
 from scripts.production import unit_lookup, showrunner_tree
 from scripts.agents.remote import local_machine
@@ -301,6 +302,18 @@ class AnswerTimeFromLog(StrEnum):
     USE_LOG = 'use log'
 
 
+class NoFiledReviewExchange(StrEnum):
+    ABSENT = 'no exchange on the List'
+
+
+@dataclass(frozen=True)
+class FiledReviewExchange:
+    destination: investigation.ListDestination
+    hides_card: bool
+    answers: frozenset[str]
+    open_staff_question: bool
+
+
 @dataclass(frozen=True)
 class ReviewItem:
     key: str
@@ -325,6 +338,7 @@ class ReviewItem:
     response: review_submissions.QuestionResponse | None = None
     answer_time: question_path.AnswerTime | AnswerTimeFromLog = AnswerTimeFromLog.USE_LOG
     body_answer_events: frozenset[int] = frozenset()
+    exchange_handoff: FiledReviewExchange | NoFiledReviewExchange = NoFiledReviewExchange.ABSENT
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
@@ -339,7 +353,8 @@ class ReviewItem:
 
     @property
     def unread_answer(self) -> bool:
-        if self.state not in (ReviewState.OPEN, ReviewState.VALIDATING):
+        if (self.state not in (ReviewState.OPEN, ReviewState.VALIDATING)
+                or isinstance(self.exchange_handoff, FiledReviewExchange)):
             return False
         time = self.answer_time
         if time is AnswerTimeFromLog.USE_LOG:
@@ -944,6 +959,8 @@ def investigation_type(record: investigation.Investigation) -> ReviewType:
 
 def on_list(item: ReviewItem) -> bool:
     """Check if the source record belongs to a List item."""
+    if isinstance(item.exchange_handoff, FiledReviewExchange) and item.exchange_handoff.hides_card:
+        return True
     source = item.source
     if isinstance(source, InvestigationSource) and source.record.belongs_on_list:
         return True
@@ -1426,6 +1443,17 @@ class ReviewRecordMissing(ReviewRecordChanged):
     """The source no longer contains the displayed record."""
 
 
+class ApplyListHandoffs(Protocol):
+    def __call__(self, items: list[ReviewItem], zone: ZoneInfo, *,
+                 sources: list[Path] | None = None) -> list[ReviewItem]: ...
+
+
+def _apply_list_handoffs(items: list[ReviewItem], zone: ZoneInfo, *,
+                         sources: list[Path] | None = None) -> list[ReviewItem]:
+    apply = cast(ApplyListHandoffs, import_module("scripts.review_links.answer_sources").apply_review_handoffs)
+    return apply(items, zone, sources=sources)
+
+
 def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> ReviewItem:
     """Reread the exact record. Use the snapshot owner for an Efficiency ledger."""
     source = item.source
@@ -1441,8 +1469,9 @@ def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> 
         raise ReviewRecordMissing('This item is no longer on the list.')
     prerequisite = Path(item.queue_after) if isinstance(source, ProposalSource) and item.queue_after else None
     selection = ExactReviewRecord(source_path(item), item.key, item.owner, prerequisite)
+    zone = user_zone()
     if isinstance(source, ProposalSource) and 'review_submission' in source.record.fields:
-        return read_sent_proposal(selection, source.record, members)
+        return _apply_list_handoffs([read_sent_proposal(selection, source.record, members)], zone)[0]
     kinds = QUESTION_TYPES if item.type in QUESTION_TYPES else (item.type,)
     try:
         records = project(root, members, kinds, REVIEW_STATES, None, [], selection, user_zone())
@@ -1450,7 +1479,7 @@ def read_current(root: Path, item: ReviewItem, members: staff.StaffSnapshot) -> 
         records = []
     for record in records:
         if record.key == item.key:
-            return record
+            return _apply_list_handoffs([record], zone)[0]
     raise ReviewRecordMissing('This item is no longer on the list.')
 
 
@@ -1532,11 +1561,14 @@ def ordered(items: list[ReviewItem], sources: list[Path] | None, zone: ZoneInfo)
 def read(root: Path, *, members: staff.StaffSnapshot | None = None,
          kinds: tuple[ReviewType, ...] = REVIEW_TYPES, show: str = 'all',
          owner_options: dict[staff.StaffId, str] | None = None,
-         sources: list[Path] | None = None, zone: ZoneInfo | None = None) -> list[ReviewItem]:
+         sources: list[Path] | None = None, zone: ZoneInfo | None = None,
+         include_filed: bool = False) -> list[ReviewItem]:
     """Read each record from its existing store without another stored copy."""
     members = staff.snapshot() if members is None else members
     zone = zone or user_zone()
     items = project(root, members, kinds, selected_states(show), owner_options, sources, ALL_RECORDS, zone)
+    if not include_filed:
+        items = _apply_list_handoffs(items, zone, sources=sources)
     if open_view(show):
         now = datetime.now(zone)
         return [item for item in items if item.for_you(now)]
@@ -1603,7 +1635,8 @@ def read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.Sta
     zone = zone or user_zone()
     items = _read_kind(kind, scope, members, below=below, sources=sources, own=own,
                        states=selected_states(show), zone=zone)
-    return with_later([normalize_times(item, zone) for item in items], sources, zone=zone)
+    return _apply_list_handoffs(with_later([normalize_times(item, zone) for item in items], sources, zone=zone),
+                                 zone, sources=sources)
 
 
 def _read_kind(kind: ReviewType, scope: Path | staff.StaffRow, members: staff.StaffSnapshot, *,
@@ -1722,7 +1755,7 @@ def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identitie
 def ready_investigations(owner: staff.StaffId, *, sources: list[Path] | None = None) -> int:
     zone = user_zone()
     items = investigation_items(staff.snapshot(), owners=(owner,), sources=sources, states=(ReviewState.OPEN,), zone=zone)
-    return count_items(with_later(items, sources, zone=zone), datetime.now(zone))
+    return count_items(_apply_list_handoffs(with_later(items, sources, zone=zone), zone, sources=sources), datetime.now(zone))
 
 
 def next_queue(kind: str, scope: Path | staff.StaffRow, below: bool, members: staff.StaffSnapshot) -> tuple[str,list[urgency.Entry[str]]]:

@@ -10,10 +10,11 @@ import secrets
 import shutil
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, cast, override
@@ -590,6 +591,9 @@ def answer_question(root: Path, identity: str, question_id: str, text: str) -> N
     result = page_question.answer(ImageReplyStore(images_root(root)), identity, question_id, text)
     if isinstance(result, page_question.AnswerRefused):
         raise question_record.AnswerRefused(result.reason)
+    file_exchange = cast(Callable[[Path, str], None],
+                         import_module("scripts.review_links.answer_sources").file_saved_picture)
+    file_exchange(root, identity)
 
 
 def answer_message(record: image_store.ImageRecord, answer: str, feedback: str) -> str:

@@ -16,6 +16,7 @@ from typing import TextIO, cast, override
 from unittest.mock import patch
 
 from scripts.console_text.test_support import accepting_console_text, real_review_question
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import review
 from scripts.production import investigation, staff, the_list
 from scripts.review_links import change_page, new_item_dialog, reply_tokens, review_page, test_review_page
@@ -46,6 +47,8 @@ class InvestigationTests(unittest.TestCase):
         configuration.mkdir()
         _ = (configuration / "console.conf").write_text(f"page.list.owner={LIST_KEEPER.id}\n")
         _ = (configuration / "producer_map.conf").write_text("")
+        _ = write_config_fixture(configuration / "notify.conf")
+        _ = write_config_fixture(configuration / "user_zone.conf")
         _ = self.enterContext(patch.object(reply_tokens, "platform", "linux"))
         _ = self.enterContext(patch.object(review, "reviewer_environment", side_effect=OSError("Fixture reviewer.")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {

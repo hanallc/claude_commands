@@ -6053,6 +6053,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertTrue(change_page.answer_item(key, 'The layout changed.', asked.question_id, recovered))
 
     def test_response_followup_uses_the_same_owner_and_got_it_closes_the_question(self) -> None:
+        _ = self.enterContext(patch.object(the_list, "file_exchanges", side_effect=OSError("The List save failed.")))
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")
         cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
@@ -6116,6 +6117,30 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(update_registration.read_review_question(path, owner.id).status, 'closed')
             self.assertEqual(self.request(card_url).status, 404)
             send.assert_called_once()
+
+    def test_filed_review_answer_redirects_to_the_saved_studio_item(self) -> None:
+        case = self.review_fixture()
+        owner = fixture_member("producer", name="item-producer")
+        cache = review_page.ReviewSnapshotCache(case.root, start_worker=False)
+        self.addCleanup(cache.close)
+        kind = new_item_dialog.SubmissionKind.QUESTION
+        request = case.submission_request(kind, owner.id)
+        with (patch.object(self.server, "review_cache", cache),
+              patch.object(self.server, "delivery_status", case.status), capture_sender("send_to_staff")):
+            created = self.new_item_http(self.new_item_body(request), finished=True)
+            self.assertEqual(created.status, 200, created.body)
+            sent = cast(dict[str, str], json.loads(created.body))
+            key = sent["key"]
+            origin = review_items.submission_origin(cache.get().records[key])
+            assert isinstance(origin, new_item_dialog.ReviewSubmission)
+            reply = new_item_dialog.submission_key(kind, owner.id, sent["id"], request.request_id)
+            self.assertTrue(change_page.answer_item(reply, "Use the wide layout.", origin.reply_token, case.status))
+            updated, _ = cache.publish_record(cache.get(), key)
+            self.assertNotIn(key, {entry["key"] for entry in updated.entries})
+            target = updated.filed_item_url(case.root, key)
+            self.assertTrue(target.startswith(studio_page.PAGE_PATH + "#item="), target)
+            result = self.request(review_page.card_url(key))
+            self.assertEqual((result.status, result.headers.get("location")), (303, target))
 
     def test_review_waits_for_directory_sync_and_list_commit_before_feature_closeout(self) -> None:
         case = self.review_fixture(changes=1, feature_project=True)

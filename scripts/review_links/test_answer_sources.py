@@ -13,10 +13,14 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
+from scripts.console_text import check as console_text
+from scripts.lib.user_zone import user_zone
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.production import investigation, record_store, staff, the_list, update_registration
 from scripts.production.issues import Issue
-from scripts.review_links import answer_sources, image_store, images, new_item_dialog, question_record, review_items
+from scripts.review_links import (
+    answer_sources, change_page, image_store, images, new_item_dialog, question_record, review_items, review_page,
+)
 from scripts.review_links.review_events import ReviewLog, encode, rows
 
 
@@ -58,9 +62,11 @@ class AnswerSourceTests(unittest.TestCase):
         self.review = self.root / "review"
         config = self.root / "config"
         config.mkdir()
-        for name in ("production", "review_links", "the_list"):
+        for name in ("production", "review_links", "the_list", "statusline"):
             _ = write_config_fixture(config / f"{name}.conf")
-        _ = (config / "console.conf").write_text(f"page.list.owner={KEEPER.id}\n", encoding="utf-8")
+        (config / "producer_map.conf").touch()
+        _ = (config / "change_review.conf").write_text(f"lists_directory={self.root / 'changes'}\n")
+        _ = write_config_fixture(config / "console.conf", f"page.list.owner={KEEPER.id}\n")
         staff_file = self.root / "staff.json"
         _ = staff_file.write_text(json.dumps({"schema": 1, "rows": [row.to_json() for row in MEMBERS.rows]}),
                                   encoding="utf-8")
@@ -194,6 +200,105 @@ class AnswerSourceTests(unittest.TestCase):
         self.assertEqual((reply.source, reply.question, reply.asked_at, reply.answer),
                          (answer_sources.Source.SCOPED_REPLY, "What changed?", SECOND_ASK,
                           answer_sources.ExchangeAnswer("The filter moved.", SECOND_REPLY, answer_sources.AnswerRead.UNREAD)))
+
+    def migrate(self, *, apply: bool) -> tuple[int, str]:
+        out = io.StringIO()
+        args = ["answer_sources", "migrate", *(["--apply"] if apply else [])]
+        with patch.object(sys, "argv", args), redirect_stdout(out):
+            result = answer_sources.main()
+        return result, out.getvalue()
+
+    def test_migrate_creates_one_row_and_keeps_every_followup(self) -> None:
+        key = self.native("open", {"since": FILED, "text": "Pick a route", "question": "Which route?",
+            "followups": [{"followup": "How long?", "reply": "Ten minutes."},
+                          {"followup": "What next?", "reply": "Wait here."}],
+        })
+        _ = self.native("closed", {"since": FILED, "text": "No longer needed", "question": "Still needed?"},
+                        status="closed")
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        result, dry = self.migrate(apply=False)
+        self.assertEqual(result, 0)
+        self.assertIn("staff-question: sources=1 exchanges=3 linked=0 new-rows=1 unchanged=0", dry)
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+        result, applied = self.migrate(apply=True)
+        self.assertEqual(result, 0)
+        self.assertIn(f"{key} -> {KEEPER.id}/L1", applied)
+        item, = the_list.records(KEEPER.id)
+        self.assertEqual(item.owner, ASKER.id)
+        self.assertEqual({exchange.source_key for exchange in item.filed_exchanges}, {key})
+        self.assertEqual({exchange.exchange_id for exchange in item.filed_exchanges},
+                         {"initial", "followup:1", "followup:2"})
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        result, repeated = self.migrate(apply=True)
+        self.assertEqual(result, 0)
+        self.assertIn("staff-question: sources=0 exchanges=0 linked=0 new-rows=0 unchanged=1", repeated)
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+
+    def test_linked_question_migrates_on_its_parked_row(self) -> None:
+        key = self.native("linked", {"since": FILED, "text": "Select a plan", "question": "Which plan?"})
+        item = the_list.add(KEEPER.id, "Review the plan", owner=OWNER.id, source="nate", changes={
+            "state": the_list.ItemState.WORKING})
+        item = the_list.park(KEEPER.id, item.id, the_list.ParkUntilDelivered.DELIVERED, source="nate")
+        item = the_list.link(KEEPER.id, item.id, (key,), source="nate")
+        result, applied = self.migrate(apply=True)
+        self.assertEqual(result, 0)
+        self.assertIn(f"{key} -> {KEEPER.id}/{item.id}", applied)
+        filed, = the_list.records(KEEPER.id)
+        exchange, = filed.filed_exchanges
+        self.assertEqual(exchange.source_key, key)
+        self.assertEqual(filed.state, item.state)
+        self.assertEqual(filed.parked_until, item.parked_until)
+        self.assertEqual(filed.log, item.log)
+
+    def test_failed_list_save_keeps_review_answer_and_retry_uses_the_reserved_number(self) -> None:
+        key = self.native("sent", {"since": FILED, "text": "Choose a plan", "question": "Which plan?",
+            "review_id": "Q1", "review_submission": new_item_dialog.stored_submission(origin("request-1234567890")),
+            "followups": [{"followup": "Which plan?", "reply": "Use plan A."}],
+        })
+        with patch.object(the_list, "_save", side_effect=OSError("The List write failed.")):
+            self.assertEqual(self.migrate(apply=True)[0], 1)
+        available, = review_items.read(self.review, members=MEMBERS, show="open")
+        self.assertEqual(available.key, key)
+        self.assertEqual(available.response.answer if available.response else "", "Use plan A.")
+        self.assertEqual(the_list.records(KEEPER.id), [])
+        self.assertEqual(self.migrate(apply=True)[0], 0)
+        item, = the_list.records(KEEPER.id)
+        self.assertEqual(item.id, "L1")
+        self.assertEqual(review_items.read(self.review, members=MEMBERS, show="open"), [])
+        _ = change_page.console_folder(self.review)
+        snapshot = review_page.build_snapshot(self.review)
+        self.assertEqual(snapshot.filed_item_url(self.review, key),
+                         review_page.report_url(investigation.ListDestination(KEEPER.id, 1)))
+
+    def test_filed_proposal_answer_keeps_the_pending_verdict(self) -> None:
+        log = (ReviewLog(SECOND_ASK, "nate", "question: What changed?"),
+               ReviewLog(SECOND_REPLY, OWNER.id, "Answer: The filter moved."))
+        issue = Issue(self.review / "proposal.md", {"review_log": [json.dumps(row) for row in rows(log)]})
+        proposal = review_items.ReviewItem("proposal/fixture", "owner/P1", review_items.ReviewType.PROPOSAL,
+            OWNER.id, OWNER.id, "Move the filter", review_items.ReviewState.OPEN,
+            review_items.ReviewTimes(START, SECOND_REPLY), log, ("approve", "decline"), review_items.ProposalSource(issue))
+        answer_sources.file_saved_review(proposal, MEMBERS)
+        current, = answer_sources.apply_review_handoffs([proposal], user_zone())
+        self.assertFalse(review_items.on_list(current))
+        self.assertFalse(current.unread_answer)
+        self.assertEqual(current.actions, ("approve", "decline"))
+        self.assertTrue(current.for_you(SECOND_REPLY))
+        item, = the_list.records(KEEPER.id)
+        self.assertEqual(item.filed_exchanges[0].source_key, proposal.key)
+
+    def test_new_investigation_answer_files_when_the_source_saves(self) -> None:
+        with patch.object(console_text, "require"):
+            record = investigation.file(OWNER.id, "Choose a route", "Which route?",
+                                        waiting_why="The owner must check the route.")
+            self.assertEqual(the_list.records(KEEPER.id), [])
+            _ = investigation.answer(OWNER.id, record.id, "Use the north route.")
+        item, = the_list.records(KEEPER.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual((item.owner, exchange.asker, exchange.answerer), (OWNER.id, answer_sources.Nate.USER, OWNER.id))
+        answer = exchange.answer
+        self.assertIsInstance(answer, answer_sources.ExchangeAnswer)
+        assert isinstance(answer, answer_sources.ExchangeAnswer)
+        self.assertEqual((answer.text, answer.read), ("Use the north route.", answer_sources.AnswerRead.UNREAD))
 
     def test_count_reports_bad_links_and_keeps_repeat_keys_without_writes(self) -> None:
         self.picture("000000000001", list_item="L29", list_keeper=KEEPER.id)
