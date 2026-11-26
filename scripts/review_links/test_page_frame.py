@@ -32,14 +32,23 @@ PAGE_OWNER = staff.StaffRow(staff.StaffId("owner"), "showrunner", "Page owner", 
 
 class CodeBlockTests(unittest.TestCase):
     def test_fenced_code_ends_at_its_first_closing_line(self) -> None:
-        empty = "```sh\n```"
-        code = "  printf x\n\n"
-        fenced = f"```sh\n{code}\n```"
-        adjacent = empty + "\n" + fenced
+        for line_end in ("\n", "\r\n"):
+            with self.subTest(line_end=line_end):
+                code = "  printf x" + line_end * 2
+                adjacent = line_end.join(("```sh", "```", "```sh", code, "```"))
+                self.assertIsNone(page_frame.CODE_BLOCK.fullmatch(adjacent))
+                self.assertEqual(page_frame.render_code_blocks(adjacent, self.fail),
+                                 page_frame.copy_code_block("") + page_frame.copy_code_block(code))
 
-        self.assertIsNone(page_frame.CODE_BLOCK.fullmatch(adjacent))
-        self.assertEqual(page_frame.render_code_blocks(adjacent, self.fail),
-                         page_frame.copy_code_block("") + page_frame.copy_code_block(code))
+    def test_one_fence_fullmatches_with_lf_and_crlf(self) -> None:
+        for line_end in ("\n", "\r\n"):
+            for code in ("", "  printf x" + line_end + "printf y  " + line_end):
+                with self.subTest(line_end=line_end, code=code):
+                    lines = ("```sh", code, "```") if code else ("```sh", "```")
+                    match = page_frame.CODE_BLOCK.fullmatch(line_end.join(lines))
+                    if match is None:
+                        self.fail("The code fence must match the complete text.")
+                    self.assertEqual(page_frame.code_block_html(match), page_frame.copy_code_block(code))
 
 
 class PageStatusTests(unittest.TestCase):
