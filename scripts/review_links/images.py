@@ -122,6 +122,16 @@ class _AnswerDraft:
         signed = attempt.get("signed_answer")
         return signed is not None and (self.action, self.words) == (signed["answer"], signed["feedback"])
 
+    def resubmitted_attempt_key(self, saved: image_store.ImageAnswers) -> str | None:
+        latest = None
+        for key, attempt in reversed(saved["attempts"].items()):
+            if self.matches_answer(attempt):
+                if not _answer_delivered(attempt):
+                    return key
+                if latest is None and (self.request_id or attempt.get("form_request_keys")):
+                    latest = key
+        return latest
+
     def _key(self, folder: Path, saved: image_store.ImageAnswers, purpose: str) -> str:
         parts = [saved["registered_at"], self.action, self.words]
         if self.round_id is not None:
@@ -401,6 +411,10 @@ def card(record: image_store.ImageRecord, token: str, members: staff.StaffSnapsh
             + '</article>')
 
 
+def _answer_delivered(answer: image_store.ImageAnswer) -> bool:
+    return bool(answer["recipients"]) and set(answer["recipients"]) <= set(answer["confirmed"])
+
+
 def _removed_image_reviews(root: Path, token: str) -> tuple[list[str], set[str]]:
     """Return the pending cards and the images with confirmed feedback for the last round."""
     directory = images_root(root)
@@ -417,7 +431,7 @@ def _removed_image_reviews(root: Path, token: str) -> tuple[list[str], set[str]]
         details = (_card_heading(heading) + f'<p>{removed}</p>' if heading is not None
                    else _card_heading({"title": removed, "look_for": []}))
         for key, answer in saved["attempts"].items():
-            if answer["recipients"] and set(answer["recipients"]) <= set(answer["confirmed"]):
+            if _answer_delivered(answer):
                 proof = answer.get("signed_answer")
                 round_id = proof["round_id"] if proof is not None else feedback_round(set(answer["answered"]))
                 if round_id == saved.get("deleted_feedback_round"):
@@ -663,22 +677,23 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         key = retry_key
     elif form_retry is not None:
         # An accepted attempt takes priority over old refusal records.
-        accepted = attempts[form_retry]
-        signed = accepted.get("signed_answer")
-        if (not draft.matches_answer(accepted)
-                or signed is not None and current_round is not None and signed["round_id"] != current_round):
+        if not draft.matches_answer(attempts[form_retry]):
             raise question_record.AnswerRefused(STALE_ANSWER)
         key = form_retry
     else:
         stale_requests = saved.get("stale_form_request_keys", [])
         if form_key and form_key in stale_requests:
             raise question_record.AnswerRefused(STALE_ANSWER)
-        if signed_form and round_id is not None and current_round is not None and round_id != current_round:
-            if form_key:
-                saved["stale_form_request_keys"] = [*stale_requests, form_key]
-                image_store.write_answers(directory, saved)
-            raise question_record.AnswerRefused(STALE_ANSWER)
-        key = form_key or draft.key(folder, saved)
+        form_retry = draft.resubmitted_attempt_key(saved) if signed_form and feedback else None
+        if form_retry is not None:
+            key = form_retry
+        else:
+            if signed_form and round_id is not None and current_round is not None and round_id != current_round:
+                if form_key:
+                    saved["stale_form_request_keys"] = [*stale_requests, form_key]
+                    image_store.write_answers(directory, saved)
+                raise question_record.AnswerRefused(STALE_ANSWER)
+            key = form_key or draft.key(folder, saved)
     attempt: image_store.ImageAnswer | None = attempts.get(key)
     stale_round = False
     if attempt is None:
@@ -1018,25 +1033,31 @@ function showStaleNotice(state, reason) {
   staleDrafts.append(draft);
 }
 function restoreForms(root, previous = []) {
-  const editable = new Map(), attempts = new Set();
+  const editable = new Map(), attempts = new Set(), previousEdits = new Map();
   const answered = new Set(root.dataset.answeredImages.split(' '));
   staleDrafts.replaceChildren();
   for (const form of forms(root)) {
     const image = imageId(form), key = attemptKey(form), state = pictureState(image);
     if (key) {
       attempts.add(key);
-      const error = state.attempts.get(key) || '';
-      state.attempts.set(key, error);
-      if (error) showActionFailure(formStatus(form), error);
+      const failure = state.attempts.get(key);
+      if (failure) showActionFailure(formStatus(form), failure.message);
     } else {
       editable.set(image, form);
     }
   }
-  const previousEdits = new Map(previous.filter(form => !attemptKey(form)).map(form => [imageId(form), form]));
+  for (const form of previous) {
+    const image = imageId(form), key = attemptKey(form);
+    if (!key) previousEdits.set(image, form);
+    else if (!attempts.has(key) && pictureState(image).attempts.get(key)?.replay) {
+      // Keep Retry available until the server confirms delivery.
+      root.append(form.closest('article').cloneNode(true));
+      attempts.add(key);
+    }
+  }
   for (const [image, state] of pictureStates) {
-    for (const [key, error] of state.attempts) {
-      // A missing card does not confirm delivery.
-      if (!attempts.has(key) && !error) state.attempts.delete(key);
+    for (const key of state.attempts.keys()) {
+      if (!attempts.has(key)) state.attempts.delete(key);
     }
     const draft = state.draft;
     let form = editable.get(image);
@@ -1098,7 +1119,7 @@ async function submit(event) {
     return;
   }
   const {retryAction, retryRound, requestId, retryDirect} = draft ?? {};
-  const replay = !key && !question && retryAction === action && requestId && retryDirect;
+  const replay = key ? state.attempts.get(key)?.replay : !question && retryAction === action && requestId && retryDirect;
   const body = new URLSearchParams(new FormData(form, event.submitter));
   if (key) {
     if (draft?.retryAction) {
@@ -1182,7 +1203,7 @@ async function submit(event) {
       saveDrafts();
       card.remove();
       showStaleNotice(state, 'This page is stale.');
-    } else if (request.key) state.attempts.set(request.key, message);
+    } else if (request.key) state.attempts.set(request.key, {message, replay: !refused && !undone});
     else {
       state.draftError = message;
       if (!question && state.revision === request.revision) {
