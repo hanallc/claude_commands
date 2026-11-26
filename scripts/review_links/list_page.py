@@ -1423,8 +1423,8 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         else:
             park_request = prefix.format() + retry
         saved["park_request_saved"] = the_list.has_park_receipt(item, park_request)
-        notice = the_list.feedback_requests(item).get(park_request)
-        saved["remove_request_saved"] = notice is not None and notice.action == "remove"
+        saved["remove_request_saved"] = (
+            the_list.remove_receipt(item, park_request) is not the_list.NoPageRequest.ABSENT)
     if not_fixed_request:
         prefix, retry = ListFormRequestPrefix.parse(not_fixed_request)
         request = prefix.format() + retry
@@ -1664,11 +1664,13 @@ def _submit_action(root: Path, keeper: staff.StaffId, identity: str, request: st
         saved_words = submitted.receipt_words(action, words) if submitted.scope else words
         recipient = prefix.recipient if item.state is the_list.ItemState.SCHEDULED else the_list.LegacyFeedbackRecipient.KEEPER
         message = f"Studio: nate removed {target}." + (f"\n\n{words}" if words else "")
-        # Use the saved message on a retry. The writer still checks the submitted words.
-        message = next((event.words for entry in reversed(item.log)
-                        if entry.source == the_list.PAGE_SOURCE
-                        and isinstance(event := entry.what, (the_list.PageFeedback, the_list.PageRequest))
-                        and event.request == request and event.action == "remove"), message)
+        receipt = the_list.remove_receipt(item, request)
+        if receipt is not the_list.NoPageRequest.ABSENT:
+            message = receipt.words
+            trimmed = words.strip()
+            legacy_words = submitted.receipt_words(action, trimmed) if submitted.scope else trimmed
+            if legacy_words == receipt.form_words:
+                saved_words = legacy_words
         notice = the_list.PageItemNotice(request, message, "remove", saved_words, recipient=recipient)
         changed = the_list.close(keeper, identity, words or "Removed by nate on the Studio.", source=the_list.PAGE_SOURCE,
                                  notice=notice, schedule_scope=submitted.scope, expected_schedule=expected)
