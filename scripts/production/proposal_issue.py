@@ -20,7 +20,7 @@ import stat
 import sys
 import tempfile
 from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from functools import cached_property
@@ -35,7 +35,7 @@ from scripts.lib import atomic_file, urgency  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production.issues import PROPOSAL_TAG, Issue, frontmatter, header_fields
 from scripts.production import record_store, staff, unit_names
-from scripts.review_links import new_item_dialog, reply_tokens, review_events
+from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens, review_events
 from scripts.review_links.review_events import MarkChange, NoMark, ReviewLog, ReviewMark, StoredReviewLog
 
 FENCE = "---"
@@ -228,19 +228,23 @@ def record_review(path: Path, words: str | tuple[str, ...], change: MarkChange, 
         for line in lines_to_append:
             events = review_events.append(events, ReviewLog(datetime.now(timezone.utc), who, line))
         mark = review_events.changed_mark(review_mark(issue), change)
-        new_wait: dict[str, str] = {}
-        if change == ReviewMark.WAITING and issue.value("review_submission"):
-            fields = cast(dict[str, object], json.loads(issue.value("review_submission")))
-            _ = new_item_dialog.read_submission(fields)
-            proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
-            new_wait["review_submission"] = json.dumps(new_item_dialog.renewed_submission_fields(fields, proof))
+        new_wait = change == ReviewMark.WAITING and bool(issue.value("review_submission"))
         if not new_wait and events == before and mark == review_mark(issue) and (not reason or reason == issue.value("waiting_why")):
             return False
-        text = _with_review_log(read_issue(path), path, events)
+        original = read_issue(path)
+        text = _with_review_log(original, path, events)
+        if new_wait:
+            _require_moved(path, original)
+            fields = cast(dict[str, object], json.loads(issue.value("review_submission")))
+            details = new_item_dialog.read_submission(fields)
+            proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
+            wait = details.next_reply_wait(issue.value(NUMBER_FIELD), proof)
+            fields["reply_wait_revision"] = wait.reply_wait_revision
+            text, _ = set_fields(text, {"review_submission": json.dumps(fields)}, path)
         text, _ = remove_fields(text, (REVIEW_MARK_FIELD,), path)
         marked = {REVIEW_MARK_FIELD: mark.value} if isinstance(mark, ReviewMark) else {}
         why = {"waiting_why": reason} if reason else {}
-        text, _ = set_fields(text, {**marked, **why, **new_wait, "date_modified": _vault_date(today)}, path)
+        text, _ = set_fields(text, {**marked, **why, "date_modified": _vault_date(today)}, path)
         write_issue(path, text)
         return True
 
@@ -482,12 +486,17 @@ def publish_numbered_draft(path: Path, draft_file: Path, today: date) -> str:
                 raise Refusal(f"{path}: the reviewed proposal draft changed.")
             write = _numbered_proposal(issue, text, numbers.next_id(path.parent), today)
             with numbers.write(write.path, write.identity, write.owner, new_record=True):
-                record_store.create_record_text(write.path, _hash_legacy_reply(write.path, write.text))
+                _require_moved(write.path, write.text)
+                record_store.create_record_text(write.path, write.text)
     return f"number {path.name}: {write.identity}"
 
 
 def review_submission(issue: Issue) -> new_item_dialog.SubmissionOrigin:
-    return new_item_dialog.decode_submission(issue.value("review_submission"))
+    origin = new_item_dialog.decode_submission(issue.value("review_submission"))
+    if isinstance(origin, new_item_dialog.ReviewSubmission):
+        identity = origin.proof_identity(issue.value(NUMBER_FIELD))
+        return origin.with_reply_proof(reply_proofs.read(identity).reply)
+    return origin
 
 
 def find_review_proposal(folders: Path | tuple[Path, ...], recipient: staff.StaffId,
@@ -543,7 +552,9 @@ def file_review_proposal(folder: Path, recipient: staff.StaffId, title: str, wor
                 with numbers.write(path, identity, recipient, new_record=True,
                                    before_write=lambda: before_write(identity, path)):
                     try:
-                        record_store.create_record_text(path, text)
+                        proof_id = details.proof_identity(identity)
+                        with reply_proofs.publishing(proof_id, reply_proofs.NoteProof(reply=details.reply_proof)):
+                            record_store.create_record_text(path, text)
                     except record_store.ReusedReviewRecord:
                         found = Issue(path, record_store.read_header(path, strict=True))
                         saved_id = found.value(NUMBER_FIELD)
@@ -611,52 +622,38 @@ def write_issue(path: Path, text: str) -> None:
         _replace_issue(path, text)
 
 
-def renew_reply_proof(issue: Issue, proof: reply_tokens.ReplyTokenProof) -> None:
-    """Replace the proof under the Proposal lock."""
-    fields = cast(dict[str, object], json.loads(issue.value("review_submission")))
-    updated = new_item_dialog.renewed_submission_fields(fields, proof)
-    text, _ = set_fields(read_issue(issue.path), {"review_submission": json.dumps(updated)}, issue.path)
-    write_issue(issue.path, text)
-
-
-def scrub_reply_token(path: Path) -> bool:
-    with issue_lock(path):
-        text = read_issue(path)
+def move_reply_proof(path: Path, *, dry_run: bool) -> int:
+    with nullcontext() if dry_run else issue_lock(path):
+        text = record_store.read_note_for_proof_move(path)
+        if isinstance(text, record_store.VanishedReviewNote):
+            return 0
         lines = record_store.lines_with_endings(text)
-        fields = Issue(path, header_fields(lines[1:_closing_fence(lines, path)]))
-        raw = fields.value("review_submission")
+        issue = Issue(path, header_fields(lines[1:_closing_fence(lines, path)]))
+        raw = issue.value("review_submission")
         if not raw:
-            return False
-        value = cast(dict[str, object], json.loads(raw))
-        if "reply_token" not in value:
-            return False
-        write_issue(path, text)
-        return True
+            return 0
+        updated, proof, count = reply_proofs.extract_submission(cast(dict[str, object], json.loads(raw)))
+        if count:
+            details = new_item_dialog.read_submission(updated)
+            identity = details.proof_identity(issue.value(NUMBER_FIELD))
+            if not dry_run:
+                changed, _ = set_fields(text, {"review_submission": json.dumps(updated)}, path)
+                with reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=proof), moving=True):
+                    write_issue(path, changed)
+        return count
 
 
-def _hash_legacy_reply(path: Path, text: str) -> str:
-    lines = record_store.lines_with_endings(text)
-    end = _closing_fence(lines, path)
-    span = _key_span(lines, end, "review_submission")
-    if span is None:
-        return text
-    issue = Issue(path, header_fields(lines[1:end]))
-    origin = review_submission(issue)
-    if not isinstance(origin, new_item_dialog.ReviewSubmission):
-        return text
-    value = cast(dict[str, object], json.loads(issue.value("review_submission")))
-    updated = new_item_dialog.hashed_submission_fields(value, origin)
-    if updated is value:
-        return text
-    start, _ = span
-    newline = lines[start][len(lines[start].rstrip("\r\n")):]
-    lines[start] = "review_submission: " + json.dumps(updated) + newline
-    return "".join(lines)
+def _require_moved(path: Path, text: str) -> None:
+    if "review_submission:" in text:
+        lines = record_store.lines_with_endings(text)
+        issue = Issue(path, header_fields(lines[1:_closing_fence(lines, path)]))
+        raw = issue.value("review_submission")
+        if raw and reply_proofs.has_legacy_submission(cast(dict[str, object], json.loads(raw))):
+            raise Refusal("Move the reply proof before editing this note.")
 
 
 def _replace_issue(path: Path, text: str) -> None:
-    if "review_submission:" in text:
-        text = _hash_legacy_reply(path, text)
+    _require_moved(path, text)
     temporary_name = ""
     try:
         with tempfile.NamedTemporaryFile(

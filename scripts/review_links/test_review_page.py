@@ -492,7 +492,7 @@ window.fetch=(url,options)=>{
         for kind in investigation.InvestigationKind:
             request = self.submission_request(new_item_dialog.SubmissionKind(kind.value), unit.id)
             origin = new_item_dialog.ReviewSubmission(
-                request.request_id, 'a'*64, request.evidence, (), 'b'*64)
+                request.request_id, 'a'*64, request.evidence, ())
             reports.append(investigation.file(owner.id, request.words, request.words, kind=kind,
                                                waiting_why='The owner checks the report.', submission=origin))
         snapshot = review_page.build_snapshot(self.root)

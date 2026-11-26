@@ -25,7 +25,7 @@ from scripts.lib import atomic_file
 from scripts.lib.user_zone import user_zone
 from scripts.production import change_routing, delivery_state, record_store, staff
 from scripts.production.issues import Issue
-from scripts.review_links import new_item_dialog, reply_tokens, review_events
+from scripts.review_links import new_item_dialog, reply_proofs, reply_tokens, review_events
 from scripts.review_links.review_events import ReviewLog
 from scripts.production.record_store import state_root as state_root
 
@@ -225,6 +225,8 @@ def _load(store: Investigations, identity: str, path: Path, *, sources: list[Pat
         recorded_owner = record_store.record_owner(record_store.RecordKind.INVESTIGATION, header, store.owner)
         if isinstance(submission, new_item_dialog.ReviewSubmission):
             _ = new_item_dialog.request_recipient(new_item_dialog.SubmissionKind(kind.value), submission.request_id)
+            proof = reply_proofs.read(submission.proof_identity(fields["id"]))
+            submission = submission.with_reply_proof(proof.reply)
         if recorded_owner != store.owner:
             raise ValueError("record identity differs from its path")
         question, answer = record_store.split_section(body, int(fields["question_length"]), "Answer")
@@ -278,14 +280,21 @@ def _save(store: Investigations, item: Investigation, path: Path,
               "filed": item.filed, "answered": item.answered, "read": item.read,
               "question_length": str(len(item.question)), "review_log": review_events.encode(item.log),
               "waiting_why": item.waiting_why, "kind": item.kind}
+    publication = nullcontext()
     if isinstance(item.submission, new_item_dialog.ReviewSubmission):
+        if not new_record:
+            _require_moved(store, item.id, path)
+        if new_record:
+            identity = item.submission.proof_identity(item.id)
+            publication = reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=item.submission.reply_proof))
         fields["review_submission"] = json.dumps(new_item_dialog.stored_submission(item.submission))
     body = f"{item.question}{ANSWER_SECTION}{item.answer}"
     with investigation_numbers() if numbers is None else nullcontext(numbers) as sequence:
         with sequence.write(path, item.id, store.owner, folder=store.folder(), new_record=new_record,
                             before_write=before_write):
             try:
-                store.write(item.id, fields, body, path=path, new_record=new_record)
+                with publication:
+                    store.write(item.id, fields, body, path=path, new_record=new_record)
             except record_store.ReusedReviewRecord:
                 return read_review_record(path)
     return item
@@ -294,14 +303,15 @@ def _save(store: Investigations, item: Investigation, path: Path,
 def write_review_submission(path: Path, item: Investigation, details: new_item_dialog.ReviewSubmission) -> None:
     """Update the submission fields while the caller holds the record lock."""
     store = _store(item.owner)
-    _write_submission_fields(store, item.id, path, new_item_dialog.stored_submission(details))
+    _require_moved(store, item.id, path)
+    text = path.read_text(encoding="utf-8", newline="")
+    _write_submission_fields(store, item.id, path, new_item_dialog.stored_submission(details), text)
 
 
 def _write_submission_fields(store: Investigations, identity: str, path: Path,
-                             fields: dict[str, object]) -> None:
+                             fields: dict[str, object], text: str) -> None:
     """Replace the submission field without rewriting the rest of the note."""
-    with path.open(encoding="utf-8", newline="") as stream:
-        lines = record_store.lines_with_endings(stream.read())
+    lines = record_store.lines_with_endings(text)
     for index, line in enumerate(lines[1:], 1):
         if line.rstrip("\r\n") == "---":
             break
@@ -309,33 +319,41 @@ def _write_submission_fields(store: Investigations, identity: str, path: Path,
             newline = line[len(line.rstrip("\r\n")):]
             lines[index] = "review_submission: " + json.dumps(json.dumps(fields), ensure_ascii=False) + newline
             with investigation_numbers() as numbers, numbers.write(path, identity, store.owner, folder=store.folder()):
-                atomic_file.write_text_atomic(path, "".join(lines))
+                atomic_file.write_locked_atomic(path, "".join(lines))
             return
     raise InvestigationError(f"{path}: the Review submission field is missing")
 
 
-def renew_reply_proof(path: Path, item: Investigation, proof: reply_tokens.ReplyTokenProof) -> None:
-    """Replace the proof under the Investigation lock."""
-    store = _store(item.owner)
-    fields, _ = store.read(item.id, path=path)
-    value = cast(dict[str, object], json.loads(fields["review_submission"]))
-    _write_submission_fields(store, item.id, path, new_item_dialog.renewed_submission_fields(value, proof))
+def _require_moved(store: Investigations, identity: str, path: Path) -> None:
+    raw = store.field(identity, "review_submission", path=path)
+    if raw and reply_proofs.has_legacy_submission(cast(dict[str, object], json.loads(raw))):
+        raise InvestigationError("Move the reply proof before editing this note.")
 
 
-def scrub_reply_token(path: Path, owner: staff.StaffId, identity: str) -> bool:
-    store = _store(owner)
-    with store.locked():
-        fields, _ = store.read(identity, path=path)
+def move_reply_proof(path: Path, *, dry_run: bool) -> int:
+    store = _store(review_owner(path))
+    with nullcontext() if dry_run else store.locked():
+        text = record_store.read_note_for_proof_move(path)
+        if isinstance(text, record_store.VanishedReviewNote):
+            return 0
+        identity = record_store.record_text_fields(path, text, frozenset(("id",))).value("id")
+        if not store.valid_id(identity):
+            raise InvestigationError("Invalid investigation ID.")
+        fields, _ = store.parse_text(identity, text)
         raw = fields.get("review_submission", "")
         if not raw:
-            return False
-        value = cast(dict[str, object], json.loads(raw))
-        details = new_item_dialog.read_submission(value)
-        updated = new_item_dialog.hashed_submission_fields(value, details)
-        if updated is value:
-            return False
-        _write_submission_fields(store, identity, path, updated)
-        return True
+            return 0
+        header = Issue(path, {"owner": [fields["owner"]]} if "owner" in fields else {})
+        if record_store.record_owner(record_store.RecordKind.INVESTIGATION, header, store.owner) != store.owner:
+            raise InvestigationError("The selected investigation changed.")
+        updated, proof, count = reply_proofs.extract_submission(cast(dict[str, object], json.loads(raw)))
+        if count:
+            details = new_item_dialog.read_submission(updated)
+            proof_id = details.proof_identity(identity)
+            if not dry_run:
+                with reply_proofs.publishing(proof_id, reply_proofs.NoteProof(reply=proof), moving=True):
+                    _write_submission_fields(store, identity, path, updated, text)
+        return count
 
 
 def _now() -> str:
@@ -507,7 +525,7 @@ def review_action(owner: staff.StaffId, identity: str, action: str, words: str, 
             submission = item.submission
             if isinstance(submission, new_item_dialog.ReviewSubmission):
                 proof = new_reply_proof if isinstance(new_reply_proof, reply_tokens.ReplyTokenProof) else reply_tokens.mint()
-                submission = submission.with_reply_proof(proof)
+                submission = submission.next_reply_wait(item.id, proof)
             item = replace(item,state=InvestigationState.OPEN,answered='',read='',log=(*item.log,event),
                            waiting_why=review_events.require_waiting_why(words),submission=submission)
         else:

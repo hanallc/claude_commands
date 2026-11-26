@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from shlex import split
 from typing import cast, override
 from unittest.mock import patch
@@ -30,7 +31,8 @@ class WaitingActionTests(unittest.TestCase):
         request = new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-question-{recipient.id}',
             new_item_dialog.SubmissionKind.QUESTION, recipient.id, 'What caused this?', new_item_dialog.NoEvidence())
         sent = review_submissions.submit(request)
-        self.assertTrue(review_submissions.answer(sent.key, 'The cause is known.', sent.reply_token))
+        original = sent.reply_token
+        self.assertTrue(review_submissions.answer(sent.key, 'The cause is known.', original))
 
         owner = self.fixture.fixture.unit.id
         for report_kind in investigation.InvestigationKind:
@@ -72,7 +74,8 @@ class WaitingActionTests(unittest.TestCase):
         request = new_item_dialog.NewItemRequest(f'r1-{uuid4().hex}-question-{recipient.id}',
             new_item_dialog.SubmissionKind.QUESTION, recipient.id, 'What caused this?', new_item_dialog.NoEvidence())
         sent = review_submissions.submit(request)
-        self.assertTrue(review_submissions.answer(sent.key, 'The cause is known.', sent.reply_token))
+        original = sent.reply_token
+        self.assertTrue(review_submissions.answer(sent.key, 'The cause is known.', original))
         root = self.fixture.root
         item = next(item for item in review_items.read(root) if item.type == review_items.ReviewType.RESPONSE)
         browser = change_page.ReviewBrowser(*change_browser.browser_manifest(change_page.console_folder(root)))
@@ -89,13 +92,19 @@ class WaitingActionTests(unittest.TestCase):
         message = cast(str, send.call_args.args[2])
         command = split(message.splitlines()[-1])
         token = command[command.index('--question') + 1]
-        self.assertNotEqual(token, sent.reply_token)
-        note = sent.path.read_text(encoding="utf-8")
-        self.assertNotIn(token, note)
-        self.assertIn(reply_tokens.digest(token), note)
-        self.assertEqual(reply_tokens.derive(review_submissions.current_reply_proof(sent.key)), token)
-        self.assertNotIn(token, status.path(delivery.page, delivery.row).read_text(encoding='utf-8'))
-        self.assertNotIn(token, status.closeout_path(delivery.page, delivery.row).read_text(encoding='utf-8'))
+        self.assertTrue(token != original)
+        proof = review_submissions.current_reply_proof(sent.key)
+        self.assertTrue(reply_tokens.derive(proof) == token)
+        assert isinstance(delivery.page, change_page.UserQuestionPage)
+        legacy: change_page.StoredUserAnswer = {
+            **delivery.page.saved, "scoped_reply": {"key": sent.key, "token_sha256": proof.sha256},
+        }
+        before_move = replace(delivery, page=replace(delivery.page, saved=legacy))
+        self.assertTrue(change_page.outbound_review_message(before_move).text == message)
+        for path in (sent.path, status.path(delivery.page, delivery.row), status.closeout_path(delivery.page, delivery.row)):
+            note = path.read_text(encoding="utf-8")
+            self.assertFalse(token in note)
+            self.assertFalse(proof.sha256 in note)
         send.assert_called_once_with(recipient.id, change_page.SENDER, message,
                                      key=change_page.review_delivery_key(delivery.page.review_list, delivery.row, delivery.attempt))
 

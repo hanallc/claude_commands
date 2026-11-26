@@ -64,12 +64,13 @@ from scripts.production import (
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
     record_store, staff, the_list, tidy_wrapped, unrouted_alert, update_registration,
 )
+from scripts.production.issues import Issue
 from scripts.production.production_doc import read_new_production
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import test_change_page
 from scripts.review_links import (
     console_tune, go_check, go_ledger, new_item_dialog, page_frame, page_question, question_record, record_table,
-    reply_tokens, review_link, review_submissions,
+    reply_proofs, reply_tokens, review_link, review_submissions,
 )
 from scripts.review_links import (
     accounts_page, change_browser, change_page, console, for_you, image_store, images, investigations_page, list_page, new_item,
@@ -124,6 +125,8 @@ def write_server_config(configuration: Path) -> dict[str, str]:
         + "page.list.items=python:scripts.review_links.list_page:waiting_updates\n"
         + "rebuilds.url=python:scripts.review_links.change_page:rebuilds_url\n")
     _ = write_config_fixture(configuration / "scratch.conf", "record_lock_attempts=3\n")
+    _ = write_config_fixture(configuration / "staff.conf",
+                             f"producer_folder_root={configuration.parent / 'vault'}\n")
     _ = (configuration / "statusline.conf").write_text(ROLE_COLOR_CONFIG, encoding="utf-8")
     return {"CONF_DIR": str(configuration), "USER_ZONE": "America/New_York"}
 
@@ -2420,7 +2423,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             unavailable = self.new_item_http(body, finished=True)
             self.assertEqual((unavailable.status, json.loads(unavailable.body)), (503, failure))
             for invalid, reason in ((b"short", "The local reply key must contain 32 bytes."),
-                                    (bytes(byte ^ 1 for byte in original), "The local reply key does not match the note.")):
+                                    (bytes(byte ^ 1 for byte in original), "The local reply key does not match the saved proof.")):
                 _ = key_file.write_bytes(invalid)
                 key_file.chmod(0o600)
                 unavailable = self.new_item_http(body, finished=True)
@@ -2575,6 +2578,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(item.state, review_items.ReviewState.WAITING)
             original = review_items.submission_origin(item)
             assert isinstance(original, new_item_dialog.ReviewSubmission)
+            assert isinstance(original.reply_proof, reply_tokens.ReplyTokenProof)
             original_token = reply_tokens.derive(original.reply_proof)
             self.assertTrue(original_token)
             words = "Can you check the second case?"
@@ -2587,6 +2591,7 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertIn("question: " + words, [event.words for event in updated.log])
             details = review_items.submission_origin(updated)
             assert isinstance(details, new_item_dialog.ReviewSubmission)
+            assert isinstance(details.reply_proof, reply_tokens.ReplyTokenProof)
             token = reply_tokens.derive(details.reply_proof)
             self.assertTrue(token)
             self.assertNotEqual(original_token, token)
@@ -5511,6 +5516,385 @@ class ReviewLinksServerTests(unittest.TestCase):
                 self.assertLess(len(wire), len(index.body))
             finally:
                 connection.close()
+
+    def test_server_recovers_legacy_transfer_before_moving_its_proof(self) -> None:
+        from scripts.review_links.test_review_submissions import request
+
+        source_owner = fixture_member("producer", name="proof-source")
+        owner = fixture_member("producer", name="proof-destination")
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)})))
+        saved = review_submissions.submit(request(review_submissions.SubmissionKind.INVESTIGATION,
+                                                  recipient=source_owner.id))
+        proof = review_submissions.current_reply_proof(saved.key)
+        token = saved.reply_token
+        identity = saved.details.proof_identity(saved.id)
+        reply_proofs.path_for(identity).unlink()
+        clean = saved.path.read_bytes()
+        marker = json.dumps('"images": []')[1:-1].encode()
+
+        def legacy_note(content: bytes, field: str, value: str) -> bytes:
+            addition = json.dumps(", " + json.dumps({field: value})[1:-1])[1:-1].encode()
+            return content.replace(marker, marker + addition, 1)
+
+        target = investigation.folder(owner.id) / saved.path.name
+        target.parent.mkdir(parents=True)
+        clean_target = clean.replace(f'owner: "{source_owner.id}"\n'.encode(), f'owner: "{owner.id}"\n'.encode(), 1)
+        source_bytes = legacy_note(clean, "reply_token", token)
+        target_bytes = legacy_note(clean_target, "reply_token_sha256", proof.sha256)
+        _ = saved.path.write_bytes(source_bytes)
+        _ = target.write_bytes(target_bytes)
+        journal = review_submissions.image_folder(saved).parent / "move.json"
+        move = review_submissions.SubmissionMove(
+            saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
+            target, saved.path, owner.id, saved.path, source_owner.id,
+            review_submissions.MoveContentDigests(hashlib.sha256(source_bytes).hexdigest(),
+                                                  hashlib.sha256(target_bytes).hexdigest()))
+        review_submissions._write_location(journal, move)  # pyright: ignore[reportPrivateUsage]
+
+        with (patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending")):
+            _ = self.enterContext(started_review_server(("127.0.0.1", 0), self.root, initialize_review=True))
+        self.assertFalse(journal.exists())
+        self.assertTrue(journal.with_name("moved.json").exists())
+        self.assertFalse(saved.path.exists())
+        self.assertTrue(target.read_bytes() == clean_target)
+        self.assertTrue(review_submissions.answer(saved.key, "Recovered reply", token))
+
+    def test_server_binds_with_an_unavailable_staff_authority(self) -> None:
+        bind = serve.ReviewLinksServer.server_bind
+
+        def check_bind(server: serve.ReviewLinksServer) -> None:
+            authority.assert_not_called()
+            bind(server)
+
+        with (patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)}),
+              patch.object(staff, "is_owner", return_value=False),
+              patch.object(staff, "authority_snapshot", side_effect=staff.StaffUnreadable("Authority unavailable")) as authority,
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              patch.object(serve.ReviewLinksServer, "server_bind", autospec=True, side_effect=check_bind) as observed,
+              patch.object(serve.ReviewLinksServer, "serve_forever") as serve_requests,
+              redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+            self.assertEqual(serve.main(["--port", "0"]), 0)
+        observed.assert_called_once()
+        serve_requests.assert_called_once()
+
+    def test_server_moves_proofs_in_a_restored_vault_without_staff(self) -> None:
+        from scripts.review_links.test_review_submissions import request
+
+        vault = self.root.parent / "vault"
+        issues = vault / "restored" / "notes"
+        issues.mkdir(parents=True)
+        doc = vault / "restored" / "production.md"
+        _ = doc.write_text("# Restored\n> **Status: PRODUCTION — running.**\n\n"
+                           + f"- **Merge branch:** main\n- **Showrunner checkout:** `{vault}`\n"
+                           + f"- **Log:** log.md\n- **Proposals:** `{issues}`\n")
+        owner = fixture_member("showrunner", name="restored-vault", doc=staff.LiveDoc(local_machine(), doc))
+        producer = fixture_member("producer", name="restored-state")
+        members = staff.StaffSnapshot((owner, producer))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)})))
+        fixtures: list[tuple[review_submissions.SavedSubmission, str, bytes, reply_tokens.ReplyTokenProof]] = []
+        for kind, recipient in ((new_item_dialog.SubmissionKind.QUESTION, owner.id),
+                                (new_item_dialog.SubmissionKind.QUESTION, producer.id),
+                                (new_item_dialog.SubmissionKind.INVESTIGATION, producer.id),
+                                (new_item_dialog.SubmissionKind.PROPOSAL, producer.id)):
+            with staff.supplied_snapshot(members):
+                for archive_inside in (True, False):
+                    saved = review_submissions.submit(request(kind, f"archive-{archive_inside}", recipient=recipient))
+                    self.assertEqual(saved.path.parent, issues if recipient == owner.id else
+                                     record_store.state_root() / recipient / (kind.value + "s"))
+                    proof, token, clean = self.put_legacy_reply_proof_in_note(saved)
+                    archive = (saved.path.parent if archive_inside else saved.path.parent.parent) / "archive"
+                    archive.mkdir(exist_ok=True)
+                    path = saved.path.rename(archive / saved.path.name)
+                    fixtures.append((replace(saved, path=path), token, clean, proof))
+        shutil.rmtree(record_store.state_root() / "review-folders")
+        bind = serve.ReviewLinksServer.server_bind
+
+        def check_bind(server: serve.ReviewLinksServer) -> None:
+            authority.assert_not_called()
+            for saved, _, clean, proof in fixtures:
+                self.assertTrue(saved.path.read_bytes() == clean)
+                self.assertTrue(reply_proofs.read(saved.details.proof_identity(saved.id)).reply == proof)
+            bind(server)
+
+        with (patch.object(staff, "is_owner", return_value=False),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(staff, "authority_snapshot", side_effect=staff.StaffUnreadable("Authority unavailable")) as authority,
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              patch.object(serve.ReviewLinksServer, "server_bind", autospec=True, side_effect=check_bind)):
+            _ = self.enterContext(started_review_server(("127.0.0.1", 0), self.root, initialize_review=True))
+        for saved, token, _, _ in fixtures:
+            self.assertTrue(review_submissions.answer(saved.key, "Restored reply", token, members=members))
+
+    def put_legacy_reply_proof_in_note(self, saved: review_submissions.SavedSubmission
+                                      ) -> tuple[reply_tokens.ReplyTokenProof, str, bytes]:
+        proof = review_submissions.current_reply_proof(saved.key)
+        token = saved.reply_token
+        reply_proofs.path_for(saved.details.proof_identity(saved.id)).unlink()
+        clean = saved.path.read_bytes()
+        marker = '"images": []'
+        legacy = ', ' + json.dumps({"reply_token_sha256": proof.sha256, "reply_token_nonce": proof.nonce})[1:-1]
+        if saved.kind in (new_item_dialog.SubmissionKind.INVESTIGATION, new_item_dialog.SubmissionKind.BUG):
+            marker = json.dumps(marker)[1:-1]
+            legacy = json.dumps(legacy)[1:-1]
+        self.assertTrue(marker.encode() in clean)
+        _ = saved.path.write_bytes(clean.replace(marker.encode(), (marker + legacy).encode(), 1))
+        return proof, token, clean
+
+    def test_server_ignores_fenced_store_examples_in_the_vault(self) -> None:
+        vault = self.root.parent / "vault"
+        vault.mkdir()
+        guide = vault / "guide.md"
+        _ = guide.write_text(f"# Example\n\n```markdown\n- **Proposals:** `{self.outside}`\n```\n")
+
+        with (patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              started_review_server(("127.0.0.1", 0), self.root, initialize_review=True) as server):
+            self.assertGreater(server.server_port, 0)
+
+    def test_server_resolves_the_owner_of_a_legacy_question_before_bind(self) -> None:
+        from scripts.review_links.test_review_submissions import request
+
+        vault = self.root.parent / "vault"
+        vault.mkdir()
+        folder = vault / "notes"
+        document = vault / "production.md"
+        _ = document.write_text("# Restored\n> **Status: PRODUCTION — running.**\n\n"
+                                + f"- **Merge branch:** main\n- **Showrunner checkout:** `{vault}`\n"
+                                + f"- **Log:** log.md\n- **Proposals:** `{folder}`\n")
+        owner = fixture_member("showrunner", name="ownerless-question", doc=staff.LiveDoc(local_machine(), document))
+        members = staff.StaffSnapshot((owner,))
+        self.enterContext(patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)}))
+        with staff.supplied_snapshot(members):
+            saved = review_submissions.submit(request(new_item_dialog.SubmissionKind.QUESTION, recipient=owner.id))
+        proof, token, clean = self.put_legacy_reply_proof_in_note(saved)
+        owner_line = f"production_id: {owner.id}\n".encode()
+        self.assertTrue(owner_line in clean)
+        legacy = saved.path.read_bytes().replace(owner_line, b"", 1)
+        _ = saved.path.write_bytes(legacy)
+        shutil.rmtree(record_store.state_root() / "review-folders")
+
+        with (patch.object(staff, "is_owner", return_value=False),
+              patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())),
+              patch.object(staff, "authority_snapshot", return_value=staff.StaffSnapshot(())) as authority,
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending")):
+            with (patch.object(serve.ReviewLinksServer, "server_bind") as bind,
+                  self.assertRaisesRegex(OSError, "reply proof move failed")):
+                with started_review_server(("127.0.0.1", 0), self.root, initialize_review=True):
+                    self.fail("The server started without a Question owner.")
+            bind.assert_not_called()
+            authority.assert_called_once()
+            self.assertTrue(saved.path.read_bytes() == legacy)
+            authority.reset_mock()
+            authority.return_value = members
+            with started_review_server(("127.0.0.1", 0), self.root, initialize_review=True) as server:
+                self.assertGreater(server.server_port, 0)
+            authority.assert_called()
+        self.assertTrue(saved.path.read_bytes() == clean.replace(owner_line, b"", 1))
+        self.assertTrue(reply_proofs.read(saved.details.proof_identity(saved.id)).reply == proof)
+        self.assertTrue(review_submissions.answer(saved.key, "Restored reply", token, members=members))
+
+    def test_server_moves_proofs_before_a_waiting_wrap(self) -> None:
+        from scripts.review_links.test_review_submissions import request
+
+        parent_doc, child_doc = (self.root.parent / f"{role}.md" for role in ("parent", "child"))
+        text = ("# Showrunner\n> **Status: PRODUCTION — running.**\n\n"
+                + f"- **Merge branch:** main\n- **Showrunner checkout:** `{self.root.parent}`\n- **Log:** log.md\n")
+        _ = parent_doc.write_text(text)
+        _ = child_doc.write_text(text)
+        parent = fixture_member("showrunner", name="wrap-parent", doc=staff.LiveDoc(local_machine(), parent_doc))
+        child = fixture_member("showrunner", name="wrap-child", parent=parent.id, doc=staff.LiveDoc(local_machine(), child_doc))
+        members = staff.StaffSnapshot((parent, child))
+        self.enterContext(patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)}))
+        with staff.supplied_snapshot(members):
+            saved = review_submissions.submit(request(new_item_dialog.SubmissionKind.QUESTION, recipient=child.id))
+        proof, token, clean = self.put_legacy_reply_proof_in_note(saved)
+        old_owner = f"production_id: {child.id}\n".encode()
+        new_owner = f"production_id: {parent.id}\n".encode()
+        expected = clean.replace(old_owner, new_owner, 1)
+        folder = update_registration.QuestionFolder(record_store.default_question_folder(parent.id), parent.id)
+        target = update_registration.review_question_path(folder, saved.request_id)
+        _ = child_doc.write_text(text.replace("— running.**", "— wrapped.**"))
+
+        wrap_waiting = threading.Event()
+        start_wrap = threading.Event()
+        starting_server = threading.current_thread()
+        locked = review_later.locked
+        scan = record_store.local_review_paths
+
+        @contextmanager
+        def observe_lock() -> Generator[Path]:
+            if threading.current_thread() is starting_server:
+                with locked() as later:
+                    yield later
+                return
+            lock_path = review_later.path().with_suffix(".lock")
+            availability = file_lock.probe_existing_exclusive(lock_path)
+            wrap_waiting.set()
+            self.assertEqual(availability, file_lock.LockAvailability.HELD)
+            with locked() as later:
+                self.assertTrue(saved.path.read_bytes() == clean)
+                yield later
+
+        def scan_with_wrap(extra_roots: tuple[Path, ...] = ()) -> Generator[Path]:
+            start_wrap.set()
+            self.assertTrue(wrap_waiting.wait(TEST_HANG_GUARD_SECS))
+            yield from scan(extra_roots)
+            self.assertTrue(saved.path.read_bytes() == clean)
+            self.assertFalse(target.exists())
+
+        def wrap_during_scan() -> None:
+            self.assertTrue(start_wrap.wait(TEST_HANG_GUARD_SECS))
+            with staff.supplied_snapshot(members):
+                tidy_wrapped.keep_open_review_items(
+                    child, (), child_doc, update_registration.QuestionStaff.for_record(members))
+
+        with (patch.object(record_store, "local_review_paths", side_effect=scan_with_wrap),
+              patch.object(review_later, "locked", side_effect=observe_lock),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              ThreadPoolExecutor(max_workers=1) as worker):
+            future = worker.submit(wrap_during_scan)
+            with started_review_server(("127.0.0.1", 0), self.root, initialize_review=True) as server:
+                self.assertGreater(server.server_port, 0)
+                future.result(timeout=TEST_HANG_GUARD_SECS)
+                self.assertFalse(saved.path.exists())
+                self.assertTrue(target.read_bytes() == expected)
+                self.assertTrue(reply_proofs.read(saved.details.proof_identity(saved.id)).reply == proof)
+                self.assertTrue(review_submissions.answer(saved.key, "Reply after wrap", token, members=members))
+
+    def test_server_skips_notes_that_vanish_during_the_reply_proof_scan(self) -> None:
+        from scripts.review_links.test_review_submissions import request
+
+        owner = fixture_member("producer", name="vanished-note")
+        members = staff.StaffSnapshot((owner,))
+        self.enterContext(patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)}))
+        for stage in ("enumeration", "header", "locked reread"):
+            with self.subTest(stage=stage), staff.supplied_snapshot(members):
+                saved = review_submissions.submit(request(new_item_dialog.SubmissionKind.QUESTION, stage, recipient=owner.id))
+                _ = self.put_legacy_reply_proof_in_note(saved)
+                self.check_vanished_proof_source(saved.path, stage)
+                self.assertFalse(saved.path.exists())
+                self.assertFalse(reply_proofs.path_for(saved.details.proof_identity(saved.id)).exists())
+
+    def check_vanished_proof_source(self, source: Path, stage: str) -> None:
+        scanned = record_store._review_scan_entries  # pyright: ignore[reportPrivateUsage]
+        header = review_submissions._proof_move_header  # pyright: ignore[reportPrivateUsage]
+        read_note = record_store.read_note_for_proof_move
+
+        def scan(folder: Path) -> tuple[os.DirEntry[str], ...]:
+            entries = scanned(folder)
+            if stage == "enumeration" and folder == source.parent:
+                self.assertTrue(any(entry.name == source.name for entry in entries))
+                source.unlink()
+                vanished = Mock(is_file=Mock(side_effect=FileNotFoundError()))
+                vanished.name = source.name
+                return tuple(cast(os.DirEntry[str], vanished) if entry.name == source.name else entry for entry in entries)
+            return entries
+
+        def read_header(path: Path) -> Issue:
+            if stage == "header" and path == source:
+                source.unlink()
+            return header(path)
+
+        def read_under_lock(path: Path) -> str | record_store.VanishedReviewNote:
+            if stage == "locked reread" and path == source:
+                source.unlink()
+            return read_note(path)
+
+        with (patch.object(record_store, "_review_scan_entries", side_effect=scan),
+              patch.object(review_submissions, "_proof_move_header", side_effect=read_header),
+              patch.object(record_store, "read_note_for_proof_move", side_effect=read_under_lock),
+              patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending"),
+              started_review_server(("127.0.0.1", 0), self.root, initialize_review=True) as server):
+            self.assertGreater(server.server_port, 0)
+
+    def test_server_refuses_proof_move_read_and_write_failures_before_bind(self) -> None:
+        from scripts.review_links.test_review_submissions import request
+
+        owner = fixture_member("producer", name="move-failure")
+        members = staff.StaffSnapshot((owner,))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)})))
+        saved = review_submissions.submit(request(new_item_dialog.SubmissionKind.INVESTIGATION, recipient=owner.id))
+        _ = self.put_legacy_reply_proof_in_note(saved)
+        proof_path = reply_proofs.path_for(saved.details.proof_identity(saved.id))
+        old = saved.path.read_bytes()
+        header = review_submissions._proof_move_header  # pyright: ignore[reportPrivateUsage]
+        write_locked = atomic_file.write_locked_atomic
+
+        def unreadable(path: Path) -> Issue:
+            if path == saved.path:
+                raise PermissionError("Cannot read the note.")
+            return header(path)
+
+        def failed_write(path: Path, content: str | bytes, *, mode: int | None = None) -> None:
+            if path == proof_path:
+                raise FileNotFoundError("Cannot write the proof.")
+            write_locked(path, content, mode=mode)
+
+        failures = (patch.object(review_submissions, "_proof_move_header", side_effect=unreadable),
+                    patch.object(atomic_file, "write_locked_atomic", side_effect=failed_write))
+        for failure in failures:
+            with (failure, patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+                  patch.object(serve.ReviewLinksServer, "server_bind") as bind,
+                  redirect_stderr(StringIO()) as errors):
+                self.assertEqual(serve.main(["--port", "0"]), 1)
+            self.assertIn("Cannot start Review links because the reply proof move failed.", errors.getvalue())
+            bind.assert_not_called()
+            self.assertTrue(saved.path.read_bytes() == old)
+            self.assertFalse(proof_path.exists())
+
+    def test_server_moves_reply_proofs_before_serving(self) -> None:
+        from scripts.review_links.test_review_submissions import request
+
+        owner = fixture_member("producer", name="proof-owner")
+        members = staff.StaffSnapshot((owner,))
+        _ = self.enterContext(patch.object(staff, "snapshot", return_value=members))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(self.root)})))
+        saved = review_submissions.submit(request(review_submissions.SubmissionKind.INVESTIGATION, recipient=owner.id))
+        proof = review_submissions.current_reply_proof(saved.key)
+        identity = saved.details.proof_identity(saved.id)
+        reply_proofs.path_for(identity).unlink()
+        clean = saved.path.read_text(newline="")
+        marker = json.dumps('"images": []')[1:-1]
+
+        def legacy_note(digest: str) -> str:
+            fields = {"reply_token_sha256": digest, "reply_token_nonce": proof.nonce}
+            addition = json.dumps(", " + json.dumps(fields)[1:-1])[1:-1]
+            return clean.replace(marker, marker + addition, 1)
+
+        rejected = legacy_note("invalid")
+        self.assertTrue(rejected != clean)
+        _ = saved.path.write_text(rejected)
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve.ReviewLinksServer, "server_bind") as bind,
+              patch.object(serve.ReviewLinksServer, "serve_forever") as serve_requests,
+              redirect_stderr(StringIO()) as errors):
+            self.assertEqual(serve.main(["--port", "0"]), 1)
+        self.assertIn("Cannot start Review links because the reply proof move failed.", errors.getvalue())
+        bind.assert_not_called()
+        serve_requests.assert_not_called()
+        self.assertTrue(saved.path.read_text(newline="") == rejected)
+
+        _ = saved.path.write_text(legacy_note(proof.sha256))
+        with (patch.object(serve, "loaded_module_stamps", return_value={}),
+              patch.object(change_page, "recover_pending"), patch.object(list_page, "recover_pending")):
+            server = self.enterContext(started_review_server(("127.0.0.1", 0), self.root, initialize_review=True))
+        self.assertTrue(saved.path.read_text(newline="") == clean)
+        self.assertTrue(reply_proofs.read(identity).reply == proof)
+        self.assertTrue(review_submissions.current_reply_proof(saved.key) == proof)
+        self.port = server.server_port
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)
+        self.addCleanup(server.shutdown)
+        self.assertEqual(self.request(review_page.PAGE_PATH).status, 200)
 
     def test_server_initializes_review_on_a_fresh_root(self) -> None:
         with (patch.object(serve, "loaded_module_stamps", return_value={}),

@@ -9,9 +9,10 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import Enum, StrEnum
 from typing import Literal, cast
+from uuid import UUID, uuid4
 
 from scripts.production import staff
-from scripts.review_links import page_frame, reply_tokens
+from scripts.review_links import page_frame, reply_proofs, reply_tokens
 
 
 MAX_WORDS_LENGTH = 40_000
@@ -357,33 +358,40 @@ class ReviewSubmission:
     request_digest: str
     evidence: Evidence
     images: tuple[ImageReference, ...]
-    reply_token_sha256: str
     page: str = ""
     page_state: BugPageState | None = None
     page_state_data: PageDataEvidence | None = None
     capture_intent: SubmissionCaptureIntent = NoDeferredCapture.ABSENT
-    reply_token_nonce: str = ""
-    legacy_reply_token: str = field(default="", repr=False, compare=False)
     notice: Notice = DefaultSubmissionNotice.FILED_KIND_FROM_REVIEW
     assignment: Assignment = ProducerAssigns()
     image_digests: tuple[tuple[str, str], ...] = field(default=(), kw_only=True)
 
-    def __post_init__(self) -> None:
-        if reply_tokens.valid(self.reply_token_sha256):
-            token = self.reply_token_sha256
-            object.__setattr__(self, "reply_token_sha256", reply_tokens.digest(token))
-            object.__setattr__(self, "legacy_reply_token", token)
-
-    @property
-    def reply_proof(self) -> reply_tokens.ReplyTokenProof:
-        return reply_tokens.ReplyTokenProof(self.reply_token_nonce, self.reply_token_sha256)
+    reply_proof: reply_tokens.ReplyProof = field(default=reply_tokens.MISSING_REPLY_PROOF, kw_only=True, repr=False)
+    reply_wait_revision: reply_proofs.ReplyWaitRevision = field(default=reply_proofs.INITIAL_REPLY_WAIT, kw_only=True)
 
     @property
     def reply_token(self) -> str:
-        return reply_tokens.derive(self.reply_proof) if self.reply_token_nonce else self.legacy_reply_token
+        return reply_tokens.derive(self.reply_proof) if isinstance(self.reply_proof, reply_tokens.ReplyTokenProof) else ""
 
-    def with_reply_proof(self, proof: reply_tokens.ReplyTokenProof) -> ReviewSubmission:
-        return replace(self, reply_token_sha256=proof.sha256, reply_token_nonce=proof.nonce, legacy_reply_token="")
+    @property
+    def reply_token_sha256(self) -> str:
+        return self.reply_proof.sha256 if not isinstance(self.reply_proof, reply_tokens.MissingReplyProof) else ""
+
+    @property
+    def reply_token_nonce(self) -> str:
+        return self.reply_proof.nonce if isinstance(self.reply_proof, reply_tokens.ReplyTokenProof) else ""
+
+    def with_reply_proof(self, proof: reply_tokens.ReplyProof) -> ReviewSubmission:
+        return replace(self, reply_proof=proof)
+
+    def proof_identity(self, number: str) -> reply_proofs.SubmissionIdentity:
+        return reply_proofs.SubmissionIdentity(number, self.request_id, self.reply_wait_revision)
+
+    def next_reply_wait(self, number: str, proof: reply_tokens.ReplyTokenProof) -> ReviewSubmission:
+        """Save the next proof before the caller writes the next wait."""
+        next_wait = replace(self, reply_proof=proof, reply_wait_revision=reply_proofs.ReplyWaitRevision(str(uuid4())))
+        reply_proofs.stage_wait(next_wait.proof_identity(number), proof)
+        return next_wait
 
     @property
     def bug_page_data(self) -> PageDataEvidence | None:
@@ -746,7 +754,9 @@ def stored_submission(details: ReviewSubmission) -> dict[str, object]:
     """Write the submission fields inside the native record."""
     fields = cast(dict[str, object], asdict(details))
     fields["evidence"] = evidence_fields(details.evidence)
-    _ = fields.pop("legacy_reply_token")
+    _ = fields.pop("reply_proof")
+    if details.reply_wait_revision == reply_proofs.INITIAL_REPLY_WAIT:
+        _ = fields.pop("reply_wait_revision")
     if details.image_digests:
         fields["image_digests"] = dict(details.image_digests)
     else:
@@ -756,8 +766,6 @@ def stored_submission(details: ReviewSubmission) -> dict[str, object]:
     _ = fields.pop("assignment")
     if isinstance(details.assignment, ChosenAssignee):
         fields["assignee_id"] = details.assignment.id
-    if not details.reply_token_nonce:
-        _ = fields.pop("reply_token_nonce")
     if details.page_state is None:
         _ = fields.pop("page_state")
     if details.page_state_data is None:
@@ -800,40 +808,23 @@ def read_submission(value: object) -> ReviewSubmission:
     data = read_evidence(row["page_state_data"]) if row.get("page_state_data") is not None else None
     if data is not None and not isinstance(data, PageDataEvidence):
         raise SubmissionError("Invalid page data in Review submission.")
-    digest = row.get("reply_token_sha256")
-    legacy = row.get("reply_token")
-    if digest is None and isinstance(legacy, str) and reply_tokens.valid(legacy):
-        digest = reply_tokens.digest(legacy)
-    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise SubmissionError("Invalid reply token hash.")
-    nonce = row.get("reply_token_nonce", "")
-    if not isinstance(nonce, str) or nonce and not reply_tokens.valid_nonce(nonce):
-        raise SubmissionError("Invalid reply token nonce.")
+    revision = row.get("reply_wait_revision", reply_proofs.INITIAL_REPLY_WAIT)
+    if not isinstance(revision, str):
+        raise SubmissionError("Invalid reply wait revision.")
+    if revision:
+        try:
+            if str(UUID(revision)) != revision:
+                raise ValueError
+        except ValueError:
+            raise SubmissionError("Invalid reply wait revision.") from None
     return ReviewSubmission(
         read_request_id(row.get("request_id")), _text(row.get("request_digest"), "Request digest", 64),
         read_evidence(row.get("evidence")), images,
-        digest, page, read_bug_page_state(row.get("page_state")), data,
+        page, read_bug_page_state(row.get("page_state")), data,
         capture_intent=_read_capture_intent(row["capture_intent"]) if "capture_intent" in row else NoDeferredCapture.ABSENT,
-        reply_token_nonce=nonce,
+        reply_wait_revision=reply_proofs.ReplyWaitRevision(revision),
         image_digests=tuple(image_digests),
-        legacy_reply_token=legacy if isinstance(legacy, str) and reply_tokens.matches(digest, legacy) else "",
         notice=_read_notice(row.get("notice")), assignment=_read_assignment(row.get("assignee_id")))
-
-
-def hashed_submission_fields(value: dict[str, object], details: ReviewSubmission) -> dict[str, object]:
-    """Replace the legacy token and retain all other submission fields."""
-    if "reply_token" not in value:
-        return value
-    return {("reply_token_sha256" if name == "reply_token" else name):
-            (details.reply_token_sha256 if name == "reply_token" else field)
-            for name, field in value.items() if name != "reply_token" or "reply_token_sha256" not in value}
-
-
-def renewed_submission_fields(value: dict[str, object], proof: reply_tokens.ReplyTokenProof) -> dict[str, object]:
-    """Replace the token proof and preserve the other submission fields."""
-    fields = {**value, "reply_token_sha256": proof.sha256, "reply_token_nonce": proof.nonce}
-    _ = fields.pop("reply_token", None)
-    return fields
 
 
 def decode_submission(value: str) -> SubmissionOrigin:
@@ -841,7 +832,15 @@ def decode_submission(value: str) -> SubmissionOrigin:
 
 
 def matches_reply_token(details: ReviewSubmission, token: str) -> bool:
-    return reply_tokens.matches(details.reply_token_sha256, token)
+    proof = details.reply_proof
+    return (not isinstance(proof, reply_tokens.MissingReplyProof)
+            and reply_tokens.matches(proof.sha256, reply_tokens.RawReplyToken(token)))
+
+
+def matches_reply_reference(details: ReviewSubmission, reference: str) -> bool:
+    proof = details.reply_proof
+    return (not isinstance(proof, reply_tokens.MissingReplyProof)
+            and reply_tokens.matches_reference(proof.sha256, reply_tokens.read_reference(reference)))
 
 
 def require_reply_token(details: SubmissionOrigin, token: str) -> None:

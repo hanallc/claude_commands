@@ -21,7 +21,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
 from scripts.production import behavior_check, behavior_request, staff, update_registration, worker
 from scripts.production.production_doc import Refusal
-from scripts.review_links import review_events
+from scripts.review_links import reply_proofs, review_events
 
 
 @dataclass(frozen=True)
@@ -492,7 +492,7 @@ def recover_question(key: str) -> (
         return behavior_check.NoReview.MISSING
     identities = update_registration.QuestionStaff.read()
     scope = update_registration.question_scope(owner, identities.record)
-    record = update_registration.keyed_question(scope, identities, key)
+    record = update_registration.keyed_question(scope, identities, reply_proofs.StaffQuestionRequestKey(key))
     if record is None:
         return behavior_check.NoReview.MISSING
     waiting = waiting_question(record)
@@ -513,7 +513,7 @@ def ask(key: str, parts: update_registration.QuestionParts, reference: str) -> b
         scope = update_registration.question_scope(owner, identities.record)
     record = update_registration.ask(scope, parts["ask"], parts, unit,
                                      update_registration.Ranking(urgency.Urgency(urgency.BLOCKS)),
-                                     identities=identities, outgoing=update_registration.KeyedStaffQuestion(key))
+                                     identities=identities, outgoing=update_registration.KeyedStaffQuestion(reply_proofs.StaffQuestionRequestKey(key)))
     return waiting_question(record)
 
 
@@ -521,7 +521,7 @@ def question_answer(key: str, owner: str, number: str) -> (
     behavior_check.Waiting | behavior_check.Answered | behavior_check.InvalidAnswer
 ):
     record = update_registration.numbered_question(staff.StaffId(owner), number)
-    if record is None or record.owner != owner or record.item.get("request_key") != key:
+    if record is None or record.owner != owner or update_registration.question_request(record) != reply_proofs.StaffQuestionRequestKey(key):
         raise behavior_check.BehaviorCheckError(f"Cannot read the behavior question {number}.")
     if record.status != "closed":
         return behavior_check.Waiting(number, owner)

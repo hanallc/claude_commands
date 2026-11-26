@@ -1,6 +1,7 @@
 """Store items sent from the New item dialog and their replies."""
 from __future__ import annotations
 
+import argparse
 import base64
 import binascii
 import hashlib
@@ -19,6 +20,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
+from functools import cache
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
@@ -27,14 +29,14 @@ from scripts.lib import atomic_file, conf
 from scripts.lib.file_lock import LockResult, exclusive
 from scripts.lib.user_zone import user_zone
 from scripts.production import investigation, producer_map, proposal_issue, record_store, staff, unrouted_alert, update_registration
-from scripts.production.issues import Issue
+from scripts.production.issues import Issue, header_fields
 from scripts.production.production_doc import WRAPPED, Refusal
-from scripts.review_links import image_store, list_draft, new_item_dialog, page_frame, reply_tokens, review_events, review_link
+from scripts.review_links import image_store, list_draft, new_item_dialog, page_frame, reply_proofs, reply_tokens, review_events, review_later, review_link
 from scripts.review_links.new_item_dialog import (
     KEY_PREFIX as KEY_PREFIX, NATIVE_ID_PREFIX, check_recipient_id,
     ScopedSubmissionKey, read_submission_key, require_request_binding, submission_key as submission_key,
     IMAGE_FORMATS, MAX_IMAGES, MAX_IMAGE_BYTES, MAX_TOTAL_IMAGE_BYTES, ImageReference, max_base64_size,
-    read_kind, read_request_id, read_words, read_submission,
+    read_kind, read_request_id, read_words,
     ByRequestId, BuildCell as BuildCell, BuildStepEvidence as BuildStepEvidence, Evidence as Evidence,
     MemoryReading as MemoryReading,
     MemorySegment as MemorySegment, MemoryTone as MemoryTone, NewItemRequest as NewItemRequest,
@@ -178,8 +180,8 @@ type NativeSubmittedRecord = update_registration.QuestionRecord | Issue | invest
 def native_origin(record: NativeSubmittedRecord) -> new_item_dialog.SubmissionOrigin:
     """Read the typed origin from a native record."""
     if isinstance(record, update_registration.QuestionRecord):
-        details = record.item.get("review_submission")
-        return read_submission(details) if details is not None else new_item_dialog.NoReviewSubmission()
+        return (update_registration.review_submission(record) if "review_submission" in record.item
+                else new_item_dialog.NoReviewSubmission())
     if isinstance(record, Issue):
         return proposal_issue.review_submission(record)
     return record.submission
@@ -233,6 +235,7 @@ class SavedSubmission(NativeSubmissionDestination):
     record: NativeSubmittedRecord = field(compare=False)
     reused: bool = field(default=False, compare=False)
     attachments: SavedAttachments = field(kw_only=True, compare=False)
+    details: ReviewSubmission = field(kw_only=True, compare=False, repr=False)
 
     @property
     def words(self) -> str:
@@ -248,13 +251,6 @@ class SavedSubmission(NativeSubmissionDestination):
     @property
     def key(self) -> str:
         return submission_key(self.kind, self.recipient_id, self.id, self.request_id)
-
-    @property
-    def details(self) -> ReviewSubmission:
-        details = native_origin(self.record)
-        if not isinstance(details, ReviewSubmission):
-            raise OSError(f"Cannot read the native Review origin for {self.id}.")
-        return details
 
     @property
     def awaiting_reply(self) -> bool:
@@ -1167,10 +1163,13 @@ def _has_receipt_for(saved: NativeSubmissionDestination) -> bool:
 
 def _saved_submission(saved: NativeSubmissionDestination, record: NativeSubmittedRecord, *,
                       attachments: SavedAttachments, edited: bool = False) -> SavedSubmission:
+    details = native_origin(record)
+    if not isinstance(details, ReviewSubmission):
+        raise OSError(f"Cannot read the native Review origin for {saved.id}.")
     result = EditedSubmission if edited else SavedSubmission
     return result(saved.id, saved.kind, saved.recipient_id, saved.request_id, saved.payload_hash,
                   saved.path, saved.original_path, saved.owner, record, browser_token_digest=saved.browser_token_digest,
-                  has_capture_intent=saved.has_capture_intent, attachments=attachments)
+                  has_capture_intent=saved.has_capture_intent, attachments=attachments, details=details)
 
 
 def _complete_receipt(folder: Path, saved: NativeSubmissionDestination, hint: RequestFile,
@@ -1759,7 +1758,8 @@ def _file_question_for_remote_owner(recipient: staff.StaffRow, title: str, membe
     record = update_registration.QuestionRecord(path, owner, owner, item, "open")
     with staff.supplied_snapshot(members), update_registration.outstanding_lock(
             update_registration.outstanding_path_for_owner(owner)):
-        return update_registration._file_question(record, outgoing.before_write)  # pyright: ignore[reportPrivateUsage]
+        return update_registration._file_question(  # pyright: ignore[reportPrivateUsage]
+            record, outgoing.before_write, reply_proof=outgoing.details.reply_proof)
 
 
 def _file(kind: SubmissionKind, recipient: staff.StaffRow, title: str, words: str, details: ReviewSubmission,
@@ -2556,9 +2556,9 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
             pending_file = folder / "pending.json"
             images = tuple(upload.reference for upload in uploads)
             proof = reply_tokens.mint()
-            details = ReviewSubmission(request_id, payload_hash, evidence, images, proof.sha256,
+            details = ReviewSubmission(request_id, payload_hash, evidence, images,
                                        page=request.page, page_state=request.page_state, capture_intent=capture_intent,
-                                       reply_token_nonce=proof.nonce, notice=notice, assignment=request.assignment,
+                                       reply_proof=proof, notice=notice, assignment=request.assignment,
                                        image_digests=tuple((upload.reference.id, upload.digest) for upload in uploads))
             title = submission_title(words)
             destinations: list[NativeSubmissionDestination] = []
@@ -2691,19 +2691,22 @@ def read_attached_page_screenshot(target: ScopedSubmissionKey, request: new_item
 
 
 def current_reply_proof(key: str) -> reply_tokens.ReplyTokenProof:
-    """Read the proof from the current native note for a saved delivery."""
+    """Find the current native note and get its proof for a saved delivery."""
     scoped = read_submission_key(key)
     address = _request_address(scoped.kind, scoped.recipient_id, scoped.request_id)
     located = locate_native_submission(address, _request_hint(address))
     if not isinstance(located, LocatedSubmission) or located.destination.id != scoped.item_id:
         raise reply_tokens.UnavailableReplyToken("Cannot find the note for this reply token.")
-    return located.details.reply_proof
+    proof = located.details.reply_proof
+    if not isinstance(proof, reply_tokens.ReplyTokenProof):
+        raise reply_tokens.UnavailableReplyToken("The item has no proof for delivery.")
+    return proof
 
 
 def renew_legacy_reply(located: LocatedSubmission) -> SavedSubmission:
-    """Give a waiting legacy note a new proof while the caller holds the recipient locks."""
+    """Give a waiting legacy item a new proof while the caller holds its recipient locks."""
     saved = located.saved()
-    if not saved.awaiting_reply or saved.details.reply_token_nonce:
+    if not saved.awaiting_reply or not isinstance(saved.details.reply_proof, reply_tokens.LegacyReplyProof):
         return saved
     target = located.destination
     lock = (update_registration.wrap_question_locks(target.owner) if target.kind == SubmissionKind.QUESTION
@@ -2713,23 +2716,14 @@ def renew_legacy_reply(located: LocatedSubmission) -> SavedSubmission:
         current = _read_native_submission(target.address, target.path, target.owner)
         if not isinstance(current, LocatedSubmission) or current.destination.id != target.id:
             raise reply_tokens.UnavailableReplyToken("Cannot find the note for this reply token.")
-        record = current.record
-        if _awaiting_reply(record) and not current.details.reply_token_nonce:
-            proof = reply_tokens.mint()
-            match record:
-                case update_registration.QuestionRecord():
-                    fields = record.item.get("review_submission", {})
-                    _ = update_registration.write_review_submission(
-                        record, new_item_dialog.renewed_submission_fields(fields, proof))
-                case Issue():
-                    proposal_issue.renew_reply_proof(record, proof)
-                case investigation.Investigation():
-                    investigation.renew_reply_proof(target.path, record, proof)
-            updated = _read_native_submission(target.address, target.path, target.owner)
-            if not isinstance(updated, LocatedSubmission) or updated.destination.id != target.id:
+        if _awaiting_reply(current.record) and isinstance(current.details.reply_proof, reply_tokens.LegacyReplyProof):
+            identity = current.details.proof_identity(target.id)
+            with reply_proofs.publishing(identity, reply_proofs.NoteProof(reply=reply_tokens.mint())):
+                pass
+            current = _read_native_submission(target.address, target.path, target.owner)
+            if not isinstance(current, LocatedSubmission) or current.destination.id != target.id:
                 raise reply_tokens.UnavailableReplyToken("Cannot read the renewed reply proof.")
-            record = updated.record
-        return replace(saved, path=target.path, owner=target.owner, record=record)
+        return replace(saved, path=target.path, owner=target.owner, record=current.record, details=current.details)
 
 
 def _with_screenshot(details: ReviewSubmission, owner: staff.StaffId,
@@ -2913,43 +2907,146 @@ def answer(key: str, words: str, reply_token: str, *, members: staff.StaffSnapsh
         raise SubmissionError(str(error)) from error
 
 
-def scrub_reply_tokens(members: staff.StaffSnapshot) -> int:
-    """Convert legacy reply tokens in the native stores and archives."""
-    kinds = (record_store.RecordKind.QUESTION, record_store.RecordKind.PROPOSAL,
-             record_store.RecordKind.INVESTIGATION)
-    folders = tuple(folder for kind in kinds for folder in record_store.staff_store_folders(kind, members=members))
-    changed = 0
-    keys = frozenset(("record_type", "registration", "review_submission", "id", "owner"))
-    for path in record_store.stored_paths(folders, strict=True):
-        fields = Issue(path, record_store.read_header(path, strict=True, keys=keys))
+@dataclass(frozen=True)
+class LocalProofMove:
+    """Use local stores and resolve legacy owners as needed."""
+
+    review_root: Path
+    extra_roots: tuple[Path, ...] = ()
+
+
+def _proof_move_header(path: Path) -> Issue:
+    with path.open("rb") as stream:
+        if stream.readline().strip() == b"---":
+            lines: list[bytes] = []
+            has_proof_name = False
+            for line in stream:
+                if line.strip() == b"---":
+                    if has_proof_name:
+                        keys = frozenset(("record_type", "registration", "review_submission", "id", "production_id", "tags"))
+                        return Issue(path, header_fields([entry.decode("utf-8") for entry in lines], keys))
+                    break
+                lines.append(line)
+                has_proof_name |= (line.startswith((b"registration:", b"review_submission:"))
+                                   and (b"reply_token" in line or b"request_key" in line))
+            else:
+                if has_proof_name:
+                    raise ValueError("A note with legacy proof fields has no closing header fence.")
+    return Issue(path, {})
+
+
+def _has_legacy_proof_fields(issue: Issue) -> bool:
+    if issue.value("record_type") != "question":
+        return reply_proofs.header_has_legacy_submission(issue.value("review_submission"))
+    registration = issue.value("registration")
+    if not any(f'"{name}"' in registration for name in (*reply_proofs.SUBMISSION_FIELDS, "request_key")):
+        return False
+    parsed = cast(object, json.loads(registration))
+    if not isinstance(parsed, dict):
+        raise ValueError("A legacy Question has invalid registration fields.")
+    fields = cast(dict[str, object], parsed)
+    submission = fields.get("review_submission")
+    return "request_key" in fields or (isinstance(submission, dict)
+            and reply_proofs.has_legacy_submission(cast(dict[str, object], submission)))
+
+
+def _require_legacy_transfers_finished(root: Path) -> None:
+    for journal in pending_submission_moves(root):
+        move = _read_request_file(journal, journal.parent.name)
+        if isinstance(move, SubmissionMove):
+            for path in (move.source, move.path):
+                try:
+                    issue = _proof_move_header(path)
+                except FileNotFoundError:
+                    continue
+                if _has_legacy_proof_fields(issue):
+                    raise OSError("The Review transfer must finish before its reply proof can move.")
+
+
+def _question_proof_roots(members: staff.StaffSnapshot) -> dict[staff.StaffId, tuple[Path, ...]]:
+    question = record_store.RecordKind.QUESTION
+    return {
+        owner: record_store.known_folders(question, owner, document=record_store.local_document(row), strict=True)
+        for owner, row in record_store.store_owners(question, members, strict=True).items()
+        if owner
+    }
+
+
+def _question_proof_owners(path: Path, roots: Mapping[staff.StaffId, tuple[Path, ...]]) -> tuple[staff.StaffId, ...]:
+    return tuple(owner for owner, folders in roots.items() if path.parent in folders or
+                 any(path.is_relative_to(archive) for archive in record_store.archive_folders(folders)))
+
+
+def move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove, *, dry_run: bool) -> tuple[int, int]:
+    """Hold the same transfer lock as wrap through the complete move."""
+    with nullcontext() if dry_run else review_later.locked():
+        return _move_reply_proofs(discovery, dry_run=dry_run)
+
+
+def _move_reply_proofs(discovery: staff.StaffSnapshot | LocalProofMove, *, dry_run: bool) -> tuple[int, int]:
+    if isinstance(discovery, LocalProofMove) and not dry_run:
+        _require_legacy_transfers_finished(discovery.review_root)
+
+    @cache
+    def authority_roots() -> dict[staff.StaffId, tuple[Path, ...]]:
+        return _question_proof_roots(staff.initial_snapshot())
+
+    @cache
+    def local_owner_roots() -> dict[staff.StaffId, tuple[Path, ...]]:
+        if isinstance(discovery, staff.StaffSnapshot):
+            return _question_proof_roots(discovery)
+        if staff.is_owner():
+            return authority_roots()
+        try:
+            members = staff.local_snapshot()
+        except staff.StaffUnreadable:
+            members = staff.StaffSnapshot(())
+        return _question_proof_roots(members)
+
+    notes = fields_moved = 0
+    extra_roots = discovery.extra_roots if isinstance(discovery, LocalProofMove) else ()
+    for path in record_store.local_review_paths(extra_roots):
+        try:
+            fields = _proof_move_header(path)
+        except FileNotFoundError:
+            continue
+        if not _has_legacy_proof_fields(fields):
+            continue
         if fields.value("record_type") == "question":
-            if '"reply_token"' not in fields.value("registration"):
-                continue
-            question = update_registration.read_review_question(path)
-            saved = update_registration.scrub_reply_token(path, question.owner)
-        elif not re.search(r'\breply_token\\?"\s*:', fields.value("review_submission")):
-            continue
-        elif fields.value("record_type") == "proposal":
-            saved = proposal_issue.scrub_reply_token(path)
-        elif fields.value("id") and fields.value("owner"):
-            saved = investigation.scrub_reply_token(path, staff.StaffId(fields.value("owner")), fields.value("id"))
+            owner = staff.StaffId(fields.value("production_id"))
+            if not owner:
+                candidates = _question_proof_owners(path, local_owner_roots())
+                if len(candidates) != 1 and isinstance(discovery, LocalProofMove):
+                    candidates = _question_proof_owners(path, authority_roots())
+                if len(candidates) != 1:
+                    raise ValueError("Cannot resolve the owner of a legacy Question with reply proof fields.")
+                owner, = candidates
+            count = update_registration.move_reply_proof(path, dry_run=dry_run, legacy_owner=owner)
+        elif fields.value("record_type") == "proposal" or "proposal" in fields.fields.get("tags", []):
+            count = proposal_issue.move_reply_proof(path, dry_run=dry_run)
+        elif fields.value("id"):
+            count = investigation.move_reply_proof(path, dry_run=dry_run)
         else:
-            continue
-        if saved:
-            changed += 1
-            print(f"Rewrote {path}")
-    return changed
+            raise ValueError("Cannot identify a note with reply proof fields.")
+        notes += bool(count)
+        fields_moved += count
+    return notes, fields_moved
 
 
 def main(argv: list[str]) -> int:
-    if argv != ["scrub-reply-tokens"]:
-        print("usage: python -m scripts.review_links.review_submissions scrub-reply-tokens", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(prog="python -m scripts.review_links.review_submissions")
+    commands = parser.add_subparsers(required=True)
+    move = commands.add_parser("move-reply-proofs")
+    _ = move.add_argument("--dry-run", action="store_true")
+    _ = move.add_argument("--root", action="append", type=Path, default=[], metavar="FOLDER")
+    options = parser.parse_args(argv)
+    discovery = LocalProofMove(review_link.review_root(), tuple(cast(list[Path], options.root)))
     try:
-        _ = scrub_reply_tokens(staff.snapshot())
-    except (OSError, ValueError, update_registration.RegistrationFailure) as error:
-        print(f"Reply token scrub: {error}", file=sys.stderr)
+        notes, fields = move_reply_proofs(discovery, dry_run=cast(bool, options.dry_run))
+    except (OSError, ValueError, update_registration.RegistrationFailure):
+        print("Could not process the legacy Review reply proof fields.", file=sys.stderr)
         return 1
+    print(f"{notes} notes, {fields} fields")
     return 0
 
 
