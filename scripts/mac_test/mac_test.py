@@ -2548,6 +2548,43 @@ class ClaimReleaseRefused:
     idle_only: bool = False
 
 
+def mirror_diagnostic_text(value: str, limit: int) -> str:
+    """Redact and shorten journal text."""
+    from scripts.aws_target.admin_secrets import redact
+
+    text = " ".join("".join(char if char.isprintable() else " " for char in redact(value)).split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def watched_mirror_refusal(record: RunRecord, identity: claim_state.ClaimIdentity,
+                           observation: offload.LeftoverObservation) -> str:
+    """Report the result and protocol fields of a refused check."""
+    from scripts.mac_test import offload
+
+    lines = observation.output.splitlines()
+    fields = {"leftovers": "missing", "rc": "missing"}
+    for line in lines:
+        name, separator, value = line.partition("=")
+        if separator and name in fields:
+            digits = value.removeprefix("-")
+            fields[name] = value if len(digits) <= 12 and digits.isascii() and digits.isdecimal() else "invalid"
+    claim_id = mirror_diagnostic_text(record["claim_id"], 64)
+    what = json.dumps(mirror_diagnostic_text(record["what"], 64), ensure_ascii=False)
+    result = observation.result
+    reason = (f"claim_id={claim_id} pid={record['pid']} what={what} result={type(result).__name__} "
+              f"leftovers={fields['leftovers']} rc={fields['rc']}")
+    if isinstance(result, offload.LeftoverCheckFailed):
+        reason += " detail=" + json.dumps(mirror_diagnostic_text(result.reason, 120), ensure_ascii=False)
+    elif isinstance(result, offload.LeftoversRemain):
+        count = str(result.count) if isinstance(result.count, int) else "unresolved"
+        reason += f" count={mirror_diagnostic_text(count, 16)}"
+    if any(line.startswith(("dispatch_start_settled=", "dispatch_start_missing=", "dispatch_start_pending=",
+                            "dispatch_start_pending_mac=", "dispatch_start_holder=")) for line in lines):
+        fence_reason = offload.start_fence_reason(identity, observation.output) or "the remote start fence settled"
+        reason += " fence=" + json.dumps(mirror_diagnostic_text(fence_reason, 120), ensure_ascii=False)
+    return reason
+
+
 def same_cleanup_claim(current: RunRecord, record: RunRecord) -> bool:
     return (claim_owner(current) == claim_owner(record)
             and current.get("remote_host") == record.get("remote_host")
@@ -2661,8 +2698,7 @@ def release_exact_claims(
                         if not watched_idle:
                             return ClaimReleaseRefused("the exact start fence is missing", fence_missing=True)
                     elif not isinstance(observed.result, offload.LeftoversEnded) or lines != [*prefix, f"dispatch_start_settled={key}"]:
-                        reason = offload.start_fence_reason(identity, observed.output)
-                        return ClaimReleaseRefused(reason or "the mirror check gave no answer")
+                        return ClaimReleaseRefused(watched_mirror_refusal(record, identity, observed))
                 elif fence_pending:
                     reason = offload.start_fence_reason(identity, observed.output)
                     if reason is not None:

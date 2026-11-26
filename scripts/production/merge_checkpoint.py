@@ -1466,6 +1466,8 @@ def promote_local_checkout(checkout: Path, merge_branch: str, approved: promotio
         require_live_files_clear(source, tip, "promote")
         at_tip = current == tip
         published = good(git(source, "rev-parse", "refs/remotes/origin/main"), "promote")
+        head = current
+        installation = None
         if not at_tip:
             if conflict := gate.promotion_edit_conflict(checkout, tip, waiting_rows.WAITING_PATHS):
                 raise checkpoint_gate.Stop("promote", "failed", conflict,
@@ -1477,18 +1479,22 @@ def promote_local_checkout(checkout: Path, merge_branch: str, approved: promotio
                 if git(source, "merge-base", "--is-ancestor", current, tip).returncode:
                     raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: main does not fast-forward to {tip}",
                                "the showrunner will clear the listed checkout paths and rerun this checkpoint")
-                try:
-                    approved.install(checkout, current)
-                except (OSError, UnicodeError) as error:
-                    status = git(checkout, "status", "--short").stdout.strip()
-                    raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or ' '.join(str(error).split())}",
-                               "the showrunner will clear the listed checkout paths and rerun this checkpoint") from error
-        head = good(git(source, "rev-parse", "refs/heads/main"), "promote")
+
+                def advance() -> None:
+                    try:
+                        approved.install(checkout, current)
+                    except (OSError, UnicodeError) as error:
+                        status = git(checkout, "status", "--short").stdout.strip()
+                        raise checkpoint_gate.Stop("promote", "failed", f"{checkout}: {status or ' '.join(str(error).split())}",
+                                   "the showrunner will clear the listed checkout paths and rerun this checkpoint") from error
+
+                head = tip
+                installation = promotion.MainInstallation(checkout, advance)
         foreign = good(git(source, "rev-list", head, "^refs/remotes/origin/main", f"^refs/remotes/origin/{merge_branch}"), "promote")
         if foreign:
             return PromotionNotPushed(published)
         try:
-            landed = approved.land(checkout)
+            landed = approved.land(checkout, installation=installation)
         except land_main.LandError as error:
             raise checkpoint_gate.Stop("promote", "failed", str(error), "repair the landing and rerun this checkpoint") from error
         hook = landed.hook
