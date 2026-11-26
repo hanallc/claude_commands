@@ -1825,11 +1825,11 @@ realFetch('/results',{method:'POST',body:JSON.stringify(failures)});
   await painted();
   check(pressNewItem('over the color picker')!==null,'The press reaches New item.');
   const capture=await newItemOver(popup,'the color picker');
-  const address=location.pathname+location.search+location.hash;
-  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent('color:account.claude1'),
-   'The screenshot address names the open color picker: '+capture.place);
+  const snapshot=await capturedDocument(capture);
+  check(capture.place===location.pathname && snapshot.querySelector('[data-color-picker][open][data-capture-modal]'),
+   'The snapshot includes the open color picker.');
+  check(!snapshot.querySelector('#review-new-item'),'The snapshot omits New item.');
   await closeNewItem(popup,'the color picker');
-  await opensAgain(capture.place,doc=>doc.querySelector('[data-color-picker]')?.open===true,'the color picker');
  }catch(error){failures.push(String(error));}
  await report();
 })();'''

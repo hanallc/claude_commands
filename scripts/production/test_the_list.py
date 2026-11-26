@@ -425,6 +425,21 @@ class TheListTests(unittest.TestCase):
             self.assertEqual((closed.state, closed.producer), (the_list.ItemState.CLOSED, OTHER.id))
             self.assertEqual(the_list.load(MORTY.id, old_item.id), closed)
 
+    def test_add_refuses_a_producer_without_a_staff_row(self) -> None:
+        path = staff.record_path()
+        members = staff.snapshot()
+        for record_exists in (False, True):
+            with self.subTest(record_exists=record_exists), staff.supplied_snapshot(members):
+                if record_exists:
+                    _ = path.write_text(staff.StaffSnapshot((MORTY, RUNNER)).encode(), encoding="utf-8")
+                    with self.assertRaisesRegex(the_list.ListError, f"{OTHER.id}:.*no current producer staff row"):
+                        _ = self.add(changes={"producer": OTHER.id})
+                else:
+                    path.unlink()
+                    with self.assertRaises(staff.StaffAbsent):
+                        _ = self.add(changes={"producer": OTHER.id})
+                self.assertEqual(the_list.records(MORTY.id, include_closed=True), [])
+
     def test_move_open_producer_preserves_closed_items_and_retries_without_a_log_entry(self) -> None:
         current = self.add("Move this", changes={"producer": OTHER.id})
         closed = self.add("Keep this", changes={"producer": OTHER.id})
@@ -2569,6 +2584,15 @@ class TheListTests(unittest.TestCase):
             _ = the_list.update(MORTY.id, "L1", {"state": the_list.ItemState.WORKING}, source="morty")
         self.assertEqual({cast(Path, call.args[0]).parent for call in writes.call_args_list},
                          {investigation.folder(MORTY.id), the_list.folder(MORTY.id)})
+
+    def test_create_records_refuses_an_absent_producer_on_a_closed_item(self) -> None:
+        item = self.add(changes={"producer": OTHER.id})
+        closed = the_list.close(MORTY.id, item.id, "Done", source="fixture")
+        _ = staff.record_path().write_text(staff.StaffSnapshot((MORTY, RUNNER)).encode(), encoding="utf-8")
+        with patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.root / "migration")}):
+            with self.assertRaisesRegex(the_list.ListError, f"{OTHER.id}:.*no current producer staff row"):
+                the_list.create_records(MORTY.id, [closed])
+            self.assertEqual(the_list.records(MORTY.id, include_closed=True), [])
 
     def test_create_records_validates_and_reserves_mortys_batch(self) -> None:
         item = self.add()

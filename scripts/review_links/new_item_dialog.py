@@ -1,13 +1,18 @@
 """Render the shared New item dialog."""
 from __future__ import annotations
 
+import base64
+import binascii
+import gzip
 import hashlib
 import json
 import math
 import re
+import zlib
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import Enum, StrEnum
+from io import BytesIO
 from typing import Literal, cast
 
 from scripts.production import staff
@@ -18,6 +23,9 @@ MAX_WORDS_LENGTH = 40_000
 MAX_REQUEST_ID_LENGTH = 210
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_LIVE_CAPTURE_BYTES = 5 * 1024 * 1024
+MAX_LIVE_CAPTURE_DOCUMENT_BYTES = 32 * 1024 * 1024
+MAX_LIVE_CAPTURE_BASE64_LENGTH = 4 * ((MAX_LIVE_CAPTURE_BYTES + 2) // 3)
 MAX_TOTAL_IMAGE_BYTES = 12 * 1024 * 1024
 MAX_PAGE_DATA_BYTES = 64 * 1024
 MAX_PAGE_ROWS = 48
@@ -197,12 +205,20 @@ def evidence_fields(evidence: Evidence) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class PageCaptureRequest:
-    """Describe the browser viewport for a console page capture."""
+    """Identify the source of a console screenshot and its viewport."""
 
     place: str
     width: int
     height: int
     dark: bool
+
+
+@dataclass(frozen=True)
+class LivePageCapture:
+    """Keep the live document until Firefox renders it."""
+
+    request: PageCaptureRequest
+    document: str
 
 
 class UnavailableCapture(Enum):
@@ -570,11 +586,39 @@ def _capture_place(data: dict[str, object]) -> str:
 
 
 def read_page_capture(value: object) -> PageCaptureRequest:
-    """Check the page address and viewport before starting Firefox."""
+    """Check the source address and viewport of a screenshot."""
     data = _mapping(value, "Page capture")
     viewport = read_capture_viewport(data)
     place = _capture_place(data)
     return PageCaptureRequest(place, viewport.width, viewport.height, viewport.dark)
+
+
+def read_live_page_capture(value: object) -> LivePageCapture:
+    """Read a gzip snapshot within both size limits."""
+    data = _mapping(value, "Live page capture")
+    request = read_page_capture(data)
+    encoded = data.get("document_gzip")
+    if not isinstance(encoded, str) or not encoded:
+        raise SubmissionError("Supply a compressed live page.")
+    if len(encoded) > MAX_LIVE_CAPTURE_BASE64_LENGTH:
+        raise SubmissionError("The live page exceeds the screenshot limit.")
+    try:
+        compressed = base64.b64decode(encoded, validate=True)
+        if len(compressed) > MAX_LIVE_CAPTURE_BYTES:
+            raise SubmissionError("The live page exceeds the screenshot limit.")
+        with gzip.GzipFile(fileobj=BytesIO(compressed)) as stream:
+            document = stream.read(MAX_LIVE_CAPTURE_DOCUMENT_BYTES + 1)
+    except (binascii.Error, EOFError, OSError, zlib.error) as error:
+        raise SubmissionError("Invalid compressed live page.") from error
+    if len(document) > MAX_LIVE_CAPTURE_DOCUMENT_BYTES:
+        raise SubmissionError("The live page exceeds the screenshot limit.")
+    try:
+        markup = document.decode("utf-8")
+    except UnicodeError as error:
+        raise SubmissionError("The live page must use valid Unicode.") from error
+    if not markup.strip():
+        raise SubmissionError("Supply a live page.")
+    return LivePageCapture(request, markup)
 
 
 def _page_integer(value: object, label: str, minimum: int) -> int:
@@ -811,7 +855,8 @@ def render() -> str:
         + f'<span data-kind-label>{label}</span></span></label>'
         for kind, label, icon in KINDS)
     limits = json.dumps({"types": list(IMAGE_FORMATS), "images": MAX_IMAGES,
-                         "imageBytes": MAX_IMAGE_BYTES,
+                         "imageBytes": MAX_IMAGE_BYTES, "captureBytes": MAX_LIVE_CAPTURE_BYTES,
+                         "captureDocumentBytes": MAX_LIVE_CAPTURE_DOCUMENT_BYTES,
                          "totalImageBytes": MAX_TOTAL_IMAGE_BYTES, "pageDataBytes": MAX_PAGE_DATA_BYTES,
                          "pageRows": MAX_PAGE_ROWS, "pageSections": MAX_PAGE_SECTIONS,
                          "sectionRows": MAX_PAGE_SECTION_ROWS,
@@ -1086,7 +1131,8 @@ function bindDraft(dialog, fresh = false) {
  // Null means the user must choose again. An empty string means the page has no default.
  let selectedRecipient = '';
  let pageOwner = '';
- let captureSession, pageContext, deferredCapture, pendingItem, pendingEdited = false;
+ let captureSession, pageContext, deferredCaptureKey, pendingItem, pendingEdited = false;
+ let pageCapture = {status: 'unavailable'};
 
  let source = '', evidence = {kind: 'none'}, tipPreview = null;
 
@@ -1260,15 +1306,27 @@ function bindDraft(dialog, fresh = false) {
   previews.hidden = !images.length;
  }
 
- function pastedData(file) {
+ function pastedData(file, signal) {
   return new Promise((resolve, reject) => {
+   signal?.throwIfAborted();
    const reader = new FileReader();
+   const abort = () => {
+    reader.abort();
+    reject(signal.reason);
+   };
+   signal?.addEventListener('abort', abort, {once: true});
+   reader.addEventListener('loadend', () => signal?.removeEventListener('abort', abort), {once: true});
    reader.addEventListener('load', () => resolve({
     media_type: file.type, base64_data: reader.result.split(',', 2)[1]
    }));
    reader.addEventListener('error', () => reject(new Error('Could not read a pasted image.')));
    reader.readAsDataURL(file);
   });
+ }
+
+ function listFilingSkipped(data) {
+  // New item receipts have a Review version. A receipt without a List number saved only the Review item.
+  return typeof data.version === 'string' && (!Number.isInteger(data.list_number) || data.list_number < 1);
  }
 
  async function responseData(response, fallback) {
@@ -1281,6 +1339,7 @@ function bindDraft(dialog, fresh = false) {
    if (response.status === 409 && data?.code === 'already_filed' &&
        typeof data.id === 'string' && /^[QPI][1-9][0-9]*$/.test(data.id)) {
     failure.filedId = data.id;
+    failure.listFilingSkipped = listFilingSkipped(data);
    }
    throw failure;
   }
@@ -1308,11 +1367,11 @@ function bindDraft(dialog, fresh = false) {
   showRecipients();
  }
 
- async function post(payload, {keepalive = false, hold = false, receiver} = {}) {
+ async function post(payload, {keepalive = false, hold = false, receiver, signal} = {}) {
   const options = {method: 'POST', headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify(payload), keepalive};
-  const response = await (hold ? heldFetch(endpoint, options, receiver) : fetch(endpoint, options));
-  return responseData(response, 'Could not send this item.');
+                   body: JSON.stringify(payload), keepalive, signal};
+  const response = hold ? heldFetch(endpoint, options, receiver) : fetch(endpoint, options);
+  return response.then(reply => responseData(reply, 'Could not send this item.'));
  }
 
  function clip(value, length = 240) {
@@ -1407,6 +1466,108 @@ function bindDraft(dialog, fresh = false) {
   return {width: innerWidth, height: innerHeight, dark};
  }
 
+ function copyLiveDocument(doc, depth = 0, focused = doc.activeElement) {
+  const view = doc.defaultView, root = doc.documentElement;
+  const copy = root.cloneNode(true);
+  const originals = root.querySelectorAll('*'), copies = copy.querySelectorAll('*');
+  const windows = view.pageCaptureWindows?.() ?? [...root.querySelectorAll('dialog:modal')];
+  function imagePixels(image) {
+   const canvas = doc.createElement('canvas');
+   canvas.width = image.naturalWidth;
+   canvas.height = image.naturalHeight;
+   canvas.getContext('2d').drawImage(image, 0, 0);
+   return canvas.toDataURL();
+  }
+  function storeScroll(element, duplicate) {
+   if (element.scrollLeft || element.scrollTop) {
+    duplicate.setAttribute('data-capture-scroll', element.scrollLeft + ' ' + element.scrollTop);
+   }
+  }
+  if (view.scrollX || view.scrollY) copy.setAttribute('data-capture-scroll', view.scrollX + ' ' + view.scrollY);
+  for (let i = 0; i < originals.length; i++) {
+   const element = originals[i];
+   let duplicate = copies[i];
+   if (!copy.contains(duplicate)) continue;
+   if (element.matches('script,base,template,#review-new-item,[data-new-item-draft]')) {
+    duplicate.remove();
+    continue;
+   }
+   if (element instanceof view.HTMLInputElement) {
+    if (element.type === 'hidden' || element.type === 'file') duplicate.removeAttribute('value');
+    else duplicate.setAttribute('value', element.type === 'password' ? '•'.repeat(element.value.length) : element.value);
+    duplicate.toggleAttribute('checked', element.checked);
+    duplicate.toggleAttribute('data-capture-indeterminate', element.indeterminate);
+   } else if (element instanceof view.HTMLTextAreaElement) {
+    duplicate.textContent = element.value;
+   } else if (element instanceof view.HTMLOptionElement) {
+    duplicate.toggleAttribute('selected', element.selected);
+   } else if (element instanceof view.HTMLCanvasElement) {
+    const image = doc.createElement('img');
+    for (const attribute of duplicate.attributes) image.setAttribute(attribute.name, attribute.value);
+    const style = view.getComputedStyle(element);
+    image.style.width = style.width;
+    image.style.height = style.height;
+    image.src = element.toDataURL();
+    duplicate.replaceWith(image);
+    duplicate = image;
+   } else if (element instanceof view.HTMLImageElement && element.currentSrc) {
+    const url = new URL(element.currentSrc);
+    const source = url.protocol === 'blob:' ? imagePixels(element)
+     : url.origin === view.location.origin ? url.pathname + url.search + url.hash : url.href;
+    duplicate.closest('picture')?.querySelectorAll('source').forEach(source => source.remove());
+    duplicate.removeAttribute('srcset');
+    duplicate.removeAttribute('loading');
+    duplicate.setAttribute('src', source);
+   } else if (element instanceof view.HTMLDialogElement && element.matches(':modal')) {
+    duplicate.setAttribute('data-capture-modal', Math.max(0, windows.indexOf(element)));
+   } else if (element instanceof view.HTMLIFrameElement) {
+    duplicate.removeAttribute('src');
+    duplicate.removeAttribute('srcdoc');
+    duplicate.removeAttribute('loading');
+    const inside = element.contentDocument;
+    if (depth < 3 && inside?.documentElement) {
+     duplicate.setAttribute('data-capture-frame-path', inside.location.pathname);
+     duplicate.setAttribute('srcdoc', copyLiveDocument(inside, depth + 1,
+      element === focused ? inside.activeElement : null));
+    }
+   }
+   if (element !== doc.scrollingElement) storeScroll(element, duplicate);
+   if (element === focused && element !== doc.body) {
+    const visible = element.matches(':focus-visible');
+    duplicate.dataset.captureFocus = visible ? 'visible' : 'hidden';
+    if (visible) {
+     // Firefox screenshots use an inactive window. Keep the paint from the live window.
+     const style = view.getComputedStyle(element);
+     for (const property of ['outline', 'outline-offset', 'box-shadow']) {
+      duplicate.style.setProperty(property, style.getPropertyValue(property), 'important');
+     }
+    }
+   }
+  }
+  return '<!doctype html>' + copy.outerHTML;
+ }
+
+ async function preparePageSnapshot(signal) {
+  try {
+   const request = {place: location.pathname, ...viewport()};
+   const documentBytes = new Blob([copyLiveDocument(document)]);
+   if (documentBytes.size > limits.captureDocumentBytes) return;
+   const stream = documentBytes.stream().pipeThrough(new CompressionStream('gzip'), {signal});
+   const compressed = await new Response(stream).blob();
+   if (compressed.size > limits.captureBytes) return;
+   const {base64_data} = await pastedData(compressed, signal);
+   if (!signal.aborted) pageCapture = {status: 'prepared', request, document_gzip: base64_data};
+  } catch (_) {
+   // Use the page data if the browser cannot prepare a screenshot.
+  } finally {
+   if (!signal.aborted && pageCapture.status === 'preparing') pageCapture = {status: 'unavailable'};
+  }
+ }
+
+ function snapshotUpload() {
+  return {...pageCapture.request, document_gzip: pageCapture.document_gzip};
+ }
+
  function collectPageContext() {
   const filters = [];
   for (const chip of document.querySelectorAll('[data-type-chip],[data-show-chip],[data-owner-chip],[data-filter-value]')) {
@@ -1432,9 +1593,6 @@ function bindDraft(dialog, fresh = false) {
   const seconds = Number(status?.dataset.renderSeconds ?? NaN);
   const data = visiblePageData();
   return {
-   // The page frame adds the open window under New item, so the screenshot shows it.
-   place: window.pageCapturePlace?.(dialog) ?? location.pathname + location.search + location.hash,
-   viewport: viewport(),
    data,
    state: {url: clip(location.href, limits.pageUrlLength), title: data.title,
            filters: clip(filters.join(' · '), 1024),
@@ -1472,10 +1630,20 @@ function bindDraft(dialog, fresh = false) {
          images.reduce((total, entry) => total + entry.file.size, image?.size ?? 0) <= limits.totalImageBytes;
  }
 
+ function includesPageCapture() {
+  return Boolean(pageContext) && includePage.checked && sendNotice.hidden;
+ }
+
+ function capturePreview() {
+  if (captureSession) return captureSession.preview;
+  return {status: pageCapture.status === 'unavailable' && !pendingItem?.defer_capture ? 'unavailable' : 'pending'};
+ }
+
  function showSentDetails() {
-  const image = captureSession?.image;
-  const include = Boolean(pageContext) && includePage.checked && sendNotice.hidden;
-  const unavailable = include && (image === null || !hasCaptureSpace(image));
+  const previewState = capturePreview();
+  const image = previewState.status === 'ready' ? previewState : undefined;
+  const include = includesPageCapture();
+  const unavailable = include && (previewState.status === 'unavailable' || !hasCaptureSpace(image));
   slot.hidden = !include || unavailable;
   taking.hidden = !!image;
   shot.hidden = !image;
@@ -1488,25 +1656,34 @@ function bindDraft(dialog, fresh = false) {
  }
 
  function startCapture(renewed = false) {
-  if (!pageContext || !includePage.checked || !token || captureSession) return;
-  const {place, viewport} = pageContext;
-  const capture = deferredCapture || {key: ensureDraftId() + randomNonce(), request: {place, ...viewport}};
-  const session = {token, renewed, capture, sent: Boolean(deferredCapture), page: ownerPage,
-                   controller: new AbortController()};
+  if (!includesPageCapture() || !token || captureSession) return;
+  const retryKey = pendingItem?.defer_capture && pendingItem.capture_key;
+  if (pageCapture.status !== 'prepared' && !retryKey) return;
+  const requestKey = deferredCaptureKey || retryKey || ensureDraftId() + randomNonce();
+  const session = {token, renewed, requestKey, sent: Boolean(retryKey), page: ownerPage,
+                   controller: new AbortController(), preview: {status: 'pending'}};
   captureSession = session;
   showSentDetails();
-  session.key = post({token, page_capture: capture.request, capture_key: capture.key})
-   .then(result => result.capture_key || '', () => '');
-  void session.key.then(async key => {
+  const key = pageCapture.status === 'prepared'
+   ? post({token, page_capture: snapshotUpload(), capture_key: requestKey}, {signal: session.controller.signal})
+      .then(result => result.capture_key)
+   : Promise.resolve(requestKey);
+  loadCapturePreview(session, key);
+ }
+
+ function loadCapturePreview(session, captureKey) {
+  const signal = session.controller.signal;
+  void captureKey.then(async key => {
    if (!key) return null;
    const path = endpoint + '?' + new URLSearchParams({capture_key: key});
    const getPreview = () => fetch(path, {cache: 'no-store',
-    headers: {'X-Review-Token': session.token}, signal: session.controller.signal});
+    headers: {'X-Review-Token': session.token}, signal});
    let refreshToken = true;
-   while (!session.controller.signal.aborted) {
+   while (!signal.aborted) {
     const response = await getPreview().catch(() => null);
+    if (signal.aborted) return null;
     if ((!response || response.status === 403) && refreshToken) {
-     const fresh = await loadOptions(session.controller.signal, session.page);
+     const fresh = await loadOptions(signal, session.page);
      if (!fresh.token) return null;
      session.token = fresh.token;
      if (captureSession === session) setOptions(fresh);
@@ -1520,7 +1697,9 @@ function bindDraft(dialog, fresh = false) {
    return null;
   }).catch(() => null).then(image => {
    if (captureSession !== session) return;
-   session.image = image ? {key: image.key, size: image.blob.size, url: URL.createObjectURL(image.blob)} : null;
+   session.preview = image
+    ? {status: 'ready', key: image.key, size: image.blob.size, url: URL.createObjectURL(image.blob)}
+    : {status: 'unavailable'};
    showSentDetails();
   });
  }
@@ -1549,18 +1728,14 @@ function bindDraft(dialog, fresh = false) {
   captureSession = undefined;
   if (!session) return;
   session.controller.abort();
-  clearCapturePreview(session);
-  showSentDetails();
-  if (!used && !session.sent) {
-   void session.key.then(key => key && post({token: session.token, discard_capture: key}, {keepalive: true})).catch(() => {});
-  }
- }
-
- function clearCapturePreview(session) {
-  if (session.image) URL.revokeObjectURL(session.image.url);
+  if (session.preview.status === 'ready') URL.revokeObjectURL(session.preview.url);
   shot.removeAttribute('href');
   preview.removeAttribute('src');
-  session.image = null;
+  session.preview = {status: 'unavailable'};
+  showSentDetails();
+  if (!used && !session.sent) {
+   void post({token: session.token, discard_capture: session.requestKey}, {keepalive: true}).catch(() => {});
+  }
  }
 
  function storeListDraft() {
@@ -1578,7 +1753,7 @@ function bindDraft(dialog, fresh = false) {
 
  function finishDraft() {
   removeListDraft();
-  draftId = deferredCapture = pendingItem = undefined;
+  draftId = pendingItem = undefined;
   canRecoverFiling = pendingEdited = false;
  }
 
@@ -1587,10 +1762,20 @@ function bindDraft(dialog, fresh = false) {
   if (launcher?.isConnected) launcher.focus({preventScroll: true});
  }
 
+ function releasePageCapture(used = false) {
+  opening.abort();
+  pageCapture = {status: 'unavailable'};
+  pageContext = null;
+  deferredCaptureKey = undefined;
+  includePage.closest('label').hidden = true;
+  showBugPage();
+  if (captureSession) discardCapture(used);
+  else showSentDetails();
+ }
+
  function close({sent = false} = {}) {
   if (sending || (!sent && !dialog.open)) return;
-  discardCapture();
-  opening.abort();
+  if (!sent) releasePageCapture();
   if (dialog.open) hideDialog();
   keepDraft = !sent && Boolean(pendingItem || words.value || images.length);
   if (!keepDraft) {
@@ -1630,9 +1815,7 @@ function bindDraft(dialog, fresh = false) {
   }
   if (pendingItem) page = pendingItem.page;
   ownerPage = page;
-  pageContext = page ? collectPageContext() : null;
   launcher = trigger;
-  token = '';
   if (ownerPage === 'list' && !draftId && !keepDraft) {
    const stored = storedListDraft();
    if (stored) {
@@ -1643,41 +1826,56 @@ function bindDraft(dialog, fresh = false) {
   }
   const newDraft = !keepDraft && !draftId;
   if (newDraft) selectedRecipient = '';
-  sendNotice.hidden = true;
-  includePage.closest('label').hidden = !pageContext;
-  recipients = null;
-  recipientChips.replaceChildren();
-  pageOwner = '';
-  showOwnerReason();
   if (!keepDraft) {
    form.reset();
    setError('');
    form.elements.kind.value = kind;
   }
+  await openDraftForm({focus: keepDraft ? words : heading, newDraft, recipientName, resetScroll: true});
+ }
+
+ async function openDraftForm({focus, newDraft = false, recipientName = '', resetScroll = false}) {
+  token = '';
+  sendNotice.hidden = true;
+  recipients = null;
+  recipientChips.replaceChildren();
+  pageOwner = '';
+  showOwnerReason();
   recipientStatus.textContent = 'Loading recipients…';
   recipientStatus.hidden = false;
+  opening = new AbortController();
+  const signal = opening.signal;
+  pageContext = ownerPage ? collectPageContext() : null;
+  if (pageContext && !pendingItem) {
+   const preparation = {status: 'preparing'};
+   pageCapture = preparation;
+   preparation.ready = preparePageSnapshot(signal);
+  }
+  includePage.closest('label').hidden = !pageContext;
   showEvidence();
   showBugPage();
   showSentDetails();
   updateSend();
-  const controller = new AbortController();
-  opening = controller;
   dialog.showModal();
-  const focus = keepDraft ? words : heading;
-  focus.focus({preventScroll: true});
-  body.scrollTop = 0;
+  const initialFocus = focus.disabled ? words : focus;
+  initialFocus.focus({preventScroll: true});
+  if (resetScroll) body.scrollTop = 0;
   try {
-   const data = await loadOptions(controller.signal);
-   if (controller.signal.aborted) return;
+   const data = await loadOptions(signal);
+   if (signal.aborted) return;
    if (newDraft) {
     selectedRecipient = (ownerPage ? data.page_owner
      : data.recipients.find(recipient => recipient.name === recipientName)?.id) || '';
    }
    setOptions(data);
+   showSentDetails();
+   if (focus === send && document.activeElement === initialFocus) send.focus({preventScroll: true});
+   if (pageCapture.status === 'preparing') await pageCapture.ready;
+   if (signal.aborted) return;
    startCapture();
    showSentDetails();
   } catch (failure) {
-   if (!controller.signal.aborted) recipientStatus.textContent = failure.message;
+   if (!signal.aborted) recipientStatus.textContent = failure.message;
   }
  }
 
@@ -1691,22 +1889,29 @@ function bindDraft(dialog, fresh = false) {
   const kind = type === 'feedback' ? 'investigation' : type;
   const payload = {request_id: ensureDraftId(), kind, recipient_id: recipient.value, words: words.value,
                    ...(ownerPage && {page: ownerPage, page_recipient: 'selected'})};
-  let key = '';
-  if (!deferredCapture && !slot.hidden && !taking.hidden) deferredCapture = captureSession?.capture;
-  if (!deferredCapture && !slot.hidden && !shot.hidden) {
-   key = captureSession?.image?.key;
-   if (!key) throw new Error('The screenshot is unavailable.');
+  if (includesPageCapture() && hasCaptureSpace() && pageCapture.status === 'preparing') {
+   await pageCapture.ready;
+   startCapture();
   }
+  const previewState = capturePreview();
+  const include = includesPageCapture() && hasCaptureSpace(previewState.status === 'ready' ? previewState : undefined);
+  let key = '';
+  if (!deferredCaptureKey && include && previewState.status === 'pending' && captureSession &&
+      pageCapture.status === 'prepared') {
+   deferredCaptureKey = captureSession.requestKey;
+  }
+  if (!deferredCaptureKey && include && previewState.status === 'ready') key = previewState.key;
   const bug = isPageBug();
+  const fallbackData = includesPageCapture() && !key;
   const data = evidence.kind !== 'none' ? evidence
-   : pageContext && (bug || deferredCapture || !fallback.hidden) ? pageContext.data : {kind: 'none'};
+   : pageContext && (bug || deferredCaptureKey || fallbackData) ? pageContext.data : {kind: 'none'};
   const state = bug && pageContext?.state;
   const files = await Promise.all(images.map(image => pastedData(image.file)));
-  if (deferredCapture && captureSession?.capture === deferredCapture) captureSession.sent = true;
+  if (deferredCaptureKey && captureSession?.requestKey === deferredCaptureKey) captureSession.sent = true;
   const item = {...payload, evidence: data, images: files,
-                ...(deferredCapture && {capture_key: deferredCapture.key, defer_capture: deferredCapture.request}),
+                ...(deferredCaptureKey && {capture_key: deferredCaptureKey, defer_capture: pageCapture.request}),
                 ...(key && {capture_key: key}), ...(state && {page_state: state})};
-  if (deferredCapture) pendingItem = item;
+  if (deferredCaptureKey) pendingItem = item;
   return item;
  }
 
@@ -1727,7 +1932,9 @@ function bindDraft(dialog, fresh = false) {
     const receiver = canRecoverFiling ? undefined : recipients?.find(recipient => recipient.id === item.recipient_id)?.name;
     canRecoverFiling = true;
     storeListDraft();
-    return post({...item, kind: submittedKind, token}, {hold: true, receiver});
+    const capture = pageCapture.status === 'prepared' && item.defer_capture && item.capture_key === deferredCaptureKey
+     ? {defer_capture: snapshotUpload()} : {};
+    return post({...item, ...capture, kind: submittedKind, token}, {hold: true, receiver});
    };
    let result;
    try {
@@ -1744,9 +1951,15 @@ function bindDraft(dialog, fresh = false) {
    }
    saved = result;
   } catch (failure) {
-   dialog.showModal();
+   if (failure?.filedId) {
+    releasePageCapture();
+    finishDraft();
+    void openDraftForm({focus: send});
+   } else {
+    dialog.showModal();
+   }
    if (failure?.definiteRefusal && !failure.staleToken) {
-    pendingItem = deferredCapture = undefined;
+    pendingItem = deferredCaptureKey = undefined;
     pendingEdited = false;
    }
    // After an Undo, the next Send builds the item again from the edited words.
@@ -1754,20 +1967,21 @@ function bindDraft(dialog, fresh = false) {
     pendingItem = undefined;
     pendingEdited = false;
     canRecoverFiling = couldRecoverFiling;
-    if (!canRecoverFiling) removeListDraft();
+    if (!canRecoverFiling) {
+     if (captureSession) captureSession.sent = false;
+     removeListDraft();
+    }
    }
    if (failure?.filedId) {
-    discardCapture();
-    finishDraft();
-    setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.');
-    void renewCapture();
+    const warning = onList && failure.listFilingSkipped ? ' No List row was filed.' : '';
+    setError('This item was already filed as ' + failure.filedId + '. Any change after that Send was not sent.' + warning);
    } else {
     setError(failure?.message || 'Could not send this item.');
     if (failure?.screenshotExpired && includePage.checked) {
      discardCapture(!onList);
      void renewCapture();
     } else if (onList && (failure?.staleToken || failure instanceof TypeError)) {
-     if (!pendingItem && (failure?.staleToken || !captureSession?.image)) discardCapture();
+     if (!pendingItem && (failure?.staleToken || captureSession?.preview.status !== 'ready')) discardCapture();
      const signal = opening.signal;
      const fresh = await loadOptions(signal).catch(() => null);
      if (!signal.aborted && fresh) {
@@ -1785,15 +1999,24 @@ function bindDraft(dialog, fresh = false) {
    return;
   }
   const keepEdits = pendingEdited;
-  discardCapture(usedPreview);
+  const listRowMissing = onList && listFilingSkipped(saved);
+  releasePageCapture(usedPreview);
   finishDraft();
-  if (keepEdits) {
-   dialog.showModal();
-   setError('Saved ' + saved.id + '. Your edits are still in the dialog.');
+  if (keepEdits || listRowMissing) {
+   if (keepEdits) {
+    void openDraftForm({focus: send});
+   } else {
+    words.value = '';
+    for (const image of [...images]) removeImage(image);
+    dialog.showModal();
+   }
+   const warning = listRowMissing ? ' No List row was filed.' : '';
+   const edits = keepEdits ? ' Your edits are still in the dialog.' : '';
+   const location = listRowMissing ? ' in Review.' : '.';
+   setError('Saved ' + saved.id + location + warning + edits);
    dialog.dispatchEvent(new CustomEvent('review-item-saved', {bubbles: true, detail: saved}));
-   startCapture();
    updateSend();
-   send.focus();
+   if (!keepEdits) dialog.querySelector('[data-close]').focus();
    return;
   }
   close({sent: true});

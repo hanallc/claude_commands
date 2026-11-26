@@ -96,7 +96,7 @@ const open = ({kind, page = 'builds'} = {}) => new Promise(resolve => {
  observer.observe(status, {attributes:true, attributeFilter:['hidden']});
  launch.closest('[data-page-owner]').dataset.pageOwner = page;
  launch.click();
-});
+}).then(() => dialog.waitForPageSnapshotForTest());
 const closeToLauncher = () => !dialog.open && document.activeElement === launch;
 function type(text) {
  textarea.value = text;
@@ -215,6 +215,7 @@ async function sendSaved() {
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
     const payload = JSON.parse(options.body);
     if (payload.page_capture) return Promise.resolve(Response.json({error:'No Firefox.'}, {status:503}));
+    if (payload.discard_capture) return Promise.resolve(Response.json({}));
     attempted.push(payload);
     if (attempted.length === 1) {
      return Promise.resolve(new Response(
@@ -255,7 +256,7 @@ async function sendSaved() {
    dialog.querySelector('[data-cancel]').click();
    check(closeToLauncher(), 'Cancel restores focus to the launcher.');
 
-   const ownerPosts = [], ownerEndpoint = '/console/review/new-item?page=builds';
+   const ownerPosts = [], ownerDiscards = [], ownerEndpoint = '/console/review/new-item?page=builds';
    let pngAvailable = true, discarded, useLiveSends = false, dropPageReply = true;
    let captureKey = 'd34db33fd34db33fd34db33fd34db33f';
    let ownerToken = 'owner-token';
@@ -273,6 +274,11 @@ async function sendSaved() {
     }
     if (url !== '/console/review/new-item' || options?.method !== 'POST') return originalFetch(url, options);
     const payload = JSON.parse(options.body);
+    if (payload.discard_capture) {
+     ownerDiscards.push(payload.discard_capture);
+     discarded?.();
+     return json({});
+    }
     ownerPosts.push(payload);
     if (payload.page_capture) {
      if (restartScenario) {
@@ -280,10 +286,6 @@ async function sendSaved() {
       previewGate = Promise.resolve();
      }
      return pngAvailable ? json({capture_key: captureKey}, 202) : json({error:'No Firefox.'}, 503);
-    }
-    if (payload.discard_capture) {
-     discarded?.();
-     return json({});
     }
     if (expireNextSend) {
      expireNextSend = false;
@@ -361,14 +363,14 @@ async function sendSaved() {
    const skippedCapture = new Promise(resolve => { discarded = resolve; });
    await sendOwner();
    await skippedCapture;
-   check(ownerPosts.length === 5 && !ownerPosts[3].capture_key && ownerPosts[3].evidence.kind === 'none' &&
-         ownerPosts[4].discard_capture === captureKey, 'Send with the box unchecked discards the capture.');
+   check(ownerPosts.length === 4 && !ownerPosts[3].capture_key && ownerPosts[3].evidence.kind === 'none' &&
+         ownerDiscards.at(-1) === ownerPosts[2].capture_key, 'Send with the box unchecked discards the capture.');
 
    await openOwner();
    const canceled = new Promise(resolve => { discarded = resolve; });
    dialog.querySelector('[data-cancel]').click();
    await canceled;
-   check(ownerPosts.length === 7 && ownerPosts[6].discard_capture === captureKey && !dialog.open,
+   check(ownerPosts.length === 5 && ownerDiscards.at(-1) === ownerPosts[4].capture_key && !dialog.open,
          'Closing the dialog discards the capture.');
 
    pngAvailable = false;
@@ -380,8 +382,8 @@ async function sendSaved() {
    main.append(paragraph);
    await openOwner();
    await sendOwner();
-   const fallback = ownerPosts[8].evidence;
-   check(ownerPosts.length === 9 && !ownerPosts[8].capture_key && fallback.kind === 'page-data' &&
+   const fallback = ownerPosts[6].evidence;
+   check(ownerPosts.length === 7 && !ownerPosts[6].capture_key && fallback.kind === 'page-data' &&
          fallback.rows.some(row=>row.includes('hana nextest')), 'No Firefox sends visible rows.');
    const running = fallback.sections?.find(section => section.label === 'Running');
    check(running?.columns[0] === 'Step' && running.columns[1] === 'Stage' &&
@@ -389,7 +391,7 @@ async function sendSaved() {
          'The fallback keeps the displayed build values with their column labels.');
    check(fallback.title === emoji && fallback.rows.some(row=>row.includes(emoji)),
          'The title and rows keep an emoji at the character limit.');
-   check(ownerPosts[8].page === 'builds', 'Send includes the page identity.');
+   check(ownerPosts[6].page === 'builds', 'Send includes the page identity.');
 
    pngAvailable = true;
    await openOwner();
@@ -406,7 +408,7 @@ async function sendSaved() {
          ownerPosts.length === at + 2 && ownerPosts[at].kind === 'question' &&
          ownerPosts[at].capture_key === oldKey && ownerPosts[at].token !== ownerToken &&
          ownerPosts[at + 1].token === ownerToken &&
-         ownerPosts[at + 1].page_capture.place === ownerPosts[at - 1].page_capture.place,
+         ownerPosts[at + 1].page_capture.document_gzip === ownerPosts[at - 1].page_capture.document_gzip,
          'The restart keeps the Question words and takes a screenshot with the new token.');
    releasePreview();
    await whenShown(shot);
@@ -577,6 +579,7 @@ async function sendSaved() {
     if (url === '/console/review/new-item' && options?.method === 'POST') {
      const payload = JSON.parse(options.body);
      if (payload.page_capture) return json({error:'No Firefox.'}, 503);
+     if (payload.discard_capture) return json({});
      listPosts.push(payload);
     }
     return originalFetch(url, options);
@@ -723,6 +726,12 @@ OWNER_OPTIONS_PROBE = r"""
 """
 
 
+SNAPSHOT_READY_HOOK = (
+    b" dialog.waitForPageSnapshotForTest = () => pageCapture.status === 'preparing' ? pageCapture.ready : undefined;\n"
+    b" return draft;"
+)
+
+
 def fixture_page(width: int, *, photo: bool, script: str = PROBE) -> bytes:
     probe = (script.replace("__RECIPIENTS__", json.dumps(RECIPIENTS))
              .replace("__PHOTO__", json.dumps(photo)).replace("__PNG__", PNG).replace("__WIDTH__", str(width))
@@ -732,8 +741,10 @@ def fixture_page(width: int, *, photo: bool, script: str = PROBE) -> bytes:
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Builds</title>'
             f'<style>{console_theme.CSS}</style></head><body>{SHELL}</body></html>').encode()
     owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
-    return page_frame.with_owner(page, "builds", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render).replace(
-        b'</body>', b'<script>' + probe.encode() + b'</script></body>')
+    rendered = page_frame.with_owner(page, "builds", owner, staff.StaffSnapshot((owner,)), new_item_dialog.render)
+    if script == PROBE:
+        rendered = rendered.replace(b" return draft;", SNAPSHOT_READY_HOOK, 1)
+    return rendered.replace(b"</body>", b"<script>" + probe.encode() + b"</script></body>")
 
 
 ROW_EVIDENCE_PROBE = r"""
@@ -828,7 +839,16 @@ def row_evidence_page() -> bytes:
     return fixture_page(1440, photo=False, script=ROW_EVIDENCE_PROBE.replace("__CAPTURE__", json.dumps(captured)))
 
 
-BUG_PROBE = r"""
+CAPTURE_TEXT = r"""
+async function captureText(capture) {
+ const bytes = Uint8Array.from(atob(capture.document_gzip), char => char.charCodeAt(0));
+ const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+ return new Response(stream).text();
+}
+"""
+
+
+BUG_PROBE = CAPTURE_TEXT + r"""
 const failures = [];
 const check = (value, description) => { if (!value) failures.push(description); };
 const wire = [], fetchHTTP = window.fetch;
@@ -847,6 +867,7 @@ window.fetch = async (path, options) => {
  }
  if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]});
  const payload = JSON.parse(options.body);
+ if (payload.discard_capture) return Response.json({});
  wire.push(payload);
  if (payload.page_capture) {
   if (!holdCapture) return Response.json({error:'No Firefox.'},{status:503});
@@ -873,7 +894,7 @@ const open = () => new Promise(resolve => {
  });
  observer.observe(recipients, {childList:true,subtree:true});
  trigger.click();
-});
+}).then(() => dialog.waitForPageSnapshotForTest());
 const type = text => {
  words.value = text;
  words.dispatchEvent(new Event('input', {bubbles:true}));
@@ -930,7 +951,7 @@ const send = async () => {
   }
   check(checkbox.checked && checkbox.labels[0].textContent.trim() === 'Include a screenshot',
         'The screenshot box is checked by default.');
-  check(wire.length === 1 && wire[0].page_capture.place === location.pathname+location.search+location.hash,
+  check(wire.length === 1 && (await captureText(wire[0].page_capture)).includes('Could not load …/brain.'),
         'Opening the Bug dialog starts the screenshot of the current page.');
   type('Review takes over two seconds with the builds filter. It also shows a load error.');
   if (__PHOTO__) {
@@ -962,7 +983,7 @@ const send = async () => {
    await send();
    check(wire.length === 4 && wire[3].capture_key === wire[2].capture_key &&
          wire[3].capture_key.startsWith(wire[3].request_id) &&
-         wire[3].defer_capture.place === wire[2].page_capture.place && wire[3].evidence.kind === 'page-data',
+         wire[3].defer_capture.document_gzip === wire[2].page_capture.document_gzip && wire[3].evidence.kind === 'page-data',
          'Send carries the draft capture key before the capture response arrives.');
    const evidence = wire[3].evidence;
    const bytes = new TextEncoder().encode(JSON.stringify(evidence)).length;
@@ -1045,7 +1066,7 @@ const send = async () => {
 
 def bug_fixture_page(*, photo: bool = False, script: str = BUG_PROBE) -> bytes:
     probe = script.replace("__PHOTO__", json.dumps(photo))
-    return (f'<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
+    page = (f'<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1"><title>Review</title>'
             f'{page_frame.PAGE_SCRIPT_ERRORS}<style>{console_theme.CSS}{page_frame.OWNER_STYLE.removeprefix("<style>").removesuffix("</style>")}'
             'main{width:min(1220px,calc(100% - 48px));margin:28px auto}.notice{color:var(--error)}</style></head><body>'
@@ -1057,6 +1078,90 @@ def bug_fixture_page(*, photo: bool = False, script: str = BUG_PROBE) -> bytes:
             '<div role="group" aria-label="Owner"><button data-owner-chip="builds" aria-pressed="true">builds</button></div>'
             '<p class="notice">Could not load …/brain.</p></main>'
             f'{new_item_dialog.render()}<script>{probe}</script></body></html>').encode()
+    if script in (BUG_PROBE, LIVE_VIEW_PROBE):
+        page = page.replace(b" return draft;", SNAPSHOT_READY_HOOK, 1)
+    return page
+
+
+LIVE_VIEW_PROBE = CAPTURE_TEXT + r"""
+const failures = [];
+const check = (value, description) => { if (!value) failures.push(description); };
+const fetchHTTP = window.fetch, wire = [];
+window.fetch = async (path, options = {}) => {
+ if (!options.body) return Response.json({token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]});
+ const payload = JSON.parse(options.body);
+ if (payload.discard_capture) return Response.json({});
+ wire.push(payload);
+ if (payload.page_capture) return new Promise(() => {});
+ return Response.json({id:'I1',key:'bug/owner/I1'});
+};
+const dialog = document.querySelector('#review-new-item');
+const words = dialog.querySelector('textarea');
+const send = dialog.querySelector('[type=submit]');
+const open = async () => {
+ document.querySelector('[data-owner-new]').click();
+ for (let step = 0; step < 120 && !dialog.querySelector('[data-recipients] input:checked'); step++) {
+  await new Promise(requestAnimationFrame);
+ }
+ await dialog.waitForPageSnapshotForTest();
+};
+(async () => {
+ try {
+  const main = document.querySelector('main');
+  main.insertAdjacentHTML('beforeend', `
+   <details id="question" open><summary>Question</summary>
+   <div id="question-body" style="height:60px;overflow:auto">
+   <div style="height:200px">Loaded question body</div><div style="height:260px">Last paragraph</div></div>
+   <textarea id="answer"></textarea><input id="who"><input id="important" type="checkbox">
+   <select id="state"><option>Open</option><option>Validating</option></select></details>
+   <canvas id="drawing" width="20" height="10"></canvas><div style="height:1600px"></div>`);
+  const field = selector => document.querySelector(selector);
+  field('#answer').value = 'An unsent answer.';
+  field('#who').value = 'Typed name';
+  field('#important').checked = true;
+  field('#state').selectedIndex = 1;
+  field('#question-body').scrollTop = 150;
+  field('#who').focus({preventScroll:true,focusVisible:true});
+  const focusVisible = field('#who').matches(':focus-visible') ? 'visible' : 'hidden';
+  field('#drawing').getContext('2d').fillRect(0, 0, 8, 10);
+  const pixels = field('#drawing').toDataURL();
+  scrollTo({top:240,behavior:'instant'});
+  await open();
+  check(wire.length === 1, 'Opening New item sends one live snapshot.');
+  const snapshot = new DOMParser().parseFromString(await captureText(wire[0].page_capture), 'text/html');
+  const copy = selector => snapshot.querySelector(selector);
+  check(!copy('script,#review-new-item,[data-new-item-draft]'), 'The snapshot omits scripts and New item.');
+  check(copy('#question[open]') && copy('#question-body').textContent.includes('Loaded question body'),
+        'The snapshot keeps the loaded question open.');
+  check(copy('#answer').value === 'An unsent answer.' && copy('#who').value === 'Typed name',
+        'The snapshot keeps the typed text.');
+  check(copy('#who').dataset.captureFocus === focusVisible, 'The snapshot records the focus state.');
+  check(copy('#important').checked && copy('#state').value === 'Validating',
+        'The snapshot keeps the selected values.');
+  check(copy('html').dataset.captureScroll === '0 240' && copy('#question-body').dataset.captureScroll === '0 150',
+        'The snapshot keeps the window and element scroll.');
+  check(copy('img#drawing').getAttribute('src') === pixels, 'The snapshot keeps the canvas pixels.');
+  dialog.querySelector('[data-cancel]').click();
+
+  const large = document.createElement('div');
+  large.hidden = true;
+  large.textContent = 'A'.repeat(32 * 1024 * 1024);
+  main.append(large);
+  await open();
+  const fallback = dialog.querySelector('[data-fallback]');
+  check(wire.length === 1 && !fallback.hidden && fallback.textContent === 'Screenshot unavailable.',
+        'A snapshot over the limit shows the fallback message without sending the snapshot.');
+  words.value = 'Send the page data.';
+  words.dispatchEvent(new Event('input', {bubbles:true}));
+  check(!send.disabled, 'Send is available after a snapshot exceeds the limit.');
+  send.click();
+  for (let step = 0; step < 120 && wire.length < 2; step++) await new Promise(requestAnimationFrame);
+  check(wire[1]?.evidence.kind === 'page-data' && !wire[1]?.capture_key, 'Send uses the page data.');
+ } catch (error) { failures.push(String(error)); }
+ await fetchHTTP('/results', {method:'POST',body:JSON.stringify(failures)});
+ parent.postMessage('finished',location.origin);
+})();
+"""
 
 
 UNDO_PROBE = r"""
@@ -1080,6 +1185,7 @@ window.fetch = async (path, options = {}) => {
  const payload = JSON.parse(options.body);
  // The screenshot stays pending, so the first Send keeps its item for a retry.
  if (payload.page_capture) return new Promise(() => {});
+ if (payload.discard_capture) return Response.json({});
  wire.push([payload, new Headers(options.headers).get('X-Undo-Hold')]);
  if (wire.length === 1) return Response.json({hold:'a'.repeat(24),seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
  return Response.json(saved);
@@ -1248,6 +1354,7 @@ function enterWords(value) {
   await waitFor(() => !send.disabled && !evidence.hidden);
   send.click();
   await waitFor(sendFinished);
+  if (restored) await waitFor(() => dialog.querySelector('[name="recipient_id"]:checked'));
   check(editable(), 'A failed Send leaves the draft editable.');
   if (restored) {
    check(posts.length === 1 && posts[0].request_id === restored.request_id && posts[0].words !== restored.words,
@@ -1495,6 +1602,7 @@ class DialogFixture:
     reject_first_send: bool = True
     retire_recipient_on_restart: bool = False
     owner_reason: str = ""
+    list_row_saved: bool = True
 
     def __post_init__(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1592,6 +1700,9 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
                 return
             fixture = self.fixture()
             fields = cast(dict[str, object], json.loads(data))
+            if "discard_capture" in fields:
+                self.send_json(200, {})
+                return
             if "page_capture" in fields:
                 if isinstance(fixture.screenshot, new_item_dialog.PageScreenshot):
                     self.send_json(202, {"capture_key": CAPTURE_KEY})
@@ -1623,10 +1734,13 @@ def capture_dialogs(output: Path, fixtures: dict[int, DialogFixture], *, pages: 
             if fixture.reject_first_send and len(fixture.posts) == 1:
                 self.send_json(503, {"error": "Fixture rejected the first send."})
                 return
+            receipt: dict[str, object] = {"id": item.id, "version": "fixture-version"}
+            if request.page == "list" and fixture.list_row_saved:
+                receipt["list_number"] = 1
             if isinstance(item, review_submissions.EditedSubmission):
-                self.send_json(409, {"code": "already_filed", "id": item.id})
+                self.send_json(409, {**receipt, "code": "already_filed"})
                 return
-            self.send_json(201, {"id": item.id, "key": item.key, "state": "Waiting"})
+            self.send_json(201, {**receipt, "key": item.key, "state": "Waiting"})
 
         @override
         def log_message(self, format: str, *args: object) -> None:
@@ -1668,6 +1782,65 @@ class NewItemDialogTests(unittest.TestCase):
         new_item_dialog.require_reply_token(restored, token)
         with self.assertRaises(new_item_dialog.SubmissionError):
             new_item_dialog.require_reply_token(restored, "b" * 43)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
+    def test_list_send_reports_when_only_the_review_item_is_saved(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fixture = DialogFixture(temporary, reject_first_send=False, list_row_saved=False)
+        configuration = temporary / "config"
+        configuration.mkdir()
+        _ = (configuration / "console.conf").write_text(f"page.list.owner={OWNER}\n")
+        owner = staff.StaffRow(OWNER, "producer", "builds", staff.StaffRoot(), current_session=OWNER)
+        probe = r"""
+(async () => {
+ const failures = [];
+ try {
+  const dialog = document.querySelector('#review-new-item');
+  const words = dialog.querySelector('textarea');
+  const send = dialog.querySelector('[type="submit"]');
+  const status = dialog.querySelector('[data-recipients-status]');
+  const waitFor = test => new Promise((resolve, reject) => {
+   const deadline = setTimeout(() => {
+    observer.disconnect();
+    reject(new Error(status.textContent || dialog.querySelector('.new-item-error').textContent));
+   }, 10000);
+   const ready = () => {
+    if (!test()) return;
+    clearTimeout(deadline);
+    observer.disconnect();
+    resolve();
+   };
+   const observer = new MutationObserver(ready);
+   observer.observe(dialog, {attributes:true, childList:true, subtree:true});
+   ready();
+  });
+  document.querySelector('[data-owner-new]').click();
+  await waitFor(() => status.textContent !== 'Loading recipients…');
+  dialog.querySelector('[name="include_page"]').click();
+  dialog.querySelector('[name="kind"][value="investigation"]').click();
+  words.value = 'Check the missing List row.';
+  words.dispatchEvent(new InputEvent('input', {bubbles:true}));
+  if (send.disabled) throw new Error('The List Send is disabled.');
+  send.click();
+  await waitFor(() => send.form.getAttribute('aria-busy') === 'false');
+  if (!dialog.open) failures.push('The dialog closed without showing the missing List row.');
+  if (!dialog.textContent.includes('Saved I1 in Review. No List row was filed.')) {
+   failures.push('The result does not name the missing List row.');
+  }
+  if (words.value || !send.disabled) failures.push('The dialog can send the saved words again.');
+ } catch (error) {
+  failures.push(String(error));
+ }
+ await fetch('/results', {method:'POST', body:JSON.stringify(failures)});
+ parent.postMessage('finished', location.origin);
+})();
+"""
+        page = fixture_page(1440, photo=False, script=probe).replace(
+            b'data-page-owner="builds"', b'data-page-owner="list"')
+        with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((owner,))):
+            capture_dialogs(temporary / "list-result.png", {1440: fixture}, pages={1440: page})
+        self.assertEqual(fixture.results, [])
+        self.assertEqual(len(fixture.posts), 1)
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_list_token_refresh_clears_a_retired_recipient(self) -> None:
@@ -1738,6 +1911,367 @@ class NewItemDialogTests(unittest.TestCase):
         submission = record.submission
         assert isinstance(submission, new_item_dialog.ReviewSubmission)
         self.assertEqual(submission.images, () if reload_after_send else (review_submissions.PAGE_SCREENSHOT,))
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
+    def test_capture_keeps_the_live_view_and_falls_back_over_the_limit(self) -> None:
+        temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        fixture = DialogFixture(temporary)
+        page = bug_fixture_page(script=LIVE_VIEW_PROBE)
+        capture_dialogs(temporary / "live-view.png", {1440: fixture}, pages={1440: page})
+        self.assertEqual(fixture.results, [])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
+    def test_draft_end_paths_release_the_live_page_capture(self) -> None:
+        probe = r"""
+const failures = [], fetchHTTP = window.fetch;
+const outcome = __OUTCOME__;
+const dialog = document.querySelector('#review-new-item'), heading = document.querySelector('main h1');
+const launch = document.querySelector('[data-owner-new]'), words = dialog.querySelector('textarea');
+const send = dialog.querySelector('[type=submit]'), shot = dialog.querySelector('[data-shot]');
+const close = dialog.querySelector('[data-cancel]'), notice = dialog.querySelector('.new-item-error');
+const saved = {id:'I1',key:'bug/owner/I1',version:'fixture'};
+const hold = 'a'.repeat(24);
+const uploads = [], reads = [], sends = [], discarded = [], revoked = [];
+const tokenReads = [];
+const continuesFiledDraft = ['already-filed','continuation-compression','continuation-token'].includes(outcome);
+let serverToken = 'fixture';
+const readyImage = () => new Response(new Blob(['fixture PNG'], {type:'image/png'}));
+const lateImage = Promise.withResolvers();
+const releasePreparation = Promise.withResolvers();
+let preparationReady = false;
+let preparations = 0;
+const revoke = URL.revokeObjectURL;
+URL.revokeObjectURL = url => { revoked.push(url); revoke(url); };
+
+function check(value, description) {
+ if (!value) throw new Error(description);
+}
+async function until(test, description) {
+ const deadline = performance.now() + 5000;
+ while (!test()) {
+  if (performance.now() > deadline) throw new Error(description);
+  await new Promise(resolve => setTimeout(resolve, 10));
+ }
+}
+function waitForResponse(request) {
+ const {signal, gate} = request;
+ return new Promise((resolve, reject) => {
+  const aborted = () => {
+   request.aborted = true;
+   reject(signal.reason);
+  };
+  if (signal?.aborted) return aborted();
+  signal?.addEventListener('abort', aborted, {once:true});
+  gate.promise.then(value => {
+   signal?.removeEventListener('abort', aborted);
+   resolve(value);
+  });
+ });
+}
+if (['cancel-preparation','continuation-compression'].includes(outcome)) {
+ const blockedPreparation = outcome === 'cancel-preparation' ? 1 : 2;
+ const blob = Response.prototype.blob;
+ Response.prototype.blob = async function() {
+  const preparation = ++preparations;
+  const result = await blob.call(this);
+  if (preparation === blockedPreparation) {
+   preparationReady = true;
+   await releasePreparation.promise;
+  }
+  return result;
+ };
+}
+window.fetch = async (path, options = {}) => {
+ path = String(path);
+ if (path === '/send-hold/' + hold + '/undo') return Response.json({outcome:'undone'});
+ if (path.includes('capture_key=') && !options.body) {
+  const key = new URL(path, location.href).searchParams.get('capture_key');
+  const request = {key, signal:options.signal, gate:Promise.withResolvers()};
+  reads.push(request);
+  if (outcome === 'cancel-poll' && reads.length === 1) return Response.json({}, {status:202});
+  if (outcome === 'cancel-poll') return waitForResponse(request);
+  if (outcome === 'cancel-reopen' && reads.length === 1) {
+   return {ok:true, status:200, blob:() => { request.reading = true; return lateImage.promise; }};
+  }
+  return readyImage();
+ }
+ if (!options.body) {
+  tokenReads.push(serverToken);
+  return Response.json({token:serverToken,page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]});
+ }
+ const payload = JSON.parse(options.body);
+ if (payload.page_capture) {
+  const request = {payload, signal:options.signal, gate:Promise.withResolvers()};
+  uploads.push(request);
+  if (payload.token !== serverToken) {
+   return Response.json({code:'stale_token',error:'The New item token expired.'},{status:403});
+  }
+  if (outcome === 'continuation-token' && uploads.length === 2) {
+   return Response.json({capture_key:payload.capture_key});
+  }
+  if (['cancel-poll','cancel-reopen','list-row'].includes(outcome)) {
+   return Response.json({capture_key:payload.capture_key});
+  }
+  return waitForResponse(request);
+ }
+ if (payload.discard_capture) {
+  discarded.push(payload.discard_capture);
+  return Response.json({});
+ }
+ sends.push({payload, signal:options.signal});
+ if (sends.length === 1) {
+  if (outcome.startsWith('undo-')) {
+   return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  }
+  if (['lost','retained','error-close'].includes(outcome)) throw new TypeError('The Send response was lost.');
+  if (continuesFiledDraft) {
+   heading.textContent = 'Fresh page evidence';
+   if (outcome === 'continuation-token') serverToken = 'after-restart';
+   return Response.json({...saved,code:'already_filed'},{status:409});
+  }
+ }
+ if (outcome === 'list-no-row' || outcome === 'retained') return Response.json(saved);
+ return Response.json({...saved,list_number:17});
+};
+const type = text => {
+ words.value = text;
+ words.dispatchEvent(new Event('input',{bubbles:true}));
+};
+async function sendWords() {
+ check(!send.disabled, 'Send is available.');
+ const count = sends.length;
+ send.click();
+ await until(() => sends.length > count, 'Send did not reach the server.');
+ await until(() => send.form.getAttribute('aria-busy') === 'false', 'Send did not settle.');
+}
+function checkReleased() {
+ const {owners, activePreview, pendingBytes} = dialog.captureStateForTest();
+ check(!owners && !activePreview && !pendingBytes, 'The completed draft releases the capture resources.');
+ check(!shot.hasAttribute('href') && !shot.querySelector('img').hasAttribute('src'), 'The preview links are clear.');
+}
+async function checkContinuation(original, replacement, replacementUpload) {
+ check(replacement.evidence.kind === 'page-data' && replacement.evidence.title === 'Fresh page evidence' &&
+       replacement.page_state?.title === 'Fresh page evidence', 'Continuation sends the fresh page evidence.');
+ check(replacement.request_id !== original.request_id && replacement.capture_key !== original.capture_key &&
+       replacement.capture_key?.startsWith(replacement.request_id), 'Continuation uses fresh draft and capture IDs.');
+ const expected = replacementUpload.payload.page_capture.document_gzip;
+ const gzip = Uint8Array.from(atob(expected), character => character.charCodeAt(0));
+ const html = await new Response(new Blob([gzip]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+ check(replacement.defer_capture?.document_gzip === expected && html.includes('<h1>Fresh page evidence</h1>'),
+       'Continuation sends the snapshot that matches the fresh page evidence.');
+}
+(async () => {
+ try {
+  if (['list-row','list-no-row','retained'].includes(outcome)) {
+   launch.closest('[data-page-owner]').dataset.pageOwner = 'list';
+  }
+  launch.click();
+  if (outcome === 'cancel-preparation') {
+   await until(() => preparationReady, 'Snapshot preparation did not start.');
+   close.click();
+   releasePreparation.resolve();
+   await new Promise(resolve => setTimeout(resolve, 50));
+   check(!uploads.length, 'Late preparation cannot start an upload.');
+   checkReleased();
+   return;
+  }
+  await until(() => uploads.length, 'The preview POST did not start.');
+  const upload = uploads[0], key = upload.payload.capture_key;
+  const png = () => new Blob(['fixture PNG'], {type:'image/png'});
+  if (outcome === 'cancel-poll') {
+   await until(() => reads.length === 2, 'The preview did not poll again.');
+   close.click();
+   check(reads[1].aborted && reads[1].signal === upload.signal, 'Cancel aborts the preview poll.');
+   check(discarded.includes(key), 'Cancel discards the capture by its request key.');
+   checkReleased();
+   return;
+  }
+  if (outcome === 'cancel-post') {
+   close.click();
+   const discardedBeforeResponse = discarded.includes(key);
+   upload.gate.resolve(Response.json({capture_key:key}));
+   await new Promise(resolve => setTimeout(resolve, 50));
+   check(upload.aborted && upload.signal?.aborted && !reads.length, 'Cancel aborts the preview POST before preview retrieval.');
+   check(discardedBeforeResponse, 'Cancel discards the capture before a POST response arrives.');
+   checkReleased();
+   return;
+  }
+  if (outcome === 'cancel-reopen') {
+   await until(() => reads[0]?.reading, 'The first preview body did not start.');
+   close.click();
+   launch.click();
+   await until(() => !shot.hidden && uploads.length === 2, 'Reopen did not show the replacement preview.');
+   const replacement = shot.href;
+   lateImage.resolve(png());
+   await new Promise(resolve => setTimeout(resolve, 50));
+   check(reads[0].signal.aborted && shot.href === replacement &&
+         uploads[1].payload.capture_key !== key, 'A late preview cannot replace the new draft preview.');
+   close.click();
+   check(revoked.includes(replacement), 'Cancel revokes the replacement preview URL.');
+   checkReleased();
+   return;
+  }
+  check(dialog.captureStateForTest().owners === 1, 'The open draft has one snapshot owner.');
+  type('First draft words.');
+  if (outcome.startsWith('undo-')) {
+   send.click();
+   const undo = () => window.top.document.querySelector('[data-send-undo] button');
+   await until(undo, 'The Undo action did not appear.');
+   check(!sends[0].signal && !upload.signal?.aborted, 'The held Send uses a separate request lifetime.');
+   undo().click();
+   await until(() => dialog.open && notice.textContent.startsWith('Undone.') && !send.disabled,
+               'Undo did not restore the draft.');
+   if (outcome === 'undo-cancel') {
+    close.click();
+    check(upload.aborted && discarded.includes(key), 'Cancel after Undo aborts and discards the capture.');
+   } else {
+    type('Edited after Undo.');
+    await sendWords();
+    const [first, second] = sends.map(request => request.payload);
+    check(second.words === 'Edited after Undo.' && second.capture_key === first.capture_key &&
+          second.defer_capture?.document_gzip === first.defer_capture?.document_gzip &&
+          second.page_state?.title === first.page_state?.title, 'Send after Undo keeps the capture and sends the edit.');
+   }
+   checkReleased();
+   return;
+  }
+  if (outcome === 'list-row') await until(() => !shot.hidden, 'The List preview did not load.');
+  const oldPreview = shot.hasAttribute('href') && shot.href;
+  await sendWords();
+  const first = sends[0].payload;
+  if (outcome !== 'list-row') {
+   check(first.defer_capture?.document_gzip === upload.payload.page_capture.document_gzip && !sends[0].signal,
+         'A pending capture is sent with the held request.');
+  }
+  if (['lost','retained','error-close'].includes(outcome)) {
+   check(dialog.open && !notice.hidden && !upload.signal?.aborted, 'A lost response keeps the editable draft and capture.');
+   if (outcome === 'error-close') {
+    close.click();
+    check(upload.aborted && !discarded.includes(key), 'Closing a failed Send keeps the capture eligible for recovery.');
+    checkReleased();
+    launch.click();
+    await until(() => !send.disabled, 'Reopen did not restore the failed Send.');
+    await sendWords();
+    const retry = sends[1].payload;
+    check(!retry.defer_capture?.document_gzip && retry.defer_capture?.place === first.defer_capture.place &&
+          retry.capture_key === key && retry.request_id === first.request_id,
+          'Retry after close keeps the draft and viewport without retaining the bytes.');
+    return;
+   }
+   if (outcome === 'retained') {
+    type('Keep this edit for a new Send.');
+    heading.textContent = 'Fresh page evidence';
+   }
+   await sendWords();
+   check(JSON.stringify(sends[1].payload) === JSON.stringify(first), 'Retry sends the original request.');
+  }
+  if (outcome === 'continuation-compression') {
+   await until(() => preparationReady && !send.disabled, 'Send did not become available during compression.');
+   check(uploads.length === 1 && !dialog.querySelector('[data-taking]').hidden,
+         'Continuation is still preparing the screenshot.');
+   send.click();
+   check(!dialog.open, 'Send closes the continuation during compression.');
+   releasePreparation.resolve();
+   await until(() => sends.length === 2 && send.form.getAttribute('aria-busy') === 'false',
+               'Send did not settle after compression.');
+   check(sends[1].payload.capture_key && sends[1].payload.defer_capture?.document_gzip,
+         'Send during continuation compression submits the pending capture.');
+   await checkContinuation(first, sends[1].payload, uploads[1]);
+   check(!reads.length, 'Send finishes while the preview upload waits.');
+  } else if (outcome === 'continuation-token') {
+   await until(() => uploads.length === 2, 'Continuation did not start a fresh preview.');
+   check(tokenReads.includes(serverToken) && uploads[1].payload.token === serverToken,
+         'Continuation fetches a fresh token before uploading.');
+   await until(() => !shot.hidden, 'The replacement preview did not load after restart.');
+   await sendWords();
+   const second = sends[1].payload;
+   check(second.token === serverToken && second.capture_key === uploads[1].payload.capture_key &&
+         second.capture_key.startsWith(second.request_id) && second.request_id !== first.request_id &&
+         second.evidence.kind === 'page-data' && second.page_state?.title === 'Fresh page evidence',
+         'The next Send uses the replacement preview and token.');
+  } else if (outcome === 'already-filed' || outcome === 'retained') {
+   check(dialog.open &&
+         words.value === (outcome === 'already-filed' ? first.words : 'Keep this edit for a new Send.'),
+         'Continuation keeps the edited dialog.');
+   const option = dialog.querySelector('[name="include_page"]').closest('label');
+   await until(() => uploads.length === 2 || option.hidden, 'Continuation did not start a fresh preview.');
+   await sendWords();
+   await checkContinuation(first, sends.at(-1).payload, uploads[1]);
+   check(upload.aborted, 'Continuation aborts the original upload.');
+  }
+  if (oldPreview) check(revoked.includes(oldPreview), 'Filing revokes the preview URL.');
+  if (outcome === 'list-no-row') check(dialog.open && !words.value, 'The Review-only result stays open without the draft.');
+  checkReleased();
+ } catch (error) {
+  failures.push(String(error));
+ } finally {
+  await fetchHTTP('/results', {method:'POST',body:JSON.stringify(failures)});
+ }
+})();
+"""
+        inspect_owners = b"""
+ dialog.captureStateForTest = () => ({
+  owners: [pageContext, typeof pageCapture === 'undefined' ? pageSnapshot : pageCapture, captureSession, pendingItem]
+   .filter(value => JSON.stringify(value)?.includes('"document_gzip"')).length,
+  activePreview: Boolean(captureSession),
+  pendingBytes: JSON.stringify(pendingItem)?.includes('"document_gzip"')
+ });
+ return draft;
+"""
+        outcomes = (
+            "cancel-preparation", "cancel-post", "cancel-poll", "undo-send", "undo-cancel",
+            "lost", "already-filed", "retained", "list-row", "list-no-row", "cancel-reopen", "error-close",
+            "continuation-compression", "continuation-token",
+        )
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                page = bug_fixture_page(script=probe.replace("__OUTCOME__", json.dumps(outcome)))
+                self.assertEqual(firefox_probe_results(page.replace(b" return draft;", inspect_owners, 1)), [[]])
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for live page capture.")
+    def test_cancel_releases_the_live_page_capture(self) -> None:
+        probe = r"""
+const failures = [];
+const dialog = document.querySelector('#review-new-item');
+const fetchHTTP = window.fetch;
+let acceptCapture, requestKey, previewReads = 0;
+const posted = Promise.withResolvers(), discarded = Promise.withResolvers();
+window.fetch = (path, options = {}) => {
+ if (options.method !== 'POST') {
+  if (String(path).includes('capture_key=')) previewReads++;
+  return Promise.resolve(Response.json({
+   token:'fixture',page_owner:'owner',recipients:[{id:'owner',name:'sdlc',proposal:true}]
+  }));
+ }
+ const payload = JSON.parse(options.body);
+ if (payload.page_capture?.document_gzip) {
+  requestKey = payload.capture_key;
+  return new Promise(accept => { acceptCapture = accept; posted.resolve(); });
+ }
+ if (payload.discard_capture === requestKey) discarded.resolve();
+ return Promise.resolve(Response.json({}));
+};
+(async () => {
+ try {
+  document.querySelector('[data-owner-new]').click();
+  await posted.promise;
+  const session = dialog.previewSessionForTest();
+  if (!dialog.hasLiveCapture()) failures.push('New item has the live snapshot.');
+  if (JSON.stringify(session).includes('"document_gzip"')) failures.push('The preview session keeps the posted snapshot.');
+  dialog.querySelector('[data-cancel]').click();
+  if (dialog.open || dialog.hasLiveCapture()) failures.push('Cancel releases the live snapshot.');
+  acceptCapture(Response.json({capture_key:requestKey}, {status:202}));
+  await discarded.promise;
+  if (previewReads) failures.push('Cancel prevents a preview request after the POST returns.');
+ } catch (error) { failures.push(String(error)); }
+ await fetchHTTP('/results', {method:'POST',body:JSON.stringify(failures)});
+})();
+"""
+        page = bug_fixture_page(script=probe).replace(
+            b" return draft;",
+            b" dialog.hasLiveCapture = () => pageCapture.status === 'prepared';\n" +
+            b" dialog.previewSessionForTest = () => captureSession;\n return draft;", 1)
+        self.assertEqual(firefox_probe_results(page), [[]])
 
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for dialog behavior")
     def test_bug_dialog_reports_the_open_page_even_without_a_screenshot(self) -> None:

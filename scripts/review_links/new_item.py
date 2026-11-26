@@ -236,10 +236,12 @@ def request_body(options: Options, kind: _NewItemRequestKind, recipient: staff.S
 
 @dataclass(frozen=True)
 class PendingListDraft:
-    """Keep the request ID and recipient while the result is uncertain."""
+    """Keep the original routing IDs while the result is uncertain."""
 
     request_id: str
     recipient: staff.StaffId
+    assignee: staff.StaffId
+    assignee_reference: str
 
 
 @dataclass(frozen=True)
@@ -247,36 +249,85 @@ class NoPendingListDraft:
     """The command has no draft with an uncertain result."""
 
 
-def draft_path(address: for_you.ConsoleAddress, session: str, assignee: staff.StaffId,
+def draft_path(address: for_you.ConsoleAddress, session: str, assignee: str,
                kind: _NewItemRequestKind, words: str) -> Path:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "new-item"
     scope = json.dumps([address.host, address.port, session, assignee, kind, words])
     return state / hashlib.sha256(scope.encode()).hexdigest()
 
 
-def read_pending_draft(path: Path) -> PendingListDraft | NoPendingListDraft:
-    try:
-        fields = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return NoPendingListDraft()
-    if (len(fields) != 2 or not re.fullmatch(r"r6-[0-9a-f]{32}", fields[0])
-            or not fields[1]):
+def draft_scope(address: for_you.ConsoleAddress, session: str, kind: _NewItemRequestKind, words: str) -> Path:
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "new-item"
+    scope = json.dumps([address.host, address.port, session, kind, words])
+    return state / hashlib.sha256(scope.encode()).hexdigest()
+
+
+def _parse_draft(fields: list[str]) -> PendingListDraft:
+    if (len(fields) != 4 or not re.fullmatch(r"r6-[0-9a-f]{32}", fields[0])
+            or not all(fields[1:])):
         raise OSError("Cannot read the pending New item draft.")
-    return PendingListDraft(fields[0], staff.StaffId(fields[1]))
+    return PendingListDraft(fields[0], staff.StaffId(fields[1]), staff.StaffId(fields[2]), fields[3])
 
 
-def save_pending_draft(path: Path, recipient: staff.StaffId) -> PendingListDraft:
-    draft = PendingListDraft("r6-" + secrets.token_hex(16), recipient)
-    atomic_file.write_text_atomic(path, f"{draft.request_id}\n{draft.recipient}\n", new_file_mode=0o600)
-    return draft
+def _draft_for_reference(scope: Path, reference: str, member: staff.StaffRow | producer_map.UnknownMember
+                         ) -> tuple[Path, PendingListDraft | NoPendingListDraft]:
+    """Prefer a typed fixed ID, then the saved spelling, then the resolved assignee."""
+    by_member: tuple[Path, PendingListDraft | NoPendingListDraft] = (scope, NoPendingListDraft())
+    by_reference = by_member
+    for path in scope.glob("*.draft"):
+        draft = _parse_draft(path.read_text(encoding="utf-8").splitlines())
+        if draft.assignee == reference:
+            return path, draft
+        if draft.assignee_reference == reference:
+            by_reference = path, draft
+        elif isinstance(member, staff.StaffRow) and draft.assignee == member.id:
+            by_member = path, draft
+    return by_reference if isinstance(by_reference[1], PendingListDraft) else by_member
+
+
+class LegacyDraftAssigneeUnproven(Exception):
+    """The draft cannot prove that this name still identifies the same assignee."""
+
+    def __init__(self, reference: str) -> None:
+        super().__init__(f'Cannot prove the assignee of the pending New item draft for "{reference}". '
+                         + 'Retry with the original fixed staff ID or the new name.')
+
+
+def _legacy_draft(address: for_you.ConsoleAddress, session: str, kind: _NewItemRequestKind, words: str,
+                  typed_reference: str, reference: str, member: staff.StaffRow | producer_map.UnknownMember
+                  ) -> tuple[Path, PendingListDraft | NoPendingListDraft]:
+    def path_for(value: str) -> Path:
+        return draft_path(address, session, value, kind, words)
+
+    exact = path_for(reference)
+    if exact.is_file():
+        path = exact
+        if isinstance(member, staff.StaffRow) and member.id == reference:
+            assignee = member.id
+        else:
+            try:
+                assignee = staff.native_id(reference)
+            except staff.StaffRefused:
+                raise LegacyDraftAssigneeUnproven(reference) from None
+    else:
+        if typed_reference != reference and path_for(typed_reference).is_file():
+            raise LegacyDraftAssigneeUnproven(reference)
+        if isinstance(member, producer_map.UnknownMember):
+            return exact, NoPendingListDraft()
+        path = path_for(member.id)
+        if not path.is_file():
+            return path, NoPendingListDraft()
+        assignee = member.id
+    fields = path.read_text(encoding="utf-8").splitlines()
+    return path, _parse_draft([*fields, assignee, reference])
 
 
 def post_item(address: for_you.ConsoleAddress, options: Options, kind: _NewItemRequestKind,
-              draft: PendingListDraft, words: str, assignee: staff.StaffId) -> ServerReply:
+              draft: PendingListDraft, words: str) -> ServerReply:
     """Retry an unconfirmed POST with the same draft ID and recipient."""
     def send(current: Options) -> ServerReply:
         return exchange(address, "POST", review_page.NEW_ITEM_PATH,
-                        request_body(current, kind, draft.recipient, words, assignee, draft.request_id))
+                        request_body(current, kind, draft.recipient, words, draft.assignee, draft.request_id))
 
     try:
         reply = send(options)
@@ -326,27 +377,31 @@ def main(arguments: list[str] | None = None) -> int:
     try:
         members = staff.snapshot()
         member = producer_map.find_member(args.assignee, members, producer_map.ASSIGNEE_KINDS)
-        if isinstance(member, producer_map.UnknownMember):
-            print(unknown_name(member, members))
-            return Outcome.UNKNOWN_NAME
-        caller = members.by_current_session(args.session) if args.session else None
-        to = unit_of(member, members) + (", this session" if caller is not None and caller.id == member.id else "")
-        result = f"{item_type.value.capitalize()} → {to}."
         kind = FILED_KINDS[item_type]
         words = words_text(item_type, args.description, args.extra)
         try:
             address = console_address()
         except ServerUnavailable:
+            if isinstance(member, producer_map.UnknownMember):
+                print(unknown_name(member, members))
+                return Outcome.UNKNOWN_NAME
             mapped = producer_map.producer_for(member.id, members)
             if isinstance(mapped, producer_map.NoProducer):
                 print(producer_question(member, mapped, members))
                 return Outcome.NO_PRODUCER
             raise
-        path = draft_path(address, args.session, member.id, kind, words)
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with exclusive(path.with_suffix(".lock")):
-            draft = read_pending_draft(path)
+        scope = draft_scope(address, args.session, kind, words)
+        reference = args.assignee if "/" in args.assignee else args.assignee.casefold()
+        scope.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        producer_note = ""
+        with exclusive(scope.with_suffix(".lock")):
+            path, draft = _draft_for_reference(scope, reference, member)
             if isinstance(draft, NoPendingListDraft):
+                path, draft = _legacy_draft(address, args.session, kind, words, args.assignee, reference, member)
+            if isinstance(draft, NoPendingListDraft):
+                if isinstance(member, producer_map.UnknownMember):
+                    print(unknown_name(member, members))
+                    return Outcome.UNKNOWN_NAME
                 mapped = producer_map.producer_for(member.id, members)
                 if isinstance(mapped, producer_map.NoProducer):
                     print(producer_question(member, mapped, members))
@@ -356,17 +411,34 @@ def main(arguments: list[str] | None = None) -> int:
                 if isinstance(recipient, Refusal):
                     print(f"new_item: {recipient.reason}", file=sys.stderr)
                     return Outcome.REFUSED
-                draft = save_pending_draft(path, recipient.id)
-                result += producer_line(member, mapped)
+                draft = PendingListDraft("r6-" + secrets.token_hex(16), recipient.id, member.id, reference)
+                path = scope / path.with_suffix(".draft").name
+                scope.mkdir(mode=0o700, exist_ok=True)
+                atomic_file.write_text_atomic(
+                    path, f"{draft.request_id}\n{draft.recipient}\n{draft.assignee}\n{draft.assignee_reference}\n",
+                    new_file_mode=0o600)
+                atomic_file.sync_folder(scope.parent)
+                producer_note = producer_line(member, mapped)
             else:
                 options = read_options(address)
-            reply = post_item(address, options, kind, draft, words, member.id)
+            reply = post_item(address, options, kind, draft, words)
             refused = reply.status == 400 or reply.status == 409 and reply.fields.get("code") != "already_filed"
             if reply.status == 200 or refused:
                 path.unlink()
+                if path.parent == scope and not any(scope.iterdir()):
+                    scope.rmdir()
         if reply.status != 200:
             print(f"new_item: {_server_error(reply)}", file=sys.stderr)
             return Outcome.FAILED
+        assignee = members.by_id(draft.assignee)
+        to = unit_of(assignee, members) if assignee is not None else draft.assignee
+        caller = members.by_current_session(args.session) if args.session else None
+        if caller is not None and caller.id == draft.assignee:
+            to += ", this session"
+        result = f"{item_type.value.capitalize()} → {to}.{producer_note}"
+    except LegacyDraftAssigneeUnproven as error:
+        print(f"new_item: {error}", file=sys.stderr)
+        return Outcome.REFUSED
     except (ServerUnavailable, OSError, ValueError, staff.StaffRefused) as error:
         print(f"new_item: {error}", file=sys.stderr)
         return Outcome.FAILED
@@ -375,8 +447,8 @@ def main(arguments: list[str] | None = None) -> int:
         filed = f"List item {number}."
     else:
         review_id = reply.fields.get("id")
-        shown = review_id if isinstance(review_id, str) and review_id else "a Review item"
-        filed = f"Filed as {shown}. The console server returned no List number."
+        saved = f"Filed as {review_id} in Review." if isinstance(review_id, str) and review_id else "Filed a Review item."
+        filed = f"{saved} No List row was filed."
     print(f"{result} {filed}")
     return Outcome.FILED
 

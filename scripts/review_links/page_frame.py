@@ -145,7 +145,6 @@ justify-content:flex-end;align-items:flex-start;gap:8px;max-width:100%;margin-bo
 # the frame sets --page-window-top on it to the bottom of the action area. A centered window limits
 # its height with it, so it stays centered and clears the copy. A window at the top starts below it.
 # Without the value, each window has the place and the height of main.
-# A screenshot address names the open window, so the capture shows the page as the user sees it.
 ACTIONS_SCRIPT = """<script>
 function stickyPageStatusHeight(){
  const banner=document.querySelector('[data-page-status]');
@@ -192,20 +191,6 @@ function measurePageActions(){
 }
 (()=>{
  const root=document.documentElement, windows=[];
- let clicked=null, reopen='', reopenClick=null;
- // Remove the window name from the address before the page reads it.
- const named=location.hash.match(/(?:^#|&)console-window=([^&]*)/);
- if(named){
-  try{reopen=decodeURIComponent(named[1]);}catch(_){}
-  const hash=location.hash.replace(named[0],named[0].startsWith('#') ? '#' : '').replace(/^#&/,'#');
-  history.replaceState(history.state,'',location.pathname+location.search+(hash==='#' ? '' : hash));
- }
- document.addEventListener('click',event=>{
-  clicked=event.target instanceof Element ? event.target : null;
-  setTimeout(()=>{clicked=null;});
- },true);
- // A link that opens no window must not move the page.
- addEventListener('click',event=>{if(event===reopenClick) event.preventDefault();});
  // A page action button opens its dialog. When the dialog closes, focus goes back to the button.
  // A press on the copy inside the open dialog moves the focus to the first control of the dialog.
  document.addEventListener('click',event=>{
@@ -256,9 +241,7 @@ function measurePageActions(){
    const copy=home.cloneNode(true);
    copy.toggleAttribute('data-page-window-actions',true);
    copy.querySelectorAll('[id]').forEach(node=>node.removeAttribute('id'));
-   // The control that opened the window names it in a screenshot address.
-   const launcher=clicked?.closest('[data-window-place],a[href]');
-   windows.push({dialog,copy,place:launcher ? launcher.dataset.windowPlace ?? launcher.getAttribute('href') : ''});
+   windows.push({dialog,copy});
    // The copy comes last, so the window keeps its own first focus.
    dialog.append(copy);
    // The window has its box only after it opens. The measure runs before the browser shows it.
@@ -275,33 +258,7 @@ function measurePageActions(){
  addEventListener('scroll',()=>place(false),{passive:true});
  // A picture in a window gets its width when it loads.
  document.addEventListener('load',()=>place(),true);
- window.pageCapturePlace=(except)=>{
-  const address=location.pathname+location.search+location.hash;
-  const shown=windows.filter(entry=>entry.dialog!==except && entry.dialog.open).at(-1)?.place;
-  return shown ? address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent(shown) : address;
- };
- function openNamed(){
-  if(!reopen) return true;
-  let launcher=null;
-  try{
-   launcher=document.querySelector('[data-window-place="'+CSS.escape(reopen)+'"]')
-    || document.querySelector('a[href="'+CSS.escape(reopen)+'"]');
-  }catch(_){reopen='';return true;}
-  if(!launcher) return false;
-  reopen='';
-  reopenClick=new MouseEvent('click',{bubbles:true,cancelable:true,button:0,view:window});
-  launcher.dispatchEvent(reopenClick);
-  reopenClick=null;
-  return true;
- }
- if(reopen){
-  // The page can add its controls after it loads its data. The screenshot waits only for the load event.
-  const watch=new MutationObserver(()=>{if(openNamed()) watch.disconnect();});
-  document.addEventListener('DOMContentLoaded',()=>{
-   if(!openNamed()) watch.observe(root,{childList:true,subtree:true});
-  },{once:true});
-  addEventListener('load',()=>{openNamed();watch.disconnect();reopen='';},{once:true});
- }
+ window.pageCaptureWindows=()=>windows.map(entry=>entry.dialog);
  document.addEventListener('DOMContentLoaded',()=>{
   const home=pageActionsArea(), banner=document.querySelector('[data-page-status]');
   if(!home) return;
@@ -974,7 +931,9 @@ function showSendUndo(hold,seconds,receiver){
 }
 async function heldFetch(url,init={},receiver){
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
- const first=await fetch(url,{...init,headers});
+ return fetch(url,{...init,headers}).then(first=>finishHeldFetch(first,receiver));
+}
+async function finishHeldFetch(first,receiver){
  if(first.headers.get('X-Send-Hold')!=='held') return first;
  const {hold,seconds}=await first.json();
  const undo=await showSendUndo(hold,seconds,receiver);

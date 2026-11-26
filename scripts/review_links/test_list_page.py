@@ -983,7 +983,8 @@ window.fetch=async (path,options={})=>{
   launcher.click();
   await until(dialog,()=>dialog.querySelector('[name="recipient_id"]:checked'));
   type('The first Send');
-  check(pendingCapture && !send.disabled,'Send is available while the screenshot is pending.');
+  check(!dialog.querySelector('[data-capture-slot]').hidden && !dialog.querySelector('[data-taking]').hidden &&
+        !send.disabled,'Send is available while the screenshot is pending.');
   send.click();
   await until(dialog,()=>!dialog.querySelector('.new-item-error').hidden && !send.disabled);
   type('The words for a new Send');
@@ -993,7 +994,7 @@ window.fetch=async (path,options={})=>{
   const row=()=>document.querySelector('[data-list-item][data-key="'+CSS.escape(savedKey)+'"]');
   await until(document.body,()=>row() && !row().hidden);
   await frame();
-  check(sends.length===2 && JSON.stringify(sends[0])===JSON.stringify(sends[1]),
+  check(pendingCapture && sends.length===2 && JSON.stringify(sends[0])===JSON.stringify(sends[1]),
         'Send retries the original draft and capture key.');
   check(location.href===address && scrollY===top,'The refresh keeps the List address and scroll position.');
   check(dialog.open && words.value==='The words for a new Send' && document.activeElement===send,
@@ -1212,17 +1213,19 @@ result.id='probe-results';result.textContent=JSON.stringify(failures);document.b
   const link=document.querySelector('a[data-list-review-card]');
   link.click();
   await until(()=>dialog.open && dialog.querySelector('iframe'),'the review box');
+  await until(()=>dialog.querySelector('iframe').contentDocument?.body?.textContent.includes('Review card fixture'),
+   'the loaded review card');
   await painted();
   check(onTop(dialog.querySelector('.list-review-close')),'The action area does not cover the review box Close button.');
   check(dialog.getBoundingClientRect().top>=actionsBottom(),'The review box starts below the action area.');
   check(pressNewItem('over the review box')!==null,'The press reaches New item.');
   const capture=await newItemOver(dialog,'the review box');
-  const address=location.pathname+location.search+location.hash;
-  check(capture.place===address+(location.hash ? '&' : '#')+'console-window='+encodeURIComponent(link.getAttribute('href')),
-   'The screenshot address names the open review box: '+capture.place);
+  const snapshot=await capturedDocument(capture);
+  const review=snapshot.querySelector('[data-list-review-dialog][open][data-capture-modal] iframe[srcdoc]');
+  check(capture.place===location.pathname && review?.getAttribute('srcdoc').includes('Review card fixture'),
+   'The snapshot includes the open review box and the loaded card.');
+  check(!snapshot.querySelector('#review-new-item'),'The snapshot omits New item.');
   await closeNewItem(dialog,'the review box');
-  await opensAgain(capture.place,doc=>doc.querySelector('[data-list-review-dialog]')?.open===true
-   && doc.querySelector('[data-list-review-dialog] iframe')!==null,'the review box');
  }catch(error){failures.push(String(error));}
  await report();
 })();'''
