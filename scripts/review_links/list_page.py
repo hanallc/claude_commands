@@ -2766,7 +2766,7 @@ const repairRequests=(()=>{
     let missing=false;
     if(!accepted){
      try{
-      const previous=await heldFetch.resume(holdId);
+      const previous=await heldFetch.resume(holdId,listRequestSeconds());
       const outcome=await reply(previous);
       if(outcome.delivered || outcome.refusal) return outcome;
       missing=previous.status===404 && previous.headers.get('X-Send-Hold-Outcome')==='missing';

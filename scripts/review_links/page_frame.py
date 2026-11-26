@@ -1140,7 +1140,8 @@ const pause=(ms,view=window,signal)=>new Promise((resolve,reject)=>{
  const timer=view.setTimeout(()=>{signal?.removeEventListener('abort',abort);resolve();},ms);
  signal?.addEventListener('abort',abort,{once:true});
 });
-const holdRequestSignal=()=>AbortSignal.timeout(30000);
+const undoRequestSignal=()=>AbortSignal.timeout(30000);
+const releaseGraceEndsAt=()=>performance.now()+RELEASE_GRACE_SECONDS*1000;
 const RETRY_LIMIT_MS=120_000,KEEPALIVE_LIMIT=64*1024;
 const heldRequests=new Map();
 const newHoldId=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),
@@ -1227,7 +1228,7 @@ function showSendUndo(request,seconds,receiver,resumable,onExpiry){
   },()=>{});
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();
-   const signal=resumable ? holdRequestSignal() : undefined;
+   const signal=resumable ? undoRequestSignal() : undefined;
    let answer=null;
    for(let tries=0;tries<2 && !answer && !signal?.aborted;tries++){
     try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST',signal}); }
@@ -1280,31 +1281,30 @@ async function heldFetch(url,{requestTimeoutSeconds,...init}={},receiver,onHold,
  const {hold,seconds}=await first.json();
  const resumable=Boolean(holdId);
  if(resumable && hold!==holdId) throw new Error('The send hold does not match this request.');
- const graceMs=RELEASE_GRACE_SECONDS*1000;
- let releaseDueAt=performance.now()+seconds*1000+graceMs;
+ request.releaseDueAt=releaseGraceEndsAt()+seconds*1000;
  let undoExpired=false;
  request.hold=hold;
  let undo=false;
  if(!request.closed && seconds>0){
   const shown=showSendUndo(request,seconds,receiver,resumable,()=>{
    undoExpired=true;
-   releaseDueAt=Math.min(releaseDueAt,performance.now()+graceMs);
+   request.releaseDueAt=Math.min(request.releaseDueAt,releaseGraceEndsAt());
   });
   onHold?.();
   undo=await shown;
  }
  if(undo===true){request.finish();throw new SendUndone();}
- // Read at once if Undo was uncertain or the hold had no Undo time.
- let resultTimeoutMs=requestTimeoutSeconds===undefined ? undefined : requestTimeoutSeconds*1000;
- if(resultTimeoutMs!==undefined && !request.closed){
-  const remainingReleaseMs=Math.max(0,Math.ceil(releaseDueAt-performance.now()));
-  if(undoExpired && remainingReleaseMs>0) await pause(remainingReleaseMs);
-  else resultTimeoutMs+=remainingReleaseMs;
- }
- const signal=resultTimeoutMs===undefined ? undefined : AbortSignal.timeout(resultTimeoutMs);
- return readHeldResult(hold,request,undo,resumable,signal);
+ return readHeldResult(hold,request,undo,resumable,requestTimeoutSeconds,undoExpired);
 }
-async function readHeldResult(hold,request,undo,resumable,signal){
+async function readHeldResult(hold,request,undo,resumable,requestTimeoutSeconds,undoExpired=false){
+ let signal;
+ if(requestTimeoutSeconds!==undefined){
+  const releaseDueAt=request?.releaseDueAt ?? releaseGraceEndsAt();
+  const remainingReleaseMs=request?.closed ? 0 : Math.max(0,Math.ceil(releaseDueAt-performance.now()));
+  // Read at once if Undo was uncertain or the hold had no Undo time.
+  if(undoExpired && remainingReleaseMs>0) await pause(remainingReleaseMs);
+  signal=AbortSignal.timeout(requestTimeoutSeconds*1000+(undoExpired ? 0 : remainingReleaseMs));
+ }
  try{
   for(let failures=0;;){
    signal?.throwIfAborted();
@@ -1327,9 +1327,9 @@ async function readHeldResult(hold,request,undo,resumable,signal){
  }
 }
 heldFetch.newId=newHoldId;
-heldFetch.resume=id=>{
+heldFetch.resume=(id,requestTimeoutSeconds)=>{
  const request=heldRequests.get(id);
- return readHeldResult(request?.hold ?? id,request,false,true,holdRequestSignal());
+ return readHeldResult(request?.hold ?? id,request,false,true,requestTimeoutSeconds);
 };
 function sendActionReceiver(form,data){
  const action=data.get('outcome') ?? data.get('action');

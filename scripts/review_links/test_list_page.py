@@ -9080,7 +9080,7 @@ window.fetch=async(_url,options)=>{
   deadlines.set(signal,milliseconds);
   return signal;
  };
- let heldPost,resultRead,receiptRead,retryPost,holdReads=0;
+ let heldPost,resultRead,resumedRead,receiptRead,retryPost,holdReads=0;
  const button=form.querySelector('[value="not works"]');
  const until=async(condition,message)=>{
   const end=performance.now()+4000;
@@ -9096,6 +9096,7 @@ window.fetch=async(_url,options)=>{
     resultRead=timeout;
     return Response.json({reason:'The fixture lost the result.'},{status:503});
    }
+   resumedRead=timeout;
    return Response.json({}, {status:404,headers:{'X-Send-Hold-Outcome':'missing'}});
   }
   if(new URL(path,location.href).searchParams.has('not-fixed-request')){
@@ -9120,8 +9121,11 @@ window.fetch=async(_url,options)=>{
  button.click();
  await until(()=>requests.length===2 && !form.dataset.sending,'The accepted retry did not finish.');
  check(heldPost===configured,'The held POST uses the configured timeout.');
- check(resultRead>configured && resultRead<=configured+RELEASE_GRACE_MS,
+ const allowsGrace=timeout=>timeout>configured && timeout<=configured+RELEASE_GRACE_MS;
+ check(allowsGrace(resultRead),
   'The held result uses the configured timeout plus the remaining Undo grace.');
+ check(allowsGrace(resumedRead),
+  'The resumed result uses the configured timeout plus the remaining Undo grace.');
  check(receiptRead===configured,'The receipt read uses the configured timeout.');
  check(retryPost===configured,'The accepted retry POST uses the configured timeout.');
 """
@@ -9131,8 +9135,10 @@ window.fetch=async(_url,options)=>{
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_not_fixed_undo_times_out_while_reading_the_body(self) -> None:
         _ = self.file_repaired_report("Fix the menu")
-        self.browser_action_sequence(r"""
+        steps = r"""
  const deadlines=new Map(),originalFetch=window.fetch;
+ const configured=Number(document.querySelector('[data-list]').dataset.requestTimeoutSeconds)*1000;
+ const undoSeconds=30;
  AbortSignal.timeout=milliseconds=>{
   const controller=new AbortController();
   deadlines.set(controller.signal,{controller,milliseconds});
@@ -9171,7 +9177,7 @@ window.fetch=async(_url,options)=>{
   if(options.method!=='POST' || requests.length) return originalFetch(path,options);
   requests.push(new URLSearchParams(options.body));
   const hold=new Headers(options.headers).get('X-Undo-Request');
-  return Response.json({hold,seconds:30},{status:202,headers:{'X-Send-Hold':'held'}});
+  return Response.json({hold,seconds:undoSeconds},{status:202,headers:{'X-Send-Hold':'held'}});
  };
  words.value=text;words.dispatchEvent(new Event('input'));
  const initial=submit('not works');
@@ -9192,12 +9198,15 @@ window.fetch=async(_url,options)=>{
   'The card reports the timeout.');
  button.click();
  await until(()=>requests.length===2,'Retry did not send the original request.');
- check(deadline.milliseconds===deadlines.get(resultSignal)?.milliseconds,
-  'Undo and hold result reads use the same time limit.');
+ const resumed=deadlines.get(resultSignal)?.milliseconds;
+ check(resumed>configured+RELEASE_GRACE_MS && resumed<=configured+undoSeconds*1000+RELEASE_GRACE_MS,
+  'The resumed result deadline allows the remaining Undo time and grace.');
  check(requests[1].toString()===requests[0].toString(),'Retry uses the original signed payload.');
  finishPost({status:503,reason:'The fixture did not confirm delivery.'});
  await until(()=>!form.dataset.sending,'Retry did not finish.');
-""", add_item=False, reduced_motion=True)
+"""
+        self.browser_action_sequence(steps.replace("RELEASE_GRACE_MS", str(send_hold.RELEASE_GRACE_SECONDS * 1000)),
+                                     add_item=False, reduced_motion=True)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for this browser test")
     def test_list_not_fixed_keeps_the_draft_until_delivery_is_confirmed(self) -> None:
