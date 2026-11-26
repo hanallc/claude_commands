@@ -31,7 +31,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
 from scripts.message import send_result
 from scripts.notify import review
-from scripts.production import delivery_state, staff, the_list, unrouted_alert
+from scripts.production import behavior_request, delivery_state, staff, the_list, unrouted_alert
 from scripts.review_links.test_page_question import FakeQuestionTransport, question_outcome
 from scripts.production.staff_test_support import fixture_member
 from scripts.review_links import change_page, console, image_store, images, list_page, page_frame, serve
@@ -841,6 +841,100 @@ class ImagesTests(ImagesFixture):
         token = images.request_token(images.console_token(self.root), record["id"])
         return urlencode({"image": record["id"], "token": token, "feedback": feedback, "action": action})
 
+    def test_direct_linked_answer_is_not_nates_words(self) -> None:
+        keeper, _, item = self.list_item()
+        record = images.register(self.shot, "Check the rows", self.owner_id(), "Phase check", list_item=item.id)
+        words = "Keep the old rows."
+        _ = images.send_answer(self.root, record["id"], "feedback", words)
+        entry = the_list.load(keeper.id, item.id).log[-1]
+        self.assertIsInstance(entry, the_list.ImageAnswerChange)
+        self.assertNotEqual(entry.source, "nate via Images")
+        source = the_list.folder(keeper.id) / f"{item.id}.md"
+        self.assertEqual(behavior_request.verified_dates(source, {words}), {})
+
+    def test_retry_of_an_older_linked_answer_keeps_only_answer_words(self) -> None:
+        keeper, _, item = self.list_item()
+        title = "Keep the third row."
+        words = "Keep the second row.\nIncrease its height."
+        record = images.register(self.shot, title, self.owner_id(), "Phase check", list_item=item.id,
+                                 look_for=("Keep the first row.",))
+        identity = record["id"]
+        key = "review:" + "a" * 64
+        saved = image_store.new_answers(record)
+        saved["attempts"][key] = {"message": images.answer_message(record, "feedback", words), "answered": [],
+                                  "recipients": [], "confirmed": []}
+        image_store.write_answers(images.images_root(self.root), saved)
+        images.delete(self.root, identity)
+        token = images.request_token(images.console_token(self.root), identity)
+        self.submit(urlencode({"image": identity, "token": token, "action": "retry", "retry_key": key}))
+        entry = the_list.load(keeper.id, item.id).log[-1]
+        self.assertEqual(entry.what, f"Image {identity}: {images.ANSWERS['feedback']}\n{words}")
+        source = the_list.folder(keeper.id) / f"{item.id}.md"
+        self.assertEqual(behavior_request.verified_dates(source, {"Title: " + title, "- Keep the first row."}), {})
+
+    def test_signed_answer_recovers_a_failed_decision_write(self) -> None:
+        first_time = datetime(2026, 11, 24, 23, 58, tzinfo=UTC)
+        retry_time = first_time + timedelta(days=1)
+        for deleted in (False, True):
+            with self.subTest(deleted=deleted):
+                record = self.register()
+                identity = record["id"]
+                body = self.feedback_body(record, "Keep the first column.")
+                with (patch.object(images, "datetime", wraps=datetime) as clock,
+                      patch.object(atomic_file, "write_text_atomic", side_effect=OSError("disk unavailable"))):
+                    clock.configure_mock(**{"now.return_value": first_time})
+                    with self.assertRaisesRegex(images.AnswerNotSent, "disk unavailable"):
+                        self.submit(body)
+                key, = image_store.read_answers(images.images_root(self.root), identity)["attempts"]
+                if deleted:
+                    images.delete(self.root, identity)
+                    token = images.request_token(images.console_token(self.root), identity)
+                    body = urlencode({"image": identity, "token": token, "action": "retry", "retry_key": key})
+                with patch.object(images, "datetime", wraps=datetime) as clock:
+                    clock.configure_mock(**{"now.return_value": retry_time})
+                    self.submit(body)
+                path, = images.decision_root(self.root).glob(f"{identity}-*.json")
+                self.assertEqual(images.read_image_decision(self.root, path),
+                                 images.ImageDecision(identity, "feedback", "Keep the first column.", first_time))
+
+    def test_signing_the_same_answer_with_or_without_a_round_keeps_one_decision(self) -> None:
+        for explicit_first in (True, False):
+            with self.subTest(explicit_first=explicit_first):
+                record = self.register()
+                body = self.feedback_body(record, "Keep the first column.")
+                explicit = body + f"&feedback_round={images.feedback_round(set())}"
+                first, second = (explicit, body) if explicit_first else (body, explicit)
+                self.submit(first)
+                archive = images.decision_root(self.root)
+                identity = record["id"]
+                path, = archive.glob(f"{identity}-*.json")
+                original = path.read_bytes()
+                self.submit(second)
+                self.assertEqual(list(archive.glob(f"{identity}-*.json")), [path])
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_retry_of_a_failed_list_write_keeps_the_original_signed_time(self) -> None:
+        keeper, _, item = self.list_item()
+        record = images.register(self.shot, "Check the rows", self.owner_id(), "Phase check", list_item=item.id)
+        words = "Keep the old rows."
+        answer_time = datetime(2026, 11, 24, 23, 58, tzinfo=UTC)
+        retry_time = answer_time + timedelta(days=1)
+        body = self.feedback_body(record, words)
+        with (patch.object(images, "datetime", wraps=datetime) as clock,
+              patch.object(the_list, "save_image_answer", side_effect=OSError("disk unavailable"))):
+            clock.configure_mock(**{"now.return_value": answer_time})
+            with self.assertRaisesRegex(images.AnswerNotSent, "disk unavailable"):
+                self.submit(body)
+        with (patch.object(images, "datetime", wraps=datetime) as clock,
+              patch.object(the_list, "now", return_value=retry_time)):
+            clock.configure_mock(**{"now.return_value": retry_time})
+            self.submit(body)
+        updated = the_list.load(keeper.id, item.id)
+        self.assertEqual(updated.log[-1].time, answer_time)
+        self.assertEqual(updated.updated, retry_time)
+        source = the_list.folder(keeper.id) / f"{item.id}.md"
+        self.assertEqual(behavior_request.verified_dates(source, {words}), {words: answer_time.date()})
+
     def test_approved_and_feedback_send_the_answer_with_feedback_only_when_written(self) -> None:
         for action, first, feedback, lines in (
                 ("approved", "your image is approved.", "", ()),
@@ -1296,7 +1390,9 @@ sessionStorage.setItem('images.answer-drafts:' + location.pathname, JSON.stringi
         record = self.register()
         words = "Use a larger title."
         _ = images.send_answer(self.root, record["id"], "feedback", words)
-        self.submit(self.feedback_body(record, words))
+        body = self.feedback_body(record, words)
+        self.submit(body)
+        self.submit(body + f"&feedback_round={images.feedback_round(set())}")
         self.assertFalse(images.decision_root(self.root).exists())
 
 
@@ -1450,6 +1546,7 @@ class ImageQuestionTests(ImagesFixture):
         self.assertEqual(len(keys), 2)
         self.assertNotEqual(keys[0], keys[1])
         self.assertEqual(len(self.sent), 2)
+        self.assertEqual(len(list(images.decision_root(self.root).glob(f"{identity}-*.json"))), 2)
 
     def test_confirmed_feedback_retry_hides_the_image_after_a_failed_write(self) -> None:
         record = self.register()

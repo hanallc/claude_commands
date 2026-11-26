@@ -128,20 +128,24 @@ def read_image_decision(root: Path, path: Path) -> ImageDecision | NoImageDecisi
     raise ValueError(f"{path}: Invalid Images answer record.")
 
 
-def _save_image_decision(root: Path, identity: str, key: str, answer: str, feedback: str, image_text: str) -> None:
-    """Save the first signed answer for this request while the Images lock is held."""
+def _save_image_decision(root: Path, saved: image_store.ImageAnswers, signed: image_store.SignedImageAnswer) -> None:
+    """Save the signed answer for this round while the Images lock is held."""
     folder = decision_root(root)
     folder.mkdir(mode=0o700, exist_ok=True)
     if folder.is_symlink():
         raise OSError(f"{folder}: Expected an Images answer folder.")
-    path = folder / f"{identity}-{key.removeprefix('review:')}.json"
+    identity = saved["id"]
+    key = hashlib.sha256(json.dumps((saved["registered_at"], signed["round_id"])).encode()).hexdigest()
+    path = folder / f"{identity}-{key}.json"
     if path.is_symlink():
         raise OSError(f"{path}: Expected an Images answer file.")
     if path.exists():
         atomic_file.sync_folder(folder)
     else:
+        heading = saved.get("heading")
+        image_text = "\n".join((heading["title"], *image_store.look_for_message_lines(heading))) if heading else ""
         fields = {"image_id": identity, "source": the_list.IMAGE_ANSWER_SOURCE, "image_text": image_text,
-                  "answer": answer, "feedback": feedback, "time": datetime.now(UTC).isoformat()}
+                  "answer": signed["answer"], "feedback": signed["feedback"], "time": signed["time"]}
         atomic_file.write_text_atomic(path, json.dumps(fields) + "\n", new_file_mode=0o600)
     atomic_file.sync_folder(root)
 
@@ -257,6 +261,7 @@ def delete(root: Path, identity: str) -> None:
             raise ValueError(f"no image {identity}")
         record = image_store.read_record(folder)
         saved = _image_answers(directory, record)
+        saved["deleted_feedback_round"] = feedback_round(answered_question_ids(record))
         if "list_item" in saved and "list_keeper" not in saved:
             saved["list_keeper"] = the_list.image_list_keeper(saved["list_item"])
         image_store.write_answers(directory, saved)
@@ -449,7 +454,8 @@ def submit(root: Path, body: str, status: change_page.DeliveryStatus
                     or draft_action not in ANSWERS):
                 raise question_record.AnswerRefused("use the Retry button on this page")
             draft = _AnswerDraft(draft_action, fields["feedback"][0].strip(), fields.get("feedback_round", [None])[0])
-        return send_answer(root, identity, action, "", retry_key=fields["retry_key"][0], draft=draft)
+        return send_answer(root, identity, action, "", retry_key=fields["retry_key"][0], draft=draft,
+                           origin=ImageAnswerOrigin.SIGNED_FORM)
     if "retry_key" in fields or "draft_action" in fields:
         raise question_record.AnswerRefused("use the form on this page")
     if action == 'question':
@@ -520,9 +526,43 @@ def _image_answers(directory: Path, record: image_store.ImageRecord) -> image_st
     return answers
 
 
+def _answer_words(identity: str, answer: str, feedback: str) -> str:
+    summary = f"Image {identity}: {ANSWERS[answer]}"
+    return summary + "\n" + feedback if feedback else summary
+
+
+def _legacy_answer_words(identity: str, item: str, message: str, answer: str) -> str:
+    _, _, body = message.partition("\n")
+    removed = f"Picture {identity} was removed.\n"
+    if body.startswith(removed):
+        feedback = body.removeprefix(removed).removesuffix(f"\nList item: {item}")
+    else:
+        link = re.search(rf"\n(?:Image|Before): https?://[^\n]+/images/{identity}/(?:image|before)\.[a-z]+\n", body)
+        feedback = body[:link.start()] if link is not None else ""
+    return _answer_words(identity, answer, feedback.removeprefix("Feedback: ") if feedback.startswith("Feedback: ") else "")
+
+
+def _record_signed_answer(attempt: image_store.ImageAnswer, saved: image_store.ImageAnswers,
+                          folder: Path, draft: _AnswerDraft) -> None:
+    """Reuse the proof when a form adds or omits the round for the same answer."""
+    active_round = saved.get("deleted_feedback_round", feedback_round(set(attempt["answered"])))
+    round_id = draft.round_id if draft.round_id is not None else active_round
+    alternate = _AnswerDraft(draft.action, draft.words, round_id if draft.round_id is None else None)
+    earlier = saved["attempts"].get(alternate.key(folder, saved["registered_at"]))
+    if earlier is not None:
+        signed = earlier.get("signed_answer")
+        earlier_round = signed["round_id"] if signed is not None else feedback_round(set(earlier["answered"]))
+        if draft.round_id is None or earlier_round == round_id:
+            if signed is not None:
+                attempt["signed_answer"] = signed
+            return
+    attempt["signed_answer"] = {"answer": draft.action, "feedback": draft.words, "time": datetime.now(UTC).isoformat(),
+                                "round_id": round_id}
+
+
 def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, round_id: str | None,
                     retry_key: str | None, origin: ImageAnswerOrigin) -> tuple[str, image_store.ImageAnswers]:
-    """Save the words and the List recipient before the first send."""
+    """Save the words, proof, and List recipient before the first send."""
     folder = directory / identity
     try:
         record = image_store.read_record(folder)
@@ -537,16 +577,13 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
         saved = _image_answers(directory, record)
 
     attempts = saved["attempts"]
-    words = ""
+    draft = _AnswerDraft(answer, feedback, round_id)
     if retry_key is not None:
         if record is not None or retry_key not in attempts:
             raise question_record.AnswerRefused("no saved answer for this removed picture")
         key = retry_key
     else:
-        key = _AnswerDraft(answer, feedback, round_id).key(folder, saved["registered_at"])
-        words = f"Image {identity}: {ANSWERS[answer]}"
-        if feedback:
-            words += "\n" + feedback
+        key = draft.key(folder, saved["registered_at"])
     if key not in attempts:
         previous: set[str] = set()
         new_answer = True
@@ -567,28 +604,33 @@ def _picture_answer(directory: Path, identity: str, answer: str, feedback: str, 
                 if round_id is not None and round_id != feedback_round(previous):
                     raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.") from None
             message = answer_message(record, answer, feedback)
-        if new_answer and origin is ImageAnswerOrigin.SIGNED_FORM and "list_item" not in saved:
-            heading = saved.get("heading")
-            image_text = "\n".join((heading["title"], *image_store.look_for_message_lines(heading))) if heading else ""
-            _save_image_decision(directory.parent, identity, key, answer, feedback, image_text)
-        attempts[key] = {"message": message, "words": words, "answered": sorted(previous),
+        attempts[key] = {"message": message, "words": _answer_words(identity, answer, feedback), "answered": sorted(previous),
                          "recipients": [], "confirmed": []}
+        if new_answer and origin is ImageAnswerOrigin.SIGNED_FORM:
+            _record_signed_answer(attempts[key], saved, folder, draft)
         image_store.write_answers(directory, saved)
     else:
         atomic_file.sync_folder(directory)
 
     attempt = attempts[key]
+    signed = attempt.get("signed_answer")
+    if signed is not None and "list_item" not in saved:
+        _save_image_decision(directory.parent, saved, signed)
     if not attempt["recipients"]:
         recipients = [saved["owner"]]
         if "list_item" in saved:
             item = saved["list_item"]
-            # Older attempts have the complete message in place of the List words.
-            words = attempt.get("words", words or attempt["message"])
             approved = attempt["message"].partition("\n")[0] == ANSWER_PREFIX + ANSWERS["approved"]
+            if signed is not None:
+                attempt["words"] = _answer_words(identity, signed["answer"], signed["feedback"])
+            elif "words" not in attempt:
+                action = "approved" if approved else "feedback"
+                attempt["words"] = _legacy_answer_words(identity, item, attempt["message"], action)
             try:
                 keeper = staff.StaffId(saved["list_keeper"]) if "list_keeper" in saved else the_list.image_list_keeper(item)
-                producer = the_list.save_image_answer(keeper, item, key, words, image_id=identity,
-                                                      approved=approved)
+                signed_at = datetime.fromisoformat(signed["time"]) if signed is not None else the_list.NoTimestamp.UNSET
+                producer = the_list.save_image_answer(keeper, item, key, attempt["words"], image_id=identity,
+                                                      approved=approved, signed_at=signed_at)
             except (the_list.ListError, OSError) as error:
                 raise AnswerNotSent(f"Could not save the answer on {item}: {error}. Try again.") from error
             saved["list_keeper"] = keeper

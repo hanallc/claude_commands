@@ -54,9 +54,17 @@ class ImageRecord(ImageReference, ImageHeading):
     questions: NotRequired[list[question_record.StoredQuestion]]
 
 
+class SignedImageAnswer(TypedDict):
+    answer: str
+    feedback: str
+    time: str
+    round_id: str
+
+
 class ImageAnswer(TypedDict):
     message: str
     words: NotRequired[str]
+    signed_answer: NotRequired[SignedImageAnswer]
     answered: list[str]
     recipients: list[str]
     confirmed: list[str]
@@ -64,6 +72,7 @@ class ImageAnswer(TypedDict):
 
 class ImageAnswers(ImageReference):
     heading: NotRequired[ImageHeading]
+    deleted_feedback_round: NotRequired[str]
     attempts: dict[str, ImageAnswer]
 
 
@@ -131,6 +140,17 @@ def _image_heading(title: object, lines: object, identity: str) -> ImageHeading:
     return {"title": title, "look_for": cast(list[str], lines)}
 
 
+def _signed_image_answer(value: object, identity: str) -> SignedImageAnswer:
+    match value:
+        case {"answer": str(answer), "feedback": str(feedback), "time": str(stamp), "round_id": str(round_id)} if (
+                answer in ("approved", "feedback")):
+            if datetime.fromisoformat(stamp).utcoffset() == UTC.utcoffset(None):
+                return {"answer": answer, "feedback": feedback, "time": stamp, "round_id": round_id}
+        case _:
+            pass
+    raise ValueError(f"{identity}: Invalid signed image answer.")
+
+
 def read_answers(directory: Path, identity: str) -> ImageAnswers:
     """Read the saved picture reference and answer attempts."""
     fields = delivery_state.read_fields(_answers_path(directory, identity))
@@ -144,6 +164,11 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
             raise ValueError(f"{identity}: invalid image heading")
         heading = cast(dict[str, object], value)
         answers["heading"] = _image_heading(heading.get("title"), heading.get("look_for"), identity)
+    if "deleted_feedback_round" in fields:
+        round_id = fields["deleted_feedback_round"]
+        if not isinstance(round_id, str) or re.fullmatch(r"[0-9a-f]{64}", round_id) is None:
+            raise ValueError(f"{identity}: Invalid feedback round for the removed image.")
+        answers["deleted_feedback_round"] = round_id
     for key, attempt in cast(dict[str, object], attempts).items():
         if not isinstance(attempt, dict):
             raise ValueError(f"{identity}: invalid image answer attempt")
@@ -158,6 +183,8 @@ def read_answers(directory: Path, identity: str) -> ImageAnswers:
             if not isinstance(words, str):
                 raise ValueError(f"{identity}: invalid image answer words")
             saved["words"] = words
+        if "signed_answer" in fields:
+            saved["signed_answer"] = _signed_image_answer(fields["signed_answer"], identity)
         answers["attempts"][key] = saved
     return answers
 

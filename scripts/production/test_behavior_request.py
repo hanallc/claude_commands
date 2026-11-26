@@ -32,9 +32,8 @@ class BehaviorRequestImagesTests(TestCase):
         feedback = "Keep the second row."
         moment = datetime(2026, 11, 23, 19, 40, tzinfo=UTC)
         words = f"Image abcdef123456: your image is approved.\n{feedback}"
-        with patch.object(the_list, "now", return_value=moment):
-            _ = the_list.save_image_answer(keeper.id, item.id, "review:" + "a" * 64, words,
-                                           image_id="abcdef123456", approved=True)
+        _ = the_list.save_image_answer(keeper.id, item.id, "review:" + "a" * 64, words,
+                                       image_id="abcdef123456", approved=True, signed_at=moment)
         source = the_list.folder(keeper.id) / f"{item.id}.md"
         self.assertEqual(behavior_request.verified_dates(source, {feedback}), {feedback: date(2026, 11, 23)})
 
