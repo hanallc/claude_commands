@@ -617,8 +617,11 @@ class AnswerSourceTests(unittest.TestCase):
                     original = replace(original, key=f"fixture/C{index}")
                     with patch.object(review_items, "read", return_value=[original]):
                         unresolved = answer_sources.read_exchanges(self.review, members=MEMBERS)
-                    self.assertEqual(unresolved.unresolved, ((original.key, 2),))
-                    self.assertFalse(unresolved.exchanges)
+                    self.assertEqual(unresolved.unresolved, ((original.key, 1),))
+                    candidate, = unresolved.exchanges
+                    self.assertEqual(candidate.answerer, list_exchange.UNRECORDED_ANSWERER)
+                    self.assertEqual(candidate.binding, list_exchange.ExchangeBinding(
+                        list_exchange.QuestionSlot("saved"), list_exchange.ReplyWithoutEvent.SLOT))
                 assert isinstance(original.source, review_items.ChangeSource)
                 original = replace(original, source=replace(
                     original.source, answered_by=OWNER.id, answered_at=FIRST_REPLY))
@@ -2230,6 +2233,69 @@ class AnswerSourceTests(unittest.TestCase):
                 else:
                     self.assertFalse(receipt.exists())
 
+    def test_unknown_change_slot_requires_its_receipt_before_the_card_hides(self) -> None:
+        slot = delivery_state.AnsweredQuestion("current", "Which road?", "East.")
+        item = self.change_with_log((), slot)
+        assert isinstance(item.source, review_items.ChangeSource)
+        event = ReviewLog(FIRST_REPLY, ASKER.name, "Answer: East.", question_path.answer_log_id(slot.question_id))
+        item = replace(item, source=replace(item.source, answered_at=FIRST_REPLY), log=(event,), answer_time=FIRST_REPLY)
+
+        visible, = answer_sources.apply_review_handoffs([item], user_zone(), members=MEMBERS)
+        self.assertFalse(review_items.on_list(visible))
+        self.assertTrue(visible.unread_answer)
+        for _ in range(2):
+            self.assertEqual(self.migrate_change(item)[0], 0)
+        row, = the_list.records(KEEPER.id)
+        saved, = row.filed_exchanges
+        self.assertEqual(row.owner, ASKER.id)
+        self.assertEqual((saved.exchange_id, saved.question), ("question:current", slot.text))
+        self.assertEqual(saved.answerer, list_exchange.UNRECORDED_ANSWERER)
+        self.assertEqual(saved.answer, list_exchange.ExchangeAnswer("East.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD))
+        self.assertEqual(saved.binding, list_exchange.ExchangeBinding(
+            list_exchange.QuestionSlot("current"), list_exchange.ReplyWithoutEvent.SLOT))
+        with the_list.lock_exchange_source(item.key) as locked:
+            receipt = locked.reservation.with_suffix(".saved")
+        exact_receipt = receipt.read_bytes()
+        handoff = self.check_change_handoff(item, frozenset({0}), unread=False)
+        self.assertEqual(handoff.filed_slot_id, slot.question_id)
+        self.assertTrue(handoff.hides_card)
+
+        validating = replace(item, state=review_items.ReviewState.VALIDATING)
+        handoff = self.check_change_handoff(validating, frozenset({0}), unread=False)
+        self.assertFalse(handoff.hides_card)
+
+        _ = receipt.unlink()
+        visible, = answer_sources.apply_review_handoffs([item], user_zone(), members=MEMBERS)
+        self.assertFalse(review_items.on_list(visible))
+        self.assertTrue(visible.unread_answer)
+        self.assertEqual(self.migrate_change(item)[0], 0)
+        self.assertEqual(receipt.read_bytes(), exact_receipt)
+        self.assertTrue(self.check_change_handoff(item, frozenset({0}), unread=False).hides_card)
+
+    def test_unknown_change_slot_checks_unclaimed_anonymous_copy_for_the_same_time(self) -> None:
+        log = (ReviewLog(START, "nate", "feedback: Check the result."),
+               ReviewLog(FIRST_REPLY, OWNER.name, "Answer: East."))
+        item = self.change_with_log(log, delivery_state.AnsweredQuestion("current", "Which road?", "East."))
+        assert isinstance(item.source, review_items.ChangeSource)
+        same_time = replace(item, source=replace(item.source, answered_at=FIRST_REPLY), answer_time=FIRST_REPLY)
+        status, preview = self.migrate_change(same_time)
+        self.assertEqual(status, 0)
+        self.assertIn(f"  {item.key}: 2", preview)
+        self.assertFalse(the_list.exchange_history(item.key))
+        projected, = answer_sources.apply_review_handoffs([same_time], user_zone(), members=MEMBERS)
+        self.assertTrue(projected.unread_answer)
+        self.assertFalse(review_items.on_list(projected))
+
+        other_time = replace(item, source=replace(item.source, answered_at=SECOND_REPLY), answer_time=SECOND_REPLY)
+        status, preview = self.migrate_change(other_time)
+        self.assertEqual(status, 0)
+        self.assertIn("Unresolved legacy replies: 0", preview)
+        saved, = the_list.exchange_history(item.key)
+        self.assertEqual(saved.answerer, list_exchange.UNRECORDED_ANSWERER)
+        self.assertEqual(saved.answer, list_exchange.ExchangeAnswer("East.", SECOND_REPLY, list_exchange.AnswerRead.UNREAD))
+        handoff = self.check_change_handoff(other_time, frozenset(), unread=True)
+        self.assertFalse(handoff.hides_card)
+
     def test_validator_fallback_resolves_once_and_unknown_author_blocks_an_anonymous_copy(self) -> None:
         log = (ReviewLog(START, "nate", "question: Which side?"),
                ReviewLog(FIRST_REPLY, OWNER.name, "Answer: East."))
@@ -2320,9 +2386,47 @@ class AnswerSourceTests(unittest.TestCase):
                 self.assertEqual(the_list.confirmed_exchanges(key, destination, row.filed_exchanges), {expected})
                 self.assertEqual(list_exchange.decode(pending.read_text(encoding="utf-8")), original)
 
+    def test_list_write_matches_an_unknown_author_to_any_author(self) -> None:
+        key = "fixture/C1"
+        answer = list_exchange.ExchangeAnswer("East.", FIRST_REPLY, list_exchange.AnswerRead.UNREAD)
+        unknown = list_exchange.Exchange(list_exchange.Source.SCOPED_REPLY, key, "question:unknown",
+            list_exchange.Direction.ANSWER_TO_NATE, "Which side?", START, list_exchange.Nate.USER,
+            list_exchange.UNRECORDED_ANSWERER, answer,
+            binding=list_exchange.ExchangeBinding(list_exchange.QuestionSlot("unknown"), list_exchange.ReplyWithoutEvent.SLOT))
+        replies = (replace(unknown, exchange_id="question:owner", answerer=OWNER.id,
+                           binding=list_exchange.ExchangeBinding(list_exchange.QuestionSlot("owner"),
+                                                                 list_exchange.TaggedReply("answer:owner"))),
+                   replace(unknown, exchange_id="question:asker", answerer=ASKER.id,
+                           binding=list_exchange.ExchangeBinding(list_exchange.QuestionSlot("asker"),
+                                                                 list_exchange.TaggedReply("answer:asker"))))
+        with the_list.lock_exchange_source(key) as locked:
+            with self.assertRaises(the_list.ConflictingExchangeReplies):
+                _ = the_list.file_exchanges(locked, (unknown, *replies), unknown.question,
+                    linked=the_list.NextNumber.AVAILABLE, owner=OWNER.id, members=MEMBERS)
+            self.assertFalse(locked.reservation.exists())
+            pending = locked.reservation.with_suffix(".pending")
+            _ = pending.write_text(list_exchange.encode((list_exchange.FiledExchange.from_exchange(unknown),)),
+                                   encoding="utf-8")
+            with self.assertRaises(the_list.ConflictingExchangeReplies):
+                _ = the_list.file_exchanges(locked, replies, unknown.question,
+                    linked=the_list.NextNumber.AVAILABLE, owner=OWNER.id, members=MEMBERS)
+            self.assertFalse(locked.reservation.exists())
+            pending.unlink()
+            destination = the_list.file_exchanges(locked, replies, unknown.question, linked=the_list.NextNumber.AVAILABLE,
+                                                  owner=OWNER.id, members=MEMBERS)
+        saved = the_list.exchange_history(key)
+        self.assertEqual({row.answerer for row in saved}, {OWNER.id, ASKER.id})
+        with the_list.lock_exchange_source(key) as locked:
+            with self.assertRaises(the_list.ConflictingExchangeReplies):
+                _ = the_list.file_exchanges(locked, (unknown,), unknown.question, linked=destination,
+                                            owner=OWNER.id, members=MEMBERS)
+        self.assertEqual(the_list.exchange_history(key), saved)
+        self.assertEqual(the_list.confirmed_exchanges(key, destination, saved), set(saved))
+
     def test_random_reply_claims_and_review_receipts(self) -> None:
         choices = random.Random(46712)
         hidden = visible = 0
+        unknown_with_copy = unknown_without_copy = 0
         for number in range(1, 65):
             with self.subTest(case=number):
                 historical_tag = choices.choice(("", "historical"))
@@ -2359,12 +2463,21 @@ class AnswerSourceTests(unittest.TestCase):
                         answer_sources.file_saved_review(old, MEMBERS)
                 durable = [exchange for row in the_list.records(KEEPER.id)
                            for exchange in row.filed_exchanges if exchange.source_key == key]
-                if isinstance(old.source, review_items.ChangeSource) and isinstance(
-                        old.source.slots.question, delivery_state.AnsweredQuestion) and current_words == "East.":
-                    self.assertFalse(any(exchange.exchange_id == "question:current" for exchange in durable))
-                    self.assertEqual(any(exchange.question == "Which side?" for exchange in durable), prior == "saved" or bool(
-                        reply_tag and not old.source.answered_by and not old.source.validators))
+                source = old.source
+                if isinstance(source, review_items.ChangeSource) and isinstance(
+                        source.slots.question, delivery_state.AnsweredQuestion):
+                    current_rows = [exchange for exchange in durable if exchange.exchange_id == "question:current"]
+                    unknown = not source.answered_by and not source.validators
+                    if current_words == "East.":
+                        self.assertFalse(current_rows)
+                        self.assertEqual(any(exchange.question == "Which side?" for exchange in durable), prior == "saved")
+                        unknown_with_copy += int(unknown)
+                    elif unknown:
+                        current_row, = current_rows
+                        self.assertEqual(current_row.answerer, list_exchange.UNRECORDED_ANSWERER)
+                        unknown_without_copy += 1
                 identities: set[tuple[staff.StaffId, datetime, str]] = set()
+                claimants: dict[tuple[datetime, str], set[staff.StaffId]] = {}
                 for exchange in durable:
                     if not isinstance(exchange.answer, list_exchange.ExchangeAnswer):
                         continue
@@ -2376,6 +2489,12 @@ class AnswerSourceTests(unittest.TestCase):
                                 exchange.answer.time, exchange.answer.text.rstrip())
                     self.assertNotIn(identity, identities)
                     identities.add(identity)
+                    authors = claimants.setdefault(identity[1:], set())
+                    missing_author = staff.StaffId(list_exchange.UNRECORDED_ANSWERER.name)
+                    self.assertNotIn(missing_author, authors)
+                    if identity[0] == missing_author:
+                        self.assertFalse(authors)
+                    authors.add(identity[0])
 
                 report_log = (ReviewLog(FIRST_REPLY, OWNER.id, "Answer: East."),)
                 if choices.choice((True, False)):
@@ -2421,6 +2540,8 @@ class AnswerSourceTests(unittest.TestCase):
                     visible += 1
         self.assertGreater(hidden, 0)
         self.assertGreater(visible, 0)
+        self.assertGreater(unknown_with_copy, 0)
+        self.assertGreater(unknown_without_copy, 0)
 
     def test_shared_verifier_applies_conflicts_to_all_reply_proofs(self) -> None:
         tag = "Q1"

@@ -2388,7 +2388,9 @@ An open slot cannot supply proof of an answer.
 A reply identity uses its resolved author ID, time, and words.
 The writer checks the complete source, including saved and pending rows, before it saves an exchange.
 When multiple exchanges claim one reply identity, the writer leaves those exchanges unresolved.
-When the slot author is unknown, the slot answer and matching anonymous replies stay unresolved.
+A Change slot answer can file without a known author.
+An unknown author matches any author when two replies have the same time and words.
+The slot answer and its competing replies stay unresolved when they match.
 If an Investigation restores its original answer to the log, Review uses the verified log position and keeps the saved binding.
 A conflicting or unverified log reply stays in Review.
 The native question and answer can still file when the log association remains unresolved.
@@ -2398,6 +2400,7 @@ Verified Feedback replies remain in Review outside the unresolved question count
 The preview reports each unresolved source key and its reply count.
 Review keeps an Investigation or native Question visible while an outgoing question waits or a reply remains unresolved.
 Review hides a card only after a confirmed List receipt covers every reply and the current answer.
+An Open Change with only one confirmed slot answer can move to the List when the answerer is unknown.
 A later slot change leaves the filed reply binding and answer text intact.
 A filed question can receive an answer or close after withdrawal.
 The writer also updates read state and verified question metadata.
