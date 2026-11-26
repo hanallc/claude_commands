@@ -1256,7 +1256,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs) -> str:
         question = source.slots.question
         filed_answer = (isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
                         and isinstance(question, change_page.AnsweredQuestion)
-                        and f"question:{question.question_id}" in item.exchange_handoff.exchange_ids)
+                        and item.exchange_handoff.filed_slot_id == question.question_id)
         if validator:
             duration = (' · Validating for <time data-validating-age datetime="'
                         +source.handed_at.isoformat()+'"></time>') if source.handed_at is not None else ''

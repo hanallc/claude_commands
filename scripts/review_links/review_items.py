@@ -317,6 +317,7 @@ class FiledReviewExchange:
     answer_events: frozenset[int]
     exchange_ids: frozenset[str]
     open_staff_question: bool
+    filed_slot_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -366,7 +367,7 @@ class ReviewItem:
         if isinstance(handoff, FiledReviewExchange):
             slot = self.source.slots.question if isinstance(self.source, ChangeSource) else delivery_state.NoQuestion()
             if isinstance(slot, delivery_state.AnsweredQuestion):
-                if f"question:{slot.question_id}" in handoff.exchange_ids:
+                if handoff.filed_slot_id == slot.question_id:
                     time = AnswerTimeFromLog.USE_LOG
             elif isinstance(time, datetime) and any(self.log[index].time == time for index in handoff.answer_events):
                 time = AnswerTimeFromLog.USE_LOG

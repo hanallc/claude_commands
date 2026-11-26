@@ -2367,11 +2367,20 @@ An existing List item keeps its state and links.
 Closed staff questions without a saved answer stay outside the migration.
 
 New questions and answers use the same writer after the source saves.
-The writer saves the source key and exchange ID on the List item.
+The writer keeps the source key, exchange ID, and question and reply origins.
+A reply origin is a reply tag, a verified log position, or an answer saved only in its slot.
+The writer uses legacy slot evidence at first filing.
+The preview reports each unresolved source key and its reply count.
+Review keeps unresolved replies visible.
+A later slot change leaves the filed reply binding and answer text intact.
+A filed question can receive an answer or close after withdrawal.
+The writer also updates read state and verified question metadata.
 The writer rereads the source under its filing lock.
 The List allocator records the destination before it advances the counter.
-A retry uses the recorded destination.
+The writer saves pending exchanges before it writes the List item.
+A retry uses the recorded destination and pending exchanges.
 Review checks a save receipt before it hands off each exchange.
+The handoff hides only the recorded reply event.
 Review keeps separate decisions and unread replies that remain in Review.
 Old links to a filed Review answer open its Studio item.
 Use **Answer question** on a Studio item to answer an open staff question.
