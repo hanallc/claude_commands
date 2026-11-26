@@ -3267,6 +3267,68 @@ fi
         self.assertIn("the run left its mirror", output)
         check.assert_called_once()
 
+    def assert_cleanup_check(self, path: Path, result: claim_state.CleanupCheckResult) -> mac_test.RemoteJobClaim:
+        record = mac_test.read_run(path)
+        assert isinstance(record, dict) and "remote_host" in record
+        self.assertEqual(record.get("cleanup_check"), claim_state.cleanup_check_record(record, self.now, result))
+        return record
+
+    def test_watcher_saves_each_result_for_the_exact_kept_claim(self) -> None:
+        path, fence = self.saved_mirror_claim()
+        kept, = claim_state.read_claims(self.paths)
+        self.assertNotIn("cleanup_check", kept.record)
+
+        with self.watch_mirror(mac_test.ActivityCheckFailed("SSH did not answer")):
+            _ = self.watch_once()
+        failed = self.assert_cleanup_check(path, claim_state.CleanupCheckResult.CANNOT_CONFIRM)
+        self.assertTrue(claim_state.same_coordination_record(failed, kept.record))
+
+        fence.parent.mkdir(parents=True)
+        with fence.open("w") as holder, mock.patch.dict(os.environ, {"WATCH_FENCE_OPEN": "yes"}), \
+             self.watch_mirror(mac_test.MacActive(2, 2)):
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _ = self.watch_once()
+        running = self.assert_cleanup_check(path, claim_state.CleanupCheckResult.RUNNING)
+
+        with self.watch_mirror(mac_test.MacActive(2, 2)):
+            _ = self.watch_once()
+        self.assertIsInstance(mac_test.read_run(path), mac_test.NoRun)
+        self.assertEqual(claim_state.read_claims(self.paths), ())
+        self.assertFalse((self.paths.directory / "cleanup-checks").exists())
+
+        mac_test.write_json(path, {**running, "attempt": "new-attempt"})
+        replacement, = claim_state.read_claims(self.paths)
+        self.assertNotIn("cleanup_check", replacement.record)
+
+    def test_watcher_records_running_work_in_the_saved_mirror(self) -> None:
+        path, fence = self.saved_mirror_claim()
+        fence.parent.mkdir(parents=True)
+        fence.touch()
+        with mock.patch.dict(os.environ, {"WATCH_ACTIVE_ROOT": self.original_root}), \
+             self.watch_mirror(mac_test.MacActive(2, 2)) as check:
+            _ = self.watch_once()
+        _ = self.assert_cleanup_check(path, claim_state.CleanupCheckResult.RUNNING)
+        self.assertTrue(fence.exists())
+        check.assert_called_once()
+
+    def test_watcher_records_ssh_failure_even_with_fence_holders(self) -> None:
+        path, fence = self.saved_mirror_claim()
+        fence.parent.mkdir(parents=True)
+        fence.touch()
+        kept, = claim_state.read_claims(self.paths)
+        key = claim_state.pending_start_key(claim_state.claim_identity(kept.record))
+
+        def disconnected(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(arguments, 255, f"dispatch_mac_id={self.machine_id}\n"
+                + f"dispatch_start_pending_mac={key}\ndispatch_start_holder={key} 2346 cargo helper\n",
+                "Connection closed")
+
+        with self.watch_mirror(mac_test.MacActive(2, 2), disconnected) as check:
+            _ = self.watch_once()
+        _ = self.assert_cleanup_check(path, claim_state.CleanupCheckResult.CANNOT_CONFIRM)
+        self.assertTrue(fence.exists())
+        check.assert_called_once()
+
     def test_mac_probe_saves_the_origin_with_the_exact_claim(self) -> None:
         from scripts.mac_test import eligibility, offload
         from scripts.mac_test.mirror_root import MacMirrorRoot

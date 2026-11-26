@@ -243,13 +243,16 @@ _NO_UNIT_LABELS: Mapping[RunningJob | Held | KeptClaim, roster.UnitLabels] = {}
 
 
 def kept_claims_suffix(kept: tuple[KeptClaim, ...],
-                       labels: Mapping[RunningJob | Held | KeptClaim, roster.UnitLabels]) -> str:
-    """Name each kept claim with its owner: the holder session name when known, else the repository."""
-    from scripts.build_targets.targets import kept_claim_text
+                       labels: Mapping[RunningJob | Held | KeptClaim, roster.UnitLabels], *, separator: str = " · ") -> str:
+    """Format each kept claim for the status command."""
+    from scripts.build_targets.targets import kept_claim_text, utc_now
     from scripts.lib.user_zone import user_zone
 
+    if not kept:
+        return ""
     zone = user_zone()
-    return "".join(" · " + display_field(kept_claim_text(claim, labels[claim].session if claim in labels else "", zone))
+    now = utc_now()
+    return "".join(separator + display_field(kept_claim_text(claim, labels[claim].session if claim in labels else "", zone, now))
                    for claim in kept)
 
 
@@ -278,7 +281,8 @@ def format_state(name: str, state: TargetState,
         return (f"{name}: " + "; ".join(running_job_text(job, labels) for job in state.jobs)
                 + kept_claims_suffix(state.kept_claims, labels))
     if isinstance(state, Unreachable):
-        return f"{name}: unreachable — {display_field(state.reason)}"
+        return (f"{name}: unreachable — {display_field(state.reason)}"
+                + kept_claims_suffix(state.kept_claims, labels, separator="\n  "))
     if isinstance(state, StateUnreadable):
         return f"{name}: state unreadable — {display_field(state.reason)}"
     since = f" since {local_time(state.since)}" if isinstance(state.since, datetime) else ", start not recorded"
@@ -295,7 +299,7 @@ def format_state(name: str, state: TargetState,
 
 
 def probe_target(target: SshTarget) -> TargetState:
-    from scripts.build_targets.targets import Unreachable
+    from scripts.build_targets.targets import Unreachable, kept_claims, unreachable_with_kept_mac_claims
     from scripts.mac_test import offload
 
     config = ssh_target_config(target)
@@ -303,6 +307,8 @@ def probe_target(target: SshTarget) -> TargetState:
         return target_state(target)
     result = offload.probe_reachability(offload.ProcessController(), config)
     if isinstance(result, offload.UnreachableHost):
+        if target.platform == "macos":
+            return unreachable_with_kept_mac_claims(result.reason, kept_claims(target_state(target)))
         return Unreachable(result.reason)
     return target_state(target)
 
@@ -313,7 +319,7 @@ def command_status(probe: bool = False) -> int:
     from scripts.buildlog import mac_idle
     from scripts.lib.user_zone import user_zone
     from scripts.message import roster
-    from scripts.build_targets.targets import Free, Held, HolderSession, Running
+    from scripts.build_targets.targets import Held, HolderSession, Running, kept_claims
 
     try:
         targets = read_targets()
@@ -329,8 +335,8 @@ def command_status(probe: bool = False) -> int:
             else target_state(target)
         )
         states.append((target.name, state))
-        jobs = ((*state.jobs, *state.kept_claims) if isinstance(state, Running) else state.kept_claims
-                if isinstance(state, Free) else (state, *state.kept_claims) if isinstance(state, Held) else ())
+        jobs = ((*state.jobs, *state.kept_claims) if isinstance(state, Running)
+                else (state, *state.kept_claims) if isinstance(state, Held) else kept_claims(state))
         for job in jobs:
             if isinstance(job.holder_session, HolderSession):
                 holders[job] = job.holder_session.session_id
@@ -1154,7 +1160,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments, *, session: Su
                 continue
             try:
                 with mac_test.locked(paths.lock):
-                    if mac_test.read_run(claim.path) != record:
+                    if not claim_state.same_coordination_record(mac_test.read_run(claim.path), record):
                         continue
                     attempt = mac_test.take_over_kept_claim(owner, claim, record, session=session)
                     if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:

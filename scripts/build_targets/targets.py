@@ -8,8 +8,9 @@ except FileNotFoundError:
     pass
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone, tzinfo
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,7 +31,7 @@ from scripts.build_targets.target_config import (
 
 
 if TYPE_CHECKING:
-    from scripts.mac_test import eligibility, mac_test
+    from scripts.mac_test import claim_state, eligibility, mac_test
 
 
 @dataclass(frozen=True)
@@ -98,14 +99,22 @@ class NoHolderSession:
 NO_HOLDER_SESSION = NoHolderSession()
 
 
+class KeptClaimReason(Enum):
+    REMOTE_CLEANUP = "remote cleanup"
+    MAC_CLEANUP_IN_PROGRESS = "Mac cleanup in progress"
+    MAC_CLEANUP_UNCONFIRMED = "Mac cleanup unconfirmed"
+    MAC_PLACE_CHANGING = "Mac place changing"
+
+
 @dataclass(frozen=True)
 class KeptClaim:
-    """A remote claim kept for cleanup. Its owner process ended, and it holds no work."""
+    """A remote place held for cleanup or a reservation change."""
 
     what: str
     repository: str
     since: datetime
     holder_session: HolderSession | NoHolderSession = NO_HOLDER_SESSION
+    reason: KeptClaimReason = KeptClaimReason.REMOTE_CLEANUP
 
 
 @dataclass(frozen=True)
@@ -151,6 +160,7 @@ class Held:
 @dataclass(frozen=True)
 class Unreachable:
     reason: str
+    kept_claims: tuple[KeptClaim, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -224,17 +234,61 @@ def holder_session(record: mac_test.RunRecord) -> HolderSession | NoHolderSessio
     return HolderSession(session_id) if session_id else NO_HOLDER_SESSION
 
 
-def kept_claim(claim: mac_test.HeldClaim) -> KeptClaim:
-    from scripts.mac_test import mac_test
+def kept_claim(paths: claim_state.StatePaths, claim: mac_test.HeldClaim) -> KeptClaim:
+    from scripts.mac_test import claim_state, mac_test
 
     record = claim.record
     repository = claim.scope.name if isinstance(claim.scope, mac_test.RepositoryScope) else Path(record["worktree"]).name
+    reason = KeptClaimReason.REMOTE_CLEANUP
+    if paths.platform == "macos" and "remote_host" in record:
+        check = record.get("cleanup_check")
+        if "replaced_reservation" in record:
+            reason = KeptClaimReason.MAC_PLACE_CHANGING
+        elif check is not None and check["result"] is claim_state.CleanupCheckResult.CANNOT_CONFIRM:
+            reason = KeptClaimReason.MAC_CLEANUP_UNCONFIRMED
+        else:
+            reason = KeptClaimReason.MAC_CLEANUP_IN_PROGRESS
     return KeptClaim(record["what"], repository, mac_test.aware_timestamp(record["since"], claim.path, "since"),
-                     holder_session(record))
+                     holder_session(record), reason)
 
 
-def kept_claim_text(kept: KeptClaim, owner: str, zone: tzinfo) -> str:
-    """Name a kept claim with its owner and start: the holder session name when known, else the repository."""
+def kept_claims(state: TargetState) -> tuple[KeptClaim, ...]:
+    return () if isinstance(state, StateUnreadable) else state.kept_claims
+
+
+def unreachable_with_kept_mac_claims(reason: str, kept: tuple[KeptClaim, ...]) -> Unreachable:
+    claims = tuple(replace(claim, reason=KeptClaimReason.MAC_CLEANUP_UNCONFIRMED)
+                   if claim.reason is KeptClaimReason.MAC_CLEANUP_IN_PROGRESS else claim
+                   for claim in kept if claim.reason is not KeptClaimReason.REMOTE_CLEANUP)
+    return Unreachable(reason, claims)
+
+
+def kept_claim_age(since: datetime, now: datetime) -> str:
+    minutes = max(0, int((now - since).total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes} min"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours} h"
+    return f"{hours // 24} days"
+
+
+def kept_claim_reason(kept: KeptClaim, now: datetime) -> str:
+    if kept.reason is KeptClaimReason.REMOTE_CLEANUP:
+        return f"Kept for cleanup: {kept.repository} {kept.what}"
+    if kept.reason is KeptClaimReason.MAC_PLACE_CHANGING:
+        return f"{kept.repository}: changing its Mac place. Nothing to do."
+    age = kept_claim_age(kept.since, now)
+    if kept.reason is KeptClaimReason.MAC_CLEANUP_UNCONFIRMED:
+        return f"{kept.repository}: a Mac run started {age} ago stopped before cleanup, and the Mac cannot confirm it ended. Check the Mac, then release it with /build:status."
+    return f"{kept.repository}: a Mac run started {age} ago stopped before cleanup. It clears by itself. Nothing to do."
+
+
+def kept_claim_text(kept: KeptClaim, owner: str, zone: tzinfo, now: datetime) -> str:
+    """Format the kept claim for the status command."""
+    if kept.reason is not KeptClaimReason.REMOTE_CLEANUP:
+        holder = f" (holder {owner})" if owner and owner != kept.repository else ""
+        return kept_claim_reason(kept, now) + holder
     return f"kept for cleanup: {owner or kept.repository} {kept.what} since {kept_since_text(kept.since, zone)}"
 
 
@@ -305,21 +359,21 @@ def ssh_target_snapshot(target: SshTarget) -> TargetSnapshot:
         block = mac_test.read_claim_block(paths)
         backoff = eligibility.read_backoff(utc_now().timestamp(), target.name, strict=True)
         shown = status_claims(target, claims)
-        kept = tuple(kept_claim(claim) for claim in shown if mac_test.run_is_kept(claim.record))
+        kept = tuple(kept_claim(paths, claim) for claim in shown if mac_test.run_is_kept(claim.record))
         if not isinstance(block, mac_test.NoMacBlock):
             block_end = ExpiresAt(block.expires) if block.expires > utc_now() else AwaitingBlockRemoval(block.expires)
             session = (HolderSession(block.delivery.name)
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
             return snapshot(Held(mac_test.holder_name(block.holder), block.reason, block.since, block_end, session, kept))
         if isinstance(eligibility.read_failed_probe(target.name), eligibility.FailedProbe):
-            return snapshot(Unreachable("failed probe"))
+            return snapshot(unreachable_with_kept_mac_claims("failed probe", kept))
         jobs = tuple(running_job(claim) for claim in shown if mac_test.run_holds_work(claim.record))
         if jobs:
             return snapshot(Running(jobs, kept))
         if isinstance(backoff, eligibility.UnreadableBackoff):
             return snapshot(StateUnreadable("retry backoff: " + backoff.reason))
         if isinstance(backoff, eligibility.ActiveBackoff):
-            return snapshot(Unreachable("retry backoff"))
+            return snapshot(unreachable_with_kept_mac_claims("retry backoff", kept))
         return snapshot(Free(kept))
     except build_hold.ReleaseRecordReadError as error:
         return snapshot(StateUnreadable(build_hold.release_record_error_line(error)))

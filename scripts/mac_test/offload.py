@@ -678,7 +678,7 @@ def start_fence_command(identity: claim_state.ClaimIdentity, target: str, *, set
         except OSError:
             pass
 '''
-        observation = MAC_MACHINE_ID_PROGRAM + '''import os, sys, time
+        observation = MAC_MACHINE_ID_PROGRAM + '''import os, re, sys, time
 
 deadline = time.monotonic() + float(sys.argv[4])
 
@@ -702,7 +702,11 @@ def check_leftovers():
     if result.stderr:
         sys.stderr.buffer.write(result.stderr)
         sys.exit(1)
-    if result.returncode != 0 or result.stdout != b"leftovers=0\\nrc=0\\n":
+    if result.returncode != 0:
+        sys.exit(1)
+    if re.fullmatch(rb"leftovers=[1-9][0-9]*\\nrc=0\\n", result.stdout):
+        sys.exit(0)
+    if result.stdout != b"leftovers=0\\nrc=0\\n":
         sys.exit(1)
 ''' if leftover_observation is not None else ""
         missing = ('''    check_leftovers()
@@ -2940,9 +2944,10 @@ def parse_leftover_check(output: str) -> LeftoverCheckResult:
 
 @dataclass(frozen=True)
 class LeftoverObservation:
-    """The observation holds the cleanup result and original output."""
+    """Keep the parsed result, output and exit status of the remote command."""
     result: LeftoverCheckResult
     output: str
+    command_succeeded: bool = True
 
 
 def read_leftovers(config: SshConnectionSettings, host: str, script: str,
@@ -2953,7 +2958,7 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
     timeout = (release_deadline.remaining() if isinstance(release_deadline, ClaimReleaseDeadline)
                else config.leftover_timeout_s)
     if timeout <= 0:
-        return LeftoverObservation(LeftoverCheckFailed("the claim release deadline expired before SSH"), "")
+        return LeftoverObservation(LeftoverCheckFailed("the claim release deadline expired before SSH"), "", command_succeeded=False)
     try:
         arguments = ["ssh", *ssh_options(config), host, script]
         result = subprocess.run(
@@ -2966,9 +2971,9 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"), "")
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s"), "", command_succeeded=False)
     except OSError:
-        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {timeout:g} s)"), "")
+        return LeftoverObservation(LeftoverCheckFailed(f"SSH leftover check could not start (time limit {timeout:g} s)"), "", command_succeeded=False)
     ledger = transfer_bytes.active_transfers.get()
     if isinstance(ledger, transfer_bytes.TransferLedger):
         ledger.observe("ssh_cleanup", arguments, result.stdout, result.stderr)
@@ -2976,8 +2981,9 @@ def read_leftovers(config: SshConnectionSettings, host: str, script: str,
         if not target_config.uses_legacy_mac_layout(eligibility.configured_ssh_target(target or "mac").platform):
             from scripts.mac_test import linux_runner
             if result.returncode == linux_runner.SLOT_PROCESSES_UNRESOLVED:
-                return LeftoverObservation(LeftoversRemain(UnresolvedLeftoverCount()), result.stdout)
-        return LeftoverObservation(LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}"), result.stdout)
+                return LeftoverObservation(LeftoversRemain(UnresolvedLeftoverCount()), result.stdout, command_succeeded=False)
+        return LeftoverObservation(LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}"),
+                                   result.stdout, command_succeeded=False)
     answer = parse_leftover_check(result.stdout)
     if isinstance(answer, LeftoverCheckFailed):
         reason = " ".join(result.stderr.split())

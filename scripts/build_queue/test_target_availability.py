@@ -79,13 +79,14 @@ class AvailabilityRowTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "UTC"})))
 
     def test_a_kept_claim_from_an_earlier_day_shows_its_date(self) -> None:
-        kept = targets.KeptClaim("doc workspace", "cargo-liner", SINCE - timedelta(days=1))
+        kept = targets.KeptClaim("doc workspace", "cargo-liner", SINCE - timedelta(days=1),
+                                 reason=targets.KeptClaimReason.MAC_CLEANUP_IN_PROGRESS)
         rows = target_availability.availability_rows((snapshot(MAC, targets.Free((kept,))),), {}, UTC)
         self.assertEqual([row["since"] for row in rows], ["since Nov 12, 2026, 13:50 UTC"])
-        self.assertEqual(targets.kept_claim_text(kept, "", UTC),
-                         "kept for cleanup: cargo-liner doc workspace since Nov 12, 2026, 13:50 UTC")
-        self.assertEqual(targets.kept_claim_text(replace(kept, since=SINCE), "", UTC),
-                         "kept for cleanup: cargo-liner doc workspace since 13:50 UTC")
+        self.assertEqual(targets.kept_claim_text(kept, "", UTC, LATER),
+                         "cargo-liner: a Mac run started 25 h ago stopped before cleanup. It clears by itself. Nothing to do.")
+        self.assertEqual(targets.kept_claim_text(replace(kept, since=SINCE), "", UTC, LATER),
+                         "cargo-liner: a Mac run started 1 h ago stopped before cleanup. It clears by itself. Nothing to do.")
         # The date form uses the zone it compares in, not the user zone setting.
         self.assertEqual(targets.kept_since_text(kept.since, ZoneInfo("America/Los_Angeles")), "Nov 12, 2026, 05:50 PST")
 
@@ -111,29 +112,91 @@ class AvailabilityRowTests(unittest.TestCase):
 
     def test_each_kept_claim_shows_a_row_with_its_owner_and_start_while_other_runs_run(self) -> None:
         job = targets.RunningJob("nextest hana", SINCE, targets.NotSeenIdle())
-        known = targets.KeptClaim("doc workspace", "cargo-liner", SINCE, targets.HolderSession("mac-session"))
-        unknown = targets.KeptClaim("nextest", "hana", LATER, targets.HolderSession("ended-session"))
+        known = targets.KeptClaim("doc workspace", "cargo-liner", SINCE, targets.HolderSession("mac-session"),
+                                  targets.KeptClaimReason.MAC_CLEANUP_IN_PROGRESS)
+        unknown = targets.KeptClaim("nextest", "hana", LATER, targets.HolderSession("ended-session"),
+                                    targets.KeptClaimReason.MAC_CLEANUP_IN_PROGRESS)
         snapshots = (snapshot(MAC, targets.Running((job,), (known,))), snapshot(NATEDEV, targets.Free()),
                      snapshot(SshTarget("spare", "macos", Path("/fixture/spare.conf")), targets.Free((unknown,))))
         rows = target_availability.availability_rows(snapshots, LABELS, UTC)
         self.assertEqual(rows, [
-            {"target": "mac", "state": "Kept", "reason": "Kept for cleanup: cargo-liner doc workspace",
+            {"target": "mac", "state": "Kept",
+             "reason": "cargo-liner: a Mac run started 1 h ago stopped before cleanup. It clears by itself. Nothing to do.",
              "holder": "research-director", "unit": "research", "showrunner": "hana", "since": "since 13:50 UTC",
              "until": ""},
             # No session name is known, so the repository in the reason names the owner.
-            {"target": "spare", "state": "Kept", "reason": "Kept for cleanup: hana nextest", "holder": "", "unit": "",
+            {"target": "spare", "state": "Kept",
+             "reason": "hana: a Mac run started 0 min ago stopped before cleanup. It clears by itself. Nothing to do.",
+             "holder": "", "unit": "",
              "showrunner": "", "since": "since 15:10 UTC", "until": ""},
         ])
         self.assertEqual(target_availability.holder_sessions(snapshots), ["mac-session", "ended-session"])
 
     def test_a_blocked_mac_shows_its_kept_claims_after_the_block_row(self) -> None:
-        kept = targets.KeptClaim("doc workspace", "cargo-liner", LATER, targets.HolderSession("first-session"))
+        kept = targets.KeptClaim("doc workspace", "cargo-liner", LATER, targets.HolderSession("first-session"),
+                                 targets.KeptClaimReason.MAC_CLEANUP_IN_PROGRESS)
         snapshots = (snapshot(MAC, replace(MAC_BLOCK, kept_claims=(kept,))),)
         rows = target_availability.availability_rows(snapshots, LABELS, UTC)
         self.assertEqual([(row["state"], row["reason"], row["holder"], row["since"]) for row in rows], [
             ("Blocked", "Mac CI restore", "research", "since 13:50 UTC"),
-            ("Kept", "Kept for cleanup: cargo-liner doc workspace", "report-director", "since 15:10 UTC")])
+            ("Kept", "cargo-liner: a Mac run started 0 min ago stopped before cleanup. It clears by itself. Nothing to do.",
+             "report-director", "since 15:10 UTC")])
         self.assertEqual(target_availability.holder_sessions(snapshots), ["mac-session", "first-session"])
+
+    def kept_mac_claim(self, *, result: claim_state.CleanupCheckResult, age: timedelta,
+                       replacing: bool = False) -> mac_test.HeldClaim:
+        scope = claim_state.RepositoryScope("hana")
+        owner = claim(scope, "nextest hana")
+        assert "remote_host" not in owner.record
+        record: mac_test.RemoteJobClaim = {**owner.record, "remote_host": "fixture-mac",
+                                          "since": (LATER - age).isoformat(), "holder_session": "mac-session"}
+        if replacing:
+            record["replaced_reservation"] = {"file": "claims/old.json", "fingerprint": "a" * 64}
+        record["cleanup_check"] = claim_state.cleanup_check_record(record, LATER, result)
+        return mac_test.HeldClaim(scope, owner.path, record)
+
+    def kept_reason(self, *, result: claim_state.CleanupCheckResult, replacing: bool = False,
+                    age: timedelta) -> str:
+        held_claim = self.kept_mac_claim(result=result, age=age, replacing=replacing)
+        state = targets.Free((targets.kept_claim(claim_state.StatePaths(Path("/fixture")), held_claim),))
+        row, = target_availability.availability_rows((snapshot(MAC, state),), LABELS, UTC)
+        return row["reason"]
+
+    def test_kept_mac_claim_with_running_work_needs_no_action(self) -> None:
+        self.assertEqual(self.kept_reason(result=claim_state.CleanupCheckResult.RUNNING, age=timedelta(minutes=12)),
+                         "hana: a Mac run started 12 min ago stopped before cleanup. It clears by itself. Nothing to do.")
+
+    def test_kept_mac_claim_with_unconfirmed_cleanup_names_the_action(self) -> None:
+        self.assertEqual(self.kept_reason(result=claim_state.CleanupCheckResult.CANNOT_CONFIRM, age=timedelta(days=2)),
+                         "hana: a Mac run started 2 days ago stopped before cleanup, and the Mac cannot confirm it ended. "
+                         + "Check the Mac, then release it with /build:status.")
+
+    def test_kept_mac_claim_with_a_place_change_needs_no_action(self) -> None:
+        self.assertEqual(self.kept_reason(result=claim_state.CleanupCheckResult.CANNOT_CONFIRM,
+                                         replacing=True, age=timedelta(hours=3)),
+                         "hana: changing its Mac place. Nothing to do.")
+
+    def test_mac_outage_shows_kept_claim_after_the_unavailable_row(self) -> None:
+        kept = self.kept_mac_claim(result=claim_state.CleanupCheckResult.RUNNING, age=timedelta(minutes=12))
+        with mock.patch.object(mac_test, "state_paths", return_value=claim_state.StatePaths(Path("/fixture"))), \
+             mock.patch.object(mac_test, "read_claims", return_value=(kept,)), \
+             mock.patch.object(mac_test, "read_claim_block", return_value=mac_test.NoMacBlock()), \
+             mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
+            for probe, backoff, reason in (
+                (eligibility.FailedProbe(), eligibility.NO_BACKOFF, "failed probe"),
+                (eligibility.NoFailedProbe(), eligibility.ACTIVE_BACKOFF, "retry backoff"),
+            ):
+                with self.subTest(reason=reason), \
+                     mock.patch.object(eligibility, "read_failed_probe", return_value=probe), \
+                     mock.patch.object(eligibility, "read_backoff", return_value=backoff):
+                    snapshots = (targets.ssh_target_snapshot(MAC),)
+                    rows = target_availability.availability_rows(snapshots, LABELS, UTC)
+                    self.assertEqual([(row["state"], row["reason"], row["holder"]) for row in rows], [
+                        ("Unavailable", reason, ""),
+                        ("Kept", "hana: a Mac run started 12 min ago stopped before cleanup, and the Mac cannot confirm "
+                         + "it ended. Check the Mac, then release it with /build:status.", "research-director"),
+                    ])
+                    self.assertEqual(target_availability.holder_sessions(snapshots), ["mac-session"])
 
     def test_unreachable_and_unreadable_targets_show_as_unavailable(self) -> None:
         snapshots = (snapshot(MAC, targets.Unreachable("retry backoff")),

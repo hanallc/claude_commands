@@ -278,7 +278,7 @@ class IsolatedBuildTargetTest(NotificationGuardedTestCase, IsolatedTargetTest):
         _ = path.write_text(json.dumps(record))
 
 
-KEPT_HANA = "kept for cleanup: hana nextest hana since 13:05 PDT"
+KEPT_HANA = "hana: a Mac run started 55 min ago stopped before cleanup. It clears by itself. Nothing to do."
 
 
 class StatusTests(IsolatedBuildTargetTest):
@@ -483,6 +483,12 @@ class StatusTests(IsolatedBuildTargetTest):
                       repo_key="https://fixture.invalid/cargo-liner", repo_name="cargo-liner",
                       holder_session="liner-session")
         _ = path.write_text(json.dumps(record))
+        paths = claim_state.StatePaths(self.mac_state)
+        kept, = claim_state.read_claims(paths)
+        assert "remote_host" in kept.record
+        record["cleanup_check"] = claim_state.cleanup_check_record(
+            kept.record, NOW, claim_state.CleanupCheckResult.CANNOT_CONFIRM)
+        _ = path.write_text(json.dumps(record))
         config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
         labels = {"hana-session": roster.UnitLabels("inspectors", "hana", "inspectors"),
                   "liner-session": roster.UnitLabels("liner-director", "builds", "liner")}
@@ -491,7 +497,31 @@ class StatusTests(IsolatedBuildTargetTest):
              mock.patch.object(roster, "unit_labels_for", return_value=labels):
             result = self.capture_status()
         self.assertEqual(result, (0, "mac: held by hana since 13:05 PDT (showrunner hana, unit inspectors) until 15:05 PDT"
-                                  + " — render checks · kept for cleanup: liner-director doc workspace since 12:05 PDT\n", ""))
+                                  + " — render checks · cargo-liner: a Mac run started 1 h ago stopped before cleanup, "
+                                  + "and the Mac cannot confirm it ended. Check the Mac, then release it with /build:status."
+                                  + " (holder liner-director)\n", ""))
+
+    def test_unreachable_mac_status_shows_kept_claim_under_the_outage(self) -> None:
+        self.write_claim()
+        path = self.mac_state / "run.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record.update(remote_host="test-mac", holder_session="mac-session")
+        _ = path.write_text(json.dumps(record))
+        config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+                                   + UNREACHABLE_WAIT_FIXTURE)
+        labels = {"mac-session": roster.UnitLabels("mac-director", "builds", "mac")}
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
+             mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()), \
+             mock.patch.object(roster, "unit_labels_for", return_value=labels), \
+             mock.patch.object(offload, "probe_reachability", return_value=offload.UnreachableHost("SSH timed out")):
+            (self.mac_state / "failed_probe").touch()
+            for probe, reason in ((False, "failed probe"), (True, "SSH timed out")):
+                with self.subTest(probe=probe):
+                    self.assertEqual(self.capture_status(probe=probe), (
+                        0, f"mac: unreachable — {reason}\n"
+                        + "  hana: a Mac run started 55 min ago stopped before cleanup, and the Mac cannot confirm it "
+                        + "ended. Check the Mac, then release it with /build:status. (holder mac-director)\n", "",
+                    ))
 
     def test_dead_remote_holder_is_free_without_deleting_its_cleanup_claim(self) -> None:
         self.write_claim()
@@ -545,19 +575,20 @@ class StatusTests(IsolatedBuildTargetTest):
             "targets=mac,mac-linux\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
             + "kind.mac-linux=ssh\nplatform.mac-linux=linux\nsettings.mac-linux=mac_linux.conf\n")
         guest = "mac-linux: running mac-linux test-affected since 13:05 PDT\n"
-        for labels, owner in (({}, "cargo-liner"),
-                              ({"liner-session": roster.UnitLabels("liner-director", "builds", "liner")}, "liner-director")):
-            with self.subTest(owner=owner), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
+        kept_text = "cargo-liner: a Mac run started 1 h ago stopped before cleanup. It clears by itself. Nothing to do."
+        for labels, holder in (({}, ""), ({"liner-session": roster.UnitLabels("liner-director", "builds", "liner")},
+                                         " (holder liner-director)")):
+            with self.subTest(holder=holder), mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
                  mock.patch.object(process_identity, "process_start", return_value=process_identity.Started("test-run-start")), \
                  mock.patch.object(roster, "unit_labels_for", return_value=labels):
                 self.assertEqual(self.capture_status(), (0, "mac: running nextest hana since 13:05 PDT"
-                    + f" · kept for cleanup: {owner} doc workspace since 12:05 PDT\n" + guest, ""))
+                    + f" · {kept_text}{holder}\n" + guest, ""))
         for name in ("claims/guest.json", "claims/hana.json"):
             (self.mac_state / name).unlink()
         with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
              mock.patch.object(process_identity, "process_start", return_value=process_identity.Gone()):
             self.assertEqual(self.capture_status(), (
-                0, "mac: free · kept for cleanup: cargo-liner doc workspace since 12:05 PDT\nmac-linux: free\n", ""))
+                0, f"mac: free · {kept_text}\nmac-linux: free\n", ""))
 
     def test_mac_running_status_adds_idle_since_from_claim(self) -> None:
         self.write_claim()

@@ -1688,19 +1688,59 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
     return watched
 
 
+@dataclass(frozen=True)
+class KeptClaimCheck:
+    claim: HeldClaim
+    checked_at: datetime
+
+
+@dataclass(frozen=True)
+class NoKeptClaimCheck:
+    """The activity check does not cover a kept claim."""
+
+
+NO_KEPT_CLAIM_CHECK = NoKeptClaimCheck()
+
+
+def save_kept_claim_check(
+    check: KeptClaimCheck, current: RunState, result: claim_state.CleanupCheckResult,
+) -> None:
+    """Write the result only while the same claim owns the path."""
+    if (isinstance(current, NoRun) or "remote_host" not in current
+            or claim_state.cleanup_check_owner(current) != claim_state.cleanup_check_owner(check.claim.record)):
+        return
+    try:
+        updated: RemoteJobClaim = {**current, "cleanup_check": claim_state.cleanup_check_record(current, check.checked_at, result)}
+        write_json(check.claim.path, updated)
+    except OSError as error:
+        print(f"Cannot save Mac cleanup check: {error}", file=sys.stderr)
+
+
+def record_kept_claim_check(
+    paths: StatePaths, check: KeptClaimCheck | NoKeptClaimCheck, result: claim_state.CleanupCheckResult,
+) -> None:
+    if isinstance(check, KeptClaimCheck):
+        try:
+            with locked(paths.lock):
+                save_kept_claim_check(check, read_run(check.claim.path), result)
+        except (OSError, StateReadError) as error:
+            print(f"Cannot save Mac cleanup check: {error}", file=sys.stderr)
+
+
 def watch_claim(
     paths: StatePaths, config: MacTestConfig, claim: HeldClaim, activity: MacActivity, now: datetime,
 ) -> bool:
     """Apply one activity answer to one claim; return whether it is still watched."""
     run = claim.record
     if "remote_host" in run:
+        check = KeptClaimCheck(claim, now) if run_is_kept(run) else NO_KEPT_CLAIM_CHECK
         saved = claim_state.saved_mac_repository(run)
         origin = run.get("mac_watch_origin")
         check_mirror = (origin is not None and isinstance(saved, claim_state.MacMirrorIdentity)
                         and recoverable_kept_claim(run))
         idle_expired = isinstance(activity, MacIdle) and claim_idle_expired(run, claim.path, config, now)
         if not check_mirror and not idle_expired:
-            return apply_claim_activity(paths, config, claim, activity, now, release_remote=False)
+            return apply_claim_activity(paths, config, claim, activity, now, release_remote=False, cleanup_check=check)
         from scripts.copies import copies
         from scripts.mac_test import offload
 
@@ -1712,12 +1752,14 @@ def watch_claim(
                     root = MacMirrorRoot(origin["mirror_root"])
                     lease.enter_context(offload.mac_cleanup_lease(saved, run["remote_host"], paths.target, mirror_root=root))
             except copies.BusyRemoteMirror:
+                record_kept_claim_check(paths, check, claim_state.CleanupCheckResult.CANNOT_CONFIRM)
                 return True
             except (OSError, copies.CopyError, conf.Unusable) as error:
                 print(f"Mac claim cleanup lease unavailable: {error}", flush=True)
+                record_kept_claim_check(paths, check, claim_state.CleanupCheckResult.CANNOT_CONFIRM)
                 return True
             return apply_claim_activity(paths, config, claim, activity, now,
-                                        release_remote=True, check_mirror=check_mirror)
+                                        release_remote=True, check_mirror=check_mirror, cleanup_check=check)
     return apply_claim_activity(paths, config, claim, activity, now, release_remote=False)
 
 
@@ -1729,6 +1771,7 @@ def claim_idle_expired(run: RunRecord, path: Path, config: MacTestConfig, now: d
 def apply_claim_activity(
     paths: StatePaths, config: MacTestConfig, claim: HeldClaim, activity: MacActivity, now: datetime,
     *, release_remote: bool, check_mirror: bool = False,
+    cleanup_check: KeptClaimCheck | NoKeptClaimCheck = NO_KEPT_CLAIM_CHECK,
 ) -> bool:
     """Check the saved claim again before updating or releasing it."""
     run = claim.record
@@ -1750,6 +1793,8 @@ def apply_claim_activity(
         if isinstance(activity, ActivityCheckFailed):
             if changed:
                 write_json(claim.path, current)
+            if isinstance(cleanup_check, KeptClaimCheck):
+                save_kept_claim_check(cleanup_check, current, claim_state.CleanupCheckResult.CANNOT_CONFIRM)
             print(f"Mac claim activity check failed: {activity.reason}", flush=True)
             return True
         if isinstance(activity, MacActive) and activity.work > 0:
@@ -1774,13 +1819,14 @@ def apply_claim_activity(
     if check_mirror:
         try:
             result = release_exact_claims(paths, current["pid"], claim_state.claim_identity(current), "",
-                                          watched_claim=claim, watched_idle=idle_release)
+                                          watched_claim=claim, watched_idle=idle_release, cleanup_check=cleanup_check)
         except (OSError, ValueError) as error:
             result = ClaimReleaseRefused(str(error))
         if isinstance(result, ClaimReleaseRefused):
             if not result.idle_only:
                 if not result.fence_missing:
                     print(f"Mac claim mirror check kept the claim: {result.reason}", flush=True)
+                record_kept_claim_check(paths, cleanup_check, result.cleanup_result)
                 return True
             check_mirror = False
         else:
@@ -1788,12 +1834,14 @@ def apply_claim_activity(
             mirror_ended = not result.fence_missing
     if not check_mirror:
         if not idle_release:
+            record_kept_claim_check(paths, cleanup_check, claim_state.CleanupCheckResult.CANNOT_CONFIRM)
             return True
         release = CliArguments()
         release.pid, release.target = current["pid"], paths.target
         release.claim_id = current["claim_id"]
         release.episode, release.attempt = current["episode"], current["attempt"]
-        if command_release(release, paths) != 0:
+        if command_release(release, paths, cleanup_check=cleanup_check) != 0:
+            record_kept_claim_check(paths, cleanup_check, claim_state.CleanupCheckResult.CANNOT_CONFIRM)
             return True
     released_at = local_time(timestamp(now), include_zone=False)
     quoted_what = "'" + current["what"].replace("'", "'\"'\"'") + "'"
@@ -2091,6 +2139,7 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
     kept["proc_start"] = proc_start.start
     kept["submitting_session"] = claim_state.session_id(session)
     kept["cleanup_pending"] = True
+    _ = kept.pop("cleanup_check", None)
     # Match the cleanup request while keeping the identity of the remote work.
     if cleanup_request_id:
         kept["cleanup_request_id"] = cleanup_request_id
@@ -2383,6 +2432,7 @@ def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope,
     record["pid"] = args.pid
     record["proc_start"] = start.start
     _ = record.pop("cleanup_request_id", None)
+    _ = record.pop("cleanup_check", None)
     cleanup_only = record.get("cleanup_pending") is True
     if not cleanup_only:
         record["worktree"] = str(claim_worktree_path(record["worktree"]))
@@ -2546,6 +2596,7 @@ class ClaimReleaseRefused:
     reason: str
     fence_missing: bool = False
     idle_only: bool = False
+    cleanup_result: claim_state.CleanupCheckResult = claim_state.CleanupCheckResult.CANNOT_CONFIRM
 
 
 def same_cleanup_claim(current: RunRecord, record: RunRecord) -> bool:
@@ -2561,6 +2612,7 @@ def release_exact_claims(
     finish_wait: bool = False,
     release_deadline: offload.ClaimReleaseDeadline | conf.UseConfiguredValue = conf.UseConfiguredValue.CURRENT,
     watched_claim: HeldClaim | None = None, watched_idle: bool = False,
+    cleanup_check: KeptClaimCheck | NoKeptClaimCheck = NO_KEPT_CLAIM_CHECK,
 ) -> ClaimsReleased | ClaimReleaseRefused:
     """Release the claims that pid holds under identity, after their remote start fence settles."""
     from scripts.mac_test import eligibility, offload
@@ -2662,7 +2714,18 @@ def release_exact_claims(
                             return ClaimReleaseRefused("the exact start fence is missing", fence_missing=True)
                     elif not isinstance(observed.result, offload.LeftoversEnded) or lines != [*prefix, f"dispatch_start_settled={key}"]:
                         reason = offload.start_fence_reason(identity, observed.output)
-                        return ClaimReleaseRefused(reason or "the mirror check gave no answer")
+                        holder_prefix = f"dispatch_start_holder={key} "
+                        mirror_running = (isinstance(observed.result, offload.LeftoversRemain)
+                                          and isinstance(observed.result.count, int)
+                                          and lines == [prefix[0], f"leftovers={observed.result.count}", "rc=0"])
+                        fence_running = (lines[:2] == [prefix[0], f"dispatch_start_pending_mac={key}"]
+                                         and any(line.startswith(holder_prefix)
+                                                 and line.removeprefix(holder_prefix).partition(" ")[0].isdecimal()
+                                                 for line in lines[2:]))
+                        running = observed.command_succeeded and (mirror_running or fence_running)
+                        return ClaimReleaseRefused(reason or "the mirror check gave no answer", cleanup_result=(
+                            claim_state.CleanupCheckResult.RUNNING if running
+                            else claim_state.CleanupCheckResult.CANNOT_CONFIRM))
                 elif fence_pending:
                     reason = offload.start_fence_reason(identity, observed.output)
                     if reason is not None:
@@ -2684,6 +2747,8 @@ def release_exact_claims(
                     return ClaimReleaseRefused(str(error))
                 transfers.extend(current.get("transfers", []))
                 pending.unlink(missing_ok=True)
+                if isinstance(cleanup_check, KeptClaimCheck) and path == cleanup_check.claim.path:
+                    save_kept_claim_check(cleanup_check, current, claim_state.CleanupCheckResult.ENDED)
                 if finish_wait and "remote_host" not in current:
                     claim_state.record_wait_removal(paths, identity, path)
                 else:
@@ -2701,7 +2766,7 @@ def print_claim_release(released: ClaimsReleased) -> None:
 
 
 def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held: bool = False,
-                    finish_wait: bool = False) -> int:
+                    finish_wait: bool = False, cleanup_check: KeptClaimCheck | NoKeptClaimCheck = NO_KEPT_CLAIM_CHECK) -> int:
     from scripts.mac_test import offload
 
     deadline = args.deadline_monotonic
@@ -2711,7 +2776,7 @@ def command_release(args: CliArguments, paths: StatePaths, *, provider_lock_held
                         else conf.UseConfiguredValue.CURRENT)
     released = release_exact_claims(paths, args.pid, claim_state.ClaimIdentity(args.claim_id, args.episode, args.attempt),
                                     args.settings, provider_lock_held=provider_lock_held, finish_wait=finish_wait,
-                                    release_deadline=release_deadline)
+                                    release_deadline=release_deadline, cleanup_check=cleanup_check)
     if isinstance(released, ClaimReleaseRefused):
         print(f"cannot release: {released.reason}", file=sys.stderr)
         return 12

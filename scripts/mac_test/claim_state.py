@@ -316,11 +316,31 @@ def read_mac_watch_origin(value: object) -> MacWatchOrigin | None:
         return None
 
 
+class CleanupCheckResult(StrEnum):
+    ENDED = "ended"
+    RUNNING = "running"
+    CANNOT_CONFIRM = "cannot confirm"
+
+
+class ClaimCleanupCheck(TypedDict):
+    """The last check of the claim's remote work."""
+
+    owner: str
+    checked_at: str
+    result: CleanupCheckResult
+
+
+@dataclass(frozen=True)
+class NoClaimCleanupCheck:
+    """The claim has no valid cleanup check."""
+
+
 class RemoteJobClaim(ClaimOwnerRecord):
     """The claim holds Mac capacity until the named host confirms that its job ends."""
 
     remote_host: str
     mac_watch_origin: NotRequired[MacWatchOrigin]
+    cleanup_check: NotRequired[ClaimCleanupCheck]
     cleanup_pending: NotRequired[bool]
     cleanup_request_id: NotRequired[str]
     instance_generation: NotRequired[str]
@@ -600,6 +620,38 @@ class HeldClaim:
                 return mac_claim_key(self.record.get("repo_key", "")) == mac_claim_key(scope.key)
             return self.record.get("repo_name") == scope.name
         return False
+
+
+def cleanup_check_owner(record: RunRecord) -> str:
+    fields = (record["claim_id"], record["episode"], record["attempt"], record["pid"], record["proc_start"],
+              record["since"], record.get("remote_host"), record.get("mac_repository"),
+              record.get("mac_watch_origin"), record.get("replaced_reservation"))
+    return sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+
+def cleanup_check_record(record: RemoteJobClaim, checked_at: datetime, result: CleanupCheckResult) -> ClaimCleanupCheck:
+    return {"owner": cleanup_check_owner(record), "checked_at": checked_at.isoformat(), "result": result}
+
+
+def decode_cleanup_check(value: object, path: Path, record: RemoteJobClaim) -> ClaimCleanupCheck | NoClaimCleanupCheck:
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        if fields.get("owner") == cleanup_check_owner(record):
+            try:
+                checked_at = aware_timestamp(fields.get("checked_at"), path, "cleanup_check.checked_at")
+                result = CleanupCheckResult(required_string(fields, "result", path))
+                return cleanup_check_record(record, checked_at, result)
+            except ValueError:
+                pass
+    return NoClaimCleanupCheck()
+
+
+def same_coordination_record(current: RunState, expected: RunRecord) -> bool:
+    """Compare claim fields that affect coordination."""
+    if isinstance(current, NoRun):
+        return False
+    return ({key: value for key, value in current.items() if key != "cleanup_check"}
+            == {key: value for key, value in expected.items() if key != "cleanup_check"})
 
 
 class ReservationRetirementError(OSError):
@@ -913,6 +965,10 @@ def decode_run(values: dict[str, object], path: Path, *, moved_from_claim: bool 
             if not request_id:
                 raise StateReadError(f"{path} has an invalid cleanup_request_id")
             remote["cleanup_request_id"] = request_id
+    if "cleanup_check" in values:
+        cleanup_check = decode_cleanup_check(values["cleanup_check"], path, remote)
+        if not isinstance(cleanup_check, NoClaimCleanupCheck):
+            remote["cleanup_check"] = cleanup_check
     return remote
 
 
