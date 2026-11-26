@@ -887,6 +887,7 @@ NO_QUEUED_PROCESS_GENERATION = NoQueuedProcessGeneration()
 class SessionIdWithoutLiveRecipient(NamedTuple):
     recipient: ClaudeMailbox
     generation: session_staff.ProvedProcessGeneration | NoQueuedProcessGeneration = NO_QUEUED_PROCESS_GENERATION
+    starting: bool = False
 
     @property
     def address(self) -> str:
@@ -2564,7 +2565,7 @@ def _fixed_staff_relay_plan(message: Message, selection: FixedStaffLookup) -> Re
     plan = _claude_delivery_plan(message, mailbox, registry, records)
     if isinstance(plan, SessionIdWithoutLiveRecipient):
         return ClaudeRoutingFailed(unit_lookup.SocketUnavailable(
-            f"no live Claude session answers to staff ID {selection.to}"))
+            herdr_types.PANE_STARTING if plan.starting else f"no live Claude session answers to staff ID {selection.to}"))
     if isinstance(plan, ClaudeRoutingFailed):
         return plan
     attempt = plan.message.claude_attempt
@@ -2624,7 +2625,9 @@ def relay_socket(message: Message, timeout: float, *,
     address = conversation_recipient(mailbox).address
     if isinstance(attempt.recipient, RelayProcessRecipient) and isinstance(plan, SessionIdWithoutLiveRecipient):
         return message, Result("failed", f"{result.detail}; {dead_socket_reason(message.to)}")
-    if isinstance(plan, SessionIdWithoutLiveRecipient) or plan.message.claude_attempt == attempt:
+    if isinstance(plan, SessionIdWithoutLiveRecipient):
+        return message, Result("queued", herdr_types.PANE_STARTING if plan.starting else result.detail, receiver=address)
+    if plan.message.claude_attempt == attempt:
         return message, Result("queued", result.detail, receiver=address)
     retried = relay(plan.message, max(1.0, timeout - (time.monotonic() - started)))
     if retried.outcome in ("sent", "queued"):
@@ -4492,6 +4495,9 @@ def _claude_delivery_plan(message: Message, mailbox: ClaudeMailbox, registry: se
     message_owner = _unique_message_owner(conversation, registry, candidates)
     with _message_proof.message_lookup(message_owner):
         checked = unit_lookup.checked_conversation(conversation, registry=registry, probe_address=False)
+    if (isinstance(checked, unit_lookup.UnknownUnit) and checked.reason == herdr_types.PANE_STARTING
+            and not registry.unreadable):
+        return SessionIdWithoutLiveRecipient(mailbox, starting=True)
     if isinstance(checked, unit_lookup.ClaudeArgvUnavailable):
         try:
             _ = staff.native_id(conversation)
@@ -5918,7 +5924,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
         plan = _claude_delivery_plan(message, mailbox, registry, running)
         if isinstance(plan, SessionIdWithoutLiveRecipient):
             plan = ClaudeRoutingFailed(unit_lookup.SocketUnavailable(
-                f"no live Claude session answers to staff ID {mailbox.staff_id}"))
+                herdr_types.PANE_STARTING if plan.starting
+                else f"no live Claude session answers to staff ID {mailbox.staff_id}"))
     elif claude_route:
         plan = relay_plan(message, registry, running, membership, mailbox)
     else:
@@ -6073,9 +6080,10 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             result = deliver_codex(message, route, options.timeout, selection=options.selection,
                                    review_recipient=stable.value)
         elif isinstance(route, QueuedStaffRecipient):
-            result = Result("queued", f"no live Claude or Codex session answers to {route.name} ({route.session_id}),"
-                            + " so it is kept for it")
             assert isinstance(plan, SessionIdWithoutLiveRecipient)
+            result = Result("queued", f"{herdr_types.PANE_STARTING}; kept for {route.name} ({route.session_id})"
+                            if plan.starting else f"no live Claude or Codex session answers to {route.name} "
+                            + f"({route.session_id}), so it is kept for it")
             queue_mailbox = conversation_recipient(plan.recipient) if transport_message.review_batch else plan.recipient
             enqueue(replace(transport_message, key=None if transport_message.review_batch and not transport_message.once_per_key
                             else transport_message.key), result.detail, started,
@@ -6131,7 +6139,8 @@ def _send_with_review(options: Options, membership: staff.StaffSnapshot, review_
             if isinstance(plan, SessionIdWithoutLiveRecipient):
                 result = Result(
                     "queued",
-                    f"no live session answers to {plan.address}, so it is kept under that name",
+                    f"{herdr_types.PANE_STARTING}; kept for {plan.address}" if plan.starting
+                    else f"no live session answers to {plan.address}, so it is kept under that name",
                 )
                 queue_mailbox = conversation_recipient(plan.recipient) if transport_message.review_batch else plan.recipient
                 enqueue(replace(transport_message, key=None if transport_message.review_batch and not transport_message.once_per_key

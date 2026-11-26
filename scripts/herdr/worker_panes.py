@@ -210,6 +210,13 @@ class ProcessUnknownWorker:
 
 
 @dataclass(frozen=True)
+class StartingWorker(ProcessUnknownWorker):
+    """The worker has a starting pane without a proved native identity."""
+
+    reason: str = herdr.PANE_STARTING
+
+
+@dataclass(frozen=True)
 class AdmissionRefused:
     reason: str
 
@@ -626,19 +633,24 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
         if isinstance(read.launches, LaunchRecordsUnavailable):
             states.append(_uncertain(row, read.launches.reason))
             continue
+        related_unknown = [item for item in scan.unknown
+                           if launch_owners.get(item.pane) == row.id and item.tab in parent_tabs]
+        if related_unknown:
+            unknown = related_unknown[0]
+            location = next(pane for pane in panes if _text(pane, "pane_id") == unknown.pane)
+            terminal = _text(location, "terminal_id")
+            if isinstance(unknown, herdr.StartingPane):
+                states.append(StartingWorker(row, unknown.pane, terminal))
+            else:
+                states.append(ProcessUnknownWorker(row, unknown.pane, terminal, unknown.reason))
+            continue
         recovery = [] if row.id not in launched_here else [pane for pane in pane_launch.reference_panes(
                     pane_launch.StaffLaunchReference(row.id), record, client, read.launches.entries,
                     evidence=pane_launch.NativePaneEvidence(panes, scan))
                     if launch_owners.get(_text(pane, "pane_id")) == row.id
                     and _text(pane, "tab_id") in parent_tabs
                     and not any(pane in scan.found.get(sibling.id, []) for sibling in workers)]
-        related_unknown = [item for item in scan.unknown
-                           if launch_owners.get(item.pane) == row.id and item.tab in parent_tabs]
-        if related_unknown:
-            unknown = related_unknown[0]
-            location = next(pane for pane in panes if _text(pane, "pane_id") == unknown.pane)
-            states.append(ProcessUnknownWorker(row, unknown.pane, _text(location, "terminal_id"), unknown.reason))
-        elif len(recovery) > 1:
+        if len(recovery) > 1:
             states.append(_uncertain(row, "multiple recovery panes"))
         elif recovery:
             pane = recovery[0]
@@ -651,7 +663,8 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                 states.append(_uncertain(row, "recovery pane belongs to another native session"))
                 continue
             states.append(StoppedWorker(row, identity, terminal))
-        elif not isinstance(selection, SelectedWorkers) and any(item.tab in parent_tabs for item in scan.unknown):
+        elif not isinstance(selection, SelectedWorkers) and any(
+                item.tab in parent_tabs and not isinstance(item, herdr.StartingPane) for item in scan.unknown):
             states.append(_uncertain(row, "pane evidence is incomplete; absence is unproved"))
         else:
             states.append(ClosedWorker(row))

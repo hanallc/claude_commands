@@ -1309,6 +1309,9 @@ def _unit_workers(
                         closure = WorkerClosure.CONFIRMED
                         status = "closed"
                         reach = CannotReceiveMessages(status)
+                    elif isinstance(state, worker_panes.StartingWorker):
+                        status = f"{state.reason}; pane {state.pane}"
+                        reach = CannotReceiveMessages(status)
                     else:
                         status = (f"stopped; pane {state.pane}" if isinstance(state, worker_panes.StoppedWorker) else
                                   f"unknown; pane {state.pane}: {state.reason}" if isinstance(state, worker_panes.ProcessUnknownWorker) else

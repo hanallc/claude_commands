@@ -4152,6 +4152,28 @@ class WorkerPaneTests(StaffTestCase):
         found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
         self.assertIsInstance(found[absent.id], worker_panes.UncertainWorker)
 
+    def test_starting_pane_affects_only_its_worker(self) -> None:
+        starting, ready, absent = self.worker("starting"), self.worker("ready"), self.worker("absent")
+        pane = "w1:p1"
+        self.world.add(starting, pane)
+        self.world.add(ready, "w1:p2")
+        pid, _, _ = self.world.foreground[pane]
+        self.world.foreground[pane] = (pid, "claude", [])
+        ticks = os.sysconf("SC_CLK_TCK")
+        fake_unit_host.process(os.environ, pid, 1, [], {}, started=str(100 * ticks))
+        _ = (self.root / "proc/uptime").write_text("101.0 0.0\n")
+        _ = write_config_fixture(self.root / "conf/shutdown.conf", "start_seconds=20\n")
+
+        with redirect_stderr(io.StringIO()) as errors:
+            found = {item.row.id: item for item in worker_panes.observe(self.parent.id, staff.snapshot())}
+
+        self.assertEqual(found, {
+            starting.id: worker_panes.StartingWorker(starting, pane, "terminal-w1:p1"),
+            ready.id: worker_panes.OpenWorker(ready, "w1:p2", "terminal-w1:p2", herdr.AgentStatus.IDLE),
+            absent.id: worker_panes.ClosedWorker(absent),
+        })
+        self.assertEqual(errors.getvalue(), "herdr agents:w1:p1: pane is starting\n")
+
     def test_unreadable_parent_pane_leaves_an_absent_worker_uncertain(self) -> None:
         absent = self.worker("absent")
         self.world.record(self.parent, "w1:p0")
