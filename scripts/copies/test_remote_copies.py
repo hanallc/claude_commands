@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
+import errno
 import fcntl
 import io
 import json
@@ -27,9 +28,9 @@ from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 from scripts.buildlog.store import host_name
 from scripts.copies import copies
 from scripts.lib.build_copies_test_support import private_copy_config
-from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, publish_mirror
+from scripts.copies.copies_test_support import copies_environment, fake_remote_removal, mirror_arguments, publish_mirror
 from scripts.copies.remote_test_support import local_remote_transport, warm_claim_servers
-from scripts.lib import conf, file_lock, scratch
+from scripts.lib import build_folders, conf, file_lock, scratch
 from scripts.lib.py_floor_test_support import seed_interpreter_cache
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.mac_test import floor_claims, mac_gate
@@ -113,6 +114,42 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertEqual(record.read_bytes(), before)
         self.assertEqual(output.read_text(), "Cargo output\n")
         remove.assert_called_once_with(mirror)
+
+    def test_mirror_remove_refuses_an_idle_fixed_folder(self) -> None:
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            output = build_folders.fixed_cargo_folder(folder) / "compiled"
+            output.parent.mkdir(exist_ok=True)
+            _ = output.write_text("Cargo output\n")
+            mirror = replace(self.remote(path=str(folder)), repository=copies.SelectedRepository("hana"))
+            copies.mark_mirror(folder, mirror.owner, mirror.repository.name, mirror.session)
+        record = folder / floor_claims.MIRROR_RECORD
+        before = record.read_bytes()
+        for root in (build_folders.build_root(), self.root / "new-build"):
+            with (self.subTest(build_root=root),
+                  mock.patch.object(build_folders, "build_root", return_value=root),
+                  mock.patch.object(floor_claims, "read_claims", return_value=floor_claims.ClaimSnapshot(frozenset())),
+                  mock.patch.object(copies, "_remove_mirror_tree",
+                                    side_effect=AssertionError("The fixed build folder reached removal")),
+                  self.assertRaisesRegex(copies.CopyError, "fixed build folder")):
+                _ = copies.mirror_remove(mirror_arguments(mirror, "mirror-remove"))
+        self.assertEqual(record.read_bytes(), before)
+        self.assertEqual(output.read_text(), "Cargo output\n")
+        self.assertFalse(floor_claims.removal_authority_path(folder).exists())
+
+    def test_deferred_removal_reports_missing_ssh_and_keeps_the_request(self) -> None:
+        mirror = self.remote()
+        copies.record_remote_holder(mirror)
+        copies.defer_remote_removal(mirror)
+        record = copies.remote_record_path(mirror)
+        before = record.read_bytes()
+        diagnostic = io.StringIO()
+        with (mock.patch.object(subprocess, "run",
+                                side_effect=FileNotFoundError(errno.ENOENT, "No such file or directory", "ssh")) as run,
+              redirect_stderr(diagnostic)):
+            copies.remove_deferred_mirrors(mirror.host)
+        run.assert_called_once()
+        self.assertEqual(record.read_bytes(), before)
+        self.assertRegex(diagnostic.getvalue(), r"anomaly: deferred mirror removal: .*'ssh'")
 
     def test_list_shows_other_rows_when_a_fixed_folder_record_disappears(self) -> None:
         vanished = self.write_fixed_folder_record(self.remote(path=str(self.root / "fixed-build")))

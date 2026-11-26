@@ -2104,15 +2104,19 @@ def remove_deferred_mirrors(host: str) -> None:
     """Retry local removal requests after a successful use of the host."""
     for path in sorted(remote_registry().glob("*.json")):
         try:
-            mirror = read_remote_registration(path)
+            try:
+                mirror = read_remote_registration(path)
+            except FileNotFoundError:
+                continue
             if not isinstance(mirror, RemoteMirror) or mirror.host != host or mirror.removal is not RemoteRemoval.DEFERRED:
                 continue
             with remote_lease(mirror):
-                current = read_remote_registration(path)
+                try:
+                    current = read_remote_registration(path)
+                except FileNotFoundError:
+                    continue
                 if isinstance(current, RemoteMirror) and current.removal is RemoteRemoval.DEFERRED:
                     remove_remote_mirror(current)
-        except FileNotFoundError:
-            continue
         except (CopyError, OSError, subprocess.SubprocessError) as error:
             print(f"anomaly: deferred mirror removal: {' '.join(str(error).split())}", file=sys.stderr)
 
@@ -2195,7 +2199,7 @@ def clone_owner_prefix(owner: str) -> str:
     return f"clone-{owner}."
 
 
-def read_clone_metadata(path: Path) -> str:
+def read_regular_metadata(path: Path) -> str:
     """Read a regular file without following links or blocking on a replaced file."""
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode):
@@ -2213,7 +2217,7 @@ def clone_lease_fields(checkout: Path) -> dict[str, object]:
     if checkout != canonical and checkout.is_relative_to(canonical):
         return build_folders.folder_lease_fields(root / checkout.relative_to(canonical))
     # The status reader only accepts paths under the build root. Task clones can use scratch.
-    raw = cast(object, json.loads(read_clone_metadata(build_folders.lease_path(checkout))))
+    raw = cast(object, json.loads(read_regular_metadata(build_folders.lease_path(checkout))))
     if not isinstance(raw, dict):
         raise ValueError(f"{checkout}: invalid folder lease")
     return cast(dict[str, object], raw)
@@ -2292,7 +2296,7 @@ def local_clone_registration(path: Path, owner: str) -> RemoteMirror:
         raise ValueError("incomplete clone registration")
     identity = RemoteMirror(owner, SelectedRepository(repository), "localhost", str(path), session)
     _ = repository_scope(identity.repository)
-    marker = cast(object, json.loads(read_clone_metadata(checkout / floor_claims.MIRROR_RECORD)))
+    marker = cast(object, json.loads(read_regular_metadata(checkout / floor_claims.MIRROR_RECORD)))
     if not isinstance(marker, dict):
         raise ValueError("invalid clone marker")
     fields = cast(dict[str, object], marker)
@@ -2300,7 +2304,7 @@ def local_clone_registration(path: Path, owner: str) -> RemoteMirror:
             "remote-mirror", owner, repository, session):
         raise ValueError("clone marker differs from the task record")
     try:
-        registration = decode_remote_mirror(read_clone_metadata(remote_record_path(identity)))
+        registration = decode_remote_mirror(read_regular_metadata(remote_record_path(identity)))
     except (FileNotFoundError, NotADirectoryError, PermissionError):
         pass
     else:
@@ -2816,8 +2820,30 @@ def mirror_metadata_locks(tree: Path) -> Generator[floor_claims.ClaimSnapshot]:
         yield claims
 
 
+def is_fixed_build_folder(tree: Path) -> bool:
+    """Identify a fixed folder from its form or a lease under a former build root."""
+    folder = tree.resolve()
+    if folder.parent.parent == build_folders.build_root().resolve():
+        with suppress(build_folders.InvalidFolderForm):
+            if isinstance(build_folders.build_folder_form(folder.name), build_folders.FixedRepositoryBuildFolders):
+                return True
+    lease = build_folders.lease_path(folder)
+    try:
+        record = cast(object, json.loads(read_regular_metadata(lease)))
+    except FileNotFoundError:
+        return False
+    except ValueError as error:
+        raise CopyError(f"{lease}: invalid build folder lease: {error}") from error
+    if not isinstance(record, dict):
+        raise CopyError(f"{lease}: invalid build folder lease")
+    fields = cast(dict[str, object], record)
+    return fields.get("machine") == folder.name and fields.get("repository") == folder.parent.name
+
+
 def mirror_remove(args: CopyArguments) -> int:
     tree = floor_claims.mirror_local_path(args.path)
+    if is_fixed_build_folder(tree):
+        raise CopyError(f"{tree}: mirror-remove cannot remove a fixed build folder")
     authority = floor_claims.removal_authority_path(tree)
     with local_mirror_lease(tree, args.session, create=False):
         with mirror_metadata_locks(tree) as claims:

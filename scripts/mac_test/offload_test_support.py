@@ -808,7 +808,7 @@ raise SystemExit(offload.main())
         self.assertTrue(Path(path).is_absolute())
         home = Path(self.environment["HOME"]).resolve()
         self.assertEqual(path, str(home / "build.fixture" / "hana" / "mac"))
-        parent = str(home.parent).removeprefix("/").replace(".", "[.]")
+        parent = str(home.parent).removeprefix("/").replace(".", "[.]").replace(" ", "[ ]")
         mirror = f"[/]{parent}/home/build[.]fixture/hana/mac"
         return f"{mirror}([/'\"[:space:]]|$)", f"^n{mirror}(/|$)"
 
