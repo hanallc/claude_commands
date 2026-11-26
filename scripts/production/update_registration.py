@@ -301,7 +301,11 @@ def parse_outstanding_entries(entries: object, path: Path) -> list[Outstanding]:
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "parts", "reviewed", "review_unavailable", "urgency",
                             "due", "marked", "follows", "asked_by", "followup", "followups", "review_id", "review_log", "waiting_why",
-                            "review_submission", "reply_log_positions", "answered_at"}, where)
+                            "review_submission", "reply_log_positions", "answered_at", "request_key"}, where)
+        if "request_key" in fields:
+            request_key = fields["request_key"]
+            if not isinstance(request_key, str) or not request_key.strip() or "question" not in fields:
+                raise InputError(f"{where}.request_key: expected a nonempty question request key")
         details: new_item_dialog.SubmissionOrigin = new_item_dialog.NoReviewSubmission()
         if "review_submission" in fields:
             try:
@@ -415,6 +419,7 @@ class FollowupExchange(TypedDict):
 
 
 class OutstandingItem(TypedDict):
+    request_key: NotRequired[str]
     waiting_why: NotRequired[str]
     review_id: NotRequired[str]
     review_log: NotRequired[str]
@@ -1547,7 +1552,9 @@ def store_questions(production: QuestionScope, entries: list[OutstandingItem], i
             item = entry.copy()
             row = question_member(production, item, identities)
             item["asked_by"] = row.id
-            selected = current.get(item.get("review_id", "")) or legacy.get((row.id, item["text"]))
+            selected = current.get(item.get("review_id", ""))
+            if selected is None and "request_key" not in item:
+                selected = legacy.get((row.id, item["text"]))
             if selected is None:
                 digest = hashlib.sha256(f"{owner}:{row.id}:{item['text']}".encode()).hexdigest()
                 path = record_store.free_record_path(folder.path / f"question-{row.id}-{digest[:16]}.md", names)
@@ -1594,14 +1601,15 @@ def migrate_questions(production: Production, *, identities: QuestionStaff | Non
     with outstanding_lock(path):
         legacy = legacy_entries(path)
         existing = open_entries(production, identities)
-        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities, strict=True)}
-        questions = {(question_member(production, entry, identities).id, entry["text"]): entry
+        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities, strict=True)
+                    if "request_key" not in record.item}
+        questions = {(question_member(production, entry, identities).id, entry["text"], entry.get("request_key", "")): entry
                      for entry in existing if "question" in entry}
         for entry in legacy:
             if "question" in entry:
                 key = (question_member(production, entry, identities).id, entry["text"])
-                if key not in questions and key not in recorded:
-                    questions[key] = entry
+                if key not in recorded:
+                    _ = questions.setdefault((*key, ""), entry)
         reminders = [entry for entry in legacy if "question" not in entry]
         def write_list() -> None:
             if any("question" in entry for entry in legacy):
@@ -1762,9 +1770,10 @@ def write_open_entries(production: QuestionScope, entries: list[OutstandingItem]
     path = outstanding_path(production)
     legacy = [entry for entry in legacy_entries(path) if "question" in entry]
     if legacy:
-        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities)}
+        recorded = {(record.asker, record.item["text"]) for record in native_question_records(production, identities)
+                    if "request_key" not in record.item}
         supplied = {(question_member(production, entry, identities).id, entry["text"])
-                    for entry in entries if "question" in entry}
+                    for entry in entries if "question" in entry and "request_key" not in entry}
         entries = list(entries)
         for entry in legacy:
             key = (question_member(production, entry, identities).id, entry["text"])
@@ -1937,7 +1946,27 @@ class QuestionFromStaff:
     pass
 
 
+@dataclass(frozen=True)
+class KeyedStaffQuestion:
+    """A caller can retry this question with the same request key."""
+
+    request_key: str
+
+
 _QUESTION_FROM_STAFF = QuestionFromStaff()
+
+
+def keyed_question(production: QuestionScope, identities: QuestionStaff, key: str) -> QuestionRecord | None:
+    matches = [record for record in native_question_records(production, identities, strict=True)
+               if record.item.get("request_key") == key]
+    if len(matches) > 1:
+        raise RegistrationFailure("ask", f"{key}: more than one question for this request")
+    return matches[0] if matches else None
+
+
+def numbered_question(owner: staff.StaffId, identity: str, *folders: Path) -> QuestionRecord | None:
+    """Read one staff question by its fixed owner and number."""
+    return _find_question(owner, identity, "questions", *folders)
 
 def _ask_recipient(production: QuestionScope, text: str, parts: QuestionParts,
                    identities: QuestionStaff, outgoing: QuestionFromReview) -> QuestionRecord:
@@ -1965,18 +1994,24 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
 
 @overload
 def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
-        identities: QuestionStaff | None = None, outgoing: QuestionFromReview) -> QuestionRecord: ...
+        identities: QuestionStaff | None = None, outgoing: QuestionFromReview | KeyedStaffQuestion) -> QuestionRecord: ...
 
 
 def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, rank: Ranking, *,
         identities: QuestionStaff | None = None,
-        outgoing: QuestionFromReview | QuestionFromStaff = _QUESTION_FROM_STAFF) -> QuestionRecord | None:
+        outgoing: QuestionFromReview | QuestionFromStaff | KeyedStaffQuestion = _QUESTION_FROM_STAFF) -> QuestionRecord | None:
     """Review and file a question with its asker's fixed staff id; its parts keep their layout on the Questions page."""
     identities = identities if identities is not None else QuestionStaff.read()
     if isinstance(outgoing, QuestionFromReview):
         limit = conf.read_or_repository("production").whole("question_title_max_chars")
         title = text[:limit].rstrip()
         return _ask_recipient(production, title, {**parts, "ask": title}, identities, outgoing)
+    if isinstance(outgoing, KeyedStaffQuestion):
+        if not outgoing.request_key.strip():
+            raise RegistrationFailure("ask", "the request key is empty")
+        saved = keyed_question(production, identities, outgoing.request_key)
+        if saved is not None:
+            return saved
     asker = identities.asker(production, unit)
     for option, title in (("--text", text), ("--ask", parts["ask"])):
         checked = check_question_title(title)
@@ -1987,10 +2022,11 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
         raise RegistrationFailure("ask", "a question with choices needs at least two --choice and one --recommend")
     question = question_text(parts)
     outstanding = outstanding_path(production)
-    if any(entry["text"] == text for entry in open_entries(production, identities)):
+    if not isinstance(outgoing, KeyedStaffQuestion) and any(
+            entry["text"] == text for entry in open_entries(production, identities)):
         raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
     # The review can take a minute, so it runs before the lock: `questions` is not held up by it.
-    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank))
+    accepted = review_open_question(production.name, QuestionForReview(text, "", question, rank), outgoing=outgoing)
     if isinstance(accepted, HeldRegistrationQuestion):
         raise RegistrationFailure("ask", f"question held for review: {text}: {accepted.details}")
     now = datetime.now(production.zone)
@@ -2002,17 +2038,28 @@ def ask(production: QuestionScope, text: str, parts: QuestionParts, unit: str, r
         entry["review_unavailable"] = accepted.reason
     store_ranking(entry, rank)
     with outstanding_lock(outstanding):
+        if isinstance(outgoing, KeyedStaffQuestion):
+            saved = keyed_question(production, identities, outgoing.request_key)
+            if saved is not None:
+                return saved
+            entry["request_key"] = outgoing.request_key
         entries = open_entries(production, identities)
-        if any(stored["text"] == text for stored in entries):
-            raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
-        if any("question" in stored and stored["text"] == text
-               and question_member(production, stored, identities).id == asker.id
-               for stored in legacy_entries(outstanding)):
-            raise RegistrationFailure("ask", f"{text}: a legacy question from this asker is already open")
+        if not isinstance(outgoing, KeyedStaffQuestion):
+            if any(stored["text"] == text for stored in entries):
+                raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
+            if any("question" in stored and stored["text"] == text
+                   and question_member(production, stored, identities).id == asker.id
+                   for stored in legacy_entries(outstanding)):
+                raise RegistrationFailure("ask", f"{text}: a legacy question from this asker is already open")
         entries.append(entry)
         with record_store.keep_file_on_error(outstanding.with_suffix(".history.jsonl")):
             write_open_entries(production, entries, identities, last=(entry,),
                                before_list=lambda: record_question_history(outstanding, [entry], now))
+        if isinstance(outgoing, KeyedStaffQuestion):
+            saved = keyed_question(production, identities, outgoing.request_key)
+            if saved is None:
+                raise RegistrationFailure("ask", f"{text}: cannot read the filed question")
+            return saved
     filed = accepted.reviewed if isinstance(accepted, ReviewedQuestion) else question
     print("filed question: " + filed)
     report("ask", "ok", f"{text}: on the open-questions list of {production.name}, not shown to the user")
@@ -2621,6 +2668,8 @@ def keep_layout_fields(entry: OutstandingItem, stored: OutstandingItem) -> None:
         entry["waiting_why"] = stored["waiting_why"]
     if "review_id" in stored:
         entry["review_id"] = stored["review_id"]
+    if "request_key" in stored:
+        entry["request_key"] = stored["request_key"]
 
 
 class HeldRegistrationQuestion(NamedTuple):
@@ -2641,12 +2690,17 @@ class ReviewUnavailableQuestion(NamedTuple):
 AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
 
 
-def review_open_question(name: str, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
+def review_open_question(name: str, item: QuestionForReview, *,
+                         outgoing: QuestionFromStaff | KeyedStaffQuestion = _QUESTION_FROM_STAFF
+                         ) -> AcceptedQuestion | HeldRegistrationQuestion:
     # Import the reviewer only when the command files a full question.
     from scripts.console_text import check as console_text
     from scripts.notify import review
 
-    key = review.QuestionKey(name, item.text)
+    if isinstance(outgoing, KeyedStaffQuestion):
+        key = review.QuestionKey(name, f"{item.text} [{outgoing.request_key}]", request_key=outgoing.request_key)
+    else:
+        key = review.QuestionKey(name, item.text)
     outcome = console_text.check(item.question, "question", key=key, title=item.text)
     if isinstance(outcome, review.QuestionAccepted):
         return ReviewedQuestion(item.text, outcome.question)

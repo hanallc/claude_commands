@@ -158,6 +158,11 @@ class GateIndexTests(unittest.TestCase):
             del module["started_at"]
             del module["ended_at"]
         _ = path.write_bytes(encode(entry))
+        with mock.patch.object(store, "host_name", return_value=path.parent.name), \
+                mock.patch.object(time, "time", return_value=EPOCH):
+            gate_record.write_gate_folder_event({"folder": "/fixture/g-suite", "pid": 12,
+                                                "sha": "commit", "branch": "main", "step": "gate"})
+            gate_record.write_gate_folder_event({"suite_folders": ["/fixture/g-suite"], "pid": 12, "end": "red"})
         original = path.read_bytes()
         self.assertEqual(index.update(), 1)
         self.assertEqual(rows("SELECT slow_test_s, tests_run, modules_run FROM gate_runs"), [(None, None, 3)])
