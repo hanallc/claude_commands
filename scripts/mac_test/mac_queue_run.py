@@ -30,7 +30,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import TextIO, TypedDict, cast
+from typing import NoReturn, TextIO, TypedDict, cast
 import uuid
 
 from scripts.build_hold import override_guard
@@ -227,6 +227,35 @@ class Arguments(argparse.Namespace):
     @property
     def is_mac_run(self) -> bool:
         return self.kind == "run" and Path(self.lifecycle_script).name == MAC_RUN_SCRIPT.name
+
+
+def queued_remote_command(placement: MacPlacement, args: Arguments, command: list[str], on_close: str) -> list[str]:
+    """Resolve the working directory and take its lease on the Mac."""
+    program = ("import sys; from scripts.mac_test.mac_queue_run import run_in_mac_cwd; "
+               + "run_in_mac_cwd(sys.argv[1], sys.argv[2:])")
+    launch = 'exec "$HOME/.claude/scripts/lib/py" ' + shlex.join(["-B", "-c", program, args.cwd, *command])
+    return remote_command(placement, "", ["/bin/zsh", "-c", launch], on_close, owned_close=args.owned_close)
+
+
+def run_in_mac_cwd(directory: str, argv: list[str]) -> NoReturn:
+    """Hold the shared lease of the resolved mirror through exec."""
+    from scripts.lib import build_folders
+    from scripts.mac_test.mirror_root import MacMirrorRoot
+
+    try:
+        cwd = Path(directory).expanduser().resolve(strict=True)
+        root = MacMirrorRoot.read(conf.read("mac_test")).local_path().resolve()
+        with contextlib.ExitStack() as lease:
+            if cwd != root and cwd.is_relative_to(root):
+                mirror = root / cwd.relative_to(root).parts[0]
+                descriptor = lease.enter_context(build_folders.mac_floor_shared_lease(mirror))
+                os.set_inheritable(descriptor, True)
+            os.chdir(cwd)
+            if Path.cwd() != cwd:
+                raise OSError(f"{cwd}: the Mac working directory changed")
+            os.execv("/bin/zsh", ["/bin/zsh", "-c", shlex.join(argv)])
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from None
 
 
 @dataclass(frozen=True)
@@ -587,8 +616,7 @@ def run_attempt(
                             if smoke_ready:
                                 status = 0
                         else:
-                            status = stream_remote(remote_command(placement, args.cwd, command, on_close,
-                                                                  owned_close=args.owned_close), remote, ssh)
+                            status = stream_remote(queued_remote_command(placement, args, command, on_close), remote, ssh)
             if isinstance(block, mac_test.ClaimDenied):
                 print(block.reason)
                 status = MAC_RUN_REFUSED_STATUS

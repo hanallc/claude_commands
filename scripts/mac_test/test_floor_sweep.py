@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr
 import fcntl
+import io
 import os
 from pathlib import Path
+import select
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -94,6 +98,78 @@ class FloorSweepTests(unittest.TestCase):
         self.assertEqual(scans.read_text().splitlines(), ["scan"])
         command.assert_called_once()
 
+    def test_queued_probe_waits_for_the_floor_before_preparing_a_mirror(self) -> None:
+        home = self.root / "home"
+        shim = home / ".claude/scripts/lib/py"
+        shim.parent.mkdir(parents=True)
+        write_shell(shim, "exec " + shlex.quote(sys.executable) + ' -B "$@"\n')
+        mirror = home / "mirrors/hana"
+        _ = write_config_fixture(self.settings, "mirror_root=~/mirrors\n")
+        commands = ("df() { printf 'header\\nfs a b 164\\n'; }\n"
+                    + "hostname() { printf 'fixture-mac\\n'; }\n")
+
+        def capture(arguments: list[str], _deadline: offload.CommandDeadline) -> offload.CommandOutput:
+            with subprocess.Popen(["/bin/sh", "-c", "read start\n" + commands + arguments[-1]],
+                                  env={**os.environ, "HOME": str(home)}, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+                assert process.stdin is not None and process.stderr is not None
+                stderr = cast(TextIO, process.stderr)
+                try:
+                    with sweep.mac_floor_mirror_leases({mirror}) as acquired:
+                        self.assertTrue(acquired)
+                        _ = process.stdin.write("\n")
+                        process.stdin.flush()
+                        self.assertTrue(select.select([stderr], [], [], 5)[0])
+                        waiting = stderr.readline()
+                        self.assertIn("waiting for the Mac floor sweep", waiting)
+                        self.assertFalse(mirror.exists())
+                    output, errors = process.communicate(timeout=10)
+                    return offload.CommandOutput(process.returncode, output, waiting + errors)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+
+        settings = eligibility.probe_settings(conf.read(self.settings))
+        with mock.patch.object(self.controller, "capture", side_effect=capture), redirect_stderr(io.StringIO()):
+            snapshot = offload.probe_mac_host(self.controller, settings, "mac", (),
+                                              setup_mirrors=(self.repository.legacy_mirror_name,))
+        self.assertEqual(snapshot, offload.MacHostProbeSnapshot(offload.ProbeSnapshot(164, "fixture-mac"), {},
+                             {self.repository.legacy_mirror_name: offload.MacMirrorSetup.READY}))
+        self.assertTrue(mirror.is_dir())
+
+    def test_queued_probe_uses_one_deadline_for_all_mirrors_and_reads_disk(self) -> None:
+        home = self.root / "home"
+        shim = home / ".claude/scripts/lib/py"
+        shim.parent.mkdir(parents=True)
+        write_shell(shim, "exec " + shlex.quote(sys.executable) + ' -B "$@"\n')
+        _ = write_config_fixture(self.settings, "mirror_root=~/mirrors\nfloor_sweep_timeout_s=2\nprobe_timeout_s=20\n")
+        mirrors = (eligibility.LegacyMirrorName("first"), eligibility.LegacyMirrorName("second"))
+        ready = eligibility.LegacyMirrorName("ready")
+        commands = ("df() { printf 'header\\nfs a b 164\\n'; }\n"
+                    + "hostname() { printf 'fixture-mac\\n'; }\n")
+
+        def capture(arguments: list[str], deadline: offload.CommandDeadline) -> offload.CommandOutput:
+            assert isinstance(deadline, offload.CommandTimeLimit)
+            self.assertEqual(deadline.seconds, 22.0)
+            result = subprocess.run(["/bin/sh", "-c", commands + arguments[-1]],
+                                    env={**os.environ, "HOME": str(home)}, capture_output=True,
+                                    text=True, timeout=deadline.seconds, check=False)
+            return offload.CommandOutput(result.returncode, result.stdout, result.stderr)
+
+        output = io.StringIO()
+        settings = eligibility.probe_settings(conf.read(self.settings))
+        with (sweep.mac_floor_mirror_leases({home / "mirrors" / name for name in mirrors}) as acquired,
+              mock.patch.object(self.controller, "capture", side_effect=capture), redirect_stderr(output)):
+            self.assertTrue(acquired)
+            snapshot = offload.probe_mac_host(self.controller, settings, "mac", (), setup_mirrors=(*mirrors, ready))
+        setups = dict.fromkeys(mirrors, offload.MacMirrorSetup.FAILED)
+        setups[ready] = offload.MacMirrorSetup.READY
+        self.assertEqual(snapshot, offload.MacHostProbeSnapshot(offload.ProbeSnapshot(164, "fixture-mac"), {},
+                         setups))
+        diagnostics = output.getvalue()
+        self.assertEqual(diagnostics.count("waiting for the Mac floor sweep to finish one removal group"), 1, diagnostics)
+        self.assertIn("timed out waiting for the Mac floor sweep", diagnostics)
+
     def test_two_callers_share_one_sweep_and_both_read_after_it(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -170,19 +246,76 @@ class FloorSweepTests(unittest.TestCase):
             (offload.COMMAND_TIMED_OUT, "floor sweep timed out after 9 s. Mac floor cleanup is unconfirmed"),
             (offload.COMMAND_COULD_NOT_START, "floor sweep could not start"),
         ):
+            errors = io.StringIO()
             with (self.subTest(cause=cause),
                   mock.patch.object(self.controller, "capture", return_value=result),
-                  mock.patch.object(offload, "probe_mac", side_effect=OSError("probe failed")) as probe):
-                answer = self.sweep()
-                self.assertIsInstance(answer, offload.SweepFailed)
-                assert isinstance(answer, offload.SweepFailed)
-                self.assertEqual(answer.cause, cause)
-                probe.assert_not_called()
+                  mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(99, "fake-mac")) as probe,
+                  redirect_stderr(errors)):
+                self.assertEqual(self.sweep(), offload.SweepShort(99))
+                self.assertEqual(errors.getvalue(), f"mac_test: {cause}\n")
+                probe.assert_called_once()
 
     def test_recheck_failure_keeps_the_disk_exclusion(self) -> None:
         with (mock.patch.object(self.controller, "capture", return_value=offload.CommandOutput(0, "", "")),
               mock.patch.object(offload, "probe_mac", return_value=offload.UNAVAILABLE_PROBE)):
             self.assertEqual(self.sweep(), offload.SweepFailed("Mac disk reading failed after the floor sweep"))
+
+    def test_a_sweep_error_allows_the_step_when_the_fresh_read_meets_the_minimum(self) -> None:
+        errors = io.StringIO()
+        with (mock.patch.object(self.controller, "capture",
+                  return_value=offload.CommandOutput(7, "mac_floor_cleanup=complete\n", "cannot remove old output")),
+              mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(120, "fake-mac")) as probe,
+              redirect_stderr(errors)):
+            self.assertEqual(self.sweep(), offload.MacDiskReady(120))
+        self.assertIn("floor sweep exited with status 7: cannot remove old output", errors.getvalue())
+        probe.assert_called_once()
+
+    def test_the_disk_probe_never_creates_a_mirror(self) -> None:
+        home = self.root / "home"
+        home.mkdir()
+        shim = home / ".claude/scripts/lib/py"
+        shim.parent.mkdir(parents=True)
+        write_shell(shim, "exec " + shlex.quote(sys.executable) + ' -B "$@"\n')
+        script = "df() { printf 'Available\\n120\\n' | awk '{print \"0 0 0 \" $1}'; }\n"
+        script += "hostname() { printf 'fake-mac\\n'; }\n"
+        script += offload.probe_script(self.repository)
+        mirror = home / offload.remote_mirror(self.repository)
+        answer = subprocess.run(["sh", "-c", script], env={**os.environ, "HOME": str(home)},
+                                capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        self.assertEqual(offload.parse_probe(answer.stdout), offload.ProbeSnapshot(120, "fake-mac"))
+        self.assertFalse(mirror.exists())
+
+    def test_mirror_launch_waits_for_the_current_floor_group(self) -> None:
+        mirror = self.root / "mirror" / "hana fixture"
+        program = """import sys
+from pathlib import Path
+from scripts.copies import copies
+with copies.local_mirror_lease(Path(sys.argv[1]), "fixture"):
+    print("run started", flush=True)
+"""
+        launch = shlex.join([sys.executable, "-B", "-c", program, str(mirror)])
+        remote = offload.after_mac_floor_group(str(mirror), launch)
+        command = shlex.quote(sys.executable) + remote.removeprefix("~/.claude/scripts/lib/py")
+        with subprocess.Popen(["sh", "-c", "read start; exec " + command],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True) as process:
+            assert process.stdin is not None and process.stdout is not None
+            stdout = cast(TextIO, process.stdout)
+            try:
+                with sweep.mac_floor_mirror_leases({mirror}) as acquired:
+                    self.assertTrue(acquired)
+                    _ = process.stdin.write("\n")
+                    process.stdin.flush()
+                    ready, _, _ = select.select([stdout], [], [], 10)
+                    self.assertTrue(ready)
+                    self.assertIn("waiting for the Mac floor sweep", stdout.readline())
+                output, _ = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, output)
+                self.assertEqual(output, "run started\n")
+            finally:
+                if process.poll() is None:
+                    process.kill()
 
     def test_offload_rejects_invalid_mirror_roots(self) -> None:
         for root in ("~//tmp", "~/", "/abs", "~/a/../b", "~/a b", "~/a/./b", "~/a/", "~/a//b", "~/a$b"):
@@ -235,7 +368,7 @@ select_leftovers
                         expected = "[.]" + relative[1:] + ("/hana([/'\"[:space:]]|$)" if suffix else "/")
                         self.assertEqual((pattern.returncode, pattern.stdout, pattern.stderr), (0, expected, ""))
 
-    def test_waiter_rejects_empty_result_after_owner_exit(self) -> None:
+    def test_waiter_logs_an_incomplete_result_and_reads_free_space_after_owner_exit(self) -> None:
         directory = self.root / "state"
         directory.mkdir()
         path = directory / "floor-sweep-mac.lock"
@@ -254,10 +387,12 @@ select_leftovers
             ("floor sweep was interrupted. Mac floor cleanup is unconfirmed",
              "floor sweep was interrupted. Mac floor cleanup is unconfirmed"),
         ):
+            errors = io.StringIO()
             with (self.subTest(saved=saved), path.open("a+") as owner,
                   mock.patch.object(self.controller, "capture") as command,
-                  mock.patch.object(offload, "probe_mac", side_effect=OSError("probe failed")) as probe,
+                  mock.patch.object(offload, "probe_mac", return_value=offload.ProbeSnapshot(99, "fake-mac")) as probe,
                   mock.patch.object(fcntl, "flock", side_effect=observe_flock),
+                  redirect_stderr(errors),
                   ThreadPoolExecutor(max_workers=1) as workers):
                 waiting.clear()
                 real_flock(owner, fcntl.LOCK_EX)
@@ -270,10 +405,11 @@ select_leftovers
                     self.assertTrue(waiting.wait(10))
                 finally:
                     owner.close()
-                self.assertEqual(waiter.result(timeout=10), offload.SweepFailed(cause))
+                self.assertEqual(waiter.result(timeout=10), offload.SweepShort(99))
+                self.assertEqual(errors.getvalue(), f"mac_test: {cause}\n")
                 self.assertEqual(path.stat().st_ino, inode)
                 self.assertEqual(command.call_count, 0)
-                probe.assert_not_called()
+                probe.assert_called_once()
 
     def test_mirror_root_has_one_configuration_source(self) -> None:
         repository = Path(__file__).resolve().parents[2]
@@ -333,6 +469,7 @@ class FloorSweepCommandTests(OffloadCommandFixture):
         self.assertEqual(answer.returncode, 75, answer.stdout)
         self.assert_wire("declined", "disk")
         self.assertIn("floor sweep exited with status 7: cannot remove old mirrors", answer.stdout)
+        self.assertEqual(sum('df -g "$HOME"' in event["args"][-1] for event in self.events_for("ssh")), 2)
         self.assertEqual(self.events_for("rsync"), [])
         self.assertFalse(self.claim_file.exists())
 
@@ -343,9 +480,8 @@ class FloorSweepCommandTests(OffloadCommandFixture):
         answer = self.command()
         self.assertEqual(answer.returncode, 75, answer.stdout)
         self.assert_wire("declined", "disk")
-        self.assertEqual(answer.stdout.splitlines()[-1],
-            "mac_test: not running on the Mac (disk: floor sweep timed out after 0.2 s. "
-            + "Mac floor cleanup is unconfirmed)")
+        self.assertIn("mac_test: floor sweep timed out after 0.2 s. Mac floor cleanup is unconfirmed", answer.stdout)
+        self.assertEqual(answer.stdout.splitlines()[-1], "mac_test: not running on the Mac (disk)")
         self.assertEqual(self.events_for("rsync"), [])
         self.assertFalse(self.claim_file.exists())
 

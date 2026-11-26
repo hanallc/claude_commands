@@ -17,7 +17,7 @@ from scripts.build_queue import placement
 from scripts.mac_test import eligibility, nextest_log, offload
 from scripts.mac_test.claim_state import RepositoryScope
 from scripts.buildlog import sync as buildlog_sync
-from scripts.mac_test.offload_test_support import HANA, OffloadCommandFixture
+from scripts.mac_test.offload_test_support import HANA, CommandEvent, OffloadCommandFixture
 from scripts.lib import conf, test_hang_guard
 
 
@@ -91,7 +91,7 @@ class OffloadForwardTests(OffloadCommandFixture):
             + shlex.quote('import sys; from scripts.lint import sweep; from scripts.lib import conf; '
                           + 'config = conf.read("lint"); '
                           + 'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, '
-                          + 'config.number(sweep.RECENT_KEY)))')
+                          + 'config.number(sweep.RECENT_KEY), mac_trim=sweep.MacRunTrim.LEASED_MIRROR))')
             + ' "$HOME"/.local/state/mac-test/test-mirror/hana/target >/dev/null 2>&1; then '
             + 'trim_status=0; else trim_status=$?; fi; '
             + 'trim_elapsed=$(( $(date +%s) - trim_started )); '
@@ -99,27 +99,22 @@ class OffloadForwardTests(OffloadCommandFixture):
             + 'trim_size=${trim_size%%[[:space:]]*}; '
             + 'over_budget=$(awk -v size="$trim_size" -v budget=64 '
             + "'BEGIN { print (size > budget * 1048576) ? \"yes\" : \"no\" }'); "
-            + 'else over_budget=unknown; fi; '
-            + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s\\n' "
-            + '"$trim_status" "$trim_elapsed" "$over_budget"; '
-            + 'if free_gib=$(df -g "$HOME"); then '
-            + "free_gib=$(printf '%s\\n' \"$free_gib\" | awk 'NR == 2 {print $4}'); "
-            + 'else free_gib=; fi; if awk -v free="$free_gib" -v floor=60 '
-            + "'BEGIN { exit !(free ~ /^[0-9]+([.][0-9]+)?$/ && (free + 0) < (floor + 0)) }'; then "
-            + 'if size_kib=$(du -sk "$HOME"/.local/state/mac-test/test-mirror/hana/target 2>/dev/null); then '
-            + "size_kib=${size_kib%%[[:space:]]*}; else size_kib=-; fi; "
-            + 'if rm -rf -- "$HOME"/.local/state/mac-test/test-mirror/hana/target; then '
-            + "printf 'mac_cleanup=0 %s %s\\n' \"$size_kib\" \"$free_gib\"; "
-            + 'else echo mac_cleanup=$?; fi; else echo mac_cleanup=kept; fi; '
+            + 'else trim_size=unknown; over_budget=unknown; fi; '
+            + 'if [ "$over_budget" = yes ] && [ "$trim_status" -eq 0 ]; then trim_status=1; fi; '
+            + "printf 'mac_trim=status=%s elapsed_seconds=%s over_budget=%s size_kib=%s budget_gib=%s\\n' "
+            + '"$trim_status" "$trim_elapsed" "$over_budget" "$trim_size" 64; '
+            + 'if [ "$trim_status" -eq 0 ]; then echo mac_cleanup=kept; '
+            + 'else echo mac_cleanup="$trim_status"; fi; '
             + 'else echo mac_cleanup=$?; fi; } 2>/dev/null'
         )
-        self.assertEqual(offload.remote_test_command(config, request, HANA), expected)
+        command = offload.remote_test_command(config, request, HANA)
+        self.assertEqual(command, expected)
         fetch = offload.remote_test_command(config, replace(request, fetch=offload.FetchFolder("target/shots")), HANA)
         self.assertTrue(fetch.startswith("cd .local/state/mac-test/test-mirror/hana && { find "))
         self.assertIn(" || :; } && rm -rf -- target/shots && run_nextest_logged() ", fetch)
         self.assertTrue(fetch.endswith("; echo mac_cleanup=kept"))
         self.assertNotIn("df -g", fetch)
-        self.assertNotIn("rm -rf -- target/shots", expected)
+        self.assertNotIn("rm -rf -- target/shots", command)
 
     def test_nextest_setup_failure_declines_without_fetching(self) -> None:
         self.configure_fetch(run_status_line="mac_nextest_setup=failed")
@@ -221,9 +216,13 @@ class OffloadForwardTests(OffloadCommandFixture):
         self.assertFalse(self.claim_file.exists())
         self.assertIn("du -sk target/shots", events[-3]["args"][-1])
         self.assertIn("sweep.sweep_workspace", events[-1]["args"][-1])
+        self.assertIn("run_after_mac_floor_group", events[-3]["args"][-1])
+        cleanup = cast(CommandEvent, json.loads((self.stub_directory / "events.jsonl").read_text().splitlines()[-1]))
+        self.assertIn("run_after_mac_floor_group", cleanup["args"][-1])
         pull = events[-2]["args"]
         self.assertEqual(pull[:6], ["-rlp", "--stats", "--compress", "--safe-links", "-e", shlex.join(["ssh", *offload.ssh_options(eligibility.read_config(self.config_path).connection)])])
         self.assertEqual(pull[-2], "mac:.local/state/mac-test/test-mirror/hana/target/shots/")
+        self.assertTrue(any(arg.startswith("--rsync-path=") and "run_after_mac_floor_group" in arg for arg in pull))
         self.assertTrue(pull[-1].endswith("/fetched/call-forward.partial/target/shots/"))
         rows = [cast(dict[str, object], json.loads(line))
                 for path in (self.root / "buildlog").glob("*/*.jsonl")

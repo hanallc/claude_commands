@@ -950,6 +950,79 @@ def _release_build_folder(path: Path, *, descriptor: int | None = None) -> None:
         os.close(descriptor)
 
 
+class MacFloorLeaseFile(Enum):
+    GROUP = ".floor-group"
+    WAITERS = ".floor-waiters"
+
+
+@contextmanager
+def mac_floor_lease_file(mirror: Path, kind: MacFloorLeaseFile) -> Generator[int]:
+    """Open the existing repository lease or its waiter file."""
+    from scripts.mac_test import floor_claims
+
+    mirror.parent.mkdir(parents=True, exist_ok=True)
+    lease = floor_claims.mirror_lock_path(mirror)
+    path = lease.with_name(lease.name + kind.value)
+    descriptor = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or not os.path.samestat(info, path.lstat()):
+            raise OSError(f"{path}: the Mac floor lease changed")
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class MacFloorWaitDeadline:
+    monotonic_seconds: float
+
+
+MAC_FLOOR_WAIT_TIMEOUT = "mac_test: timed out waiting for the Mac floor sweep"
+
+
+@contextmanager
+def mac_floor_shared_lease(
+    mirror: Path, *, deadline: MacFloorWaitDeadline | UseConfiguredValue = UseConfiguredValue.CURRENT,
+) -> Generator[int]:
+    """Hold the repository lease shared through the work."""
+    from scripts.lib import conf
+
+    with mac_floor_lease_file(mirror, MacFloorLeaseFile.GROUP) as group:
+        if not build_folder_lock.take_lock(group, fcntl.LOCK_SH, build_folder_lock.NO_WAIT):
+            if isinstance(deadline, UseConfiguredValue):
+                deadline = MacFloorWaitDeadline(time.monotonic() + conf.read("mac_test").number("floor_sweep_timeout_s"))
+            if deadline.monotonic_seconds <= time.monotonic():
+                raise TimeoutError(MAC_FLOOR_WAIT_TIMEOUT)
+            print("mac_test: waiting for the Mac floor sweep to finish one removal group",
+                  file=sys.stderr, flush=True)
+            retry = _probe_timing().retry_seconds
+            with mac_floor_lease_file(mirror, MacFloorLeaseFile.WAITERS) as waiters:
+                for descriptor in (waiters, group):
+                    timing = build_folder_lock.ProbeTiming(max(0.0, deadline.monotonic_seconds - time.monotonic()), retry)
+                    if not build_folder_lock.take_lock(descriptor, fcntl.LOCK_SH, timing):
+                        raise TimeoutError(MAC_FLOOR_WAIT_TIMEOUT)
+        yield group
+
+
+def mac_build_host() -> bool:
+    return sys.platform == "darwin"
+
+
+@contextmanager
+def mac_numbered_copy_lease(repository: str) -> Generator[tuple[int, ...]]:
+    """Keep the Mac floor lease in the copy and its child processes."""
+    if not mac_build_host():
+        yield ()
+        return
+    from scripts.lib import conf
+    from scripts.mac_test.mirror_root import MacMirrorRoot
+
+    mirror = MacMirrorRoot.read(conf.read("mac_test")).local_path() / _form_name(repository)
+    with mac_floor_shared_lease(mirror) as descriptor, inherit_build_lock(descriptor):
+        yield (descriptor,)
+
+
 COPY_USE_STAMP = ".lint-sweep-used"
 
 
@@ -1510,6 +1583,7 @@ def numbered_copy_use_lease(path: Path) -> Generator[NumberedCopyUseLease | Numb
     with ExitStack() as stack:
         try:
             form = _record_numbered_copy_path(path)
+            floor = stack.enter_context(mac_numbered_copy_lease(form.repo))
             claims = stack.enter_context(build_folder_use(path))
             directory = stack.enter_context(build_folder_lock.folder_parent(path, build_root(), create=False))
             inherited = next((str(fd) for fd, held in _locks.items() if held == path),
@@ -1530,7 +1604,7 @@ def numbered_copy_use_lease(path: Path) -> Generator[NumberedCopyUseLease | Numb
                     or (not has_inherited_lock and _copy_is_kept(path, directory))
                     or _read_folder_lease(path, directory).get("ready") is not True):
                 raise ValueError(f"{path}: no available numbered copy source")
-            result = NumberedCopyUseLease(record, (descriptor, *claims))
+            result = NumberedCopyUseLease(record, (descriptor, *claims, *floor))
         except (OSError, ValueError, RuntimeError) as error:
             yield NumberedCopyUseRefused(str(error))
         else:
