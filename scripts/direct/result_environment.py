@@ -41,8 +41,8 @@ def read_policy() -> TestEnvironmentPolicy:
         return configuration.words(key)
 
     return TestEnvironmentPolicy(
-        policy_words("VERIFY_RESULT_ENV_NAMES"),
-        policy_words("VERIFY_RESULT_ENV_PREFIXES"),
-        tuple((name, value) for entry in policy_words("VERIFY_TEST_FIXED_ENV")
+        policy_words("verify_result_env_names"),
+        policy_words("verify_result_env_prefixes"),
+        tuple((name, value) for entry in policy_words("verify_test_fixed_env")
               for name, _, value in (entry.partition("="),)),
     )

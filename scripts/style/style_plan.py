@@ -65,7 +65,7 @@ from scripts.style import style_footprint
 from scripts.style import style_proposals
 from scripts.production.issues import Issue, frontmatter
 from scripts.production import session_staff, staff
-from scripts.production.production_doc import Refusal, production_field
+from scripts.production.production_doc import Refusal
 from scripts.production.proposal_issue import ApprovedDecision, decision_answer, require_generated_body
 from scripts.style.unit_files import changed_files, git, report_unit_problems_once, unit_file_holders, unit_worktrees
 from scripts.style.unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
@@ -3366,12 +3366,10 @@ def _select_observed_phase(
     buildable = 0
     refusals: Counter[str] = Counter()
     try:
-        folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
+        folder = style_config.proposals_folder(doc)
     except Refusal:
         decisions: tuple[Issue, ...] = ()
     else:
-        if not folder.is_absolute():
-            folder = doc.parent.parent / folder
         decisions = tuple(issue for issue in style_proposals.approved_decisions(folder, ledger.unit_name(unit))
                           if (definition := catalog_definition(definitions, issue.value("style_rule"))) is not None
                           and definition.family in families)
@@ -4234,12 +4232,10 @@ def classify_split(ledger: style_ledger.Ledger, unit: str, doc: Path, base: Unit
     unsynced = unsynced_changes(ledger.repo, base, tip)
     directories = cache.tip(tip).crate_dirs
     try:
-        folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
+        folder = style_config.proposals_folder(doc)
     except Refusal:
         selected: tuple[Issue, ...] = ()
     else:
-        if not folder.is_absolute():
-            folder = doc.parent.parent / folder
         selected = style_proposals.approved_decisions(folder, name)
     population: list[tuple[style_ledger.HeldFinding, Path]] = []
     decisions: dict[Path, bool] = {}

@@ -12,6 +12,19 @@ from scripts.build_queue import admission_records as records
 from scripts.production import staff
 
 
+class MemoryLoanTests(unittest.TestCase):
+    def test_only_unreserved_growth_counts_toward_the_loan(self) -> None:
+        runs = (
+            records.RunMemory("first", 13, records.AnonymousRunUse(2), held=40),
+            records.RunMemory("second", 8, records.AnonymousRunUse(4)),
+            records.RunMemory("over", 2, records.AnonymousRunUse(9)),
+            records.RunMemory("unknown", 101, records.RunUseUnavailable("unreadable"), held=19),
+        )
+        self.assertEqual(records.growth_loan_bytes(runs, 80), 2)
+        self.assertEqual(records.growth_loan_bytes(runs, 100), 0)
+        self.assertEqual(records.growth_loan_bytes(runs, 0), 15)
+
+
 class ProcessStartTimeTests(unittest.TestCase):
     def test_process_stat_with_invalid_name_keeps_start_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

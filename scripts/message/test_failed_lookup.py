@@ -44,7 +44,7 @@ class FailedLookupTests(unittest.TestCase):
         _ = (config / "postmaster.conf").write_text(
             "# range: 0.001..\nwait_seconds=1\n# range: 0.001..\nclaim_grace_seconds=1\n")
         _ = (config / "codex_daemon.conf").write_text("# range: 0.001..\ntimeout_seconds=1\n")
-        _ = (config / "production.conf").write_text("UNIT_ANOMALIES_TO=fallback-owner\n")
+        _ = (config / "production.conf").write_text("unit_anomalies_to=fallback-owner\n")
         top = staff.StaffRow(staff.StaffId(fixture_runtime_id("top-id")), "showrunner", "top", staff.StaffRoot(),
                             current_session=staff.StaffId(fixture_runtime_id("top-current")))
         runner = staff.StaffRow(staff.StaffId(fixture_runtime_id("builds-id")), "showrunner", "builds", staff.ReportsTo(top.id),

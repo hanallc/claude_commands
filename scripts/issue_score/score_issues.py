@@ -694,12 +694,21 @@ def main(argv: list[str] | None = None) -> int:
     _ = experiment_command.add_argument("--variants", required=True, help="JSON variant sets")
     _ = experiment_command.add_argument("--only", default="*")
     _ = experiment_command.add_argument("--limit", type=int, default=0)
-    blind_command = commands.add_parser("blind", help="Write a held-out A/B preference sheet")
-    _ = blind_command.add_argument("run_id")
-    _ = blind_command.add_argument("--count", type=int, default=UseConfiguredValue.CURRENT)
-    _ = blind_command.add_argument("--seed", type=int, default=0)
-    blind_score_command = commands.add_parser("blind-score", help="Tally a completed A/B preference sheet")
-    _ = blind_score_command.add_argument("sheet")
+    blind_command = commands.add_parser(
+        "blind", help="Write a held-out A/B preference sheet",
+        description=("Write a shuffled A/B sheet from held-out issues where Jev and the vault disagree. "
+                     "Each item shows the issue and two unlabeled answers. Set each pick to A, B or same, "
+                     "then run blind-score with the sheet path to see which source you preferred."))
+    _ = blind_command.add_argument("run_id", help="Saved run filename, with or without .jsonl")
+    _ = blind_command.add_argument("--count", type=int, default=UseConfiguredValue.CURRENT,
+                                   help="Most items to write; fewer when eligible issues run out; default blind_sample_count in issue_score.conf")
+    _ = blind_command.add_argument("--seed", type=int, default=0, help="Shuffle seed; the same run, issues, --count and seed give the same items, order and A/B sides")
+    blind_score_command = commands.add_parser(
+        "blind-score", help="Tally a completed A/B preference sheet",
+        description=("Tally a sheet that blind wrote, after each pick is set to A, B or same. "
+                     "Writes the results beside the sheet, with .results.md in place of .json, as Jev, vault and same counts per field, "
+                     "and prints its path."))
+    _ = blind_score_command.add_argument("sheet", help="Path of the sheet that blind printed")
     args = parser.parse_args(argv, namespace=CommandArguments())
     try:
         if args.command == "propose":

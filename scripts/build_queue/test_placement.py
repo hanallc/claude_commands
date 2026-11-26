@@ -1425,7 +1425,9 @@ class PlacementTests(unittest.TestCase):
                 persist.assert_called_once()
 
     def test_scaler_execution_report_persists_one_transition(self) -> None:
-        self.check_execution_report_persist_count(guest=False)
+        # Let the report handler settle the journal without a concurrent probe.
+        with mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            self.check_execution_report_persist_count(guest=False)
 
     def test_mac_linux_execution_report_persists_one_transition(self) -> None:
         self.check_execution_report_persist_count(guest=True)
@@ -1672,6 +1674,15 @@ class PlacementTests(unittest.TestCase):
                     assert isinstance(reply, wire.Assignment), reply
                     self.assertEqual(reply.assignment.destination, guest.destination)
                     continue
+                if case == "stale":
+                    assert isinstance(reply, wire.PlacementWait), reply
+                    self.assertEqual(reply.wait, wire.PlacementEvidenceWait())
+                    self.assertEqual(reply.eligibility, (
+                        placement.CandidateEligibility(guest.destination, placement.EvidenceNeeded(reason)),
+                        placement.CandidateEligibility(local_candidate(fixture).destination, ALLOWED_HOST),
+                    ))
+                    self.assertNotIn(request.episode, fixture.server.reservations)
+                    continue
                 assert isinstance(reply, wire.LocalPlacementGranted), reply
                 self.assertEqual(reply.assignment.destination, local_candidate(fixture).destination)
                 self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
@@ -1741,7 +1752,7 @@ class PlacementTests(unittest.TestCase):
                 waiting, = fixture.server.handle_request(request)
                 assert isinstance(waiting, wire.PlacementWait), waiting
                 self.assertEqual(waiting.eligibility[0].eligibility,
-                                 placement.TemporaryExclusion("mac_linux_reading_required"))
+                                 placement.EvidenceNeeded("mac_linux_reading_required"))
                 _ = publish_candidate(fixture, request)
                 _ = fixture.run_pass()
                 assignment = assignment_for(fixture, request)
@@ -4892,7 +4903,7 @@ with mock.patch.object(subprocess, "run", side_effect=private_transport), \
 
         with PlacementFixture() as fixture:
             settings, request, destination = self.target_settings_fixture(fixture)
-            host = socket.gethostname().split(".", 1)[0]
+            host = conf.local_host_key_name()
             good = settings.read_text() + f"\n# range: 1..\nshell_timeout_s=10\n# range: 1..\nshell_timeout_s.{host}=31\n"
             broken = "\n".join("floor_sweep_timeout_s=broken" if line.startswith("floor_sweep_timeout_s=") else line
                                for line in good.splitlines()) + "\n"

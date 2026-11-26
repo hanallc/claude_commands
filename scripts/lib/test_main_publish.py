@@ -1,11 +1,13 @@
 """Publishing commits only its file, protects main, and preserves queued Mac pulls."""
 from __future__ import annotations
 
+import fcntl
 import os
 from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr
 from functools import cached_property
 import io
+import json
 from pathlib import Path, PurePosixPath
 import shlex
 import shutil
@@ -16,7 +18,8 @@ from typing import final, override
 import unittest
 from unittest import mock
 
-from scripts.lib import land_main, main_publish, main_sync, waiting_rows
+from scripts.lib import land_main, main_publish, main_sync, waiting_rows, zone
+from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.main_push_lock_test_support import publish_after_contender
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -54,11 +57,11 @@ class PublicationRepository:
         )
         self.ssh.chmod(0o755)
         self.env = {
-            **os.environ, "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
+            **fixture_git_environment(root), "HOME": str(self.home), "CONF_DIR": str(self.config.parent),
             "ZONE_SSH": str(self.ssh), "ZONE_STATE": str(root / "state"),
             "SSH_LOG": str(self.ssh_log), "OFFLINE": str(root / "OFFLINE"),
             "XDG_STATE_HOME": str(root / "xdg"),
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_TERMINAL_PROMPT": "0",
             "PATH": str(self.programs) + os.pathsep + os.environ.get("PATH", os.defpath),
         }
@@ -619,11 +622,27 @@ class MainPublishTests(PublicationTestCase):
         _ = fetch_head.write_text(fetch_text)
         refs = repo.git(mac, "show-ref")
         _ = repo.change()
-        _ = repo.git(repo.checkout, "commit", "-qam", "advance main")
+        _ = repo.git(repo.checkout, "commit", "-qam", "approve production main")
+        approved = repo.head()
+        _ = repo.git(repo.checkout, "push", "origin", approved + ":refs/heads/main")
+        _ = (repo.checkout / "other.txt").write_text("later change\n")
+        _ = repo.git(repo.checkout, "commit", "-qam", "advance local main")
         _ = (repo.root / "OFFLINE").unlink()
         _ = repo.ssh.write_text('#!/bin/sh\nfor command do :; done\nexec sh -c "$command"\n')
         with mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.file://.insteadOf",
                                           "GIT_CONFIG_VALUE_0": "natedev:"}):
+            with self.subTest(attempt="retry an offline production pull"):
+                mac_path = PurePosixPath(str(mac))
+                settings_pull = main_publish.MacCheckoutPull(mac_path, repo.checkout)
+                main_publish.queue_pull_only("settings", "Mac asleep", pulls=(settings_pull,))
+                pull = main_publish.ProductionMacPull(mac_path, repo.checkout, approved)
+                main_publish.queue_pull_only("production", "Mac asleep", pulls=(pull,))
+                main_publish.clear_pull_only(mac_path)
+                result = zone.drain(repo.checkout, pulled=mac_path)
+                self.assertIn("took the production change", " ".join(result))
+                self.assertEqual(repo.git(mac, "rev-parse", "HEAD"), approved)
+                self.assertEqual(fetch_head.read_text(), fetch_text)
+                self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
             for attempt in ("first pull", "repeat pull"):
                 with self.subTest(attempt=attempt):
                     pulled = main_publish.pull_mac(repo.checkout, ssh_program=str(repo.ssh), mac=PurePosixPath(str(mac)))
@@ -692,6 +711,73 @@ class MainPublishTests(PublicationTestCase):
             self.assertEqual((pending.label, pending.text, pending.reason), ("example.amount", "", "Mac asleep"))
             main_publish.clear_pull_only()
             self.assertIsInstance(main_publish.read_queue(), main_publish.NoPendingMacPull)
+
+        older = repo.head()
+        _ = (repo.checkout / "other.txt").write_text("newer\n")
+        _ = repo.git(repo.checkout, "commit", "-qam", "newer publication")
+        newer = repo.head()
+        _ = repo.git(repo.checkout, "push", "origin", "main")
+        mac = PurePosixPath("~/production")
+        old_pull = main_publish.ProductionMacPull(mac, repo.checkout, older)
+        new_pull = main_publish.ProductionMacPull(mac, repo.checkout, newer)
+        original_read = main_publish.queue_bytes
+
+        for action in ("competing writes", "clear during newer write"):
+            with self.subTest(queue=action):
+                main_publish.queue_pull_only("older", "Mac asleep", pulls=(old_pull,))
+                reads = 0
+                newer_writes = False
+
+                def read_with_competitor(path: Path) -> bytes:
+                    nonlocal reads, newer_writes
+                    content = original_read(path)
+                    if newer_writes:
+                        return content
+                    reads += 1
+                    if reads == 1:
+                        newer_writes = True
+                        try:
+                            main_publish.queue_pull_only("newer", "Mac asleep", pulls=(new_pull,))
+                        finally:
+                            newer_writes = False
+                    if reads == 2:
+                        with path.with_suffix(".lock").open("a") as contender:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return content
+
+                with mock.patch.object(main_publish, "queue_bytes", side_effect=read_with_competitor):
+                    if action == "competing writes":
+                        main_publish.queue_pull_only("older", "Retry", pulls=(old_pull,))
+                    else:
+                        main_publish.clear_mac_pull(old_pull)
+                self.assertGreaterEqual(reads, 3)
+                pending = main_publish.read_queue()
+                assert isinstance(pending, main_publish.PendingMacPull)
+                self.assertEqual(pending.pulls, (new_pull,))
+                main_publish.clear_mac_pull(new_pull)
+
+        with self.subTest(queue="legacy pull with a zone notice"):
+            _ = queue_path.write_text(json.dumps({
+                "zone": "America/New_York", "text": "A waiting zone notice", "since": "2026-11-01",
+                "reason": "Mac asleep", "pulls": [
+                    {"mac": "~/.claude", "source": str(repo.checkout)},
+                    {"mac": str(mac), "source": str(repo.checkout), "kind": "production", "sha": newer},
+                ],
+            }))
+            result = zone.drain(repo.checkout, pulled=None)
+            self.assertIn("record the published commit", " ".join(result))
+            ssh_calls = repo.ssh_log.read_text()
+            self.assertEqual(ssh_calls.splitlines().count("mac"), 1)
+            self.assertIn(f"cd {main_publish.remote_path(mac)}", ssh_calls)
+            self.assertIn(newer, ssh_calls)
+            self.assertNotIn("broadcast.py", ssh_calls)
+            pending = main_publish.read_queue()
+            self.assertIsInstance(pending, main_publish.PendingMacPull)
+            assert isinstance(pending, main_publish.PendingMacPull)
+            self.assertEqual(pending.text, "A waiting zone notice")
+            self.assertEqual(pending.pulls, (main_publish.MacPullAwaitingPublication(
+                main_publish.DEFAULT_MAC_CHECKOUT, repo.checkout),))
 
 
 if __name__ == "__main__":

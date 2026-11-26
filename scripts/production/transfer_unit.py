@@ -13,7 +13,7 @@ import sys
 from typing import cast
 
 
-from scripts.production import showrunners, staff, staff_move, staff_sources
+from scripts.production import add_unit, showrunners, staff, staff_move, staff_sources
 from scripts.production.production_doc import Production, Refusal, read_production
 
 
@@ -43,6 +43,9 @@ def apply(from_name: str, unit: str, to_name: str) -> UnitTransfer:
     with staff.row_operation(str(request.member.id)):
         changed = request.member.parent != staff.ReportsTo(request.parent.id)
         if changed:
+            assert isinstance(request.member.unit_type, staff.UnitDetails)
+            add_unit.require_serving_merge_unit(request.receiving, request.member.unit_type.value,
+                                                 add_unit.document_paths(request.receiving))
             _ = staff.move(request.member.id, staff.ReportsTo(request.parent.id))
             notice = showrunners.send_to_address(
                 str(request.member.id), f"transfer:{request.member.id}:{request.parent.id}",
