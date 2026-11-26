@@ -21,6 +21,7 @@ from scripts.lib import conf, live_settings, main_publish, main_sync, waiting_ro
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib.test_main_publish import pending_rows
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.agents import remote
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, isolated_staff_file
@@ -55,6 +56,7 @@ class WaitingRowsTests(unittest.TestCase):
         _ = (self.checkout / "config/example.conf").write_text(SETTINGS)
         _ = (self.checkout / "config/models.conf").write_text(REGISTRY)
         _ = (self.checkout / "config/statusline.conf").write_text(STATUSLINE)
+        _ = write_config_fixture(self.checkout / "config/user_zone.conf")
         self.run_git(self.checkout, "add", ".")
         self.run_git(self.checkout, "commit", "-qm", "start")
         self.run_git(self.checkout, "push", "-q", "origin", "HEAD:main")

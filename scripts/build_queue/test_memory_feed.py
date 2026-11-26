@@ -6153,6 +6153,7 @@ class BuildsPageProofTests(unittest.TestCase):
             _ = environment.pop(setting, None)
         write_private_build_roots(directory / "build_folders.conf", directory, FIXTURE_MACHINE)
         _ = write_config_fixture(directory / "review_links.conf")
+        _ = write_config_fixture(directory / "user_zone.conf")
         result = run_process_group(command,
             env={**environment, "CONF_DIR": str(directory), "TMPDIR": str(directory)},
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
