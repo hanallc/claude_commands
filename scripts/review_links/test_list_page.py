@@ -4893,22 +4893,48 @@ window.fetch=(url,options)=>{
         self.browser_action_sequence(steps, add_item=False, markup=initial, reduced_motion=True)
 
     def test_remove_closes_before_delivery_and_repeated_requests_do_nothing(self) -> None:
-        item = self.add("Remove this item now")
-        fields = self.fields(item, "remove")
         root = self.root / "reviews"
+        for words in ("", "Keep <this> & that.\n\nRemove the duplicate."):
+            with self.subTest(words=words), patch.object(change_page, "send_to_staff") as send:
+                item = self.add("Remove this item now")
+                fields = self.fields(item, "remove", words=words)
+                delivery = list_page.submit(root, urlencode(fields))
+                closed = the_list.load(MORTY.id, item.id)
+                self.assertEqual(closed.state, the_list.ItemState.CLOSED)
+                self.assertEqual(closed.closing_words, words or "Removed by nate on the Studio.")
+                self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
+                                     for entry in closed.log), 1)
+                send.assert_not_called()
+                list_page.deliver(delivery)
+                expected = f"Studio: nate removed item {item.number}." + (f"\n\n{words}" if words else "")
+                self.assertEqual((send.call_args.args[0], send.call_args.args[2]), (MORTY.id, expected))
+                saved = the_list.load(MORTY.id, item.id)
+                if words:
+                    log = list_page.item_log(list_page.ListRecord(MORTY.id, saved), NOW, staff_names.read(), frozenset())
+                    escaped = "Keep &lt;this&gt; &amp; that."
+                    self.assertIn(f"<dt>Closing words</dt><dd><p>{escaped}</p>", log.markup)
+                    self.assertIn(f"<p>Studio: nate removed item {item.number}.</p><p>{escaped}</p>", log.markup)
+                    self.assertNotIn("<this>", log.markup)
+                list_page.deliver(list_page.submit(root, urlencode(fields)))
+                send.assert_called_once()
+                self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+                with self.assertRaisesRegex(the_list.ListError, "different action or words"):
+                    _ = list_page.submit(root, urlencode({**fields, "words": "Changed on retry."}))
+
+    def test_remove_retry_uses_the_saved_list_page_notice(self) -> None:
+        root = self.root / "reviews"
+        item = self.add("Remove the duplicate")
+        fields = self.fields(item, "remove", words="Keep the original.")
+        message = f"List page: nate removed item {item.number}."
+        notice = the_list.PageItemNotice(fields["request"], message, "remove", fields["words"])
+        closed = the_list.close(MORTY.id, item.id, "Removed by nate on the List page.",
+                                 source=the_list.PAGE_SOURCE, notice=notice)
         with patch.object(change_page, "send_to_staff") as send:
             delivery = list_page.submit(root, urlencode(fields))
-            closed = the_list.load(MORTY.id, item.id)
-            self.assertEqual(closed.state, the_list.ItemState.CLOSED)
-            self.assertEqual(sum(isinstance(entry.what, the_list.FieldChange) and entry.what.action == "Closed"
-                                 for entry in closed.log), 1)
-            send.assert_not_called()
+            self.assertEqual(the_list.load(MORTY.id, item.id), closed)
             list_page.deliver(delivery)
-            self.assertEqual(send.call_args.args[2], f"List page: nate removed item {item.number}.")
-            saved = the_list.load(MORTY.id, item.id)
-            list_page.deliver(list_page.submit(root, urlencode(fields)))
             send.assert_called_once()
-            self.assertEqual(the_list.load(MORTY.id, item.id), saved)
+            self.assertEqual(send.call_args.args[2], message)
 
     def test_list_adds_the_next_number_after_a_page_remove(self) -> None:
         first = self.add("Keep the first item", number=206)
@@ -5257,7 +5283,7 @@ window.fetch=async(_path,options={})=>{
             skipped = the_list.load(MORTY.id, item.id).schedule
             assert isinstance(skipped, the_list.ScheduledSeries)
             self.assertEqual(skipped.exceptions, (the_list.RunException(
-                2, the_list.SkippedRun("Removed by nate on the List page.")),))
+                2, the_list.SkippedRun("Removed by nate on the Studio.")),))
             other = self.fields(saved, "remove", scope="this", run="3")["request"]
             for request, expected in ((remove["request"], True), (create["request"], False), (other, False)):
                 with self.subTest(request=request):
@@ -11037,7 +11063,7 @@ window.fetch=async(path,options={})=>{
             for action, extra, words in (
                     ("park", {"until": "2026-12-03"}, "List page: nate parked item 106 until 2026-12-03."),
                     ("tell", {"words": "Explain this simply.\nKeep these words."}, "Explain this simply.\nKeep these words."),
-                    ("remove", {}, "List page: nate removed item 106.")):
+                    ("remove", {}, "Studio: nate removed item 106.")):
                 with self.subTest(action=action):
                     fields = self.fields(item, action, **extra)
                     delivery = list_page.submit(root, urlencode(fields))

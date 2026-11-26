@@ -1852,6 +1852,8 @@ The server clears that claim without a failure notice.
 If the server cannot start the send for another reason, it clears the claim and logs the error.
 Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURCE`.
 Remove sits at the left edge of the open row above the four-line text box.
+Remove saves text from the box as closing words and adds it after the removal line in the producer's notice.
+An empty box uses the short Studio notice and the default closing words.
 Park and Remove collapse the row after the save.
 The table applies the saved state before the next refresh.
 Park, Remove, Tell, Ask question, and Mark read show a message if the page cannot confirm the save.
