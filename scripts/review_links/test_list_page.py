@@ -1293,8 +1293,8 @@ if(example.filterOn){
         row = '<div class="record-filter-row" role="group" aria-label="Producer" data-filter-row="producer">'
         self.assertEqual(studio.count(row), 1)
         self.assertIn('<div class="studio-tab-row"><div class="studio-tabs">' + row, studio)
-        controls = ('<div class="studio-tabs">', '<div class="record-filter-words">',
-                    '<div class="list-top-bands">', '<div data-record-filters>')
+        controls = ('<div data-page-top-controls>', '<div class="studio-tabs">', '<div class="record-filter-words">',
+                    '<div data-record-filters>', '<div class="list-top-bands">')
         positions = [studio.index(control) for control in controls]
         self.assertEqual(positions, sorted(positions))
         self.assertIn('<h1 class="page-title">The Studio</h1>', studio)
@@ -1303,6 +1303,55 @@ if(example.filterOn){
         tab = studio.split(f'data-filter-value="staff:{DWIGHT.id}"', 1)[1].split('</button>', 1)[0]
         self.assertIn(f'src="{studio_page.AVATAR_PATH}/{DWIGHT.id}/01-128.webp"', tab)
         self.assertIn('<span class="studio-name">dwight</span> <b>2</b>', tab)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required to check the frozen Studio filters.")
+    def test_browser_studio_filters_and_table_header_follow_the_frozen_top(self) -> None:
+        for number in range(1, 25):
+            _ = self.add(f"Check Studio item {number}", number=number)
+        markup = list_page.render(self.root / "reviews", include_counts=False)
+        page = page_frame.with_owner(markup, "studio", MORTY, staff.StaffSnapshot((MORTY,)), new_item_dialog.render)
+        probe = b'''<script>
+(async()=>{
+ const failures=[],check=(ok,message)=>{if(!ok) failures.push(message);};
+ const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const find=selector=>document.querySelector(selector);
+ const box=element=>element.getBoundingClientRect();
+ const hit=element=>{
+  const {left,top,width,height}=box(element);
+  return element.contains(document.elementFromPoint(left+width/2,top+height/2));
+ };
+ try{
+  frameElement.style.height='800px';
+  const top=find('.page-top'), title=find('.page-heading');
+  const heading=find('.list-table thead'), row=find('[data-number="20"] .list-row');
+  const controls=['.studio-tabs button','#list-search','#filter-owner-all','#filter-show-all','#list-unread'].map(find);
+  check(controls.every(control=>top.contains(control)), 'The shared frame contains all five Studio filters.');
+  for(const width of [1440,390]){
+   frameElement.style.width=width+'px';
+   scrollTo({top:0,behavior:'instant'});
+   await paint();
+   const first=box(row).top;
+   for(const scroll of [700,980]){
+    scrollTo({top:scroll,behavior:'instant'});
+    await paint();
+    const bottom=box(width===1440 ? top : title).bottom;
+    check(innerWidth===width && scrollY===scroll && Math.abs(box(row).top-first+scroll)<1,
+     width+' px: the table rows scroll under the frame.');
+    check(Math.abs(box(heading).top-bottom)<1 && hit(heading.querySelector('button')),
+     width+' px: the table header touches the frozen top and accepts input.');
+    check(width===1440 ? controls.every(hit) : controls.every(control=>box(control).bottom<0) && hit(title),
+     width+' px: the desktop filters stay visible and the phone keeps only the title.');
+   }
+   row.scrollIntoView({block:'start',behavior:'instant'});
+   await paint();
+   check(box(row).top>=box(heading).bottom-1 && hit(row.querySelector('.list-toggle')),
+    width+' px: scrolling a row into view clears the table header.');
+  }
+ }catch(error){failures.push(String(error));}
+ await fetch('/results',{method:'POST',body:JSON.stringify(failures)});
+})();
+</script>'''
+        self.assertEqual(firefox_probe_results(page.replace(b'</body>', probe + b'</body>')), [[]])
 
     def test_studio_lists_linked_items_with_states_and_missing_records(self) -> None:
         closed = self.add("Close this check", number=210)
@@ -1530,6 +1579,8 @@ if(example.filterOn){
   return [picture.getAttribute('src'),picture.getAttribute('srcset')];
  }));
  const shown=pictures();
+ const frozen=document.querySelector('.page-top');
+ const status=frozen.querySelector('[data-page-status]');
  check(shown.includes('/01-128.webp') && !shown.includes('/02-'),'The first render shows picture 01.');
  check(tab('staff:'+DWIGHT).dataset.filterCount==='0' && tab('all').dataset.filterCount==='1',
   'The first render counts one item.');
@@ -1538,6 +1589,8 @@ if(example.filterOn){
  await flush();
  await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
  check(document.querySelector('[data-number="2"]'),'The refresh shows the new row.');
+ check(frozen===document.querySelector('.page-top') && frozen.contains(status) && status.dataset.state!=='Failed',
+  'The refresh keeps the frame and updates its status.');
  check(pictures()===shown,'The refresh keeps each picture src and srcset on screen.');
  check(tab('staff:'+DWIGHT).dataset.filterCount==='1' && tab('staff:'+DWIGHT).querySelector('b').textContent==='1'
   && tab('all').dataset.filterCount==='2','The refresh updates the tab counts.');
@@ -1703,7 +1756,7 @@ if(example.filterOn){
         back = "new Promise(resolve=>{addEventListener('popstate',resolve,{once:true});history.back();})"
         _ = evaluate(back)
         self.assertIs(evaluate(opened), False)
-        _ = evaluate("document.getElementById('list-search').focus()")
+        _ = evaluate("document.getElementById('list-unread').focus()")
         for key, code in (("Tab", 9), ("Enter", 13)):
             if key == "Enter":
                 self.assertIs(evaluate(f"document.activeElement==={link}"), True)
@@ -2622,8 +2675,10 @@ frame.addEventListener('load',async()=>{
     const top=target.getBoundingClientRect().top;
     check(win.getComputedStyle(frozen).position==='sticky' && Math.abs(box.top)<1 &&
      banner.getBoundingClientRect().height>=60,'the tall status line stays in the frozen top');
-    const gap=top-box.bottom;
-    check(Math.abs(gap-16)<=1,'the gap below the frozen top is '+gap+' px, expected 16 px');
+    const heading=doc.querySelector('.list-table thead').getBoundingClientRect();
+    const gap=top-heading.bottom;
+    check(Math.abs(heading.top-box.bottom)<=1 && Math.abs(gap-16)<=1,
+     'The row starts 16 px below the table header. Found '+gap+' px.');
    }
   }
   const expected=originalFilters.slice();
@@ -6840,7 +6895,8 @@ window.fetch=async(_path,options={})=>{
  row.querySelector('.list-toggle').scrollIntoView({block:'center',behavior:'instant'});
  row.querySelector('.list-toggle').click();
  unpark.focus({preventScroll:true});
- check(filter.getBoundingClientRect().bottom<0,'The focused row is below the viewport with the filters.');
+ check(SHORT_VIEWPORT ? filter.getBoundingClientRect().bottom<0 : filter.getBoundingClientRect().top>=0,
+       'The Parked filter stays visible when the frame freezes it.');
  submit('unpark');
  finishPost({item_state:'Working',parked:'false',parked_until:'',unpark_outcome:'cleared'});
  await flush();

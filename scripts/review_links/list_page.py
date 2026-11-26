@@ -2317,7 +2317,16 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
             counts = f'<div data-list-counts-url="{studio_page.PAGE_PATH}?{html.escape(counts_query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    content = (STYLE + studio_page.STYLE + page_frame.title(studio_page.TITLE, "studio", SCRIPT_VERSION)
+    filters = ('<div class="studio-tab-row">'
+               + studio_page.tabs(producer_chips, producer_selected)
+               + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
+               + '</div><div data-record-filters>'
+               + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
+               + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)
+               + f'<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="{UNREAD_VALUE}"{check_unread}>'
+               + 'Unread only</label></div>'
+               + '<p data-hidden-action-status role="status" hidden></p></div></div>')
+    content = (STYLE + studio_page.STYLE
                + '<p data-review-refresh-error role="status" hidden></p>'
                + f'<div data-list data-list-path="{studio_page.PAGE_PATH}" data-refresh-seconds="{seconds}"'
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
@@ -2327,18 +2336,8 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps([entry.key for entry in closed]), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
-               + '<div class="studio-tab-row">'
-               + studio_page.tabs(producer_chips, producer_selected)
-               + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
-               + '</div>'
+               + page_frame.title(studio_page.TITLE, "studio", SCRIPT_VERSION, frozen_controls=filters)
                + top_bands(top_items, today, names)
-               + '<div data-record-filters>'
-               + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
-               + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)
-               + f'<label class="list-unread-switch"><input type="checkbox" role="switch" id="list-unread" value="{UNREAD_VALUE}"{check_unread}>'
-               + 'Unread only</label></div>'
-               + '<p data-hidden-action-status role="status" hidden></p></div>'
-               + '</div>'
                + '<p data-missing-item role="status" hidden></p>'
                + '<template data-producer-answering-template>' + producer_answering_note(names) + '</template>'
                + '<div data-list-count role="status" aria-live="polite"></div>'
@@ -2423,7 +2422,7 @@ font-size:13px;border:1px solid var(--line);border-radius:8px;background:var(--c
 [data-list-review-dialog] iframe{display:block;width:100%;height:var(--review-card-height,15rem);
 max-height:calc(100dvh - 98px - var(--page-window-top,0px));border:0}
 :root:has([data-list-review-dialog][open]){overflow:hidden}
-:root:has([data-list-review-dialog][open]) [data-list]{opacity:.35}
+:root:has([data-list-review-dialog][open]) :is([data-list]>:not(.page-top),[data-page-top-controls]){opacity:.35}
 :root:has([data-list-review-dialog][open][data-fullscreen]){scrollbar-gutter:auto}
 [data-list-review-dialog][data-fullscreen]{width:100vw;height:calc(100dvh - var(--page-window-top,0px));border:0;
 border-radius:0;margin:var(--page-window-top,0px) 0 0}
@@ -2995,6 +2994,9 @@ function focusAfterQuestion(item){
  content.querySelector('#list-search').focus();
 }
 let ownerNameWidth=0;
+const tableHeadingSize=new ResizeObserver(([entry])=>{
+ document.documentElement.style.setProperty('--studio-table-heading-height',entry.borderBoxSize[0].blockSize+'px');
+});
 function sizeListColumns(){
  const table=content.querySelector('table');
  const numberWidth=table.querySelector('.list-number-column').getBoundingClientRect().width;
@@ -3009,6 +3011,8 @@ function sizeListColumns(){
 }
 addEventListener('resize',sizeListColumns);
 function bindListControls(){
+ tableHeadingSize.disconnect();
+ tableHeadingSize.observe(content.querySelector('table').tHead);
  const ownerNames=content.querySelectorAll('.list-owner-name');
  ownerNameWidth=0;
  if(ownerNames.length){
@@ -3843,8 +3847,7 @@ function bindFeedbackForm(form){
       if(saved && item.hidden){
        const status=content.querySelector('[data-hidden-action-status]');
        const top=target.getBoundingClientRect().top;
-       const inset=(typeof stuckPageActionsBottom==='function' ? stuckPageActionsBottom()
-        : document.querySelector('[data-page-status]').offsetHeight)+12;
+       const inset=target.closest('.page-top').getClientRects().length ? 0 : stuckPageActionsBottom()+12;
        if(top<inset || status.getBoundingClientRect().bottom>innerHeight)
         scrollBy({top:Math.floor(top-inset),behavior:'instant'});
       }
@@ -4001,6 +4004,7 @@ async function refresh(_supersede=false,current=()=>true){
  const newer=reloadForNewScript(page,()=>saving>0);
  if(newer || saving || document.querySelector('.list-schedule-dialog[open]') || parkPickerBlocksRefresh()) return newer;
  if(!fresh) throw new Error('The page has no list.');
+ const facts=pageRefreshFacts(page);
  decodeListKeys(fresh);
  refreshNeeded=false;
  tableView.preserveRecordRowTop(()=>applyListSnapshot(fresh));
@@ -4008,7 +4012,6 @@ async function refresh(_supersede=false,current=()=>true){
  reviewRefreshError.hidden=true;
  if(delivery && response.headers?.get('X-Item-Delivery-Pending')==='false')
   tableView.finishDeliveryWindow(delivery);
- const facts=pageRefreshFacts(page);
  scheduleParkExpiry(facts,requestStarted);
  return facts;
 }
@@ -4035,6 +4038,13 @@ function applyListSnapshot(fresh){
  if(key && !nextItem) tableView.closeCard(key);
  const links=nextItem && !nextItem.dataset.listReviewVersion &&
   recordDetails(nextItem).querySelector('[data-list-review-links]');
+ // Keep the title, status, and actions that the page frame observes.
+ const top=content.querySelector('.page-top'),nextTop=fresh.querySelector('.page-top');
+ const controls=top.querySelector('[data-page-top-controls]');
+ // Keep the old controls in the old list until the table reads their values.
+ top.replaceWith(...controls.childNodes);
+ controls.append(...nextTop.querySelector('[data-page-top-controls]').childNodes);
+ nextTop.replaceWith(top);
  content.replaceWith(fresh);content=fresh;
  closedKeys=new Set(JSON.parse(content.dataset.closedKeys));
  bindListControls();tableView.replace();
