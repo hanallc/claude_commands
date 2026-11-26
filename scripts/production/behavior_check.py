@@ -57,10 +57,10 @@ class GitRange(NamedTuple):
             raise BehaviorCheckError(detail or f"git {args[0]} exited with status {result.returncode}")
         return result.stdout
 
-    def pinned(self) -> GitRange:
-        base = self.git("rev-parse", "--verify", "--end-of-options", f"{self.base}^{{commit}}")
-        commit = self.git("rev-parse", "--verify", "--end-of-options", f"{self.commit}^{{commit}}")
-        return GitRange(self.repo, base.decode("ascii").strip(), commit.decode("ascii").strip())
+    def comparison_range(self) -> GitRange:
+        commit = self.git("rev-parse", "--verify", "--end-of-options", f"{self.commit}^{{commit}}").decode("ascii").strip()
+        base = self.git("merge-base", "--", self.base, commit).decode("ascii").strip()
+        return GitRange(self.repo, base, commit)
 
     def origin_identity(self, timeout: float | None) -> str:
         remote = os.fsdecode(self.git("remote", "get-url", "origin", timeout=timeout)).strip()
@@ -380,6 +380,12 @@ class TestHistoryCommit(NamedTuple):
     parents: list[str]
     subject: str
 
+    def phase_author(self) -> str:
+        if len(self.parents) < 2:
+            return ""
+        merge = re.fullmatch(r"Merge (\S+) phase (\S+) \([0-9a-fA-F]{7,64}\) into \S+", self.subject)
+        return f"Ask {merge[1]} (phase {merge[2]})" if merge else ""
+
 
 def describe_tip(change: GitRange) -> str:
     subject = change.git("show", "-s", "--format=%s", "--no-notes", "--no-show-signature", change.commit, "--")
@@ -441,12 +447,10 @@ def question_authors(change: GitRange, tests: ChangedTests, findings: set[str]) 
                 break
             if on_first_parent and parent != step.parents[0]:
                 on_first_parent = False
-                merge = re.fullmatch(r"Merge (\S+) phase (\S+) \([0-9a-fA-F]{7,64}\) into \S+", step.subject)
-                if merge:
-                    unit = f"Ask {merge[1]} (phase {merge[2]})"
+                unit = step.phase_author()
             commit = parent
             path = previous_path
-        authors[finding.test] = unit or f"{commit} {step.subject}"
+        authors[finding.test] = step.phase_author() or unit or f"{commit} {step.subject}"
     return authors
 
 
@@ -594,7 +598,7 @@ def main(arguments: list[str]) -> int:
             execute = cast(Callable[[str, GitRange, NoChangedTests, str, str, Path | NoQuestionDraft], int],
                            import_module("scripts.production.behavior_review").execute)
             return execute("status", change, NoChangedTests.EMPTY, args.key, "", NoQuestionDraft.OMITTED)
-        change = change.pinned()
+        change = change.comparison_range()
         if args.action == "check":
             require_review(change)
             return 0

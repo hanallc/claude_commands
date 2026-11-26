@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from typing import final, override
 from contextlib import redirect_stdout
 from unittest import mock
-from scripts.production import change_review, gate, promotion, showrunners
+from scripts.production import behavior_check, change_review, gate, promotion, showrunners
 from scripts.production.staff_test_support import isolated_staff_file, recorded_showrunner
 from scripts.production.gate_modules import GateRefused
 from scripts.production.gate_test_support import MergeGateFixture, wait_for_file
@@ -207,16 +207,34 @@ sys.meta_path.insert(0, NoRepositoryModules())
 
     def test_promotion_retries_its_recorded_fast_forward_after_push_failure(self) -> None:
         args = self.publish_for_promotion()
-        with mock.patch.dict(os.environ, self.environment), mock.patch.object(
-                land_main, "land", side_effect=land_main.LandError("injected push failure")):
+        hook = self.origin / "hooks/pre-receive"
+        self.write(hook, "#!/bin/sh\necho 'injected push failure' >&2\nexit 1\n")
+        hook.chmod(0o755)
+        with mock.patch.dict(os.environ, self.environment):
             with self.assertRaisesRegex(GateRefused, "injected push failure"):
                 gate.promote(args)
         self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.checkpoint)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        hook.unlink()
         result = self.run_promote_only()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.checkpoint)
         self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 1)
+
+    def test_behavior_refusal_keeps_live_main_at_its_current_tip(self) -> None:
+        args = self.publish_for_promotion()
+        path = self.main / "subject.txt"
+        original = path.read_bytes() if path.exists() else b""
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(behavior_check, "require_review",
+                                side_effect=behavior_check.BehaviorCheckError("no review is on record")) as check):
+            with self.assertRaisesRegex(GateRefused, "no review is on record"):
+                gate.promote(args)
+        check.assert_called_once_with(behavior_check.GitRange(self.main, self.base, self.checkpoint), timeout=None)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertEqual(path.read_bytes() if path.exists() else b"", original)
+        self.assertFalse(self.calls())
 
     def test_promotion_refuses_missing_or_stale_ci_for_the_exact_tip(self) -> None:
         self.write(self.unit / ".github/workflows/ci.yml", "name: CI\n")
@@ -307,11 +325,86 @@ sys.meta_path.insert(0, NoRepositoryModules())
         _ = self.git(self.main, "switch", "--detach", "main")
         _ = self.git(self.checkout, "switch", "main")
         self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `main`\n")
-        result = self.run_gate("--promote", "--merge-branch", "main", "--main-repo", str(self.checkout))
+        with mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check:
+            result = self.run_gate("--promote", "--merge-branch", "main", "--main-repo", str(self.checkout))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        check.assert_called_once_with(behavior_check.GitRange(self.checkout, self.base, self.checkpoint))
         tip = self.git(self.checkout, "rev-parse", "HEAD")
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), tip)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD^2"), self.checkpoint)
+
+    def test_a_legacy_gate_retries_a_merge_with_a_local_production_doc_commit(self) -> None:
+        _ = self.git(self.main, "switch", "--detach", "main")
+        _ = self.git(self.checkout, "switch", "main")
+        self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `main`\n")
+        self.write(self.checkout / "production-note.md", "Retire alpha.\n")
+        local = self.commit(self.checkout, "production(fixture): retire alpha")
+        hook = self.origin / "hooks/pre-receive"
+        self.write(hook, '#!/bin/sh\necho "fixture push refusal" >&2\nexit 1\n')
+        hook.chmod(0o755)
+        options = ("--merge-branch", "main", "--main-repo", str(self.checkout))
+
+        stopped = self.run_gate(*options)
+
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("fixture push refusal", stopped.stderr)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, local, self.checkpoint])
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        hook.unlink()
+
+        with mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check:
+            retried = self.run_gate(*options)
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        check.assert_called_once_with(behavior_check.GitRange(self.checkout, self.base, self.checkpoint))
+        self.assertIn(f"Local doc commit goes out with this merge: {local[:12]}", retried.stdout)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), merged)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+
+        published = self.run_gate(*options)
+        self.assertEqual(published.returncode, 0, published.stdout + published.stderr)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), merged)
+
+    def test_a_legacy_main_gate_refuses_a_checkpoint_without_behavior_review(self) -> None:
+        _ = self.git(self.main, "switch", "--detach", "main")
+        _ = self.git(self.checkout, "switch", "main")
+        self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `main`\n")
+        test_path = Path("scripts/lib/test_fixture_behavior.py")
+        original = "def test_fixture_behavior():\n    assert 1\n"
+        self.write(self.checkout / test_path, original)
+        fork = self.commit(self.checkout, "add behavior test")
+        self.write(self.checkout / "scripts/lib/test_only_on_main.py", "def test_only_on_main():\n    assert 1\n")
+        baseline = self.commit(self.checkout, "add a test on main")
+        _ = self.git(self.checkout, "push", "origin", "main")
+        _ = self.git(self.unit, "switch", "-c", "legacy-phase", fork)
+        self.write(self.unit / test_path, original.replace("assert 1", "assert 2"))
+        checkpoint = self.commit(self.unit, "edit behavior test\n\nChange-Review: none — test only")
+        _ = self.git(self.unit, "push", "origin", "legacy-phase")
+
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                if retry:
+                    _ = self.git(self.checkout, "merge", "--no-ff", "-m", "recorded merge", checkpoint)
+                    merged = self.git(self.checkout, "rev-parse", "HEAD")
+                    with mock.patch.dict(os.environ, self.environment):
+                        receipt = gate.push_record_path(self.checkout, "checkpoint", "origin/main:" + checkpoint)
+                        gate.write_push_record(receipt, gate.RecordedPush(baseline, merged, checkpoint))
+                head = self.git(self.checkout, "rev-parse", "HEAD")
+                contents = (self.checkout / test_path).read_bytes()
+                with (mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check,
+                      mock.patch.object(gate, "merge_for_gate", wraps=gate.merge_for_gate) as merge):
+                    result = self.run_gate("--merge-branch", "main", "--unit-branch", "legacy-phase",
+                                           checkpoint=checkpoint, previous=fork)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"Behavior check for {test_path}::test_fixture_behavior: no review is on record", result.stderr)
+                check.assert_called_once_with(behavior_check.GitRange(self.checkout, fork, checkpoint))
+                merge.assert_not_called()
+                self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
+                self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+                self.assertEqual((self.checkout / test_path).read_bytes(), contents)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), baseline)
 
     def test_enrolled_gate_refuses_incoming_live_files_in_both_publication_modes(self) -> None:
         integration, doc, declared = self.enrolled_fixture()
@@ -338,8 +431,17 @@ sys.meta_path.insert(0, NoRepositoryModules())
 
     def test_promotion_rejects_an_unrecorded_commit_with_the_same_tree(self) -> None:
         args = self.publish_for_promotion()
+        actual = land_main.run_git
+
+        def interrupt_push(checkout: Path, *args: str,
+                           time_limit: land_main.CommandTimeLimit | land_main.NoTimeLimit = land_main.UNLIMITED_GIT,
+                           environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+            if args[0] == "push":
+                raise KeyboardInterrupt()
+            return actual(checkout, *args, time_limit=time_limit, environment=environment)
+
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(
-                land_main, "land", side_effect=KeyboardInterrupt()):
+                land_main, "run_git", side_effect=interrupt_push):
             with self.assertRaises(KeyboardInterrupt):
                 gate.promote(args)
         _ = self.git(self.main, "commit", "--allow-empty", "-m", "unrelated local commit")
