@@ -19,6 +19,7 @@ import time
 from typing import BinaryIO, TextIO, cast
 import unittest
 from unittest import mock
+from uuid import uuid4
 
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib import build_copies, build_folders, conf, removal_guard, scratch
@@ -203,7 +204,8 @@ class QueueRunTests(unittest.TestCase):
         private = private_copy_config(root)
         source = root / "source"
         source.mkdir()
-        with mock.patch.dict(os.environ, {**private.environment, "HOME": str(root), "MAC_PLACEMENT": "smoke/attempt"}):
+        placement = f"{uuid4().hex}/{uuid4().hex}"
+        with mock.patch.dict(os.environ, {**private.environment, "HOME": str(root), "MAC_PLACEMENT": placement}):
             _ = subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
             _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", "https://example.test/widget.git"],
                                check=True, capture_output=True)

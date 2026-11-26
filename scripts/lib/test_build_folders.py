@@ -922,6 +922,17 @@ class FolderFormTests(unittest.TestCase):
               mock.patch.object(os, "pathconf", return_value=1)):
             self.assertEqual(folders.build_root(form=folders.FixedRepositoryBuildFolders("mac")), root)
 
+    def test_f7_cargo_target_name_uses_the_volume_case_rule(self) -> None:
+        self.write_config(machine_root="TARGET/build")
+        form = folders.FixedRepositoryBuildFolders("mac")
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(os, "pathconf", return_value=0),
+              self.assertRaisesRegex(folders.InvalidFixedBuildRoot, "inside a Cargo target directory")):
+            _ = folders.build_root(form=form)
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(os, "pathconf", return_value=1)):
+            self.assertEqual(folders.build_root(form=form), self.root / "TARGET/build")
+
     def test_placement_refuses_overlap_with_each_configured_root(self) -> None:
         root = folders.build_root()
         initial = self.config.read_text()

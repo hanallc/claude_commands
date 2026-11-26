@@ -225,32 +225,53 @@ class RemoteCopiesTests(unittest.TestCase):
         self.assertEqual(payload.read_text(), "[]\n")
 
     def test_row_34_fixed_refresh_keeps_the_mirror_and_recovery_files(self) -> None:
+        from scripts.mac_test import claim_state, eligibility, offload
+
         with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
             mirror = self.remote(path=str(folder))
             copies.mark_mirror(folder, mirror.owner, mirror.repository.name, mirror.session)
             keep = build_folders.copy_keep_file(folder)
             _ = keep.write_text("saved run\n")
-            _ = (self.source / "source.txt").write_text("local source edit\n")
             _ = (folder / "source.txt").write_text("receiver edit\n")
             _ = (folder / "receiver-only.txt").write_text("stale\n")
             files = (folder / keep.name, folder / ".mac-smoke-launch-123", folder / ".git",
                      folder / "target", folder / "ignored.txt")
             for path in files:
                 _ = path.write_text(f"{path.name}\n")
-            record = folder / floor_claims.MIRROR_RECORD
-            before = record.read_bytes()
-            excludes = self.root / "excludes"
-            _ = excludes.write_text("/.git\n/target\n/ignored.txt\n")
-            command = copies.remote_rsync(self.source, mirror, excludes, [], protect_fixed_recovery=True)
-            result = subprocess.run([*command[:-1], f"{folder}/"], capture_output=True, text=True,
-                                    check=False, timeout=TEST_HANG_GUARD_SECS)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            for path in files:
-                self.assertEqual(path.read_text(), f"{path.name}\n")
-            self.assertEqual(keep.read_text(), "saved run\n")
-            self.assertEqual(record.read_bytes(), before)
-            self.assertEqual((folder / "source.txt").read_text(), "local source edit\n")
-            self.assertFalse((folder / "receiver-only.txt").exists())
+        _ = (self.source / "source.txt").write_text("local source edit\n")
+        _ = (self.source / ".gitignore").write_text("/ignored.txt\n")
+        _ = (self.source / "ignored.txt").write_text("ignored source\n")
+        request = offload.OffloadRequest(self.source, "package", "call", offload.NO_RESULT_FILE, (),
+                                         owner=mirror.owner, holder_session=mirror.session, target="mac")
+        repository = eligibility.KnownRepository(mirror.repository.name)
+        config = eligibility.OffloadConfig(
+            True, eligibility.SshConnectionSettings(mirror.host, 1, 1, UNREACHABLE_WAIT_FIXTURE_SECONDS),
+            1, 1, 1, "1", {})
+        controller = offload.ProcessController()
+        identity = claim_state.ClaimIdentity("claim", "episode", "attempt")
+        controller.claim_identity = identity
+        fence = self.root / offload.start_fence_relative(identity, request.target)
+        write_text_atomic(fence.with_suffix(".lock"), "")
+        write_text_atomic(self.root / offload.fixed_folder_record(identity, request.target, "run").path,
+                          str(folder) + "\n")
+
+        with local_remote_transport(self.root):
+            held = offload.offload_fixed_folder.set(offload.HeldOffloadFolder(folder))
+            try:
+                self.assertTrue(offload.copy_tree(controller, config, request, repository),
+                                controller.copy_failure_detail)
+            finally:
+                offload.offload_fixed_folder.reset(held)
+
+        for path in files:
+            self.assertEqual(path.read_text(), f"{path.name}\n")
+        self.assertEqual(keep.read_text(), "saved run\n")
+        record = floor_claims.read_mirror_record(folder / floor_claims.MIRROR_RECORD)
+        self.assertEqual((record["owner"], record["repo"], record["session"]),
+                         (mirror.owner, mirror.repository.name, mirror.session))
+        self.assertIn("last_use", record)
+        self.assertEqual((folder / "source.txt").read_text(), "local source edit\n")
+        self.assertFalse((folder / "receiver-only.txt").exists())
 
     def test_row_37_fetch_cleanup_refuses_a_former_fixed_folder(self) -> None:
         root = build_folders.build_root()

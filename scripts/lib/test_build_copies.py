@@ -1168,6 +1168,23 @@ with folders.temporary_build_folder(request) as path:
                 build_copies.prepare_fixed_checkout(self.source, reused, self.base, reserved=reserved)
         self.assertEqual((path / "change.txt").read_text(), "keep after refusal")
 
+    def test_row_28_fixed_reuse_refuses_a_missing_source_record(self) -> None:
+        reserved = ("target", build_folders.COPY_USE_STAMP)
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as path:
+            build_copies.prepare_fixed_checkout(self.source, path, self.base, reserved=reserved)
+            tracked = path / "change.txt"
+            _ = tracked.write_text("keep after refusal")
+        lease = self.lease(path)
+        del lease["source"]
+        _ = build_folders.lease_path(path).write_text(json.dumps(lease))
+
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as reused:
+            with self.assertRaisesRegex(ValueError, "no saved source record"):
+                build_copies.prepare_fixed_checkout(self.source, reused, self.base, reserved=reserved)
+
+        self.assertEqual(tracked.read_text(), "keep after refusal")
+        self.assertNotIn("source", self.lease(path))
+
     def test_a_damaged_copy_index_and_source_edits_restore_from_the_rescue_before_reset(self) -> None:
         for number, damaged in enumerate((b"damaged index\x00\xff", b"DIRC\x00\x00\x00\xff")):
             with self.subTest(index=damaged):

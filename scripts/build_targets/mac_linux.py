@@ -1080,7 +1080,7 @@ git config remote.origin.url {shlex.quote(source.origin_url)}
 git archive {shlex.quote(source.runner_commit)} scripts config | tar -xf - -C "$stage"
 mkdir -- "$stage/next-config"
 git show "$origin_main:config/build_folders.conf" > "$stage/next-config/build_folders.conf"
-CONF_DIR="$stage/next-config" "$stage/scripts/lib/py" "$stage/{RUNNER_PATH}" "$stage/request.json" --check-placement
+CONF_DIR="$stage/next-config" "$stage/scripts/lib/py" "$stage/{RUNNER_PATH}" "$stage/request.json" --check-placement "$origin_main"
 rm -f -- "$placement_pending"
 rm -rf -- "$bootstrap"
 mv -T -- "$stage" "$bootstrap"
@@ -2928,14 +2928,55 @@ def save_guest_build_folder(source: Path, checkout: Path, attempt: str) -> None:
     atomic_file.write_text_atomic(marker, str(record) + '\n', new_file_mode=0o600)
 
 
-def check_guest_placement(request_path: Path) -> int:
+def stage_incoming_cargo(commit: str, staging: Path) -> build_folders.IncomingCargoCheckout:
+    """Read the Cargo files that the guest main checkout will use after reset."""
+    paths = ('.cargo/config', '.cargo/config.toml', 'Cargo.toml')
+
+    def git(*words: str) -> bytes:
+        return subprocess.check_output(('git', *words), stdin=subprocess.DEVNULL,
+                                       timeout=GUEST_REF_TIMEOUT_SECONDS)
+
+    entries: dict[str, tuple[str, str]] = {}
+    for entry in os.fsdecode(git('ls-tree', '-rtz', commit, '--', '.cargo', 'Cargo.toml')).split('\0'):
+        if entry:
+            fields, name = entry.split('\t', 1)
+            if name in paths or name == '.cargo':
+                mode, _, object_id = fields.split()
+                entries[name] = mode, object_id
+    if '.cargo' in entries and entries['.cargo'][0] != '040000':
+        raise ValueError('The incoming .cargo path is not a directory.')
+    tracked = set(os.fsdecode(git('ls-files', '-z', '--', '.cargo', 'Cargo.toml')).split('\0'))
+    for name in paths:
+        if name in entries:
+            mode, object_id = entries[name]
+            if mode not in FILE_MODES:
+                raise ValueError(f'{name}: the incoming Cargo file is not a regular file.')
+            contents = git('cat-file', 'blob', object_id)
+        elif name not in tracked and not (name.startswith('.cargo/') and '.cargo' in tracked):
+            try:
+                retained = Path(name)
+                if not stat.S_ISREG(retained.stat().st_mode):
+                    raise ValueError(f'{name}: the retained Cargo file is not a regular file.')
+                contents = retained.read_bytes()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+        else:
+            continue
+        destination = staging / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _ = destination.write_bytes(contents)
+    return build_folders.IncomingCargoCheckout(staging)
+
+
+def check_guest_placement(request_path: Path, origin_main: str) -> int:
     """Check the incoming build configuration before removing the bootstrap."""
     request = guest_request(request_path)
     try:
         repository = build_folders.repo_word(Path.cwd())
-        _ = build_folders.check_fixed_repository_placement(repository, machine=TARGET)
+        cargo = stage_incoming_cargo(origin_main, request_path.parent / 'incoming-cargo')
+        _ = build_folders.check_fixed_repository_placement(repository, machine=TARGET, cargo_checkout=cargo)
         build_folders.require_no_fixed_build_folders(Path(BOOTSTRAP_DIR))
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         return refuse_run(str(error), request['attempt'])
     return 0
 
@@ -3089,6 +3130,6 @@ if __name__ == '__main__':
     elif sys.argv[2:3] == [RUN_COPY]:
         run_copy(Path(sys.argv[1]), int(sys.argv[3]))
     elif sys.argv[2:3] == ['--check-placement']:
-        raise SystemExit(check_guest_placement(Path(sys.argv[1])))
+        raise SystemExit(check_guest_placement(Path(sys.argv[1]), sys.argv[3]))
     else:
         raise SystemExit(run_guest(Path(sys.argv[1])))

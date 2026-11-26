@@ -745,6 +745,24 @@ class LinuxShellTests(unittest.TestCase):
         self.assertIn("mac_cleanup=1", result.stdout)
         self.assertEqual((target / folder.relative_to(root) / "compiled").read_text(), "Cargo output")
 
+    def test_row_73_low_disk_cleanup_reports_the_test_result_with_a_malformed_lease(self) -> None:
+        private = private_copy_config(self.root / "private-build")
+        with mock.patch.dict(os.environ, private.environment):
+            root = build_folders.build_root()
+            with build_folders.fixed_repository_build_folder("hana", machine="mac-linux", unit="verify") as folder:
+                _ = (folder / "compiled").write_text("Cargo output")
+        _ = build_folders.lease_path(folder).write_text("{")
+        target = self.mirror / "custom-build"
+        _ = root.rename(target)
+        self.environment.update({"FAKE_FREE_GIB": "1", "FAKE_LINT_STATUS": "7"})
+
+        result = self.execute(self.request(words=("--target-dir", target.name)))
+
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-2:], ["mac_exit=7", "mac_cleanup=1"])
+        self.assertIn("invalid build folder lease", result.stderr)
+        self.assertEqual((target / folder.relative_to(root) / "compiled").read_text(), "Cargo output")
+
     def test_explicit_build_folder_cannot_escape_the_selected_slot(self) -> None:
         neighbor = self.root / offload.remote_mirror(self.identity, "linux", 1) / "target/retained"
         neighbor.parent.mkdir(parents=True)

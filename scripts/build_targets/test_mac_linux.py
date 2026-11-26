@@ -4007,6 +4007,27 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(old_bootstrap.read_text(), 'Keep the earlier bootstrap.')
         self.assertEqual((main / 'history.txt').read_text(), 'old source\n')
 
+    def test_rows_23_27_guest_checks_incoming_cargo_before_removal_and_reset(self) -> None:
+        self.assertIsInstance(self.route(), GateRun)
+        main = self.guest_home / '.claude'
+        bootstrap = main / mac_linux.BOOTSTRAP_DIR
+        bootstrap.mkdir()
+        old_bootstrap = bootstrap / 'old-data'
+        _ = old_bootstrap.write_text('Keep the earlier bootstrap.')
+        (self.repo / '.cargo').mkdir()
+        _ = (self.repo / '.cargo/config.toml').write_text('[build]\ntarget-dir = "../build"\n')
+        _ = (self.repo / 'history.txt').write_text('The incoming source.\n')
+        _ = self.git('add', '.cargo/config.toml', 'history.txt')
+        _ = self.git('commit', '-qm', 'set incoming Cargo output to the fixed build root')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+        result = self.route()
+
+        self.assertIn('inside a Cargo target directory', self.not_started(result))
+        self.assertEqual(old_bootstrap.read_text(), 'Keep the earlier bootstrap.')
+        self.assertEqual((main / 'history.txt').read_text(), 'old source\n')
+        self.assertFalse((main / '.cargo/config.toml').exists())
+
     def test_run_guest_keeps_output_in_a_folder_without_a_worktree(self) -> None:
         checkout = self.guest_home / 'build/claude/mac-linux'
         output = checkout / 'target/fixture-output'

@@ -23,6 +23,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import termios
 import time
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
@@ -815,6 +816,9 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         else:
             trimmed = trim_build_folder(target, environment)
             cleanup = 'kept' if trimmed == 0 else '1'
+    except ValueError as error:
+        print(f'{target}: cleanup refused: {error}', file=sys.stderr)
+        cleanup = '1'
     except OSError:
         cleanup = '1'
     if step_started:
