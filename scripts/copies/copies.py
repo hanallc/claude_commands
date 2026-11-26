@@ -38,7 +38,7 @@ from uuid import UUID
 
 from scripts.lib import (
     build_copies, build_folder_lock, build_folders, cancellation, conf, copy_record, file_lock, git_index, git_rescue,
-    process_start, scratch, session_folder,
+    process_group, process_start, scratch, session_folder,
 )
 from scripts.lib.copy_record import (
     AllRepositories as AllRepositories,
@@ -3227,7 +3227,7 @@ def run_mirror_receiver(command: list[str], descriptors: tuple[int, ...], enviro
                 if disconnected:
                     # Keep the leader PID until after the signal, so the group ID cannot be reused.
                     with suppress(ProcessLookupError):
-                        os.killpg(group, signal.SIGKILL)
+                        process_group.send_process_group(group, signal.SIGKILL)
                 # Every inherited pipe writer must close before the lease can end.
                 _ = lifetime.read(1)
             return child.wait()
