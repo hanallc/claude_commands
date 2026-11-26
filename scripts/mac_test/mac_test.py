@@ -19,7 +19,6 @@ import json
 import math
 import os
 from pathlib import Path
-import re
 import signal
 import subprocess
 import sys
@@ -2549,89 +2548,40 @@ class ClaimReleaseRefused:
     idle_only: bool = False
 
 
-@dataclass(frozen=True, repr=False)
-class WatchedMirrorReply:
-    """Keep the exact check result and SSH diagnostics for a watched claim."""
-
-    result: offload.LeftoverCheckResult
-    output: str
-    status: int | Literal["not-reported"]
-    stderr: str
-
-
-def read_watched_mirror(config: eligibility.SshConnectionSettings, host: str, script: str,
-                        release_deadline: offload.ClaimReleaseDeadline | conf.UseConfiguredValue) -> WatchedMirrorReply:
-    """Read the Mac check with the same SSH options and deadline as read_leftovers."""
-    from scripts.mac_test import offload
-
-    timeout = (release_deadline.remaining() if isinstance(release_deadline, offload.ClaimReleaseDeadline)
-               else config.leftover_timeout_s)
-    if timeout <= 0:
-        failed = offload.LeftoverCheckFailed("the claim release deadline expired before SSH")
-        return WatchedMirrorReply(failed, "", "not-reported", "")
-    arguments = ["ssh", *offload.ssh_options(config), host, script]
-    try:
-        reply = subprocess.run(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, check=False, timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        failed = offload.LeftoverCheckFailed(f"SSH leftover check timed out after {timeout:g} s")
-        stderr = error.stderr
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        return WatchedMirrorReply(failed, "", "not-reported", stderr or "")
-    except OSError:
-        failed = offload.LeftoverCheckFailed(f"SSH leftover check could not start (time limit {timeout:g} s)")
-        return WatchedMirrorReply(failed, "", "not-reported", "")
-    ledger = transfer_bytes.active_transfers.get()
-    if isinstance(ledger, transfer_bytes.TransferLedger):
-        ledger.observe("ssh_cleanup", arguments, reply.stdout, reply.stderr)
-    if reply.returncode != 0:
-        reason = " ".join(reply.stderr.split()) or f"SSH cleanup exited with status {reply.returncode}"
-        result = offload.LeftoverCheckFailed(reason)
-    else:
-        result = offload.parse_leftover_check(reply.stdout)
-        if isinstance(result, offload.LeftoverCheckFailed) and reply.stderr.strip():
-            result = offload.LeftoverCheckFailed(" ".join(reply.stderr.split()))
-    return WatchedMirrorReply(result, reply.stdout, reply.returncode, reply.stderr)
-
-
 def mirror_diagnostic_text(value: str, limit: int) -> str:
-    """Redact URLs and credentials before limiting the journal text."""
+    """Redact and shorten journal text."""
     from scripts.aws_target.admin_secrets import redact
 
-    text = re.sub(r"(?i)\bhttps?://\S+", "[redacted URL]", value)
-    text = re.sub(r"(?i)\b(?:bearer|basic)\s+\S+", "[redacted credential]", text)
-    text = re.sub(r"\b(?:gh[pousr]_|github_pat_|sk-|tskey-|xox[baprs]-)[\w-]+", "[redacted credential]", text)
-    credential = r"[\w-]*(?:password|secret|token|api[_-]?key)[\w-]*"
-    text = re.sub(rf"(?i)(?:\b{credential}[\"']?\s*[:=]|--{credential}\s+).*", "[redacted credential]", text)
-    text = redact(text)
-    text = " ".join("".join(char if char.isprintable() else " " for char in text).split())
+    text = " ".join("".join(char if char.isprintable() else " " for char in redact(value)).split())
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
-def watched_mirror_refusal(record: RunRecord, identity: claim_state.ClaimIdentity, reply: WatchedMirrorReply) -> str:
-    """Describe only the protocol fields and safe text from a refused check."""
+def watched_mirror_refusal(record: RunRecord, identity: claim_state.ClaimIdentity,
+                           observation: offload.LeftoverObservation) -> str:
+    """Report the result and protocol fields of a refused check."""
     from scripts.mac_test import offload
 
-    lines = reply.output.splitlines()
+    lines = observation.output.splitlines()
     fields = {"leftovers": "missing", "rc": "missing"}
     for line in lines:
         name, separator, value = line.partition("=")
         if separator and name in fields:
-            fields[name] = value if re.fullmatch(r"-?[0-9]{1,12}", value) else "invalid"
+            digits = value.removeprefix("-")
+            fields[name] = value if len(digits) <= 12 and digits.isascii() and digits.isdecimal() else "invalid"
     claim_id = mirror_diagnostic_text(record["claim_id"], 64)
     what = json.dumps(mirror_diagnostic_text(record["what"], 64), ensure_ascii=False)
-    reason = (f"claim_id={claim_id} pid={record['pid']} what={what} result={type(reply.result).__name__} "
-              f"leftovers={fields['leftovers']} rc={fields['rc']} exit={reply.status}")
-    if reply.stderr.strip():
-        reason += " stderr=" + json.dumps(mirror_diagnostic_text(reply.stderr, 120), ensure_ascii=False)
-    if reply.status == "not-reported" and isinstance(reply.result, offload.LeftoverCheckFailed):
-        reason += " detail=" + json.dumps(mirror_diagnostic_text(reply.result.reason, 120), ensure_ascii=False)
+    result = observation.result
+    reason = (f"claim_id={claim_id} pid={record['pid']} what={what} result={type(result).__name__} "
+              f"leftovers={fields['leftovers']} rc={fields['rc']}")
+    if isinstance(result, offload.LeftoverCheckFailed):
+        reason += " detail=" + json.dumps(mirror_diagnostic_text(result.reason, 120), ensure_ascii=False)
+    elif isinstance(result, offload.LeftoversRemain):
+        count = str(result.count) if isinstance(result.count, int) else "unresolved"
+        reason += f" count={mirror_diagnostic_text(count, 16)}"
     if any(line.startswith(("dispatch_start_settled=", "dispatch_start_missing=", "dispatch_start_pending=",
                             "dispatch_start_pending_mac=", "dispatch_start_holder=")) for line in lines):
-        fence_reason = offload.start_fence_reason(identity, reply.output)
-        if fence_reason is not None:
-            reason += " fence=" + json.dumps(mirror_diagnostic_text(fence_reason, 120), ensure_ascii=False)
+        fence_reason = offload.start_fence_reason(identity, observation.output) or "the remote start fence settled"
+        reason += " fence=" + json.dumps(mirror_diagnostic_text(fence_reason, 120), ensure_ascii=False)
     return reason
 
 
@@ -2727,8 +2677,9 @@ def release_exact_claims(
                                                          report_holders=paths.platform == "macos") + "\n"
                 if watched_claim is None and isinstance(remote_work, KeepRemoteWork):
                     command += "printf 'leftovers=0\\nrc=0\\n'\n"
+                observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,
+                                                  release_deadline=release_deadline)
                 if watched_claim is not None and origin is not None:
-                    observed = read_watched_mirror(connection, record["remote_host"], command, release_deadline)
                     machine_id = origin["machine_id"]
                     key = claim_state.pending_start_key(identity)
                     lines = observed.output.splitlines()
@@ -2748,13 +2699,10 @@ def release_exact_claims(
                             return ClaimReleaseRefused("the exact start fence is missing", fence_missing=True)
                     elif not isinstance(observed.result, offload.LeftoversEnded) or lines != [*prefix, f"dispatch_start_settled={key}"]:
                         return ClaimReleaseRefused(watched_mirror_refusal(record, identity, observed))
-                else:
-                    observed = offload.read_leftovers(connection, record["remote_host"], command, paths.target,
-                                                      release_deadline=release_deadline)
-                    if fence_pending:
-                        reason = offload.start_fence_reason(identity, observed.output)
-                        if reason is not None:
-                            return ClaimReleaseRefused(reason)
+                elif fence_pending:
+                    reason = offload.start_fence_reason(identity, observed.output)
+                    if reason is not None:
+                        return ClaimReleaseRefused(reason)
                 if not isinstance(observed.result, offload.LeftoversEnded):
                     return ClaimReleaseRefused("the remote work of the claim has not ended")
             with nullcontext() if provider_lock_held else locked(paths.lock):

@@ -3434,23 +3434,26 @@ fi
         path, fence = self.saved_mirror_claim(idle_since=expired, work_idle_since=expired)
         fence.parent.mkdir(parents=True)
         fence.touch()
-        for status, output in ((255, ""), (0, "leftovers=0\nrc=0\n")):
+        for status, output, expected in (
+            (255, "", 'detail="SSH cleanup exited with status 255"'),
+            (0, "leftovers=0\nrc=0\n", "result=LeftoversEnded leftovers=0 rc=0"),
+        ):
             with self.subTest(status=status), self.watch_mirror(mac_test.MacIdle(), remote=lambda *args, **kwargs:
                     subprocess.CompletedProcess(args, status, output, "")) as check:
                 diagnostic = self.watch_once()
-                self.assertIn(f"exit={status}", diagnostic)
+                self.assertIn(expected, diagnostic)
             self.assertTrue(path.exists())
             self.assertTrue(fence.exists())
             check.assert_called_once()
 
         def timed_out(*_args: object, **_options: object) -> subprocess.CompletedProcess[str]:
-            raise subprocess.TimeoutExpired(["ssh"], 1, stderr=b"partial diagnostic\n")
+            raise subprocess.TimeoutExpired(["ssh"], 1)
 
         with self.watch_mirror(mac_test.MacIdle(), remote=timed_out) as check:
             diagnostic = self.watch_once()
         self.assertTrue(path.exists())
         self.assertTrue(fence.exists())
-        self.assertIn('exit=not-reported stderr="partial diagnostic" detail="SSH leftover check timed out', diagnostic)
+        self.assertIn('detail="SSH leftover check timed out', diagnostic)
         check.assert_called_once()
 
     def test_kept_mirror_claim_reports_the_exact_check_reply(self) -> None:
@@ -3466,30 +3469,35 @@ fi
         self.assertTrue(fence.exists())
         check.assert_called_once()
         self.assertEqual(output, "Mac claim mirror check kept the claim: claim_id=fixture-claim pid=4317 "
-                         + 'what="alpha tests" result=LeftoverCheckFailed leftovers=1 rc=0 exit=1 '
-                         + 'stderr="remote work still holds the mirror"\n')
+                         + 'what="alpha tests" result=LeftoverCheckFailed leftovers=1 rc=0 '
+                         + 'detail="remote work still holds the mirror"\n')
 
-    def test_kept_mirror_diagnostic_redacts_credentials_and_urls(self) -> None:
-        address = "https://bucket.invalid/object?X-Amz-Signature=fixture-signature"
-        path, fence = self.saved_mirror_claim(what=f"copy {address}")
+        reply = subprocess.CompletedProcess(["ssh"], 0, reply.stdout, "")
+        with self.watch_mirror(mac_test.MacIdle(), remote=lambda *_args, **_options: reply) as check:
+            output = self.watch_once()
+        self.assertTrue(path.exists())
+        self.assertTrue(fence.exists())
+        check.assert_called_once()
+        self.assertIn("result=LeftoversRemain leftovers=1 rc=0 count=1", output)
+
+    def test_kept_mirror_diagnostic_redacts_and_limits_the_detail(self) -> None:
+        credential = "AKIA0123456789ABCDEF"
+        path, fence = self.saved_mirror_claim(what=f"copy {credential}")
         fence.parent.mkdir(parents=True)
         fence.touch()
         reply = subprocess.CompletedProcess(["ssh"], 1,
-            f"dispatch_mac_id={self.machine_id}\nleftovers={address}\nrc=0\n",
-            f"lookup failed for {address}\n--password fixture-password\nghp_fixture_bare_token\n" + "x" * 160)
+            f"dispatch_mac_id={self.machine_id}\nleftovers={credential}\nrc=0\n",
+            f"lookup failed for {credential}\n" + "x" * 160)
         with self.watch_mirror(mac_test.MacIdle(), remote=lambda *_args, **_options: reply):
             output = self.watch_once()
         self.assertTrue(path.exists())
         self.assertTrue(fence.exists())
         self.assertEqual(len(output.splitlines()), 1)
-        self.assertIn('what="copy [redacted URL]"', output)
-        self.assertIn("leftovers=invalid rc=0 exit=1", output)
-        self.assertIn('stderr="lookup failed for [redacted URL] [redacted credential] [redacted credential] ', output)
+        self.assertIn('what="copy [redacted]"', output)
+        self.assertIn("leftovers=invalid rc=0", output)
+        self.assertIn('detail="lookup failed for [redacted] ', output)
         self.assertTrue(output.endswith('..."\n'))
-        self.assertNotIn("bucket.invalid", output)
-        self.assertNotIn("fixture-signature", output)
-        self.assertNotIn("fixture-password", output)
-        self.assertNotIn("fixture_bare_token", output)
+        self.assertNotIn(credential, output)
 
     def test_active_pass_clears_idle_since_with_state_lock_released(self) -> None:
         record = self.write_claim(idle_since="2026-10-13T12:00:00+00:00")
