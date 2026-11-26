@@ -40,7 +40,7 @@ STARTED_NS = time.time_ns()
 from scripts.disks import disks_page, sessions
 from scripts.aws_target import aws_page, machines_page
 from scripts.build_queue import admission_client, admission_protocol as admission, kill_action, memory_feed, memory_files
-from scripts.lib import atomic_file, conf, scratch
+from scripts.lib import atomic_file, conf, scratch, session_folder
 from scripts.lib.file_lock import exclusive
 from scripts.lib.process_group import run_process_group
 from scripts.production import change_routing, change_review, staff, the_list, tidy_wrapped
@@ -2634,13 +2634,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             self.browser_failure(503, "The measure could not start.", error)
             return
+        found: list[session_folder.SessionFolder] = []
+        folders: sessions.SessionReport | None = None
         try:
-            folders = sessions.session_report()
+            root = session_folder.session_root()
+            if root is not None:
+                found = session_folder.session_folders(root)
+                folders = sessions.session_report(root, found)
         except (OSError, ValueError) as error:
             print(f"review-links disks sessions: {error}", file=sys.stderr)
-            folders = None
         try:
-            names = disks_page.session_name_registry()
+            names = disks_page.session_name_registry(found)
         except (OSError, ValueError) as error:
             print(f"review-links disks staff names: {error}", file=sys.stderr)
             names = None

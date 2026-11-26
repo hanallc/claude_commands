@@ -87,19 +87,20 @@ def shared_step_tip(source: str) -> StepTip:
     return StepTip(parts[0], parts[1])
 
 
-def session_name_registry() -> dict[str, str]:
+def current_session_folders() -> list[session_folder.SessionFolder]:
+    """The session folders on this machine, or none when the session root cannot be read."""
+    try:
+        root = session_folder.session_root()
+        return session_folder.session_folders(root) if root is not None else []
+    except (OSError, conf.Unusable):
+        return []
+
+
+def session_name_registry(folders: Sequence[session_folder.SessionFolder]) -> dict[str, str]:
     """Read current staff names and color session folders by their recorded owner."""
     names = staff_names.read()
     registry = names.registry()
-    try:
-        root = session_folder.session_root()
-        folders = sorted(root.iterdir()) if root is not None else []
-    except (OSError, conf.Unusable):
-        return registry
-    for folder in folders:
-        if folder.name.startswith('.') or folder.is_symlink() or not folder.is_dir():
-            continue
-        record = session_folder.read_record(folder)
+    for folder, record in folders:
         if record is not None:
             owner = names.members.by_member_reference(record['owner'])
             if owner is not None:
@@ -122,7 +123,7 @@ def publish(folder: Path, settings: PageSettings) -> Path:
     page = (page_frame.template(source, "Disks", "disks")
             .replace("__STEP_TIP_STYLE__", tip.style).replace("__STEP_TIP_SCRIPT__", tip.script)
             .replace("__DISKS_SETTINGS__", json.dumps(settings).replace("</", "<\\/")))
-    page = page.replace('</head>', staff_names.script(session_name_registry()) + '</head>', 1)
+    page = page.replace('</head>', staff_names.script(session_name_registry(current_session_folders())) + '</head>', 1)
     folder.mkdir(parents=True, exist_ok=True)
     page_path = folder / PAGE_NAME
     try:

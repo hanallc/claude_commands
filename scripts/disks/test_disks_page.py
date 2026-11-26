@@ -133,7 +133,7 @@ class DisksPageTests(unittest.TestCase):
                                 current_session=staff.StaffId("worker-session"))
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((member,))):
             answer = {"state": "current", "sessions": {"root": str(root), "sessions": [session(name, GIB, "running")]},
-                      "staff_names": disks_page.session_name_registry()}
+                      "staff_names": disks_page.session_name_registry(disks_page.current_session_folders())}
         rendered = cast(list[str], self.run_drive(page_frame.ACTION_STATUS_SCRIPT
             + "globalThis.window = globalThis;" + registry[1] + """
             const card = new Element();

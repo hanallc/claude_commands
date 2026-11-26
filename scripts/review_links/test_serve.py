@@ -6540,6 +6540,7 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(disks_page, "output_folder", return_value=self.root / "disks"))
         start = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(disks_page.MeasureStart.STARTED, 7)))
         folders: sessions.SessionReport = {"root": "/session", "sessions": []}
+        _ = self.enterContext(patch.object(session_folder, "session_root", return_value=self.root))
         _ = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
         _ = self.enterContext(patch.object(disks_page, "session_name_registry", return_value={}))
         answer: dict[str, object] = {"state": "started", "target": 7, "sessions": folders, "staff_names": {}}
@@ -6562,7 +6563,17 @@ class ReviewLinksServerTests(unittest.TestCase):
               patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(
                   disks_page.MeasureStart.STARTED, 7)),
               patch.object(disks_page, "session_name_registry", return_value={}),
+              patch.object(session_folder, "session_root", return_value=self.root),
               patch.object(sessions, "session_report", side_effect=OSError("The sessions are unavailable."))):
+            status, response = self.post("/disks/measure", "")
+        self.assertEqual((status, json.loads(response)),
+                         (200, {"state": "started", "target": 7, "sessions": None, "staff_names": {}}))
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(disks_page, "output_folder", return_value=self.root / "disks"),
+              patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(
+                  disks_page.MeasureStart.STARTED, 7)),
+              patch.object(disks_page, "session_name_registry", return_value={}),
+              patch.object(session_folder, "session_root", return_value=None)):
             status, response = self.post("/disks/measure", "")
         self.assertEqual((status, json.loads(response)),
                          (200, {"state": "started", "target": 7, "sessions": None, "staff_names": {}}))
@@ -6578,7 +6589,8 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = self.enterContext(patch.object(disks_page, "start_measure", return_value=disks_page.MeasureRequest(
             disks_page.MeasureStart.CURRENT, 7)))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {session_folder.ROOT_ENV: str(root)})))
-        _ = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
+        report = self.enterContext(patch.object(sessions, "session_report", return_value=folders))
+        scan = self.enterContext(patch.object(session_folder, "session_folders", wraps=session_folder.session_folders))
         snapshot = self.enterContext(patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())))
         status, body = self.post("/disks/measure", "")
         self.assertEqual((status, json.loads(body)),
@@ -6593,9 +6605,12 @@ class ReviewLinksServerTests(unittest.TestCase):
         snapshot.return_value = staff.StaffSnapshot((member,))
         folders["sessions"].append({"name": name, "size": None, "state": "running", "held": []})
 
+        scan.reset_mock()
         status, body = self.post("/disks/measure", "")
         answer = cast(dict[str, object], json.loads(body))
         self.assertEqual((status, answer["sessions"]), (200, folders))
+        self.assertEqual(scan.call_count, 1)
+        report.assert_called_with(root, [(path, {"owner": member.id, "session_id": member.current_session})])
         names = cast(dict[str, str], answer["staff_names"])
         span = ElementTree.fromstring(names[name])
         self.assertEqual((span.tag, span.text, span.get("data-color-text"), span.get("style")),
