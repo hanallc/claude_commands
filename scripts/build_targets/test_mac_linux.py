@@ -35,7 +35,7 @@ from scripts.build_queue.admission_jobs import GATE_JOB_NOT_RECORDED, GateJobNot
 from scripts.build_queue.snapshot_codec import UNKNOWN_CALLER
 from scripts.build_targets import build_targets, mac_linux, target_config
 from scripts.build_targets.mac_linux import send_guest_execution
-from scripts.buildlog import store, treekey
+from scripts.buildlog import machine_facts, store, treekey
 from scripts.copies import copies
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start, scratch
 from scripts.lib.build_copies import CopyQueuePosition
@@ -965,9 +965,12 @@ class MacLinuxRouteTests(unittest.TestCase):
             'aliases=natedev mac\nnatedev.platform=linux\nnatedev.hosts=natedev\n'
             + 'mac.platform=darwin\nmac.hosts=fixture-mac\n', encoding='utf-8')
         _ = write_config_fixture(config / 'build_folders.conf')
+        _ = write_config_fixture(config / 'test_times.conf')
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             'GATE_STATE_DIR': str(self.root / 'gate-state'),
             'GATE_PASSED_DIR': str(self.root / 'gate-passes'),
+            'BUILDLOG_DIR': str(self.root / 'buildlog'),
+            'MACHINE_FACTS_FILE': str(self.root / 'machine-facts.json'),
             'BUILD_TARGETS_STATE_DIR': str(self.root / 'target-state'),
             'MAC_TEST_STATE_DIR': str(self.root / 'mac-state'),
             'CONF_DIR': str(config), 'PATH': str(binaries) + os.pathsep + os.environ['PATH'],
@@ -3798,6 +3801,56 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(result.module_skips, {'scripts/fixture/test_first.py': 0, 'scripts/fixture/test_second.py': 1})
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
+    def recorded_guest_gate(self) -> dict[str, object]:
+        paths = sorted((store.root() / mac_linux.TARGET).glob('*.jsonl'))
+        self.assertEqual(len(paths), 1, 'The guest gate did not save a buildlog file.')
+        line, = paths[0].read_text(encoding='utf-8').splitlines()
+        return cast(dict[str, object], json.loads(line))
+
+    def write_mac_load(self, load: float, cpus: int, written: float) -> None:
+        facts: machine_facts.SavedFacts = {'version': machine_facts.VERSION, 'written': written,
+                                         'machines': {'mac': machine_facts.facts('read', load=load, cpus=cpus)}}
+        _ = machine_facts.state_path().write_text(json.dumps(facts), encoding='utf-8')
+
+    def test_green_guest_saves_each_module_time(self) -> None:
+        result = self.route()
+        assert isinstance(result, GateRun) and result.passed, result
+        row = self.recorded_guest_gate()
+        self.assertEqual((row['kind'], row['host'], row['status']), ('gate_run', mac_linux.TARGET, 0))
+        self.assertEqual(row['max_jobs'], 2)
+        self.assertNotIn('vcpus', row)
+        modules = cast(list[dict[str, object]], row['modules'])
+        self.assertEqual([(module['suite'], module['module'], module['wall_s'], module['cpu_s']) for module in modules],
+                         [('fixture', 'test_first.py', 1.3, 1.0), ('fixture', 'test_second.py', 1.3, 1.0)])
+
+    def test_guest_saves_distinct_start_and_end_mac_load(self) -> None:
+        start = time.time() - 2
+        end = start + 1
+        self.write_mac_load(4.75, 12, start)
+
+        def update_facts(*_args: object, **_options: object) -> None:
+            self.write_mac_load(8.25, 12, end)
+
+        with patch.object(mac_linux, 'start_guest_report', side_effect=update_facts) as report:
+            result = self.route()
+        assert isinstance(result, GateRun) and result.passed, result
+        report.assert_called_once()
+        row = self.recorded_guest_gate()
+        self.assertEqual(row['mac_load_start'], {'state': 'read', 'load': 4.75, 'cpus': 12, 'written': start})
+        self.assertEqual(row['mac_load_end'], {'state': 'read', 'load': 8.25, 'cpus': 12, 'written': end})
+
+    def test_guest_saves_absent_mac_load_with_its_reason(self) -> None:
+        def expire_facts(*_args: object, **_options: object) -> None:
+            self.write_mac_load(4.75, 12, time.time() - machine_facts.STALE_SECONDS - 1)
+
+        with patch.object(mac_linux, 'start_guest_report', side_effect=expire_facts) as report:
+            result = self.route()
+        assert isinstance(result, GateRun) and result.passed, result
+        report.assert_called_once()
+        row = self.recorded_guest_gate()
+        self.assertEqual(row['mac_load_start'], {'state': 'absent', 'reason': 'The machine facts file is missing or invalid.'})
+        self.assertEqual(row['mac_load_end'], {'state': 'absent', 'reason': 'The machine facts reading is stale.'})
+
     def test_child_text_on_standard_output_leaves_the_reply_clean(self) -> None:
         result = self.route('child-stdout')
         assert isinstance(result, mac_linux.MacLinuxGateRun), result
@@ -3821,6 +3874,10 @@ with (patch.object(conf, 'read', read_config),
         assert isinstance(result, GateRun), result
         self.assertFalse(result.passed)
         self.assertEqual([job.returncode for job in result.jobs], [1, 1])
+        row = self.recorded_guest_gate()
+        self.assertEqual((row['kind'], row['host'], row['status']), ('gate_run', mac_linux.TARGET, 1))
+        modules = cast(list[dict[str, object]], row['modules'])
+        self.assertEqual([(module['wall_s'], module['status']) for module in modules], [(1.3, 1), (1.3, 1)])
         self.assert_guest_clean('probe', 'arm', 'run', 'cleanup')
 
     def test_guest_runner_failure_returns_reason_and_cleans(self) -> None:

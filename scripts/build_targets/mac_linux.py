@@ -42,12 +42,14 @@ from scripts.aws_target import gate_box, ledger
 from scripts.build_queue import execution_identity
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
+from scripts.buildlog import machine_facts, store
 from scripts.lib import atomic_file, build_folders, conf, process_group, process_start
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import (
     AllModules, GateJobKind, GateResultUnknown, GateRun, GuestGateBlocked, ModuleCoverage, SuiteMode, TreeSelection,
 )
+from scripts.test_times import gate_record
 from scripts.test_times.gate_record import TYPE_CHECK_JOB
 
 if TYPE_CHECKING:
@@ -257,7 +259,6 @@ def consume_launch_permission(launch: GuestLaunchRecovery,
     If the reply is lost, the gate stops before it sends the arm command.
     """
     from scripts.build_queue import admission_client, admission_protocol as wire, placement
-    from scripts.buildlog import store
 
     gate_holder, = launch.holders
     destination = assignment.destination
@@ -277,6 +278,35 @@ def consume_launch_permission(launch: GuestLaunchRecovery,
     return permission.claim
 
 
+class MacLoadReading(TypedDict):
+    state: Literal['read']
+    load: float
+    cpus: int
+    written: float
+
+
+class MacLoadAbsent(TypedDict):
+    state: Literal['absent']
+    reason: str
+
+
+@dataclass(frozen=True)
+class GuestGateSample:
+    at: float
+    mac_load: MacLoadReading | MacLoadAbsent
+
+
+@dataclass(frozen=True)
+class GuestGateSamples:
+    start: GuestGateSample
+    end: GuestGateSample
+
+
+@dataclass(frozen=True)
+class GuestGateSamplesUnavailable:
+    """The controller did not observe both ends of the guest stream."""
+
+
 @dataclass
 class GuestGateDispatch:
     """The guest gate holds the queue's launch permission for this claim."""
@@ -288,6 +318,7 @@ class GuestGateDispatch:
     arm_requested: bool = False
     start_folder_payload: bytes = b''
     folder_start_reports: ExitStack = field(default_factory=ExitStack, repr=False, compare=False)
+    samples: GuestGateSamples | GuestGateSamplesUnavailable = GuestGateSamplesUnavailable()
 
 
 class GuestRunRequest(TypedDict):
@@ -1872,6 +1903,28 @@ def ssh_connect_timeout(remaining: float) -> int:
     return max(1, min(SSH_CONNECT_TIMEOUT_SECONDS, int(remaining)))
 
 
+def read_mac_gate_load(at: float) -> MacLoadReading | MacLoadAbsent:
+    """Use the saved Mac reading and its existing freshness limit."""
+    try:
+        saved = machine_facts.read_facts(machine_facts.state_path())
+    except (OverflowError, RuntimeError):
+        saved = machine_facts.FactsUnread.VALUE
+    if isinstance(saved, machine_facts.FactsUnread):
+        return {'state': 'absent', 'reason': 'The machine facts file is missing or invalid.'}
+    written = saved['written']
+    if at - written > machine_facts.STALE_SECONDS:
+        return {'state': 'absent', 'reason': 'The machine facts reading is stale.'}
+    mac = saved['machines'].get('mac')
+    if mac is None or mac['state'] != 'read' or mac['load'] is None or mac['cpus'] is None:
+        return {'state': 'absent', 'reason': 'The Mac load or CPU count is unavailable.'}
+    return {'state': 'read', 'load': mac['load'], 'cpus': mac['cpus'], 'written': written}
+
+
+def sample_guest_gate() -> GuestGateSample:
+    at = time()
+    return GuestGateSample(at, read_mac_gate_load(at))
+
+
 def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, timeout: int,
                              armed: ArmedGuestAttempt, dispatch: GuestGateDispatch,
                              reports: ExitStack, *, connect_deadline: float = math.inf) -> tuple[bytes, bytes]:
@@ -1894,10 +1947,10 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
     reply_line = bytearray()
     progress = cloud_gate.ModuleProgress()
     last_counter: progress_profile.ProgressCounter | progress_profile.NoCounter = progress_profile.NoCounter()
-    started = False
+    start_sample: GuestGateSample | None = None
 
-    def observe_guest(line: bytes) -> None:
-        nonlocal connected, deadline, payload, started
+    def observe_guest(line: bytes) -> GuestGateSample | None:
+        nonlocal connected, deadline, payload
         line = line.rstrip(b'\r')
         if not connected and budget_sent and line == accepted_line:
             now = monotonic()
@@ -1907,12 +1960,13 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
                 payload = b'\n' + bootstrap
                 if not stream_input.closed:
                     _ = ready.register(input_fd, EVENT_WRITE)
-        if not connected or started or (line != start_line and not line.startswith(start_line + b' ')):
-            return
-        started = True
+        if not connected or (line != start_line and not line.startswith(start_line + b' ')):
+            return None
         dispatch.started = armed
         dispatch.start_folder_payload = line[len(start_line) + 1:]
+        sample = sample_guest_gate()
         start_guest_report(armed, dispatch, deadline, reports, folder_payload=dispatch.start_folder_payload)
+        return sample
 
     def read_reply(data: bytes) -> None:
         nonlocal last_counter
@@ -1978,15 +2032,15 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
                     data = os.read(key.fd, 65536)
                     if not data:
                         _ = ready.unregister(key.fd)
-                        if key.fd == error_fd and parsed < len(stderr):
-                            observe_guest(bytes(stderr[parsed:]))
+                        if key.fd == error_fd and start_sample is None and parsed < len(stderr):
+                            start_sample = observe_guest(bytes(stderr[parsed:]))
                     elif key.fd == output_fd:
                         read_reply(data)
                     else:
                         offset = len(stderr)
                         stderr.extend(data)
-                        while not (connected and started) and (line_end := stderr.find(b'\n', offset)) >= 0:
-                            observe_guest(bytes(stderr[parsed:line_end]))
+                        while start_sample is None and (line_end := stderr.find(b'\n', offset)) >= 0:
+                            start_sample = observe_guest(bytes(stderr[parsed:line_end]))
                             parsed = offset = line_end + 1
         _ = stream.wait(timeout=max(0, deadline - monotonic()))
     except subprocess.TimeoutExpired as error:
@@ -1996,6 +2050,8 @@ def communicate_guest_bundle(stream: subprocess.Popen[bytes], bootstrap: bytes, 
             detail = stream_diagnostic(bytes(stderr))
             raise GuestTookNoRun(f'The guest SSH connect deadline expired before command acceptance: {detail}') from error
         raise
+    if start_sample is not None:
+        dispatch.samples = GuestGateSamples(start_sample, sample_guest_gate())
     return bytes(stdout + reply_line), bytes(stderr)
 
 
@@ -2378,6 +2434,26 @@ def reply_run(reply: GuestReply, request: GuestRequest, source: CandidateSource)
                            bundle_reason=reply.bundle_reason, module_skips=skips)
 
 
+def record_guest_gate(repo: Path, source: CandidateSource, request: GuestRequest, run: MacLinuxGateRun,
+                      samples: GuestGateSamples) -> None:
+    """Write the guest verdict and module times to the controller's Buildlog."""
+    try:
+        at = samples.start.at
+        row = gate_box.completion_record(run, request['attempt'], source.commit, source.tree, TARGET, at,
+                                         samples.end.at, request['mode'], split=source.coverage is ModuleCoverage.SUBSET)
+        # The guest uses a fixed time limit. Keep its rows out of the shared time limit history.
+        _ = row.pop('vcpus')
+        row.update(checkout=str(repo), source=TARGET, dirty=source.commit != source.head,
+                   reason='time limit' if run.time_limit_report else 'Mac Linux guest gate',
+                   max_jobs=request['jobs'], mac_load_start=samples.start.mac_load,
+                   mac_load_end=samples.end.mac_load)
+        gate_record.keep_failure_logs(ledger.text(row, 'id'), TARGET, at,
+                                      cast(list[gate_record.ModuleRun], row['modules']), gate_box.execution_records(run))
+        store.append_line(store.host_file(TARGET, at), row)
+    except Exception as error:
+        gate_record.report_not_written(error)
+
+
 def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float | None,
           selected: AllModules | TreeSelection, gate_job: StepJob | GateJobNotRecorded,
           assignment: PlacementAssignment, type_dirs: Sequence[str] = ()) -> GateRun | GuestNotStarted | GuestGateBlocked | str:
@@ -2494,6 +2570,8 @@ def route(repo: Path, *, mode: SuiteMode, full: bool, module_time_limit_s: float
         completion = placement.AttemptCompleted((status or 1) if checkout_changed else status)
         if checkout_changed:
             return GuestGateBlocked('the checkout changed during the guest run')
+        if isinstance(dispatch.samples, GuestGateSamples):
+            record_guest_gate(repo, source, request, run, dispatch.samples)
         return run
     except mac_run.MacRunRefused as error:
         return refused(str(error))
