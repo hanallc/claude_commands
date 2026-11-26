@@ -9126,12 +9126,12 @@ class ReviewLinksServerTests(unittest.TestCase):
                     save.assert_called_once_with("role.worker", "#af875f")
                 with self.subTest(move=result), patch.object(accounts_page, "save_next_move_settings", return_value=result) as move:
                     status, content = self.post(accounts_page.PAGE_PATH, "group=units&to=claude2&percent=20&measure=fable")
-                    self.assertEqual((status, json.loads(content)), (expected, body if expected == 200 else {}))
+                    self.assertEqual((status, json.loads(content)), (expected, body))
                     move.assert_called_once_with("units", "claude2", "20", "fable")
                 with (self.subTest(clear=result), patch.object(accounts_page, "clear_next_move", return_value=result) as clear,
                       redirect_stderr(StringIO()) as errors):
                     status, content = self.post(accounts_page.PAGE_PATH, "group=showrunners&clear=first")
-                    self.assertEqual((status, json.loads(content)), (expected, body if expected == 200 else {}))
+                    self.assertEqual((status, json.loads(content)), (expected, body))
                     clear.assert_called_once_with("showrunners")
                     if isinstance(result, (accounts_page.Refused, accounts_page.SaveFailed)):
                         self.assertEqual(errors.getvalue().count(f"review-links accounts POST: {result.reason}\n"), 1)

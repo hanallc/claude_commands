@@ -132,32 +132,42 @@ class UsageRate:
 
 @dataclass(frozen=True)
 class NoUsageRate:
-    """The readings do not show a rise from the start of the window."""
+    """The readings do not support a positive usage rate."""
 
 
 def hourly_usage_rate(readings: list[Reading], now: datetime, *,
                       account_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT
                       ) -> UsageRate | NoUsageRate:
-    """Measure the observed rise from the cutoff to the last recent reading."""
+    """Divide the usage rise by the observed hours in the lookback window."""
     if isinstance(account_config, UseConfiguredValue):
         account_config = conf.read("accounts")
     lookback = timedelta(minutes=account_config.whole("rate.lookback_minutes"))
     cutoff = now - lookback
-    earliest = cutoff - MAX_GAP
-    by_time = {reading.at: reading for reading in readings if earliest <= reading.at <= now}
-    recent = sorted(by_time.values())
-    if not recent or recent[0].at > cutoff or now - recent[-1].at > MAX_GAP:
+    start_reading: Reading | None = None
+    by_time: dict[datetime, Reading] = {}
+    for reading in readings:
+        if reading.at <= cutoff:
+            if start_reading is None or reading.at >= start_reading.at:
+                start_reading = reading
+        elif reading.at <= now:
+            by_time[reading.at] = reading
+    if start_reading is None:
+        return NoUsageRate()
+
+    recent = [start_reading, *sorted(by_time.values())]
+    if now - recent[-1].at > MAX_GAP:
         return NoUsageRate()
 
     points = 0.0
+    seconds = 0.0
     for before, after in zip(recent, recent[1:]):
-        if after.at <= cutoff:
-            continue
         span = after.at - before.at
-        if span > MAX_GAP or before.used_percent >= 100 or after.used_percent < before.used_percent:
-            return NoUsageRate()
+        if (span > MAX_GAP or before.used_percent >= 100
+                or after.used_percent < before.used_percent or before.used_percent == after.used_percent == 0):
+            continue
         observed = after.at - max(before.at, cutoff)
         points += (after.used_percent - before.used_percent) * (observed / span)
+        seconds += observed.total_seconds()
     if not math.isfinite(points) or points <= 0:
         return NoUsageRate()
-    return UsageRate(points * 3600 / (recent[-1].at - cutoff).total_seconds())
+    return UsageRate(points * 3600 / seconds)

@@ -2006,9 +2006,9 @@ moveDialog.addEventListener('keydown',event=>{
   event.preventDefault();stops[event.shiftKey ? stops.length-1 : 0].focus();
  }
 });
-function showMoveFailure(now,busy,focus){
+function showMoveFailure(now,busy,focus,reason){
  moveError.textContent=busy ? 'Another move is in progress. Try again when it ends.'
-  : now ? 'The move did not start. Try again.' : 'The settings were not saved. Try again.';
+  : now ? 'The move did not start. Try again.' : reason || 'The settings were not saved. Try again.';
  moveError.hidden=false;positionMoveDialog();focus.focus({preventScroll:true});
 }
 async function submitMoveDialog(now){
@@ -2027,19 +2027,21 @@ async function submitMoveDialog(now){
  for(const control of controls) control.disabled=true;
  let accepted=false;
  let busy=false;
+ let reason='';
  try{
   const response=await fetch(location.pathname,{method:'POST',signal:pageRequestSignal(),
    headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(fields)});
   const result=await response.json();
   busy=now && response.status===409 && result?.state==='move-in-progress';
   accepted=response.ok && result?.state==='saved';
+  if(!now && !response.ok && typeof result?.reason==='string') reason=result.reason;
  }catch{
   // Use the action's message for a failed request.
  }finally{
   for(const control of controls) control.disabled=false;
   moveSaving=false;moveForm.removeAttribute('aria-busy');
   if(accepted){closeMoveDialog();void updates.refresh(true);}
-  else showMoveFailure(now,busy,focused);
+  else showMoveFailure(now,busy,focused,reason);
  }
 }
 moveNow.addEventListener('click',()=>void submitMoveDialog(true));

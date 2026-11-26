@@ -745,10 +745,12 @@ The forecast excludes history before the current weekly window.
 The page, expiry push, and half-point hold use the same hourly rate function.
 The key `rate.lookback_minutes` in `config/accounts.conf` sets the lookback to 60 minutes by default.
 The window ends at the current time.
-The rate measures the rise and elapsed time from the window start to the latest reading.
-The latest reading must be at most 15 minutes old.
-The observed span must reach the window start without a refill, a gap over 15 minutes, or an interval that starts at 100%.
-It shows the hourly rate for Claude and Codex when recent history gives a rate.
+The rate needs a reading at or before the window start and a newest reading at most 15 minutes old.
+The reading at or before the window start can be any age.
+The rate divides the total usage rise by the observed hours in the window.
+It skips refills and gaps over 15 minutes, including gaps that cross the window start.
+It also skips spans that start at 100% used or have two readings at 0% used.
+The page shows the rate for Claude and Codex when the counted spans show a rise and the weekly reading is recent.
 If the rate is missing, both forecast cells show a dash with an explanation.
 If the quota lasts until the reset, the run-out cell shows a dash with that explanation.
 The page shows forecast times in the user's time zone.
