@@ -1506,7 +1506,7 @@ def action_state(owner: staff.StaffId, item: the_list.ListItem, *,
         saved["next_step_html"] = progress.next_step_html()
         saved["next_step_sort"] = progress.next_step.casefold()
     if read_closed_detail and saved.get("detail_closed"):
-        saved["detail_html"] = detail_panel(ListRecord(owner, item), '', local_today, names, unread_answers, progress)
+        saved["detail_html"] = detail_panel(ListRecord(owner, item), '', local_today, names, frozenset(), progress)
     if has_detail:
         reviews: ReviewRecords = {}
         if item.reviews:
