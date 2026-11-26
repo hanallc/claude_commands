@@ -16,7 +16,7 @@ from scripts.build_queue.queue_fixture import fixture_reservation
 TRACE_NOW = 10 * 86_400
 TRACE_POLICY = memory_trace.MemoryTracePolicy(2, 64, 8_192, 2, 8, 65_536,
                                             final_replay_bytes=100000,
-                                            max_pending_commands=8,
+                                            max_pending_commands=8, general_trace_share_percent=50,
                                             scope_loss_grace_seconds=4, seal_retry_count=2)
 TRACE_SHAPE = "a" * 64
 
@@ -109,6 +109,18 @@ class ProgramMemoryFeedTests(unittest.TestCase):
             assert after is not None
             self.assertIsNone(after["past"])
             self.assertEqual(read.call_count, 3)
+
+    def test_program_memory_ignores_general_traces(self) -> None:
+        store = self.trace_store()
+        rows = self.trace_rows("lint", "nextest")
+        reservation, entry = self.reservations["lint"][0]
+        self.reservations["lint"] = [({**reservation, "step": "lint"}, entry)]
+        for identifier in ("lint", "nextest"):
+            shape = memory_trace.GeneralTraceShape("fixture", "git-root:hana", identifier, ("cargo", identifier))
+            writer = store.start(memory_trace.TraceHeader(identifier, memory_trace.shape_key(shape),
+                (TRACE_NOW - 6) * 1000, store.policy.sample_interval_ms, 10, shape))
+            _ = writer.append(self.compile_trace_sample(0, 3))
+        self.assertEqual(self.views(program_memory_feed.ProgramMemoryFeed(store), rows), {})
 
     def test_program_memory_skips_aggregate_rows(self) -> None:
         store = self.trace_store()

@@ -79,16 +79,34 @@ The refresh also writes each machine's change list to `<rebuild.cache>-changes.j
 It reads the active system and `rebuild.generations` on each machine.
 It connects to the Mac over `rebuild.ssh`.
 The refresh uses the same completion rule as the clear command.
-The refresh lists commits after the verified revision.
+The refresh lists commit subjects after the verified running revision.
+If Git cannot list the range, the refresh lists paths changed in the configured commit.
+The refresh also lists those paths when it cannot verify the running revision.
+The Rebuilds page shows up to five commit subjects or paths and gives the number of additional entries.
+Each display checks the running path and the configured commit before it uses the cached list.
+When the list is unavailable, the display shows `Changes not read yet` and the configured commit subject if available.
 Each commit's `Claude-Session` id maps to a local session through the transcript that records it.
 The refresh finds that transcript with one `rg` scan of the Claude projects folders and keeps the answer in `<rebuild.cache>-sessions.json`.
 A new session id costs one scan; a known id costs none.
-A machine that does not answer keeps its last list.
+A failed probe keeps the last list and its system identities.
 The status line names each waiting rebuild once in the `For you:` row.
-It shows `rebuild natedev`, `rebuild mac`, or both.
+The status line shows the first cached commit subject for a rebuild found by the system check.
+It cuts the subject to fit and adds `+N` when more commits wait.
+For a filed need, it shows the latest open reason.
+Linux reads the cached details during the render.
+The Mac reads the same short reasons from `rebuild_reasons` in the console count response.
+The console reads the cached details for that request.
+These reads run no Git commands.
+The rebuild reasons remain available when a damaged action record prevents a count.
+The status line shows `reason not read` if the response has a machine with no reason.
 Open needs appear even when evaluation has no result or the cache does not exist.
 Completed needs leave the row unless the cached system comparison still requires a rebuild.
 The For you card lists the open reasons and uses the oldest open request for its age.
+Review and Rebuilds keep the history for an old request with a blank reason.
+They also show the cached comparison for that request when the system check found a rebuild.
+For a rebuild found by the system check, the card shows the same cached reason as the Rebuilds page.
+It shows up to five commit subjects or paths and gives the number of additional entries.
+The card shows `Found by the system check` under `Asked by`.
 The Rebuild details page shows completed requests once per machine and commit, newest completion first.
 The page names each damaged archive and shows the valid records.
 A failed need read leaves the cached system comparison visible.

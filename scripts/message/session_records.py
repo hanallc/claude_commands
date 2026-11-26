@@ -9,7 +9,7 @@ import tomllib
 from collections.abc import Callable, Generator, Iterable, Iterator, Set
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
@@ -265,10 +265,17 @@ def sessions_dir() -> Path:
 
 
 @dataclass(frozen=True)
+class UnverifiedSessionStart:
+    """The session has no verified process start."""
+
+
+@dataclass(frozen=True)
 class LiveSessionProcess:
     """The registry or saved process identity positively identifies a live session."""
 
     pid: int
+    # Keep equality by PID for callers that only use the live PID.
+    started: str | UnverifiedSessionStart = field(default=UnverifiedSessionStart(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -309,12 +316,12 @@ def process_liveness(pid: int, recorded_start: str) -> LiveSessionProcess | Sess
         return SessionNotLive()
     except PermissionError:
         if current == recorded_start:
-            return LiveSessionProcess(pid)
+            return LiveSessionProcess(pid, recorded_start)
     except (OSError, OverflowError) as error:
         return SessionLivenessUnknown(f"process identity unreadable: {error}")
     if current is None:
         return SessionLivenessUnknown(f"process identity unreadable for pid {pid}")
-    return LiveSessionProcess(pid)
+    return LiveSessionProcess(pid, recorded_start)
 
 
 @dataclass(frozen=True)
@@ -330,7 +337,7 @@ def _session_observations(session_id: str, registry: RegistryRead) -> Iterator[L
         if registered["sessionId"] != session_id:
             continue
         if running_session(registered):
-            yield LiveSessionProcess(registered["pid"])
+            yield LiveSessionProcess(registered["pid"], registered.get("procStart") or UnverifiedSessionStart())
         else:
             observed = process_liveness(registered["pid"], registered.get("procStart", ""))
             if not isinstance(observed, SessionNotLive):

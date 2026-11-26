@@ -25,8 +25,8 @@ class VerifyResultEnvironmentTests(VerifyMacOffloadFixture):
         super().setUp()
         fixed = " ".join(f"{name}={value}" for name, value in FIXED_ENVIRONMENT.items())
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "direct.conf",
-                                 f"VERIFY_TEST_FIXED_ENV={fixed}\nVERIFY_RESULT_ENV_NAMES=NO_COLOR CLICOLOR RUST_LOG\n"
-                                 + "VERIFY_RESULT_ENV_PREFIXES=\n")
+                                 f"verify_test_fixed_env={fixed}\nverify_result_env_names=NO_COLOR CLICOLOR RUST_LOG\n"
+                                 + "verify_result_env_prefixes=\n")
         for name in ("NO_COLOR", "CLICOLOR"):
             _ = self.environment.pop(name, None)
         cargo = CARGO_STUB.replace(
@@ -77,7 +77,7 @@ Path(os.environ["TEST_RUNNER_STATE"], "remote-command").write_text(command)
 
     def test_empty_environment_policy_reaches_cargo_and_passes(self) -> None:
         _ = write_config_fixture(Path(self.environment["CONF_DIR"]) / "direct.conf",
-            "VERIFY_RESULT_ENV_NAMES=\nVERIFY_RESULT_ENV_PREFIXES=\nVERIFY_TEST_FIXED_ENV=\n")
+            "verify_result_env_names=\nverify_result_env_prefixes=\nverify_test_fixed_env=\n")
         result = self.verify("test", "sample", "--local", "Linux test")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.local_runs()), 1)

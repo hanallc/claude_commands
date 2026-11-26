@@ -242,6 +242,48 @@ class UniqueBuildFolder:
 
 
 @dataclass(frozen=True)
+class _NoGateBootIdentity:
+    """The gate has no boot identity to publish."""
+
+
+@dataclass(frozen=True)
+class _GateSuiteOwner:
+    """Identify the process that requests a gate suite folder."""
+
+    pid: int
+    start: process_start.ProcessStart
+    boot: str | _NoGateBootIdentity
+
+    @classmethod
+    def current(cls) -> _GateSuiteOwner:
+        pid = os.getpid()
+        start = process_start.process_start(pid)
+        if sys.platform == "darwin":
+            return cls(pid, start, _NoGateBootIdentity())
+        try:
+            return cls(pid, start, boot_identity())
+        except (OSError, ValueError):
+            return cls(pid, start, _NoGateBootIdentity())
+
+    def publish(self, path: Path, directory: int, folder: os.stat_result) -> None:
+        fields = _read_folder_lease(path, directory)
+        fields.update(pid=self.pid, device=folder.st_dev, inode=folder.st_ino)
+        if isinstance(self.start, process_start.Started):
+            fields["process_start"] = self.start.start
+        if isinstance(self.boot, str):
+            fields["boot_id"] = self.boot
+        _publish_lease(path, directory, fields)
+
+
+@final
+@dataclass(frozen=True)
+class GateSuiteFolder(UniqueBuildFolder):
+    """Read the owner identity before allocating a gate suite folder."""
+
+    owner: _GateSuiteOwner = field(default_factory=_GateSuiteOwner.current, init=False)
+
+
+@dataclass(frozen=True)
 class StableOwnerFolder:
     """The request holds the name, parent, and mode for an owner folder."""
     name: str
@@ -719,7 +761,7 @@ def parse_resolved_form(path: Path, build_root: Path) -> ParsedFolder:
 
 
 def test_runs_parent(checkout: Path) -> Path:
-    """Use the selected checkout's build output or its temporary parent."""
+    """Select a test parent from the checkout output or the caller's private temporary folder."""
     target = checkout / "target"
     output = None
     if isinstance(parse_form(checkout), BuildCopy):
@@ -736,10 +778,22 @@ def test_runs_parent(checkout: Path) -> Path:
             raise InvalidFolderForm(f"{parent}: a model test folder must not be a link")
         return parent
 
+    from scripts.lib import session_folder, unit_runs
+
     inherited = inherited_temporary_parent().resolve()
-    if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV):
-        return inherited.parent
-    return inherited / "test-runs"
+    parent = inherited.parent if str(inherited) == os.environ.get(TEST_RUN_FOLDER_ENV) else inherited / "test-runs"
+    build = build_root().resolve()
+    protected = (
+        build / "test-runs",
+        session_folder.configured_root().resolve(),
+        session_folder.former_root().resolve(),
+        unit_runs.RUN_ROOT.resolve(),
+        unit_runs.FORMER_RUN_ROOT.resolve(),
+    )
+    resolved = parent.resolve()
+    if inherited == build or any(folder.is_relative_to(root) for root in protected for folder in (inherited, resolved)):
+        raise InvalidFolderForm(f"{checkout}: test runs from {inherited} require an assigned build output")
+    return parent
 
 
 def repository_git_timeout() -> float:
@@ -1070,6 +1124,12 @@ def _read_folder_lease(path: Path, directory: int, *, allow_empty: bool = False)
 def folder_lease_fields(path: Path) -> dict[str, object]:
     """Read lease fields for a status display."""
     with build_folder_lock.folder_parent(path, build_root(), create=False) as directory:
+        return _read_folder_lease(path, directory)
+
+
+def gate_folder_lease_fields(path: Path, root: Path) -> dict[str, object]:
+    """Read a lease under the gate root without acquiring a removal lock."""
+    with build_folder_lock.folder_parent(path, root, create=False) as directory:
         return _read_folder_lease(path, directory)
 
 
@@ -2016,6 +2076,10 @@ def _create_build_folder(request: BuildFolderRequest | BuildFolderSpec | _Tempor
                             if not stat.S_ISDIR(os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mode):
                                 raise
                     allocated = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                    if isinstance(original, GateSuiteFolder):
+                        if made_inode is None or not stat.S_ISDIR(allocated.st_mode) or not os.path.samestat(made_inode, allocated):
+                            raise OSError(errno.ESTALE, "the gate suite folder changed during allocation", str(path))
+                        original.owner.publish(path, directory, allocated)
                     if isinstance(original, (LinkedEditableRepository, RemoteEditableRepository)):
 
                         if isinstance(original, LinkedEditableRepository):
