@@ -739,21 +739,45 @@ Each role on an account has a row with its color swatch.
 When rows for one account are next to each other, the first row shows the account details.
 When sorting separates those rows, the account details appear at the start of each group.
 An account without a role has an empty role cell.
-The page and the Claude expiry push use `quota_alert.weekly_forecast` with the same usage history.
 The page uses the remaining quota from the displayed weekly reading.
-The forecast excludes history before the current weekly window.
-The page, expiry push, and half-point hold use the same hourly rate function.
-The key `rate.lookback_minutes` in `config/accounts.conf` sets the lookback to 60 minutes by default.
-The window ends at the current time.
-The rate needs a reading at or before the window start and a newest reading at most 15 minutes old.
-The reading at or before the window start can be any age.
-The rate divides the total usage rise by the observed hours in the window.
-It skips refills and gaps over 15 minutes, including gaps that cross the window start.
-It also skips spans that start at 100% used or have two readings at 0% used.
-The page shows the rate for Claude and Codex when the counted spans show a rise and the weekly reading is recent.
-If the rate is missing, both forecast cells show a dash with an explanation.
-If the quota lasts until the reset, the run-out cell shows a dash with that explanation.
-The page shows forecast times in the user's time zone.
+The key \`rate.lookback_minutes\` in \`config/accounts.conf\` sets the lookback to 60 minutes by default.
+The page measures from the later of the weekly window start and the newest role selection that changed the account.
+The role history sets the time even if the role has no members or the members fail to restart.
+A later member move does not change that time.
+When the role map knows the source label, it writes `source_account` in `roles.jsonl`.
+The move reason supplies the source label when it names a numbered account.
+Otherwise, the role map uses the previous selection, including a resolved legacy Claude selection.
+The group selection also stores the source label for history recovery.
+Recovery uses the original selection time when the group selection has it.
+The page uses the journal's source label first.
+For an older entry with no source label, the page uses the first valid source account from a matching batch.
+The batch must start at or after the selection and before the next selection of the same role.
+Otherwise, the previous role selection supplies the source account.
+For the first explicit producers selection, the fallback is the showrunners account before that journal entry.
+An unknown prior account supplies no rate.
+
+The **used / hour** tooltip shows the source of the rate:
+
+- **Whole last hour** lists the first and last readings that count in the lookback.
+- **Partial data** lists the minutes that count since the move or reset. This rate mixes with the last known good rate when available.
+- **Last known good** lists the prior account, rate, and move time for each role with a known rate.
+
+The weight of the measured rate is the minutes that count divided by the lookback.
+The last known good rate is the sum of the rates on the accounts that recent roles left.
+Each prior rate uses the lookback that ends at the move.
+Its readings must belong to the weekly window that contains the move.
+The page carries rates only between accounts of the same tool.
+The page excludes refills, gaps over 15 minutes, spans that start at 100% used, and spans with two readings at 0% used.
+An otherwise valid span can end at 100% used.
+The whole-window rate needs a reading at or before the lookback start and a newest reading at most 15 minutes old.
+Saved reading pairs can supply a partial rate when the weekly balance is stale.
+The last known good rate can appear while the current weekly balance is unavailable.
+The **empty at** cell needs a current weekly balance and uses the displayed rate.
+An empty account with a current reading shows a dash and the tooltip **The weekly quota is used up.**
+If the rate is missing, both cells show a dash with an explanation.
+If the quota lasts until the reset, **empty at** shows a dash with that explanation.
+The page shows times in the user's time zone.
+The Claude expiry push and the half-point hold still use the whole-window rate.
 
 The Roles table has one row per role.
 It shows the selected account for each role.

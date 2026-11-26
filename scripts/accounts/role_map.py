@@ -11,7 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -23,6 +23,7 @@ from typing import Literal, NotRequired, ParamSpec, TypeVar, TypedDict, cast
 from scripts.accounts import worker_names
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
+from scripts.whoami.note_file import NumberedAccountLabel, parse_account_label
 
 ROLE_MAP_HOST = "natedev"
 ClaudeGroup = Literal["units", "showrunners", "producers"]
@@ -51,6 +52,7 @@ class StoredGroupSelection(TypedDict):
     reset: NotRequired[str]
     why: NotRequired[str]
     at: NotRequired[str]
+    source_account: NotRequired[str]
 
 
 def selection_reason(selection: StoredGroupSelection) -> TransitionReason:
@@ -63,6 +65,11 @@ class StoredGroupSelections(TypedDict, total=False):
     units: str | StoredGroupSelection
     showrunners: str | StoredGroupSelection
     producers: str | StoredGroupSelection
+
+
+def effective_claude_group(groups: Mapping[str, object], group: ClaudeGroup) -> ClaudeGroup:
+    """Use the showrunners account until producers have their own selection."""
+    return "showrunners" if group == "producers" and "producers" not in groups else group
 
 
 @dataclass(frozen=True)
@@ -203,6 +210,7 @@ class RoleHistoryEntry(TypedDict):
     cause: NotRequired[Literal["by hand", "refusal", "auto", "credits off"]]
     window: NotRequired[Literal["weekly", "five_hour", "unknown"]]
     reset: NotRequired[str]
+    source_account: NotRequired[str]
 
 
 def _change_document(change: RoleMapChange | WorkersClaudeRouteChange) -> RoleChangeDocument | dict[str, str]:
@@ -410,6 +418,9 @@ def _groups(
                 selected["why"] = why
             else:
                 report_anomaly(f"invalid {group} reason")
+        source = _numbered_source(fields.get("source_account"), group)
+        if isinstance(source, NumberedAccountLabel):
+            selected["source_account"] = source.label
         groups[group] = selected
     return groups
 
@@ -602,7 +613,61 @@ def _groups_lock() -> Generator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _role_history_entry(change: RoleMapChange) -> RoleHistoryEntry:
+@dataclass(frozen=True)
+class UnrecordedSelectionSource:
+    """No numbered source account is available for the selection."""
+
+
+SelectionSource = NumberedAccountLabel | UnrecordedSelectionSource
+LegacyGroupSourceResolver = Callable[[ClaudeGroup, str], SelectionSource]
+
+
+def _no_legacy_group_source(_group: ClaudeGroup, _label: str) -> UnrecordedSelectionSource:
+    return UnrecordedSelectionSource()
+
+
+def _numbered_source(value: object, role: Role) -> SelectionSource:
+    if isinstance(value, str):
+        source = parse_account_label(value)
+        if isinstance(source, NumberedAccountLabel) and source.tool == ("codex" if role == "workers" else "claude"):
+            return source
+    return UnrecordedSelectionSource()
+
+
+def _selected_source(
+    values: Mapping[str, object], role: Role, resolve_legacy_group_source: LegacyGroupSourceResolver,
+) -> SelectionSource:
+    key = role if role == "workers" else effective_claude_group(values, role)
+    previous = values.get(key)
+    if isinstance(previous, dict):
+        previous = cast(dict[str, object], previous).get("label")
+    if key != "workers" and isinstance(previous, str) and previous in ("default", "~/.claude"):
+        return resolve_legacy_group_source(key, previous)
+    return _numbered_source(previous, role)
+
+
+def _named_move_source(change: RoleMapChange) -> SelectionSource:
+    if change.cause == "refusal":
+        label, separator, _ = change.why.partition(" refused: ")
+    elif change.cause == "auto":
+        label, separator, _ = change.why.partition(" at ")
+    else:
+        return UnrecordedSelectionSource()
+    return _numbered_source(label, change.role) if separator else UnrecordedSelectionSource()
+
+
+def _stored_group_selection(change: RoleMapChange, source: SelectionSource) -> StoredGroupSelection:
+    assert change.cause != "credits off"
+    selection = StoredGroupSelection(label=change.label, move_id=change.move_id,
+        cause=change.cause, window=change.window, why=change.why, at=change.at)
+    if change.reset:
+        selection["reset"] = change.reset
+    if isinstance(source, NumberedAccountLabel):
+        selection["source_account"] = source.label
+    return selection
+
+
+def _role_history_entry(change: RoleMapChange, source: SelectionSource) -> RoleHistoryEntry:
     row = RoleHistoryEntry(at=change.at, label=change.label, why=change.why)
     if change.role == "workers":
         row["role"] = "workers"
@@ -615,6 +680,8 @@ def _role_history_entry(change: RoleMapChange) -> RoleHistoryEntry:
     row["window"] = change.window
     if change.reset:
         row["reset"] = change.reset
+    if isinstance(source, NumberedAccountLabel):
+        row["source_account"] = source.label
     return row
 
 
@@ -625,11 +692,15 @@ def _recover_locked_role_history(history: Path) -> None:
             _ = worker_names.migrate_locked_journal(source, history)
 
 
-def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
+def write_role_map(
+    change: RoleMapChange | WorkersClaudeRouteChange, *,
+    resolve_legacy_group_source: LegacyGroupSourceResolver = _no_legacy_group_source,
+) -> None:
     change = decode_role_map_change(json.dumps(_change_document(change)))
     if isinstance(change, WorkersClaudeRouteChange):
         _write_workers_claude_route(change)
         return
+    source = _named_move_source(change)
     if not is_role_map_host():
         try:
             _ = ssh_role_map(("role-map-write", json.dumps(_change_document(change), sort_keys=True)))
@@ -647,15 +718,13 @@ def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
                     size = history.stat().st_size if history.exists() else -1
                     if change.role == "workers":
                         values = worker_names.configuration(values)
+                    if isinstance(source, UnrecordedSelectionSource):
+                        source = _selected_source(values, change.role, resolve_legacy_group_source)
+                    if change.role == "workers":
                         values["workers"] = change.label
                     else:
-                        assert change.cause != "credits off"
-                        selection = StoredGroupSelection(label=change.label, move_id=change.move_id,
-                            cause=change.cause, window=change.window, why=change.why, at=change.at)
-                        if change.reset:
-                            selection["reset"] = change.reset
-                        values[change.role] = selection
-                    row = _role_history_entry(change)
+                        values[change.role] = _stored_group_selection(change, source)
+                    row = _role_history_entry(change, source)
                     try:
                         _atomic_write(path, json.dumps(values, sort_keys=True) + "\n")
                         history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -685,12 +754,7 @@ def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
         if change.role == "workers":
             workers = change.label
         else:
-            assert change.cause != "credits off"
-            selected = StoredGroupSelection(label=change.label, move_id=change.move_id,
-                cause=change.cause, window=change.window, why=change.why, at=change.at)
-            if change.reset:
-                selected["reset"] = change.reset
-            groups[change.role] = selected
+            groups[change.role] = _stored_group_selection(change, source)
         scope.value = RoleMap(groups, workers, scope.value.workers_claude)
 
 
@@ -839,9 +903,10 @@ def repair_selected_auto_moves(entries: tuple[AutoMoveTarget, ...], now: datetim
                         or selected["label"] != entry.label):
                     continue
                 if entry.entry_id not in consumed:
-                    missing.append(_role_history_entry(RoleMapChange(entry.group, selected["label"],
-                        "auto: " + entry.entry_id, now.isoformat(), selected["move_id"], "auto",
-                        selected["window"], selected.get("reset", ""))))
+                    change = RoleMapChange(entry.group, selected["label"], "auto: " + entry.entry_id,
+                        selected.get("at", now.isoformat()), selected["move_id"], "auto",
+                        selected["window"], selected.get("reset", ""))
+                    missing.append(_role_history_entry(change, _numbered_source(selected.get("source_account"), entry.group)))
                 consumed.add(entry.entry_id)
             if missing and not dry_run:
                 descriptor = os.open(history, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)

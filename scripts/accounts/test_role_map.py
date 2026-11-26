@@ -206,6 +206,38 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual(json.loads(line)["why"], "auto: line-write")
         self.assertEqual(accounts.roles_history_file().read_bytes(), line)
 
+    def test_refusal_selection_records_the_named_source_instead_of_the_previous_account(self) -> None:
+        self.seed(self.server_home, groups={"units": "claude3"})
+        at = RoleMapReadTime.now(timezone.utc)
+        with patch.object(role_map, "ssh_role_map", side_effect=self.remote):
+            _ = accounts.set_group_account("units", "claude2", why="claude1 refused: weekly limit", now=at,
+                origin=accounts.RefusalOrigin("weekly", accounts.KnownReset(at + timedelta(days=1))))
+        groups = self.server_home / ".local/state/accounts/groups.json"
+        history = groups.with_name("roles.jsonl")
+        row = cast(dict[str, object], json.loads(history.read_text()))
+        selection = cast(dict[str, dict[str, object]], json.loads(groups.read_text()))["units"]
+        self.assertEqual(row["source_account"], "claude1")
+        self.assertEqual(selection["source_account"], "claude1")
+
+    def test_automatic_selection_records_the_resolved_legacy_source(self) -> None:
+        self.seed(self.home, groups={"units": "default"})
+        at = RoleMapReadTime.now(timezone.utc)
+        selected_at = at - timedelta(days=1)
+        history = accounts.roles_history_file()
+        _ = history.write_text(json.dumps({"group": "units", "label": "default", "at": selected_at.isoformat()}) + "\n")
+        _ = accounts.accounts_config_file().write_text(json.dumps({
+            "workers": "codex1", "home_cutovers": [{"at": at.isoformat(), "label": "claude1"}],
+        }))
+        with patch.object(role_map, "is_role_map_host", return_value=True):
+            selected = accounts.group_label(accounts.group_accounts(), "units")
+            self.assertEqual(selected, "claude1")
+            _ = accounts.set_group_account("units", "claude2", why="auto: fixture-rule", now=at,
+                                           origin=accounts.AutoOrigin())
+        row = cast(dict[str, object], json.loads(history.read_text().splitlines()[-1]))
+        selection = cast(dict[str, dict[str, object]], json.loads(accounts.groups_file().read_text()))["units"]
+        self.assertEqual(row["source_account"], selected)
+        self.assertEqual(selection["source_account"], selected)
+
     def remote(self, arguments: tuple[str, ...]) -> str:
         """Run the real remote CLI against a second scratch home, never a shell or ssh."""
         with (scratch_account_home(self.server_home, {
@@ -340,6 +372,7 @@ class RoleMapTests(unittest.TestCase):
             self.assertEqual(json.loads(accounts.groups_file().read_text())["units"], {
                 "label": "claude3", "move_id": "interrupted-group-move", "cause": "auto",
                 "window": "weekly", "why": "auto: " + first.id, "reset": reset, "at": change.at,
+                "source_account": "claude1",
             })
 
             _ = refusal_watch.run_auto_moves(repair_at, account_config=account_config)
@@ -350,10 +383,30 @@ class RoleMapTests(unittest.TestCase):
             self.assertEqual(next_moves.read_next_moves(), (second,))
         rows = [json.loads(line) for line in history.read_text().splitlines()]
         self.assertEqual(rows, [{
-            "at": repair_at.isoformat(), "group": "units", "label": "claude3",
+            "at": change.at, "group": "units", "label": "claude3",
             "why": "auto: " + first.id, "move_id": "interrupted-group-move", "cause": "auto",
-            "window": "weekly", "reset": reset,
+            "window": "weekly", "reset": reset, "source_account": "claude1",
         }])
+
+    def test_repaired_role_history_keeps_the_original_selection_time_and_source(self) -> None:
+        self.seed(self.home, groups={"showrunners": "claude1"})
+        moved_at = RoleMapReadTime.now(timezone.utc)
+        change = role_map.RoleMapChange("producers", "claude2", "auto: fixture-rule",
+                                        moved_at.isoformat(), "fixture-move", "auto")
+        history = accounts.roles_history_file()
+        with patch.object(role_map, "is_role_map_host", return_value=True):
+            role_map.write_role_map(change)
+            original = history.read_text()
+            history.unlink()
+            role_map.write_role_map(role_map.RoleMapChange("showrunners", "claude3", "fixture move",
+                (moved_at + timedelta(minutes=5)).isoformat(), "other-move"))
+            targets = (role_map.AutoMoveTarget("fixture-rule", "producers", "claude2"),)
+            repaired = role_map.repair_selected_auto_moves(targets, moved_at + timedelta(minutes=20))
+        self.assertEqual(repaired, role_map.RecordedAutoMoves(frozenset({"fixture-rule"})))
+        self.assertEqual(history.read_text().splitlines(keepends=True)[1:], [original])
+        row = cast(dict[str, object], json.loads(original))
+        self.assertEqual(row["at"], moved_at.isoformat())
+        self.assertEqual(row["source_account"], "claude1")
 
     def test_scratch_home_writes_its_groups_workers_and_history_without_remote_changes(self) -> None:
         self.seed(self.home, groups={"units": "claude3", "showrunners": "claude1"})
@@ -370,7 +423,8 @@ class RoleMapTests(unittest.TestCase):
         ssh.assert_not_called()
         groups = cast(dict[str, object], json.loads(accounts.groups_file().read_text()))
         self.assertEqual(groups["units"], {"label": "claude2", "move_id": "scratch-move",
-                                          "cause": "by hand", "window": "unknown", "why": "scratch selection", "at": at})
+                                          "cause": "by hand", "window": "unknown", "why": "scratch selection",
+                                          "at": at, "source_account": "claude3"})
         self.assertEqual(groups["showrunners"], "claude1")
         self.assertEqual(selected.groups, groups)
         self.assertEqual(selected.workers, "codex3")
@@ -378,9 +432,9 @@ class RoleMapTests(unittest.TestCase):
         history = [json.loads(line) for line in accounts.groups_file().with_name("roles.jsonl").read_text().splitlines()]
         self.assertEqual(history, [
             {"at": at, "group": "units", "label": "claude2", "why": "scratch selection",
-             "move_id": "scratch-move", "cause": "by hand", "window": "unknown"},
+             "move_id": "scratch-move", "cause": "by hand", "window": "unknown", "source_account": "claude3"},
             {"at": at, "role": "workers", "label": "codex3", "account_label": "codex3",
-             "why": "scratch workers", "cause": "by hand", "window": "unknown"},
+             "why": "scratch workers", "cause": "by hand", "window": "unknown", "source_account": "codex1"},
         ])
         self.assertEqual(self.files(self.server_home), remote_before)
         self.assertFalse(role_map.role_map_cache_file().exists())
@@ -423,7 +477,8 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual((before.groups, before.workers), ({"units": "claude3"}, "codex3"))
         stored = cast(dict[str, object], json.loads(accounts.groups_file().read_text()))
         self.assertEqual(stored["units"], {"label": "claude2", "move_id": "unread-login-move",
-                                          "cause": "by hand", "window": "unknown", "why": "isolated selection", "at": change.at})
+                                          "cause": "by hand", "window": "unknown", "why": "isolated selection",
+                                          "at": change.at, "source_account": "claude3"})
         self.assertEqual((after.groups, after.workers), (stored, "codex3"))
         history = accounts.groups_file().with_name("roles.jsonl").read_text().splitlines()
         self.assertEqual(len(history), 1)
@@ -473,7 +528,7 @@ class RoleMapTests(unittest.TestCase):
         history = self.server_home / ".local/state/accounts/roles.jsonl"
         self.assertEqual(json.loads(history.read_text()), {
             "at": change.at, "group": "units", "label": "claude2", "why": "auto: units-low",
-            "move_id": "automatic-transition", "cause": "auto", "window": "unknown"})
+            "move_id": "automatic-transition", "cause": "auto", "window": "unknown", "source_account": "claude1"})
         # The readback may create a transport cache, but it never changes local selections or history.
         for path, contents in before.items():
             self.assertEqual((self.home / path).read_bytes(), contents)
@@ -507,7 +562,8 @@ class RoleMapTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(json.loads(history[0]), {"role": "workers", "label": "codex3",
             "account_label": "codex3", "why": "quota exhausted", "at": change.at,
-            "move_id": "worker-move", "cause": "refusal", "window": "five_hour", "reset": change.reset})
+            "move_id": "worker-move", "cause": "refusal", "window": "five_hour", "reset": change.reset,
+            "source_account": "codex1"})
 
     def test_authoritative_workers_write_preserves_home_cutovers_and_every_other_configuration_key(self) -> None:
         self.seed(self.home, groups={"units": "claude2"}, workers="codex1")
