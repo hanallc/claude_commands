@@ -90,7 +90,7 @@ from scripts.lib.build_steps import (
 from scripts.lint import memory_admit, sweep
 from scripts.message import send_budget, session_send
 from scripts.production import (  # noqa: E402
-    affected_modules, change_review, land_runs, nightly_schedule, promotion, session_staff,
+    affected_modules, behavior_check, change_review, land_runs, nightly_schedule, promotion, session_staff,
     showrunners, staff, unit_config, unit_lookup, unit_names,
 )
 from scripts.production.gate_modules import GateRefused, discover_test_modules, is_test_module, test_module_name
@@ -2769,7 +2769,8 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
     checkpoint = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.checkpoint}^{{commit}}")
     origin = f"origin/{args.merge_branch}"
     legacy = Path(args.main_repo).expanduser() if args.enrolled else None
-    check_local_doc_commits(repo, checkpoint_retry_origin(repo, origin, checkpoint, legacy=legacy))
+    retry_origin = checkpoint_retry_origin(repo, origin, checkpoint, legacy=legacy)
+    check_local_doc_commits(repo, retry_origin)
     previous = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.previous_checkpoint}^{{commit}}")
     if git(repo, "merge-base", "--is-ancestor", checkpoint, f"origin/{args.unit_branch}").returncode:
         raise GateRefused("checkpoint is not on origin unit branch")
@@ -2794,6 +2795,14 @@ def merge_checkpoint(args: GateArguments, target: GateTarget) -> int:
         raise GateRefused(f"cannot preview checkpoint merge: {failure_detail(preview)}")
     if refusal := live_file_refusal(repo, preview.stdout.splitlines()[0]):
         raise GateRefused(refusal)
+    if args.legacy_direct_main:
+        # Use the original baseline for a recorded merge that still needs a push.
+        comparison_base = f"{baseline}^1" if retry_origin == baseline else baseline
+        try:
+            change = behavior_check.GitRange(repo, comparison_base, checkpoint).comparison_range()
+            behavior_check.require_review(change)
+        except (behavior_check.BehaviorCheckError, OSError) as error:
+            raise GateRefused(str(error)) from error
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     recovery = ACTIVE_GATE_RECOVERY.get()
     merged = ""

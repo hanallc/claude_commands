@@ -325,11 +325,52 @@ sys.meta_path.insert(0, NoRepositoryModules())
         _ = self.git(self.main, "switch", "--detach", "main")
         _ = self.git(self.checkout, "switch", "main")
         self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `main`\n")
-        result = self.run_gate("--promote", "--merge-branch", "main", "--main-repo", str(self.checkout))
+        with mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check:
+            result = self.run_gate("--promote", "--merge-branch", "main", "--main-repo", str(self.checkout))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        check.assert_called_once_with(behavior_check.GitRange(self.checkout, self.base, self.checkpoint))
         tip = self.git(self.checkout, "rev-parse", "HEAD")
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), tip)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD^2"), self.checkpoint)
+
+    def test_a_legacy_main_gate_refuses_a_checkpoint_without_behavior_review(self) -> None:
+        _ = self.git(self.main, "switch", "--detach", "main")
+        _ = self.git(self.checkout, "switch", "main")
+        self.write(self.quiet_production, "# quiet\n\n- **Merge branch:** `main`\n")
+        test_path = Path("scripts/lib/test_fixture_behavior.py")
+        original = "def test_fixture_behavior():\n    assert 1\n"
+        self.write(self.checkout / test_path, original)
+        fork = self.commit(self.checkout, "add behavior test")
+        self.write(self.checkout / "scripts/lib/test_only_on_main.py", "def test_only_on_main():\n    assert 1\n")
+        baseline = self.commit(self.checkout, "add a test on main")
+        _ = self.git(self.checkout, "push", "origin", "main")
+        _ = self.git(self.unit, "switch", "-c", "legacy-phase", fork)
+        self.write(self.unit / test_path, original.replace("assert 1", "assert 2"))
+        checkpoint = self.commit(self.unit, "edit behavior test\n\nChange-Review: none — test only")
+        _ = self.git(self.unit, "push", "origin", "legacy-phase")
+
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                if retry:
+                    _ = self.git(self.checkout, "merge", "--no-ff", "-m", "recorded merge", checkpoint)
+                    merged = self.git(self.checkout, "rev-parse", "HEAD")
+                    with mock.patch.dict(os.environ, self.environment):
+                        receipt = gate.push_record_path(self.checkout, "checkpoint", "origin/main:" + checkpoint)
+                        gate.write_push_record(receipt, gate.RecordedPush(baseline, merged, checkpoint))
+                head = self.git(self.checkout, "rev-parse", "HEAD")
+                contents = (self.checkout / test_path).read_bytes()
+                with (mock.patch.object(behavior_check, "require_review", wraps=behavior_check.require_review) as check,
+                      mock.patch.object(gate, "merge_for_gate", wraps=gate.merge_for_gate) as merge):
+                    result = self.run_gate("--merge-branch", "main", "--unit-branch", "legacy-phase",
+                                           checkpoint=checkpoint, previous=fork)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"Behavior check for {test_path}::test_fixture_behavior: no review is on record", result.stderr)
+                check.assert_called_once_with(behavior_check.GitRange(self.checkout, fork, checkpoint))
+                merge.assert_not_called()
+                self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
+                self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+                self.assertEqual((self.checkout / test_path).read_bytes(), contents)
+                self.assertEqual(self.git(self.origin, "rev-parse", "main"), baseline)
 
     def test_enrolled_gate_refuses_incoming_live_files_in_both_publication_modes(self) -> None:
         integration, doc, declared = self.enrolled_fixture()

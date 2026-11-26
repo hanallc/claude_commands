@@ -13,6 +13,7 @@ Each changed file contributes its path, its old and new Git modes, and its old a
 
 `land_main.py` and direct checkpoint pushes read the default branch from origin.
 They check default-branch pushes against the fetched tip.
+The legacy direct-main gate checks from the merge base to the checkpoint before it merges.
 Promotion checks behavior once for a new default-branch tip before it moves live main or pushes the commit.
 The PR script checks the range from the merge base to the PR head.
 It reads the head and base again before merge and supplies the checked head to GitHub.
