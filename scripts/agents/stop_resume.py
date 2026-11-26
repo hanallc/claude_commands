@@ -1434,17 +1434,21 @@ def wait_for_native_session(client: herdr.Herdr, pane: str, deadline: float, *, 
             time.sleep(operation_deadline.remaining(min(0.5, remaining)))
 
 
-def _resume_liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+def _resume_liveness(identity: str, *, deadline: float = math.inf
+                     ) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
     """Give a concurrent registry write another chance before a resume fails."""
-    live = sessions.session_liveness(identity)
+    live = (sessions.session_liveness(identity) if deadline == math.inf
+            else sessions.session_liveness(identity, deadline=deadline))
     if isinstance(live, sessions.SessionLivenessUnknown) and live.unreadable_registry:
+        deadline = worker_lifecycle.effective_deadline(deadline)
         delay = sessions.retry_policy().registry_delay_seconds
+        if monotonic() + delay >= deadline:
+            return live
+        time.sleep(delay)
+        if monotonic() >= deadline:
+            return live
         try:
-            if delay >= operation_deadline.remaining():
-                return live
-            time.sleep(delay)
-            operation_deadline.check()
-            registry = sessions.read_registry(for_session=identity, deadline=worker_lifecycle.effective_deadline())
+            registry = sessions.read_registry(for_session=identity, deadline=deadline)
         except TimeoutError:
             return live
         return sessions.session_liveness(identity, registry=registry)
@@ -1469,14 +1473,16 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
         cursor.since = launched_at
     operation_deadline.check()
     client.run_in_pane(tab.pane_id, command)
-    deadline = monotonic() + operation_deadline.remaining(start_seconds)
-    live = _resume_liveness(entry["session_id"])
-    while isinstance(live, sessions.SessionNotLive):
+    deadline = worker_lifecycle.effective_deadline(monotonic() + start_seconds)
+    while monotonic() < deadline:
+        live = _resume_liveness(entry["session_id"], deadline=deadline)
+        if not isinstance(live, sessions.SessionNotLive):
+            break
         remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise herdr_types.HerdrFailure("never started")
-        time.sleep(operation_deadline.remaining(min(0.5, remaining)))
-        live = _resume_liveness(entry["session_id"])
+        if remaining > 0:
+            time.sleep(min(0.5, remaining))
+    else:
+        raise herdr_types.HerdrFailure("never started")
     if isinstance(live, sessions.SessionLivenessUnknown):
         raise herdr_types.HerdrFailure(live.reason)
     if not message:
