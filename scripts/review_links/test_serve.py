@@ -7442,17 +7442,21 @@ class ReviewLinksServerTests(unittest.TestCase):
             fields = {"keeper": morty.id, "id": item.id, "request": request,
                     "token": list_page.request_token(self.root, morty.id, item.id, request),
                     "action": "read", "words": "Explain this simply.", "until": "2026-12-03"}
-            for invalid_words in ("", "\x85", "\x1c\t\u2028\u3000", "x" * 10001):
-                with self.subTest(invalid_words=len(invalid_words), action="not works"):
-                    verdict = {**fields, "action": "not works", "words": invalid_words}
-                    code, body = self.post(list_page.PAGE_PATH, urlencode(verdict))
-                    self.assertEqual(code, 400)
-                    self.assertEqual(json.loads(body), {
-                        "reason": "Enter your words for the owner and the producer.",
-                        "not_fixed_receipt": {"request": request, "state": "refused"},
-                    })
-                    self.assertEqual(the_list.load(morty.id, item.id), item)
-                    delivery.assert_not_called()
+            verdict = {**fields, "action": "not works", "words": "x" * 10001}
+            code, body = self.post(list_page.PAGE_PATH, urlencode(verdict))
+            self.assertEqual(code, 400)
+            self.assertEqual(json.loads(body), {
+                "reason": "Use at most 10,000 characters for Not fixed.",
+                "not_fixed_receipt": {"request": request, "state": "refused"},
+            })
+            for action in ("tell", "question"):
+                for words in ("", " \t\n "):
+                    with self.subTest(action=action, words=words):
+                        self.assertEqual(
+                            self.post(list_page.PAGE_PATH, urlencode({**fields, "action": action, "words": words}))[0],
+                            400)
+            self.assertEqual(the_list.load(morty.id, item.id), item)
+            delivery.assert_not_called()
             for action in ("read", "park", "tell", "remove"):
                 fields["action"] = action
                 with self.subTest(action=action):
@@ -7503,6 +7507,42 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertTrue(sent.is_set())
                 finally:
                     restarted.server_close()
+
+    def test_list_not_fixed_with_empty_or_blank_words_sends_only_the_notice(self) -> None:
+        keeper = self.configure_list_keeper()
+        producer = fixture_member("producer", name="dwight")
+        owner = fixture_member("showrunner", name="sdlc")
+        for words in ("", "\x85\x1c\t\u2028\u3000"):
+            with self.subTest(words=words):
+                native = investigation.file(owner.id, "Fix the menu", "The menu omits a choice.",
+                                            waiting_why="sdlc checks the menu.")
+                report = the_list.ListReport(the_list.ReportKind.BUG, review_items.investigation_record_key(native),
+                                             native.question)
+                number = the_list.file_report(keeper.id, report, native.title, owner=owner.id, producer=producer.id,
+                                              unit="", source="nate", state=the_list.ItemState.WORKING)
+                repaired = the_list.update(keeper.id, f"L{number}", {
+                    "state": the_list.ItemState.REPAIRED, "next_step": "Open the menu."
+                }, source="dwight")
+                request, token = list_page.signed_item_request(
+                    list_page.ListRecord(keeper.id, repaired), list_page.form_secret(self.root))
+                fields = urlencode({"keeper": keeper.id, "id": repaired.id, "request": request, "token": token,
+                                    "action": "not works", "words": words, "until": ""})
+                with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+                      patch.object(change_page, "send_to_staff", return_value=None) as send):
+                    self.assertEqual(self.post(studio_page.PAGE_PATH, fields)[0], 200)
+                    code, body = self.post(studio_page.PAGE_PATH, fields)
+                    self.assertEqual(code, 200)
+                    result = cast(list_page.SavedActionState, json.loads(body))
+                    self.assertEqual(result.get("not_fixed_receipt"), {"request": request, "state": "delivered"})
+                    self.assertIn("<p>Not fixed</p>", result.get("detail_html", ""))
+                    notice = f"List page: Not fixed for item {number}"
+                    self.assertCountEqual([(sent.args[0], sent.args[2]) for sent in send.call_args_list],
+                                          [(producer.id, notice), (owner.id, notice)])
+
+                saved = the_list.load(keeper.id, repaired.id)
+                self.assertEqual((saved.state, saved.next_step), (the_list.ItemState.WORKING, ""))
+                feedback = the_list.feedback_requests(saved)[request]
+                self.assertEqual((feedback.words, feedback.state), ("", "sent"))
 
     def go_fixture(self, *, natedev: bool = False, waiting: bool = False, producer: staff.StaffRow | None = None,
                    page_path: str = list_page.PAGE_PATH

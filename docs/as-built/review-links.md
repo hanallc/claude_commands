@@ -143,7 +143,10 @@ The state shows when the item entered New, Working, Repaired, or Delivered.
 The producer uses `the_list.py update --state Repaired --next-step "How to try the repair"` after testing.
 Needs me shows the repair instructions and the Works and Not fixed buttons.
 Works records Delivered after the Undo timer expires.
-Not fixed sends the user's words to the owner and producer through the same Undo control.
+Not fixed sends a notice to the owner and producer through the same Undo control.
+The notice includes any words the user enters.
+An empty or blank box sends the notice with no words.
+The box accepts up to 10,000 characters.
 Both verdicts clear the repair instructions from Next step.
 A saved Not fixed verdict returns the item to Working.
 The browser stores the signed Not fixed request and its hold ID before sending.
