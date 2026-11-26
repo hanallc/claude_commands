@@ -18,13 +18,14 @@ from scripts.lib import process_start, unit_runs
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from scripts.lib.transcript_test_support import compressed_copy
 from scripts.notify import review
-from scripts.production import behavior_check, behavior_review, session_staff, staff, update_registration, worker
-from scripts.review_links import review_events
+from scripts.production import behavior_check, behavior_review, session_staff, staff, the_list, update_registration, worker
+from scripts.review_links import list_draft, question_record, review_events
 
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
 REVIEWER = "fixture-reviewer"
 MOVE_QUOTE = "Move at once. Use scripts/direct/assign.py to restart the work."
+MOVE_REQUEST = "Wait for the running step."
 MOVE_QUESTION = update_registration.QuestionParts(
     ask="Allow a wait before an account move? (2026-11-23)",
     context="You set a rule for immediate moves and restarts. A wait lets the running build finish.",
@@ -97,6 +98,18 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def reply(self, text: str) -> None:
         _ = self.write(self.folder / "review.md", text)
 
+    def typed_turn(self, text: str) -> dict[str, object]:
+        return {"type": "user", "origin": {"kind": "human"}, "turnOrigin": "human", "promptSource": "typed",
+                "timestamp": "2026-11-25T23:30:00-08:00", "message": {"role": "user", "content": text}}
+
+    def transcript(self, *turns: dict[str, object]) -> Path:
+        path = self.home / ".claude/projects/fixture/conversation.jsonl"
+        return self.write(path, "".join(json.dumps(turn) + "\n" for turn in turns))
+
+    def requested(self, source: Path, quote: str, test: str = "test_move") -> dict[str, str]:
+        return {"test": f"test_fixture.py::{test}", "finding": "requested", "quote": quote, "source": str(source),
+                "date": "2000-01-01", "change": "Change the timing."}
+
     def question_file(self, parts: update_registration.QuestionParts) -> Path:
         return self.write(self.root / "question.json", json.dumps(parts))
 
@@ -132,32 +145,43 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
 
         self.assertEqual(self.cli("check", *args), (0, ""))
         saved = self.folder / "completed-reply.txt"
+        refusal = (1, f"{key}: the saved approval has no valid proof.\n")
         foreign = self.write(self.root / "another-reply.txt", CLEAR_REPLY)
         behavior_check.write_record(key, behavior_check.Clear(foreign))
         self.assertIn("no valid proof", self.cli("check", *args)[1])
+        self.assertEqual(self.cli("status", "--key", key), refusal)
         behavior_check.write_record(key, behavior_check.Clear(saved))
         _ = self.write(self.folder / "review-key", "different patch")
         self.assertIn("no valid proof", self.cli("check", *args)[1])
         _ = self.write(self.folder / "review-key", key)
         _ = self.write(saved, "[]")
         self.assertIn("no valid proof", self.cli("check", *args)[1])
+        self.assertEqual(self.cli("status", "--key", key), refusal)
+        _ = self.write(saved, "invalid JSON")
+        self.assertEqual(self.cli("status", "--key", key), refusal)
         saved.unlink()
         self.assertIn("no valid proof", self.cli("check", *args)[1])
+        self.assertEqual(self.cli("status", "--key", key), refusal)
 
     def test_verified_requests_clear_the_range_and_list_each_quote(self) -> None:
         args, key = self.two_changed_tests()
-        move_quote = "Wait for the running step before moving."
-        move_source = self.write(self.root / "decision.md", f"## Decision\n{move_quote}\n")
+        move_quote = MOVE_REQUEST
+        keeper = replace(self.producer, name="morty")
+        with staff.supplied_snapshot(staff.StaffSnapshot((keeper,))):
+            item = the_list.add(keeper.id, "Set the move timing", owner=keeper.id, source="nate", changes={})
+        store = list_draft.list_records(keeper.id)
+        move_source = store.path(item.id)
+        fields, body = store.read(item.id)
+        question = question_record.Question("Q1", "2026-11-23T07:00:00Z", "When should the move start?",
+                                           question_record.Answer(move_quote, "2026-11-24T10:00:00Z"))
+        fields["questions"] = json.dumps([question_record.stored(question)])
+        event = {"time": "2026-11-24T10:00:01+00:00", "source": "nate", "action": "Answered", "question_id": "Q1"}
+        store.write(item.id, fields, body.rstrip() + "\n- " + json.dumps(event) + "\n")
         refresh_quote = 'Refresh "now" when an item opens.'
-        turn = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": refresh_quote}]}}
-        refresh_source = self.write(self.root / "conversation.jsonl", json.dumps(turn) + "\n")
+        refresh_source = self.transcript(self.typed_turn(f"Use the current title. {refresh_quote} Keep the item open."))
         compressed = compressed_copy(refresh_source)
-        self.reply(json.dumps([
-            {"test": "test_fixture.py::test_move", "finding": "requested", "quote": move_quote,
-             "source": str(move_source), "date": "2026-11-24", "change": "The move waits for the running step."},
-            {"test": "test_fixture.py::test_refresh", "finding": "requested", "quote": refresh_quote,
-             "source": str(refresh_source), "date": "2026-11-25", "change": "An open item refreshes at once."},
-        ]))
+        self.reply(json.dumps([self.requested(move_source, move_quote),
+                               self.requested(refresh_source, refresh_quote, "test_refresh")]))
         output = (f"{key} clear\ntest_fixture.py::test_move\n"
                   f"Nate's request (2026-11-24, {move_source}): {move_quote}\n"
                   f"test_fixture.py::test_refresh\nNate's request (2026-11-25, {refresh_source}): {refresh_quote}\n")
@@ -171,39 +195,89 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         ask.assert_not_called()
         self.assertEqual(behavior_check.read_record(key), behavior_check.Clear(self.folder / "completed-reply.txt"))
         self.assertEqual(self.cli("check", *args), (0, ""))
+        store.write(item.id, fields, body.rstrip() + "\n- " + json.dumps({**event, "source": "producer"}) + "\n")
+        self.assertIn("no valid proof", self.cli("check", *args)[1])
+        store.write(item.id, fields, body.rstrip() + "\n- " + json.dumps(event) + "\n")
         compressed.unlink()
         self.assertIn("no valid proof", self.cli("check", *args)[1])
         self.assertEqual(self.cli("status", "--key", key), (1, f"{key}: the saved approval has no valid proof.\n"))
 
     def test_an_unverified_request_requires_a_question(self) -> None:
         args, key = self.changed_range()
-        quote = "Wait for the running step."
-        missing = self.write(self.root / "decision.md", "The move starts at once.")
-        transcript = self.write(self.root / "conversation.jsonl", "\n".join(json.dumps(turn) for turn in (
-            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": quote}]}},
-            {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": quote}]}},
-            {"type": "user", "message": {"role": "user", "content": f'<system-reminder source="script">{quote}</system-reminder>'}},
-        )) + "\n")
-        for source in (missing, transcript, self.root / "missing.md"):
-            with (self.subTest(source=source), mock.patch.object(astra_review, "run_review", return_value=0),
+        quote = MOVE_REQUEST
+        notes = self.write(self.root / "decision.md", quote)
+        _ = self.git("commit", "--allow-empty", "-m", quote)
+        commit_message = self.repo / ".git/COMMIT_EDITMSG"
+        typed = self.typed_turn(quote)
+        for case, source in (
+            ("notes", notes), ("commit", commit_message), ("missing", self.root / "missing.md"),
+            ("external JSONL", self.write(self.root / "fake.jsonl", json.dumps(typed))),
+        ):
+            with self.subTest(case=case):
+                self.assert_unverified_request(args, key, source, quote)
+        for case, turn in (
+            ("assistant", {**typed, "type": "assistant"}),
+            ("tool", {**typed, "message": {"role": "user", "content": [{"type": "tool_result", "content": quote}]}}),
+            ("reminder", self.typed_turn(f'<system-reminder source="script">{quote}</system-reminder>')),
+            ("postmaster", {**typed, "source": "postmaster"}),
+            ("cross-session", {**typed, "origin": {"kind": "peer"}}),
+            ("hook", {**typed, "promptSource": "system"}),
+            ("forwarded", {**typed, "turnOrigin": "forwarded"}),
+            ("paste", self.typed_turn(f"<pasted_content>{quote}</pasted_content>")),
+            ("paste metadata", {**typed, "pastedContents": {"1": quote}}),
+            ("missing provenance", {"type": "user", "timestamp": typed["timestamp"], "message": typed["message"]}),
+            ("missing date", {**typed, "timestamp": ""}),
+            ("missing quote", self.typed_turn("The move starts at once.")),
+            ("sentence fragment", self.typed_turn("Do not move at once.")),
+            ("abbreviation", self.typed_turn("Use no such instruction, e.g. Move at once.")),
+        ):
+            with self.subTest(case=case):
+                source = self.transcript(turn)
+                cited = {"sentence fragment": "move at once.", "abbreviation": "Move at once."}.get(case, quote)
+                self.assert_unverified_request(args, key, source, cited)
+
+    def assert_unverified_request(self, args: list[str], key: str, source: Path, quote: str) -> None:
+        with (mock.patch.object(astra_review, "run_review", return_value=0),
                   mock.patch.object(update_registration, "ask") as ask):
-                behavior_check.record_path(key).with_suffix(".run").unlink(missing_ok=True)
-                (self.folder / "completed-reply.txt").unlink(missing_ok=True)
-                self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "requested", "quote": quote,
-                                        "source": str(source), "date": "2026-11-23",
-                                        "change": "The move waits for the running step."}]))
-                code, output = self.cli("run", *args)
-                self.assertEqual(code, 1)
-                self.assertIn(f"Nate's words (2026-11-23, {source}): {quote}", output)
-                self.assertIn("Nate was not asked.", output)
-                ask.assert_not_called()
-                self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
-                self.assertEqual(self.cli("check", *args)[0], 1)
+            behavior_check.record_path(key).with_suffix(".run").unlink(missing_ok=True)
+            (self.folder / "completed-reply.txt").unlink(missing_ok=True)
+            self.reply(json.dumps([self.requested(source, quote)]))
+            code, output = self.cli("run", *args)
+            self.assertEqual(code, 1)
+            self.assertIn(f"Nate's words (2000-01-01, {source}): {quote}", output)
+            self.assertIn("Nate was not asked.", output)
+            ask.assert_not_called()
+            self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+            self.assertEqual(self.cli("check", *args)[0], 1)
+
+    def test_only_nates_answer_in_a_registered_question_can_clear_a_request(self) -> None:
+        args, key = self.changed_range()
+        source = self.root / "configured-questions" / "question-fixture.md"
+        moment = datetime.fromisoformat("2026-11-26T10:00:00-08:00")
+        answer = review_events.ReviewLog(moment, "producer", f"Answer: {MOVE_REQUEST}")
+        question = update_registration.QuestionRecord(source, self.producer.id, self.producer.id, {
+            "since": "2026-11-25T09:00", "text": "When should the move start?",
+            "question": "Should the move wait?", "asked_by": self.producer.id,
+            "review_log": review_events.encode((answer,)),
+        }, "closed")
+        update_registration.write_question_record(question, assign_id=True)
+        self.assert_unverified_request(args, key, source, MOVE_REQUEST)
+        question.item["review_log"] = review_events.encode((replace(answer, who="nate"),))
+        update_registration.write_question_record(question)
+        copy = self.write(self.root / "question-copy.md", source.read_text())
+        self.assert_unverified_request(args, key, copy, MOVE_REQUEST)
+        behavior_check.record_path(key).with_suffix(".run").unlink()
+        (self.folder / "completed-reply.txt").unlink()
+        self.reply(json.dumps([self.requested(source, MOVE_REQUEST)]))
+        with mock.patch.object(astra_review, "run_review", return_value=0):
+            output = f"{key} clear\ntest_fixture.py::test_move\nNate's request (2026-11-26, {source}): {MOVE_REQUEST}\n"
+            self.assertEqual(self.cli("run", *args), (0, output))
+        self.assertEqual(self.cli("check", *args), (0, ""))
 
     def test_mixed_findings_need_a_question_only_for_specified_behavior(self) -> None:
         args, key = self.two_changed_tests()
         refresh_quote = "Refresh at once when an item opens."
-        source = self.write(self.root / "decision.md", f"{MOVE_QUOTE}\n{refresh_quote}\n")
+        source = self.transcript(self.typed_turn(f"{MOVE_QUOTE}\n{refresh_quote}"))
         self.reply(json.dumps([
             {"test": "test_fixture.py::test_move", "finding": "specified", "quote": MOVE_QUOTE,
              "source": str(source), "date": "2026-11-23", "change": "The move waits for the running step."},

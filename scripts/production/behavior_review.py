@@ -7,18 +7,16 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 import json
 import re
-import subprocess
 import sys
 from typing import cast
 from unicodedata import category
 
-from scripts.agents import catch_up
 from scripts.astra import astra_review, astra_roles, astra_work
 from scripts.direct import pass_record, progress_history, recorder_state
-from scripts.lib import file_lock, transcripts, unit_runs, urgency
+from scripts.lib import file_lock, unit_runs, urgency
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
-from scripts.production import behavior_check, staff, update_registration, worker
+from scripts.production import behavior_check, behavior_request, staff, update_registration, worker
 from scripts.production.production_doc import Refusal
 from scripts.review_links import review_events
 
@@ -34,7 +32,12 @@ class BehaviorEvidence:
 
 @dataclass(frozen=True)
 class NateRequest(BehaviorEvidence):
-    """The change follows Nate's newest words."""
+    """The reviewer found a request. The source proves its words and date."""
+
+
+@dataclass(frozen=True)
+class ClaimedNateRequest(BehaviorEvidence):
+    """The reviewer found a request. The source still needs verification."""
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,7 @@ class NoNateDecision:
 
 
 type BehaviorFinding = NoNateDecision | NateRequest | NateSpecified
+type ReviewFinding = NoNateDecision | ClaimedNateRequest | NateSpecified
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,7 @@ class ReviewPending:
     run: Path
 
 
-def read_findings(text: str) -> dict[str, BehaviorFinding]:
+def read_findings(text: str) -> dict[str, ReviewFinding]:
     try:
         lines = text.strip().splitlines()
         if lines and re.fullmatch(r"DONE \S+", lines[-1]):
@@ -66,7 +70,7 @@ def read_findings(text: str) -> dict[str, BehaviorFinding]:
         result = cast(object, json.loads(payload))
         if not isinstance(result, list):
             raise ValueError("expected a list of findings")
-        findings: dict[str, BehaviorFinding] = {}
+        findings: dict[str, ReviewFinding] = {}
         for value in cast(list[object], result):
             if not isinstance(value, dict):
                 raise ValueError("expected an object for each finding")
@@ -79,7 +83,7 @@ def read_findings(text: str) -> dict[str, BehaviorFinding]:
                     path = Path(source)
                     if not path.is_absolute() or not quote.strip() or not change.strip() or len(change.splitlines()) != 1:
                         raise ValueError(f"{test}: expected a quote, an absolute source path and one line about the change")
-                    evidence = NateRequest if kind == "requested" else NateSpecified
+                    evidence = ClaimedNateRequest if kind == "requested" else NateSpecified
                     finding = evidence(test, quote, path, date.fromisoformat(day), change.strip())
                 case _:
                     raise ValueError("invalid finding")
@@ -91,40 +95,22 @@ def read_findings(text: str) -> dict[str, BehaviorFinding]:
     return findings
 
 
-def source_quotes(path: Path, quotes: set[str]) -> set[str]:
-    """Find exact quotes in a text file or in user turns of a transcript."""
-    try:
-        if transcripts.uncompressed_path(path).suffix != ".jsonl":
-            if not path.is_file():
-                return set()
-            text = path.read_text(encoding="utf-8")
-            return {quote for quote in quotes if quote in text}
-        source = transcripts.transcript_source(path)
-        if not source.is_file():
-            return set()
-        missing = quotes.copy()
-        with transcripts.open_transcript(source) as stream:
-            for line in stream:
-                for block in catch_up.record_blocks(line, user_prompts=True):
-                    if block.label == "user":
-                        missing = {quote for quote in missing if quote not in block.text}
-                if not missing:
-                    break
-        return quotes - missing
-    except (OSError, UnicodeError, subprocess.CalledProcessError):
-        return set()
-
-
-def verify_requests(findings: Iterable[BehaviorFinding]) -> list[BehaviorFinding]:
+def verify_requests(findings: Iterable[ReviewFinding]) -> list[BehaviorFinding]:
     rows = list(findings)
     quotes: dict[Path, set[str]] = {}
     for finding in rows:
-        if isinstance(finding, NateRequest):
+        if isinstance(finding, ClaimedNateRequest):
             quotes.setdefault(finding.source, set()).add(finding.quote)
-    verified = {source: source_quotes(source, words) for source, words in quotes.items()}
-    return [NateSpecified(finding.test, finding.quote, finding.source, finding.day, finding.change)
-            if isinstance(finding, NateRequest) and finding.quote not in verified[finding.source] else finding
-            for finding in rows]
+    verified = {source: behavior_request.verified_dates(source, words) for source, words in quotes.items()}
+    results: list[BehaviorFinding] = []
+    for finding in rows:
+        if not isinstance(finding, ClaimedNateRequest):
+            results.append(finding)
+        elif (day := verified[finding.source].get(finding.quote)) is not None:
+            results.append(NateRequest(finding.test, finding.quote, finding.source, day, finding.change))
+        else:
+            results.append(NateSpecified(finding.test, finding.quote, finding.source, finding.day, finding.change))
+    return results
 
 
 def parse_reply(text: str, tests: behavior_check.ChangedTests) -> list[BehaviorFinding]:
@@ -182,6 +168,9 @@ Return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Use "requested" only when Nate's newest words on the behavior ask for this change.
 Use "specified" when the change departs from those words or you cannot tell whether it follows them.
+For "requested", cite a typed Claude turn or an answer by Nate in a List or Question record.
+Quote a complete sentence or line. Use its source date.
+Use "specified" when you cannot cite one of these sources.
 Use {{"test":"ID","finding":"requested","quote":"exact words","source":"/absolute/path",
 "date":"YYYY-MM-DD","change":"how the behavior changes"}}
 Use the same fields for "specified".
@@ -518,11 +507,10 @@ def status(key: str) -> int:
             record = refresh_answer(key, record)
         elif isinstance(record, behavior_check.Clear):
             try:
-                findings = read_findings(read_clear_reply(key, record))
+                evidence = verify_requests(read_findings(read_clear_reply(key, record)).values())
             except (behavior_check.BehaviorCheckError, OSError, ValueError):
-                return report(key, record)
-            evidence = verify_requests(findings.values())
-            if any(isinstance(finding, NateSpecified) for finding in evidence):
+                evidence = []
+            if not evidence or any(isinstance(finding, NateSpecified) for finding in evidence):
                 print(f"{key}: the saved approval has no valid proof.")
                 return 1
             return report(key, record, (finding for finding in evidence if isinstance(finding, NateRequest)))
