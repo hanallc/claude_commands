@@ -41,6 +41,7 @@ ANSWERS = {"approved": "your image is approved.", "feedback": "your image is not
 # A page loaded before the answer buttons existed can still post delete.
 ACTIONS = frozenset(("delete", "question", "retry", *ANSWERS))
 ANSWER_PREFIX = "From the user (via the Images page): "
+STALE_ANSWER = "This page is stale. Review the new answer and try again."
 _DECISION_FILE = re.compile(r"([0-9a-f]{12})-[0-9a-f]{64}\.json")
 
 
@@ -159,6 +160,8 @@ def _signed_answer_key(saved: image_store.ImageAnswers, signed: image_store.Sign
     fields = [saved["id"], saved["registered_at"], signed["round_id"], signed["answer"], signed["feedback"]]
     if "previous_answer_key" in signed:
         fields.append(signed["previous_answer_key"])
+    if "form_request_key" in signed:
+        fields.append(signed["form_request_key"])
     return "review:" + hashlib.sha256(json.dumps(fields).encode()).hexdigest()
 
 
@@ -173,7 +176,7 @@ def _save_image_decision(root: Path, saved: image_store.ImageAnswers, signed: im
     path = folder / f"{identity}-{key}.json"
     if path.is_symlink():
         raise OSError(f"{path}: Expected an Images answer file.")
-    if not path.exists() and "previous_answer_key" not in signed:
+    if not path.exists() and "previous_answer_key" not in signed and "form_request_key" not in signed:
         # Keep old evidence at the path that reviewers can already cite.
         old_key = hashlib.sha256(json.dumps((saved["registered_at"], signed["round_id"])).encode()).hexdigest()
         old_path = folder / f"{identity}-{old_key}.json"
@@ -631,23 +634,22 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
     attempts = saved["attempts"]
     answer, feedback, round_id = draft.action, draft.words, draft.round_id
     signed_form = origin is _ImageAnswerOrigin.SIGNED_FORM
-    has_request = signed_form and bool(draft.request_id)
-    form_retry = draft.form_attempt_key(folder, saved) if has_request else None
+    form_key = draft.request_key(folder, saved) if signed_form and draft.request_id else ""
+    form_retry = draft.form_attempt_key(folder, saved) if form_key else None
+    answered: set[str] = answered_question_ids(record) if record is not None else set()
+    current_round = feedback_round(answered) if record is not None else saved.get("deleted_feedback_round")
     if retry_key is not None:
         if record is not None or retry_key not in attempts:
             raise question_record.AnswerRefused("no saved answer for this removed picture")
         key = retry_key
     elif form_retry is not None:
         if not draft.matches_answer(attempts[form_retry]):
-            raise question_record.AnswerRefused("This page is stale. Review the new answer and try again.")
+            raise question_record.AnswerRefused(STALE_ANSWER)
         key = form_retry
     else:
-        key = draft.key(folder, saved)
-        if signed_form and round_id is not None:
-            current_round = (feedback_round(answered_question_ids(record)) if record is not None
-                             else saved.get("deleted_feedback_round"))
-            if current_round is not None and round_id != current_round:
-                raise question_record.AnswerRefused("This page is stale. Review the new answer and try again.")
+        if signed_form and round_id is not None and current_round is not None and round_id != current_round:
+            raise question_record.AnswerRefused(STALE_ANSWER)
+        key = form_key or draft.key(folder, saved)
     attempt: image_store.ImageAnswer | None = attempts.get(key)
     stale_round = False
     if attempt is None:
@@ -664,28 +666,33 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
             try:
                 previous = set(legacy.read_text(encoding="utf-8").splitlines())
             except FileNotFoundError:
-                previous = answered_question_ids(record)
+                previous = answered
                 stale_round = not signed_form and round_id is not None and round_id != feedback_round(previous)
             message = answer_message(record, answer, feedback)
         attempt = {"message": message, "words": _answer_words(identity, answer, feedback), "answered": sorted(previous),
                    "recipients": [], "confirmed": []}
     new_proof = False
     if signed_form and retry_key is None and form_retry is None:
-        signed = _signed_answer_for_submission(attempt, saved, draft)
-        signed_key = next((key for key, entry in attempts.items() if entry.get("signed_answer") == signed),
-                          draft.key(folder, saved, signed))
-        if signed_key != key:
-            key = signed_key
-            attempt = attempts.get(key) or {"message": attempt["message"], "words": _answer_words(identity, answer, feedback),
-                                            "answered": attempt["answered"], "recipients": [], "confirmed": []}
-        new_proof = attempt.get("signed_answer") != signed
+        if form_key:
+            proof: image_store.SignedImageAnswer = {
+                "answer": answer, "feedback": feedback, "time": datetime.now(UTC).isoformat(),
+                "round_id": current_round or round_id or feedback_round(answered), "form_request_key": form_key,
+            }
+        else:
+            proof = _signed_answer_for_submission(attempt, saved, draft)
+            signed_key = next((key for key, entry in attempts.items() if entry.get("signed_answer") == proof),
+                              draft.key(folder, saved, proof))
+            if signed_key != key:
+                key = signed_key
+                attempt = attempts.get(key) or {"message": attempt["message"], "words": _answer_words(identity, answer, feedback),
+                                                "answered": attempt["answered"], "recipients": [], "confirmed": []}
+        new_proof = attempt.get("signed_answer") != proof
         if new_proof:
-            attempt["signed_answer"] = signed
+            attempt["signed_answer"] = proof
     new_attempt = key not in attempts
     if stale_round and new_attempt:
         raise question_record.AnswerRefused("The image has a new answer. Review the answer and try again.")
     request_keys = attempt.get("form_request_keys", [])
-    form_key = draft.request_key(folder, saved) if has_request else ""
     new_request = bool(form_key) and form_key not in request_keys
     if new_request:
         attempt["form_request_keys"] = [*request_keys, form_key]
@@ -856,6 +863,7 @@ const notice = document.querySelector('[data-image-notice]');
 let list = document.querySelector('[data-images]');
 const motion = createCardMotion(() => list);
 let refreshRequest = 0;
+let staleAnswerNotice = '';
 const refreshSeconds = () => list.dataset.refreshSeconds;
 const imageLink = () => new URLSearchParams(location.hash.slice(1));
 function apply() {
@@ -1016,6 +1024,10 @@ async function submit(event) {
     showActionFailure(status, state.draftError);
     return;
   }
+  if (staleAnswerNotice) {
+    staleAnswerNotice = '';
+    showActionFailure(actionFailure);
+  }
   const {retryAction, retryRound, requestId} = draft ?? {};
   const body = new URLSearchParams(new FormData(form, event.submitter));
   if (key) {
@@ -1048,12 +1060,13 @@ async function submit(event) {
   saveDrafts();
   const card = form.closest('article');
   const hold = holdCard(card, hidden => { if (hidden) apply(); });
-  let postFailed = false, retryable = true;
+  let postFailed = false, retryable = true, staleAnswer = false;
   try {
     const response = await hold.post(location.pathname, {method: 'POST', body}, card.dataset.sendReceiver);
     if (!response.ok) {
       retryable = response.status >= 500;
       const reason = await response.json().then(body => body.reason, () => '');
+      staleAnswer = response.status === 400 && reason === __STALE_ANSWER__;
       throw new Error(reason || 'HTTP ' + response.status);
     }
     const result = question ? {} : await response.json().catch(() => ({}));
@@ -1088,7 +1101,12 @@ async function submit(event) {
     postFailed = true;
     const undone = error instanceof SendUndone;
     const message = undone ? error.message : 'Not sent: ' + error.message;
-    if (request.key) state.attempts.set(request.key, message);
+    if (staleAnswer && !request.key) {
+      clearDraft(state, edit);
+      card.remove();
+      staleAnswerNotice = message;
+      showActionFailure(actionFailure, message);
+    } else if (request.key) state.attempts.set(request.key, message);
     else {
       state.draftError = message;
       if ((!retryable || undone) && !question && state.revision === request.revision) {
@@ -1134,7 +1152,7 @@ async function refresh(_supersede=false,current=()=>true) {
       return;
     }
     const facts = pageRefreshFacts(page);
-    showActionFailure(actionFailure);
+    showActionFailure(actionFailure, staleAnswerNotice);
     restoreForms(fresh, previous);
     const top = scrollY;
     const wasWaiting = !waiting.hidden;
@@ -1173,7 +1191,7 @@ bind(list);
 // An image link opens its image at once.
 apply();
 scrollToLinkedImage();
-})();"""
+})();""".replace('__STALE_ANSWER__', json.dumps(STALE_ANSWER))
 SCRIPT_VERSION = change_page.script_version(SCRIPT + page_frame.ZOOM_SCRIPT + page_frame.ZOOM_STYLE)
 
 

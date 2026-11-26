@@ -937,18 +937,38 @@ class ImagesTests(ImagesFixture):
         self.assertEqual({decision.feedback for decision in decisions if isinstance(decision, images.ImageDecision)},
                          {"Keep the red row.", "Remove the red row."})
 
-    def test_linked_forms_with_or_without_a_round_share_one_list_entry(self) -> None:
+    def test_fresh_form_request_without_a_round_sends_in_the_current_round(self) -> None:
         keeper, _, item = self.list_item()
         record = images.register(self.shot, "Check the rows", self.owner_id(), "Phase check", list_item=item.id)
-        body = self.feedback_body(record, "Keep the red row.")
-        self.submit(body + f"&feedback_round={images.feedback_round(set())}&answer_request=" + "a" * 32)
-        self.submit(body + "&answer_request=" + "b" * 32)
-        answer = image_store.read_answers(images.images_root(self.root), record["id"])
-        self.assertEqual(len(answer["attempts"]), 1)
+        identity = record["id"]
+        change_page.deliver(images.ask_question(self.root, identity, "Which check passed?", self.status), self.status)
+        self.sent.clear()
+        body = self.feedback_body(record, "Keep the red row.") + "&answer_request="
+        first = body + "a" * 32
+        self.submit(first)
+        first_round = images.feedback_round(set())
+        self.submit(first + f"&feedback_round={first_round}")
         self.assertEqual(len(self.sent), 2)
+
+        images.answer_question(self.root, identity, "Q1", "The gate passed.")
+        current_round = images.feedback_round({"Q1"})
+        second = body + "b" * 32
+        self.submit(second)
+        self.assertEqual(len(self.sent), 4)
+        self.submit(second + f"&feedback_round={current_round}")
+        self.assertEqual(len(self.sent), 4)
+        self.submit(body + "c" * 32)
+
+        attempts = image_store.read_answers(images.images_root(self.root), identity)["attempts"]
+        self.assertEqual(len(attempts), 3)
+        rounds = [attempt["signed_answer"]["round_id"] for attempt in attempts.values() if "signed_answer" in attempt]
+        self.assertEqual(rounds, [first_round, current_round, current_round])
+        self.assertEqual(len(self.sent), 6)
         saved = the_list.load(keeper.id, item.id)
-        entry, = (entry for entry in saved.log if isinstance(entry, the_list.ImageAnswerChange))
-        self.assertIn("Keep the red row.", entry.what)
+        entries = [entry for entry in saved.log if isinstance(entry, the_list.ImageAnswerChange)]
+        self.assertEqual(len({entry.key for entry in entries}), 3)
+        for entry in entries:
+            self.assertIn("Keep the red row.", entry.what)
 
     def test_retry_of_an_older_form_request_finishes_its_original_attempt(self) -> None:
         record = self.register()
@@ -1760,6 +1780,50 @@ class ImageQuestionTests(ImagesFixture):
             self.submit(keep)
         paths = images.decision_root(self.root).glob(f"{identity}-*.json")
         self.assertEqual(len(list(paths)), 3)
+
+    @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
+    def test_browser_discards_a_stale_draft_when_the_image_is_already_answered(self) -> None:
+        record = self.register("Stale fixture")
+        _ = self.register("Other fixture")
+        page = images.render(self.status)
+        self.ask(record)
+        identity = record["id"]
+        images.answer_question(self.root, identity, "Q1", "The gate passed.")
+        token = images.request_token(images.console_token(self.root), identity)
+        body = {"image": identity, "token": token, "action": "feedback", "feedback": "Remove the red row.",
+                "feedback_round": images.feedback_round({"Q1"})}
+        self.submit(urlencode(body))
+        stale = {**body, "feedback": "Keep the red row.", "feedback_round": images.feedback_round(set())}
+        with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale") as refusal:
+            self.submit(urlencode(stale))
+        fresh = json.dumps(images.render(self.status).decode()).replace("<", r"\u003c")
+        error = json.dumps({"reason": str(refusal.exception)})
+        probe = r'''
+async (find, whenPageShows, check) => {
+ const realFetch = window.fetch.bind(window);
+ window.fetch = (url, options) => {
+  if (url !== location.pathname) return realFetch(url, options);
+  if (options?.method === 'POST') return Promise.resolve(new Response(ERROR_BODY, {status: 400}));
+  return Promise.resolve(new Response(FRESH_PAGE));
+ };
+ const oldList = document.querySelector('[data-images]');
+ const stale = find('Stale fixture');
+ const form = stale.querySelector('form');
+ form.elements.feedback.value = 'Keep the red row.';
+ find('Other fixture').querySelector('textarea').value = 'Keep this draft.';
+ form.requestSubmit(form.querySelector('button[value=feedback]'));
+ await whenPageShows('the refreshed list', () => !oldList.isConnected);
+ check(!document.getElementById(stale.id), 'The refresh removes the stale form.');
+ check(![...document.querySelectorAll('textarea')].some(field => field.value === 'Keep the red row.'),
+       'The refresh discards the stale words.');
+ const drafts = sessionStorage.getItem('images.answer-drafts:' + location.pathname) ?? '';
+ check(!drafts.includes('Keep the red row.'), 'The browser clears the stale draft from storage.');
+ const status = document.getElementById('image-action-failure');
+ check(!status.hidden && status.textContent.includes('This page is stale'), 'The page shows the refusal.');
+ check(find('Other fixture').querySelector('textarea').value === 'Keep this draft.', 'The other draft remains.');
+}'''.replace("ERROR_BODY", json.dumps(error)).replace("FRESH_PAGE", fresh)
+        script = f"<script>{self.question_probe(probe)}</script>".encode()
+        self.assertEqual(firefox_probe_results(page.replace(b"</body>", script + b"</body>")), [[]])
 
     def test_confirmed_feedback_retry_hides_the_image_after_a_failed_write(self) -> None:
         record = self.register()
