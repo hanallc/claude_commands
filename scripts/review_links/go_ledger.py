@@ -1,4 +1,4 @@
-"""Keep one ledger record for each Go that nate presses on the List page."""
+"""Keep one ledger record for each Go that nate presses in the Studio."""
 from __future__ import annotations
 
 import errno
@@ -12,7 +12,7 @@ from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 from scripts.lib import atomic_file, file_lock
 from scripts.production import staff, the_list
@@ -41,6 +41,7 @@ class GoRecord(TypedDict):
     used: bool
     sent: dict[str, bool]
     reported: dict[str, bool]
+    origin: NotRequired[Literal["Studio"]]
 
 
 class GoCheckAnswer(TypedDict):
@@ -98,7 +99,8 @@ def _read(path: Path) -> GoRecord:
     value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
     states = [fields.get(name) for name in ("sent", "reported")]
-    if (fields.keys() != GoRecord.__annotations__.keys() or not isinstance(fields["used"], bool)
+    if (fields.keys() - {"origin"} != GoRecord.__annotations__.keys() - {"origin"}
+            or ("origin" in fields and fields["origin"] != "Studio") or not isinstance(fields["used"], bool)
             or not all(isinstance(text, str) for name, text in fields.items() if name not in ("used", "sent", "reported"))
             or not all(isinstance(state, dict) and all(isinstance(name, str) and isinstance(done, bool)
                                                        for name, done in cast(dict[object, object], state).items())
@@ -147,7 +149,8 @@ def record(root: Path, *, ask: the_list.Ask, item: str, recipients: Iterable[sta
     """Write the unused, unsent record before the List saves the Go."""
     entry: GoRecord = {"go_id": secrets.token_hex(16), "ask": ask.ask_id, "item": item, "target": ask.target,
                        "what": ask.what, "time": moment.isoformat(), "client": client, "page": page, "used": False,
-                       "sent": dict.fromkeys(recipients, False), "reported": dict.fromkeys(recipients, False)}
+                       "sent": dict.fromkeys(recipients, False), "reported": dict.fromkeys(recipients, False),
+                       "origin": "Studio"}
     path = _path(root, entry["go_id"])
     with locked(root):
         if not atomic_file.create_text_atomic(path, json.dumps(entry, ensure_ascii=False)):
@@ -205,10 +208,11 @@ def check(root: Path, go_id: str, caller: str) -> GoCheckAnswer:
         return {"ok": True, "text": entry["what"]}
 
 
-def message(item: the_list.ListItem, ask: the_list.Ask, go_id: str, agent: str) -> str:
+def message(item: the_list.ListItem, ask: the_list.Ask, entry: GoRecord, agent: str) -> str:
     """Name what nate approved; carry only the go id and the check command."""
     button = "Go" if ask.kind is the_list.AskKind.GO else "Approved"
-    return (f"List page: nate pressed {button} for item {item.number}.\n"
+    go_id = entry["go_id"]
+    return (f"{entry.get('origin', 'List page')}: nate pressed {button} for item {item.number}.\n"
             + f"What: {ask.what}\n"
             + f"For: {agent}. Only {agent} can use it, once.\n"
             + f"Go id: {go_id}\n"

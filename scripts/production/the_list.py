@@ -273,6 +273,11 @@ class NoAdditionalRecipient(Enum):
     ABSENT = "absent"
 
 
+class PageNoticeOrigin(StrEnum):
+    LIST_PAGE = "List page"
+    STUDIO = "Studio"
+
+
 @dataclass(frozen=True)
 class PageFeedback:
     request: str
@@ -286,6 +291,7 @@ class PageFeedback:
     recipient: FeedbackRecipient = LegacyFeedbackRecipient.KEEPER
 
     additional_recipient: staff.StaffId | NoAdditionalRecipient = NoAdditionalRecipient.ABSENT
+    origin: PageNoticeOrigin = PageNoticeOrigin.LIST_PAGE
 
     def key(self) -> PageRequest:
         return PageRequest(self.request, self.action, self.words, self.form_words, self.parked_until)
@@ -311,6 +317,7 @@ class PageItemNotice:
     form_words: str = ""
     parked_until: Parking = NoTimestamp.UNSET
     recipient: FeedbackRecipient = LegacyFeedbackRecipient.KEEPER
+    origin: PageNoticeOrigin = PageNoticeOrigin.LIST_PAGE
 
 
 class AskKind(StrEnum):
@@ -1843,6 +1850,8 @@ def _log_content(content: LogContent) -> dict[str, object]:
             fields["recipient"] = staff_id(content.recipient, "feedback recipient")
         if content.additional_recipient is not NoAdditionalRecipient.ABSENT:
             fields["additional_recipient"] = staff_id(content.additional_recipient, "additional feedback recipient")
+        if content.origin is PageNoticeOrigin.STUDIO:
+            fields["origin"] = content.origin
         return {"feedback": fields}
     if isinstance(content, QuestionRequestReceipt):
         return {"receipt": {**_request_fields(content.request), "question_id": _question_id(content.question_id)}}
@@ -2705,7 +2714,7 @@ def _change(keeper: staff.StaffId, identity: str, edit: Callable[[ListItem, date
             if entries and isinstance(page_action, PageItemNotice):
                 pending = PageFeedback(page_action.request, page_action.words, action=page_action.action,
                                        form_words=request.form_words, parked_until=request.parked_until,
-                                       recipient=page_action.recipient)
+                                       recipient=page_action.recipient, origin=page_action.origin)
                 if page_action.action == ReportVerdict.NOT_FIXED:
                     assert not isinstance(item.owner, UnassignedOwner)
                     pending = replace(pending, recipient=item.producer, additional_recipient=item.owner)
@@ -2766,7 +2775,7 @@ def check_report(keeper: staff.StaffId, identity: str, verdict: ReportVerdict, w
             raise RepairCheckRefused(request, "Assign an owner before sending Not fixed.")
         return replace(item, state=state, next_step="")
 
-    action = (PageItemNotice(request, words, ReportVerdict.NOT_FIXED)
+    action = (PageItemNotice(request, words, ReportVerdict.NOT_FIXED, origin=PageNoticeOrigin.STUDIO)
               if verdict is ReportVerdict.NOT_FIXED else PageRequest(request, ReportVerdict.WORKS, ""))
     result = _change(keeper, identity, check, FieldChange("Updated", {"state": state, "next_step": ""}), PAGE_SOURCE,
                      unread=False, page_action=action)
@@ -3989,7 +3998,7 @@ def _next_step_notice(keeper: staff.StaffId, request: str, done: str, item: List
     name = shlex.quote(producer.name if producer is not None else item.producer)
     default_keeper = record_store.list_keeper(conf.read_or_repository("console"), members)
     keeper_option = "" if default_keeper is not None and keeper == default_keeper.id else f" --keeper {shlex.quote(keeper)}"
-    words = (f"List page: {done} item {item.number}, so it is now Working. Write its next step: "
+    words = (f"Studio: {done} item {item.number}, so it is now Working. Write its next step: "
              + f"`{_LAUNCHER} update --id {item.id}{keeper_option} --source {name} --next-step \"<step>\"`.")
     return PageFeedback(request, words, action="read", form_words=form_words, recipient=item.producer)
 
@@ -4044,13 +4053,14 @@ def _read_page_activity(fields: dict[str, object], source: str, *, receipt: bool
         raise ListError("invalid List feedback action")
     recipient = _field_text(fields.get("recipient", ""), "feedback recipient")
     additional = _field_text(fields.get("additional_recipient", ""), "additional feedback recipient")
+    origin = PageNoticeOrigin(_field_text(fields.get("origin", PageNoticeOrigin.LIST_PAGE), "feedback origin"))
     return PageFeedback(request, words, state, alerted_to,
                         UnreadUpdate(target) if target else NoUnreadUpdate.ABSENT,
                         ReportVerdict.NOT_FIXED if action == "not works" else action,
                         form_words, parked_until,
                         recipient=staff_id(recipient, "feedback recipient") if recipient else LegacyFeedbackRecipient.KEEPER,
                         additional_recipient=(staff_id(additional, "additional feedback recipient")
-                                              if additional else NoAdditionalRecipient.ABSENT))
+                                              if additional else NoAdditionalRecipient.ABSENT), origin=origin)
 
 
 def _page_requests(item: ListItem) -> dict[str, PageActivity]:
@@ -4108,6 +4118,9 @@ def _previous_page_request(
                     target = _request_parking(recorded[0])
             if target != request.parked_until:
                 raise ListError("this request already has a different parking time")
+            if key.form_words != request.form_words:
+                raise ListError("this request already has a different action or words")
+        elif key.action == request.action == "unpark":
             if key.form_words != request.form_words:
                 raise ListError("this request already has a different action or words")
         elif key != request:
