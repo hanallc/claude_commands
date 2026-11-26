@@ -458,7 +458,7 @@ class MacTests(unittest.TestCase):
         self.assertEqual(seen[0][-2], "natedev")
         self.assertEqual(seen[0][-1], silence.REMOTE + " on --until '2026-10-21 07:00'")
 
-    def test_a_drop_asks_natedev_and_drops_nothing_when_natedev_cannot_answer(self) -> None:
+    def test_a_drop_distinguishes_remote_failure_from_an_empty_queue(self) -> None:
         asked: list[tuple[list[str], str]] = []
 
         def asker(answer: tuple[int, str]) -> silence.Ask:
@@ -469,10 +469,11 @@ class MacTests(unittest.TestCase):
 
         self.assertEqual(silence.drop("stall-watch", "stall-watch:prompt:x y", "Darwin", asker((0, "2\n"))), 2)
         self.assertEqual(asked[0], ([*silence.SSH, silence.REMOTE + " drop --source stall-watch --key 'stall-watch:prompt:x y'"], ""))
+        self.assertEqual(silence.drop("stall-watch", "k", "Darwin", asker((0, "0\n"))), 0)
         for answer in ((255, ""), (0, "not a number\n")):
-            with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as errors:
-                self.assertEqual(silence.drop("stall-watch", "k", "Darwin", asker(answer)), 0)
-            self.assertIn("natedev could not be asked to drop k", errors.getvalue())
+            with (self.subTest(answer=answer),
+                  self.assertRaisesRegex(silence.RemoteDropFailed, "did not confirm the drop for k")):
+                _ = silence.drop("stall-watch", "k", "Darwin", asker(answer))
 
 
 if __name__ == "__main__":

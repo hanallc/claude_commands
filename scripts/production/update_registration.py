@@ -1416,10 +1416,14 @@ def _write_question_text(record: QuestionRecord, text: str | None,
     identity = _numbered_question_id(record)
     if not identity:
         write_text_atomic(record.path, text)
-        return
-    sequence = nullcontext(numbers) if numbers is not None else question_numbers()
-    with sequence as locked, locked.write(record.path, identity, record.owner):
-        write_text_atomic(record.path, text)
+    else:
+        sequence = nullcontext(numbers) if numbers is not None else question_numbers()
+        with sequence as locked, locked.write(record.path, identity, record.owner):
+            write_text_atomic(record.path, text)
+    if record.status == "closed":
+        from scripts.notify import question_pushes
+
+        question_pushes.answer_saved(record.path)
 
 
 def _question_text(record: QuestionRecord, *, new_record: bool = False) -> str | None:
