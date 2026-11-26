@@ -3521,9 +3521,9 @@ def _save_and_file_change_reply(status: DeliveryStatus, page: ReviewPage, row: s
         members = staff.snapshot()
         current = _change_answer_item(status, page, row, members)
         if current is not None:
-            file_saved_review = cast(Callable[[review_items.ReviewItem, staff.StaffSnapshot], None],
+            file_saved_review = cast(Callable[[review_items.ReviewItem, staff.StaffSnapshot, Path], None],
                                      import_module("scripts.review_links.answer_sources").file_saved_review)
-            file_saved_review(current, members)
+            file_saved_review(current, members, status.root)
     return changed
 
 
@@ -3544,9 +3544,10 @@ def answer_item(key: str, words: str, question_id: str, status: DeliveryStatus) 
     def file_exchange() -> None:
         with review_items.after_store_write(item.key):
             members = staff.snapshot()
-            file_saved_review = cast(Callable[[review_items.ReviewItem, staff.StaffSnapshot], None],
+            current = review_items.read_current(status.root, item, members)
+            file_saved_review = cast(Callable[[review_items.ReviewItem, staff.StaffSnapshot, Path], None],
                                      import_module("scripts.review_links.answer_sources").file_saved_review)
-            file_saved_review(review_items.read_current(status.root, item, members), members)
+            file_saved_review(current, members, status.root)
     if isinstance(source, (review_items.QuestionSource, review_items.InvestigationSource,
                            review_items.ProposalSource, review_items.EfficiencySource)):
         if isinstance(source, (review_items.QuestionSource, review_items.ProposalSource)):

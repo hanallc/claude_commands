@@ -1517,9 +1517,9 @@ def submit_snapshot(root: Path, snapshot: ReviewSnapshot, fields: dict[str, list
     if isinstance(item.source, review_items.QuestionSource) and outcome == 'answer':
         with review_items.after_store_write(key):
             members = staff.snapshot()
-            file_exchange = cast(Callable[[ReviewItem, staff.StaffSnapshot], None],
+            file_exchange = cast(Callable[[ReviewItem, staff.StaffSnapshot, Path], None],
                                  import_module("scripts.review_links.answer_sources").file_saved_review)
-            file_exchange(review_items.read_current(root, item, members), members)
+            file_exchange(review_items.read_current(root, item, members), members, root)
     if outcome == 'question' and isinstance(delivery, change_page.MessageDelivery) and item.type == ReviewType.QUESTION:
         with review_items.after_store_write(item.key):
             delivery = review_actions.track_question(delivery, key, words, status)

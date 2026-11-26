@@ -5954,6 +5954,24 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(exchange.question, "Which layout?")
         self.assertEqual(exchange.answerer, item.owner)
 
+    def test_change_reply_retry_files_from_an_explicit_review_root(self) -> None:
+        case = self.review_fixture(changes=1)
+        status = change_page.DeliveryStatus(case.root / "explicit")
+        page = change_page.ReviewPage(case.fixture.review_list, case.fixture.production, ("C1",), "")
+        question = status.ask(page, "C1", "Which layout?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        members = staff.snapshot()
+        keeper = record_store.list_keeper(conf.read("console"), members)
+        assert keeper is not None
+        words = "Use the wide layout."
+        saved = status.save_question_answer(page, "C1", question.question_id, words, author=keeper.id)
+        self.assertIsInstance(saved, datetime)
+        self.assertEqual(the_list.records(keeper.id), [])
+        self.assertFalse(change_page.answer_item("page-owner/C1", words, question.question_id, status))
+        item, = the_list.records(keeper.id)
+        exchange, = item.filed_exchanges
+        self.assertEqual((exchange.exchange_id, exchange.question), ("question:" + question.question_id, "Which layout?"))
+
     def test_filed_review_answer_redirects_to_the_saved_studio_item(self) -> None:
         case = self.review_fixture()
         owner = fixture_member("producer", name="item-producer")

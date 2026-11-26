@@ -5,6 +5,7 @@ import argparse
 import sys
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -39,6 +40,7 @@ type ListLink = investigation.ListDestination | LegacyListLink
 class Exchange(list_exchange.Exchange):
     list_links: tuple[ListLink, ...]
     reply_event: ReviewLog | None = field(default=None, compare=False)
+    mirrored_slot_exchange_id: str = field(default="", compare=False)
 
 
 type ReloadExchanges = Callable[[], Iterable[Exchange]]
@@ -194,55 +196,58 @@ def _scoped_log_exchanges(item: review_items.ReviewItem, key: str, links: tuple[
              if prompt.identity.startswith("question:")}
     slot = source.slots.question if isinstance(source, review_items.ChangeSource) else delivery_state.NoQuestion()
     slot_prompt: _LoggedQuestion | None = None
-    if isinstance(slot, delivery_state.AnsweredQuestion) and not isinstance(slot, review_items.CompletedFeedback):
-        legacy = next((prompt.time for prompt in reversed(tuple(prompts.values()))
-                       if prompt.identity.startswith("log:") and prompt.text == slot.text), item.times.filed)
+    legacy_slot = False
+    if (isinstance(source, review_items.ChangeSource) and isinstance(slot, delivery_state.AnsweredQuestion)
+            and not isinstance(slot, review_items.CompletedFeedback)):
         original = named.get(slot.question_id)
-        slot_prompt = _LoggedQuestion("question:" + slot.question_id, slot.text,
-                                      legacy if original is None else original.time)
+        slot_prompt = original or _LoggedQuestion("question:" + slot.question_id, slot.text, item.times.filed)
+        legacy_slot = original is None and not source.answered_by and not isinstance(source.answered_at, datetime)
         named[slot.question_id] = slot_prompt
-    slot_reply_position = -1
-    if slot_prompt is not None and isinstance(slot, delivery_state.AnsweredQuestion):
-        tagged = {slot.question_id, question_path.answer_log_id(slot.question_id)}
-        matching = [index for index, event in enumerate(log) if event.words == "Answer: " + slot.answer
-                    and event.who != Nate.USER and event.feedback_request_id in (*tagged, "")]
-        exact = [index for index in matching if log[index].feedback_request_id in tagged]
-        legacy = [index for index in matching if not log[index].feedback_request_id]
-        if exact:
-            slot_reply_position = exact[0]
-        elif len(legacy) == 1:
-            slot_reply_position = legacy[0]
+    tagged_answers = {"question:" + event.feedback_request_id.removeprefix("answer:") for event in log
+                      if event.feedback_request_id and event.who != Nate.USER
+                      and event.words.startswith("Answer: ") and event.words.removeprefix("Answer: ").strip()}
+    last_answer_position = -1
+    if legacy_slot:
+        last_answer_position = max((index for index, event in enumerate(log)
+                                    if event.who != Nate.USER and event.words.startswith("Answer: ")), default=-1)
     seen: set[str] = set()
-    matched_slot = False
+    logged_legacy_slot = False
     for index, event in enumerate(log):
         label, _, words = event.words.partition(": ")
         if index in prompts:
-            pending = prompts[index] if not event.feedback_request_id else None
+            pending = prompts[index]
             continue
         if event.who == Nate.USER and label.lower() in ("answer", "approve", "decline", "feedback",
                                                         "feedback sent", "marked read", "read"):
             pending = None
         if label != "Answer" or event.who == Nate.USER or not words.strip():
             continue
-        if index == slot_reply_position:
-            prompt = slot_prompt
-        elif event.feedback_request_id:
+        if event.feedback_request_id:
             prompt = named.get(event.feedback_request_id.removeprefix("answer:"))
+            if pending == prompt:
+                pending = None
         else:
             prompt, pending = pending, None
+            if prompt is not None and prompt.identity in tagged_answers:
+                continue
         if prompt is None or prompt.identity in seen:
             continue
         seen.add(prompt.identity)
-        matched_slot = matched_slot or prompt == slot_prompt
+        mirrored_slot_exchange_id = ""
+        # A complete legacy log exchange keeps its ID when an old slot repeats its text.
+        if (index == last_answer_position and isinstance(slot, delivery_state.AnsweredQuestion)
+                and prompt.identity.startswith("log:") and prompt.text == slot.text and words == slot.answer):
+            logged_legacy_slot = True
+            mirrored_slot_exchange_id = "question:" + slot.question_id
         state = _read_state(event.time, read_times, acknowledged=item.state is review_items.ReviewState.DONE)
         yield Exchange(Source.SCOPED_REPLY, key, prompt.identity, Direction.ANSWER_TO_NATE, prompt.text,
                        prompt.time, Nate.USER, _answerer(event.who, members),
-                       ExchangeAnswer(words, event.time, state), links, event)
-    if (slot_prompt is not None and isinstance(slot, delivery_state.AnsweredQuestion) and not matched_slot):
-        reference = ""
-        if isinstance(source, review_items.ChangeSource):
-            reference = source.answered_by or (source.validators[0] if source.validators else "")
-        answered_at = item.answer_time if isinstance(item.answer_time, datetime) else TimeNotRecorded.ABSENT
+                       ExchangeAnswer(words, event.time, state), links, event, mirrored_slot_exchange_id)
+    if (slot_prompt is not None and isinstance(source, review_items.ChangeSource)
+            and isinstance(slot, delivery_state.AnsweredQuestion) and slot_prompt.identity not in seen
+            and not logged_legacy_slot):
+        reference = source.answered_by or (source.validators[0] if source.validators else "")
+        answered_at = source.answered_at if isinstance(source.answered_at, datetime) else TimeNotRecorded.ABSENT
         answer = ExchangeAnswer(slot.answer, answered_at, _read_state(answered_at, read_times,
                                 acknowledged=item.state is review_items.ReviewState.DONE))
         author = _answerer(reference, members) if reference else RecordedAnswerer("Answerer not recorded")
@@ -472,8 +477,15 @@ class NoExchangeFiling(StrEnum):
 def file_source(plan: FilingPlan, members: staff.StaffSnapshot, reload: ReloadExchanges
                 ) -> investigation.ListDestination | NoExchangeFiling:
     """Read the current source under its filing lock before saving to the List."""
-    key = plan.exchanges[0].source_key
-    with the_list.lock_exchange_source(key) as source:
+    planned = plan.exchanges[0]
+    key = planned.source_key
+    with ExitStack() as locks:
+        if planned.source is Source.STAFF_QUESTION:
+            # Withdrawal holds this lock when it saves the native question.
+            _, owner, _ = key.split("/", 2)
+            path = update_registration.outstanding_path_for_owner(staff.StaffId(owner))
+            _ = locks.enter_context(update_registration.outstanding_lock(path))
+        source = locks.enter_context(the_list.lock_exchange_source(key))
         exchanges = tuple(exchange for exchange in reload()
                           if exchange.source_key == key and (_eligible(exchange) or plan.previously_filed))
         if not exchanges:
@@ -548,7 +560,7 @@ def file_saved_investigation(record: investigation.Investigation) -> None:
         file_saved_review(review_items.investigation_item(record, members, path), members)
 
 
-def file_saved_review(item: review_items.ReviewItem, members: staff.StaffSnapshot, *,
+def file_saved_review(item: review_items.ReviewItem, members: staff.StaffSnapshot,
                       root: Path | None = None) -> None:
     zone = user_zone()
     if not tuple(_review_item_exchanges(item, (), zone, members)):
@@ -619,7 +631,8 @@ def apply_review_handoffs(items: list[review_items.ReviewItem], zone: ZoneInfo, 
             continue
         standalone = (item.type in review_items.QUESTION_TYPES
                       or item.type is review_items.ReviewType.INVESTIGATION)
-        ids = frozenset(exchange.exchange_id for exchange in matched if isinstance(exchange.answer, ExchangeAnswer))
+        ids = frozenset(identity for exchange in matched if isinstance(exchange.answer, ExchangeAnswer)
+                        for identity in (exchange.exchange_id, exchange.mirrored_slot_exchange_id) if identity)
         answer_events: set[int] = set()
         for exchange in matched:
             reply = exchange.reply_event
