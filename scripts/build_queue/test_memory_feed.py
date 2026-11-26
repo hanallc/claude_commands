@@ -1212,17 +1212,17 @@ class MemoryFeedTests(unittest.TestCase):
                         self.assertEqual(send.call_count, 3)
 
     def test_mac_script_sources_report_each_program_once(self) -> None:
-        build = queue_view.MacBuild(410, "/Mac/hana", 100, "cargo build", "hana")
+        build = queue_view.MacBuild(410, "/Mac/hana", 100, "cargo build --api-key fixture-key", "hana")
         record = queue_view.mac_build_record(build)
         nightly = queue_view.mac_build_from_record({**record, "script_source": {
-            "program": "/bin/nightly", "parent_pid": 309, "parent_command": "/bin/zsh nightly.sh"}})
+            "program": "/bin/nightly", "parent_pid": 309, "parent_command": "/bin/zsh nightly.sh 'X-Api-Key: fixture-key'"}})
         retry = replace(nightly, pid=411, started_at=200)
         other = queue_view.mac_build_from_record({**record, "pid": 412, "script_source": {
             "program": "/bin/check", "parent_pid": 310, "parent_command": "/bin/check"}})
         reading = queue_view.MacBuildReading(250, (nightly, retry, other))
 
-        def inline_thread(*, target: Callable[[outage_alerts.AlertClaim, str], None],
-                          args: tuple[outage_alerts.AlertClaim, str], name: str, daemon: bool) -> mock.Mock:
+        def inline_thread(*, target: Callable[[admission_service.SourceAlert], None],
+                          args: tuple[admission_service.SourceAlert], name: str, daemon: bool) -> mock.Mock:
             self.assertEqual(name, "admission-source-refusal")
             self.assertTrue(daemon)
             return mock.Mock(start=lambda: target(*args))
@@ -1236,8 +1236,9 @@ class MemoryFeedTests(unittest.TestCase):
             messages = [cast(str, call.args[1]) for call in send.call_args_list]
             self.assertTrue(all(call.args[0] == "bob" for call in send.call_args_list))
             self.assertIn("Machine: mac.", messages[0])
-            self.assertIn("Process: 410 cargo build. Parent: 309 /bin/zsh nightly.sh.", messages[0])
-            self.assertIn("Parent: 310 /bin/check.", messages[1])
+            self.assertIn("Command: cargo.\nProcess: 410 cargo. Parent: 309 zsh.", messages[0])
+            self.assertNotIn("fixture-key", messages[0])
+            self.assertIn("Parent: 310 check.", messages[1])
             self.assertEqual(outage_alerts.clear_prefix(
                 admission_service.SourceLocation("hana", "/Mac/hana").alert_prefix, time.time() + 1), 2)
 

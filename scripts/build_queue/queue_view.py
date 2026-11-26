@@ -414,7 +414,7 @@ def repository_name(folder):
 
 
 def process_environment(pid):
-    """Read only Cargo paths, CI labels and the queue placement from the Mac environment."""
+    """Read the selected Cargo, CI, placement, and source fields."""
     if sys.platform != "darwin":
         return {}
     try:
@@ -436,7 +436,7 @@ def process_environment(pid):
 
 
 def cargo_environment(data):
-    """Keep only Cargo paths, CI labels and the queue placement from the environment."""
+    """Keep only the selected environment fields."""
     if len(data) < 4:
         return {}
     argc = struct.unpack_from("i", data)[0]
@@ -456,7 +456,7 @@ def cargo_environment(data):
         key, separator, value = field.partition(b"=")
         if separator and key in (b"CARGO_TARGET_DIR", b"CARGO_BUILD_TARGET_DIR", b"CARGO_HOME", b"HOME",
                                  b"RUNNER_NAME", b"GITHUB_JOB", b"MAC_PLACEMENT", b"BUILDLOG_CALL_ID",
-                                 b"CODEX_THREAD_ID", b"CLAUDE_CODE_SESSION_ID"):
+                                 b"CODEX_THREAD_ID", b"CLAUDE_CODE_SESSION_ID", b"HERDR_ENV"):
             selected[os.fsdecode(key)] = os.fsdecode(value)
     return selected
 
@@ -676,11 +676,16 @@ def read_builds(processes=None, records=None, captures=None):
         except Exception:
             origin = "unknown"
         ci_environment = environment if origin == "ci" else {}
-        session = record["session"] or environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
+        agent = environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
+        session = agent or record["session"]
         gate = gate_label(pid, processes, records, ci_uid)
-        source = (direct_build_source(pid, processes)
-                  if not session and origin == "non-ci" and gate != "hana-ci" and not gate.startswith("placement ")
-                  else {})
+        source = {}
+        if origin == "non-ci" and gate != "hana-ci" and not gate.startswith("placement "):
+            if not agent and environment.get("HERDR_ENV"):
+                session = ""
+                source = dict(terminal=True)
+            elif not session:
+                source = direct_build_source(pid, processes)
         try:
             folder = str(Path(folder).resolve())
         except OSError:
@@ -714,7 +719,7 @@ print("rc=0")
 
 def refresh_mac_builds() -> None:
     """Refresh the shared reading from the feed loop at its configured interval."""
-    from scripts.build_queue.admission_service import source_command_text
+    from scripts.build_queue.admission_service import source_observed_program
 
     now = time.time()
     previous = read_mac_builds()
@@ -736,7 +741,7 @@ def refresh_mac_builds() -> None:
                               if isinstance(counter, progress_profile.ProgressCounter) else {})
             if isinstance(source := row.get("script_source"), dict):
                 evidence = cast(dict[str, object], source)
-                evidence["parent_command"] = source_command_text(str(evidence.get("parent_command", "")))
+                evidence["parent_command"] = source_observed_program(str(evidence.get("parent_command", "")))
             builds.append(mac_build_from_record(row))
         reading = MacBuildReading(now, tuple(sorted(builds, key=lambda build: build.started_at)),
                                   unplaced_runs=unplaced, home=str(data.get("home", "")))

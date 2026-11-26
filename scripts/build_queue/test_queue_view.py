@@ -153,7 +153,8 @@ def empty_mac_reading(fixture: QueueFixture) -> None:
 
 
 class MacQueueViewTests(unittest.TestCase):
-    def mac_source_build(self, ancestors: tuple[str, ...], *, agent: str = "", placement: str = "") -> queue_view.MacBuild:
+    def mac_source_build(self, ancestors: tuple[str, ...], *, agent: str = "", placement: str = "",
+                         herdr: str = "", recorded_session: str = "") -> queue_view.MacBuild:
         with QueueFixture(captured=False) as fixture:
             folder = str(fixture.root)
             programs = ("/bin/cargo", *ancestors)
@@ -162,15 +163,17 @@ class MacQueueViewTests(unittest.TestCase):
                 "command": executable + (" build" if index == 0 else ""),
                 "executable": executable, "resident_bytes": 1234, "started_at": NOW,
             } for index, executable in enumerate(programs)}
-            environment = {"CODEX_THREAD_ID": agent, "MAC_PLACEMENT": placement}
+            environment = {"CODEX_THREAD_ID": agent, "MAC_PLACEMENT": placement, "HERDR_ENV": herdr}
+            data = struct.pack("i", 2) + b"/bin/cargo\0\0cargo\0build\0" + b"\0".join(
+                os.fsencode(key + "=" + value) for key, value in environment.items()) + b"\0\0"
             script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
                 f"read_processes = lambda: {processes!r}\n"
                 + "read_captures = lambda processes: {}\n"
                 + "read_gate_records = lambda: {}\n"
                 + f"output = lambda arguments: 'p100\\nn{folder}\\n'\n"
                 + "repository_name = lambda folder: 'hana'\n"
-                + "project_record = lambda folder: dict(recorded_unit='', session='', repository='')\n"
-                + f"process_environment = lambda pid: {environment!r} if pid == 100 else {{}}\n"
+                + f"project_record = lambda folder: dict(recorded_unit='', session={recorded_session!r}, repository='')\n"
+                + f"process_environment = lambda pid: cargo_environment({data!r}) if pid == 100 else {{}}\n"
                 + "print(json.dumps(read_builds()))")
             result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -200,6 +203,14 @@ class MacQueueViewTests(unittest.TestCase):
     def test_mac_multiplexer_under_launchd_is_a_script(self) -> None:
         build = self.mac_source_build(("/bin/zsh", "/opt/homebrew/bin/tmux"))
         self.assertEqual(build.source_name, "script · tmux")
+
+    def test_mac_herdr_pane_without_an_agent_uses_terminal(self) -> None:
+        for recorded_session in ("", "old-agent"):
+            with self.subTest(recorded_session=recorded_session):
+                build = self.mac_source_build(("/bin/zsh", "/opt/homebrew/bin/herdr"), herdr="1",
+                                              recorded_session=recorded_session)
+                self.assertEqual((build.source_name, build.session), ("terminal", ""))
+                self.assertIsNone(build.script_source)
 
     def test_mac_ci_and_placement_keep_their_source(self) -> None:
         ci = self.mac_source_build(("/actions/Runner.Worker",))
@@ -397,7 +408,9 @@ class MacQueueViewTests(unittest.TestCase):
             folder = str(fixture.root)
             for name, marker, environment, session, call, placement in (
                 ("Claude", "", {"CLAUDE_CODE_SESSION_ID": "session-a"}, "session-a", "", ""),
-                ("copy record", "session-b", {"CLAUDE_CODE_SESSION_ID": "other"}, "session-b", "", ""),
+                ("copy record", "session-b", {}, "session-b", "", ""),
+                ("live Claude", "session-b", {"CLAUDE_CODE_SESSION_ID": "other"}, "other", "", ""),
+                ("live Codex", "session-b", {"CODEX_THREAD_ID": "codex-c"}, "codex-c", "", ""),
                 ("Verify", "", {"CODEX_THREAD_ID": "session-c", "BUILDLOG_CALL_ID": "verify-id"}, "session-c", "verify-id", ""),
                 ("no record", "", {}, "", "", ""),
                 ("placed Verify", "", {"CODEX_THREAD_ID": "session-d", "BUILDLOG_CALL_ID": "placed-id",

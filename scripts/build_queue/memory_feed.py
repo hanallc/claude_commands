@@ -4193,11 +4193,12 @@ def notify_mac_script_sources(reading: queue_view.MacBuildReading) -> None:
             continue
         source = admission_service.SourceLocation(build.repository, build.folder)
         command = admission_service.source_command_text(build.command)
-        parent_command = admission_service.source_command_text(script.parent_command)
-        parent = f"{script.parent_pid} {parent_command}"
-        admission_service.start_source_refusal_alert(source, "", script.program, lambda:
-            admission_service.source_refusal_message(source, observed_at=reading.read_at, machine="mac", given="",
-                command=command, process=f"{build.pid} {command}", parent=parent))
+        process = f"{build.pid} {admission_service.source_observed_program(build.command)}"
+        parent = f"{script.parent_pid} {admission_service.source_observed_program(script.parent_command)}"
+        message = admission_service.source_refusal_message(source, observed_at=reading.read_at, machine="mac",
+            given="", command=command, process=process, parent=parent)
+        admission_service.start_source_refusal_alert(
+            admission_service.SourceAlert(source.alert_key("", script.program), message))
 
 
 def main(argv: Sequence[str]) -> int:

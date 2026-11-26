@@ -1268,9 +1268,12 @@ The service refuses new admissions and placements that resolve to this fallback.
 A terminal, CI runner, named timer, or named session can still submit work.
 A showrunner needs no unit.
 The service sends bob one alert per cause through the outage alert ledger.
-The key uses a hash of the repository and folder and a hash of the given ID or name and the command program.
+The first hash in the key uses the repository and the resolved absolute working folder.
+The second hash uses the given ID or name and the command program.
 The key has no process ID or time.
-The sender runs outside the admission pass.
+The sender claims and clears ledger entries outside the admission pass.
+The alert shows the command program and its script path when available.
+The alert shows only the process ID and program for each process.
 A named admission clears all older alerts for that repository and folder.
 The shared name check rejects blank text, dashes, raw IDs, text with `$`, and the fallback label.
 A staff unit uses its own name for priority. A worker uses its parent unit.
@@ -2697,18 +2700,20 @@ The feed uses the source checkout and submitting session from the placement to f
 After the placement leaves the queue, the feed reads the Verify calls in one SQLite query.
 When the index lacks a call, the row shows `unregistered session` until a refresh finds the call.
 The Mac reader records the Verify call ID from `BUILDLOG_CALL_ID`.
-It reads the session from the copy record or the process environment.
+The reader uses a live agent ID before the session from the copy record.
 The decoder also accepts `launcher_session` from older readings when the shared session field is empty or absent.
 A Mac unit row shows the unit in its unit color and the showrunner below it.
 A showrunner's own row shows the showrunner in the showrunner color.
 If the reader and staff lookup find no owner, the row shows the checkout folder name with no small line.
 For a direct non-CI Mac build, the reader uses the agent ID from the process environment when available.
-Without an agent ID or a recorded session, a macOS app ancestor gives the name `terminal`.
+A herdr pane with no live agent ID gives the name `terminal`.
+The reader uses `HERDR_ENV` to identify the pane.
+Without an agent ID or a recorded session, a macOS app ancestor also gives the name `terminal`.
 This rule covers terminal apps and editors such as Zed.
 If the chain reaches launchd with no app ancestor, the row shows `script · <program>`.
 The name comes from the program that launchd started.
-A shell in a multiplexer shows the multiplexer as a script when launchd is the parent of its server.
-The feed sends bob the same alert as a refusal for a script source.
+A shell in another multiplexer shows as a script when launchd starts its server.
+The feed sends bob one alert for that script source.
 It uses the same ledger with an empty ID and the program that launchd started.
 The Step column uses the shared layout.
 The Mac reader identifies hana CI by a `Runner.Worker` or `Runner.Listener` process ancestor.
@@ -2717,7 +2722,7 @@ The Mac build field in the hover shows gate labels such as `user`, `unplaced`, a
 The stage uses a test counter or a running test binary as evidence for `testing`.
 The reader resolves the target folder from Cargo arguments, the process environment, and Cargo configuration.
 It embeds the shared Cargo folder reader in the same Mac reading.
-The Mac kernel supplies only the selected Cargo path environment fields.
+The reader keeps only the selected Cargo, CI, placement, and source fields from the Mac process environment.
 Observed compiler output folders also identify test binaries, as they do in cargo tile.
 The reader resolves symlinks before it compares directory components.
 A test binary under a custom target folder can supply `testing` without a counter.

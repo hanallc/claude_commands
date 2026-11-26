@@ -19,6 +19,7 @@ import io
 import json
 import math
 import errno
+import fcntl
 import os
 from pathlib import Path
 from queue import Queue
@@ -291,9 +292,12 @@ class PlacementStatusTests(unittest.TestCase):
                         account.assert_not_called()
 
     def test_identical_placement_poll_without_identity_uses_the_published_wait(self) -> None:
-        from scripts.build_queue.test_placement import PlacementFixture, local_candidate, placement_request
+        from scripts.build_queue.test_placement import SUBMITTING_SESSION, PlacementFixture, local_candidate, placement_request
 
-        with PlacementFixture() as fixture:
+        member = staff.StaffRow(staff.StaffId("submitter"), "unit", "fixture submitter", staff.StaffRoot(),
+                                current_session=staff.StaffId(SUBMITTING_SESSION.session_id))
+        with (PlacementFixture() as fixture,
+              mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot((member,)))):
             _ = fixture.fixture_owner(os.getpid(), "fixture-peer")
             fixture.hold_starts()
             request = placement_request(fixture)
@@ -4908,6 +4912,7 @@ class OutageClaimTests(unittest.TestCase):
             with fixture.loop_turn():
                 fixture.restart()
                 fixture.server.run_once()
+                _ = fixture.server.alerts.submit(lambda: None).result(timeout=3)
                 fixture.clock.advance(6)
                 fixture.server.run_once()
                 self.assertIsInstance(outage_alerts.claim("build-admission"), outage_alerts.AlertDelivered)
@@ -4917,6 +4922,7 @@ class OutageClaimTests(unittest.TestCase):
                 fixture.clock.advance(1)
                 with mock.patch.object(outage_alerts, "clear", wraps=outage_alerts.clear) as clear:
                     fixture.server.run_once()
+                    _ = fixture.server.alerts.submit(lambda: None).result(timeout=3)
                     fixture.clock.advance(7)
                     fixture.server.run_once()
                 self.assertEqual([call for call in clear.call_args_list if call.args[0] == "build-admission"],
@@ -4931,14 +4937,17 @@ class OutageClaimTests(unittest.TestCase):
                 with fixture.loop_turn():
                     fixture.restart()
                     fixture.server.run_once()
+                    _ = fixture.server.alerts.submit(lambda: None).result(timeout=3)
                     fixture.clock.advance(7)
                     with mock.patch.object(outage_alerts, "clear", side_effect=[failure, True]) as clear, \
                             redirect_stderr(io.StringIO()) as errors:
                         fixture.server.run_once()
+                        _ = fixture.server.alerts.submit(lambda: None).result(timeout=3)
                         self.assertEqual(clear.call_args_list, [mock.call("build-admission", fixture.clock.now())])
                         self.assertEqual(len(errors.getvalue().splitlines()), 1)
                         self.assertIn("cannot clear outage alert", errors.getvalue())
                         fixture.server.run_once()
+                        _ = fixture.server.alerts.submit(lambda: None).result(timeout=3)
                         fixture.server.run_once()
                         self.assertEqual(clear.call_args_list,
                             [mock.call("build-admission", fixture.clock.now())] * 2)
@@ -5083,10 +5092,8 @@ class ReadingAlertTests(unittest.TestCase):
     @staticmethod
     def finish_delivery(fixture: AdmissionFixture) -> None:
         delivery = fixture.server.reading_alert_delivery
-        if isinstance(delivery, service.ReadingAlertDelivery):
-            delivery.thread.join(timeout=3)
-            if delivery.thread.is_alive():
-                raise AssertionError("the stub sender did not finish")
+        if delivery is not None:
+            delivery.result(timeout=3)
 
     def test_one_message_per_unreadable_stretch_and_another_after_recovery(self) -> None:
         with AdmissionFixture() as fixture:
@@ -5182,8 +5189,8 @@ class ReadingAlertTests(unittest.TestCase):
                     self.assertTrue(entered.wait(timeout=2))
                     self.assertEqual(result.rows[0].decision.state, "hold")
                     delivery = fixture.server.reading_alert_delivery
-                    assert isinstance(delivery, service.ReadingAlertDelivery)
-                    self.assertTrue(delivery.thread.is_alive())
+                    assert delivery is not None
+                    self.assertFalse(delivery.done())
                     _ = fixture.run_pass()
                     self.assertIs(fixture.server.reading_alert_delivery, delivery)
                 finally:
@@ -5215,7 +5222,7 @@ class ReadingAlertTests(unittest.TestCase):
                 fixture.clock.advance(2)
                 _ = fixture.run_pass()
                 self.assertIsInstance(fixture.server.reading_hold, service.NoReadingHold)
-                self.assertIsInstance(fixture.server.reading_alert_delivery, service.NoReadingAlertDelivery)
+                self.assertIsNone(fixture.server.reading_alert_delivery)
 
 
 class PlacementRestartTests(unittest.TestCase):
@@ -7100,35 +7107,142 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(fixture.connect(request).replies(), [
                 wire.Refused("Refused: this request names no source. It gives no session id, staff id or name.")])
             self.assertNotIn(request.episode, fixture.server.waiters)
+            _ = fixture.server.alerts.submit(lambda: None).result(timeout=3)
+
+    def test_held_alert_ledger_does_not_delay_refusal_or_grant(self) -> None:
+        for named in (False, True):
+            with self.subTest(named=named), AdmissionFixture() as fixture:
+                request = fixture.request(need=GIB)
+                if not named:
+                    request = replace(request, identity=replace(request.identity, name="", session_id=""))
+                ledger = fixture.root / "alerts.json"
+                released, completed = threading.Event(), threading.Event()
+
+                def claim(_: str) -> outage_alerts.AlertDelivered:
+                    with lock_path.open("a", encoding="utf-8") as other:
+                        fcntl.flock(other, fcntl.LOCK_EX)
+                    completed.set()
+                    return outage_alerts.AlertDelivered()
+
+                def clear(prefix: str, observed_at: float) -> int:
+                    removed = clear_prefix(prefix, observed_at)
+                    completed.set()
+                    return removed
+
+                lock_path = ledger.with_suffix(".lock")
+                clear_prefix = outage_alerts.clear_prefix
+                with (lock_path.open("a", encoding="utf-8") as lock,
+                      mock.patch("scripts.accounts.outage_alerts._path", return_value=ledger),
+                      mock.patch.object(outage_alerts, "claim", side_effect=claim),
+                      mock.patch.object(outage_alerts, "clear_prefix", side_effect=clear),
+                      mock.patch.object(service, "send_admission_alert") as send):
+                    def unlock() -> None:
+                        released.set()
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    timeout = threading.Timer(2, unlock)
+                    timeout.start()
+                    try:
+                        reply, = fixture.connect(request).replies()
+                        self.assertIsInstance(reply, wire.Admitted if named else wire.Refused)
+                        self.assertFalse(released.is_set())
+                    finally:
+                        timeout.cancel()
+                        timeout.join()
+                        unlock()
+                        self.assertTrue(completed.wait(3))
+                    send.assert_not_called()
+
+    def test_named_ci_grant_clears_a_refusal_from_the_same_resolved_folder(self) -> None:
+        with AdmissionFixture() as fixture, fixture.loop_turn():
+            fixture.clock.epoch = time.time()
+            checkout = fixture.root / "checkout"
+            checkout.mkdir()
+            alias = fixture.root / "alias"
+            alias.symlink_to(checkout, target_is_directory=True)
+            repository = records.RepositoryIdentity("fixture-repository", "fixture")
+            runner = replace(fixture.service_request(), cwd=str(alias), worktree=checkout.name, repository=repository)
+            refusal = fixture.request(need=GIB)
+            refusal = replace(refusal, cwd=str(checkout), profile=replace(refusal.profile, repository=repository),
+                identity=replace(refusal.identity, name="", session_id="", folder=str(checkout)))
+            delivered, cleared = threading.Event(), threading.Event()
+            deliver_claim, clear_prefix = outage_alerts.delivered, outage_alerts.clear_prefix
+
+            def deliver(claim: outage_alerts.AlertClaim) -> None:
+                deliver_claim(claim)
+                delivered.set()
+
+            def clear(prefix: str, observed_at: float) -> int:
+                result = clear_prefix(prefix, observed_at)
+                cleared.set()
+                return result
+
+            with (mock.patch.object(service, "send_admission_alert", return_value=True),
+                  mock.patch.object(outage_alerts, "delivered", side_effect=deliver),
+                  mock.patch.object(outage_alerts, "clear_prefix", side_effect=clear)):
+                self.assertIsInstance(fixture.connect(refusal).replies()[0], wire.Refused)
+                self.assertTrue(delivered.wait(3))
+                fixture.clock.advance(5)
+                _ = only_admitted(fixture.server.handle_request(runner))
+                self.assertTrue(cleared.wait(3))
+                key = service.SourceLocation(repository.key, str(checkout)).alert_key("", refusal.argv[0])
+                self.assertIsInstance(outage_alerts.claim(key), outage_alerts.AlertClaim)
+
+    def test_source_refusal_alert_omits_command_and_process_credentials(self) -> None:
+        with AdmissionFixture(private=True) as fixture:
+            request = fixture.request(need=GIB)
+            parent = fixture.proc.spawn()
+            write_process(fixture.proc.path, request.owner.pid, parent=parent.pid, start=request.owner.start_time)
+            _ = (fixture.proc.path / str(request.owner.pid) / "cmdline").write_text(
+                "curl\0--api-key\0fixture-process-key\0")
+            _ = (fixture.proc.path / str(parent.pid) / "cmdline").write_text(
+                "/bin/bash\0--header\0X-Api-Key: fixture-parent-key\0")
+            request = replace(request, identity=replace(request.identity, name="", session_id=""),
+                argv=("python3", "/fixture/build.py", "--api-key", "fixture-command-key",
+                      "--header", "X-Api-Key: fixture-header-key"))
+            sent: Queue[str] = Queue()
+            delivered = threading.Event()
+            deliver_claim = outage_alerts.delivered
+
+            def send(recipient: str, message: str) -> bool:
+                self.assertEqual(recipient, "bob")
+                sent.put(message)
+                return True
+
+            def deliver(claim: outage_alerts.AlertClaim) -> None:
+                deliver_claim(claim)
+                delivered.set()
+
+            with (mock.patch.object(service, "send_admission_alert", side_effect=send),
+                  mock.patch.object(outage_alerts, "delivered", side_effect=deliver)):
+                self.assertIsInstance(fixture.connect(request).replies()[0], wire.Refused)
+                self.assertTrue(delivered.wait(3))
+                message = sent.get_nowait()
+            self.assertIn("Command: python3 /fixture/build.py.\n", message)
+            self.assertIn(f"Process: {request.owner.pid} curl. Parent: {parent.pid} bash.\n", message)
+            for text in ("fixture-command-key", "fixture-header-key", "fixture-process-key", "fixture-parent-key",
+                         "--api-key", "X-Api-Key"):
+                self.assertNotIn(text, message)
 
     def test_service_refuses_and_reports_an_unresolved_source_until_admitted(self) -> None:
         with AdmissionFixture() as fixture, \
                 mock.patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())):
             fixture.clock.epoch = time.time()
-            threads: list[threading.Thread] = []
             messages: list[tuple[str, str]] = []
 
             def send(recipient: str, message: str) -> bool:
                 messages.append((recipient, message))
                 return True
 
-            def record_thread(*, target: Callable[..., None], args: tuple[object, ...],
-                              name: str, daemon: bool) -> threading.Thread:
-                thread = threading.Thread(target=target, args=args, name=name, daemon=daemon)
-                threads.append(thread)
-                return thread
-
             def refuse(request: wire.AdmitRequest, given: str) -> None:
                 request = replace(request, identity=replace(request.identity, session_id=given, name=""))
                 self.assertEqual(fixture.connect(request).replies(), [wire.Refused(
                     f"Refused: this request names no source. The session id '{given}' resolves to no staff row "
                     + "and no session name. Run it from a named session, or set CLAUDE_SESSION_NAME.")])
-                for thread in threads:
-                    thread.join(timeout=3)
-                    self.assertFalse(thread.is_alive())
+                _ = fixture.server.alerts.submit(lambda: None).result(timeout=3)
 
-            with mock.patch.object(service, "threading", mock.Mock(wraps=threading, Thread=record_thread)), \
-                    mock.patch.object(service, "send_admission_alert", side_effect=send):
+            with mock.patch.object(service, "send_admission_alert", side_effect=send):
                 causes = (("missing-session", "cargo"), ("another-session", "cargo"), ("missing-session", "rustc"))
 
                 def refuse_causes() -> None:
@@ -7140,7 +7254,7 @@ class ServiceTests(unittest.TestCase):
                 for (given, program), (recipient, message) in zip(causes, messages, strict=True):
                     self.assertEqual(recipient, "bob")
                     self.assertIn(f"Given: session id '{given}' (resolves to nothing).", message)
-                    self.assertIn(f"Command: {program} build.", message)
+                    self.assertIn(f"Command: {program}.", message)
                     self.assertIn(f"Repository: fixture. Folder: {fixture.root}.", message)
                 refuse(replace(fixture.request(need=GIB), argv=("cargo", "check")), "missing-session")
                 self.assertEqual(len(messages), 3)
@@ -7221,6 +7335,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(fixture.server.handle_request(request), [
                 wire.Refused("Refused: this request names no source. It gives no session id, staff id or name.")])
             self.assertNotIn(request.episode, fixture.server.placement_requests)
+            _ = fixture.server.alerts.submit(lambda: None).result(timeout=3)
 
     def assert_reload_hash_journal(self, journal: str, next_check: float) -> str:
         provision, schedule, ready, revision = journal.splitlines()

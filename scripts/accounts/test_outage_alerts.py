@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import time
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -24,9 +25,9 @@ class OutageAlertsTests(unittest.TestCase):
             ):
                 with patch.object(time, "time", return_value=stamp):
                     claim = outage_alerts.claim(key)
-                assert isinstance(claim, outage_alerts.AlertClaim)
+                self.assertIsInstance(claim, outage_alerts.AlertClaim)
                 if delivered:
-                    outage_alerts.delivered(claim)
+                    outage_alerts.delivered(cast(outage_alerts.AlertClaim, claim))
 
             self.assertEqual(outage_alerts.clear_prefix("source:", 12.0), 2)
             self.assertEqual(outage_alerts.clear_prefix("source:", 12.0), 0)

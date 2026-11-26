@@ -708,7 +708,7 @@ class QueueMoveTests(unittest.TestCase):
             fixture.free(0)
             fixture.hold_starts()
             unnamed, first, second = [fixture.request(since=fixture.clock.now() + index) for index in range(3)]
-            unnamed = replace(unnamed, identity=wire.Identity("", "", "", ""), cwd="",
+            unnamed = replace(unnamed, identity=wire.Identity("", "fixture", "", ""), cwd="",
                 profile=replace(unnamed.profile, step="", repo=""))
             for request in (unnamed, first, second):
                 self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
@@ -741,7 +741,7 @@ class QueueMoveTests(unittest.TestCase):
             fixture.free(0)
             fixture.hold_starts()
             first, unnamed, last = [fixture.request(since=fixture.clock.now() + index) for index in range(3)]
-            unnamed = replace(unnamed, identity=wire.Identity("", "", "", ""), cwd="",
+            unnamed = replace(unnamed, identity=wire.Identity("", "fixture", "", ""), cwd="",
                 profile=replace(unnamed.profile, step="", repo=""))
             requests = (first, unnamed, last)
             for request in requests:
