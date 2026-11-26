@@ -1435,6 +1435,15 @@ def wait_for_native_session(client: herdr.Herdr, pane: str, deadline: float, *, 
             time.sleep(operation_deadline.remaining(min(0.5, remaining)))
 
 
+def _resume_liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+    """Give a concurrent registry write another chance before a resume fails."""
+    live = sessions.session_liveness(identity)
+    if isinstance(live, sessions.SessionLivenessUnknown) and live.unreadable_registry:
+        time.sleep(operation_deadline.remaining(sessions.retry_policy().registry_delay_seconds))
+        return sessions.session_liveness(identity, registry=sessions.read_registry(for_session=identity))
+    return live
+
+
 def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
     """Run the account command in the session's own pane, with one resume message."""
     client = herdr.Herdr(herdr.shared_session())
@@ -1454,13 +1463,13 @@ def _start_session(tab: herdr.TabSession, entry: pane_launch.NativePaneLaunch, a
     operation_deadline.check()
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + operation_deadline.remaining(start_seconds)
-    live = sessions.session_liveness(entry["session_id"])
+    live = _resume_liveness(entry["session_id"])
     while isinstance(live, sessions.SessionNotLive):
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise herdr_types.HerdrFailure("never started")
         time.sleep(operation_deadline.remaining(min(0.5, remaining)))
-        live = sessions.session_liveness(entry["session_id"])
+        live = _resume_liveness(entry["session_id"])
     if isinstance(live, sessions.SessionLivenessUnknown):
         raise herdr_types.HerdrFailure(live.reason)
     if not message:
@@ -1549,7 +1558,7 @@ def running_on_account(identity: str, pane_id: str, *, kind: str = "claude", cap
         if not observed.pids:
             return ResumeFailed(identity, "live Codex thread has no process account proof")
         return _codex_running_on_account(identity, pane_id, observed.pids[0], capture_generation)
-    live = sessions.session_liveness(identity)
+    live = sessions.session_liveness(identity) if capture_generation else _resume_liveness(identity)
     if isinstance(live, sessions.SessionNotLive):
         return live
     if isinstance(live, sessions.SessionLivenessUnknown):
@@ -2027,7 +2036,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 client.prompt(tab.pane_id, message, target=identity)
             started = launched
         else:
-            live = sessions.session_liveness(identity)
+            live = _resume_liveness(identity)
             if isinstance(live, sessions.SessionLivenessUnknown):
                 raise herdr_types.HerdrFailure(live.reason)
             if isinstance(live, sessions.SessionNotLive):
@@ -2388,7 +2397,7 @@ def _confirm_move_start(result: ClaudeUp, requester: str, why: str) -> ClaudeUp 
         failure = _early_exit(identity, result.pane_id, result.account, 0.0,
                               requester=requester, why=why, failure=reason)
         return ResumeFailed(identity, failure)
-    live = sessions.session_liveness(identity)
+    live = _resume_liveness(identity)
     failure = (_check_stay(identity, result.pane_id, result.account, live.pid,
                            sessions.process_start(live.pid) or "", requester, why)
                if isinstance(live, sessions.LiveSessionProcess) else

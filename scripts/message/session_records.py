@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
+from uuid import UUID
 
 from scripts.lib.transcripts import config_dirs as config_dirs, transcript_paths, uncompressed_path
 from scripts.lib.session_paths import sessions_directory
@@ -127,8 +128,9 @@ def registry_unreadable_reason(paths: tuple[Path, ...]) -> str:
 
 
 def read_registry(*, directory: Path | ConfiguredRegistryDirectory = CONFIGURED_REGISTRY_DIRECTORY,
-                  dependencies: Callable[[Path], None] | None = None) -> RegistryRead:
-    """Report a directory that cannot be listed and any unreadable session records."""
+                  dependencies: Callable[[Path], None] | None = None,
+                  for_session: str | None = None) -> RegistryRead:
+    """Report unreadable records unless their identity excludes the selected session."""
     if isinstance(directory, ConfiguredRegistryDirectory):
         directory = sessions_dir()
     try:
@@ -139,8 +141,8 @@ def read_registry(*, directory: Path | ConfiguredRegistryDirectory = CONFIGURED_
     unreadable: list[Path] = []
     policy = retry_policy()
     for path in paths:
-        observation = _read_observation(path, policy, dependencies=dependencies)
-        if isinstance(observation, RegistryRecordGone):
+        observation = _read_observation(path, policy, dependencies=dependencies, for_session=for_session)
+        if observation is None or isinstance(observation, RegistryRecordGone):
             continue
         if isinstance(observation, UnreadableSessionRecord):
             unreadable.append(path)
@@ -192,7 +194,22 @@ def parse_session(parsed: object) -> RegistryEntry:
     )
 
 
-def _read_observation(path: Path, policy: SessionRetryPolicy, *, dependencies: Callable[[Path], None] | None = None) -> RegistryObservation | UnreadableSessionRecord | RegistryRecordGone:
+def _other_session(path: Path, raw: object, session_id: str) -> bool:
+    """Prove a different conversation from the current process generation's record."""
+    if not isinstance(raw, dict):
+        return False
+    record = cast(dict[str, object], raw)
+    identity, pid, started = record.get("sessionId"), record.get("pid"), record.get("procStart")
+    if (not isinstance(identity, str) or identity == session_id or not isinstance(pid, int)
+            or isinstance(pid, bool) or pid <= 0 or path.name != f"{pid}.json"
+            or not isinstance(started, str) or not started):
+        return False
+    return str(UUID(identity)) == identity and process_start(pid) == started
+
+
+def _read_observation(path: Path, policy: SessionRetryPolicy, *,
+                      dependencies: Callable[[Path], None] | None = None, for_session: str | None = None,
+                      ) -> RegistryObservation | UnreadableSessionRecord | RegistryRecordGone | None:
     """Reread a concurrent write; only a live unreadable record remains uncertain."""
     for attempt in range(policy.registry_reads):
         try:
@@ -202,6 +219,8 @@ def _read_observation(path: Path, policy: SessionRetryPolicy, *, dependencies: C
             record = parse_session(raw)
             if not isinstance(record, UnreadableSessionRecord):
                 return RegistryObservation(record, cast(RegistryDetails, raw))
+            if for_session is not None and attempt + 1 == policy.registry_reads and _other_session(path, raw, for_session):
+                return None
         except FileNotFoundError:
             return RegistryRecordGone()
         except (OSError, ValueError, TypeError):
@@ -288,6 +307,7 @@ class SessionLivenessUnknown:
     """Unreadable evidence prevents establishing whether the session is live."""
 
     reason: str
+    unreadable_registry: tuple[Path, ...] = field(default=(), compare=False, repr=False)
 
 
 def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
@@ -343,7 +363,7 @@ def _session_observations(session_id: str, registry: RegistryRead) -> Iterator[L
             if not isinstance(observed, SessionNotLive):
                 yield observed
     if registry.unreadable:
-        yield SessionLivenessUnknown(registry_unreadable_reason(registry.unreadable))
+        yield SessionLivenessUnknown(registry_unreadable_reason(registry.unreadable), registry.unreadable)
 
 
 def session_liveness(session_id: str, registry: RegistryRead | None = None,
