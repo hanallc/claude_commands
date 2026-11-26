@@ -938,6 +938,122 @@ assert not loaded, sorted(loaded)
         self.write_settings(str(path))
         return path
 
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_copies_links_without_following_them(self) -> None:
+        cleanup = cleanup_old_folders
+        scripts = self.home / "checkout/scripts"
+        shim = self.home / "worker/scripts/lib/py"
+        runtime = self.home / "run/current-system/sw/bin/python3"
+        scripts.mkdir(parents=True)
+        for referent in (scripts / "helper", shim, runtime):
+            referent.parent.mkdir(parents=True, exist_ok=True)
+            _ = referent.write_text("keep outside the gate\n")
+        for referent in (scripts, scripts / "helper", shim, runtime):
+            os.utime(referent, ns=(1, 1))
+        external_stamps = {path: path.stat() for path in (scripts, scripts / "helper", shim, runtime)}
+
+        directory_link = self.gate_checkout_to_move("fc-scripts") / ".claude/scripts"
+        shim_link = self.gate_checkout_to_move("merge-gate-shim") / "case/.claude/scripts/lib/py"
+        internal_link = self.gate_checkout_to_move("targeted-test-stub") / "case/bin/ssh"
+        relative_link = self.candidate("targeted-test-relative", home=self.gate) / "session/.id/c-movable"
+        runtime_link = self.gate_checkout_to_move("t-runtime") / "case/bin/uv"
+        link_targets = {directory_link: str(scripts), shim_link: str(shim),
+                        internal_link: str(internal_link.with_name("command-stub")),
+                        relative_link: "demo", runtime_link: str(runtime)}
+        for link, target_text in link_targets.items():
+            link.parent.mkdir(parents=True)
+            link.symlink_to(target_text)
+            os.utime(link, ns=(1_700_000_000_000_000_000, 1_700_000_001_000_000_000), follow_symlinks=False)
+        _ = internal_link.with_name("command-stub").write_text("stub\n")
+        link_stamps = {link: link.lstat() for link in link_targets}
+        self.write_settings(str(self.gate / "*"))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        standard, _bounds = cleanup.review_local(cleanup.Machine.NATEDEV)
+        self.assertTrue(all(isinstance(row.outcome, removal_guard.Kept) for row in standard.rows))
+
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        self.assertEqual(len(review.rows), len(link_targets))
+        destinations: dict[Path, Path] = {}
+        for row in review.rows:
+            self.assertIsInstance(row.outcome, cleanup.WouldMove, row)
+            assert isinstance(row.outcome, cleanup.WouldMove)
+            destinations[row.path] = row.outcome.target
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
+        for link, target_text in link_targets.items():
+            relative = link.relative_to(self.gate)
+            source = self.gate / relative.parts[0]
+            self.assertFalse(source.exists())
+            moved = destinations[source] / link.relative_to(source)
+            self.assertTrue(moved.is_symlink())
+            self.assertEqual(os.readlink(moved), target_text)
+            before, after = link_stamps[link], moved.lstat()
+            self.assertEqual((after.st_mode, after.st_mtime_ns), (before.st_mode, before.st_mtime_ns))
+        for referent, before in external_stamps.items():
+            after = referent.stat()
+            self.assertEqual((after.st_atime_ns, after.st_mtime_ns, after.st_ctime_ns),
+                             (before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns))
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_source_when_the_copy_changes_link_text(self) -> None:
+        cleanup = cleanup_old_folders
+        path = self.gate_checkout_to_move()
+        link = path / "alias"
+        link.symlink_to("old-target")
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        row, = review.rows
+        self.assertIsInstance(row.outcome, cleanup.WouldMove)
+        assert isinstance(row.outcome, cleanup.WouldMove)
+        copy = cleanup.copy_gate_tree
+
+        def change_link(source: int, destination: int) -> None:
+            copy(source, destination)
+            before = os.stat("alias", dir_fd=destination, follow_symlinks=False)
+            os.unlink("alias", dir_fd=destination)
+            os.symlink("new-target", "alias", dir_fd=destination)
+            os.utime("alias", ns=(before.st_atime_ns, before.st_mtime_ns), dir_fd=destination, follow_symlinks=False)
+
+        with (mock.patch.object(cleanup, "copy_gate_tree", side_effect=change_link),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 1, output.getvalue())
+        self.assertIn("copy differs from the checked source: alias", output.getvalue())
+        self.assertEqual(os.readlink(link), "old-target")
+        self.assertFalse(row.outcome.target.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux cleanup worker")
+    def test_gate_move_keeps_fifos_and_recovery_records(self) -> None:
+        cleanup = cleanup_old_folders
+        pipe = self.gate_checkout_to_move("merge-gate-with-pipe")
+        recovery = self.gate_checkout_to_move("t-with-recovery")
+        plain = self.candidate("fc-without-git", home=self.gate)
+        os.mkfifo(pipe / "jobserver")
+        (recovery / "run.json").touch()
+        self.write_settings(str(self.gate / "*"))
+        mode = cleanup.CleanupMode.MOVE_GATE_GIT
+        review, bounds = cleanup.review_local(cleanup.Machine.NATEDEV, mode=mode)
+        rows = {row.path: row.outcome for row in review.rows}
+        self.assertEqual(rows[pipe], removal_guard.Kept(f"contains a FIFO, socket or device: {pipe / 'jobserver'}"))
+        self.assertEqual(rows[recovery], removal_guard.Kept("gate recovery record"))
+        self.assertIsInstance(rows[plain], cleanup.WouldMove)
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(cleanup.apply(review, bounds, mode=mode), 0, output.getvalue())
+        self.assertTrue((pipe / "jobserver").is_fifo())
+        self.assertTrue((recovery / "run.json").is_file())
+        self.assertFalse(plain.exists())
+
+    def test_gate_move_list_reports_progress_only_on_a_terminal(self) -> None:
+        cleanup = cleanup_old_folders
+        _ = self.candidate("fc-first", home=self.gate)
+        _ = self.candidate("t-second", home=self.gate)
+        other = self.candidate()
+        self.write_settings(str(other))
+        for terminal, expected in ((True, "\rChecking folder 1 of 2\rChecking folder 2 of 2\r\x1b[K"), (False, "")):
+            with (self.subTest(terminal=terminal), redirect_stderr(io.StringIO()) as errors,
+                  mock.patch.object(errors, "isatty", return_value=terminal)):
+                _ = cleanup.review_local(cleanup.Machine.NATEDEV, mode=cleanup.CleanupMode.MOVE_GATE_GIT)
+            self.assertEqual(errors.getvalue(), expected)
+
     def test_gate_move_keeps_linked_worktrees_at_any_depth(self) -> None:
         cleanup = cleanup_old_folders
         linked = self.candidate("t-linked", home=self.gate)
