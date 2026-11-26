@@ -718,28 +718,32 @@ def graph_for_files(repo: Path, paths: set[str], blobs: dict[str, str], dirty: s
     return SourceGraph(graph, tokens, config_reads, repository_scan_graph(repo, scan_facts, bare_modules))
 
 
+MODULE_HISTORY_SQL = (
+    "WITH latest AS (SELECT "
+    + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+    + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+    + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
+    + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+    + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+    + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
+    + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
+    + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
+    + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
+    + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
+    + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
+    + "CASE WHEN run_id = content_gate THEN content_reads END FROM latest CROSS JOIN gate_modules "
+    + "WHERE run_id IN (config_gate, folder_gate, content_gate) ORDER BY suite, module, attempt"
+)
+
+
 def latest_module_reads() -> dict[str, ModuleReadRecord]:
     """Read each field from its newest full, non-aborted gate."""
     from scripts.buildlog import index
 
     _ = index.update()
     with closing(index.read_only()) as connection:
-        rows = cast(list[tuple[str, str, str | None, str | None, str | None]], connection.execute(
-            "WITH latest AS (SELECT "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.config_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS config_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.folder_scans IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS folder_gate, "
-            + "(SELECT id FROM gate_runs WHERE selection = 'full' AND aborted = 0 "
-            + "AND EXISTS (SELECT 1 FROM gate_modules AS recorded WHERE recorded.run_id = gate_runs.id "
-            + "AND recorded.content_reads IS NOT NULL) ORDER BY started_at DESC, id DESC LIMIT 1) AS content_gate) "
-            + "SELECT suite, module, CASE WHEN run_id = config_gate THEN config_reads END, "
-            + "CASE WHEN run_id = folder_gate THEN folder_scans END, "
-            + "CASE WHEN run_id = content_gate THEN content_reads END FROM gate_modules CROSS JOIN latest "
-            + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate ORDER BY suite, module, attempt"
-        ).fetchall())
+        rows = cast(list[tuple[str, str, str | None, str | None, str | None]],
+                    connection.execute(MODULE_HISTORY_SQL).fetchall())
     recorded: dict[str, ModuleReadRecord] = {}
     for suite, module, config_json, folder_json, content_json in rows:
         path = f"scripts/{suite}/{module}"

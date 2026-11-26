@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import closing
 from datetime import UTC, datetime
 import json
 import os
@@ -13,6 +14,7 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
+from scripts.buildlog import index as buildlog_index
 from scripts.production import affected_modules as affected
 from scripts.test_times.gate_record_test_support import gate_run
 
@@ -352,6 +354,55 @@ class AffectedModulesTests(unittest.TestCase):
                     self.write(path, "# .astimezone()\nVALUE = 2\n")
                 _ = self.commit()
                 self.assertEqual(tuple(module.name for module in self.selection().modules), expected)
+
+    def test_module_history_uses_run_id_lookups(self) -> None:
+        query = affected.MODULE_HISTORY_SQL
+        old_query = query.replace("FROM latest CROSS JOIN gate_modules "
+                                  + "WHERE run_id IN (config_gate, folder_gate, content_gate)",
+                                  "FROM gate_modules CROSS JOIN latest "
+                                  + "WHERE run_id = config_gate OR run_id = folder_gate OR run_id = content_gate")
+        with closing(sqlite3.connect(":memory:")) as connection:
+            for statement in buildlog_index.schema_statements():
+                _ = connection.execute(statement)
+            plan = cast(list[tuple[int, int, int, str]],
+                        connection.execute("EXPLAIN QUERY PLAN " + query).fetchall())
+            details = [row[3] for row in plan]
+            self.assertIn("SEARCH gate_modules USING INDEX sqlite_autoindex_gate_modules_1 (run_id=?)", details)
+            self.assertFalse(any(detail.startswith("SCAN gate_modules") for detail in details), details)
+
+            _ = connection.executemany("INSERT INTO gate_runs (id, started_at, selection, aborted) VALUES (?, ?, ?, ?)", (
+                ("shared", "2026-01-01", "full", 0),
+                ("folder", "2026-01-02", "full", 0),
+                ("older-tie", "2026-01-03", "full", 0),
+                ("winner-tie", "2026-01-03", "full", 0),
+                ("null", "2026-01-04", "full", 0),
+                ("aborted", "2026-01-05", "full", 1),
+                ("affected", "2026-01-06", "affected", 0),
+            ))
+            insert = ("INSERT INTO gate_modules (run_id, suite, module, attempt, config_reads, folder_scans, "
+                      + "content_reads) VALUES (?, 'checks', 'test_reader.py', ?, ?, ?, ?)")
+            _ = connection.execute(insert, ("shared", 1, '["shared"]', '[]', '["assets/x"]'))
+            shared = cast(list[tuple[object, ...]], connection.execute(query).fetchall())
+            self.assertCountEqual(shared, cast(list[tuple[object, ...]], connection.execute(old_query).fetchall()))
+            self.assertEqual(shared, [("checks", "test_reader.py", '["shared"]', '[]', '["assets/x"]')])
+
+            _ = connection.executemany(insert, (
+                ("folder", 1, None, '["assets"]', None),
+                ("older-tie", 1, '["loser"]', None, None),
+                ("winner-tie", 1, '[]', None, None),
+                ("winner-tie", 2, '["retry"]', None, None),
+                ("null", 1, None, None, None),
+                ("aborted", 1, '[]', '[]', '[]'),
+                ("affected", 1, '[]', '[]', '[]'),
+            ))
+            separate = cast(list[tuple[object, ...]], connection.execute(query).fetchall())
+            self.assertCountEqual(separate, cast(list[tuple[object, ...]], connection.execute(old_query).fetchall()))
+            self.assertCountEqual(separate, [
+                ("checks", "test_reader.py", None, None, '["assets/x"]'),
+                ("checks", "test_reader.py", None, '["assets"]', None),
+                ("checks", "test_reader.py", '[]', None, None),
+                ("checks", "test_reader.py", '["retry"]', None, None),
+            ])
 
     def test_folder_and_config_records_use_independent_latest_full_gates(self) -> None:
         self.write("config/limits.conf", "value=one\n")
