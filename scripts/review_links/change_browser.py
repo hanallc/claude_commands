@@ -30,6 +30,7 @@ from scripts.statusline import rebuild_row
 
 MANIFEST = change_page.BROWSER_MANIFEST
 FOLDER = "/(" + change_page.CONSOLE_FOLDER + "|[a-z0-9]{6})"
+_NO_FOLLOWUP_DELIVERY = change_page.NoDelivery()
 
 
 @dataclass(frozen=True)
@@ -791,7 +792,9 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
     text = question.record.item["text"]
     if outcome in ("answer", "feedback"):
         return update_registration.answer(production, text, identities=identities, only_open=True)
-    if outcome in ("followup", "question"):
+    if outcome == "question":
+        return update_registration.followup(production, text, words, identities=identities, recipient=question.owner)
+    if outcome == "followup":
         return update_registration.followup(production, text, words, identities=identities)
     urgency.move_to_end(update_registration.question_queue(production), update_registration.item_key(question.owner, text),
                         datetime.now(production.zone).replace(tzinfo=None))
@@ -802,7 +805,8 @@ def save_outcome(production: update_registration.QuestionScope, question: Waitin
 def save_question_record(production: update_registration.QuestionScope, question: WaitingQuestion,
                          outcome: change_page.QuestionOutcome, words: str,
                          save: ExactQuestionSave | SelectedQuestionSave, *,
-                         before_write: Callable[[], None]) -> None:
+                         before_write: Callable[[], None],
+                         recipient: staff.StaffId | change_page.NoDelivery = _NO_FOLLOWUP_DELIVERY) -> None:
     """Validate and write one canonical question under its owner's lock."""
     path = update_registration.outstanding_path(production)
     superseded = ''
@@ -829,8 +833,10 @@ def save_question_record(production: update_registration.QuestionScope, question
         if outcome in ('answer', 'feedback'):
             current = replace(current, status='closed')
         elif outcome in ('followup', 'question'):
+            assert isinstance(recipient, str)
             reason = review_events.require_waiting_why(words)
-            item['followup'] = update_registration.PendingFollowup(text=reason, sent=now.strftime('%Y-%m-%dT%H:%M'))
+            item['followup'] = update_registration.PendingFollowup(
+                text=reason, sent=now.strftime('%Y-%m-%dT%H:%M'), recipient=recipient)
             item['waiting_why'] = reason
         else:
             raise change_page.AnswerRefused('choose an action on this card')
@@ -867,15 +873,9 @@ class QuestionQueueSave:
 QUESTION_QUEUE_SAVE = QuestionQueueSave()
 
 
-def question_relay(record: update_registration.QuestionRecord, production: update_registration.QuestionScope,
-                   identities: update_registration.QuestionStaff) -> update_registration.AnswerRelay:
-    return update_registration.answer_relay(production, production.name, update_registration.question_asker(
-        record.item, update_registration.OpenItemWithoutAsker(), identities), identities)
-
-
 def question_receiver(owner: staff.StaffId, outcome: change_page.QuestionOutcome,
                       relay: update_registration.AnswerRelay) -> staff.StaffId:
-    return relay.recipient if outcome not in ("feedback", "question") and isinstance(relay.recipient, str) else owner
+    return owner if outcome in ("feedback", "question") else relay.recipient_or_owner(owner)
 
 
 def question_toast_labels(record: update_registration.QuestionRecord,
@@ -887,7 +887,7 @@ def question_toast_labels(record: update_registration.QuestionRecord,
         return {**labels, "answer": owner, "followup": owner}
     try:
         scope = update_registration.question_scope(record.owner, members)
-        relay = question_relay(record, scope, update_registration.QuestionStaff.for_record(members))
+        relay = update_registration.question_relay(record, scope, update_registration.QuestionStaff.for_record(members))
     except (OSError, ValueError, ProductionRefusal, update_registration.RegistrationFailure):
         return labels
     return {**labels, "answer": receiver_names(members, (question_receiver(record.owner, "answer", relay),)),
@@ -912,7 +912,7 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
         return send(
             current, question.record, production, "question" if outcome == "followup" else outcome, words, status,
             verify_revision=save.verify_revision if isinstance(save, ExactQuestionSave) else None)
-    relay = question_relay(question.record, production, identities)
+    relay = update_registration.question_relay(question.record, production, identities)
     recipient = question_receiver(question.owner, outcome, relay)
     message = question_message(outcome, production.name, item["text"], relay.unit, words, question.key)
     answer = words if outcome == "answer" else ""
@@ -936,7 +936,8 @@ def submit_question(question: WaitingQuestion, outcome: change_page.QuestionOutc
 
         try:
             if not isinstance(save, QuestionQueueSave):
-                save_question_record(production, question, outcome, words, save, before_write=claim_delivery)
+                save_question_record(production, question, outcome, words, save, before_write=claim_delivery,
+                                     recipient=recipient)
             else:
                 claim_delivery()
                 relay = save_outcome(production, question, outcome, words, identities)
