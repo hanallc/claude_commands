@@ -128,19 +128,18 @@ def registry_unreadable_reason(paths: tuple[Path, ...]) -> str:
     return "session registry unreadable: " + ", ".join(map(str, paths))
 
 
-class _RegistryRetryExpired(TimeoutError):
-    """The deadline prevents a retry of an unreadable record."""
+class RegistryReadExpired(TimeoutError):
+    """Keep the evidence from a registry scan that reaches its deadline."""
 
-    def __init__(self, path: Path) -> None:
-        self.path: Path = path
-        super().__init__("session registry read deadline passed")
+    def __init__(self, registry: RegistryRead) -> None:
+        self.registry: RegistryRead = registry
+        super().__init__(registry_unreadable_reason(registry.unreadable) if registry.unreadable
+                         else "session registry read deadline passed")
 
 
 def _check_registry_deadline(deadline: float, delay: float = 0, *, unreadable: Path | None = None) -> None:
     if deadline != math.inf and time.monotonic() + delay >= deadline:
-        if unreadable is not None:
-            raise _RegistryRetryExpired(unreadable)
-        raise TimeoutError("session registry read deadline passed")
+        raise RegistryReadExpired(RegistryRead((), () if unreadable is None else (unreadable,)))
 
 
 def read_registry(*, directory: Path | ConfiguredRegistryDirectory = CONFIGURED_REGISTRY_DIRECTORY,
@@ -153,21 +152,23 @@ def read_registry(*, directory: Path | ConfiguredRegistryDirectory = CONFIGURED_
     try:
         paths = [path for path in directory.iterdir() if path.suffix == ".json"]
     except OSError:
-        _check_registry_deadline(deadline)
+        _check_registry_deadline(deadline, unreadable=directory)
         return RegistryRead((), (directory,))
     _check_registry_deadline(deadline)
     entries: list[RegistryObservation] = []
     unreadable: list[Path] = []
     policy = retry_policy()
-    for path in paths:
-        observation = _read_observation(path, policy, dependencies=dependencies, for_session=for_session, deadline=deadline)
-        if observation is None or isinstance(observation, RegistryRecordGone):
-            continue
-        if isinstance(observation, UnreadableSessionRecord):
-            unreadable.append(path)
-        else:
-            entries.append(observation)
-    _check_registry_deadline(deadline)
+    try:
+        for path in paths:
+            observation = _read_observation(path, policy, dependencies=dependencies, for_session=for_session, deadline=deadline)
+            if isinstance(observation, RegistryObservation):
+                entries.append(observation)
+            elif isinstance(observation, UnreadableSessionRecord):
+                unreadable.append(path)
+        _check_registry_deadline(deadline)
+    except RegistryReadExpired as error:
+        unreadable.extend(error.registry.unreadable)
+        raise RegistryReadExpired(RegistryRead(tuple(entries), tuple(unreadable))) from error
     return RegistryRead(tuple(entries), tuple(unreadable))
 
 
@@ -399,9 +400,11 @@ def session_liveness(session_id: str, registry: RegistryRead | None = None, *, d
     if isinstance(reading, ReadCurrentRegistry):
         try:
             reading = read_registry() if deadline == math.inf else read_registry(deadline=deadline)
-        except _RegistryRetryExpired as error:
-            paths = (error.path,)
-            return SessionLivenessUnknown(registry_unreadable_reason(paths), paths)
+        except RegistryReadExpired as error:
+            observed = next(_session_observations(session_id, error.registry), None)
+            if observed is None:
+                raise
+            return observed
     return next(_session_observations(session_id, reading), SessionNotLive())
 
 
