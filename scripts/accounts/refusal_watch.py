@@ -759,6 +759,7 @@ def _continue_wait(state: WatchState, session_id: str, name: str, previous: Watc
         return f"{name}: continuation not delivered: {delivery.reason}"
     clear_assumed(session_id)
     _set_transition(state, session_id, previous["entry_id"], "continued", previous["move_id"])
+    _save_state(state)
     return f"{name}: continued on its current account"
 
 
