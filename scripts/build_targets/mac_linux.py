@@ -610,7 +610,7 @@ def run_guest_ssh(command: tuple[str, ...], timeout: float) -> subprocess.Comple
                           timeout=timeout, check=False, env=guest_ssh_environment())
 
 
-def read_guest_main(settings: GuestSettings) -> GuestMain | EmptyGuestMain:
+def read_guest_main(settings: GuestSettings, *, wait_limit_seconds: float = math.inf) -> GuestMain | EmptyGuestMain:
     shell = guest_shell(settings) + '''
 if ! command -v bwrap >/dev/null 2>&1; then
     printf 'bwrap is absent from the guest PATH.\\n' >&2
@@ -620,8 +620,9 @@ if [ -f "$checkout/.git/HEAD" ]; then
     git -C "$checkout" rev-parse --verify --quiet refs/heads/main || test "$?" -eq 1
 fi'''
     command = settings.command(shell)
+    deadline = monotonic() + min(settings.unreachable_wait_seconds, wait_limit_seconds)
     reply = retry_guest_connect(lambda remaining: run_guest_ssh(command, min(GUEST_REF_TIMEOUT_SECONDS, remaining)),
-                                monotonic() + settings.unreachable_wait_seconds)
+                                deadline)
     if reply.returncode:
         raise GuestUnavailable(f'guest main probe exited {reply.returncode}: {reply.stderr.strip() or "no diagnostic"}')
     commit = reply.stdout.strip()
