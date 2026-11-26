@@ -421,8 +421,9 @@ Merge and tests-only runs skip basedpyright.
 The daily `--nightly` run checks all of `scripts`, including hooks.
 The queue reservation and the runner governor use separate configuration keys.
 Gate startup checks recovery records for dead gate processes across checkouts.
-Every gate mode runs its cleanup before it exits on SIGTERM when the default handler is active.
-Guests that call `run_suites` directly also clean up their suites before they exit on SIGTERM.
+Checkpoint runs use the default SIGTERM disposition so the next gate can recover their rollback records.
+Other gate modes run cleanup before SIGTERM exits when the default handler is active.
+The cleanup scope covers suite setup and any CPU pool that the caller opens separately.
 The gate preserves an existing SIGTERM handler.
 The gate defers SIGTERM until suite folder cleanup and the recovery record update finish.
 After cleanup, the gate exits with SIGTERM.
