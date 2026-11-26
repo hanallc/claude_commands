@@ -2538,7 +2538,6 @@ On 2026-11-21, Nate asked to “show the showrunner (in its color)” at 19:13.
 At 19:17 he changed the row start to “only show the unit (and the showrunner in small text under)”.
 The Builds page uses the same staff colors in the row and its hover.
 Rows without a unit show their plain name and leave the small text and `Step` empty.
-This includes Build tools, unowned Mac builds, compiler cache, unowned processes, and CI.
 The small text is empty when the showrunner is the same name as the unit.
 `Step` shows the step only when the feed's `title.unit` names a unit. When the step text is the unit, the feed sends an empty `title.unit`, so `Step` stays empty and the unit does not show twice.
 `queueRowLabels` gives the row start, the small text, and the `Step` and `Verify` cells from one place.
@@ -2611,10 +2610,11 @@ The wait ends at the next line, which reports the tokens taken.
 The admission reading stores it in the running step's `measured.counter`.
 A row without a counter shows `—`.
 Local builds, gate runs, and cloud rows use their recorded counters.
-hana CI currently has no admission counter.
-The Running table shows hana CI only when a recorded runner has a busy job.
-Idle or unreadable runners have no separate Running row.
-Their memory remains in the taken total, the cap, and the summary tooltip.
+Running lists admitted Hana CI Cargo steps.
+Running has no Build tools row or CI service row.
+The Build tools part of the memory bar includes the CI service memory.
+Its tooltip shows one line per running runner service.
+The taken total and cap include the CI service memory.
 Waiting rows use `#` in the first column for their queue place.
 Both sections use the same column widths.
 The table is always beside the chart, and each step uses one row at every pane width.
@@ -2715,8 +2715,15 @@ A readable counter adds a Progress row.
 A failed or old reading replaces the Mac run rows with one short `Mac builds` status.
 The feed log retains raw errors; the page shows only the status and reading age.
 CI runner records supply the `hana CI` owner for their Running and Waiting steps.
-The aggregate running CI row also shows Unit `hana CI`.
-The feed compares the step's recorded runner unit with the runner records, not page text.
+The feed matches each step's recorded runner unit to the CI runner records.
+The feed reads runner and Cargo scope membership before it reads the process table.
+It reads anonymous RAM only from live runner processes outside admitted Cargo process trees and scopes.
+The Build tools bar, page cap, and taken total use the saved CI charge from admission.
+The runner lines divide the saved charge in proportion to their live readings.
+If the service processes exit during a sample, the feed can reuse the last good reading for two samples.
+A persistent failure shows the runner name and the existing `unavailable` value.
+If a reading is missing, the known readings stay within the saved charge.
+Other build tools includes any part of the saved CI charge that the runner lines do not cover.
 The terminal queue view shows a `machine` column after `min` and before `pid`.
 The column uses `scripts.buildlog.store.host_name()`, the shared short host name.
 A narrow view omits the machine column before it reduces name space.

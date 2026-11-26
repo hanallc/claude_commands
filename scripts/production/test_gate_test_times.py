@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 import gzip
 import io
 import os
 from pathlib import Path
 import re
+import signal
 import time
 from typing import final, override
 import unittest
@@ -71,6 +72,196 @@ class MergeGateTestTimesTests(MergeGateFixture):
         records = self.gate_run_records()
         self.assertEqual(len(records), 1, records)
         return records[0]
+
+    def test_suite_folder_start_and_end_match_the_live_lease(self) -> None:
+        for end, status in (("normal", 0), ("red", 1), ("sigterm", -signal.SIGTERM)):
+            with self.subTest(end=end):
+                if end == "red":
+                    self.write(self.state / "red-hooks", "red")
+                buildlog = self.root / f"records-{end}"
+                preamble = f"""from contextlib import contextmanager
+from scripts.buildlog import store
+from scripts.lib import build_folders
+allocate = gate.gate_temporary
+
+@contextmanager
+def observe_folder(recovery, tool, parent):
+    with allocate(recovery, tool, parent) as folder:
+        lease = build_folders.gate_folder_lease_fields(folder, parent)
+        start, = [row for path in store.root().glob("*/*.jsonl")
+                  for row in store.locked_rows(path) if row.get("kind") == "gate_folder_start"]
+        assert start["folder"] == str(folder.resolve())
+        for field in ("pid", "process_start", "boot_id"):
+            assert start.get(field) == lease.get(field)
+        if {end!r} == "sigterm":
+            signal.raise_signal(signal.SIGTERM)
+        yield folder
+
+gate.gate_temporary = observe_folder
+"""
+                with mock.patch.dict(self.environment, {"BUILDLOG_DIR": str(buildlog)}):
+                    result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                    record = self.only_record()
+                start, = [row for path in buildlog.glob("*/*.jsonl")
+                          for row in store.locked_rows(path) if row.get("kind") == "gate_folder_start"]
+                self.assertEqual(start["sha"], self.base)
+                self.assertEqual(start["branch"], "integration")
+                self.assertEqual(start["step"], "gate")
+                self.assertEqual(record.get("end"), end)
+                self.assertEqual(record.get("suite_folders"), [start["folder"]])
+                fields: Mapping[str, object] = record
+                for field in ("pid", "process_start", "boot_id", "sha", "branch", "step"):
+                    self.assertEqual(fields.get(field), start.get(field))
+                self.assertEqual(record["aborted"], end == "sigterm")
+                if end == "sigterm":
+                    self.assertEqual(record["modules"], [])
+
+    def test_sigterm_before_the_timing_mask_writes_one_end(self) -> None:
+        preamble = """from contextlib import contextmanager
+allocate = gate.gate_temporary
+sigmask = signal.pthread_sigmask
+
+def stop_before_mask(how, signals):
+    if how == signal.SIG_BLOCK and signal.SIGTERM in signals:
+        signal.pthread_sigmask = sigmask
+        assert signal.SIGTERM not in sigmask(signal.SIG_BLOCK, ())
+        signal.raise_signal(signal.SIGTERM)
+    return sigmask(how, signals)
+
+@contextmanager
+def arm_after_suite(recovery, tool, parent):
+    with allocate(recovery, tool, parent) as folder:
+        yield folder
+    signal.pthread_sigmask = stop_before_mask
+
+gate.gate_temporary = arm_after_suite
+"""
+        result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        record = self.only_record()
+        self.assertEqual(record.get("end"), "sigterm")
+        self.assertTrue(record["aborted"])
+        kinds = [row.get("kind") for path in Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
+                 for row in store.locked_rows(path)]
+        self.assertEqual(kinds.count("gate_folder_end"), 0)
+
+    def test_sigterm_during_cleanup_error_unwind_writes_one_end(self) -> None:
+        self.assert_cleanup_error_stop(signal.SIGTERM, -signal.SIGTERM, "sigterm")
+
+    def test_sigint_and_sighup_during_cleanup_error_unwind_write_one_end(self) -> None:
+        for signum, status, python_sigint in (
+            (signal.SIGINT, 1, True),
+            (signal.SIGINT, -signal.SIGINT, False),
+            (signal.SIGHUP, -signal.SIGHUP, False),
+        ):
+            with self.subTest(signum=signum, python_sigint=python_sigint):
+                self.assert_cleanup_error_stop(signum, status, "red", python_sigint=python_sigint)
+
+    def assert_cleanup_error_stop(self, signum: signal.Signals, status: int, end: gate_record.GateEnd, *,
+                                  python_sigint: bool = False) -> None:
+        preamble = f"""from contextlib import ExitStack, contextmanager
+from scripts.lib import build_folders
+from unittest.mock import patch
+allocate = gate.gate_temporary
+remove = build_folders._remove_build_folder
+sigmask = signal.pthread_sigmask
+stop = signal.Signals({int(signum)})
+signal.signal(stop, signal.default_int_handler if {python_sigint!r} else signal.SIG_DFL)
+sigmask(signal.SIG_UNBLOCK, (stop,))
+
+def stop_before_mask(how, signals):
+    if how == signal.SIG_BLOCK and signal.SIGTERM in signals:
+        signal.pthread_sigmask = sigmask
+        assert stop not in sigmask(signal.SIG_BLOCK, ())
+        signal.raise_signal(stop)
+    return sigmask(how, signals)
+
+@contextmanager
+def fail_suite_cleanup(recovery, tool, parent):
+    try:
+        with ExitStack() as cleanup:
+            # Keep a detached helper from changing the fixture after the gate exits.
+            with patch.object(os, "pidfd_open", create=True, side_effect=PermissionError("fixture pidfd refusal")):
+                folder = cleanup.enter_context(allocate(recovery, tool, parent))
+            yield folder
+
+            def refuse_removal(path, **options):
+                if path == folder:
+                    raise OSError("fixture cleanup failure")
+                return remove(path, **options)
+
+            build_folders._remove_build_folder = refuse_removal
+    except OSError as error:
+        assert str(error) == "fixture cleanup failure"
+        assert folder.is_dir()
+        signal.pthread_sigmask = stop_before_mask
+        raise
+    finally:
+        build_folders._remove_build_folder = remove
+
+gate.gate_temporary = fail_suite_cleanup
+"""
+        buildlog = self.root / f"records-{signum.name}-{status}"
+        with mock.patch.dict(self.environment, {"BUILDLOG_DIR": str(buildlog)}):
+            result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+        rows = [row for path in buildlog.glob("*/*.jsonl") for row in store.locked_rows(path)]
+        start, = [row for row in rows if row.get("kind") == "gate_folder_start"]
+        ends = [row for row in rows if row.get("kind") in ("gate_run", "gate_folder_end")]
+        self.assertEqual([(row.get("end"), row.get("suite_folders")) for row in ends],
+                         [(end, [start["folder"]])])
+
+    def test_sigterm_during_the_timing_append_writes_one_end(self) -> None:
+        preamble = """from scripts.buildlog import store
+write_all = store._write_all
+
+def stop_during_timing_append(descriptor, data):
+    if data.startswith(b'{"kind":"gate_run",'):
+        middle = len(data) // 2
+        write_all(descriptor, data[:middle])
+        signal.raise_signal(signal.SIGTERM)
+        assert signal.SIGTERM in signal.sigpending()
+        write_all(descriptor, data[middle:])
+    else:
+        write_all(descriptor, data)
+
+store._write_all = stop_during_timing_append
+"""
+        result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, -signal.SIGTERM, result.stdout + result.stderr)
+        self.assertEqual(self.only_record().get("end"), "normal")
+        kinds = [row.get("kind") for path in Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
+                 for row in store.locked_rows(path)]
+        self.assertEqual(kinds.count("gate_folder_end"), 0)
+
+    def test_sigint_during_timing_sync_writes_one_end(self) -> None:
+        preamble = """from scripts.buildlog import store
+write_all = store._write_all
+sync = os.fsync
+signal.signal(signal.SIGINT, signal.default_int_handler)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+
+def arm_after_append(descriptor, data):
+    write_all(descriptor, data)
+    if data.startswith(b'{"kind":"gate_run",'):
+        def interrupt_sync(sync_descriptor):
+            assert sync_descriptor == descriptor
+            os.fsync = sync
+            signal.raise_signal(signal.SIGINT)
+            assert signal.SIGINT in signal.sigpending()
+            sync(sync_descriptor)
+
+        os.fsync = interrupt_sync
+
+store._write_all = arm_after_append
+"""
+        result = self.run_gate("--tests-only", "--full", own_process=True, preamble=preamble)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        rows = [row for path in Path(self.environment["BUILDLOG_DIR"]).glob("*/*.jsonl")
+                for row in store.locked_rows(path)]
+        ends = [(row["kind"], row.get("end")) for row in rows if row.get("kind") in ("gate_run", "gate_folder_end")]
+        self.assertEqual(ends, [("gate_run", "normal")])
 
     @gate_suites("hooks", "notify", "direct")
     def test_record_keeps_each_attempt_and_only_failed_or_slow_tests(self) -> None:

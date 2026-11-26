@@ -40,6 +40,7 @@ from scripts.production import staff
 PATH = "/console/build-kill"
 PROC = Path("/proc")
 CARGO_PROGRAMS = frozenset({"cargo", "cargo-nextest", "cargo-tile-real"})
+RECOVERY_THREAD = "build kill recovery"
 BUILD_STEPS = CARGO_BUILD_VERBS | {"cargo", "cargo-nextest", "fmt"}
 
 
@@ -832,7 +833,8 @@ class KillActions:
         """Start one recovery pass from the server maintenance cycle."""
         with self._lock:
             if self._retry and (self._worker is None or not self._worker.is_alive()):
-                self._worker = threading.Thread(target=self._recover, args=(tuple(self._retry),), daemon=True)
+                self._worker = threading.Thread(target=self._recover, args=(tuple(self._retry),),
+                                                name=RECOVERY_THREAD, daemon=True)
                 self._worker.start()
 
     def resume(self) -> None:

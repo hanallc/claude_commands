@@ -49,6 +49,7 @@ class UpkeepTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root),
+            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
             "GATE_STATE_DIR": str(self.root / "merge-gate"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "HERDR_UPKEEP_CONFIG": str(self.root / "config.toml")}))

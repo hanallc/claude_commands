@@ -30,6 +30,27 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_direct_push_to_the_remote_default_branch_requires_test_review(self) -> None:
+        production = read_new_production(self.doc, "example")
+        branch = production.merge_branch
+        _ = self.git("symbolic-ref", "HEAD", f"refs/heads/{branch}", cwd=self.origin)
+        _ = self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        path = "test_guard.py"
+        self.write(self.checkout, path, "def test_move():\n    assert 1\n")
+        _ = self.git("add", path)
+        _ = self.git("commit", "-m", "Add a test")
+        _ = self.git("push", "origin", branch)
+        base = self.git("rev-parse", "HEAD")
+        self.write(self.checkout, path, "def test_move():\n    assert 2\n")
+        _ = self.git("commit", "-am", "Change the test")
+        tip = self.git("rev-parse", "HEAD")
+        with mock.patch.dict(os.environ, self.env), self.assertRaises(checkpoint_gate.Stop) as result:
+            _ = merge_checkpoint.push_git(production, tip)
+        self.assertEqual((result.exception.step, result.exception.state), ("push", "held"))
+        self.assertIn("no review is on record", result.exception.detail)
+        self.assertIn(f"--base {base} --commit {tip}", result.exception.detail)
+        self.assertEqual(self.git("rev-parse", f"refs/heads/{branch}", cwd=self.origin), base)
+
     def test_conflict_holds_with_no_merge_left_behind(self) -> None:
         self.write(self.checkout, "src/alpha.txt", "main side\n")
         _ = self.git("add", "src/alpha.txt")

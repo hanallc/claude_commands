@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import fcntl
 import hashlib
 import inspect
 import json
@@ -25,12 +26,14 @@ from typing import TextIO, cast, final, override
 from unittest.mock import patch
 from urllib.parse import urlencode
 
+from scripts.console_text.test_support import accepting_console_text
 from scripts.agents import pane_record
 from scripts.agents.remote import local_machine
 from scripts.lib import atomic_file, conf, urgency
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import write_config_fixture
+from scripts.notify import review
 from scripts.production import change_review, investigation, next_item, production_admission, production_lifecycle, proposal_issue, proposals_folder, record_store, session_staff, showrunners, staff, tidy_wrapped, update_registration
 from scripts.production.issues import Issue, frontmatter
 from scripts.production.production_doc import read_production
@@ -87,6 +90,7 @@ class ReviewSubmissionTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.enterContext(accepting_console_text())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issues = self.root / "issues"
         self.doc = self.root / "production.md"
@@ -149,6 +153,47 @@ class ReviewSubmissionTests(unittest.TestCase):
                                                         review_items.ReviewState.OPEN))
         self.assertEqual(row.log[-1].words, 'Answer: '+answer)
         self.assertEqual(row.response, submissions.QuestionResponse(payload.words, answer, row.log[-1].time))
+
+    def test_scoped_review_replies_release_recipient_locks_and_recheck_the_record(self) -> None:
+        words = "Use the desktop layout."
+        for kind in submissions.SubmissionKind:
+            with self.subTest(kind=kind):
+                saved = submissions.submit(request(kind))
+                token = saved.reply_token
+
+                def read_draft(*_args: object, **_kwargs: object) -> review.QuestionAccepted:
+                    lock = investigation.state_root() / "investigation-locks" / (OWNER + ".lock")
+                    with lock.open("r") as handle:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if kind == submissions.SubmissionKind.PROPOSAL:
+                        digest = hashlib.sha256(str(saved.path.resolve()).encode()).hexdigest()[:32]
+                        issue_lock = Path.home() / ".local/state/proposal-issue/locks" / f"proposal-issue-{digest}.lock"
+                        issue_lock.parent.mkdir(parents=True, exist_ok=True)
+                        with issue_lock.open("a") as handle:
+                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with submissions.scoped_submission(new_item_dialog.read_submission_key(saved.key)) as located:
+                        match located.record:
+                            case update_registration.QuestionRecord() as record:
+                                update_registration.set_waiting_why(record, "Check the second layout.")
+                            case Issue() as issue:
+                                _ = proposal_issue.record_review(issue.path, "Check the second layout.",
+                                                                 review_events.KeepMark(), date.today())
+                            case investigation.Investigation() as record:
+                                investigation.set_waiting_why(record.owner, record.id, "Check the second layout.")
+                    return review.QuestionAccepted(words)
+
+                with patch.object(review, "review_question", side_effect=read_draft) as reader:
+                    with self.assertRaisesRegex(submissions.SubmissionError, "selected .* changed"):
+                        _ = submissions.answer(saved.key, words, token)
+                reader.assert_called_once()
+                self.assertNotIn(words, saved.path.read_text())
+                self.assertIn("Check the second layout.", saved.path.read_text())
+
+                with patch.object(review, "review_question", return_value=review.QuestionAccepted(words)) as reader:
+                    self.assertTrue(submissions.answer(saved.key, words, token))
+                    self.assertFalse(submissions.answer(saved.key, words, token))
+                reader.assert_called_once()
+                self.assertIn(words, saved.path.read_text())
 
     def test_four_kinds_use_their_native_stores_and_ids(self) -> None:
         expected = ("Q1", "P1", "I1", "I2")
@@ -534,9 +579,14 @@ class ReviewSubmissionTests(unittest.TestCase):
             self.assertEqual(reply_tokens.derive(second.details.reply_proof), original_token)
             self.assertEqual(mac_key.read_bytes(), original_key)
         self.assertEqual(reply_tokens.derive(proof), token)
+
+        def accept(_key: review.QuestionKey, draft: str, **_kwargs: object) -> review.QuestionAccepted:
+            return review.QuestionAccepted(draft)
+
         for kind in submissions.SubmissionKind:
-            with self.subTest(kind=kind):
+            with (self.subTest(kind=kind), patch.object(review, "review_question", side_effect=accept) as reader):
                 first = submissions.submit(request(kind, kind))
+                reader.reset_mock()
                 proof = first.details.reply_proof
                 token = reply_tokens.derive(proof)
                 self.assertEqual(token, first.reply_token)
@@ -550,6 +600,7 @@ class ReviewSubmissionTests(unittest.TestCase):
                     self.assertFalse(change_page.answer_item(first.key, "An answer", token, status))
                     with self.assertRaisesRegex(question_record.AnswerRefused, "no longer accepts"):
                         _ = change_page.answer_item(first.key, "New answer", token, status)
+                reader.assert_called_once()
                 match kind:
                     case submissions.SubmissionKind.QUESTION:
                         answered, = self.questions()
@@ -777,7 +828,7 @@ class ReviewSubmissionTests(unittest.TestCase):
             self.assertEqual(submissions.submit(payload), saved)
         self.assertEqual(saved.path.parent, self.issues)
         receipt = cast(dict[str, str], json.loads((submissions.image_folder(saved).parent / "receipt.json").read_text()))
-        self.assertEqual(receipt, {"id": "P1", "kind": "proposal", "recipient": OWNER,
+        self.assertEqual(receipt, {"destination": "native", "id": "P1", "kind": "proposal", "recipient": OWNER,
                                    "path": str(saved.path), "original_path": str(saved.path),
                                    "payload_hash": saved.payload_hash})
         self.assertEqual(list(new_folder.glob("*.md")), [])
@@ -2288,10 +2339,13 @@ class ReviewSubmissionTests(unittest.TestCase):
         archive = moved.parent / 'archive' / '2026'
         archive.mkdir(parents=True)
         archived = moved.rename(archive / moved.name)
-        with patch.object(investigation, 'review_record_paths', wraps=investigation.review_record_paths) as search:
+        with (patch.object(investigation, 'review_record_paths', wraps=investigation.review_record_paths) as search,
+              patch.object(review, "review_question", return_value=review.QuestionAccepted("Answer in the archive"))):
             self.assertTrue(submissions.answer(saved.key, 'Answer in the archive', token, members=wrapped))
+            self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 2)
+            search.reset_mock()
             retry = submissions.submit(payload, members=wrapped)
-        self.assertEqual(search.call_args_list, [((PRODUCER,), {"strict": True})] * 2)
+            search.assert_called_once_with(PRODUCER, strict=True)
         self.assertEqual((retry.id, retry.owner, retry.path), (saved.id, PRODUCER, archived))
         self.assertEqual((retry.key, retry.reply_token), (saved.key, ""))
         self.assertTrue(new_item_dialog.matches_reply_token(retry.details, token))

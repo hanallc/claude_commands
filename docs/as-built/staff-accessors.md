@@ -20,7 +20,11 @@ The fixed `id` identifies a member across session changes.
 `set_run` stores the open run path.
 `clear_run` clears pointers that match the supplied run path.
 
-`Kind` is `Literal["showrunner", "unit", "worker", "producer"]`.
+`Kind` is `Literal["showrunner", "unit", "worker", "producer", "session"]`.
+A session has `StaffRoot` as its parent.
+Its `launch_folder` field records where it starts.
+A unit can still own that folder as its worktree.
+`create_session` adds a session and its account in one staff transaction.
 A producer has `StaffRoot` as its parent.
 It can hold both a worktree and a document.
 It can start a staff path, such as `morty`.
@@ -164,6 +168,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/session_state.py` | read | StaffRow, Exited, Paused |
 | `scripts/accounts/unit_watchdog.py` | read | active, initial_snapshot, snapshot |
+| `scripts/adhoc_review/shared_review.py` | read | snapshot supplies the staff names and current sessions for join |
 | `scripts/agents/codex_test_support.py` | read | CodexBackend (fixture) |
 | `scripts/agents/detached_runs.py` | read | local_snapshot |
 | `scripts/agents/restart_support.py` | read | Kind (type only); the continuation send names the recipient kind |
@@ -245,6 +250,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/lint/tmp_sweep.py` | read | local_snapshot |
 | `scripts/maintenance/agent_notes_job.py` | read | snapshot |
 | `scripts/maintenance/folder_size.py` | read | snapshot and active select producers. LiveDoc supplies the recorded path. StaffId identifies the notice recipient. |
+| `scripts/maintenance/herdr_upkeep.py` | read | StaffRefused reports a staff read failure during the scheduled List check. |
 | `scripts/mac_test/mac_test.py` | read | initial_snapshot, by_id, StaffId; holder_name shows the current name of a fixed holder key, delivery_target sends to the staff id |
 | `scripts/message/escalate.py` | read | active, snapshot |
 | `scripts/message/failed_lookup.py` | read | snapshot |
@@ -263,10 +269,11 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
+| `scripts/production/behavior_review.py` | read | caller_identity identifies the requester. StaffId identifies the owner of the saved question. StaffRefused reports a staff refusal. |
+| `scripts/production/broadcast.py` | read | initial_snapshot supplies producer membership. StaffUnreadable reports a failure to read it. |
 | `scripts/production/census.py` | read | StaffId |
 | `scripts/production/change_review.py` | read | snapshot |
 | `scripts/production/change_routing.py` | read | staff.json path |
-| `scripts/production/codex_winddown.py` | read | snapshot |
 | `scripts/production/completion_receipt.py` | read | native_id |
 | `scripts/production/delivery_state.py` | read | staff.json path |
 | `scripts/production/demote_showrunner.py` | write | by_id, change_director, cli_result, move, operation, snapshot |
@@ -356,8 +363,10 @@ The shared pane launch builder uses `set_home`.
 | `scripts/review_links/serve.py` | read | snapshot supplies the recipients for the New item dialog. |
 | `scripts/review_links/staff_names.py` | read | snapshot gives the staff rows; StaffRow kind and name pick each staff name's role color for the console pages |
 | `scripts/review_links/investigations_page.py` | read | snapshot and by_id resolve legacy investigation submissions |
-| `scripts/review_links/list_page.py` | read | snapshot, by_id, and parent_of name List owners, validate morty, resolve the alert showrunner, and supply identities to the shared count readers; by_id and StaffRow top_item mark the top priority items |
-| `scripts/review_links/studio_page.py` | read | active and StaffRow retirement pick the producers that get a Studio tab; the snapshot comes from `list_page.render` |
+| `scripts/review_links/list_draft.py` | read | StaffId identifies the List keeper and the notice recipients. |
+| `scripts/review_links/list_page.py` | read | The staff snapshot supplies owners, the alert showrunner, and the identities for count queries. StaffRow top_item marks the top priority item. |
+| `scripts/review_links/studio_page.py` | read | Active producers get Studio tabs. The snapshot comes from `list_page.render`. |
+| `scripts/agents/clone_session.py` | write | create_session adds the clone with its distinct native ID. |
 | `scripts/agents/inventory.py` | read | local_snapshot |
 | `scripts/agents/launch_names.py` | read | initial_snapshot |
 | `scripts/agents/member_account.py` | write | StaffRow, SessionHome, set_home; repairs the home from live process evidence |
@@ -399,7 +408,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 247 accessor rows (43 write, 203 read, and 1 owner).
+The table has 254 accessor rows (44 write, 209 read, and 1 owner).
 
 ## Approved copies
 

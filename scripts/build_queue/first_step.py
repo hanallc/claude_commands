@@ -373,7 +373,8 @@ def _gate_request(command: Sequence[str], source: Path, targets: tuple[str, ...]
         if "natedev" not in targets:
             raise FirstStepRefused(f"gate.py {flag} runs only on natedev")
         targets = ("natedev",)
-    local = replace(_program_request(command, source, owner, position, run).refresh(), sidecar=str(sidecar))
+    local = replace(_program_request(command, source, owner, position, run).refresh(), sidecar=str(sidecar),
+                    trace_sampling=wire.ProcessTreeTraceSampling())
     tree_key = treekey.tree_key(str(source))
     source_key = (execution_identity.SourceKeyKnown(tree_key) if tree_key
                   else execution_identity.SourceKeyUnavailable('source key is unavailable'))

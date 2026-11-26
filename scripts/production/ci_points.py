@@ -20,7 +20,7 @@ from scripts.buildlog.repository import remote_identity
 from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
 from scripts.production import promotion
-from scripts.production.checkpoint_gate import CiRecord as CiRecord, InvalidCiRecord, NoCiRecord, read_ci_record
+from scripts.production.checkpoint_gate import CiRecord as CiRecord, InvalidCiRecord, NoCiRecord, Stop, read_ci_record
 from scripts.production.production_doc import Production, Refusal, read_production
 from scripts.production.production_names import CARGO_LINER_PRODUCTION
 from scripts.production.merge_checkpoint import git, live_file_refusal, merged_checkpoints, merge_lock
@@ -241,9 +241,10 @@ def push_covers_branch(filters: object, branch: str) -> bool:
 
 
 def ci_trigger(production: Production, tip: str, remote: CiPushRemote) -> PushStartsCi | DispatchStartsCi | NoCiTrigger:
-    directory = ".github/workflows"
-    listing = required(git(production.checkout, "ls-tree", "--name-only", "-z", tip, f"{directory}/"), "ci start")
-    workflows = [path for path in listing.split("\0") if path.endswith((".yml", ".yaml"))]
+    try:
+        workflows = promotion.ci_workflow_paths(production.checkout, tip)
+    except Stop as error:
+        raise PointFailure("ci start", error.detail) from error
     candidates: dict[str, bool] = {}
     for workflow in workflows:
         try:
@@ -255,7 +256,7 @@ def ci_trigger(production: Production, tip: str, remote: CiPushRemote) -> PushSt
         if covers_push or "workflow_dispatch" in events:
             candidates[workflow] = covers_push
     if not candidates:
-        return NoCiTrigger(", ".join(workflows) or f"{directory}/ci.yml")
+        return NoCiTrigger(", ".join(workflows) or f"{promotion.CI_WORKFLOW_DIRECTORY}/ci.yml")
     host, _, repo = remote.repo.partition("/")
     rows = required(command("ci start", "gh", "api", "--hostname", host, "--paginate",
                             f"repos/{repo}/actions/workflows?per_page=100", "--jq",

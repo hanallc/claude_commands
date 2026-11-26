@@ -3364,6 +3364,35 @@ runpy.run_module('scripts.agents.restart', run_name='__main__', alter_sys=True)
                                             environment, herdr.NO_ENVIRONMENT_REMOVALS)
             self.assertEqual(pane, "w1:p0")
 
+    def test_restart_standalone_claude_preserves_its_implicit_home_after_loading_the_environment(self) -> None:
+        self.running.clear()
+        home = self.root / "source-home"
+        identity = self.rows[0].current_session
+        row = staff.StaffRow(identity, "session", "clone", staff.StaffRoot(), current_session=identity,
+                             launch_folder=staff.SessionLaunchFolder(remote.local_machine(), self.root),
+                             home=staff.SessionHome(home / ".claude"))
+        record = staff.StaffSnapshot((row,))
+        with patch.object(staff, "initial_snapshot", return_value=record):
+            entry = pane_record.launch("w1:p0", str(identity), str(self.root), {"HOME": str(home)}, ["claude", "-n", "clone"])
+            with (patch.object(pane_record, "publication_for_session",
+                      return_value=pane_launch.LaunchPublication(pane_record.record_path("agents"), entry)),
+                  patch.object(herdr, "read_conversation", return_value=herdr.StoppedConversation()),
+                  patch.object(herdr, "prepare_session_environment", return_value=herdr.PreparedAgentEnvironment(
+                      self.root, {"HOME": "/inherited/home", "CLAUDE_CONFIG_DIR": "/inherited/account"})) as prepare,
+                  patch.object(herdr, "launch_prepared_agent", return_value=herdr.AgentLaunched(
+                      "w1:p0", herdr.PromptSubmissionNotRequired())) as launch):
+                self.assertEqual(restart.start_row(row, record, herdr.Herdr("agents"),
+                    worker_scope=restart.WorkerRestartScope.SELECTED_ROWS), "w1:p0")
+        supplied = cast(dict[str, str], prepare.call_args.args[2])
+        self.assertEqual(supplied["HOME"], str(home))
+        self.assertNotIn("CLAUDE_CONFIG_DIR", supplied)
+        self.assertNotIn("CLAUDE_CODE_REMOTE_MEMORY_DIR", supplied)
+        self.assertEqual(prepare.call_args.args[3], frozenset({"CLAUDE_CONFIG_DIR"}))
+        prepared = cast(herdr.PreparedAgentEnvironment, launch.call_args.args[2])
+        self.assertEqual(prepared.env, {"HOME": str(home)})
+        self.assertEqual(prepared.unset_environment, frozenset({"CLAUDE_CONFIG_DIR"}))
+        self.assertEqual(prepared.claude_home, pane_launch.ImplicitClaudeHome(home))
+
     def test_start_row_uses_the_configured_opening_prompt_budget_only_for_claude_prompts(self) -> None:
         for start_seconds, opening_seconds in ((7, 43), (51, 17)):
             for kind, opening in (

@@ -24,6 +24,7 @@ def _usage() -> str:
   agents resume NAME [--retired] [--why TEXT] [--to ACCOUNT]
   agents resume PRODUCER --resend-opening-prompt
   agents resume --production SHOWRUNNER
+  agents clone NAME --as NEW
   agents retire NAME [--to PRODUCER]
   agents rename OLD NEW [--to-doc PATH] [--to-branch NAME]
   agents move SESSION_OR_GROUP ACCOUNT [--dry-run] [--why TEXT]
@@ -516,6 +517,42 @@ def _paused_resume_needs_message(row: staff.StaffRow) -> bool:
         stop_resume.ClaudeUp))
 
 
+def _forward_resume(row: staff.StaffRow, options: CommandLine) -> int | None:
+    """Resume a staff row on its configured workstation."""
+    machine = stop_resume.member_machine(row)
+    if not machine:
+        if options.production:
+            # Keep the local lookup for production units without a recorded machine.
+            return None
+        print(f"{row.name}: resume refused because the staff row has no machine", file=sys.stderr)
+        return 1
+    if unit_machine_is_local(machine):
+        return None
+    if options.here:
+        print(f"{row.name}: session is on {machine}", file=sys.stderr)
+        return 1
+    route = remote.machine_alias(machine)
+    if isinstance(route, remote.MachineNameRefused):
+        print(f"{row.name}: {route.reason}", file=sys.stderr)
+        return 1
+    if route.alias != other_machine():
+        print(f"{row.name}: no resume route to {machine}", file=sys.stderr)
+        return 1
+    arguments = ["resume", "--here", f"--why={options.why}"]
+    if options.to is not None:
+        arguments.append(f"--to={options.to}")
+    arguments.extend(("--", str(row.id)))
+    code, output = run_remote(arguments)
+    if code == 255:
+        print(f"{row.name}: cannot reach {machine} to resume the session", file=sys.stderr)
+        return 1
+    if output:
+        print(output)
+    elif code:
+        print(f"{row.name}: resume failed on {machine} (status {code})", file=sys.stderr)
+    return code
+
+
 def _local_keep_workers_refusal(row: staff.StaffRow) -> str:
     try:
         observed = herdr.read_conversation(str(row.current_session))
@@ -577,11 +614,24 @@ def _lifecycle(options: CommandLine) -> int:
         rows = [row] if row is not None else []
         if not rows:
             if options.command == "resume":
+                named = [member for member in record.rows if member.name == options.session]
+                if len(named) == 1:
+                    forwarded = _forward_resume(named[0], options)
+                    if forwarded is not None:
+                        return forwarded
+                if options.here:
+                    print(f"{options.session}: no staff row on this machine", file=sys.stderr)
+                    return 1
                 return _result_code(stop_resume.resume(options.session, why=why, to=options.to))
             raise staff.StaffNotFound(staff.StaffId(options.session))
     code = 0
     for row in rows:
         if options.command == "resume":
+            if not isinstance(row.worktree, staff.RemovedWorktree):
+                forwarded = _forward_resume(row, options)
+                if forwarded is not None:
+                    code = max(code, forwarded)
+                    continue
             with ExitStack() as operation:
                 try:
                     _ = operation.enter_context(staff.row_operation(str(row.id)))
@@ -712,6 +762,9 @@ def main(argv: list[str] | None = None) -> int:
     _ = command.add_argument("--dry-run", action="store_true")
     _ = command.add_argument("--only", default="")
     _ = command.add_argument("--account", dest="account")
+    command = commands.add_parser("clone")
+    _ = command.add_argument("session", metavar="NAME")
+    _ = command.add_argument("--as", dest="new", required=True, metavar="NEW")
     command = commands.add_parser("remove-stray")
     _ = command.add_argument("producer", metavar="NAME")
     _ = command.add_argument("session", metavar="SESSION")
@@ -735,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
         _ = selection.add_argument("session", nargs="?")
         _ = selection.add_argument("--production", default="")
         if verb == "resume":
+            _ = command.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
             _ = command.add_argument("--retired", action="store_true")
             _ = command.add_argument("--resend-opening-prompt", action="store_true")
             _ = command.add_argument("--to")
@@ -788,8 +842,12 @@ def main(argv: list[str] | None = None) -> int:
             return set_model.report_error(error)
     locks = ExitStack()
     try:
-        if options.command in ("resume", "restart", "add-producer", "transfer", "move") and not options.dry_run:
+        if options.command in ("resume", "restart", "add-producer", "transfer", "move", "clone") and not options.dry_run:
             locks.enter_context(herdr.reboot_lock())
+        if options.command == "clone":
+            from scripts.agents import clone_session
+
+            return clone_session.run(options.session, options.new)
         if options.command == "resume" and options.resend_opening_prompt:
             if options.production or options.retired:
                 raise ValueError("--resend-opening-prompt needs one producer name and an active pane")

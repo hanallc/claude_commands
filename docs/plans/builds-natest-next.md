@@ -106,7 +106,7 @@ Phases 181 (`68da1fa10`), 183 (`8fe4448ec`), 184 (`0a6f179eb`), 185 (`cbe16dd36`
    | --- | --- | ---: | ---: | --- | --- |
    | 1 | `whoami/test_worker_usage.py:144` | 23 | 6.668 | whoami/usage owner | snapshot, instrumentation and external-directory cases |
    | 2 | `hooks/test_codex_hooks.py:197` | 67 | 8.074 | hooks/Codex owner | fake app-server processes, closure cases, CLI entry |
-   | 3 | `production/test_codex_winddown.py:637` | 21 | 7.674 | sdlc and messaging | bind `STATE`, `NOTIFIER`, broadcast and production paths locally |
+   | 3 | `production/test_codex_winddown.py:637` (obsolete: code deleted) | 21 | 7.674 | sdlc and messaging | bind `STATE`, `NOTIFIER`, broadcast and production paths locally |
 
    `mac_test/test_offload_cleanup.py:157` (34.52 CPU s, rank 9) runs the real sweep from `offload.py:1829`: 96 Python `-c` tasks, 33.27 local CPU s, required cleanup with no proven removable share. Merge-checkpoint (`merge_checkpoint_test_support.py:83`) and send (`test_send.py:359`) already run in process. Publication metadata (0–0.847 s) stays behind these trials. Earlier dispatch table, for history (architect after Phase 209):
 

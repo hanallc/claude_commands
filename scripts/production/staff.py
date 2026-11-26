@@ -39,8 +39,8 @@ if TYPE_CHECKING:
 
 OWNER_MACHINE = "natedev"
 StaffId = NewType("StaffId", str)
-Kind = Literal["showrunner", "unit", "worker", "producer"]
-_KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "producer")
+Kind = Literal["showrunner", "unit", "worker", "producer", "session"]
+_KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "producer", "session")
 UnitType = Literal["direct", "merge", "style"]
 UNIT_TYPES: tuple[UnitType, ...] = ("direct", "merge", "style")
 
@@ -86,7 +86,7 @@ class ReportsTo:
 
 @dataclass(frozen=True)
 class StaffRoot:
-    """A top showrunner has no parent."""
+    """The staff member has no parent."""
 
 
 @dataclass(frozen=True)
@@ -288,6 +288,38 @@ def worktree_machine(row: StaffRow) -> str:
 
 
 @dataclass(frozen=True)
+class SessionLaunchFolder:
+    """The machine and folder where a standalone session starts."""
+
+    machine: str
+    path: Path
+    unknown_fields: dict[str, object] = field(default_factory=dict, kw_only=True, compare=False)
+
+    def __post_init__(self) -> None:
+        _location(self.machine, self.path)
+
+    def to_json(self) -> dict[str, object]:
+        return {**self.unknown_fields, "machine": self.machine, "path": str(self.path)}
+
+    @classmethod
+    def from_json(cls, value: object) -> SessionLaunchFolder:
+        match value:
+            case {"machine": str() as machine, "path": str() as path}:
+                fields = cast(dict[str, object], value)
+                try:
+                    return cls(machine, Path(path), unknown_fields=_unknown_fields(fields, {"machine", "path"}))
+                except StaffRefused as error:
+                    raise StaffUnreadable(str(error)) from error
+            case _:
+                raise StaffUnreadable("launch_folder requires a machine and path")
+
+
+@dataclass(frozen=True)
+class NoSessionLaunchFolder:
+    """The row has no standalone session launch folder."""
+
+
+@dataclass(frozen=True)
 class LiveDoc:
     machine: str
     path: Path
@@ -449,6 +481,7 @@ class StaffRow:
     exited: Exited | Active = field(default_factory=Active)
     role: KnownWorkerRole | WorkerRoleUnknown = field(default_factory=WorkerRoleUnknown, kw_only=True)
     home: SessionHome | HomeUnknown = field(default_factory=HomeUnknown, kw_only=True)
+    launch_folder: SessionLaunchFolder | NoSessionLaunchFolder = field(default_factory=NoSessionLaunchFolder, kw_only=True)
     run: OpenRun | NoRun = field(default_factory=NoRun, kw_only=True)
     unit_type: UnitDetails | NotUnit = field(default_factory=NotUnit, kw_only=True)
     retirement: RetiredProducer | Active = field(default_factory=Active, kw_only=True)
@@ -472,6 +505,8 @@ class StaffRow:
             value["run"] = str(self.run.path)
         if isinstance(self.home, SessionHome):
             value["home"] = str(self.home.path)
+        if isinstance(self.launch_folder, SessionLaunchFolder):
+            value["launch_folder"] = self.launch_folder.to_json()
         if not isinstance(self.worktree, WorktreeUnfilled):
             value["worktree"] = {**self.worktree.unknown_fields, "machine": self.worktree.machine, "path": str(self.worktree.path),
                                  "state": "present" if isinstance(self.worktree, PresentWorktree) else "removed"}
@@ -549,9 +584,13 @@ class StaffRow:
             # _clean_parse finds this print from the data; a new parse print must update it too.
             print(f"anomaly: {staff_id}: unknown staff fields: {', '.join(invalid)}", file=sys.stderr)
         worktree, doc = _row_locations(kind, fields)
+        launch_folder: SessionLaunchFolder | NoSessionLaunchFolder = NoSessionLaunchFolder()
+        if kind == "session":
+            launch_folder = SessionLaunchFolder.from_json(fields.get("launch_folder"))
+            known_fields.add("launch_folder")
         return cls(StaffId(staff_id), kind, name,
                    ReportsTo(StaffId(parent)) if isinstance(parent, str) else StaffRoot(), worktree, doc, current_session=StaffId(current),
-                   role=parsed_role, home=parsed_home, unit_type=unit_type,
+                   role=parsed_role, home=parsed_home, launch_folder=launch_folder, unit_type=unit_type,
                    run=OpenRun(Path(run)) if isinstance(run, str) else NoRun(), retirement=retirement, top_item=top_item,
                    paused=Paused.from_json(fields["paused"]) if "paused" in fields else Active(),
                    exited=Exited.from_json(fields["exited"]) if "exited" in fields else Active(),
@@ -1316,7 +1355,7 @@ def operation() -> AbstractContextManager[None]:
 
 
 def _parent_kinds(kind: Kind) -> tuple[Kind, ...]:
-    return () if kind == "producer" else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
+    return () if kind in ("producer", "session") else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
 
 
 def validate_name(kind: Kind, name: str) -> None:
@@ -1327,6 +1366,11 @@ def validate_name(kind: Kind, name: str) -> None:
         raise StaffRefused(f"invalid short staff name: {name!r}")
     if kind == "worker":
         _ = WorkerName.parse(name)
+    if kind == "session":
+        from scripts.message.address import reserved_recipient
+
+        if reserved_recipient(name):
+            raise StaffRefused(f"{name}: reserved message address")
 
 
 def validate_unit_name_for_write(name: str) -> None:
@@ -1341,6 +1385,8 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
     unknown = {cast(str, row["id"]) for row in unknown_rows}
     sessions = {cast(str, row.get("current_session", row["id"])) for row in unknown_rows}
     names: set[tuple[Kind, ReportsTo | StaffRoot | None, str]] = set()
+    folded_names: set[str] = set()
+    standalone_names: set[str] = set()
     worktrees: set[tuple[str, Path]] = set()
     for row in rows:
         if row.id in indexed or row.id in unknown:
@@ -1351,6 +1397,8 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
         if row.current_session in sessions:
             raise StaffRefused(f"duplicate current session: {row.current_session}")
         sessions.add(row.current_session)
+        if (row.kind == "session") != isinstance(row.launch_folder, SessionLaunchFolder):
+            raise StaffRefused(f"{row.name}: only a session has a standalone launch folder")
         if row.kind not in ("unit", "producer") and not isinstance(row.worktree, WorktreeUnfilled):
             raise StaffRefused(f"{row.kind} cannot hold worktree")
         if row.kind not in ("showrunner", "producer") and not isinstance(row.doc, DocUnfilled):
@@ -1364,14 +1412,22 @@ def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = 
         if row.kind not in _KINDS:
             raise StaffRefused(f"invalid staff kind: {row.kind}")
         validate_name(row.kind, row.name)
+        folded = row.name.casefold()
+        if folded in standalone_names or (row.kind == "session" and folded in folded_names):
+            raise StaffRefused(f"{row.name}: another staff row has this name")
+        if row.kind == "session":
+            standalone_names.add(folded)
+        folded_names.add(folded)
         key = (row.kind, None if row.kind == "showrunner" else row.parent, row.name)
         if key in names:
             raise StaffRefused(f"{row.kind} name already exists: {row.name}")
         names.add(key)
     for row in rows:
         if isinstance(row.parent, StaffRoot):
-            if row.kind not in ("showrunner", "producer"):
+            if row.kind not in ("showrunner", "producer", "session"):
                 raise StaffRefused(f"{row.kind} {row.name} requires a parent")
+        elif row.kind == "session":
+            raise StaffRefused(f"{row.name}: a session cannot have a parent")
         elif row.parent.id not in unknown:
             parent = indexed.get(row.parent.id)
             allowed = _parent_kinds(row.kind)
@@ -1801,7 +1857,7 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
     if not all(parts) or len(parts) > len(_KINDS):
         return None
     # A root kind starts its own path.
-    roots = [row for row in rows if row.kind in ("showrunner", "producer") and row.name == parts[0]]
+    roots = [row for row in rows if row.kind in ("showrunner", "producer", "session") and row.name == parts[0]]
     row = roots[0] if len(roots) == 1 else None
     for name in parts[1:]:
         if row is None:
@@ -1871,8 +1927,8 @@ def _under_test_root(path: Path) -> bool:
 
 
 def _location_paths(row: StaffRow) -> tuple[Path, ...]:
-    return tuple(location.path for location in (row.doc, row.worktree)
-                 if isinstance(location, (LiveDoc, WrappedDoc, PresentWorktree, RemovedWorktree)))
+    return tuple(location.path for location in (row.doc, row.worktree, row.launch_folder)
+                 if isinstance(location, (LiveDoc, WrappedDoc, PresentWorktree, RemovedWorktree, SessionLaunchFolder)))
 
 
 def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
@@ -2051,6 +2107,8 @@ def ensure(kind: Kind, *, name: str, parent: ReportsTo | StaffRoot = STAFF_ROOT,
            doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
                 runtime_id: str = "", unit_type: UnitType | None = None) -> StaffRow:
     """Admit the identity and its location in the same owner transaction."""
+    if kind == "session":
+        raise StaffRefused("use create-session to admit a session")
     if not is_owner():
         arguments = ["ensure", kind, f"--name={name}", f"--runtime-id={runtime_id}"]
         if unit_type is not None:
@@ -2066,6 +2124,27 @@ def ensure(kind: Kind, *, name: str, parent: ReportsTo | StaffRoot = STAFF_ROOT,
 
     return _transaction(lambda rows: _ensure_row(rows, kind, name, parent, worktree=worktree, doc=doc,
                                                runtime_id=runtime_id, unit_type=unit_type))
+
+
+def create_session(name: str, identity: str, folder: SessionLaunchFolder, home: SessionHome) -> StaffRow:
+    """Admit a root session once, with its launch folder and account."""
+    validate_name("session", name)
+    if not home.path.is_absolute():
+        raise StaffRefused(f"{name}: the session home must be absolute")
+    session_id = native_id(identity)
+    if not is_owner():
+        return _remote_row(["create-session", session_id, f"--name={name}", "--machine", folder.machine,
+                            "--path", str(folder.path), "--home", str(home.path)])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        if any(session_id in (row.id, row.current_session) for row in rows):
+            raise StaffRefused(f"{session_id}: runtime identity already belongs to another member")
+        row = StaffRow(session_id, "session", name, STAFF_ROOT,
+                       current_session=session_id, home=home, launch_folder=folder)
+        rows.append(row)
+        return row
+
+    return _transaction(edit)
 
 
 def ensure_worker(identity: StaffId, name: str, parent: StaffId) -> StaffRow:
@@ -2912,6 +2991,11 @@ def _parser() -> argparse.ArgumentParser:
     _ = add.add_argument("--worktree", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--doc", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
+    create = verbs.add_parser("create-session", help=argparse.SUPPRESS)
+    _ = create.add_argument("target")
+    for field_name in ("name", "machine", "path", "home"):
+        _ = create.add_argument(f"--{field_name}", required=True)
+    _ = create.add_argument("--json", action="store_true")
     worker_parser = verbs.add_parser("ensure-worker", help=argparse.SUPPRESS)
     _ = worker_parser.add_argument("target")
     _ = worker_parser.add_argument("--name", required=True)
@@ -3040,6 +3124,9 @@ def _mutate(arguments: _Arguments, seed_text: str) -> StaffRow | StaffSnapshot |
         return begin_resume(StaffId(arguments.target), Paused.from_json(_decode(arguments.hold_record)))
     if arguments.verb == "finish-resume":
         return finish_resume(StaffId(arguments.target), arguments.resume_key, restore_pause=arguments.restore_pause)
+    if arguments.verb == "create-session":
+        return create_session(arguments.name, arguments.target,
+                              SessionLaunchFolder(arguments.machine, Path(arguments.path)), SessionHome(Path(arguments.home)))
     if arguments.verb == "ensure-worker":
         assert arguments.parent is not None
         return ensure_worker(native_id(arguments.target), arguments.name, StaffId(arguments.parent))

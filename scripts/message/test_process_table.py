@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the shared process-table snapshot and Codex-agent classification."""
+"""Tests for process table snapshots and process lookup."""
 
 from __future__ import annotations
 
@@ -62,21 +62,6 @@ class ProcessTableTests(unittest.TestCase):
             20: process_table.Process(20, 10, "python3", "python3 /tools/worker.py --task one two"),
             30: process_table.Process(30, 10, "sleep", ""),
         })
-
-    def test_codex_exec_is_an_agent(self) -> None:
-        self.assertTrue(process_table.is_codex_agent(
-            process_table.Process(1, 0, "codex", "codex exec --json"),
-        ))
-
-    def test_servers_wrappers_and_claude_workers_are_not_agents(self) -> None:
-        for command, arguments in (
-            ("codex", "codex app-server --listen ws://127.0.0.1:1"),
-            ("bash", "bash /home/u/.claude/scripts/agents/agent_bg.sh a"),
-        ):
-            with self.subTest(arguments=arguments):
-                self.assertFalse(process_table.is_codex_agent(
-                    process_table.Process(1, 0, command, arguments),
-                ))
 
 
 if __name__ == "__main__":

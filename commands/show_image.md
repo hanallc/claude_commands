@@ -27,6 +27,8 @@ Check the light mode and phone width yourself when the change needs them.
      --look-for "The owner filter is below State." --owner "$staff_id" --change sdlc/C12
    ```
    - Use `--image PATH` for a single image.
+   - Add `--two-halves` when one file contains two halves other than a before and after pair.
+   - The command checks the title and look-for points before it copies the image.
    - On a narrow window, a pair shows the before image above the after image.
    - Use `--list-item L<n>` to link the picture to a List item.
    - The command searches the current and old List folders.

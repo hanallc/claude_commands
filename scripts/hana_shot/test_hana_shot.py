@@ -13,6 +13,8 @@ import re
 import shlex
 import shutil
 from pathlib import Path
+import plistlib
+import select
 import signal
 import socket
 import struct
@@ -30,11 +32,12 @@ import zlib
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
 from scripts.buildlog import store
 from scripts.hana_shot import hana_shot
-from scripts.lib import conf, process_group
+from scripts.lib import conf, process_group, process_start
 from scripts.lib import scratch as scratch_folders
 from scripts.lib.git_test_support import fixture_git_environment
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
+from scripts.notify import push_texts
 from scripts.production import staff
 from scripts.production.cli_fixture import invoke_cli, process_boundary, process_boundary_for_case
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, fixture_worker, isolated_staff_file
@@ -63,6 +66,8 @@ TOOLS = ((30, GRAYSCALE, 3, "hana.effect.grayscale"), (20, GRAYSCALE, 1, "hana.e
 EXTRA_ENTITY = 77
 SHOT_SIZE = (4, 3)
 REMOTE_HOST = "natemccoy@mac"
+REMOTE_PROBE = ["ssh", "-T", "-o", "BatchMode=yes", "--", REMOTE_HOST]
+IOREG = ["/usr/sbin/ioreg", "-a", "-n", "Root", "-d1"]
 # Fake scp and ssh: the remote host is a local folder, and every call is logged as one JSON line.
 # The keep-awake call answers "awake", then logs "ended" once the script closes its stdin.
 FAKE_REMOTE = """\
@@ -78,8 +83,10 @@ log([name, *sys.argv[1:]])
 if name == "scp":
     if {copies!r}:
         shutil.copyfile(remote / Path(sys.argv[2]).name, sys.argv[3])
-elif sys.argv[2:] == ["uname", "-s"]:
+elif sys.argv[-2:] == ["uname", "-s"]:
     print({system!r})
+elif sys.argv[-len({ioreg!r}):] == {ioreg!r}:
+    sys.stdout.buffer.write(Path({console!r}).read_bytes())
 elif sys.argv[2] == "rm":
     (remote / Path(sys.argv[-1]).name).unlink(missing_ok=True)
 else:
@@ -447,6 +454,13 @@ class HanaShotTest(BuildLogIsolatedTest):
     @override
     def setUp(self) -> None:
         super().setUp()
+        if sys.platform == "darwin":
+            probe = hana_shot.probe_mac_console
+
+            def probe_fixture(remote: str | None, timeout: float) -> hana_shot.MacConsole:
+                return hana_shot.MacConsole.UNLOCKED if remote is None else probe(remote, timeout)
+
+            _ = self.enterContext(mock.patch.object(hana_shot, "probe_mac_console", side_effect=probe_fixture))
         self.fake = Fake()
         server = FixtureServer(("127.0.0.1", 0), handler_for(self.fake))
         self.fake_listeners = [server]
@@ -482,8 +496,13 @@ class HanaShotTest(BuildLogIsolatedTest):
 
     def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         if process_boundary_for_case(self):
+            command = [str(SCRIPT)]
+            if sys.platform == "darwin" and "--remote" not in args:
+                command = ["-c", "import sys; from scripts.hana_shot import hana_shot as shot; "
+                           + "shot.probe_mac_console = lambda remote, timeout: shot.MacConsole.UNLOCKED; "
+                           + "sys.exit(shot.main(sys.argv[1:]))"]
             return subprocess.run(
-                [str(SCRIPT.parents[1] / "lib/py"), str(SCRIPT), *args],
+                [str(SCRIPT.parents[1] / "lib/py"), *command, *args],
                 cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
                 timeout=TEST_HANG_GUARD_SECS, check=False,
             )
@@ -1590,6 +1609,24 @@ class LocateTests(HanaShotTest):
 
     def locate(self, selector: str = "tool:Shape#1", *options: str) -> subprocess.CompletedProcess[str]:
         return self.run_script("locate", "--port", str(self.port), "--target", selector, *options)
+
+    def test_commands_without_capture_skip_the_mac_lock_check(self) -> None:
+        port = ("--port", str(self.port))
+        for command in (
+            ("pose", "get", *port),
+            ("locate", *port, "--target", "tool:Shape#1"),
+            ("targets", *port),
+            ("views", "add", "current", *port, "--mode", "pose", "--from-current",
+             "--views-file", str(self.scratch / "views.toml")),
+        ):
+            with (
+                self.subTest(command=command),
+                mock.patch.object(hana_shot, "sys", mock.Mock(wraps=sys, platform="darwin")),
+                mock.patch.object(hana_shot, "probe_mac_console", side_effect=AssertionError("unexpected lock check")),
+            ):
+                result = self.run_script(*command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
 
     def test_locate_prints_logical_pixels_and_json_without_a_move_capture_or_timing(self) -> None:
         result = self.locate()
@@ -2810,6 +2847,77 @@ class ShotTests(HanaShotTest):
         self.assertEqual(self.timing_lines()[0]["failure_reason"], "no_app")
 
 
+def console_plist(locked: bool = False, **session_fields: object) -> bytes:
+    session: dict[str, object] = {"CGSSessionOnConsoleKey": True, "CGSSessionLoginDoneKey": True}
+    return plistlib.dumps([{"IOConsoleLocked": locked, "IOConsoleUsers": [session | session_fields]}])
+
+
+class MacConsoleTests(BuildLogIsolatedTest):
+    def test_mac_console_requires_explicit_unlock_from_the_logged_in_session(self) -> None:
+        ready = hana_shot.MacConsole.UNLOCKED
+        locked = hana_shot.MacConsole.LOCKED
+        unavailable = hana_shot.MacConsole.UNAVAILABLE
+        for output, expected in (
+            (console_plist(), ready),
+            (console_plist(True), locked),
+            (console_plist(CGSSessionScreenIsLocked=True), locked),
+            (console_plist(CGSSessionOnConsoleKey=False), unavailable),
+            (console_plist(CGSSessionLoginDoneKey=False), unavailable),
+            (console_plist(CGSSessionScreenIsLocked="false"), unavailable),
+            (plistlib.dumps([{"IOConsoleUsers": [{"CGSSessionOnConsoleKey": True, "CGSSessionLoginDoneKey": True}]}]),
+             unavailable),
+            (b"<?xml broken", unavailable),
+            (b'<?xml version="1.0"?><plist><date>invalid</date></plist>', unavailable),
+            (b"Permission denied", unavailable),
+        ):
+            with self.subTest(expected=expected, output=output):
+                self.assertIs(hana_shot.mac_console_state(output), expected)
+
+    def test_mac_console_does_not_treat_display_sleep_as_a_lock(self) -> None:
+        self.assertIs(hana_shot.mac_console_state(console_plist(DisplayAsleep=True)), hana_shot.MacConsole.UNLOCKED)
+
+    def test_mac_probe_rejects_failed_ssh_and_checks_ioreg_locally(self) -> None:
+        unavailable = hana_shot.MacConsole.UNAVAILABLE
+        with mock.patch.object(subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 255, console_plist(), b"no connection")) as run:
+            self.assertIs(hana_shot.probe_mac_console(REMOTE_HOST, 0.5), unavailable)
+        run.assert_called_once_with([*REMOTE_PROBE, *IOREG], stdin=subprocess.DEVNULL,
+                                    capture_output=True, check=False, timeout=0.5)
+        for error in (OSError("ssh failed"), subprocess.TimeoutExpired("ssh", 0.5)):
+            with self.subTest(error=error), mock.patch.object(subprocess, "run", side_effect=error):
+                self.assertIs(hana_shot.probe_mac_console(REMOTE_HOST, 0.5), unavailable)
+        with mock.patch.object(subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, console_plist(), b"")) as run:
+            self.assertIs(hana_shot.probe_mac_console(None, 0.5), hana_shot.MacConsole.UNLOCKED)
+        run.assert_called_once_with(IOREG, stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=0.5)
+
+    def test_mac_alert_clear_command_checks_the_process_identity_and_lock(self) -> None:
+        ready, locked, unavailable = (
+            hana_shot.MacConsole.UNLOCKED, hana_shot.MacConsole.LOCKED, hana_shot.MacConsole.UNAVAILABLE,
+        )
+        original, reused = process_start.Started("100"), process_start.Started("200")
+        for identity, console, code, probes_console in (
+            (original, locked, 1, True),
+            (original, unavailable, 1, True),
+            (original, ready, 0, True),
+            (reused, locked, 0, False),
+            (process_start.Zombie("100"), locked, 0, False),
+            (process_start.Gone(), locked, 0, False),
+            (process_start.Unreadable("cannot read"), locked, 1, True),
+        ):
+            with (
+                self.subTest(identity=type(identity), console=console, probes_console=probes_console),
+                mock.patch.object(process_start, "process_start", return_value=identity) as read,
+                mock.patch.object(hana_shot, "probe_mac_console", return_value=console) as probe,
+            ):
+                self.assertEqual(hana_shot.main(["--mac-lock-cleared", "123", "100", REMOTE_HOST]), code)
+                read.assert_called_once_with(123)
+                if probes_console:
+                    probe.assert_called_once_with(REMOTE_HOST, conf.read("hana_shot").number("call_timeout_seconds"))
+                else:
+                    probe.assert_not_called()
+
+
 class RemoteTests(HanaShotTest):
     def fake_remote(self, copies: bool, system: str = "Linux") -> Path:
         """Point the fake Hana's writes at a folder standing in for the remote host, and fake scp and ssh."""
@@ -2818,8 +2926,11 @@ class RemoteTests(HanaShotTest):
         self.fake.remote = remote
         bin_directory = self.scratch / "bin"
         bin_directory.mkdir()
+        console = self.scratch / "mac-console.plist"
+        _ = console.write_bytes(console_plist())
         source = FAKE_REMOTE.format(
             python=sys.executable, remote=str(remote), log=str(self.ssh_log), copies=copies, system=system,
+            ioreg=IOREG, console=str(console),
         )
         for name in ("scp", "ssh"):
             fake = bin_directory / name
@@ -2846,7 +2957,7 @@ class RemoteTests(HanaShotTest):
         remote_path = cast(str, screenshot["path"])
         self.assertRegex(remote_path, r"^/tmp/hana_shot_[0-9]+_1\.png$")
         [uname, copy, removal] = self.ssh_calls()
-        self.assertEqual(uname, ["ssh", REMOTE_HOST, "uname", "-s"])
+        self.assertEqual(uname, [*REMOTE_PROBE, "uname", "-s"])
         self.assertEqual(copy[:3], ["scp", "-q", f"{REMOTE_HOST}:{remote_path}"])
         self.assertEqual(Path(copy[3]).parent, self.scratch)
         self.assertEqual(self.fake.methods("world.mutate_components"), [], "a Linux host keeps its window level")
@@ -2862,9 +2973,10 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(result.returncode, 1, result.stderr)
         [screenshot] = self.fake.methods("brp_extras/screenshot")
         self.assertIn(f"no PNG came back from {REMOTE_HOST}:{screenshot['path']}", result.stderr)
+        uname, copy = self.ssh_calls()
         self.assertEqual(
-            [call[:3] for call in self.ssh_calls()],
-            [["ssh", REMOTE_HOST, "uname"], ["scp", "-q", f"{REMOTE_HOST}:{screenshot['path']}"]],
+            [uname, copy[:3]],
+            [[*REMOTE_PROBE, "uname", "-s"], ["scp", "-q", f"{REMOTE_HOST}:{screenshot['path']}"]],
             "the remote shot is kept",
         )
         self.assertEqual(len(list(remote.iterdir())), 1)
@@ -2882,12 +2994,165 @@ class RemoteTests(HanaShotTest):
         ])
         self.assertEqual(self.fake.window_level, "Normal")
         calls = self.ssh_calls()
-        uname, awake, copy = calls[:3]
-        self.assertEqual(uname, ["ssh", REMOTE_HOST, "uname", "-s"])
+        uname, before_start, awake, before_capture, copy = calls[:5]
+        self.assertEqual(uname, [*REMOTE_PROBE, "uname", "-s"])
+        self.assertEqual(before_start, [*REMOTE_PROBE, *IOREG])
+        self.assertEqual(before_capture, [*REMOTE_PROBE, *IOREG])
         self.assertEqual(awake[:2], ["ssh", REMOTE_HOST])
         self.assertTrue(awake[2].startswith("caffeinate -u "), awake)
         self.assertEqual(copy[0], "scp", "the display is awake before the shot")
         self.assertIn(["ended"], calls, "the keep-awake ends before the run exits")
+
+    def test_shot_waits_before_the_camera_read_and_each_capture_retry(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        self.fake.screenshot = "busy-once"
+        ready = hana_shot.MacConsole.UNLOCKED
+        locked = hana_shot.MacConsole.LOCKED
+        states = iter((hana_shot.MacConsole.UNAVAILABLE, locked, locked, ready, ready, locked, ready))
+        observations: list[tuple[bool, int]] = []
+        sleep = mock.Mock(return_value=None)
+
+        def probe(_remote: str | None, _timeout: float) -> hana_shot.MacConsole:
+            observations.append((bool(self.fake.calls), len(self.fake.methods("brp_extras/screenshot"))))
+            return next(states)
+
+        with (
+            mock.patch.object(hana_shot, "probe_mac_console", side_effect=probe) as checked,
+            mock.patch.object(hana_shot, "time", mock.Mock(wraps=time, sleep=sleep)),
+            mock.patch.object(push_texts, "send_user_push", return_value=True) as send,
+            mock.patch.object(push_texts, "user_retire_argv", return_value=[sys.executable, "-c", ""]) as retire,
+        ):
+            result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(observations, [(False, 0)] * 4 + [(True, 0), (True, 1), (True, 1)])
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 2)
+        settings = conf.read("hana_shot")
+        self.assertEqual(checked.call_args_list, [mock.call(REMOTE_HOST, settings.number("call_timeout_seconds"))] * 7)
+        self.assertEqual(sleep.call_args_list.count(mock.call(settings.number("resend_seconds"))), 4)
+        send.assert_called_once()
+        alert = send.call_args
+        self.assertEqual(cast(push_texts.RenderedPush, alert.args[0]).id, "hana_shot.mac_locked")
+        clears_when = cast(str, alert.kwargs["clears_when"])
+        identity = process_start.process_start(os.getpid())
+        assert isinstance(identity, process_start.Started)
+        self.assertEqual(shlex.split(clears_when), [
+            sys.executable, str(SCRIPT.resolve()), "--mac-lock-cleared", str(os.getpid()), identity.start, REMOTE_HOST,
+        ])
+        retire.assert_called_once_with(alert.kwargs["sender"], alert.kwargs["key"])
+        self.assertTrue((self.scratch / "shot.png").is_file())
+
+    def test_views_check_waits_then_retires_the_alert_before_capture(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        _ = (self.scratch / "views.toml").write_text('[views.home]\nmode = "home"\n')
+        ready = hana_shot.MacConsole.UNLOCKED
+        states = iter((ready, hana_shot.MacConsole.LOCKED, ready))
+
+        def retire_command(_sender: str, _key: str) -> list[str]:
+            self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+            return [sys.executable, "-c", ""]
+
+        with (
+            mock.patch.object(hana_shot, "probe_mac_console", side_effect=states) as probe,
+            mock.patch.object(hana_shot, "time", mock.Mock(wraps=time, sleep=mock.Mock(return_value=None))),
+            mock.patch.object(hana_shot, "brightest", return_value=0.5),
+            mock.patch.object(push_texts, "send_user_push", return_value=True) as send,
+            mock.patch.object(push_texts, "user_retire_argv", side_effect=retire_command) as retire,
+        ):
+            result = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"), "--remote", REMOTE_HOST)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PASS home", result.stdout)
+        self.assertEqual(probe.call_count, 3)
+        send.assert_called_once()
+        retire.assert_called_once_with(send.call_args.kwargs["sender"], send.call_args.kwargs["key"])
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 1)
+
+    def test_stopping_a_locked_shot_retires_its_alert(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        with (
+            mock.patch.object(hana_shot, "probe_mac_console", return_value=hana_shot.MacConsole.LOCKED),
+            mock.patch.object(hana_shot, "time", mock.Mock(wraps=time, sleep=mock.Mock(side_effect=KeyboardInterrupt))),
+            mock.patch.object(push_texts, "send_user_push", return_value=True) as send,
+            mock.patch.object(push_texts, "user_retire_argv", return_value=[sys.executable, "-c", ""]) as retire,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+
+        send.assert_called_once()
+        retire.assert_called_once_with(send.call_args.kwargs["sender"], send.call_args.kwargs["key"])
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.timing_lines()[0]["exit_code"], 130)
+
+    def test_sigterm_retires_the_alert_while_the_mac_stays_locked(self) -> None:
+        _ = self.fake_remote(copies=True, system="Darwin")
+        retired = self.scratch / "retired.json"
+        child = """
+import json
+from pathlib import Path
+import sys
+from scripts.hana_shot import hana_shot
+from scripts.notify import push_texts
+
+retired = sys.argv.pop(1)
+
+def send(*args, sender, key, **kwargs):
+    print(json.dumps([sender, key]), flush=True)
+    return True
+
+def retire(sender, key):
+    return [sys.executable, "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2])",
+            retired, json.dumps([sender, key])]
+
+hana_shot.probe_mac_console = lambda remote, timeout: hana_shot.MacConsole.LOCKED
+push_texts.send_user_push = send
+push_texts.user_retire_argv = retire
+sys.exit(hana_shot.main(sys.argv[1:]))
+"""
+        process: subprocess.Popen[str] = subprocess.Popen(
+            [str(SCRIPT.parents[1] / "lib/py"), "-c", child, str(retired), "shot", "--port", str(self.port),
+             "--out", str(self.scratch / "shot.png"), "--mode", "home", "--remote", REMOTE_HOST],
+            cwd=self.scratch, env=self.script_environment(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(self.stop_script, process)
+        stdout = process.stdout
+        assert stdout is not None
+        readable, _, _ = select.select([stdout.fileno()], [], [], TEST_HANG_GUARD_SECS)
+        self.assertTrue(readable, "the Mac lock alert did not arrive")
+        alert = cast(str, stdout.readline()).strip()
+        self.assertTrue(alert, "the child exited before it sent the alert")
+        process.send_signal(signal.SIGTERM)
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertTrue(retired.is_file(), stderr)
+        self.assertEqual(retired.read_text(), alert)
+        self.assertEqual(process.returncode, 128 + signal.SIGTERM)
+        self.assertEqual(self.timing_lines()[0]["exit_code"], 128 + signal.SIGTERM)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_sigterm_during_install_restores_the_previous_handler(self) -> None:
+        def install(signum: int, handler: object) -> signal.Handlers:
+            if handler is hana_shot.terminate_capture:
+                hana_shot.terminate_capture(signum, None)
+            return signal.SIG_IGN
+
+        read_handler = mock.Mock(return_value=signal.SIG_IGN)
+        write_handler = mock.Mock(side_effect=install)
+        signals = mock.Mock(SIGTERM=signal.SIGTERM, getsignal=read_handler, signal=write_handler)
+        with (
+            mock.patch.object(hana_shot, "signal", signals),
+            mock.patch.object(hana_shot, "write_invocation"),
+        ):
+            code = hana_shot.main(["shot", "--port", str(self.port), "--mode", "home"])
+
+        self.assertEqual(code, 128 + signal.SIGTERM)
+        read_handler.assert_called_once_with(signal.SIGTERM)
+        self.assertEqual(write_handler.call_args_list, [
+            mock.call(signal.SIGTERM, hana_shot.terminate_capture),
+            mock.call(signal.SIGTERM, mock.ANY),
+            mock.call(signal.SIGTERM, signal.SIG_IGN),
+        ])
 
     @process_boundary
     def test_remote_mac_shot_restores_an_always_on_bottom_window(self) -> None:
@@ -3005,12 +3270,14 @@ class RemoteTests(HanaShotTest):
         self.assertEqual(self.fake.window_level, "AlwaysOnTop")
         self.assertIn(["ended"], self.ssh_calls())
 
-    def test_remote_host_that_gives_no_system_fails_before_any_shot(self) -> None:
+    def test_remote_host_that_gives_no_system_waits_without_reading_the_camera(self) -> None:
         _ = self.fake_remote(copies=True, system="")
-        result = self.shot("--mode", "home", "--remote", REMOTE_HOST)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(f"ssh {REMOTE_HOST} uname -s gave no answer", result.stderr)
-        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+        sleep = mock.Mock(side_effect=KeyboardInterrupt)
+        with mock.patch.object(hana_shot, "time", mock.Mock(wraps=time, sleep=sleep)):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = self.shot("--mode", "home", "--remote", REMOTE_HOST)
+        sleep.assert_called_once_with(conf.read("hana_shot").number("resend_seconds"))
+        self.assertEqual(self.fake.calls, [])
 
     def test_launch_and_shutdown_are_refused_with_remote(self) -> None:
         for flag in ("--launch", "--shutdown"):
