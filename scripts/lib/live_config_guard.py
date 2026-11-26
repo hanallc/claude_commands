@@ -53,25 +53,40 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
         return os.readlink(f"/proc/self/fd/{descriptor}")
 
     def writer() -> str:
-        test_id = os.environ.get("DEVTOOLS_TEST_ID")
-        if test_id:
-            return f"test {test_id}"
         from inspect import currentframe
 
+        test_id = os.environ.get("DEVTOOLS_TEST_ID")
+        label = f"test {test_id}" if test_id else ""
+        location = ""
+        fallback = f"entry {sys.argv[0] if sys.argv else '<unknown>'}"
         frame = currentframe()
+        if frame is not None:
+            frame = frame.f_back
         while frame is not None:
             code = frame.f_code
+            name: object = frame.f_globals.get("__name__")
+            module = name if isinstance(name, str) else ""
+            if (code.co_filename == install_live_config_guard.__code__.co_filename
+                    or module.partition(".")[0] in {"io", "os", "pathlib", "shutil"}):
+                frame = frame.f_back
+                continue
+            if not location:
+                location = f" at {code.co_filename}:{frame.f_lineno}"
+                fallback = f"module {module}" if module and module != "__main__" else f"entry {code.co_filename}"
+            if label:
+                break
             if code.co_name in {"setUpClass", "tearDownClass"} and code.co_argcount:
                 owner: object = frame.f_locals.get(code.co_varnames[0])
                 if isinstance(owner, type):
-                    return f"class {owner.__module__}.{owner.__qualname__}"
-            if code.co_name in {"<module>", "load_tests", "setUpModule", "tearDownModule"}:
-                module: object = frame.f_globals.get("__name__")
-                if isinstance(module, str) and module != "__main__":
-                    return f"module {module}"
-                return f"entry {code.co_filename}"
+                    label = f"class {owner.__module__}.{owner.__qualname__}"
+                    break
+            if module and module != "__main__" and code.co_name in {
+                "<module>", "load_tests", "setUpModule", "tearDownModule",
+            }:
+                label = f"module {module}"
+                break
             frame = frame.f_back
-        return f"entry {sys.argv[0] if sys.argv else '<unknown>'}"
+        return f"({label or fallback}){location}"
 
     def check(value: object, directory_fd: object = -1, *, follow_entry: bool) -> None:
         nonlocal reported
@@ -91,7 +106,7 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
         if resolved in roots or resolved.startswith(prefixes):
             if not os.path.isfile(startup_hook):
                 return
-            message = f"Test attempted to write live configuration at {absolute} ({writer()})"
+            message = f"Test attempted to write live configuration at {absolute} {writer()}"
             if not reported:
                 try:
                     with open(violation_log, "a", encoding="utf-8", errors="backslashreplace") as log:
@@ -109,7 +124,7 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
     def audit(event: str, arguments: tuple[object, ...]) -> None:
         if event == "open":
             path, _, flags = arguments
-            # The event omits dir_fd. Use the directory from guarded_open when it has one.
+            # A saved reference to os.open skips the dir_fd check because the event omits dir_fd.
             if isinstance(flags, int) and flags & write_flags:
                 exclusive = flags & os.O_CREAT and flags & os.O_EXCL
                 check(path, open_directory.get(), follow_entry=not (flags & os.O_NOFOLLOW or exclusive))
@@ -130,6 +145,16 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
     if original_open in os.supports_dir_fd:
         os.supports_dir_fd.add(guarded_open)
     return restore_open
+
+
+def check_live_config_writes(violation_log: Path) -> None:
+    """Raise the first refusal from this run or one of its children."""
+    try:
+        log = violation_log.open(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    with log:
+        raise LiveConfigWrite(log.readline().rstrip())
 
 
 @contextmanager
@@ -176,6 +201,4 @@ if spec is not None and spec.loader is not None:
         else:
             os.environ["PYTHONPATH"] = previous
         hook.unlink(missing_ok=True)
-        if violation_log.exists():
-            with violation_log.open(encoding="utf-8") as log:
-                raise LiveConfigWrite(log.readline().rstrip())
+        check_live_config_writes(violation_log)

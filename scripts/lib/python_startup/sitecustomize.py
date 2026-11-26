@@ -22,6 +22,7 @@ from types import CodeType, ModuleType
 # Keep typing out of interpreter startup.
 TYPE_CHECKING = False
 if TYPE_CHECKING:
+    from contextvars import ContextVar
     from typing import Literal, Protocol, overload
 
     class _CheckoutStartupAttributes(Protocol):
@@ -30,8 +31,6 @@ if TYPE_CHECKING:
         def pop(self, key: Literal["ready"], /) -> Callable[[], None]: ...
         @overload
         def pop(self, key: Literal["startup_search"], default: None, /) -> list[str] | None: ...
-        @overload
-        def pop(self, key: Literal["direct_test_cleanup"], default: None, /) -> Callable[[], None] | None: ...
         def get(self, key: Literal["startup_search"], /) -> list[str] | None: ...
         def __setitem__(self, key: Literal["startup_search"], value: list[str], /) -> None: ...
         def setdefault(self, key: Literal["startup_hooks"], default: list[ModuleType], /) -> list[ModuleType]: ...
@@ -255,18 +254,6 @@ class DataclassCodeFinder:
 def start_process(arguments: list[str]) -> str:
     """Select the checkout and register the direct test boundary."""
     selected = select_checkout(arguments)
-    state = sys.modules["_devtools_checkout"]
-    if "direct_test_cleanup" not in state.__dict__:
-        import atexit
-
-        def finish_test_run() -> None:
-            finish = _checkout_attributes(state).pop("direct_test_cleanup", None)
-            if finish is not None:
-                finish()
-
-        # Reserve the cleanup before the next startup hook registers its callbacks.
-        state.__dict__["direct_test_cleanup"] = None
-        _ = atexit.register(finish_test_run)
     if (os.environ.get("CLAUDE_DISABLE_DATACLASS_CODE_CACHE") != "1"
             and "dataclasses" not in sys.modules
             and not any(type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path)):
@@ -415,21 +402,25 @@ def _unittest_boundary(module: ModuleType) -> None:
     module.__dict__["_devtools_test_boundary"] = True
     lock = allocate_lock()
     started = False
+    check_exit: Callable[[], None] | None = None
+    running: ContextVar[bool] | None = None
 
     def begin() -> None:
-        nonlocal started
+        nonlocal started, check_exit, running
         if not started:
             with lock:
                 if not started:
                     # This process owns the tests it starts.
                     _ = os.environ.pop("DEVTOOLS_TEST_ID", None)
-                    _begin_direct_test()
+                    check_exit = _begin_direct_test()
+                    if check_exit is not None:
+                        from contextvars import ContextVar
+
+                        running = ContextVar("direct_test_running", default=False)
                     started = True
 
     def wrap(owner: type[object], method: Callable[..., object]) -> None:
-        @wraps(method)
-        def run(*args: object, **kwargs: object) -> object:
-            begin()
+        def invoke(*args: object, **kwargs: object) -> object:
             test = args[0] if owner is TestCase and args else None
             if not isinstance(test, TestCase):
                 return method(*args, **kwargs)
@@ -442,6 +433,24 @@ def _unittest_boundary(module: ModuleType) -> None:
                     _ = os.environ.pop("DEVTOOLS_TEST_ID", None)
                 else:
                     os.environ["DEVTOOLS_TEST_ID"] = previous
+
+        @wraps(method)
+        def run(*args: object, **kwargs: object) -> object:
+            begin()
+            if check_exit is None or running is None or owner is TestLoader or running.get():
+                return invoke(*args, **kwargs)
+            # Check once after unittest finishes the outer run and its fixtures.
+            token = running.set(True)
+            try:
+                result = invoke(*args, **kwargs)
+            except SystemExit:
+                check_exit()
+                raise
+            else:
+                check_exit()
+                return result
+            finally:
+                running.reset(token)
 
         setattr(owner, method.__name__, run)
 
@@ -561,12 +570,11 @@ def within_test_limit() -> bool:
         return False
 
 
-def _begin_direct_test() -> None:
+def _begin_direct_test() -> Callable[[], None] | None:
     sys.dont_write_bytecode = True
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     if within_test_limit():
-        return
-    import atexit
+        return None
     from contextlib import AbstractContextManager, nullcontext
     from pathlib import Path
     from typing import cast
@@ -576,7 +584,7 @@ def _begin_direct_test() -> None:
     checkout = Path(sys.modules["_devtools_checkout"].__path__[0])
     has_test_folder = (checkout / "scripts/lib/testing_folders.py").is_file()
     if not (linux or has_test_folder):
-        return
+        return None
 
     from scripts.lib import conf
 
@@ -601,15 +609,16 @@ def _begin_direct_test() -> None:
                 else:
                     _start_direct_test_watchdog(seconds)
             if has_test_folder:
-                from scripts.lib.testing_folders import start_test_run
+                from scripts.lib import testing_folders
 
-                finish: object = start_test_run()
-                if callable(finish):
-                    atexit.unregister(finish)
-                    sys.modules["_devtools_checkout"].__dict__["direct_test_cleanup"] = finish
+                _ = testing_folders.start_test_run()
+                check_exit: object = getattr(testing_folders, "check_test_run_exit", None)
+                if callable(check_exit):
+                    return cast(Callable[[], None], check_exit)
     except (OSError, conf.Unusable, ValueError) as error:
         print(f"direct test: {error}", file=sys.stderr, flush=True)
         raise SystemExit(1) from None
+    return None
 
 
 def _cgroup(pid: int) -> str:

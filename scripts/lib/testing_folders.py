@@ -12,7 +12,7 @@ import tempfile
 from typing import NewType
 
 from scripts.lib import build_folders
-from scripts.lib.live_config_guard import LiveConfigWrite, guard_live_config
+from scripts.lib.live_config_guard import LiveConfigWrite, check_live_config_writes, guard_live_config
 from scripts.lib.session_folder import ROOT_ENV as SESSION_ROOT_ENV
 
 
@@ -27,6 +27,7 @@ class SelectParentFromCheckout:
 # Create this value after the folder preparation and sweep.
 PreparedTestRunsParent = NewType("PreparedTestRunsParent", Path)
 _prepared_parent: PreparedTestRunsParent | SelectParentFromCheckout = SelectParentFromCheckout()
+check_test_run_exit: Callable[[], None] | None = None
 
 
 def prepare_test_runs_parent(checkout: Path) -> PreparedTestRunsParent:
@@ -80,6 +81,7 @@ def start_test_run() -> Callable[[], None]:
 
     A direct run with no BUILDLOG_DIR keeps its build log in the run folder, so no test writes the caller's log.
     """
+    global check_test_run_exit
     owner = os.getpid()
     caller_log = os.environ.get(BUILDLOG_ENV)
     parent = _prepared_parent
@@ -88,13 +90,30 @@ def start_test_run() -> Callable[[], None]:
         path = scope.enter_context(lifetime)
         # HOME can change during a test. Protect the login account's config.
         live_config = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".claude/config"
-        scope.enter_context(guard_live_config(live_config, path, path / "live-config-writes"))
+        violation_log = path / "live-config-writes"
+        scope.enter_context(guard_live_config(live_config, path, violation_log))
         cleanup = scope.pop_all()
     if not caller_log:
         os.environ[BUILDLOG_ENV] = str(path / "buildlog")
 
-    def finish() -> None:
+    previous_check = check_test_run_exit
+    reported = False
+
+    def check_exit() -> None:
+        nonlocal reported
         if os.getpid() == owner:
+            try:
+                check_live_config_writes(violation_log)
+            except LiveConfigWrite as error:
+                if not reported:
+                    print(f"direct test: {error}", file=sys.stderr, flush=True)
+                    reported = True
+                raise SystemExit(1) from None
+
+    def finish() -> None:
+        global check_test_run_exit
+        if os.getpid() == owner:
+            check_test_run_exit = previous_check
             if caller_log is None:
                 _ = os.environ.pop(BUILDLOG_ENV, None)
             else:
@@ -102,12 +121,9 @@ def start_test_run() -> Callable[[], None]:
             try:
                 cleanup.close()
             except LiveConfigWrite as error:
-                try:
+                if not reported:
                     print(f"direct test: {error}", file=sys.stderr, flush=True)
-                    _ = sys.stdout.flush()
-                finally:
-                    # A SystemExit in an atexit callback cannot set the exit status.
-                    os._exit(1)
 
     _ = atexit.register(finish)
+    check_test_run_exit = check_exit
     return finish

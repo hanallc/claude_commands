@@ -287,7 +287,7 @@ class Child(unittest.TestCase):
                 self.assertFalse(path.exists())
 
     def run_config_write_fixture(self, source: str, *, relative: bool = False,
-                                 before_discovery: str = "") -> subprocess.CompletedProcess[str]:
+                                 before_startup: str = "") -> subprocess.CompletedProcess[str]:
         login_home = self.root / "login"
         config = login_home / ".claude/config/showrunners.conf"
         config.parent.mkdir(parents=True)
@@ -300,9 +300,17 @@ import pwd
 import runpy
 from types import SimpleNamespace
 pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir={str(login_home)!r})
-{before_discovery}
 runpy.run_module("unittest", run_name="__main__", alter_sys=True)
 """
+        arguments = [str(SHIM), "-B"]
+        if before_startup:
+            arguments = [sys.executable, "-BS"]
+            startup = SHIM.parent / "python_startup/sitecustomize.py"
+            program = before_startup + f"""
+import runpy
+import sys
+runpy.run_path({str(startup)!r}, run_name="_fixture_startup")["start_process"](sys.argv)
+""" + program
         environment = without_user_test_manager(self.root, self.environment())
         environment["HOME"] = str(self.root / "other-home")
         environment["CONF_DIR"] = alias.name if relative else str(alias)
@@ -310,7 +318,7 @@ runpy.run_module("unittest", run_name="__main__", alter_sys=True)
         for path in self.root.glob("config/*.conf"):
             _ = (config.parent / path.name).write_bytes(path.read_bytes())
         result = subprocess.run(
-            [str(SHIM), "-B", "-c", program, "discover", "-s", str(self.root), "-p", "test_config_write.py"],
+            [*arguments, "-c", program, "discover", "-s", str(self.root), "-p", "test_config_write.py"],
             env=environment, cwd=self.root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(config.read_text(), "original\n")
         return result
@@ -446,31 +454,91 @@ class Fixture(unittest.TestCase):
         self.assertIn(f"Module setup: {refusal} (module test_config_write)", result.stdout)
         self.assertIn(f"{refusal} (class test_config_write.Fixture)", result.stderr)
 
+    def test_a_direct_run_names_the_file_and_line_of_a_child_writer(self) -> None:
+        child = self.root / "child_config_writer.py"
+        _ = child.write_text("""from pathlib import Path
+
+def write(path):
+    Path(path).write_text("child")
+""")
+        result = self.run_config_write_fixture(f"""
+import subprocess
+import sys
+import unittest
+from scripts.lib import conf
+
+class Fixture(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        command = '''import sys
+import child_config_writer
+try:
+    child_config_writer.write(sys.argv[1])
+except AssertionError as error:
+    print(error)
+'''
+        subprocess.run([sys.executable, "-c", command, str(conf.path("showrunners"))],
+                       check=True, timeout={TEST_HANG_GUARD_SECS!r})
+
+    def test_write(self):
+        pass
+""")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        writer = f"(module child_config_writer) at {child}:4"
+        self.assertIn(writer, result.stdout)
+        self.assertIn(writer, result.stderr)
+
     def test_a_direct_run_runs_startup_cleanup_after_a_config_write_refusal(self) -> None:
         result = self.run_config_write_fixture("""
+import atexit
 import os
 import unittest
 from pathlib import Path
 from scripts.lib import conf
+
+def report():
+    print("The test folder exists:", Path(os.environ["TMPDIR"], "report").is_file())
+
+atexit.register(report)
 
 class Fixture(unittest.TestCase):
     def test_write(self):
         Path(os.environ["TMPDIR"], "report").touch()
         with self.assertRaises(AssertionError):
             conf.path("showrunners").write_text("test")
-""", before_discovery="""
-import atexit
-import os
-from pathlib import Path
-
-def report():
-    print("The test folder exists:", Path(os.environ["TMPDIR"], "report").is_file())
-
-atexit.register(report)
 """)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("direct test: Test attempted to write live configuration", result.stderr)
         self.assertIn("The test folder exists: True", result.stdout)
+
+    def test_a_direct_run_runs_callbacks_registered_before_the_config_guard(self) -> None:
+        result = self.run_config_write_fixture("""
+import atexit
+import unittest
+from scripts.lib import conf
+
+class Fixture(unittest.TestCase):
+    def test_write(self):
+        atexit.register(print, "After the guard")
+        with self.assertRaises(AssertionError):
+            conf.path("showrunners").write_text("test")
+""", before_startup="""
+import atexit
+atexit.register(print, "Before the guard")
+""")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["After the guard", "Before the guard"])
+        self.assertIn("direct test: Test attempted to write live configuration", result.stderr)
+
+    def test_a_python_start_without_tests_does_no_config_guard_work(self) -> None:
+        result = subprocess.run([str(SHIM), "-BS", "-c", """
+import sys
+assert "atexit" not in sys.modules
+assert "scripts.lib.live_config_guard" not in sys.modules
+assert "scripts.lib.testing_folders" not in sys.modules
+"""], cwd=self.root, env=self.environment(), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "test-runs").exists())
 
     def test_a_run_has_an_absent_session_root_and_restores_the_callers(self) -> None:
         for caller in ("", str(self.root / "caller-session")):
