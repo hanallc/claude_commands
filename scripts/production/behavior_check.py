@@ -57,10 +57,10 @@ class GitRange(NamedTuple):
             raise BehaviorCheckError(detail or f"git {args[0]} exited with status {result.returncode}")
         return result.stdout
 
-    def pinned(self) -> GitRange:
-        base = self.git("rev-parse", "--verify", "--end-of-options", f"{self.base}^{{commit}}")
-        commit = self.git("rev-parse", "--verify", "--end-of-options", f"{self.commit}^{{commit}}")
-        return GitRange(self.repo, base.decode("ascii").strip(), commit.decode("ascii").strip())
+    def comparison_range(self) -> GitRange:
+        commit = self.git("rev-parse", "--verify", "--end-of-options", f"{self.commit}^{{commit}}").decode("ascii").strip()
+        base = self.git("merge-base", "--", self.base, commit).decode("ascii").strip()
+        return GitRange(self.repo, base, commit)
 
     def origin_identity(self, timeout: float | None) -> str:
         remote = os.fsdecode(self.git("remote", "get-url", "origin", timeout=timeout)).strip()
@@ -598,7 +598,7 @@ def main(arguments: list[str]) -> int:
             execute = cast(Callable[[str, GitRange, NoChangedTests, str, str, Path | NoQuestionDraft], int],
                            import_module("scripts.production.behavior_review").execute)
             return execute("status", change, NoChangedTests.EMPTY, args.key, "", NoQuestionDraft.OMITTED)
-        change = change.pinned()
+        change = change.comparison_range()
         if args.action == "check":
             require_review(change)
             return 0

@@ -3,6 +3,7 @@
 The check finds existing tests that a commit alters or removes. It adds no marks to tests.
 
 Run `scripts/lib/py scripts/production/behavior_check.py find --repo CHECKOUT --base BASE --commit COMMIT` to see the test changes. The command prints the key and each test's old and new text.
+The `find`, `run`, `check`, and `status` commands compare the result of `git merge-base BASE COMMIT` with COMMIT.
 
 The finder reads Python test functions and Rust functions with test attributes. It skips new tests and tests that move with the same text.
 It includes the attributes of enclosing Rust modules in the test text.

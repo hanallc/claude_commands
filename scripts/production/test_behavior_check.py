@@ -1,13 +1,16 @@
 """Check test changes against fixture repositories."""
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+import io
+import json
 import os
 from typing import cast, override
 from unittest import mock
 
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
-from scripts.production import behavior_check
+from scripts.production import behavior_check, behavior_review
 
 
 class BehaviorCheckTests(ScriptRepositoryTestCase):
@@ -62,6 +65,19 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
                                       "    async def test_remove(self):\n        pass\n", ""),
         ))
 
+    def test_commands_ignore_tests_added_to_main_after_the_fork(self) -> None:
+        _ = self.git("switch", "-c", "topic")
+        _ = self.write(self.repo / "application.txt", "topic change\n")
+        topic = self.commit_files()
+        _ = self.git("switch", "main")
+        _ = self.write(self.repo / "test_main.py", "def test_new_on_main():\n    assert True\n")
+        _ = self.commit_files()
+        with mock.patch.object(behavior_review, "execute", side_effect=AssertionError("Unexpected review lookup")):
+            for action in ("find", "run", "check", "status"):
+                with self.subTest(action=action), redirect_stdout(io.StringIO()) as output, redirect_stderr(output):
+                    status = behavior_check.main([action, "--repo", str(self.repo), "--base", "main", "--commit", topic])
+                    self.assertEqual((status, output.getvalue()), (0, ""))
+
     def test_rust_checks_plain_and_qualified_attributes_and_skips_comments(self) -> None:
         original = """mod tests {
     /* #[test] fn commented() {} */
@@ -96,8 +112,14 @@ class BehaviorCheckTests(ScriptRepositoryTestCase):
         topic = self.commit_files()
         changes = self.changes(base, topic)
         _ = self.git("switch", "main")
-        _ = self.write(self.repo / "application.txt", "unrelated merge base change\n")
+        _ = self.write(self.repo / "test_main.py", "def test_new_on_main():\n    assert True\n")
         main = self.commit_files()
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(behavior_check.main(["find", "--repo", str(self.repo), "--base", "main", "--commit", topic]), 0)
+        self.assertEqual(cast(object, json.loads(output.getvalue())), {
+            "key": changes.key,
+            "tests": [{"test": entry.test, "old": entry.old, "new": entry.new} for entry in changes.tests],
+        })
         _ = self.git("merge", "--no-ff", "--no-edit", "topic")
         merged = self.git("rev-parse", "HEAD").stdout.strip()
         merged_changes = self.changes(main, merged)
