@@ -3457,7 +3457,7 @@ function showKillResults() {
   const visible = new Set();
   const statuses = new Map(killInfo.results.map(result => [result.reference, result]));
   for (const [reference, result] of pendingKills) {
-    if (!statuses.has(reference)) statuses.set(reference, result);
+    statuses.set(reference, result);
   }
   const statusText = result => {
     if (result.stop === "Stop unconfirmed" && result.reason) return result.reason;

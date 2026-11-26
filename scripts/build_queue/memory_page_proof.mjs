@@ -907,6 +907,8 @@ try {
             assert.equal(await outsideState(),'Not stopped: Still running after Kill: pid 8105');
             killPost = killPostReply = undefined;
             await submitOutside();
+            await evaluate('refreshKill()');
+            assert.equal(await outsideState(),'Stopping','The previous Kill result must not replace the pending retry.');
             killPostReply();
             await evaluate('refreshKill()');
             assert.equal(await outsideState(),'Stopping');
