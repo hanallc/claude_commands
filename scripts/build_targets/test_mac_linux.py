@@ -4059,7 +4059,6 @@ with (patch.object(conf, 'read', read_config),
         self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD'), interrupted)
         self.assertEqual(self.git_at(main, 'rev-parse', 'origin/main'), interrupted)
         self.assertEqual((main / 'history.txt').read_text(), 'old source\n')
-        self.assertTrue((bootstrap / mac_linux.BOOTSTRAP_RESET_PENDING).is_file())
 
         config = self.repo / 'config/build_folders.conf'
         _ = write_config_fixture(config, 'roots.build=~/.claude/build\n')
@@ -4068,8 +4067,9 @@ with (patch.object(conf, 'read', read_config),
 
         self.assertIn('inside a Git checkout', self.not_started(self.route()))
         self.assertEqual(self.git_at(main, 'rev-parse', 'HEAD'), interrupted)
+        self.assertEqual(self.git_at(main, 'rev-parse', 'origin/main'), interrupted)
         self.assertEqual((main / 'history.txt').read_text(), 'The interrupted revision.\n')
-        self.assertTrue((bootstrap / mac_linux.BOOTSTRAP_RESET_COMPLETE).is_file())
+        self.assertTrue((bootstrap / 'main-reset-complete').is_file())
 
     def test_row_26_refuses_a_former_fixed_folder_before_reset(self) -> None:
         self.assertIsInstance(self.route(), GateRun)
