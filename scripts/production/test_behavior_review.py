@@ -142,6 +142,8 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             code, output = self.cli("run", *args)
             self.assertEqual(code, 0, output)
             self.assertEqual(self.cli("run", *args), (0, output))
+            behavior_check.record_path(key).unlink()
+            self.assertEqual(self.cli("run", *args), (0, output))
         runner.assert_called_once()
         prompt = cast(str, runner.call_args.args[1])
         self.assertIn("Run each shell command to completion in one tool call.", prompt)
@@ -156,6 +158,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertIn("+    assert 'wait first'", (self.folder / "code.diff").read_text())
         self.assertFalse(list(Path(self.environment["SHOWRUNNER_STATE_DIR"]).glob("*/questions/*")))
 
+        (self.folder / "review-instructions").unlink()
         self.assertEqual(self.cli("check", *args), (0, ""))
         saved = self.folder / "completed-reply.txt"
         refusal = (1, f"{key}: the saved approval has no valid proof.\n")
@@ -413,15 +416,20 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
                 behavior_check.record_path(key).unlink()
                 (normal_folder / "completed-reply.txt").unlink()
 
-    def test_retries_replace_unstarted_and_failed_review_attempts(self) -> None:
+    def test_retries_replace_unstarted_failed_and_stale_review_attempts(self) -> None:
         args, key = self.changed_range()
         pointer = behavior_check.record_path(key).with_suffix(".run")
-        for state in ("unstarted", "canceled", "refused"):
+        for state in ("unstarted", "canceled", "refused", "missing instructions", "different instructions"):
             with self.subTest(state=state):
                 prior = self.root / state
                 prior.mkdir()
                 _ = self.write(pointer, f"{prior}\n")
-                if state != "unstarted":
+                if state in ("missing instructions", "different instructions"):
+                    _ = self.write(prior / "completed-reply.txt", "[]")
+                    _ = self.write(prior / "review-key", key)
+                    if state == "different instructions":
+                        _ = self.write(prior / "review-instructions", "0" * 64)
+                elif state != "unstarted":
                     _ = self.write(pass_record.state_path(prior), json.dumps({"pass": {"review": {"status": state}}}))
                 behavior_check.record_path(key).unlink(missing_ok=True)
                 self.reply(CLEAR_REPLY)

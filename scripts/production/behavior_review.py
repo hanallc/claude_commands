@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 import json
 import re
@@ -124,17 +125,7 @@ def parse_reply(text: str, tests: behavior_check.ChangedTests) -> list[BehaviorF
     return verify_requests(findings.values())
 
 
-def prepare_review(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, folder: Path) -> str:
-    test_file = folder / "tests.json"
-    diff_file = folder / "code.diff"
-    write_text_atomic(test_file, json.dumps([asdict(test) for test in tests.tests], indent=2), new_file_mode=0o600)
-    diff = change.git("diff", "--no-ext-diff", "--no-textconv", change.base, change.commit, "--")
-    write_text_atomic(diff_file, diff.decode("utf-8", errors="replace"), new_file_mode=0o600)
-    reply = folder / "review.md"
-    assignment = astra_work.AstraWork("astra-reviewer", str(folder), str(test_file),
-                                     datetime.now(timezone.utc).isoformat(),
-                                     str(reply), astra_work.StandaloneWork())
-    return astra_work.header_line(assignment) + f"""
+REVIEW_INSTRUCTIONS = """
 You are the independent reviewer. You did not author this change.
 Read the old and new test text in {test_file}.
 Read the code diff in {diff_file}.
@@ -148,14 +139,14 @@ Never call `write_stdin`. Do not start interactive or background commands.
 If a search times out, split its input into smaller groups and search each group.
 
 Use these sources:
-1. List records and their questions and answers in {state_root()}/*/list/L*.md.
+1. List records and their questions and answers in {state_root}/*/list/L*.md.
 2. Question records from scripts/production/update_registration.py and change review verdicts.
    Follow the store paths in the showrunner documents and the showrunner state root.
 3. User turns in Claude session transcripts. Do not count assistant, tool, or peer messages.
    Use scripts/lib/transcripts.py to find distinct paths and read plain and compressed transcripts.
    Use `rg --search-zip --files-with-matches --hidden --no-ignore` on groups of transcript paths.
    Select files by terms for the affected behaviors. Parse only those files for matching user turns.
-4. Commit messages in {change.repo}.
+4. Commit messages in {repo}.
 5. ~/.claude/docs/decision_criteria.md and memory files that quote Nate.
 
 Count only words that Nate used to set the affected behavior. Check who wrote the words.
@@ -177,6 +168,20 @@ Use the same fields for "specified".
 
 Read only. Do not edit files, run builds or tests, send messages, or file a question.
 """
+
+
+def prepare_review(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, folder: Path) -> str:
+    test_file = folder / "tests.json"
+    diff_file = folder / "code.diff"
+    write_text_atomic(test_file, json.dumps([asdict(test) for test in tests.tests], indent=2), new_file_mode=0o600)
+    diff = change.git("diff", "--no-ext-diff", "--no-textconv", change.base, change.commit, "--")
+    write_text_atomic(diff_file, diff.decode("utf-8", errors="replace"), new_file_mode=0o600)
+    reply = folder / "review.md"
+    assignment = astra_work.AstraWork("astra-reviewer", str(folder), str(test_file),
+                                     datetime.now(timezone.utc).isoformat(),
+                                     str(reply), astra_work.StandaloneWork())
+    return astra_work.header_line(assignment) + REVIEW_INSTRUCTIONS.format(
+        test_file=test_file, diff_file=diff_file, state_root=state_root(), repo=change.repo)
 
 
 class ReviewNeedsDispatch:
@@ -224,6 +229,7 @@ def recover_reply(folder: Path) -> Path | ReviewPending | ReviewNeedsDispatch:
 def reviewer_reply(change: behavior_check.GitRange, tests: behavior_check.ChangedTests,
                    pointer: Path, lock: file_lock.ExclusiveLock) -> Path | ReviewPending:
     """Recover the prior reply or start one review while the lock is held."""
+    instructions_digest = sha256(REVIEW_INSTRUCTIONS.encode("utf-8")).hexdigest()
     try:
         folder = review_folder(pointer)
     except FileNotFoundError:
@@ -232,11 +238,17 @@ def reviewer_reply(change: behavior_check.GitRange, tests: behavior_check.Change
         prior = recover_reply(folder)
         if isinstance(prior, ReviewPending):
             return prior
-        if isinstance(prior, Path) and (folder / "review-key").read_text(encoding="ascii").strip() == tests.key:
-            return prior
+        if isinstance(prior, Path):
+            try:
+                if ((folder / "review-key").read_text(encoding="ascii").strip() == tests.key
+                        and (folder / "review-instructions").read_text(encoding="ascii").strip() == instructions_digest):
+                    return prior
+            except FileNotFoundError:
+                pass
     folder = astra_review.review_attempt_folder()
     prompt = prepare_review(change, tests, folder)
     write_text_atomic(folder / "review-key", tests.key + "\n", new_file_mode=0o600)
+    write_text_atomic(folder / "review-instructions", instructions_digest + "\n", new_file_mode=0o600)
     reply = folder / "review.md"
     log = folder / "codex.log"
     write_text_atomic(pointer, str(folder) + "\n", new_file_mode=0o600)
