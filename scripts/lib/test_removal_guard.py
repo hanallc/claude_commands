@@ -308,6 +308,47 @@ class RemovalGuardTests(unittest.TestCase):
         self.assertEqual(head.read_text(), "ref: refs/heads/main\n")
 
     @unittest.skipUnless(sys.platform == "linux", "requires the Linux copy verifier")
+    def test_proved_copy_removes_only_git_files_with_the_checked_identity(self) -> None:
+        candidate = self.home / "old"
+        candidate.mkdir()
+        marker = candidate / ".git"
+        text = "gitdir: missing\n"
+        _ = marker.write_text(text)
+        stale = removal_guard.CheckedGitFile.from_stat(marker, marker.stat())
+        os.utime(marker, ns=(stale.modified_ns, stale.modified_ns - 1_000_000_000))
+        current = removal_guard.CheckedGitFile.from_stat(marker, marker.stat())
+        self.assertNotEqual(stale, current)
+        destination = self.root / "claude/resources/shm-moved" / candidate.name
+        _ = shutil.copytree(candidate, destination)
+        bounds = cleanup_old_folders.CleanupBounds(self.home, self.root, self.names.repositories)
+        guard = cleanup_old_folders.read_cleanup_guard(frozenset((candidate,)), bounds,
+                                                       mount_reader=lambda: (Path("/"),))
+
+        with (guard.check(candidate) as checked, session_move.open_directory(candidate) as source,
+              session_move.open_directory(destination) as copied):
+            entries: dict[Path, cleanup_old_folders.CleanupEntry] = {}
+            _ = cleanup_old_folders.inspect_cleanup_tree(checked, entries)
+            plain = removal_guard.ApprovedCleanup(entries, removal_guard.CleanupRemoval.PLAIN)
+            copy = removal_guard.CopyDestination(destination, copied)
+            unnamed = removal_guard.ProvedCopyCleanup(checked, source, copy, entries)
+            outdated = removal_guard.ProvedCopyCleanup(checked, source, copy, entries,
+                                                      checked_git_files=frozenset((stale,)))
+            named = removal_guard.ProvedCopyCleanup(checked, source, copy, entries,
+                                                   checked_git_files=frozenset((current,)))
+            with self.assertRaisesRegex(removal_guard.ChangedEntry, "holds Git work"):
+                removal_guard.remove_cleanup(checked, plain)
+            self.assertEqual(marker.read_text(), text)
+            for proof in (unnamed, outdated):
+                with self.assertRaisesRegex(removal_guard.ChangedEntry, "holds Git work"):
+                    removal_guard.remove_proved_copy(checked, proof, destination,
+                                                     before_delete=lambda: None, after_copy_check=lambda: None)
+                self.assertEqual(marker.read_text(), text)
+            removal_guard.remove_proved_copy(checked, named, destination,
+                                             before_delete=lambda: None, after_copy_check=lambda: None)
+        self.assertFalse(candidate.exists())
+        self.assertEqual((destination / marker.name).read_text(), text)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux copy verifier")
     def test_a_proved_staging_copy_cannot_authorize_removal(self) -> None:
         candidate = self.home / "old"
         nested = candidate / "nested/.git"
