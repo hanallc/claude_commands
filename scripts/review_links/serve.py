@@ -31,7 +31,7 @@ from enum import Enum
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO, cast, override
+from typing import BinaryIO, Literal, cast, override
 from urllib.parse import SplitResult, parse_qs, unquote, urlsplit, urlunsplit
 
 # Detect file changes before the first stamp, including changes during imports.
@@ -1069,8 +1069,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 else:
                     filters = parse_qs(route.query, keep_blank_values=True)
                     show = filters.get('show', filters.get('state', ['open']))[0]
-                    kind = filters.get('type', [''])[0]
-                    content = snapshot.render(show=show or 'open', kind=kind)
+                    content = snapshot.render(show=show or 'open')
             except (OSError, ValueError) as error:
                 print(f"review-links review: {error}", file=sys.stderr)
                 self.html_response(503, change_page.document("<p>The Review page is not available.</p>"))
@@ -1434,7 +1433,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 location = change_page.publish_next(page, body)
                 self.redirect(location)
                 return
-            delivery = change_page.submit(page, body, server.delivery_status)
+            with change_page.file_change_actions(review_actions.file_change_work):
+                delivery = change_page.submit(page, body, server.delivery_status)
         except change_review.VerdictDurabilityUnconfirmed as error:
             try:
                 self.failed_answer(page, body, 503, "The verdict was written. Durability is unconfirmed.", error)
@@ -1519,7 +1519,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if length <= 0:
                 raise ValueError("empty answer")
             body = self.rfile.read(length).decode("utf-8")
-            delivery, answer = change_browser.submit(browser, body, server.delivery_status)
+            with change_page.file_change_actions(review_actions.file_change_work):
+                delivery, answer = change_browser.submit(browser, body, server.delivery_status)
         except change_review.VerdictDurabilityUnconfirmed as error:
             try:
                 self.browser_failure(503, "The verdict was written. Durability is unconfirmed.", error)
@@ -1953,10 +1954,19 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 status = server.delivery_status
                 # Concurrent Sends wait for the delivery of the same item.
                 with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
+                    report_row = review_actions.submission_report_row(saved)
                     delivery = review_actions.prepare_submission_delivery(
                         saved, saved.words, status, evidence_page=evidence_page, members=created.members)
+                    response["reply_owner"] = (
+                        delivery.page.saved["owner"] if isinstance(delivery, change_page.MessageDelivery)
+                        and isinstance(delivery.page, change_page.ReviewMessagePage) else saved.owner)
                     outcome = self.deliver_review(server, delivery, report_outcome=True)
-                    if on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
+                    if isinstance(report_row, the_list.ListItem):
+                        response["list_number"] = report_row.number
+                        response["list_owner"] = (report_row.owner.value if isinstance(report_row.owner, the_list.UnassignedOwner)
+                                                  else review_items.name(report_row.owner, created.members))
+                        response["list_producer"] = review_items.name(report_row.producer, created.members)
+                    elif on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
                             request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
                         number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
                         if isinstance(number, int):
@@ -2221,7 +2231,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             result['detail_unavailable'] = True
         if isinstance(saved.item, review_items.ReviewItem):
             later = saved.item.times.later
-            result.update(state=saved.item.state, type=saved.item.type,
+            state = review_items.ReviewState.DONE if review_items.on_list(saved.item) else saved.item.state
+            result.update(state=state, type=saved.item.type,
                           later=0 if isinstance(later, review_items.NoLaterTime) else later.timestamp()*1000)
         if self.headers.get(send_hold.REPLAY_HEADER) == "1":
             delivery = change_page.finish_verdict_cleanup(saved.delivery, server.delivery_status)
@@ -2493,9 +2504,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             (identity,) = fields["item-state"]
             (keeper,) = fields.get("keeper", [])
             (park_request,) = fields.get("park-request", [""])
+            (not_fixed_request,) = fields.get("not-fixed-request", [""])
             with server.list_store_access(), server.staff_read_scope():
                 current = list_page.saved_action_state(keeper, identity, status=server.delivery_status,
                                                        park_request=park_request, include_detail=True,
+                                                       not_fixed_request=not_fixed_request,
                                                        review_records=server.list_review_records(),
                                                        top_priority=view.top_priority)
         except ValueError as error:
@@ -2509,6 +2522,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         """Save a List view's item action before the shared sender starts."""
         server = cast(ReviewLinksServer, self.server)
         fixture = server.mode is ServerMode.LIST_FIXTURE
+        fields: dict[str, list[str]] = {}
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 100000:
@@ -2522,6 +2536,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                     server.root, body, server.delivery_status,
                     review_records=server.list_review_records(), include_detail=True,
                     top_priority=view.top_priority)
+        except the_list.RepairCheckRefused as error:
+            if fields.get("action") == [the_list.ReportVerdict.NOT_FIXED]:
+                receipt = list_page.NotFixedReceipt(request=error.request, state=list_page.NotFixedReceiptState.REFUSED)
+                self.json_response(400, {"reason": str(error), "not_fixed_receipt": receipt})
+            else:
+                self.browser_failure(400, str(error), error)
+            return
         except ValueError as error:
             self.browser_failure(400, str(error), error)
             return
@@ -2535,11 +2556,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         action = fields["action"][0]
         delivery = submission.delivery if isinstance(submission, list_page.ListUnparkSubmission) else submission
         pending = not isinstance(delivery, change_page.NoMessageDelivery)
-        state = {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
+        repair_feedback = action == the_list.ReportVerdict.NOT_FIXED
+        state = "saved" if repair_feedback else {"read": "read", "question": "saved", "top": "saved"}.get(action, "sent")
         reply = {"state": state, "delivery_pending": pending, **saved_fields}
         if current is not None and isinstance(submission, list_page.ListUnparkSubmission):
             reply["unpark_outcome"] = submission.response_outcome(current).value
-        if self.headers.get(send_hold.REPLAY_HEADER) == "1":
+        if self.headers.get(send_hold.REPLAY_HEADER) == "1" or repair_feedback:
             try:
                 outcome = list_page.deliver_with_outcome(submission)
             except OSError as error:
@@ -2547,6 +2569,11 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 outcome = change_page.DeliveryUnconfirmed()
             reply.update(held_delivery_result(outcome, not pending))
             reply["delivery_pending"] = False
+            if repair_feedback and isinstance(delivery, list_page.ListFeedbackDelivery):
+                receipt_state = (list_page.NotFixedReceiptState.DELIVERED
+                                 if isinstance(outcome, change_page.DeliveryConfirmed)
+                                 else list_page.NotFixedReceiptState.ACCEPTED)
+                reply["not_fixed_receipt"] = list_page.NotFixedReceipt(request=delivery.request, state=receipt_state)
             self.json_response(200, reply)
             return
         with server.item_delivery(pending) as check:
@@ -2810,9 +2837,9 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
         if result is send_hold.HoldState.PENDING:
             self.json_response(202, {"pending": True}, hold=send_hold.HoldHeader.PENDING)
         elif result is send_hold.HoldState.UNDONE:
-            self.json_response(404, {"reason": "This send was undone."})
+            self.json_response(404, {"reason": "This send was undone."}, hold_outcome="undone")
         elif result is send_hold.HoldState.MISSING:
-            self.json_response(404, {"reason": "This send was undone or its result expired."})
+            self.json_response(404, {"reason": "This send was undone or its result expired."}, hold_outcome="missing")
         else:
             self.send_response(result.status)
             self.send_header("Content-Type", result.content_type)
@@ -2823,11 +2850,14 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             _ = self.wfile.write(result.body)
 
     def json_response(self, status: int, fields: Mapping[str, object], *,
-                      hold: send_hold.HoldHeader | None = None) -> None:
+                      hold: send_hold.HoldHeader | None = None,
+                      hold_outcome: Literal["undone", "missing"] | None = None) -> None:
         content = json.dumps(fields).encode("utf-8")
         self.send_response(status)
         if hold is not None:
             self.send_header("X-Send-Hold", hold.value)
+        if hold_outcome is not None:
+            self.send_header("X-Send-Hold-Outcome", hold_outcome)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
@@ -2926,6 +2956,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
         def recover_pending() -> None:
             with reply_tokens.serving(self.store_folder):
                 try:
+                    review_actions.recover_interrupted_list_reports()
                     recover_changes(self.delivery_status)
                     review_actions.recover_submission_deliveries(self.delivery_status, review_page.PAGE_PATH)
                 except (OSError, ValueError) as error:

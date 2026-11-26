@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from urllib.parse import urlencode
+
 from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 from scripts.production import staff
@@ -18,6 +20,13 @@ from scripts.review_links import send_hold, setting_controls
 
 ICONS = Path(__file__).with_name("lucide")
 QUESTION_WAITING = "The {owner_role} will answer this"
+LIST_PAGE_PATH = "/console/list.html"
+
+
+def list_item_fragment(keeper: str, number: int) -> str:
+    return "#" + urlencode({"item": f"{keeper}/L{number}"})
+
+
 OWNER_PAGES = frozenset(("accounts", "aws", "builds", "disks", "images", "list", "aws_machines", "placement_disk",
                          "rebuilds", "review", "studio"))
 TITLE_ELEMENT = re.compile(rb"<h1(?=[\s>])[^>]*>.*?</h1>", re.DOTALL)
@@ -685,6 +694,32 @@ border-radius:8px;background:var(--card);color:var(--ink)}
 @media(max-width:560px){.review-actions{flex-direction:column;align-items:flex-start;flex-wrap:nowrap}}
 ''' + HEADING_STYLE + PAGE_TOP_STYLE)
 
+class VerdictAction(StrEnum):
+    WORKS = "works"
+    NOT_FIXED = "not works"
+
+
+class VerdictItemType(StrEnum):
+    CHANGE = "outcome"
+    LIST_REPAIR = "action"
+
+
+NEGATIVE_VERDICT_LABELS = {
+    VerdictItemType.CHANGE: "Does not work",
+    VerdictItemType.LIST_REPAIR: "Not fixed",
+}
+
+
+def verdict_button(item_type: VerdictItemType, action: VerdictAction, *,
+                   primary: bool = False, selected: bool = False) -> str:
+    """Render the verdict for a change or a List repair."""
+    label = "Works" if action is VerdictAction.WORKS else NEGATIVE_VERDICT_LABELS[item_type]
+    pressed = 'aria-pressed="true" ' if selected else ""
+    style = ' class="primary"' if primary else ""
+    disabled = ' disabled' if item_type is VerdictItemType.LIST_REPAIR and action is VerdictAction.NOT_FIXED else ""
+    return f'<button {pressed}name="{item_type}" value="{action}"{style}{disabled}>{label}</button>'
+
+
 def console_dialog(dialog_id: str, title_id: str, title: str, body: str, *,
                    before_body: str = '', footer: str = '', form: bool = False, body_class: str = '') -> str:
     """Render a console dialog with its shared assets."""
@@ -1105,11 +1140,13 @@ const pause=(ms,view=window,signal)=>new Promise((resolve,reject)=>{
  const timer=view.setTimeout(()=>{signal?.removeEventListener('abort',abort);resolve();},ms);
  signal?.addEventListener('abort',abort,{once:true});
 });
+const holdRequestSignal=()=>AbortSignal.timeout(30000);
 const RETRY_LIMIT_MS=120_000,KEEPALIVE_LIMIT=64*1024;
 const heldRequests=new Map();
-function trackHeldRequest(key){
+const newHoldId=()=>Array.from(crypto.getRandomValues(new Uint8Array(12)),
+ byte=>byte.toString(16).padStart(2,'0')).join('');
+function trackHeldRequest(key,id){
  const view=sendUndoHost().defaultView || window;
- const id=Array.from(crypto.getRandomValues(new Uint8Array(12)),byte=>byte.toString(16).padStart(2,'0')).join('');
  const started=Date.now(),elapsed=performance.now();
  const expired=()=>Date.now()-started>=RETRY_LIMIT_MS || performance.now()-elapsed>=RETRY_LIMIT_MS;
  const request={id,hold:id,expired,closed:false,closeToast:null,finish};
@@ -1130,7 +1167,7 @@ function trackHeldRequest(key){
  heldRequests.set(key,request);
  return request;
 }
-function showSendUndo(request,seconds,receiver,onExpiry){
+function showSendUndo(request,seconds,receiver,resumable,onExpiry){
  const {hold}=request,host=sendUndoHost();
  const view=host.defaultView;
  if(!view.getSendUndoStack){
@@ -1149,7 +1186,7 @@ function showSendUndo(request,seconds,receiver,onExpiry){
  const timing={duration:seconds*1000,easing:'linear',fill:'forwards'};
  const fade=toast.animate([{opacity:1},{opacity:1,offset:.5},{opacity:0}],timing);
  const shrink=bar.animate([{transform:'scaleX(1)'},{transform:'scaleX(0)'}],timing);
- return new Promise(resolve=>{
+ return new Promise((resolve,reject)=>{
   let done=false,removalTimer=0;
   const remove=()=>{
    view.clearTimeout(removalTimer);
@@ -1190,12 +1227,21 @@ function showSendUndo(request,seconds,receiver,onExpiry){
   },()=>{});
   button.addEventListener('click',async()=>{
    button.disabled=true;fade.pause();shrink.pause();
+   const signal=resumable ? holdRequestSignal() : undefined;
    let answer=null;
-   for(let tries=0;tries<2 && !answer;tries++){
-    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST'}); }catch{ await pause(500); }
+   for(let tries=0;tries<2 && !answer && !signal?.aborted;tries++){
+    try{ answer=await fetch(SEND_HOLD_PATH+'/'+hold+'/undo',{method:'POST',signal}); }
+    catch{ if(!signal?.aborted) await pause(500); }
    }
-   if(answer?.ok){finish(true);return;}
+   if(answer?.ok && (!resumable || (await answer.json().catch(()=>null))?.outcome==='undone')){
+    finish(true);return;
+   }
    if(request.closed) return;
+   if(signal?.aborted){
+    done=true;remove();
+    reject(new Error('The Undo response timed out. The send can still leave.'));
+    return;
+   }
    done=true;
    button.remove();bar.remove();fade.cancel();
    if(answer?.status===409){
@@ -1210,12 +1256,12 @@ function showSendUndo(request,seconds,receiver,onExpiry){
   });
  });
 }
-async function heldFetch(url,{requestTimeoutSeconds,...init}={},receiver,onHold){
+async function heldFetch(url,{requestTimeoutSeconds,...init}={},receiver,onHold,holdId){
  const postSignal=init.signal ?? (requestTimeoutSeconds===undefined ? undefined : AbortSignal.timeout(requestTimeoutSeconds*1000));
  const headers=new Headers(init.headers);headers.set('X-Undo-Hold','1');
  const body=String(init.body ?? '');
- const key=JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
- const request=heldRequests.get(key) || trackHeldRequest(key);
+ const key=holdId ?? JSON.stringify([new URL(url,location.href).href,headers.get('Content-Type'),body]);
+ const request=heldRequests.get(key) || trackHeldRequest(key,holdId ?? newHoldId());
  headers.set(SEND_REQUEST_HEADER,request.id);
  const keepalive=body.length<=KEEPALIVE_LIMIT && new TextEncoder().encode(body).length<=KEEPALIVE_LIMIT;
  const post=async keepalive=>{
@@ -1232,49 +1278,63 @@ async function heldFetch(url,{requestTimeoutSeconds,...init}={},receiver,onHold)
   return first;
  }
  const {hold,seconds}=await first.json();
+ const resumable=Boolean(holdId);
+ if(resumable && hold!==holdId) throw new Error('The send hold does not match this request.');
  const graceMs=RELEASE_GRACE_SECONDS*1000;
  let releaseDueAt=performance.now()+seconds*1000+graceMs;
+ let undoExpired=false;
  request.hold=hold;
  let undo=false;
  if(!request.closed && seconds>0){
-  const shown=showSendUndo(request,seconds,receiver,()=>{
+  const shown=showSendUndo(request,seconds,receiver,resumable,()=>{
+   undoExpired=true;
    releaseDueAt=Math.min(releaseDueAt,performance.now()+graceMs);
   });
   onHold?.();
   undo=await shown;
  }
  if(undo===true){request.finish();throw new SendUndone();}
- // A hold with no Undo time can already have a result. Allow for grace in its deadline.
+ // Read at once if Undo was uncertain or the hold had no Undo time.
  let resultTimeoutMs=requestTimeoutSeconds===undefined ? undefined : requestTimeoutSeconds*1000;
  if(resultTimeoutMs!==undefined && !request.closed){
   const remainingReleaseMs=Math.max(0,Math.ceil(releaseDueAt-performance.now()));
-  if(seconds===0) resultTimeoutMs+=remainingReleaseMs;
-  else if(remainingReleaseMs>0) await pause(remainingReleaseMs);
+  if(undoExpired && remainingReleaseMs>0) await pause(remainingReleaseMs);
+  else resultTimeoutMs+=remainingReleaseMs;
  }
- const resultSignal=resultTimeoutMs===undefined ? undefined : AbortSignal.timeout(resultTimeoutMs);
+ const signal=resultTimeoutMs===undefined ? undefined : AbortSignal.timeout(resultTimeoutMs);
+ return readHeldResult(hold,request,undo,resumable,signal);
+}
+async function readHeldResult(hold,request,undo,resumable,signal){
  try{
   for(let failures=0;;){
-   resultSignal?.throwIfAborted();
+   signal?.throwIfAborted();
    try{
-    const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store',signal:resultSignal});
-    if(response.headers.get('X-Send-Hold')!=='pending'){
-     if(response.status!==404 || !request.expired()) request.finish();
-     if(typeof undo==='function') await undo(response);
-     return response;
-    }
+    const response=await fetch(SEND_HOLD_PATH+'/'+hold,{cache:'no-store',signal});
+    if(response.headers.get('X-Send-Hold')==='pending') continue;
+    if(resumable || response.status!==404 || !request?.expired()) request?.finish();
+    if(typeof undo==='function') await undo(response);
+    if(resumable && response.status===404 && response.headers.get('X-Send-Hold-Outcome')==='undone')
+     throw new SendUndone();
+    return response;
    }catch(error){
-    resultSignal?.throwIfAborted();
-    if(++failures>=30) throw error;
-    await pause(1000,window,resultSignal);
+    if(error instanceof SendUndone || ++failures>=30) throw error;
+    await pause(1000,window,signal);
    }
   }
  }catch(error){
-  if(typeof undo==='function') await undo();
+  if(!(error instanceof SendUndone) && typeof undo==='function') await undo();
   throw error;
  }
 }
+heldFetch.newId=newHoldId;
+heldFetch.resume=id=>{
+ const request=heldRequests.get(id);
+ return readHeldResult(request?.hold ?? id,request,false,true,holdRequestSignal());
+};
 function sendActionReceiver(form,data){
- const action=data.get('outcome');
+ const action=data.get('outcome') ?? data.get('action');
+ if(data.get('action')==='works') return null;
+ if(data.get('action')==='not works') return form.dataset.repairReceiver;
  const verdict=action==='works' && data.get('feedback')?.trim() ? 'works-with-words' : action;
  if(action==='approve' && data.get('assignee')){
   const option=form.elements.assignee?.selectedOptions[0];
@@ -1309,7 +1369,7 @@ function holdCard(card,changed){
   return true;
  }
  return {
-  post:(url,init,receiver)=>heldFetch(url,init,receiver,()=>setHeld(true)),
+  post:(url,init,receiver,id)=>heldFetch(url,init,receiver,()=>setHeld(true),id),
   restore:()=>setHeld(false),
  };
 }

@@ -134,6 +134,42 @@ Generated style decisions use their own filing path.
 When the selected recipient becomes unavailable, the dialog clears the selection and disables Send until you choose a recipient.
 Changing the type or reopening a kept draft preserves this empty selection.
 Feedback uses the native Investigation record.
+Bug, Enhancement, and Investigation use the same List workflow.
+Review files a Change on the List when you send feedback or return the change to a team.
+**Ask showrunner to check** files a Validation on the List for the showrunner.
+These paths save the List number, owner, and producer in one row write.
+The List keeps the report type and shows the original words and picture.
+The state shows when the item entered New, Working, Repaired, or Delivered.
+The producer uses `the_list.py update --state Repaired --next-step "How to try the repair"` after testing.
+Needs me shows the repair instructions and the Works and Not fixed buttons.
+Works records Delivered after the Undo timer expires.
+Not fixed sends the user's words to the owner and producer through the same Undo control.
+Both verdicts clear the repair instructions from Next step.
+A saved Not fixed verdict returns the item to Working.
+The browser stores the signed Not fixed request and its hold ID before sending.
+The card keeps Not fixed available after an unknown result, including after a reload.
+A confirmed Undo of the original hold or an exact refusal ends the request before acceptance.
+A refusal keeps the draft so the user can correct it and start a new request.
+A retry sends the original words and keeps any newer edits in the draft.
+The List receipt identifies the exact request and distinguishes acceptance from confirmed delivery.
+Confirmed delivery clears the draft if it still contains the unchanged submitted words.
+When Tell or Ask clears the draft, the browser also clears its stored copy.
+Server recovery retries pending notices with the same delivery key.
+Review and Changes use Does not work for a change verdict.
+Server recovery finishes an interrupted report filing before it sends the first notice.
+The dialog keeps a report's draft ID across a reload.
+Run `the_list.py move-review-bugs` from the Morty session to move existing open Review bugs.
+A migration marks the native record before it writes the List item.
+The command keeps the original words and attachments and records the List number on each completed Review record.
+Run the command again to finish an interrupted migration.
+Run `the_list.py move-review-waits` from the Morty session to move Waiting and Validating Review records.
+The command links the source record or uses it as evidence on the List.
+The source retains its words and records `moved to List item <n>`.
+The command checks the source state under its lock before it files the report.
+Rows that become Open before filing stay in Review.
+Replies to moved records appear on the List.
+The moved records stay out of Review counts and `/next`.
+Run the command again to finish a move that stopped before the source log was saved.
 
 Select **Scheduled** to create a List item directly.
 Select the owner in **To**.
@@ -678,7 +714,7 @@ The old addresses redirect to Review with the corresponding type filter.
 The redirect retains the owner, filters, sort and open item.
 Legacy `row` fields become `item` fields.
 Old Investigations links with `show=not-read`, `show=answer ready`, or `show=read` select Open.
-Old Investigations links with `show=open` select Waiting.
+Old Investigations links with `show=open` select Open.
 Old Investigations links with `show=all` select All.
 Legacy investigation owner filters retain the exact record owner.
 The Review navigation entry uses the Lucide `inbox` icon.
@@ -703,7 +739,12 @@ This command does not allocate question IDs or write records.
 The writer checks the current state under its lock before it stores the reason.
 Questions use the canonical owner lock, including questions without a current owner.
 The command prints one plain error line for a refused update.
-`investigation.py file` requires `--waiting-why`. The Python `followup` API stores the follow-up words as the reason.
+`investigation.py file` requires `--waiting-why` and files an Investigation on the List.
+The caller owns the investigation.
+The command saves the List row in the folder of the producer set in `page.list.owner`.
+A producer who files an investigation also produces it.
+For other callers, the command uses the producer map or the configured List producer if the map has no active producer.
+The Python `followup` API stores the follow-up words as the reason.
 `proposal_issue.record_review` and `efficiency_reviews.record` require `waiting_why` when setting the Waiting mark.
 `candidates.py outcome E<n> deferred --waiting-why "<reason>"` stores the reason beside the ledger.
 The states are **Open**, **Validating**, **Waiting** and **Done**.
@@ -725,7 +766,7 @@ Mark read also works when the Question owner is unavailable.
 An active Later value continues to apply after Mark read.
 A decision that still requires an action stays in Open after Mark read if Later does not hide it.
 The List and Review keep their existing Later storage formats.
-Validating changes remain visible in Validating and All.
+Review keeps native Waiting and Validating states for records that still use the native reply path.
 The count readers and `/next` use this shared reader.
 Open items count in the status line.
 An open investigation and a deferred efficiency item do not count.
@@ -741,7 +782,9 @@ Questions without an owner remain visible under Owner unavailable.
 These questions have the state Open and retain their previous count totals.
 They have no answer control until an owner becomes available.
 
-The page shows Questions, Responses, Changes, Investigations, Proposals, Efficiencies and Bugs.
+The Type row has All, For you, Questions, Responses, Changes, Investigations, Proposals and Efficiencies.
+Legacy Bug records remain visible under All and in searches by ID.
+Review opens old Bug filter links with All types selected.
 Only a Question filed through the dialog appears as a Response after an answer.
 The Response uses the Question's existing key, owner, exchanges and log.
 The Question stays in its native store during the complete exchange.
@@ -782,16 +825,15 @@ An unknown owner returns to All and clears both owner and source-owner constrain
 Owner names resolve against all known owners before the type and Show filters apply.
 The address uses the resulting selection.
 Type and Show changes restore owners when their rows match again.
-The Show row offers All, Open, Waiting, Done, and Validating below the Type row.
-With Responses or For you selected, Show hides Validating.
-Old Waiting links open Waiting.
+The Show row offers All, Open, and Done below the Type row.
+Old Waiting and Validating links select Open.
 Review expands legacy filter names in the query and fragment before it combines them.
 The query wins for names in LIST_QUERY_FIELDS that both sources supply.
 The fragment wins for other names, including sort and dir.
 The Owner row follows the Show row.
 Exactly one Show chip stays selected. Pressing that chip changes nothing.
 Type and Show counts include an Owner reset if the click would return Owner to All.
-Type counts use Open when a click selects For you or switches from Validating to Responses.
+Type counts use Open when a click selects For you.
 The table and the three chip rows use the same row data and filter rules.
 The browser counts all matching rows, including rows outside the current scroll window.
 One typed `ReviewIndexEntry` record defines the row data for counts, filters and column sorting.
@@ -816,11 +858,15 @@ If the body request or index reports a missing item, the browser closes the card
 The Show chips replace the right count text.
 All includes active Review records and all For you actions.
 Done shows completed For you actions.
-**Ask showrunner to check** moves a change to Validating.
-**Ask question** and **Send feedback** move an open change to Waiting.
+**Ask showrunner to check** files a Validation on the List.
+**Send feedback** and **Does not work** file a Change on the List.
+Standalone change review links use the same filing path.
+List filing completes before the verdict saves.
+If List filing fails, the verdict stays available for retry.
+**Ask question** sends the question through the native reply path.
 The change leaves Open and its counts when the request starts.
 A failed save restores the row and its counts.
-A Validating change opens from its row in Validating and All.
+An unmoved Validating change opens from its row in All.
 The row and card show **With <validator> · Validating for <duration>**.
 The validation record stores the validator’s staff ID.
 The page resolves the name from that ID.
@@ -834,14 +880,15 @@ The card shows **Question for <validator>** and **Answer from <validator>** when
 The active validation log shows **Asked <validator> to validate**, **Asked a question about validation**, and **Answered the question**.
 The question and answer sections show the full text.
 The question and answer preserve the active validation and its handoff time.
-The Validating and All chips count the change.
+All counts the change while it still belongs to Review.
 A chip with a zero count is dim.
 The next changed snapshot replaces the index.
 An unchanged version retains the index and checks expired Later times.
 The fresh index supplies the state and revision of each active item.
 The browser removes a saved marker when the index moves beyond its submitted revision and saved state.
-A fault returns the change to Open.
-A reply to a question or feedback sent from Open also returns the change to Open.
+A fault returns an unmoved change to Open.
+A reply returns an unmoved change to Open.
+For a moved change, the List links to the native record with the result.
 A works result moves the change to Done without a notice.
 Review removes the completed change.
 Stable chip IDs retain keyboard focus after a Show load or refresh.
@@ -1039,6 +1086,15 @@ If token derivation fails during delivery, the server records a delivery failure
 Send uses the transport result even if the server cannot save the delivery failure.
 The dialog shows the error and keeps the draft for another Send.
 A retry after the wait ends returns the existing item without sending another message.
+
+Both `/new_item` and the New item window send the reply command to the owner through Review delivery.
+The CLI and browser return the public filing receipt. Keep the reply command in the owner session.
+Use the delivered `change_page.py answer-question` command for every New item type.
+
+Run `scripts/lib/py scripts/review_links/new_item.py resend-reply I45` to send a waiting item's reply command again.
+Use the native item ID or the full submission key. The command sends to the current owner session.
+The command reads the reply proof from the native item and renews a legacy proof if necessary.
+The command refuses unknown items and items that no longer wait for a reply.
 
 From the repository, run `scripts/lib/py -m scripts.review_links.review_submissions scrub-reply-tokens`.
 The command finds native records in their current folders, former folders and archives.
@@ -1723,6 +1779,18 @@ Parked items also match the word `Parked`.
 The address retains the owner, producer, status chip, unread switch, search, column, and direction.
 
 A row opens to show its latest status, completion condition, item links, and log.
+HTTP and HTTPS links in the open row's item text and log open in a new tab.
+Whitespace, angle brackets, double quotes, and the start of the next URL scheme end a link.
+Only HTTP and HTTPS URLs become links.
+Trailing punctuation stays outside the link. Asterisks and apostrophes within a URL stay in the link.
+The Links section follows the item fields and precedes the actions.
+The section includes jumps to related and blocking items on the List.
+URLs in blocking conditions appear as links beside the blocking item.
+The section lists each distinct URL from the fields, log, and answers in order of first appearance.
+The section uses the Next step label for URLs in schedule instructions.
+Each URL row shows a link label, the oldest source field, and the full URL.
+The Links section uses the original question time after the question closes.
+The section is absent when the item has no jumps or URLs.
 The log shows its newest entry first.
 On a wide page, the log is to the right of the current fields.
 On a narrow page, the log is below the current fields.

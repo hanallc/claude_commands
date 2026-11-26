@@ -99,9 +99,14 @@ class ImagesFixture(unittest.TestCase):
                  *, look_for: tuple[str, ...] = ()) -> image_store.ImageRecord:
         return images.register(self.shot, title, self.owner_id(), "Phase console-images", look_for=look_for)
 
-    def list_item(self) -> tuple[staff.StaffRow, staff.StaffRow, the_list.ListItem]:
+    def configure_list(self) -> staff.StaffRow:
         self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.temporary / "state")}))
         keeper = fixture_member("producer", name="morty")
+        _ = write_config_fixture(self.temporary / "config" / "console.conf", f"page.list.owner={keeper.id}\n")
+        return keeper
+
+    def list_item(self) -> tuple[staff.StaffRow, staff.StaffRow, the_list.ListItem]:
+        keeper = self.configure_list()
         producer = fixture_member("producer", name="shot-producer")
         item = the_list.add(keeper.id, "Check the picture", owner=keeper.id, source="nate",
                             changes={"producer": producer.id, "state": the_list.ItemState.WAITING_FOR_NATE})
@@ -889,8 +894,7 @@ class ImagesTests(ImagesFixture):
                 self.assertNotIn(record["id"], images.render(self.status).decode())
 
     def test_linked_answers_save_before_delivery_and_survive_owner_delete(self) -> None:
-        self.enterContext(patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(self.temporary / "state")}))
-        morty = fixture_member("producer", name="morty")
+        morty = self.configure_list()
         producer = fixture_member("producer", name="shot-producer")
         owner = self.owner
         assert owner is not None

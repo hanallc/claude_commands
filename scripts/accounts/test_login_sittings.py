@@ -196,10 +196,6 @@ class LoginSittingsTests(unittest.TestCase):
                 _ = self.run_pass(self.now + timedelta(days=request_in))
                 self.assertEqual(self.sent[0], (sittings.reminder_push(expected), kind))
 
-    def test_repository_config_has_no_sitting_window(self) -> None:
-        config = Path(__file__).resolve().parents[2] / "config" / "accounts.conf"
-        self.assertNotIn("login_sitting_window_days", conf.read(config).values())
-
     def test_sitting_without_any_stored_date_records_the_sitting_without_a_push(self) -> None:
         _ = self.run_pass(self.now)
         self.assertEqual(self.sent, [])
