@@ -417,7 +417,7 @@ class MemoryHoverTests(unittest.TestCase):
         self.assertEqual((fields.get("Caller"), fields.get("Worker"), fields.get("Showrunner")),
                          ("mirror", "mirror", "cargo-liner"))
 
-    def test_mac_tooltip_shows_unknown_when_unit_spacing_differs_and_showrunner_is_filtered(self) -> None:
+    def test_mac_tooltip_omits_a_filtered_showrunner_when_unit_spacing_differs(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
@@ -427,7 +427,8 @@ class MemoryHoverTests(unittest.TestCase):
         rows = self.read_work_tooltip(reading, "mac-build")
         fields = {row["label"]: row["value"] for row in rows[1:]}
         self.assertEqual(rows[0]["label"], "core services · Phase 56c pass 2 stage CPU")
-        self.assertEqual((fields.get("Showrunner"), fields.get("Worker")), ("unknown", "mirror"))
+        self.assertNotIn("Showrunner", fields)
+        self.assertEqual(fields.get("Worker"), "mirror")
 
     def test_mac_tooltip_preserves_the_base_owner_for_distinct_units_with_similar_names(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
@@ -521,7 +522,7 @@ class MemoryHoverTests(unittest.TestCase):
         return cast(list[dict[str, object]], self.page_expression(
             f"tooltipRows('row:' + data.walk.find(row => row.kind === {json.dumps(kind)}).key, data)", page))
 
-    def test_tooltips_show_unknown_when_the_browser_filters_the_showrunner(self) -> None:
+    def test_tooltips_omit_a_filtered_showrunner(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
@@ -533,10 +534,10 @@ class MemoryHoverTests(unittest.TestCase):
           ([key, rows]) => rows.map(row => [key + ':' + (row.kind || 'local'), [row.title.unit, row.showrunner,
             tooltipRows(key + ':' + row.key, data).filter(field => field.label === 'Showrunner').map(field => field.value)]])))""",
             page)
-        self.assertEqual(actual, {key: ["research", "release.service", ["unknown"]] for key in
+        self.assertEqual(actual, {key: ["research", "release.service", []] for key in
                                   ("row:local", "row:mac-build", "row:cloud", "wait:local", "wait:cloud")})
 
-    def test_older_mac_row_uses_its_title_unit_for_an_unknown_showrunner(self) -> None:
+    def test_older_mac_row_keeps_its_title_and_omits_a_filtered_showrunner(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
@@ -551,9 +552,9 @@ class MemoryHoverTests(unittest.TestCase):
           return tooltipRows('row:' + row.key, data);
         })()""", page))
         self.assertEqual(rows[0]["label"], "handler · nextest")
-        self.assertEqual([field["value"] for field in rows if field["label"] == "Showrunner"], ["unknown"])
+        self.assertNotIn("Showrunner", [field["label"] for field in rows])
 
-    def test_older_same_name_rows_use_the_base_unit_for_an_unknown_showrunner(self) -> None:
+    def test_older_same_name_rows_omit_a_filtered_showrunner(self) -> None:
         cases: tuple[tuple[str, dict[str, object]], ...] = (
             ("native Mac", {"kind": "mac-build", "machine": "mac"}),
             ("Mac Linux guest", {"machine": "mac-linux", "guest_run": {"target": "mac-linux", "attempt": "fixture"},
@@ -569,9 +570,9 @@ class MemoryHoverTests(unittest.TestCase):
                 rows = cast(list[dict[str, object]], self.page_expression(
                     "tooltipRows('row:fixture-run-0', data)", {"walk": [row], "read_at": 200}))
                 self.assertEqual(rows[0]["label"], "handler")
-                self.assertEqual([field["value"] for field in rows if field["label"] == "Showrunner"], ["unknown"])
+                self.assertNotIn("Showrunner", [field["label"] for field in rows])
 
-    def test_unreadable_aws_gate_tooltip_shows_unknown_for_a_filtered_showrunner(self) -> None:
+    def test_unreadable_aws_gate_tooltip_omits_a_filtered_showrunner(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
@@ -581,7 +582,7 @@ class MemoryHoverTests(unittest.TestCase):
         row, = (row for row in reading["walk"] if row.get("kind") == "cloud")
         self.assertEqual((row["title"], row["unit"], row.get("showrunner")),
                          ({"unit": "", "step": "research"}, "research", "release.service"))
-        self.assert_unknown_showrunner_in_tooltip(reading, row, "research")
+        self.assert_no_showrunner_in_tooltip(reading, row, "research")
 
     def test_same_name_local_and_native_mac_steps_keep_the_tooltip_unit(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
@@ -596,7 +597,7 @@ class MemoryHoverTests(unittest.TestCase):
             with self.subTest(kind=row.get("kind", "local")):
                 self.assertEqual(row["title"], {"unit": "", "step": "nextest"})
                 self.assertEqual(row["unit"], "nextest")
-                self.assert_unknown_showrunner_in_tooltip(reading, row, "nextest")
+                self.assert_no_showrunner_in_tooltip(reading, row, "nextest")
 
     def test_same_name_ended_step_keeps_the_tooltip_unit(self) -> None:
         fixture = test_memory_feed.MemoryFeedTests()
@@ -605,16 +606,16 @@ class MemoryHoverTests(unittest.TestCase):
         reading = fixture.ended_step_hold_page("test hana")
         row, = reading["walk"]
         self.assertEqual(row["title"], {"unit": "", "step": "test hana"})
-        self.assert_unknown_showrunner_in_tooltip(reading, row, "test hana")
+        self.assert_no_showrunner_in_tooltip(reading, row, "test hana")
 
-    def assert_unknown_showrunner_in_tooltip(self, reading: memory_feed.MemoryPage,
-                                            row: memory_feed.RowQueueNotes, title: str) -> None:
+    def assert_no_showrunner_in_tooltip(self, reading: memory_feed.MemoryPage,
+                                       row: memory_feed.RowQueueNotes, title: str) -> None:
         page = cast(object, json.loads(memory_feed.page_json(reading)))
         key = row.get("key", "")
         rows = cast(list[dict[str, object]], self.page_expression(
             f"tooltipRows({json.dumps('row:' + key)}, data)", page))
         self.assertEqual(rows[0]["label"], title)
-        self.assertEqual([field["value"] for field in rows[1:] if field["label"] == "Showrunner"], ["unknown"])
+        self.assertNotIn("Showrunner", [field["label"] for field in rows[1:]])
 
     def test_queue_rows_show_unit_showrunner_step_and_one_running_target(self) -> None:
         # nate, 2026-11-21 and 2026-11-23: the unit starts the row, the showrunner is the small text under it,
@@ -1423,7 +1424,7 @@ class MemoryHoverTests(unittest.TestCase):
                     "need": 4.0, "need_part": False, **row}]}))
                 self.assertIn(expected, hover[0])
                 if expected == "unavailable":
-                    self.assertEqual(hover[1], "Showrunner  unknown")
+                    self.assertEqual(hover[1], "")
                 else:
                     self.assertIn("Uses  1.0 GiB", hover[1])
                     self.assertEqual("+ Build reserved" in hover[1], bool(row["reserved"]))

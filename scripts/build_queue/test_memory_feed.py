@@ -1544,7 +1544,7 @@ process.stdout.write($("leftover-rows").innerHTML);
         self.assertEqual(pending.get("guest_unconfirmed"), "not confirmed")
         self.assertNotIn("guest_run", pending)
 
-    def test_guest_unit_without_a_showrunner_shows_unknown(self) -> None:
+    def test_guest_unit_without_a_showrunner_omits_the_showrunner_field(self) -> None:
         for what in ("", "handler"):
             with self.subTest(what=what):
                 page = self.guest_gate_page(unit="handler", what=what)
@@ -1555,7 +1555,7 @@ process.stdout.write($("leftover-rows").innerHTML);
                     self.assertEqual((row["unit"], row.get("showrunner")), ("handler", ""))
                     if what:
                         self.assertEqual(row["title"]["unit"], "")
-                    self.assertIn("Showrunner  unknown", "\n".join(tips["walk"][page["walk"].index(row)]))
+                    self.assertNotRegex("\n".join(tips["walk"][page["walk"].index(row)]), r"(?m)^Showrunner(?:  |$)")
 
     def test_guest_gate_rows_show_on_mac_linux_with_the_confirmed_attempt_or_not_confirmed(self) -> None:
         page = self.guest_gate_page()
@@ -3360,7 +3360,7 @@ const refresh = createPageRefresh(tick);
         self.assertEqual(row.get("detail"), "between steps")
         payload = cast(dict[str, object], json.loads(memory_feed.page_json(page)))
         tips, _ = self.render_assignment_table(payload)
-        self.assertIn("Showrunner  unknown", "\n".join(tips["walk"][0]))
+        self.assertNotRegex("\n".join(tips["walk"][0]), r"(?m)^Showrunner(?:  |$)")
 
     def test_released_holds_keep_the_recorded_caller(self) -> None:
         members = staff.StaffSnapshot(())
@@ -4823,7 +4823,7 @@ const refresh = createPageRefresh(tick);
         tips, table = self.render_assignment_table(payload)
         self.assertIn('<span class="name">research</span></span><span class="owner"></span>', table)
         self.assertNotIn(">unknown<", table)
-        self.assertIn("Showrunner  unknown", "\n".join(tips["walk"][page["walk"].index(mac)]))
+        self.assertNotRegex("\n".join(tips["walk"][page["walk"].index(mac)]), r"(?m)^Showrunner(?:  |$)")
 
     def test_decoded_work_rows_keep_caller_names_separate_from_display_labels(self) -> None:
         for stored, reservation, caller, held in (

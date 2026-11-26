@@ -2000,11 +2000,10 @@ function doneText(row) {
     : progress.total > 0 && recorded(progress.done) ? 100 * progress.done / progress.total : null;
   return recorded(percent) ? formatPercent(percent, progress.done === progress.total) : "—";
 }
-function ownerFields(row, baseUnit = '') {
+function ownerFields(row) {
   const override = row.tooltip_owner_override;
   const showrunner = override?.showrunner || ownerText(row.showrunner);
-  const unit = override?.unit ?? row.tooltip_unit ?? (baseUnit && baseUnit !== '—' ? baseUnit : row.title?.unit);
-  const fields = [staffField('Showrunner', [showrunner || (unit && unit !== '—' ? 'unknown' : '')], 'showrunner')];
+  const fields = [staffField('Showrunner', [showrunner], 'showrunner')];
   if (row.runner === 'worker') fields.push(staffField('Worker', [ownerText(row.worker)], 'worker'));
   if (row.caller) fields.push(field('Caller', row.caller));
   return fields.filter(row => row.value);
@@ -2094,7 +2093,7 @@ function stepTooltip(key, data) {
   if (macRow(row) && row.gate_label && !row.gate_label.startsWith('placement ')) {
     detailFields.push(field('Mac build', row.gate_label));
   }
-  if (unavailable) return [...rows, ...ownerFields(row, row.unit), ...detailFields, ...stepFields, ...unavailableLocation, ...namedTargets,
+  if (unavailable) return [...rows, ...ownerFields(row), ...detailFields, ...stepFields, ...unavailableLocation, ...namedTargets,
     ...(waiting && namesGuest ? routeFields(row) : []), ...callFields];
   if (group) return [...rows, field('Started by', 'not the queue'),
     ...groupRows((row.parts || []).map((part, index) => {
@@ -2103,7 +2102,7 @@ function stepTooltip(key, data) {
       const parts = [...(part.who_parts || [{kind:'text',text:part.who}]), ...(suffix ? [{kind:'text',text:' · '+suffix}] : [])];
       return {...field(partsText(parts), group.parts[index][1].text), labelParts:parts};
     }))];
-  rows.push(...ownerFields(row, row.unit), ...detailFields, ...stepFields);
+  rows.push(...ownerFields(row), ...detailFields, ...stepFields);
   if (row.priority_entries?.length) rows.push(...priorityFields(row.priority_entries, row.priority_lines));
   if (waiting) {
     if (row.place) rows.push(field('Place in line', row.place));

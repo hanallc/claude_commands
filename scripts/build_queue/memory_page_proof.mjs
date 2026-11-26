@@ -712,7 +712,7 @@ try {
           };
           const unknown = await handlerTooltip(readings.handler_tip_unknown);
           assert.match(unknown.text, /^handler · nextest\n/);
-          assert.match(unknown.text, /\nShowrunner\nunknown\n/);
+          assert.doesNotMatch(unknown.text, /(?:^|\n)Showrunner(?:\n|$)/);
           const sameStep = await handlerTooltip(readings.handler_tip_same_step);
           assert.match(sameStep.text, /^handler\n/);
           assert.match(sameStep.text, /\nShowrunner\nrelease\.service\n/);
