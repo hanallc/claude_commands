@@ -1296,6 +1296,7 @@ if(example.filterOn){
         initial = list_page.render(root, include_counts=False).decode()
         _ = the_list.close(MORTY.id, closed.id, "The check passed.", source="morty")
         fresh = list_page.render(root, include_counts=False).decode()
+        closed_detail = list_page.saved_action_state(MORTY.id, closed.id, include_detail=True)
         self.browser_action_sequence(r'''
  const item=number=>document.querySelector('[data-number="'+number+'"]');
  const links=()=>recordDetails(item(494)).querySelector('[data-linked-items]');
@@ -1322,10 +1323,12 @@ if(example.filterOn){
  check(closedBadge.getBoundingClientRect().left===workingBadge.getBoundingClientRect().left,
   'Badges with different widths start in the same column.');
  const count=document.querySelector('[data-list-count]').textContent;
+ itemSnapshots.set(item(210).dataset.key,CLOSED_DETAIL);
  links().querySelectorAll('a')[0].click();
  const closed=item(210);
  check(recordIsOpen(closed) && !closed.hidden && closed.closest('[data-linked-item]'),
   'The closed item link opens its detail outside the results.');
+ await flush();
  check(!recordDetails(closed).querySelector('form') &&
   recordDetails(closed).textContent.includes('The check passed.'),'The closed detail shows the log and no actions.');
  check(document.querySelector('[data-list-count]').textContent===count,'The closed item does not change the counts.');
@@ -1335,9 +1338,85 @@ if(example.filterOn){
  const target=item(OPEN_NUMBER);
  check(recordIsOpen(target) && !target.hidden && !recordIsOpen(item(494)) &&
   new URLSearchParams(location.hash.slice(1)).get('item')===target.dataset.key,'The open item link opens its item.');
-'''.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/')).replace('OPEN_NUMBER', str(open_item.number)),
+'''.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+           .replace('CLOSED_DETAIL', json.dumps(closed_detail).replace('</', '<\\/'))
+           .replace('OPEN_NUMBER', str(open_item.number)),
                                      reduced_motion=True, add_item=False, markup=initial, open_number=494,
                                      window_size=(1440, 900))
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_snapshot_removes_the_last_link_after_an_action(self) -> None:
+        target = self.add("Check the linked item", number=1)
+        source = self.add("Check the links", number=2)
+        source = the_list.update(MORTY.id, source.id, {"related_to": (target.number,)}, source="morty")
+        root = self.root / "reviews"
+        initial = list_page.render(root, include_counts=False).decode()
+        source = the_list.update(MORTY.id, source.id, {"related_to": ()}, source="morty")
+        _, action = list_page.save_action(root, urlencode(self.fields(source, "read")),
+                                          include_detail=True, top_priority=list_page.TopPriority.SHOWN)
+        assert action is not None
+        fresh = list_page.render(root, include_counts=False).decode()
+        steps = r'''
+ const linked=()=>recordDetails(row).querySelector('[data-linked-items]');
+ check(linked()?.textContent.includes('#1 Check the linked item'),'The first snapshot shows the link.');
+ row.closest('[data-undo-seconds]').dataset.undoSeconds='0';
+ const fetchAction=window.fetch;
+ let releasePage,requestPage;
+ const requested=new Promise(resolve=>{requestPage=resolve;});
+ window.fetch=(path,options)=>options.method==='POST' ? fetchAction(path,options) : new Promise(resolve=>{
+  releasePage=()=>resolve(new Response(FRESH_PAGE));requestPage();
+ });
+ submit('read');finishPost(ACTION_RESULT);
+ await requested;
+ check(row.dataset.unread==='false' && linked(),'The action keeps the previous link until the full snapshot.');
+ const before=row.closest('[data-list]');
+ const refreshed=new Promise(resolve=>{
+  const observer=new MutationObserver(()=>{if(!before.isConnected){observer.disconnect();resolve();}});
+  observer.observe(before.parentElement,{childList:true});
+ });
+ releasePage();await refreshed;
+ check(recordIsOpen(row) && !linked(),'The full snapshot removes the last related link.');
+'''.replace('FRESH_PAGE', json.dumps(fresh).replace('</', '<\\/'))
+        self.browser_action_sequence(steps.replace('ACTION_RESULT', json.dumps(action).replace('</', '<\\/')),
+                                     reduced_motion=True, add_item=False, markup=initial, open_number=2)
+
+    @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
+    def test_browser_closed_link_opens_its_closed_target_on_demand(self) -> None:
+        leaf = self.add("Check the last result", number=1)
+        middle = self.add("Check the middle result", number=2)
+        source = self.add("Check the first result", number=3)
+        _ = the_list.update(MORTY.id, middle.id, {"related_to": (leaf.number,)}, source="morty")
+        _ = the_list.update(MORTY.id, source.id, {"related_to": (middle.number,)}, source="morty")
+        _ = the_list.close(MORTY.id, leaf.id, "The leaf log is complete.", source="morty")
+        _ = the_list.close(MORTY.id, middle.id, "The middle log is complete.", source="morty")
+        markup = list_page.render(self.root / "reviews", include_counts=False).decode()
+        bodies = [list_page.saved_action_state(MORTY.id, item.id, include_detail=True) for item in (leaf, middle)]
+        steps = r'''
+ const item=number=>document.querySelector('[data-number="'+number+'"]');
+ const closedReads=[];
+ const fetchPage=window.fetch;
+ window.fetch=(path,options)=>{
+  const id=new URL(path,location.href).searchParams.get('item-state');
+  if(id) closedReads.push(id);
+  return fetchPage(path,options);
+ };
+ const [leaf,middle]=[item(1),item(2)];
+ const bodies=CLOSED_BODIES;
+ itemSnapshots.set(leaf.dataset.key,bodies[0]);itemSnapshots.set(middle.dataset.key,bodies[1]);
+ check(!closedReads.length && !recordDetails(middle).querySelector('.list-log') &&
+  !recordDetails(leaf).querySelector('.list-log'),'The snapshot keeps the Closed summaries without either log.');
+ recordDetails(row).querySelector('[data-linked-items] a').click();
+ await flush();
+ const middleDetail=recordDetails(middle),link=middleDetail.querySelector('[data-linked-items] a');
+ check(closedReads.join()==='L2' && middleDetail.textContent.includes('The middle log is complete.') &&
+  !middleDetail.querySelector('form'),'Opening the middle item reads only its read-only detail.');
+ check(link?.textContent==='#1 Check the last result' &&
+  link.nextElementSibling?.textContent==='Closed','The middle item shows the Closed target and its title.');
+ link.click();await flush();
+ check(recordIsOpen(leaf) && !leaf.hidden && recordDetails(leaf).textContent.includes('The leaf log is complete.') &&
+  !recordDetails(leaf).querySelector('form') && closedReads.join()==='L2,L1','The target opens and reads its own log.');
+'''.replace('CLOSED_BODIES', json.dumps(bodies).replace('</', '<\\/'))
+        self.browser_action_sequence(steps, reduced_motion=True, add_item=False, markup=markup, open_number=3)
 
     @unittest.skipUnless(shutil.which("google-chrome"), "Chrome is required for browser checks")
     def test_browser_studio_tab_filters_the_rows_to_its_producer(self) -> None:
@@ -2338,12 +2417,15 @@ if(direct || shot){const image=new Image();image.hidden=true;image.src='/complet
         _ = self.add("Open blocker", number=30)
         other_producer = self.add("Linked item from another producer", number=31)
         _ = the_list.update(MORTY.id, other_producer.id, {"producer": DWIGHT.id}, source="morty")
-        _ = the_list.update(MORTY.id, source.id, {"related_to": (29,),
-            "blocked_by": (the_list.ItemDependency(30, "The blocker is complete."),)}, source="morty")
+        _ = the_list.update(MORTY.id, source.id, {"blocked_by": (
+            the_list.ItemDependency(30, "The blocker is complete."),)}, source="morty")
         records = list_page.records(include_closed=True)
         for index, entry in enumerate(records):
             if entry.item.id == source.id:
-                records[index] = list_page.ListRecord(entry.keeper, replace(entry.item, related_to=(2, 29, 31, 99), unread_since=NOW))
+                dependencies = (*entry.item.blocked_by, the_list.ItemDependency(29, "Check the closed blocker."),
+                                the_list.ItemDependency(99, "Check the missing blocker."))
+                records[index] = list_page.ListRecord(entry.keeper, replace(
+                    entry.item, related_to=(2, 31), blocked_by=dependencies, unread_since=NOW))
             elif entry.item.id == "L30":
                 records[index] = list_page.ListRecord(entry.keeper, replace(entry.item, unread_since=NOW))
         with patch.object(list_page, "records", return_value=records), patch.object(list_page, "counts_strip", return_value=""):
@@ -2357,8 +2439,12 @@ addEventListener('message',event=>{
   search.value=event.data.pendingWords;search.dispatchEvent(new Event('input'));
  }
  const links=recordDetails(document.querySelector('[data-number="1"]')).querySelectorAll('a');
- [...links].find(link=>link.textContent==='#'+event.data.clickListLink).click();
+ findListLink(links,event.data.clickListLink).click();
 });
+function findListLink(links,number){
+ const label='#'+number;
+ return [...links].find(link=>link.textContent===label || link.textContent.startsWith(label+' '));
+}
 </script></body>''')
         page = console.ConsolePage("studio", "Studio", "clapperboard", "The Studio", console.AvailablePage(studio_page.PAGE_PATH))
         shell = console.render((page,), console.UnavailablePage()).decode()
@@ -2392,7 +2478,7 @@ frame.addEventListener('load',async()=>{
   const pendingWords=scenario==='pending-words' ? 'item' : '';
   const originalFilters=filters();
   if(pendingWords) originalFilters[2]=pendingWords;
-  const link=[...win.recordDetails(source).querySelectorAll('a')].find(a=>a.textContent==='#'+number);
+  const link=win.findListLink(win.recordDetails(source).querySelectorAll('a'),number);
   const sourceForm=win.recordDetails(source).querySelector('[data-feedback-form]');
   if(scenario==='closed'){
    sourceForm.elements.words.value='Keep the source draft.';
@@ -2493,7 +2579,7 @@ frame.addEventListener('load',async()=>{
   }
   if(scenario==='closed'){
    const missingPlace=win.location.href;
-   const valid=[...win.recordDetails(source).querySelectorAll('[data-record-jump]')].find(link=>link.textContent==='#2');
+   const valid=win.findListLink(win.recordDetails(source).querySelectorAll('[data-record-jump]'),2);
    valid.click();
    check(expanded(row(2)) && !expanded(source) && missing().hidden,'A valid link opens its row and clears the notice.');
    const backToMissing=changed(win);
@@ -2924,27 +3010,30 @@ frame.addEventListener('load',async()=>{
         detail = body.split('<div class="list-panel">', 1)[1].split('<script', 1)[0]
         self.assertIn(f'href="{url}" target="_blank" rel="noopener"', detail)
 
-    def test_one_links_section_keeps_related_jumps_and_url_links(self) -> None:
-        _ = self.add("Related item", number=210)
+    def test_linked_items_lists_a_closed_relation_once_and_keeps_blockers_and_urls(self) -> None:
+        related = self.add("Related item", number=210)
         _ = self.add("Blocking item", number=211)
         url = "https://console.test/check"
         item = the_list.add(MORTY.id, "Inspect the links", owner=OWNER.id, source="nate", changes={
             "latest_status": f"See {url}.", "related_to": (210,),
             "blocked_by": (the_list.ItemDependency(211, "The check passes."),),
         })
+        _ = the_list.close(MORTY.id, related.id, "The check is complete.", source="morty")
         body = list_page.render(self.root / "reviews", include_counts=False).decode()
         row = body.split(f'data-key="{MORTY.id}/{item.id}"', 1)[1].split("</tbody>", 1)[0]
         self.assertEqual(row.count("<h3>Links</h3>"), 1)
-        self.assertNotIn("<h3>Related items</h3>", row)
+        self.assertIn('<h3>Linked items · 1 of 1 closed</h3>', row)
+        link = html.escape(list_page.item_link(MORTY.id, related.number), quote=True)
+        self.assertEqual(row.count(f'href="{link}&amp;reveal=1"'), 1)
+        self.assertNotIn(f'href="{link}"', row)
         section = row.split('<section class="item-links">', 1)[1].split("</section>", 1)[0]
         parsed = ElementTree.fromstring(f"<section>{section.replace(' data-record-jump ', ' data-record-jump="" ')}</section>")
         anchors = parsed.findall("ul/li/a")
         self.assertEqual([(anchor.text, anchor.get("href"), anchor.get("target")) for anchor in anchors], [
             ("#211", list_page.item_link(MORTY.id, 211), None),
-            ("#210", list_page.item_link(MORTY.id, 210), None),
             ("console.test/check", url, "_blank"),
         ])
-        self.assertTrue(all("data-record-jump" in anchor.attrib for anchor in anchors[:2]))
+        self.assertIn("data-record-jump", anchors[0].attrib)
         self.assertEqual(anchors[-1].get("rel"), "noopener")
 
     def test_blocking_condition_links_the_url_once_in_the_links_section(self) -> None:
