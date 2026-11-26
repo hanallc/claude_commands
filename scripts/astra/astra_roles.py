@@ -244,6 +244,25 @@ def _role_record(role: HeldRole) -> RoleRecord:
     return record
 
 
+def reviewer_process_running(staff_id: str) -> bool:
+    """Check the process that holds this review."""
+    if not staff_id:
+        return False
+    try:
+        fields = _json_object(_record_path(staff_id))
+    except FileNotFoundError:
+        return False
+    if fields.get("staff_id") != staff_id or "pid" not in fields:
+        raise ValueError("The review holder does not match its record.")
+    lifetime = _role_lifetime(fields, "reviewer")
+    if not isinstance(lifetime, ExecProcess) or not isinstance(lifetime.start, process_start.Started):
+        raise ValueError("The review holder has no recorded process start.")
+    observed = process_start.process_start(lifetime.pid)
+    if isinstance(observed, process_start.Unreadable):
+        raise OSError(f"Cannot check reviewer PID {lifetime.pid}: {observed.reason}")
+    return observed == lifetime.start
+
+
 
 
 class AllHeldRoles(Enum):

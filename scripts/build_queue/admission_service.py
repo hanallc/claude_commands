@@ -612,6 +612,7 @@ class ReservationRecord:
     cargo_folder: placement.CargoFolder | placement.NoCargoFolder = placement.NoCargoFolder()
     gate_job: StepJob | GateJobNotRecorded = GATE_JOB_NOT_RECORDED
     cloud_launch_seen: bool = False
+    trace_sampling: wire.TraceSampling = wire.ScopeTraceSampling()
 
 
 def admitted_gate_job(request: wire.AdmitRequest, proc: Path) -> StepJob | GateJobNotRecorded:
@@ -1250,7 +1251,7 @@ class OperatingSystemReader:
             shape = memory_trace.GeneralTraceShape(host, record.repo_identity or record.worktree or record.repo,
                                                   record.step, argv)
         worker.submit(memory_trace.TraceGrant(record.reservation_id, shape, reservation_row(record),
-                                              wall, self.clock.monotonic()))
+                                              wall, self.clock.monotonic(), record.trace_sampling))
 
     def release_trace(self, record: ReservationRecord, ending: ReservationEnding,
                       wall: float) -> None:
@@ -4330,7 +4331,7 @@ class AdmissionServer:
             profile.repository.key if isinstance(profile.repository, records.RepositoryIdentity) else "",
             profile.scope, step_estimator.test_package(list(request.argv)), tuple(step_estimator.test_filters(list(request.argv))),
             shape, run=request.run, place=request.place, cargo_folder=cargo_folder,
-            gate_job=admitted_gate_job(request, self.proc.path))
+            gate_job=admitted_gate_job(request, self.proc.path), trace_sampling=request.trace_sampling)
         self.writes.register(record)
         if cloud:
             return record
@@ -5484,7 +5485,7 @@ done
             return wire.LaunchRequest(request.episode, owner, request.since, identity, request.profile)
         return wire.AdmitRequest(request.episode, owner, local.argv, local.cwd, request.since, local.sidecar,
             identity, local.call, local.test_width, request.profile, local.fresh_test, local.token_back_at, request.run,
-            session=request.constraints.session)
+            session=request.constraints.session, trace_sampling=local.trace_sampling)
 
     def _placement_row(self, request: wire.PlacementRequest) -> records.Waiter:
         admission = self._placement_admission(request)
@@ -8027,7 +8028,7 @@ done
             if not isinstance(initial, SystemEvidence):
                 initial = read_system(plan, self.readings, self.proc, self.clock)
             traces = (memory_trace.TraceCapture(memory_trace.TraceStore(self.state_dir / "memory_traces", self.trace_policy),
-                        self.progress_captures.root, self.boot_id, self.clock)
+                        self.progress_captures.root, self.boot_id, self.clock, proc=self.proc.path)
                       if isinstance(self.trace_policy, memory_trace.MemoryTracePolicy) else self.trace_policy)
             self.system_reader = OperatingSystemReader(plan, initial, self.readings, self.proc, self.clock,
                                                        self.reading_events, traces=traces)
