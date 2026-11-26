@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import atexit
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 import os
 from pathlib import Path
@@ -75,7 +75,7 @@ def _test_run_folder(parent: PreparedTestRunsParent) -> Generator[Path]:
             tempfile.tempdir = old_tempdir
 
 
-def start_test_run() -> None:
+def start_test_run() -> Callable[[], None]:
     """Keep the bootstrap allocation until normal interpreter exit.
 
     A direct run with no BUILDLOG_DIR keeps its build log in the run folder, so no test writes the caller's log.
@@ -110,3 +110,4 @@ def start_test_run() -> None:
                     os._exit(1)
 
     _ = atexit.register(finish)
+    return finish

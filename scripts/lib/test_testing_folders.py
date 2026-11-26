@@ -278,7 +278,7 @@ class Child(unittest.TestCase):
                 # The targeted gate holds a run folder and keeps the caller's build log.
                 with testing_folders.test_run_folder():
                     self.assertEqual(os.environ.get("BUILDLOG_DIR"), caller or None)
-                testing_folders.start_test_run()
+                _ = testing_folders.start_test_run()
                 path = Path(os.environ[testing_folders.RUN_FOLDER_ENV])
                 self.assertEqual(os.environ["BUILDLOG_DIR"], caller or str(path / "buildlog"))
                 finish, = finishes
@@ -286,7 +286,8 @@ class Child(unittest.TestCase):
                 self.assertEqual(os.environ.get("BUILDLOG_DIR"), caller or None)
                 self.assertFalse(path.exists())
 
-    def run_config_write_fixture(self, source: str, *, relative: bool = False) -> subprocess.CompletedProcess[str]:
+    def run_config_write_fixture(self, source: str, *, relative: bool = False,
+                                 before_discovery: str = "") -> subprocess.CompletedProcess[str]:
         login_home = self.root / "login"
         config = login_home / ".claude/config/showrunners.conf"
         config.parent.mkdir(parents=True)
@@ -299,6 +300,7 @@ import pwd
 import runpy
 from types import SimpleNamespace
 pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir={str(login_home)!r})
+{before_discovery}
 runpy.run_module("unittest", run_name="__main__", alter_sys=True)
 """
         environment = without_user_test_manager(self.root, self.environment())
@@ -382,6 +384,93 @@ class Fixture(unittest.TestCase):
         attempted = self.root / "config-link/showrunners.conf"
         self.assertIn(f"direct test: Test attempted to write live configuration at {attempted} "
                       + "(test test_config_write.Fixture.test_write)", result.stderr)
+
+    def test_a_direct_run_blocks_relative_writes_to_a_config_directory_descriptor(self) -> None:
+        result = self.run_config_write_fixture("""
+import os
+import unittest
+from scripts.lib import conf
+
+class Fixture(unittest.TestCase):
+    def test_write(self):
+        path = conf.path("showrunners")
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.close(os.open(path.name, os.O_WRONLY | os.O_TRUNC, dir_fd=directory))
+        finally:
+            os.close(directory)
+""")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        attempted = self.root / "login/.claude/config/showrunners.conf"
+        self.assertIn(f"Test attempted to write live configuration at {attempted}", result.stderr)
+
+    def test_a_direct_run_names_the_module_and_class_that_write_config(self) -> None:
+        result = self.run_config_write_fixture("""
+import unittest
+from scripts.lib import conf
+
+def write():
+    conf.path("showrunners").write_text("test")
+
+try:
+    write()
+except AssertionError as error:
+    print("Import:", error)
+
+def load_tests(loader, tests, pattern):
+    try:
+        write()
+    except AssertionError as error:
+        print("Discovery:", error)
+    return tests
+
+def setUpModule():
+    try:
+        write()
+    except AssertionError as error:
+        print("Module setup:", error)
+
+class Fixture(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        write()
+
+    def test_write(self):
+        self.fail("The class setup did not fail")
+""")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        attempted = self.root / "config-link/showrunners.conf"
+        refusal = f"Test attempted to write live configuration at {attempted}"
+        self.assertIn(f"Import: {refusal} (module test_config_write)", result.stdout)
+        self.assertIn(f"Discovery: {refusal} (module test_config_write)", result.stdout)
+        self.assertIn(f"Module setup: {refusal} (module test_config_write)", result.stdout)
+        self.assertIn(f"{refusal} (class test_config_write.Fixture)", result.stderr)
+
+    def test_a_direct_run_runs_startup_cleanup_after_a_config_write_refusal(self) -> None:
+        result = self.run_config_write_fixture("""
+import os
+import unittest
+from pathlib import Path
+from scripts.lib import conf
+
+class Fixture(unittest.TestCase):
+    def test_write(self):
+        Path(os.environ["TMPDIR"], "report").touch()
+        with self.assertRaises(AssertionError):
+            conf.path("showrunners").write_text("test")
+""", before_discovery="""
+import atexit
+import os
+from pathlib import Path
+
+def report():
+    print("The test folder exists:", Path(os.environ["TMPDIR"], "report").is_file())
+
+atexit.register(report)
+""")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("direct test: Test attempted to write live configuration", result.stderr)
+        self.assertIn("The test folder exists: True", result.stdout)
 
     def test_a_run_has_an_absent_session_root_and_restores_the_callers(self) -> None:
         for caller in ("", str(self.root / "caller-session")):

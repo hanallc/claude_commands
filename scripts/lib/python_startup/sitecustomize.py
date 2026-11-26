@@ -30,6 +30,8 @@ if TYPE_CHECKING:
         def pop(self, key: Literal["ready"], /) -> Callable[[], None]: ...
         @overload
         def pop(self, key: Literal["startup_search"], default: None, /) -> list[str] | None: ...
+        @overload
+        def pop(self, key: Literal["direct_test_cleanup"], default: None, /) -> Callable[[], None] | None: ...
         def get(self, key: Literal["startup_search"], /) -> list[str] | None: ...
         def __setitem__(self, key: Literal["startup_search"], value: list[str], /) -> None: ...
         def setdefault(self, key: Literal["startup_hooks"], default: list[ModuleType], /) -> list[ModuleType]: ...
@@ -253,6 +255,18 @@ class DataclassCodeFinder:
 def start_process(arguments: list[str]) -> str:
     """Select the checkout and register the direct test boundary."""
     selected = select_checkout(arguments)
+    state = sys.modules["_devtools_checkout"]
+    if "direct_test_cleanup" not in state.__dict__:
+        import atexit
+
+        def finish_test_run() -> None:
+            finish = _checkout_attributes(state).pop("direct_test_cleanup", None)
+            if finish is not None:
+                finish()
+
+        # Reserve the cleanup before the next startup hook registers its callbacks.
+        state.__dict__["direct_test_cleanup"] = None
+        _ = atexit.register(finish_test_run)
     if (os.environ.get("CLAUDE_DISABLE_DATACLASS_CODE_CACHE") != "1"
             and "dataclasses" not in sys.modules
             and not any(type(finder).__name__ == DataclassCodeFinder.__name__ for finder in sys.meta_path)):
@@ -407,6 +421,8 @@ def _unittest_boundary(module: ModuleType) -> None:
         if not started:
             with lock:
                 if not started:
+                    # This process owns the tests it starts.
+                    _ = os.environ.pop("DEVTOOLS_TEST_ID", None)
                     _begin_direct_test()
                     started = True
 
@@ -550,6 +566,7 @@ def _begin_direct_test() -> None:
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     if within_test_limit():
         return
+    import atexit
     from contextlib import AbstractContextManager, nullcontext
     from pathlib import Path
     from typing import cast
@@ -586,7 +603,10 @@ def _begin_direct_test() -> None:
             if has_test_folder:
                 from scripts.lib.testing_folders import start_test_run
 
-                start_test_run()
+                finish: object = start_test_run()
+                if callable(finish):
+                    atexit.unregister(finish)
+                    sys.modules["_devtools_checkout"].__dict__["direct_test_cleanup"] = finish
     except (OSError, conf.Unusable, ValueError) as error:
         print(f"direct test: {error}", file=sys.stderr, flush=True)
         raise SystemExit(1) from None

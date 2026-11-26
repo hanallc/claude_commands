@@ -52,6 +52,27 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
             return os.fsdecode(raw)
         return os.readlink(f"/proc/self/fd/{descriptor}")
 
+    def writer() -> str:
+        test_id = os.environ.get("DEVTOOLS_TEST_ID")
+        if test_id:
+            return f"test {test_id}"
+        from inspect import currentframe
+
+        frame = currentframe()
+        while frame is not None:
+            code = frame.f_code
+            if code.co_name in {"setUpClass", "tearDownClass"} and code.co_argcount:
+                owner: object = frame.f_locals.get(code.co_varnames[0])
+                if isinstance(owner, type):
+                    return f"class {owner.__module__}.{owner.__qualname__}"
+            if code.co_name in {"<module>", "load_tests", "setUpModule", "tearDownModule"}:
+                module: object = frame.f_globals.get("__name__")
+                if isinstance(module, str) and module != "__main__":
+                    return f"module {module}"
+                return f"entry {code.co_filename}"
+            frame = frame.f_back
+        return f"entry {sys.argv[0] if sys.argv else '<unknown>'}"
+
     def check(value: object, directory_fd: object = -1, *, follow_entry: bool) -> None:
         nonlocal reported
         try:
@@ -70,10 +91,7 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
         if resolved in roots or resolved.startswith(prefixes):
             if not os.path.isfile(startup_hook):
                 return
-            test_id = os.environ.get("DEVTOOLS_TEST_ID")
-            message = f"Test attempted to write live configuration at {absolute}"
-            if test_id:
-                message += f" (test {test_id})"
+            message = f"Test attempted to write live configuration at {absolute} ({writer()})"
             if not reported:
                 try:
                     with open(violation_log, "a", encoding="utf-8", errors="backslashreplace") as log:
