@@ -148,8 +148,12 @@ On status 80, `copies.py run` requests settlement.
 For Mac Linux, the wrapper needs a no-run report before it requests a replacement.
 The wrapper writes the replacement assignment to the same file and runs the gate on the assigned machine.
 After a prelaunch refusal, another attempt on the same guest requires a fresh availability reading.
+When the queue needs a guest reading, it waits before it considers later machines in registry order.
+The first eligible machine in that order takes the run.
+A busy, blocked, off, or unreachable guest lets placement consider the next machine immediately.
 An eligible named machine can take the run while the guest is in backoff.
-A fresh reading that still excludes the guest keeps it out of placement.
+The queue waits at most 30 seconds for the reading.
+The next queue pass uses the result or treats the guest as unreachable.
 If placement fails, the wrapper reports `Gate placement blocked`.
 A confirmed test failure gives status 1.
 A gate command in Merge tests uses `copies.py run --commit <sha>` with the prepared merge commit.
