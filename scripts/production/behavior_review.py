@@ -12,16 +12,12 @@ from unicodedata import category
 
 from scripts.astra import astra_review, astra_roles, astra_work
 from scripts.direct import pass_record, progress_history, recorder_state
-from scripts.lib import conf, file_lock, unit_runs, urgency
+from scripts.lib import file_lock, unit_runs, urgency
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.showrunner_state import state_root
 from scripts.production import behavior_check, staff, update_registration, worker
 from scripts.production.production_doc import Refusal
 from scripts.review_links import review_events
-
-
-YES_CHOICE = "Yes. Land the change."
-NO_CHOICE = "No. Keep the current behavior."
 
 
 @dataclass(frozen=True)
@@ -59,8 +55,8 @@ def parse_reply(text: str, tests: behavior_check.ChangedTests) -> list[Specified
             match row:
                 case {"test": str(test), "finding": "none"} if len(row) == 2:
                     pass
-                case {"test": str(test), "finding": "specified", "quote": str(quote),
-                      "source": str(source), "date": str(day), "change": str(change)} if len(row) == 6:
+                case {"test": str(test), "finding": "specified", "quote": str(quote), "source": str(source),
+                      "date": str(day), "change": str(change)} if len(row) == 6:
                     path = Path(source)
                     if not path.is_absolute() or not quote.strip() or not change.strip() or len(change.splitlines()) != 1:
                         raise ValueError(f"{test}: expected a quote, an absolute source path and one line about the change")
@@ -106,12 +102,13 @@ Use these sources:
 
 Count only words that Nate used to set the affected behavior. Check who wrote the words.
 Quote only the words that apply to the changed behavior.
+In `change`, write one plain line for the author about how the behavior changes.
 If you cannot complete the review, report the blocker instead of a finding.
 
 Return one JSON array. Give one object for each test ID in tests.json.
 Use {{"test":"ID","finding":"none"}} when you find no such words.
 Otherwise use {{"test":"ID","finding":"specified","quote":"exact words","source":"/absolute/path",
-"date":"YYYY-MM-DD","change":"One plain sentence about what the change does."}}
+"date":"YYYY-MM-DD","change":"how the behavior changes"}}
 
 Read only. Do not edit files, run builds or tests, send messages, or file a question.
 """
@@ -202,9 +199,56 @@ def asking_staff(reference: str, identities: update_registration.QuestionStaff) 
     raise behavior_check.BehaviorCheckError("Pass --production to name the owner of the Review question.")
 
 
-def ask(key: str, evidence: list[SpecifiedBehavior], reference: str) -> behavior_check.Waiting:
+def first_word(text: str) -> str:
+    words = text.split(maxsplit=1)
+    word = words[0] if words else ""
+    end = len(word)
+    while end and category(word[end - 1]).startswith("P"):
+        end -= 1
+    return word[:end]
+
+
+def read_question(path: Path, evidence: list[SpecifiedBehavior]) -> update_registration.QuestionParts:
+    parts = update_registration.read_parts(cast(object, json.loads(path.read_text(encoding="utf-8"))), str(path))
+    choices = parts["choices"]
+    yes_start = "Yes (the change goes in"
+    no_start = "No (the change stays out"
+    if len(choices) != 2 or not all(
+        any(re.match(re.escape(start) + r"\b", choice) for choice in choices) for start in (yes_start, no_start)
+    ):
+        raise behavior_check.BehaviorCheckError(f'{path}: start one choice with "{yes_start}" and one with "{no_start}".')
+    title_and_point = tuple(" ".join(parts[key].split()) for key in ("ask", "context"))
+    for finding in evidence:
+        if not any(re.search(rf"\b{finding.day.isoformat()}\b", text) for text in title_and_point):
+            raise behavior_check.BehaviorCheckError(f"{path}: the title and point omit {finding.day} for {finding.test}.")
+    return parts
+
+
+def question_route(key: str) -> Path:
+    return behavior_check.record_path(key).with_suffix(".owner")
+
+
+def waiting_question(record: update_registration.QuestionRecord) -> behavior_check.Waiting:
+    question = record.item.get("review_id", "")
+    if not question:
+        raise behavior_check.BehaviorCheckError("The filed question has no number.")
+    return behavior_check.Waiting(question, record.owner)
+
+
+def recover_question(key: str) -> behavior_check.Waiting | behavior_check.NoReview:
+    try:
+        owner, _, _ = question_route(key).read_text(encoding="utf-8").partition("\n")
+    except FileNotFoundError:
+        return behavior_check.NoReview.MISSING
     identities = update_registration.QuestionStaff.read()
-    route = behavior_check.record_path(key).with_suffix(".owner")
+    scope = update_registration.question_scope(owner, identities.record)
+    record = update_registration.keyed_question(scope, identities, key)
+    return behavior_check.NoReview.MISSING if record is None else waiting_question(record)
+
+
+def ask(key: str, parts: update_registration.QuestionParts, reference: str) -> behavior_check.Waiting:
+    identities = update_registration.QuestionStaff.read()
+    route = question_route(key)
     try:
         owner = route.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
@@ -213,32 +257,10 @@ def ask(key: str, evidence: list[SpecifiedBehavior], reference: str) -> behavior
     else:
         owner, _, unit = owner.partition("\n")
         scope = update_registration.question_scope(owner, identities.record)
-    name = " ".join(evidence[0].test.rsplit("::", 1)[-1].split())
-    prefix = "Allow changes to "
-    remaining = len(evidence) - 1
-    suffix = "?"
-    if remaining:
-        suffix = f" and {remaining} more {'test' if remaining == 1 else 'tests'}?"
-    limit = conf.read_or_repository("production").whole("question_title_max_chars")
-    title = prefix + name[:max(0, limit - len(prefix) - len(suffix))] + suffix
-    items: list[str] = []
-    for finding in evidence:
-        words = " ".join(finding.quote.splitlines())
-        for item in (f'You said on {finding.day}, "{words}"', finding.change):
-            if item not in items:
-                items.append(item)
-    parts = update_registration.QuestionParts(
-        ask="Allow this change?", context="The change waits for your answer.", items=items,
-        choices=[YES_CHOICE, NO_CHOICE],
-        recommend="No. Keep the behavior you set.",
-    )
-    record = update_registration.ask(scope, title, parts, unit,
+    record = update_registration.ask(scope, parts["ask"], parts, unit,
                                      update_registration.Ranking(urgency.Urgency(urgency.BLOCKS)),
                                      identities=identities, outgoing=update_registration.KeyedStaffQuestion(key))
-    question = record.item.get("review_id", "")
-    if not question:
-        raise behavior_check.BehaviorCheckError("The filed question has no number.")
-    return behavior_check.Waiting(question, record.owner)
+    return waiting_question(record)
 
 
 def question_answer(key: str, owner: str, number: str) -> (
@@ -252,11 +274,7 @@ def question_answer(key: str, owner: str, number: str) -> (
     for event in reversed(review_events.decode(record.item.get("review_log", ""))):
         if event.who == "nate" and event.words.casefold().startswith("answer:"):
             words = event.words.partition(":")[2].strip()
-            first_word = words.split(maxsplit=1)[0] if words else ""
-            end = len(first_word)
-            while end and category(first_word[end - 1]).startswith("P"):
-                end -= 1
-            approval = {"yes": behavior_check.Approval.YES, "no": behavior_check.Approval.NO}.get(first_word[:end].casefold())
+            approval = {"yes": behavior_check.Approval.YES, "no": behavior_check.Approval.NO}.get(first_word(words).casefold())
             if approval is not None:
                 return behavior_check.Answered(number, owner, approval, words, event.time)
             return behavior_check.InvalidAnswer(number, owner, f"Nate's answer to {number}, {words!r}, is not Yes or No.")
@@ -303,7 +321,28 @@ def report(key: str, record: behavior_check.LandingRecord | behavior_check.NoRev
     return 1
 
 
-def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key: str, reference: str) -> int:
+def print_findings(change: behavior_check.GitRange, tests: behavior_check.ChangedTests,
+                   evidence: list[SpecifiedBehavior]) -> None:
+    for finding in evidence:
+        print(finding.test, f"Nate's words ({finding.day}, {finding.source}): {finding.quote}",
+              f"Change: {finding.change}", sep="\n", file=sys.stderr)
+    names = {finding.test for finding in evidence}
+    try:
+        authors = behavior_check.question_authors(change, tests, names)
+        routes = [authors[finding.test] for finding in evidence]
+    except Exception:
+        # The refusal must include a route even when Git history cannot supply one.
+        try:
+            fallback = behavior_check.describe_tip(change)
+        except Exception:
+            fallback = f"Ask the author of {change.commit}"
+        routes = [fallback] * len(evidence)
+    for finding, route in zip(evidence, routes, strict=True):
+        print(route if len(evidence) == 1 else f"{finding.test}: {route}", file=sys.stderr)
+
+
+def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key: str, reference: str,
+        question: Path | behavior_check.NoQuestionDraft) -> int:
     path = behavior_check.record_path(key)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = file_lock.take_exclusive(path.with_suffix(".lock"))
@@ -318,18 +357,38 @@ def run(change: behavior_check.GitRange, tests: behavior_check.ChangedTests, key
             path.unlink()
         elif record is not behavior_check.NoReview.MISSING:
             return report(key, record)
+        saved = recover_question(key)
+        if isinstance(saved, behavior_check.Waiting):
+            behavior_check.write_record(key, saved)
+            return report(key, refresh_answer(key, saved))
         pointer = path.with_suffix(".run")
         reply = reviewer_reply(change, tests, pointer, lock)
         if isinstance(reply, ReviewPending):
             print(f"The land waits for the independent review in {reply.run}.")
-            print(f"After the reply arrives, run {change.command('run', production=reference)}")
+            print(f"After the reply arrives, run {change.command('run', production=reference, question=question)}")
             return 1
         try:
             evidence = parse_reply(reply.read_text(encoding="utf-8"), tests)
         except behavior_check.BehaviorCheckError:
             pointer.unlink()
             raise
-        record = ask(key, evidence, reference) if evidence else behavior_check.Clear(reply)
+        if not evidence:
+            record = behavior_check.Clear(reply)
+        elif question is behavior_check.NoQuestionDraft.OMITTED:
+            print_findings(change, tests, evidence)
+            print("Nate was not asked. Write the question for nate in the question template as JSON, "
+                  + "then run again with --question FILE.", file=sys.stderr)
+            return 1
+        else:
+            try:
+                record = ask(key, read_question(question, evidence), reference)
+            except update_registration.RegistrationFailure as error:
+                if error.step != "ask" or not str(error).startswith("question held for review:"):
+                    raise
+                print(f"behavior_check: {error}", file=sys.stderr)
+                print_findings(change, tests, evidence)
+                print(f"Nate was not asked. Revise {question} and run again.", file=sys.stderr)
+                return 1
         behavior_check.write_record(key, record)
         return report(key, record)
     finally:
@@ -351,11 +410,11 @@ def status(key: str) -> int:
 
 
 def execute(action: str, change: behavior_check.GitRange, tests: behavior_check.ChangedTests | behavior_check.NoChangedTests,
-            key: str, production: str) -> int:
+            key: str, production: str, question: Path | behavior_check.NoQuestionDraft) -> int:
     """Run the review command and report errors from its record stores."""
     try:
         if action == "run" and isinstance(tests, behavior_check.ChangedTests):
-            return run(change, tests, key, production)
+            return run(change, tests, key, production, question)
         return status(key)
     except (behavior_check.BehaviorCheckError, update_registration.InputError, update_registration.RegistrationFailure,
             Refusal, staff.StaffRefused, recorder_state.OldRecorderState, OSError, ValueError) as error:

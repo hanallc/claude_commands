@@ -27,10 +27,28 @@ Run `behavior_check.py run` with the same range before a land. Use the repositor
 1. If the range has no changed test, the command exits 0.
 2. If the range has changed tests, the command starts an independent read-only review. Run the same command after the reviewer replies.
 3. If the reviewer finds no decision, the command saves a clear record.
-4. If the reviewer finds a decision, the command files one question on Review. The question gives the user's words, the change, and the Yes and No choices.
-5. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.
+4. If the reviewer finds a decision, the command prints Nate's words, the source, the date, and the change.
+5. Send the finding to the unit named in `Ask UNIT (phase PHASE)`.
+6. Ask the author to write the question and run the same command with `--question FILE`.
+7. Run `behavior_check.py status --key KEY` to save the answer and its time. The command also accepts the original range.
+
+The command traces each finding to the commit that last changed the test in the range.
+It names the unit and phase from the first-parent phase merge whose merged side contains that commit.
+If there is no such merge, it prints the commit hash and subject.
+If the lookup fails, the command prints the range tip's hash and subject.
+If the command cannot read the subject, it prints `Ask the author of COMMIT`.
+
+Use the question template to write `ask`, `context`, `items`, `choices`, and `recommend` in the JSON file.
+Include each finding's ISO date in the title or point.
+Paraphrase Nate's words when needed. The review record and refusal output keep the exact quote.
+Start one choice with `Yes (the change goes in` and the other with `No (the change stays out`.
+Describe the result of each choice after its required start.
+The command files one question per key with `blocks` urgency.
+Once the command files the question, later runs track the answer without the file.
 
 A retry starts a new review if the prior reviewer process ended before it saved a valid reply.
 The collector reads the first word of the answer. It ignores letter case and punctuation at the end of that word.
+If the Console review holds the question, the command prints the review's questions and failed rules.
+Revise the JSON file and run the command again with `--question FILE`.
 If the first word is neither Yes nor No, `behavior_check.py run` quotes the answer and the land stays refused.
 A missing review, an incomplete review, a question without an answer, and a No answer stop the land. Review errors also stop the land.
