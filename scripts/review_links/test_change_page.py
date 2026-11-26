@@ -3084,7 +3084,7 @@ class ChangePageTests(unittest.TestCase):
         key = self.file_user_question("Choose a safe save")
         path, forms, _ = self.browser("questions")
         fields = self.browser_fields(forms, key, "answer", "Keep my typed answer")
-        with patch.object(update_registration, "answer", side_effect=OSError("private save unavailable")):
+        with patch.object(update_registration, "write_selected_item", side_effect=OSError("private save unavailable")):
             failed = self.http_request(path, fields)
         self.assertEqual(failed.status, 503)
         self.assertIn("could not be saved", failed.body)
