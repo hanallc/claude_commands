@@ -36,7 +36,7 @@ from scripts.lib import atomic_file, process_group, process_start, process_stop,
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import write_config_fixture
-from scripts.message import send_budget
+from scripts.message import send, send_budget
 from scripts.production import staff
 
 
@@ -48,12 +48,16 @@ class KillActionTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(patch.object(staff, "local_snapshot", return_value=staff.StaffSnapshot(())))
         _ = self.enterContext(patch.object(process_stop, "CGROUP_ROOT", self.root / "cgroups"))
+        # Each test owns its message state and sends nothing, so no test reads the machine's message state.
+        _ = self.enterContext(patch.object(send, "STATE", self.root / "message"))
+        _ = self.enterContext(patch.object(send, "send", return_value=send.Result("sent", "fixture delivery")))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})))
 
     def launch_record(self, caller: detached_runs.Caller, command: list[str],
                       launch_supervisor: Callable[[list[str], IO[bytes]], object]) -> Path:
         runs = self.root / detached_runs.DETACHED_RUNS_DIR
         before = set(runs.glob("*.json"))
-        _ = (self.root / "detached_runs.conf").write_text("# whole: 1..10\nLIVE_RUN_LIMIT=2\n")
+        _ = (self.root / "detached_runs.conf").write_text("# whole: 1..10\nlive_run_limit=2\n")
         popen = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
 
         def launch(argv: list[str], **options: object) -> object:
@@ -120,7 +124,8 @@ class KillActionTests(unittest.TestCase):
         start = threading.Thread.start
 
         def record_thread(thread: threading.Thread) -> None:
-            workers.append(thread)
+            if thread.name == kill_action.RECOVERY_THREAD:
+                workers.append(thread)
             start(thread)
 
         with (patch.object(threading.Thread, "start", new=record_thread),
@@ -166,7 +171,7 @@ class KillActionTests(unittest.TestCase):
                 process.kill()
 
     def install_outside_stop_graces(self) -> None:
-        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=1\nKILL_GRACE_SECONDS=1")
+        _ = write_config_fixture(self.root / "shutdown.conf", "stop_grace_seconds=1\nkill_grace_seconds=1")
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root)})))
 
     def outside_stop_fixture(self) -> Path:
@@ -640,7 +645,7 @@ with socket.socket(fileno=int(sys.argv[1])) as peer:
         target, _, member_scope = self.scoped_target()
         events = process_stop.CGROUP_ROOT / member_scope.parent.relative_to("/") / "cgroup.events"
         _ = events.write_text("populated 1\n")
-        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
+        _ = write_config_fixture(self.root / "shutdown.conf", "stop_grace_seconds=2\nkill_grace_seconds=5")
         reference = target.candidate.reference
         actions = kill_action.KillActions(self.root)
 
@@ -815,7 +820,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
             process_stop.publish_run_slice(path, process_stop.ScopeUnit(unit, "fixture.scope"))
         events = folder / "cgroup.events"
         _ = events.write_text("populated 1\n")
-        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
+        _ = write_config_fixture(self.root / "shutdown.conf", "stop_grace_seconds=2\nkill_grace_seconds=5")
         route = kill_action.DetachedCommand(path, group, command_started, supervisor, started, run_slice)
         run = kill_action.KillCandidate(group, command_started, group, command_started, "session", "check", "at")
         target = kill_action.KillTarget(run, route, staff.StaffId(str(raw["staff_id"])), "impl3, worker", "impl3", "worker")
@@ -845,7 +850,9 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
             patch.object(worker_panes, "worker_pass", return_value=passed),
             patch.object(worker_panes, "worker_run", return_value=self.root),
             patch.object(worker_panes, "parent_run_index", return_value={}),
-            patch.object(worker_panes, "observe_worker", return_value=worker_panes.WorkerNotObserved.CURRENT),
+            patch.object(worker_panes, "observe_worker", return_value=worker_panes.ClosedWorker(row)),
+            # The fixture pane has no herdr pane, so a close never reads the machine's live panes.
+            patch.object(worker_panes, "close", return_value=worker_panes.Closed()),
             patch.object(scratch, "end", return_value=()),
             patch.object(turn_end, "_prepare_notice", return_value=turn_end.TurnDecision(turn_end.TurnOutcome.DONE,
                                                                                        lambda: None)),
@@ -1117,7 +1124,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
         reference = target.candidate.reference
         actions = kill_action.KillActions(self.root)
         flock = fcntl.flock
-        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
+        _ = write_config_fixture(self.root / "shutdown.conf", "stop_grace_seconds=2\nkill_grace_seconds=5")
 
         def prune_before_lock(descriptor: int | IO[str], operation: int) -> None:
             fd = descriptor if isinstance(descriptor, int) else descriptor.fileno()
@@ -1147,7 +1154,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
         path = target.route.record
         reference = target.candidate.reference
         actions = kill_action.KillActions(self.root)
-        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
+        _ = write_config_fixture(self.root / "shutdown.conf", "stop_grace_seconds=2\nkill_grace_seconds=5")
 
         class Restart(BaseException):
             pass
@@ -1315,7 +1322,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
         self.save_unfinished_request(target)
         path = target.route.record
         original = path.read_bytes()
-        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
+        _ = write_config_fixture(self.root / "shutdown.conf", "stop_grace_seconds=2\nkill_grace_seconds=5")
 
         def changed_route(*_args: object) -> kill_action.NoStopRoute:
             with path.with_suffix(".scope-stop.lock").open("a") as lock, self.assertRaises(BlockingIOError):
@@ -1372,7 +1379,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
         self.write_run(target)
         events = folder / "cgroup.events"
         _ = events.write_text("populated 1\n")
-        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
+        _ = write_config_fixture(self.root / "shutdown.conf", "stop_grace_seconds=2\nkill_grace_seconds=5")
         reference = target.candidate.reference
         actions = kill_action.KillActions(self.root)
 
@@ -1422,7 +1429,7 @@ with (patch.object(detached_runs, "COMMAND_GATE", 'read -r ready || exit 125; sh
         self.write_run(target)
         events = folder / "cgroup.events"
         _ = events.write_text("populated 1\n")
-        _ = write_config_fixture(self.root / "shutdown.conf", "STOP_GRACE_SECONDS=2\nKILL_GRACE_SECONDS=5")
+        _ = write_config_fixture(self.root / "shutdown.conf", "stop_grace_seconds=2\nkill_grace_seconds=5")
         reference = target.candidate.reference
         actions = kill_action.KillActions(self.root)
 

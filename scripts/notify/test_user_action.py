@@ -49,10 +49,11 @@ class ActionConflictTests(unittest.TestCase):
         self.assertEqual(action_conflicts(action, "Type Go: remove arrange_jacks/ in the trunk pane."), [])
 
     def test_an_action_with_no_pane_checks_only_what_to_type(self) -> None:
-        action = ActionRequired("At chatgpt.com/codex/settings/usage, redeem your limit reset.")
+        action = ActionRequired("Wake the Mac or check its network.")
         self.assertEqual(action_conflicts(action, "The cargo-liner session waits."), [])
-        self.assertEqual(len(action_conflicts(action, "Then type /codex_winddown clear.")), 1)
-        self.assertEqual(action_conflicts(NoActionRequired(), "Then type /codex_winddown clear."), [])
+        body = "Then type /whoami."
+        self.assertEqual(len(action_conflicts(action, body)), 1)
+        self.assertEqual(action_conflicts(NoActionRequired(), body), [])
 
 
 if __name__ == "__main__":

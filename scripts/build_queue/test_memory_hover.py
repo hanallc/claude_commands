@@ -15,8 +15,10 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+from unittest.mock import patch
 from xml.etree import ElementTree
 from typing import cast
+from scripts.accounts import accounts
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import limits_view, memory_feed, program_memory_feed, progress_profile as progress, queue_view, snapshot_codec
 from scripts.build_queue import test_memory_feed
@@ -626,8 +628,8 @@ class MemoryHoverTests(unittest.TestCase):
                "queued": True, "started_at": 100, "used": 1, "reserved": 0, "counted": 1, "machine": "natedev",
                "title": {"unit": "builder", "step": "nextest hana"}, "detail": "building tests",
                "verify": {"verb": "test", "call": "verify test hana", "step": "nextest", "total": 1, "position": 1}}
-        ci = {"name": "hana CI", "unit": "", "showrunner": "builds", "ci": True, "admitted": True,
-              "ci_label": "hana CI · runner", "ci_runners": [{"state": "busy", "job": "doctests"}],
+        ci = {"name": "hana CI", "unit": "", "showrunner": "builds", "queued": True,
+              "ci_label": "hana CI · runner", "detail": "doctests",
               "started_at": 100, "used": 1, "reserved": 0, "counted": 1}
         guest = {"name": "builder: gate", "unit": "builder", "showrunner": "builds", "queued": True,
                  "started_at": 100, "used": 1, "reserved": 0, "counted": 1, "machine": "mac-linux",
@@ -720,11 +722,40 @@ class MemoryHoverTests(unittest.TestCase):
                         self.assertEqual(icon[0].get("class"), "machine-emoji")
                         self.assertEqual("".join(icon.itertext()), emoji)
 
-    def role_setup(self) -> str:
-        members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
-                        current_session=staff.StaffId(name)) for name in ("builder", "helper"))
-        names = staff_names.StaffNames(staff.StaffSnapshot(members))
-        return "globalThis.window=globalThis;" + staff_names.script(names.registry())[8:-9]
+    def role_setup(self, members: tuple[staff.StaffRow, ...] | None = None) -> str:
+        if members is None:
+            members = tuple(staff.StaffRow(staff.StaffId(name), "unit", name, staff.StaffRoot(),
+                            current_session=staff.StaffId(name)) for name in ("builder", "helper", "queue", "report"))
+        colors = {"role.unit-director": "#ffaf02", "role.showrunner": "#a379fd", "role.worker": "#ff0404"}
+        with patch.object(accounts, "role_colors", return_value=colors):
+            names = staff_names.StaffNames(staff.StaffSnapshot(members))
+        return "globalThis.window=globalThis;" + staff_names.script(names.registry(), names.role_labels())[8:-9]
+
+    def test_role_labels_color_tooltips_targets_and_aws_controls(self) -> None:
+        tip, held, targets, grouped, individual, csv = cast(list[str], self.page_expression(
+            "(()=>{" + self.role_setup() + """
+            renderTargets([{target:"Mac", state:"Held", unit:"builder", showrunner:"builds"}]);
+            return [tipRowsHtml(ownerFields({showrunner:"builds", runner:"worker", worker:"worker"})),
+              tipRowsHtml(tooltipRows("held:4242-99", data)), $('targets').innerHTML,
+              awsDayDetail(data.days[0], data.price_day, {groupBy:"unit", openGroups:new Set()}),
+              awsDayDetail(data.days[0], data.price_day, {groupBy:"none", openGroups:new Set()}),
+              awsRunsCsv(data.days)];
+            })()""", {**aws_cost_fixture(), "held_places": [self.kept_place_row()]}, walk=True))
+        self.assertRegex(tip, r'<dt><span[^>]*data-color-text="role.showrunner" style="color:#a379fd">Showrunner</span></dt>')
+        self.assertRegex(tip, r'<dt><span[^>]*data-color-text="role.worker" style="color:#ff0404">Worker</span></dt>')
+        self.assertRegex(held, r'<dt[^>]*><span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">Unit</span></dt>')
+        self.assertEqual(held.count('style="color:#ffaf02">queue</span>'), 3)
+        self.assertRegex(targets, r'data-color-text="role.unit-director"[^>]*>Unit</span> ')
+        self.assertRegex(targets, r'data-color-text="role.showrunner"[^>]*>Showrunner</span> builds')
+        for table in (grouped, individual):
+            self.assertRegex(table, r'<th scope="col"><span[^>]*data-color-text="role.unit-director"'
+                             + ' style="color:#ffaf02">Unit</span></th>')
+        self.assertIn('data-aws-group-by="unit" aria-pressed="false" style="--role-label-color:#ffaf02">Unit</button>',
+                      individual)
+        self.assertRegex(individual, r'<td><span[^>]*data-color-text="role.unit-director" style="color:#ffaf02">report</span></td>')
+        self.assertIn('<td>Unit not recorded</td>', individual)
+        self.assertIn('"Unit"', csv.splitlines()[0])
+        self.assertNotIn('data-color-text', csv)
 
     def test_target_fallback_keeps_holder_text_and_colors_only_staff_names(self) -> None:
         for holder in ("nate", "builder", "<unknown>"):
@@ -816,10 +847,30 @@ class MemoryHoverTests(unittest.TestCase):
         # Runs on names machines, so its words take the machine colors and never a staff color.
         runs_on = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == "Runs on")
         self.assertEqual([(span.get("class"), span.text) for span in runs_on.iter("span")], [("machine", "builder")])
-        for label, name in (("Showrunner", "helper"), ("Worker", "builder")):
-            value = next(grid[index + 1] for index, cell in enumerate(grid) if cell.text == label)
-            self.assertEqual(value.findtext("span"), name)
+        for label, role, color, name in (("Showrunner", "showrunner", "#a379fd", "helper"),
+                                         ("Worker", "worker", "#ff0404", "builder")):
+            index = next(index for index, cell in enumerate(grid) if cell.tag == "dt" and "".join(cell.itertext()) == label)
+            span = grid[index].find("span")
+            assert span is not None
+            self.assertEqual((span.get("data-color-text"), span.get("style")), (f"role.{role}", f"color:{color}"))
+            self.assertEqual(grid[index + 1].findtext("span"), name)
         self.assertEqual(grid[0].findtext("span"), "builder")
+
+    def test_bump_actor_uses_the_staff_color_in_the_mark_and_tooltip(self) -> None:
+        members = (staff.StaffRow(staff.StaffId("showrunner-id"), "showrunner", "builder", staff.StaffRoot(),
+                                 current_session=staff.StaffId("showrunner-session")),
+                   staff.StaffRow(staff.StaffId("unit-id"), "unit", "builder", staff.StaffRoot(),
+                                  current_session=staff.StaffId("unit-session")))
+        move = {"kind": "bump", "who": "builder", "who_id": "unit-id", "from_place": 2, "to_place": 1, "at": "12:22 PST"}
+        mark, tip = cast(list[str], self.page_expression("(()=>{" + self.role_setup(members)
+            + "renderWalk(data);return [$('walk').innerHTML, tooltipHtml('moved:row:fixture-run-0', data)];})()",
+            {"walk": [{"name": "Compile", "queued": True, "last_move": move}]}, walk=True))
+        mark_actor = ElementTree.fromstring(f"<root>{mark}</root>").find(".//span[@class='move-mark']/span/span")
+        tip_actor = ElementTree.fromstring(tip).findall("dd")[1].find("span")
+        for actor in (mark_actor, tip_actor):
+            assert actor is not None
+            self.assertEqual((actor.text, actor.get("data-color-text"), actor.get("style")),
+                             ("builder", "role.unit-director", "color:#ffaf02"))
 
     def test_builds_page_has_no_navigation_or_framing_restriction(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
@@ -896,7 +947,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(children[children.index(header) + 1].get("data-tip"), "wait:fixture-wait-0")
                 table_rows = root.findall(".//tbody/tr")
                 self.assertEqual([row.get("class") for row in table_rows],
-                                 ["tools", "", "", "room", "queue-head", "wait wait-first"])
+                                 ["", "", "room", "queue-head", "wait wait-first"])
                 self.assertEqual(root.findtext(".//tr[@data-tip='wait:fixture-wait-0']/td[@class='place']"), "1")
                 self.assertEqual(root.findtext(".//div[@data-tip='wait:fixture-wait-0']//span[@class='name']"), "first")
                 self.assertEqual(step_text(root, ".//tr[@data-tip='wait:fixture-wait-0']/th[@class='step']"), "")
@@ -1078,7 +1129,7 @@ class MemoryHoverTests(unittest.TestCase):
                 "walk": [{"name": "Running <gate>", "queued": True},
                          {"name": "Mac nextest", "kind": "mac-build"},
                          {"name": "Mac offline", "kind": "mac-unavailable"},
-                         {"name": "hana CI", "ci": True, "admitted": True}],
+                         {"name": "hana CI", "ci_label": "hana CI", "queued": True}],
                 "waiters": [{"name": "Queued gate", "since": 100}]}
         rendered = self.page_expression("(renderWalk(data), $('walk').innerHTML)", data, walk=True)
         root = ElementTree.fromstring(f"<root>{rendered}</root>")
@@ -1122,7 +1173,7 @@ class MemoryHoverTests(unittest.TestCase):
                 self.assertEqual(evidence.memory.free_for_next_gib, 18.0)
                 self.assertEqual(evidence.memory.cap_text, "31.0 GiB" if expected is not None else "unavailable")
                 self.assertEqual(evidence.memory.free_text, "18.0 GiB")
-                self.assertIn(new_item_dialog.MemorySegment("Build tools", 2, new_item_dialog.MemoryTone.TOOLS, "2.0 GiB"),
+                self.assertIn(new_item_dialog.MemorySegment("Build tools", 4, new_item_dialog.MemoryTone.TOOLS, "4.0 GiB"),
                               evidence.memory.segments)
                 expected_entry = (new_item_dialog.TipField("Work", caption) if len(caption) <= 30
                                   else new_item_dialog.TipDetail(caption[:limits["text"]]))
@@ -1587,7 +1638,7 @@ document.querySelector('#result').textContent = JSON.stringify({
                 "detail": "busy", "unit": "", "keep_text": "", "runner": "unknown"}]}
         hover = cast(list[str], self.page_expression("tipText('row:fixture-run-0', data)", data))
         self.assertEqual(hover[0], "hana CI · runner-1  running")
-        self.assertEqual(hover[1], "Detail  idle\nRuns on  natedev")
+        self.assertEqual(hover[1], "Detail  busy\nRuns on  natedev")
 
     def test_a_running_row_hover_ends_the_memory_text_before_the_source_sentence(self) -> None:
         for keep_text, queued in (("need 11.3 GiB\nfull need: no matching anonymous profile", True),
@@ -1689,9 +1740,9 @@ document.querySelector('#result').textContent = JSON.stringify({
                      "progress": {"kind": "NoProgress"}},
                     {"name": "Mac test", "kind": "cloud", "machine": "mac", "stage": "testing",
                      "progress": {"kind": "RowProgress"}},
-                    {"name": "hana CI", "ci": True, "admitted": True, "ci_runners": [{"state": "busy"}],
+                    {"name": "hana CI", "ci_label": "hana CI", "queued": True,
                      "progress": {"kind": "NoProgress"}},
-                    {"name": "CI counter", "ci": True, "admitted": True, "ci_runners": [{"state": "busy"}],
+                    {"name": "CI counter", "ci_label": "hana CI", "queued": True,
                      "progress": {"kind": "RowProgress", "phase": "building"}},
                 ]
                 waiting_kinds: tuple[tuple[str, dict[str, object]], ...] = (
@@ -1939,32 +1990,88 @@ document.querySelector('#result').textContent = JSON.stringify({
         self.assertEqual([(icon.get("class"), icon.get("aria-label"), icon.get("data-machine")) for icon in waiting],
                          [("machine machine-icon dim", target, target) for target in targets])
 
-    def test_ci_row_requires_a_running_job_and_preserves_the_used_total(self) -> None:
-        for state in ("idle", "waiting", "unmatched", "busy", "unreadable"):
-            with self.subTest(state=state):
-                data = {"total": 64, "cap": 48, "taken": 4.125, "used": 3, "ci_ram": 0.125,
-                        "ram": {**RAM_FIXTURE, "build_tools_bytes": 0, "rust_analyzer_bytes": 0,
-                                "sccache_bytes": 0, "other_build_tools_bytes": 0, "queued_builds_bytes": 3 * GIB,
-                                "ci_bytes": 0.125 * GIB, "build_covered_bytes": GIB, "build_target_bytes": GIB,
-                                "room_bytes": 43.875 * GIB},
-                        "read_at": 200, "waiters": [], "walk": [{
-                            "name": "hana CI", "ci": True, "admitted": state == "busy",
-                            "ci_runners": [{"state": "busy" if state in ("waiting", "unmatched") else state}],
-                            "used": 0.125, "queued": False, "started_at": 100,
-                            "progress": {"kind": "NoProgress"}}]}
-                result = cast(list[object], self.page_expression(
-                    "(renderWalk(data), [$('walk').innerHTML, $('walk-sum').textContent, data.ci_ram, data.used])",
-                    data, walk=True))
-                root = ElementTree.fromstring(f"<root>{result[0]}</root>")
-                rows = root.findall(".//tr[@data-tip='row:fixture-run-0']")
-                chart_rows = root.findall(".//div[@data-run='fixture-run-0']")
-                self.assertEqual(len(rows), int(state == "busy"))
-                self.assertEqual(len(chart_rows), int(state == "busy"))
-                self.assertEqual(result[1:], ["4.1 of 48.0 GiB taken", 0.125, 3])
-                if rows:
-                    self.assertEqual(rows[0][0].text, "—")
-                    self.assertEqual(step_text(rows[0], "th[@class='step']"), "")
-                    self.assertEqual(chart_rows[0].findtext(".//span[@class='name']"), "hana CI")
+    def test_ci_service_tooltip_names_both_runners_and_only_cargo_has_a_queue_row(self) -> None:
+        ram = {**RAM_FIXTURE, "build_tools_bytes": 1_024 * MIB, "rust_analyzer_bytes": 304 * MIB,
+               "sccache_bytes": 0, "other_build_tools_bytes": 0, "ci_bytes": 0,
+               "build_covered_bytes": GIB, "build_target_bytes": GIB,
+               "ci_services": [{"name": "hana-linux-1", "bytes": 704 * MIB},
+                               {"name": "hana-linux-2", "bytes": 16 * MIB}]}
+        cargo = {"name": "hana CI: nextest", "ci_label": "hana CI · hana-linux-1",
+                 "title": {"unit": "", "step": "hana CI · hana-linux-1"}, "pid": 702}
+        data = {"total": 64, "cap": 48, "read_at": 200, "ram": ram}
+        for admitted in (False, True):
+            with self.subTest(admitted=admitted):
+                service = {"name": "hana CI", "pid": 701, "ci": True, "admitted": True}
+                current = {**data, "ram": {**ram, "queued_builds_bytes": 3 * GIB if admitted else 0,
+                                            "room_bytes": (43 if admitted else 46) * GIB},
+                           "walk": [service, {**cargo, "queued": True, "used": 3, "started_at": 100}]
+                           if admitted else [service],
+                           "waiters": [] if admitted else [{**cargo, "since": 100, "need": 3}]}
+                markup, tip, title, taken = cast(tuple[str, list[str], str, str], self.page_expression(
+                    "(renderWalk(data), [$('walk').innerHTML, tipText('tools', data), "
+                    + "$('walk-title').textContent, $('walk-sum').textContent])", current, walk=True))
+                root = ElementTree.fromstring(f"<root>{markup}</root>")
+                running = root.findall(".//tr[@data-tip='row:fixture-run-1']")
+                waiting = root.findall(".//tr[@data-tip='wait:fixture-wait-0']")
+                self.assertEqual((len(running), len(waiting)), (int(admitted), int(not admitted)))
+                self.assertFalse(root.findall(".//*[@data-tip='tools']"))
+                self.assertFalse(root.findall(".//*[@data-tip='row:fixture-run-0']"))
+                self.assertEqual(title, f"Running, in start order ({int(admitted)})")
+                self.assertEqual(taken, f"{5 if admitted else 2}.0 of 48.0 GiB taken")
+                self.assertIn("+ hana CI service hana-linux-1  0.7 GiB", tip[1])
+                self.assertIn("+ hana CI service hana-linux-2  <0.1 GiB", tip[1])
+
+    def test_build_tools_tooltip_wraps_runner_labels_and_keeps_values_visible(self) -> None:
+        chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+        if chrome is None:
+            self.skipTest("Chrome is required for the tooltip layout check.")
+        ram = {**RAM_FIXTURE, "ci_services": [{"name": "hana-linux-1", "bytes": 704 * MIB},
+                                              {"name": "hana-linux-2", "bytes": 16 * MIB}]}
+        tip = self.page_expression("buildsTooltipHtml('tools', data)", {"ram": ram}, walk=True)
+        source = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
+        styles = source.partition("<style>")[2].partition("</style>")[0].replace("__PAGE_FRAME_STYLE__", "")
+        position = source[source.index("function placeTipAt("):source.index("const f1 =")]
+        markup = json.dumps(f'<!doctype html><style>{styles}</style><div id="tip">{tip}</div>')
+        with tempfile.TemporaryDirectory(prefix="tools-tip-") as folder:
+            page = Path(folder) / "tools.html"
+            _ = page.write_text(f"""<!doctype html><meta charset="utf-8">
+<iframe height="1647" style="border:0"></iframe><output id="result"></output>
+<script>{position}
+const frame = document.querySelector('iframe'), doc = frame.contentDocument;
+doc.open();
+doc.write({markup});
+doc.close();
+const tip = doc.querySelector('#tip');
+const services = [...tip.querySelectorAll('dt')].filter(cell => cell.textContent.includes('hana-linux-'));
+function textRects(cell) {{
+  const range = doc.createRange();
+  range.selectNodeContents(cell);
+  return [...range.getClientRects()];
+}}
+const layouts = [240, 360, 1600].map(width => {{
+  frame.width = width;
+  frame.contentWindow.eval('(' + placeTipAt.toString() + ')')(tip, width / 2, 600);
+  const box = tip.firstElementChild.getBoundingClientRect();
+  return {{width:doc.documentElement.clientWidth, labels:services.map(cell => textRects(cell).length),
+    valuesFit:services.every(cell => {{
+      const [value, ...rest] = textRects(cell.nextElementSibling);
+      return value && !rest.length && value.left >= box.left && value.right <= box.right &&
+        value.top >= box.top && value.bottom <= box.bottom;
+    }})}};
+}});
+document.querySelector('#result').textContent = JSON.stringify(layouts);
+</script>""")
+            result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
+                "--disable-background-networking", f"--user-data-dir={folder}/chrome",
+                "--dump-dom", page.as_uri()], capture_output=True, text=True,
+                timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
+        layouts = cast(list[dict[str, object]], json.loads(output))
+        self.assertEqual([layout["width"] for layout in layouts], [240, 360, 1600])
+        self.assertTrue(all(layout["valuesFit"] for layout in layouts), layouts)
+        self.assertGreater(min(cast(list[int], layouts[0]["labels"])), 1)
+        self.assertEqual([layout["labels"] for layout in layouts[1:]], [[1, 1], [1, 1]])
 
     def test_mac_row_uses_its_stage_step_name_memory_and_aligned_tooltip(self) -> None:
         for stage, expected in (("MacBuilding", "building"), ("MacTesting", "testing"),
@@ -2060,7 +2167,7 @@ document.querySelector('#result').textContent = JSON.stringify({
         behind = cast(list[dict[str, object]], self.page_expression("tooltipRows('wait:fixture-wait-1', data)", data))
         self.assertEqual([row["label"] for row in behind if str(row["value"]).endswith(" GiB")], ["Needs"])
         self.assertEqual([row["value"] for row in tips[0] if row["kind"] != "caption"],
-                         ["3.1 GiB", "1.1 GiB", "1.0 GiB", "1.0 GiB"])
+                         ["3.1 GiB", "2.1 GiB", "1.0 GiB"])
         run = {str(row["label"]): str(row["value"]) for row in tips[1]}
         self.assertEqual((run["Uses"], run["+ Build reserved"], run["= In queue cap"]),
                          ("1.0 GiB", "1.1 GiB", "2.1 GiB"))
@@ -2159,7 +2266,7 @@ document.querySelector('#result').textContent = JSON.stringify({
              + "ram:{...data.ram,unattributed_bytes:sign * 0.099 * GIB}})[0].value)", {},
              ["-<0.1 GiB", "<0.1 GiB"]),
             ("Build tools keep their order", "amounts('tools')",
-             {"ram": {**RAM_FIXTURE, "build_tools_bytes": 410 * MIB, "rust_analyzer_bytes": 150 * MIB,
+             {"ram": {**RAM_FIXTURE, "build_tools_bytes": 410 * MIB, "ci_bytes": 0, "rust_analyzer_bytes": 150 * MIB,
                       "sccache_bytes": 0, "python_tests_bytes": 120 * MIB,
                       "waiting_runs_bytes": 70 * MIB, "other_build_tools_bytes": 70 * MIB}},
              ["0.4 GiB", "0.1 GiB", "0.0 GiB", "0.1 GiB", "<0.1 GiB", "<0.1 GiB"]),
@@ -2985,6 +3092,121 @@ process.stdout.write(JSON.stringify(steps));
                 fields = [(label.text or "", value.text or "") for label, value in zip(labels, values, strict=True)]
                 self.assertEqual(fields, expected)
 
+    def test_open_aws_day_refreshes_its_unit_color_with_the_same_report(self) -> None:
+        result = self.page_expression("(()=>{" + self.role_setup() + r"""
+            const day = data.days[0].day;
+            awsCostReport = data;
+            const periods = awsPeriods("day", data.days);
+            awsCostGroups = {groups:{day:periods}, largest:{day:1000}};
+            awsCostOpen.get("day").set(periods[0].id, true);
+            awsRunViews.set(day, {groupBy:"none", openGroups:new Set()});
+            renderAwsHistory();
+            const colors = () => {
+              const rendered = $("aws-history-rows").innerHTML;
+              return [
+                rendered.match(/color:(#[a-f0-9]+)">Unit<\/span>/)?.[1],
+                rendered.match(/--role-label-color:(#[a-f0-9]+)">Unit<\/button>/)?.[1],
+                rendered.includes('data-aws-group-by="none" aria-pressed="true"'),
+              ];
+            };
+            const before = colors();
+            const names = window.staffNames, unit = names.roleLabels.unit;
+            refreshBuildStaffNames({staff_names:names.values, report_version:"same-report",
+              role_labels:{...names.roleLabels, unit:{css:"#123456", opening:unit.opening.replace(unit.css,"#123456")}}});
+            const after = colors();
+            refreshBuildStaffNames({staff_names:names.values, report_version:"same-report", role_labels:{}});
+            return [before, after, colors()];
+            })()""", aws_cost_fixture(), walk=True, history=True)
+        self.assertEqual(result, [["#ffaf02", "#ffaf02", True], ["#123456", "#123456", True], [None, None, True]])
+
+    def test_open_aws_day_refreshes_staff_names_with_the_same_report(self) -> None:
+        result = self.page_expression("(()=>{" + self.role_setup() + r"""
+            const day = data.days[0];
+            awsCostReport = data;
+            const periods = awsPeriods("day", data.days);
+            awsCostGroups = {groups:{day:periods}, largest:{day:1000}};
+            awsCostOpen.get("day").set(periods[0].id, true);
+            awsRunViews.set(day.day, {groupBy:"none", openGroups:new Set()});
+            const names = window.staffNames, values = names.values;
+            renderAwsHistory();
+            const color = () => $("aws-history-rows").innerHTML.match(/color:(#[a-f0-9]+)">report<\/span>/)?.[1];
+            const before = color();
+            const changed = {...values, report:values.report.replace("role.unit-director", "role.showrunner")
+              .replace("#ffaf02", "#a379fd")};
+            refreshBuildStaffNames({staff_names:changed, report_version:"same-report"});
+            const after = color();
+            const {report, ...remaining} = changed;
+            refreshBuildStaffNames({staff_names:remaining, report_version:"same-report"});
+            return [before, after, color(), $("aws-history-rows").innerHTML.includes(">report</td>")];
+            })()""", aws_cost_fixture(), walk=True, history=True)
+        self.assertEqual(result, ["#ffaf02", "#a379fd", None, True])
+
+    def aws_focus_probe(self, probe: str) -> str:
+        chrome = shutil.which("google-chrome")
+        if chrome is None:
+            self.skipTest("Chrome is required for the AWS focus check.")
+        fixture = test_memory_feed.MemoryFeedTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        page_reading = fixture.guest_gate_page()
+        script = self.role_setup() + """
+const reading = __READING__, costs = __COSTS__;
+costs.days[1].runs_list[0].unit = "report";
+const labels = staffNames.roleLabels;
+render({...reading, staff_names:staffNames.values, role_labels:labels});
+renderReport({kind:"IndexUnavailable", aws_costs:costs});
+for (const day of costs.days.slice(0, 2)) awsCostOpen.get("day").set("day-" + day.day, true);
+renderAwsHistory();
+""".replace("__READING__", memory_feed.page_json(page_reading)).replace("__COSTS__", json.dumps(aws_cost_fixture()))
+        with tempfile.TemporaryDirectory(prefix="aws-color-focus-") as folder:
+            page = Path(folder) / PAGE_NAME
+            document = memory_feed.page_document(0).replace("</body>",
+                '<output id="result"></output><script>' + script + probe + '</script></body>')
+            _ = page.write_text(document, encoding="utf-8")
+            result = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
+                "--disable-background-networking", f"--user-data-dir={folder}/chrome",
+                "--window-size=1440,900", "--dump-dom", page.as_uri()], capture_output=True,
+                text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.partition('<output id="result">')[2].partition("</output>")[0]
+
+    def test_aws_color_refresh_keeps_focus_on_the_same_day_group_button(self) -> None:
+        output = self.aws_focus_probe("""
+const buttons = () => [...document.querySelectorAll('[data-aws-group-by="unit"]')];
+const original = buttons()[1];
+const unit = labels.unit;
+original.focus();
+const focusedBefore = document.activeElement === original;
+render({...reading, staff_names:staffNames.values, role_labels:{...labels,
+  unit:{css:"#123456", opening:unit.opening.replace(unit.css,"#123456")}}});
+const current = buttons()[1];
+document.querySelector('#result').textContent = JSON.stringify([
+  buttons().length, focusedBefore, current !== original, document.activeElement === current,
+  current.style.getPropertyValue("--role-label-color"),
+]);
+""")
+        self.assertEqual(output, '[2,true,true,true,"#123456"]')
+
+    def test_aws_staff_refresh_keeps_focus_on_controls_in_an_open_day(self) -> None:
+        output = self.aws_focus_probe("""
+const date = costs.days[1].day;
+const day = () => document.querySelector(`[data-aws-day="${date}"]`);
+day().querySelector('tr[data-aws-group] button').click();
+const names = staffNames.values;
+const changed = {...names, report:names.report.replace('#ffaf02', '#123456')};
+const controls = ['[data-aws-csv]', 'tr[data-aws-group] button', '.aws-group-scroll', '.aws-run-scroll'];
+const results = controls.map((selector, index) => {
+  const original = day().querySelector(selector);
+  original.focus();
+  const focused = document.activeElement === original;
+  render({...reading, staff_names:index % 2 ? names : changed, role_labels:labels});
+  const current = day().querySelector(selector);
+  return [focused, current !== original, document.activeElement === current];
+});
+document.querySelector('#result').textContent = JSON.stringify(results);
+""")
+        self.assertEqual(json.loads(output), [[True, True, True]] * 4)
+
     def test_aws_cost_breakdowns_use_bill_day_states_and_recorded_job_and_unit_names(self) -> None:
         estimate, units, billed, no_attempt, older, zero = cast(list[str], self.page_expression(
             "[awsDayDetail(data.days[0], data.price_day, {groupBy:'job', openGroups:new Set(['[\"hana\"]'])}),"
@@ -3174,7 +3396,7 @@ process.stdout.write(JSON.stringify(steps));
         if limits:
             functions += html[html.index("function limitMarks("):html.index('$("build-limits").addEventListener')]
             constants += f"const buildLimitIcons = {json.dumps(memory_feed.build_limit_icons())};\n"
-        if walk or limits:
+        if walk or limits or history:
             functions += html[html.index("function esc(s)"):html.index("const consoleHidden =")]
             constants += """
 const elements = new Map();
@@ -3283,7 +3505,7 @@ renderWalk = reading => { painted = reading; };
 
     def test_the_bar_and_legend_show_the_blocks_in_their_groups(self) -> None:
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
-        builds, free, other = ["tools", "queued", "ci"], ["reserved", "room", "safety", "swap"], [
+        builds, free, other = ["tools", "queued"], ["reserved", "room", "safety", "swap"], [
             "desktop", "agents", "programs", "kernel", "cache", "unattributed"]
         bar = page[page.index('<div class="bar-wrap'):page.index('<div class="scale')]
         legend = page[page.index('<div class="legend">'):page.index('</details>', page.index('<div class="legend">'))]
@@ -3315,6 +3537,7 @@ renderWalk = reading => { painted = reading; };
 
     def test_memory_tooltips_use_the_shared_aligned_grid(self) -> None:
         data = {"read_at": 400, "cap": 31, "psi": {"some": 3.2, "full": 0}, "limits": {"some": 10, "full": 2},
+                "ram": {**RAM_FIXTURE, "ci_services": [{"name": "hana-linux-1", "bytes": 512 * MIB}]},
                 "tokens": {"kind": "TokenPool", "total": 31, "free": 4, "memory_floor_bytes": 2 * GIB},
                 "walk": [program_memory_row(program_memory_fixture(started=True)),
                          {"name": "Mac nextest", "kind": "mac-build", "used": 2, "started_at": 340, "read_at": 380},
@@ -3358,16 +3581,18 @@ renderWalk = reading => { painted = reading; };
                       grids["wait:fixture-wait-0"])
         page = Path(memory_feed.__file__).with_name("memory_live.html").read_text()
         self.assertRegex(page, r"\.tip \{[^}]*grid-template-columns: fit-content\(44%\) minmax\(0, 1fr\)")
+        self.assertIn('data-build-tools-tip=""', grids["tools"])
+        self.assertRegex(page, r"\.tip \{[^}]*[;{]\s*width: max-content;")
         self.assertIn(".tip :is(dt, dd) { overflow-wrap: anywhere; }", page)
         self.assertRegex(page, r"\.tip dt \{[^}]*text-align: left")
         self.assertRegex(page, r"\.tip dd \{[^}]*text-align: right")
 
     def test_each_ram_block_tooltip_uses_the_design_text(self) -> None:
-        keys = ["g-builds", "tools", "queued", "ci", "g-free", "reserved", "room", "system", "safety", "swap",
+        keys = ["g-builds", "tools", "queued", "g-free", "reserved", "room", "system", "safety", "swap",
                 "g-else", "desktop", "agents", "programs", "kernel", "cache", "unattributed", "cap", "budget"]
         tips = cast(list[list[str]], self.page_expression(
             "[" + ", ".join(f"tipText('{key}', data)" for key in keys) + "]", {"cap": 31, "cap_text": "fixture"}))
-        self.assertEqual(dict(zip(keys, tips, strict=True)), {'g-builds': ['Builds  7.0 GiB', 'RAM that builds use now\nBuild tools  2.0 GiB\n+ Queued builds  3.0 GiB\n+ hana CI  2.0 GiB'], 'tools': ['Build tools  2.0 GiB', 'RAM that build tools use now\nrust-analyzer  1.0 GiB\n+ sccache  0.5 GiB\n+ Other build tools  0.5 GiB'], 'queued': ['Queued builds  3.0 GiB', 'RAM of builds the queue started'], 'ci': ['hana CI  2.0 GiB', 'RAM of hana CI programs'], 'g-free': ['Free RAM  30.0 GiB', 'RAM that no program holds\nBuild reserved  6.0 GiB\n+ Free  18.0 GiB\n+ System reserved  6.0 GiB'], 'reserved': ['Build reserved  6.0 GiB', 'Held for running builds to grow into'], 'room': ['Free  18.0 GiB', 'Where the next step can start\nQueue cap  31.0 GiB\n− Builds  7.0 GiB\n− Build reserved  6.0 GiB'], 'system': ['System reserved  6.0 GiB', 'RAM kept outside the queue cap\nSafety net  4.0 GiB\n+ Swap coming back  2.0 GiB'], 'safety': ['Safety net  4.0 GiB', 'RAM the queue always leaves free'], 'swap': ['Swap coming back  2.0 GiB', 'RAM held for swap that comes back\nShare held  50.0%'], 'g-else': ['Everything else  27.0 GiB', 'RAM used outside builds\nDesktop  3.0 GiB\n+ Agents  8.0 GiB\n+ Other programs  4.0 GiB\n+ Kernel  3.0 GiB\n+ File and kernel cache  7.0 GiB\n+ Not attributed  2.0 GiB'], 'desktop': ['Desktop  3.0 GiB', 'RAM of the desktop session\nProtected  2.0 GiB'], 'agents': ['Agents  8.0 GiB', 'RAM of agent sessions and their tools'], 'programs': ['Other programs  4.0 GiB', 'RAM of all other programs\nfirefox  2.0 GiB\nzed  1.0 GiB\n5 smaller programs  1.0 GiB'], 'kernel': ['Kernel  3.0 GiB', 'RAM the kernel uses for itself\nCompressed swap (zram)  1.5 GiB\n+ Slab, stacks, page tables  1.0 GiB\n+ Other kernel counters  0.5 GiB'], 'cache': ['File and kernel cache  7.0 GiB', 'Estimated cache outside free RAM'], 'unattributed': ['Not attributed  2.0 GiB', 'RAM without an attribution\nKernel, no counter  1.5 GiB\n+ No program name  0.5 GiB'], 'cap': ['Queue cap  31.0 GiB', 'What builds may use\nBuilds  7.0 GiB\n+ Build reserved  6.0 GiB\n+ Free  18.0 GiB'], 'budget': ['RAM  64.0 GiB', 'Memory across this machine\nBuilds  7.0 GiB\n+ Free RAM  30.0 GiB\n+ Everything else  27.0 GiB']})
+        self.assertEqual(dict(zip(keys, tips, strict=True)), {'g-builds': ['Builds  7.0 GiB', 'RAM that builds use now\nBuild tools  4.0 GiB\n+ Queued builds  3.0 GiB'], 'tools': ['Build tools  4.0 GiB', 'RAM that build tools use now\nrust-analyzer  1.0 GiB\n+ sccache  0.5 GiB\n+ Other build tools  2.5 GiB'], 'queued': ['Queued builds  3.0 GiB', 'RAM of builds the queue started'], 'g-free': ['Free RAM  30.0 GiB', 'RAM that no program holds\nBuild reserved  6.0 GiB\n+ Free  18.0 GiB\n+ System reserved  6.0 GiB'], 'reserved': ['Build reserved  6.0 GiB', 'Held for running builds to grow into'], 'room': ['Free  18.0 GiB', 'Where the next step can start\nQueue cap  31.0 GiB\n− Builds  7.0 GiB\n− Build reserved  6.0 GiB'], 'system': ['System reserved  6.0 GiB', 'RAM kept outside the queue cap\nSafety net  4.0 GiB\n+ Swap coming back  2.0 GiB'], 'safety': ['Safety net  4.0 GiB', 'RAM the queue always leaves free'], 'swap': ['Swap coming back  2.0 GiB', 'RAM held for swap that comes back\nShare held  50.0%'], 'g-else': ['Everything else  27.0 GiB', 'RAM used outside builds\nDesktop  3.0 GiB\n+ Agents  8.0 GiB\n+ Other programs  4.0 GiB\n+ Kernel  3.0 GiB\n+ File and kernel cache  7.0 GiB\n+ Not attributed  2.0 GiB'], 'desktop': ['Desktop  3.0 GiB', 'RAM of the desktop session\nProtected  2.0 GiB'], 'agents': ['Agents  8.0 GiB', 'RAM of agent sessions and their tools'], 'programs': ['Other programs  4.0 GiB', 'RAM of all other programs\nfirefox  2.0 GiB\nzed  1.0 GiB\n5 smaller programs  1.0 GiB'], 'kernel': ['Kernel  3.0 GiB', 'RAM the kernel uses for itself\nCompressed swap (zram)  1.5 GiB\n+ Slab, stacks, page tables  1.0 GiB\n+ Other kernel counters  0.5 GiB'], 'cache': ['File and kernel cache  7.0 GiB', 'Estimated cache outside free RAM'], 'unattributed': ['Not attributed  2.0 GiB', 'RAM without an attribution\nKernel, no counter  1.5 GiB\n+ No program name  0.5 GiB'], 'cap': ['Queue cap  31.0 GiB', 'What builds may use\nBuilds  7.0 GiB\n+ Build reserved  6.0 GiB\n+ Free  18.0 GiB'], 'budget': ['RAM  64.0 GiB', 'Memory across this machine\nBuilds  7.0 GiB\n+ Free RAM  30.0 GiB\n+ Everything else  27.0 GiB']})
         blocks = cast(int, self.page_expression("RAM_BLOCKS.reduce((sum, [, , amount]) => sum + amount(data.ram), 0)", {}))
         self.assertEqual(blocks, 64 * GIB)
         groups = cast(list[int], self.page_expression("['builds', 'free', 'else'].map(group => groupBytes(data.ram, group))", {}))
@@ -3382,7 +3607,7 @@ renderWalk = reading => { painted = reading; };
             (163, 155, 194, ["+ Python tests  0.1 GiB", "+ Waiting runs  0.2 GiB", "+ Other build tools  0.2 GiB"]),
             (412, 80, 20, ["+ Python tests  <0.1 GiB", "+ Waiting runs  <0.1 GiB", "+ Other build tools  0.4 GiB"]),
         ):
-            ram = {**RAM_FIXTURE, "python_tests_bytes": python_tests * MIB, "waiting_runs_bytes": waiting_runs * MIB,
+            ram = {**RAM_FIXTURE, "ci_bytes": 0, "queued_builds_bytes": 5 * GIB, "python_tests_bytes": python_tests * MIB, "waiting_runs_bytes": waiting_runs * MIB,
                    "other_build_tools_bytes": remainder * MIB}
             with self.subTest(remainder=remainder):
                 result = self.page_expression("[tipText('tools', data), tipText('cap', data)]", {"ram": ram, "cap": 31})
@@ -3407,7 +3632,7 @@ renderWalk = reading => { painted = reading; };
         ram = {**RAM_FIXTURE, "available_bytes": 5 * GIB, "room_bytes": 0, "shortfall_bytes": 7 * GIB,
                "swap_covered_bytes": GIB, "build_covered_bytes": 0, "swap_missing_bytes": GIB,
                "build_missing_bytes": 6 * GIB, "rust_analyzer_bytes": 0, "sccache_bytes": 20 * MIB,
-               "build_tools_bytes": 532 * MIB,
+               "build_tools_bytes": 532 * MIB, "ci_bytes": 0,
                "kernel_bytes": {"kind": "ReadingUnavailable", "reason": "meminfo is missing"},
                "kernel_no_counter_bytes": 0}
         tips = cast(list[list[str]], self.page_expression(
@@ -3431,8 +3656,8 @@ renderWalk = reading => { painted = reading; };
         empty = {**RAM_FIXTURE, "build_tools_bytes": 0, "queued_builds_bytes": 0, "rust_analyzer_bytes": 0,
                  "sccache_bytes": 0, "other_build_tools_bytes": 0}
         self.assertEqual(self.page_expression("[tipText('tools', data), tipText('g-builds', data)]", {"ram": empty}),
-                         [["Build tools  0.0 GiB", "RAM that build tools use now\nrust-analyzer  0.0 GiB\n+ sccache  0.0 GiB\n+ Other build tools  0.0 GiB"],
-                          ["Builds  2.0 GiB", "RAM that builds use now\nBuild tools  0.0 GiB\n+ Queued builds  0.0 GiB\n+ hana CI  2.0 GiB"]])
+                         [["Build tools  2.0 GiB", "RAM that build tools use now\nrust-analyzer  0.0 GiB\n+ sccache  0.0 GiB\n+ Other build tools  2.0 GiB"],
+                          ["Builds  2.0 GiB", "RAM that builds use now\nBuild tools  2.0 GiB\n+ Queued builds  0.0 GiB"]])
 
     def test_the_status_line_names_the_one_reason_a_start_waits(self) -> None:
         for code, ram, expected in (

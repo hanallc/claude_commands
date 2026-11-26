@@ -345,7 +345,7 @@ To limit memory for the detached command, use this scope form.
 systemd-run --user --scope --collect -q -p MemoryMax=<cap> -- <command>
 ```
 
-`start` checks for a live twin before it applies `config/detached_runs.conf` `LIVE_RUN_LIMIT` to that worker.
+`start` checks for a live twin before it applies `config/detached_runs.conf` `live_run_limit` to that worker.
 At the limit, exit 4 starts nothing and names the live runs on stderr.
 Wait for a run's result as the next message, or put more files in one run.
 Exit 3 means the caller has no registered worker route; only that exit permits attached execution.
@@ -481,7 +481,7 @@ Use `<YYYY-MM-DDTHH:MM>` for a later day.
 State the time the recorder printed.
 
 Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
-`UNIT_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/direct.conf`.
+`unit_progress_interval_seconds` in `~/.claude/config/direct.conf`.
 It sets the Codex poll timeout. A missing or non-positive integer is an error;
 tell the user to set it. No timer sends reports: a report comes only when
 someone asks (2026-10-19).
@@ -768,7 +768,7 @@ while another phase is open.
 already have been cleared by the validated successful release. If either state
 survives, the phase is not complete and this section must not run.
 
-In `single`, also run `finish-run --status completed`, then run <RunAsBuilt/>,
+In `single`, also run <RunAsBuilt/>, then run `finish-run --status completed`,
 apply <RetainPhaseReservation/>, report that no checkpoint release was
 attempted, run `bash ~/.claude/scripts/direct/end_session.sh`, and end. Other
 modes continue.

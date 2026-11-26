@@ -64,7 +64,8 @@ from scripts.notify import push_reference
 from scripts.notify import silence
 from scripts.notify import decision_priority
 from scripts.notify.push_catalog import (NATE_ADHOC_TEXT_ID, NEEDS_GO_ASK, NEEDS_GO_TEXT,
-                                         PAID_CREDIT_ACTION_PREFIX, remaining_credit_accounts)
+                                         PAID_CREDIT_ACTION_PREFIX, RESTART_FAILED_TEXT_ID,
+                                         remaining_credit_accounts)
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix, typed_texts)
@@ -704,6 +705,25 @@ def deliver_here(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post
     return post_message(source, priority, title, message, keys_file, post, detail, push["key"], push["text_id"])
 
 
+def _update_kept_restart_failure(message: str) -> push_texts.RenderedPush | None:
+    """Read the session and account from the saved legacy text."""
+    action, _, body = message.partition("\n")
+    prefix = "Action: In the Claude session named natedev on the natedev computer, run /agents restart "
+    if not action.startswith(prefix) or not action.endswith("."):
+        return None
+    account = action[len(prefix):-1]
+    prefix = "After your restart request, "
+    if not body.startswith(prefix):
+        return None
+    session, found, _ = body[len(prefix):].partition(f" on Claude account {account} did not restart on ")
+    if not found or re.match(r"(?:one|[0-9]+) sessions?\b", session, re.IGNORECASE):
+        return None
+    try:
+        return push_texts.render(RESTART_FAILED_TEXT_ID, session=session, account=account, identity="")
+    except ValueError:
+        return None
+
+
 def refresh_paid_credit_action(push: silence.KeptPush, account: str) -> str:
     """Use the live account list for a paid-credit push released from silence."""
     message = push["message"]
@@ -730,45 +750,58 @@ def refresh_paid_credit_action(push: silence.KeptPush, account: str) -> str:
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Drop settled requests and retired alerts before posting kept pushes."""
     reference = push.get("reference", push_reference.NO_REFERENCE)
-    reason = "retired template message.repeat_flood" if push["text_id"] == "message.repeat_flood" else ""
-    if push["text_id"] in TOKEN_ALERT_IDS and not push_texts.approval_date(push["text_id"]):
-        reason = TOKEN_APPROVAL_REQUIRED
-    if reference["kind"] == "question":
-        try:
-            opening = push_reference.read_question(Path(reference["path"]))
-        except (OSError, ValueError) as error:
-            log(push["source"], push["priority"], push["title"], push["message"],
-                f"anomaly: question record {reference['path']}: {error}",
-                key=push["key"], template=push["text_id"], reference=reference)
-        else:
-            if opening.status == "closed":
-                reason = "question closed"
-            elif opening.since != reference["since"]:
-                reason = "question reopened"
-    if push["text_id"] == NEEDS_GO_TEXT:
-        go_ask = re.match(r"List Go L([1-9][0-9]*)/(A[1-9][0-9]*)(?:, |$)", push["detail"])
-        if go_ask is None:
-            reason = "Go ask ID missing"
-        else:
-            item, ask_id = go_ask[1], go_ask[2]
+    text_id = push["text_id"]
+    reason = ""
+    title, message = push["title"], push["message"]
+    if text_id and not any(entry.id == text_id for entry in push_texts.catalog()):
+        reason = f"retired template {text_id}"
+    else:
+        if text_id == RESTART_FAILED_TEXT_ID and (
+                title == "Claude coding work remains stopped" or "/agents restart " in message.partition("\n")[0]):
+            rendered = _update_kept_restart_failure(message)
+            if rendered is None:
+                reason = "restart failure lacks saved resume values"
+            else:
+                title, message = rendered.posted_title, rendered.message
+        if text_id in TOKEN_ALERT_IDS and not push_texts.approval_date(text_id):
+            reason = TOKEN_APPROVAL_REQUIRED
+        if reference["kind"] == "question":
             try:
-                asks = _answerable_go_asks(item)
-            except GoListReadFailed as error:
-                log(push["source"], push["priority"], push["title"], push["message"], str(error),
+                opening = push_reference.read_question(Path(reference["path"]))
+            except (OSError, ValueError) as error:
+                log(push["source"], push["priority"], push["title"], push["message"],
+                    f"anomaly: question record {reference['path']}: {error}",
                     key=push["key"], template=push["text_id"], reference=reference)
-                return 1
-            if not any(ask.ask_id == ask_id for ask in asks):
-                reason = f"Go ask L{item}/{ask_id} closed or unavailable"
+            else:
+                if opening.status == "closed":
+                    reason = "question closed"
+                elif opening.since != reference["since"]:
+                    reason = "question reopened"
+        if text_id == NEEDS_GO_TEXT:
+            go_ask = re.match(r"List Go L([1-9][0-9]*)/(A[1-9][0-9]*)(?:, |$)", push["detail"])
+            if go_ask is None:
+                reason = "Go ask ID missing"
+            else:
+                item, ask_id = go_ask[1], go_ask[2]
+                try:
+                    asks = _answerable_go_asks(item)
+                except GoListReadFailed as error:
+                    log(push["source"], push["priority"], push["title"], push["message"], str(error),
+                        key=push["key"], template=push["text_id"], reference=reference)
+                    return 1
+                if not any(ask.ask_id == ask_id for ask in asks):
+                    reason = f"Go ask L{item}/{ask_id} closed or unavailable"
     if reason:
         log(push["source"], push["priority"], push["title"], push["message"], "dropped: " + reason,
             key=push["key"], template=push["text_id"], reference=reference)
         return push_reference.KeptPushDropped()
     detail, account = paid_credit_details(push)
     detail = f"kept during silence, {detail}" if detail else "kept during silence"
-    message = refresh_paid_credit_action(push, account)
+    if push["text_id"] in PAID_CREDIT_TEXT_IDS:
+        message = refresh_paid_credit_action(push, account)
     need = push.get("need") or {"0": "note", "1": "decision", "2": "blocked"}[push["priority"]]
     priority = decision_priority.priority(need, push.get("due", ""))
-    return post_message(push["source"], priority, push["title"], message, keys_file, post, detail,
+    return post_message(push["source"], priority, title, message, keys_file, post, detail,
                         push["key"], push["text_id"])
 
 

@@ -78,7 +78,8 @@ class CatchUpTests(unittest.TestCase):
         (self.home / "config").mkdir()
         _ = (self.home / "config/catch_up.conf").write_text(
             "".join(f"# whole: 1..1073741824\n{key}={value}\n" for key, value in
-                    (("blocks", 150), ("message_chars", 4000), ("tool_chars", 200), ("window_bytes", 8388608))),
+                    (("blocks", 150), ("message_chars", 4000), ("tool_chars", 200), ("window_bytes", 8388608)))
+            + "# whole: 0..\nnear_minutes=8\n",
             encoding="utf-8")
         self.codex = self.write(".codex/sessions/2026/11/13", f"rollout-2026-11-13T12-00-00-{CODEX_ID}.jsonl", CODEX_RECORDS)
         self.claude = self.write(".claude5/projects/-home-fixture", f"{CLAUDE_ID}.jsonl", CLAUDE_RECORDS)
@@ -161,6 +162,80 @@ class CatchUpTests(unittest.TestCase):
             self.assertEqual(catch_up.main(["codex:00000000-0000-4000-8000-000000000000"]), 1)
         self.assertEqual(errors.getvalue(),
                          "catch_up.py: no saved transcript for codex:00000000-0000-4000-8000-000000000000\n")
+
+    def test_codex_user_prompts_near_a_time(self) -> None:
+        _ = self.write(str(self.codex.parent), self.codex.name, [
+            *CODEX_RECORDS,
+            codex_message(18, "user", "At the edge."),
+            codex_message(19, "user", '<system-reminder source="script">A relay.</system-reminder>'),
+            codex_message(20, "user", "Use the original prompt.\n<environment_context>cwd</environment_context>"),
+            codex_message(21, "user", "<environment_context>cwd</environment_context>"),
+            codex_message(23, "user", "Outside the window."),
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output), mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}):
+            self.assertEqual(catch_up.main([f"codex:{CODEX_ID}", "--user-prompts", "--near",
+                                            "2026-11-13T16:20:00-05:00", "--minutes", "2"]), 0)
+        self.assertEqual(output.getvalue(),
+                         "[11-13 13:18:00]\nAt the edge.\n"
+                         + "[11-13 13:20:00]\nUse the original prompt.\n")
+
+    def test_claude_user_prompts_skip_tool_results_and_hook_text(self) -> None:
+        _ = self.write(str(self.claude.parent), self.claude.name, [
+            *CLAUDE_RECORDS,
+            claude_record(6, "user", [{"type": "tool_result", "content": "tool output"},
+                                      {"type": "text", "text": "tool annotation"}]),
+            claude_record(8, "user", "<system-reminder>Hook output.</system-reminder>"),
+            claude_record(9, "user", "Outside the default window."),
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(catch_up.main([f"session:{CLAUDE_ID}", "--user-prompts", "--near",
+                                            "2026-11-13T22:00:00"]), 0)
+        self.assertEqual(output.getvalue(), "[11-13 22:02:00]\nContinue the transfer.\n")
+
+    def test_claude_user_prompts_skip_generated_records(self) -> None:
+        teammate = '<teammate-message teammate_id="fixture">Peer message.</teammate-message>'
+        empty_paste = ('<pasted_content id="fixture">\n'
+                       + '<system-reminder>Script prompt.</system-reminder>\n'
+                       + '</pasted_content id="fixture">')
+        for name, record in (
+            ("tool source", claude_record(2, "user", "Tool message.", sourceToolAssistantUUID="fixture-assistant")),
+            ("teammate", claude_record(2, "user", teammate)),
+            ("empty paste", claude_record(2, "user", empty_paste)),
+        ):
+            with self.subTest(name=name):
+                _ = self.write(str(self.claude.parent), self.claude.name, [record])
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(catch_up.main([f"session:{CLAUDE_ID}", "--user-prompts", "--near",
+                                                    "2026-11-13T22:00:00"]), 0)
+                self.assertEqual(output.getvalue(), "")
+
+    def test_codex_user_prompts_keep_typed_parts_next_to_context(self) -> None:
+        typed = "Use the original prompt."
+        for context in ("<environment_context>cwd</environment_context>",
+                        "# AGENTS.md instructions\n\n<INSTRUCTIONS>Context.</INSTRUCTIONS>"):
+            for parts in ((context, typed), (typed, context)):
+                with self.subTest(parts=parts):
+                    _ = self.write(str(self.codex.parent), self.codex.name, [
+                        codex_item(20, {"type": "message", "role": "user",
+                                        "content": [{"type": "input_text", "text": part} for part in parts]}),
+                    ])
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(catch_up.main([f"codex:{CODEX_ID}", "--user-prompts", "--near",
+                                                        "2026-11-13T21:20:00"]), 0)
+                    self.assertEqual(output.getvalue(), f"[11-13 21:20:00]\n{typed}\n")
+
+    def test_user_prompts_refuse_a_bad_time(self) -> None:
+        for value in ("yesterday", "2026-11-13", "2026-11-13T25:00:00Z"):
+            with self.subTest(value=value):
+                errors = io.StringIO()
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as failure:
+                    _ = catch_up.main([f"codex:{CODEX_ID}", "--user-prompts", "--near", value])
+                self.assertEqual(failure.exception.code, 2)
+                self.assertIn("--near requires an ISO time, for example 2026-11-24T13:30:00-08:00", errors.getvalue())
 
 
 if __name__ == "__main__":
