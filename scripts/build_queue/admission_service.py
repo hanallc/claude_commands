@@ -4667,7 +4667,7 @@ class AdmissionServer:
 
     def _request_mac_linux_evidence(self, request: wire.PlacementRequest,
                                     key: placement.HostEvidenceKey) -> placement.HostEvidence:
-        from scripts.mac_test import mac_test
+        from scripts.mac_test import claim_state, mac_test
 
         now = self.clock.now()
         if (any(_holds_consumed_guest_slot(saved) for saved in self.assignments.values())
@@ -4677,7 +4677,11 @@ class AdmissionServer:
         backoff = mac_linux_backoff(now)
         if isinstance(backoff, placement.TemporaryExclusion):
             return placement.FreshHostEvidence(key, now, "", backoff)
-        block = mac_test.blocking_claim_block(mac_test.state_paths(), key.session)
+        try:
+            block = mac_test.blocking_claim_block(mac_test.state_paths(), key.session)
+        except claim_state.StateReadError as error:
+            return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion(
+                f"The guest block file is unreadable. {error}"))
         if not isinstance(block, mac_test.NoMacBlock):
             return placement.FreshHostEvidence(key, now, "", placement.TemporaryExclusion("blocked"))
         self.host_requests[key] = request
@@ -6105,8 +6109,8 @@ done
                 _ = row.pop("token_left_at", None)
                 _ = row.pop("token_back_at", None)
             preview_ordered.append((path, row))
-        preview = gate.admission_pass(replace(inputs, ordered=preview_ordered), inputs.now, policy)
-        local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
+        preview_inputs = replace(inputs, ordered=preview_ordered)
+        local_starts: set[str] | None = None
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
         held_copy_destinations = [saved.assignment.destination
             for episode, key in self.current_assignments.items()
@@ -6115,6 +6119,7 @@ done
             and (submitted := self.placement_requests.get(episode)) is not None
             and isinstance(submitted.purpose, placement.SpeculativeCopy)]
         removed: set[str] = set()
+        guest_waiters: set[str] = set()
         pending_remote_starts = set(inputs.pending_remote_starts)
         cargo_folders = dict(inputs.cargo_folders)
         held: list[PlacementHold] = []
@@ -6139,8 +6144,9 @@ done
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
                     break
                 if is_mac_linux_guest(destination) and isinstance(candidate.eligibility, placement.EvidenceNeeded):
-                    # Keep later candidates from taking the run before the guest answers.
-                    removed.add(owner)
+                    # Keep the run out of local admission until the guest answers.
+                    guest_waiters.add(owner)
+                    local_starts = None
                     break
                 shared_at = shared_free_at.get((request.episode, destination))
                 if shared_at is None and not isinstance(candidate.eligibility, placement.AllowedHost):
@@ -6160,6 +6166,10 @@ done
                     if newest.episode != request.episode:
                         continue
                 if destination.provider == "local":
+                    if local_starts is None:
+                        preview = gate.admission_pass(without_owners(preview_inputs, guest_waiters), inputs.now, policy)
+                        local_starts = {row.owner for row in preview.rows
+                                        if isinstance(row.admission, gate.ProposedAdmission)}
                     if owner in local_starts:
                         break
                     continue
@@ -6216,7 +6226,7 @@ done
                         holds[(hold.episode, hold.destination)] = start
         self.placement_holds = holds
         self.placement_hold_answers = answers
-        local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed
+        local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed - guest_waiters
         named = {owner: candidates for owner, request in owners.items()
                  if self._placement_waiting(request) and (candidates := self._placement_candidate_reading(request))}
         return replace(inputs, ordered=[(path, row) for path, row in ordered

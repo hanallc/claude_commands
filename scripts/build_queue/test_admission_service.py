@@ -656,6 +656,66 @@ class PlacementStatusTests(unittest.TestCase):
                              placement.CandidateEligibility(guest.destination, placement.TemporaryExclusion("blocked")))
             self.assertNotIn(key, fixture.server.host_readers)
 
+    def test_placement_excludes_the_guest_when_its_block_file_is_invalid(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture, placement_request,
+        )
+        from scripts.mac_test import mac_test
+
+        with PlacementFixture() as fixture:
+            _ = mac_linux_fixture(fixture)
+            block = mac_test.state_paths().block
+            self.assertTrue(block.is_relative_to(fixture.root))
+            block.parent.mkdir(parents=True, exist_ok=True)
+            _ = block.write_text("{invalid json", encoding="utf-8")
+            guest = mac_linux_candidate()
+            local = local_candidate(fixture)
+            request = placement_request(fixture)
+            request = replace(request, constraints=replace(request.constraints, candidates=(guest, local)))
+
+            granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            self.assertEqual(granted.assignment.destination, local.destination)
+            candidate = fixture.server.placement_eligibility[request.episode][0]
+            self.assertEqual(candidate.destination, guest.destination)
+            assert isinstance(candidate.eligibility, placement.TemporaryExclusion), candidate
+            self.assertIn("The guest block file is unreadable.", candidate.eligibility.reason)
+            self.assertIn(str(block), candidate.eligibility.reason)
+
+    def test_a_guest_reading_wait_leaves_natedev_room_for_the_next_request(self) -> None:
+        from scripts.build_queue.test_placement import (
+            PlacementFixture, aws_gate_request, local_candidate, mac_linux_candidate, mac_linux_fixture,
+            placement_request, read_aws_gate_evidence,
+        )
+
+        with PlacementFixture() as fixture:
+            request = aws_gate_request(fixture)
+            registry = fixture.root / "build_targets.conf"
+            scaler_settings = registry.read_text(encoding="utf-8").split("\n", 1)[1]
+            _ = mac_linux_fixture(fixture)
+            settings = registry.read_text(encoding="utf-8").replace(
+                "targets=mac-linux,natedev\n", "targets=mac-linux,natedev,claude-aws\n", 1)
+            _ = registry.write_text(settings + scaler_settings, encoding="utf-8")
+            _ = read_aws_gate_evidence(fixture, request)
+            fixture.free(12 * GIB)
+            guest = mac_linux_candidate()
+            local = local_candidate(fixture)
+            older = placement_request(fixture, since=fixture.clock.now() - 1)
+            older = replace(older, constraints=replace(older.constraints, candidates=(guest, local)))
+            initial, = fixture.connect(older).replies()
+            assert isinstance(initial, wire.PlacementWait), initial
+            self.assertEqual(initial.eligibility[0], placement.CandidateEligibility(
+                guest.destination, placement.EvidenceNeeded("not read")))
+
+            request = replace(request, route=older.route, constraints=replace(request.constraints,
+                candidates=(local, *request.constraints.candidates)))
+            with mock.patch.object(fixture.server, "_aws_gate_spending", return_value=placement.AllowedHost()) as spending:
+                granted, = fixture.connect(request).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            self.assertEqual(granted.assignment.destination, local.destination)
+            self.assertNotIn(older.episode, fixture.server.reservations)
+            spending.assert_not_called()
+
     def test_mac_linux_placement_probe_shares_one_deadline_across_connect_retries(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, mac_linux_candidate, mac_linux_fixture, placement_request,
