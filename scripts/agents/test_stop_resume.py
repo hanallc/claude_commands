@@ -6266,38 +6266,6 @@ class StopResumeTests(unittest.TestCase):
             stop_resume.ResumePending("resume-error", "claude4", "cannot run"),
             stop_resume.ResumePending("gone-tab", "claude4", "session has no tab after stop"), stop_resume.ClaudeUp("good", "own-pane", "claude4")])
 
-    def test_pending_move_summary_changes_when_the_phone_separator_exceeds_the_budget(self) -> None:
-        session = "native-1"
-        target = "claude4"
-        prefix = "These sessions did not finish their move to claude4: "
-        action = f"Retry pending moves on natedev with `{moves.RETRY_COMMAND}`."
-        empty = render("alert.decision", sender="shutdown", title="Some sessions still need to move",
-                       action=action, body=prefix + ".")
-        budget = pushover.phone_message_limit(empty.sender, empty.id)
-        for excess in (0, 1):
-            name = "x" * (budget - empty.phone_message_length + excess)
-            full = render(empty.id, **(empty.values | {"body": prefix + name + "."}))
-            self.assertEqual(len(full.message), budget + excess - 1)
-            self.assertEqual(full.phone_message_length, budget + excess)
-            batch = stop_resume.MoveBatch(
-                {session: stop_resume.ResolvedMoveMember(pane_launch.NativeLaunchReference(session), name)},
-                moves.ExplicitMoveTarget.REQUESTED_ACCOUNT, stop_resume.NewMoveRequest(), target,
-                results={session: stop_resume.ResumeFailed(session, "fixture start failed")},
-                native_sessions={session: session},
-            )
-            with (self.subTest(excess=excess),
-                  patch.object(moves, "read_latest_request", return_value=moves.LatestMoveRequest(batch.request_id, target)),
-                  patch.object(remote, "local_machine", return_value="natedev"),
-                  patch.object(stop_resume, "_send_move_push") as send):
-                stop_resume._alert_pending_moves(batch, {})  # pyright: ignore[reportPrivateUsage]
-            send.assert_called_once()
-            push = cast(RenderedPush, send.call_args.args[0])
-            if excess:
-                self.assertEqual(push.body, "1 sessions did not finish their move to claude4. "
-                                 + f"Read the pending list on natedev with `{moves.MOVE_COMMAND} result`.")
-            else:
-                self.assertEqual(push.body, full.body)
-
     def test_two_watcher_failures_send_one_phone_alert(self) -> None:
         rows = tuple(staff.StaffRow(staff.StaffId(f"staff-{index}"), "showrunner", f"runner-{index}-" + "x" * 70,
                                    staff.StaffRoot(), current_session=staff.StaffId(f"native-{index}"))
@@ -6332,8 +6300,7 @@ class StopResumeTests(unittest.TestCase):
             with (patch.object(pushover, "read_keys", return_value={"user": "fixture", "token": "fixture"}),
                   patch.object(pushover, "log"), redirect_stdout(io.StringIO())):
                 self.assertEqual(pushover.post_message(push.sender, "1", push.title, push.message,
-                                                       self.root / "phone-keys", phone, "", key, push.id,
-                                                       action_end=push.action_end), 0)
+                                                       self.root / "phone-keys", phone, "", key, push.id), 0)
             return subprocess.CompletedProcess(command, 0, "SENT: fixture\n", "")
 
         def stop_member(reference: str) -> stop_resume.NotRunning:

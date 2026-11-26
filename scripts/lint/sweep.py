@@ -3912,7 +3912,7 @@ def fit_disk_floor_push(free: int, floor: int, choices: FolderChoices, *,
     limit = lint_settings.whole("sweep_push_text_limit")
     for candidate in (choices, UNAVAILABLE_FOLDER_CHOICES):
         rendered = disk_floor_push(free, floor, candidate, machine=machine)
-        if rendered.phone_message_length < limit:
+        if len(rendered.message) < limit:
             return rendered
     print("lint sweep: phone text exceeds sweep_push_text_limit", file=sys.stderr)
     return NO_PHONE_ALERT
