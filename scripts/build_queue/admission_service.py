@@ -6084,6 +6084,44 @@ done
                 free[destination] = max(free.get(destination, evidence.observed_at), evidence.observed_at)
         return shared
 
+    def _placement_choices(self, request: wire.PlacementRequest) -> tuple[placement.CandidateEligibility, ...]:
+        """Stop the list of choices at a guest that needs a reading."""
+        candidates = self.placement_eligibility.get(request.episode, ())
+        for index, candidate in enumerate(candidates):
+            if is_mac_linux_guest(candidate.destination) and isinstance(candidate.eligibility, placement.EvidenceNeeded):
+                return candidates[:index + 1]
+        return candidates
+
+    def _placement_preview_inputs(self, inputs: records.QueueInputs, owners: dict[str, wire.PlacementRequest],
+                                  choices: dict[str, tuple[placement.CandidateEligibility, ...]],
+                                  policy: records.AdmissionPolicy) -> records.QueueInputs:
+        """Prepare the local order before the placement walk."""
+        preview_ordered: list[tuple[Path, records.Waiter]] = []
+        deferred_local: set[str] = set()
+        for path, row in inputs.ordered:
+            owner = records.waiter_owner(row)
+            request = owners.get(owner)
+            if request is not None:
+                if not any(candidate.destination.provider == "local" for candidate in choices[owner]):
+                    deferred_local.add(owner)
+                prerequisite = self.prerequisites.get(request.episode)
+                if (isinstance(prerequisite, placement.TokenRequired)
+                        and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked)):
+                    row = row.copy()
+                    _ = row.pop("token_left_at", None)
+                    _ = row.pop("token_back_at", None)
+            preview_ordered.append((path, row))
+        preview = replace(inputs, ordered=preview_ordered)
+        deferred_claims = {claim.slot.reservation for claim in inputs.slots
+                           if isinstance(claim, records.ContinuationSlot) and claim.owner in deferred_local}
+        if deferred_claims:
+            # Apply the admission policy's claim returns before removing the guest waits.
+            head = gate.head_policy(inputs, inputs.now, policy, gate.start_spacing_after(inputs.now, policy))
+            for reservation in head.returned_claims & deferred_claims:
+                del self.slots[reservation]
+            preview = replace(preview, slots=tuple(self.slots.values()))
+        return without_owners(preview, deferred_local)
+
     def _placement_pass(self, inputs: records.QueueInputs, ordered: list[tuple[Path, records.RankedWaiter]],
                         policy: records.AdmissionPolicy,
                         remote_start_hold_seconds: int) -> records.QueueInputs:
@@ -6097,20 +6135,12 @@ done
         queued = [request for _, row in ordered if (request := owners.get(records.waiter_owner(row))) is not None]
         shared_free_at = self._newer_remote_free_readings(queued)
         local_occupied = inputs.occupied_cargo_folders
-        preview_ordered: list[tuple[Path, records.Waiter]] = []
-        for path, row in inputs.ordered:
-            request = owners.get(records.waiter_owner(row))
-            prerequisite = (self.prerequisites.get(request.episode) if request is not None
-                            else placement.TokenNotRequired())
-            unchecked = (isinstance(prerequisite, placement.TokenRequired)
-                         and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
-            if unchecked:
-                row = row.copy()
-                _ = row.pop("token_left_at", None)
-                _ = row.pop("token_back_at", None)
-            preview_ordered.append((path, row))
-        preview_inputs = replace(inputs, ordered=preview_ordered)
-        local_starts: set[str] | None = None
+        choices = {owner: self._placement_choices(request) for owner, request in owners.items()}
+        preview_inputs = self._placement_preview_inputs(inputs, owners, choices, policy)
+        local_starts: set[str] = set()
+        if preview_inputs.ordered:
+            preview = gate.admission_pass(preview_inputs, inputs.now, policy)
+            local_starts = {row.owner for row in preview.rows if isinstance(row.admission, gate.ProposedAdmission)}
         copies = tuple(request for request in owners.values() if isinstance(request.purpose, placement.SpeculativeCopy))
         held_copy_destinations = [saved.assignment.destination
             for episode, key in self.current_assignments.items()
@@ -6119,7 +6149,6 @@ done
             and (submitted := self.placement_requests.get(episode)) is not None
             and isinstance(submitted.purpose, placement.SpeculativeCopy)]
         removed: set[str] = set()
-        guest_waiters: set[str] = set()
         pending_remote_starts = set(inputs.pending_remote_starts)
         cargo_folders = dict(inputs.cargo_folders)
         held: list[PlacementHold] = []
@@ -6135,18 +6164,13 @@ done
             initial_readiness_unchecked = (isinstance(prerequisite, placement.TokenRequired)
                 and isinstance(prerequisite.readiness, placement.TokenReadinessUnchecked))
             waiting_for: list[PlacementHold] = []
-            for candidate in self.placement_eligibility.get(request.episode, ()):
+            for candidate in choices[owner]:
                 destination = candidate.destination
                 if destination.provider == "local" and request.constraints.cargo_folder in local_occupied:
                     continue
                 if (initial_readiness_unchecked and destination.provider == "local"
                         and isinstance(inputs.build_space, records.NoBuildSpaceHold)
                         and isinstance(candidate.eligibility, placement.EvidenceNeeded)):
-                    break
-                if is_mac_linux_guest(destination) and isinstance(candidate.eligibility, placement.EvidenceNeeded):
-                    # Keep the run out of local admission until the guest answers.
-                    guest_waiters.add(owner)
-                    local_starts = None
                     break
                 shared_at = shared_free_at.get((request.episode, destination))
                 if shared_at is None and not isinstance(candidate.eligibility, placement.AllowedHost):
@@ -6166,10 +6190,6 @@ done
                     if newest.episode != request.episode:
                         continue
                 if destination.provider == "local":
-                    if local_starts is None:
-                        preview = gate.admission_pass(without_owners(preview_inputs, guest_waiters), inputs.now, policy)
-                        local_starts = {row.owner for row in preview.rows
-                                        if isinstance(row.admission, gate.ProposedAdmission)}
                     if owner in local_starts:
                         break
                     continue
@@ -6226,7 +6246,7 @@ done
                         holds[(hold.episode, hold.destination)] = start
         self.placement_holds = holds
         self.placement_hold_answers = answers
-        local_order = (inputs.waiter_orders.keys() | pending_remote_starts) - removed - guest_waiters
+        local_order = (preview_inputs.waiter_orders.keys() | pending_remote_starts) - removed
         named = {owner: candidates for owner, request in owners.items()
                  if self._placement_waiting(request) and (candidates := self._placement_candidate_reading(request))}
         return replace(inputs, ordered=[(path, row) for path, row in ordered

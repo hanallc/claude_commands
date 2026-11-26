@@ -716,6 +716,65 @@ class PlacementStatusTests(unittest.TestCase):
             self.assertNotIn(older.episode, fixture.server.reservations)
             spending.assert_not_called()
 
+    def test_waiting_for_the_guest_preserves_an_earlier_mac_hold(self) -> None:
+        from scripts.build_queue.test_placement import (
+            ManualEvidenceWorker, PlacementFixture, mac_linux_candidate, mac_linux_fixture,
+            placement_request, publish_candidate, write_config_fixture,
+        )
+
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            fixture.configure(waiting_pass_seconds=1)
+            _ = write_config_fixture(fixture.root / "mac_test.conf", "probe_timeout_s=5\n", template="mac_test")
+            _ = mac_linux_fixture(fixture)
+            older = placement_request(fixture, since=fixture.clock.now() - 1)
+            mac, = older.constraints.candidates
+            older = replace(older, constraints=replace(older.constraints, candidates=(mac, mac_linux_candidate())))
+            waiting, = fixture.connect(older).replies()
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertTrue(all(isinstance(candidate.eligibility, placement.EvidenceNeeded)
+                                for candidate in waiting.eligibility), waiting.eligibility)
+
+            _ = publish_candidate(fixture, older)
+            fixture.clock.advance(7)
+            younger = placement_request(fixture, session=OwningSession("younger-session"))
+            _ = publish_candidate(fixture, younger)
+            reply, = fixture.connect(younger).replies()
+            self.assertIsInstance(reply, wire.PlacementWait)
+            self.assertIn((older.episode, mac.destination), fixture.server.placement_holds)
+            self.assertNotIn(younger.episode, fixture.server.current_assignments)
+
+    def test_guest_wait_preserves_the_local_return_of_a_younger_continuation_claim(self) -> None:
+        from scripts.build_queue.test_placement import (
+            ManualEvidenceWorker, PlacementFixture, local_candidate, mac_linux_candidate, mac_linux_fixture,
+            placement_request,
+        )
+
+        with PlacementFixture() as fixture, mock.patch.object(service, "HostEvidenceWorker", ManualEvidenceWorker):
+            _ = mac_linux_fixture(fixture)
+            older_since = fixture.clock.now() - 1
+            run = fixture.run_owner()
+            prior = fixture.finish_step(fixture.request(run=run))
+            fixture.allow_next_start()
+            fixture.free(12 * GIB)
+            local = local_candidate(fixture)
+            older = placement_request(fixture, since=older_since)
+            older = replace(older, constraints=replace(older.constraints, candidates=(local,)))
+            self.assertIsInstance(fixture.connect(older).replies()[0], wire.PlacementWait)
+            self.assertIsInstance(fixture.server.slots[prior.reservation], records.BetweenStepsSlot)
+
+            younger = placement_request(fixture)
+            younger = replace(younger, run=run,
+                constraints=replace(younger.constraints, candidates=(mac_linux_candidate(), local)))
+            waiting, = fixture.connect(younger).replies()
+            assert isinstance(waiting, wire.PlacementWait), waiting
+            self.assertIsInstance(waiting.eligibility[0].eligibility, placement.EvidenceNeeded)
+
+            granted, = fixture.connect(older).replies()
+            assert isinstance(granted, wire.LocalPlacementGranted), granted
+            self.assertEqual(granted.assignment.destination, local.destination)
+            self.assertNotIn(prior.reservation, fixture.server.slots)
+            self.assertNotIn(younger.episode, fixture.server.reservations)
+
     def test_mac_linux_placement_probe_shares_one_deadline_across_connect_retries(self) -> None:
         from scripts.build_queue.test_placement import (
             PlacementFixture, mac_linux_candidate, mac_linux_fixture, placement_request,
