@@ -440,6 +440,7 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     rows = settings.whole("feedback_rows")
     card_motion = page_frame.CardMotion.read(settings)
     waiting: list[str] = []
+    answered: list[str] = []
     cards: list[str] = []
     refresh_needed = False
     for record in records(root):
@@ -448,6 +449,8 @@ def render(status: change_page.DeliveryStatus) -> bytes:
             cards.append(card(record, token, members, rows, names, open_questions=review.open_questions))
         elif review.open_questions:
             waiting.append(record['id'])
+        elif "feedback_at" in record:
+            answered.append(record["id"])
         refresh_needed |= review.refresh()
     cards.extend(_pending_answer_cards(root, token))
     answer_refresh_seconds = settings.number("page_refresh_seconds")
@@ -455,13 +458,20 @@ def render(status: change_page.DeliveryStatus) -> bytes:
     waiting_text = page_frame.QUESTION_WAITING.format(owner_role="owner")
     content = (STYLE + page_frame.title("Images", "images")
                + page_frame.action_failure("image-action-failure")
+               + '<div data-image-stale-drafts></div>'
                + f'<p hidden data-image-waiting role="status">{waiting_text}</p>'
                + '<p hidden data-image-notice role="status"></p>'
                + '<div data-image-layout><nav data-image-groups aria-label="Image groups"></nav>'
                + f'<div><div data-images data-script="{SCRIPT_VERSION}" data-refresh-seconds="{refresh_seconds}"'
                + f' {card_motion.attributes()}'
-               + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}">'
+               + f' data-answer-refresh-seconds="{answer_refresh_seconds}" data-waiting-images="{" ".join(waiting)}"'
+               + f' data-answered-images="{" ".join(answered)}">'
                + f'{"".join(cards)}</div><p hidden data-empty></p></div></div>'
+               + '<template data-image-stale-draft><section><p data-draft-reason></p>'
+               + '<p class="image-answer-words" data-draft-words></p><div class="answer-actions">'
+               + '<button type="button" data-draft-copy>Copy</button>'
+               + '<button type="button" data-draft-dismiss>Dismiss</button>'
+               + '</div><span data-draft-copy-status role="status"></span></section></template>'
                + '<template data-image-draft-template><article><h2 class="image-title"></h2>'
                + _answer_form("", "", "", rows, question=False) + '</article></template>'
                + '<noscript>Enable JavaScript to answer on an image.</noscript>'
@@ -635,6 +645,9 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
     answer, feedback, round_id = draft.action, draft.words, draft.round_id
     signed_form = origin is _ImageAnswerOrigin.SIGNED_FORM
     form_key = draft.request_key(folder, saved) if signed_form and draft.request_id else ""
+    stale_requests = saved.get("stale_form_request_keys", [])
+    if form_key and form_key in stale_requests:
+        raise question_record.AnswerRefused(STALE_ANSWER)
     form_retry = draft.form_attempt_key(folder, saved) if form_key else None
     answered: set[str] = answered_question_ids(record) if record is not None else set()
     current_round = feedback_round(answered) if record is not None else saved.get("deleted_feedback_round")
@@ -642,14 +655,15 @@ def _picture_answer(directory: Path, identity: str, draft: _AnswerDraft, retry_k
         if record is not None or retry_key not in attempts:
             raise question_record.AnswerRefused("no saved answer for this removed picture")
         key = retry_key
-    elif form_retry is not None:
-        if not draft.matches_answer(attempts[form_retry]):
-            raise question_record.AnswerRefused(STALE_ANSWER)
-        key = form_retry
     else:
-        if signed_form and round_id is not None and current_round is not None and round_id != current_round:
+        stale = (not draft.matches_answer(attempts[form_retry]) if form_retry is not None else
+                 signed_form and round_id is not None and current_round is not None and round_id != current_round)
+        if stale:
+            if form_key:
+                saved["stale_form_request_keys"] = [*stale_requests, form_key]
+                image_store.write_answers(directory, saved)
             raise question_record.AnswerRefused(STALE_ANSWER)
-        key = form_key or draft.key(folder, saved)
+        key = form_retry or form_key or draft.key(folder, saved)
     attempt: image_store.ImageAnswer | None = attempts.get(key)
     stale_round = False
     if attempt is None:
@@ -860,6 +874,8 @@ const groups = document.querySelector('[data-image-groups]');
 const layout = document.querySelector('[data-image-layout]');
 const waiting = document.querySelector('[data-image-waiting]');
 const notice = document.querySelector('[data-image-notice]');
+const staleDrafts = document.querySelector('[data-image-stale-drafts]');
+const staleDraftTemplate = document.querySelector('[data-image-stale-draft]');
 let list = document.querySelector('[data-images]');
 const motion = createCardMotion(() => list);
 let refreshRequest = 0;
@@ -948,11 +964,49 @@ function readEdit(form, state, edited = false) {
   const {feedback, token, feedback_round: round} = form.elements;
   const changed = feedback.value !== (state.draft?.words ?? '');
   if (edited || changed) state.revision++;
-  const prior = changed || state.draft?.needsCurrentForm ? null : state.draft;
+  const prior = changed ? {needsCurrentForm: state.draft?.needsCurrentForm} : state.draft;
   state.draft = {...prior, words: feedback.value, token: token.value, round: round.value};
+}
+async function copyStaleDraft(words, status) {
+  try {
+    await navigator.clipboard.writeText(words.textContent);
+  } catch {
+    try {
+      const selection = getSelection(), range = new Range();
+      range.selectNodeContents(words);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      if (!document.execCommand('copy')) throw new Error('Copy failed.');
+      selection.removeAllRanges();
+    } catch {
+      status.textContent = 'Copy failed. Select and copy the feedback.';
+      return;
+    }
+  }
+  status.textContent = 'Copied.';
+}
+function showStaleDraft(state, alreadyAnswered) {
+  const draft = staleDraftTemplate.content.firstElementChild.cloneNode(true);
+  draft.querySelector('[data-draft-reason]').textContent = alreadyAnswered
+    ? 'Feedback for this round was already sent.' : 'This image has no feedback form.';
+  const words = draft.querySelector('[data-draft-words]');
+  words.textContent = state.draft.words;
+  const status = draft.querySelector('[data-draft-copy-status]');
+  draft.querySelector('[data-draft-copy]').addEventListener('click', () => void copyStaleDraft(words, status));
+  draft.querySelector('[data-draft-dismiss]').addEventListener('click', () => {
+    clearDraft(state);
+    draft.remove();
+    if (![...pictureStates.values()].some(other => other.draft?.needsCurrentForm)) {
+      staleAnswerNotice = '';
+      showActionFailure(actionFailure);
+    }
+  });
+  staleDrafts.append(draft);
 }
 function restoreForms(root, previous = []) {
   const editable = new Map(), attempts = new Set();
+  const answered = new Set(root.dataset.answeredImages.split(' '));
+  staleDrafts.replaceChildren();
   for (const form of forms(root)) {
     const image = imageId(form), key = attemptKey(form), state = pictureState(image);
     if (key) {
@@ -989,6 +1043,8 @@ function restoreForms(root, previous = []) {
     if (form) {
       if (draft) form.elements.feedback.value = draft.words;
       showActionFailure(formStatus(form), state.draftError);
+    } else if (draft?.needsCurrentForm && draft.words) {
+      showStaleDraft(state, answered.has(image));
     } else if (!state.attempts.size && !draft?.needsCurrentForm) {
       pictureStates.delete(image);
     }
@@ -1041,6 +1097,7 @@ async function submit(event) {
       if (draft.requestId) body.set('answer_request', draft.requestId);
     }
   } else {
+    delete draft.needsCurrentForm;
     if (!question) {
       const sameDraft = draft.retryAction === action;
       if (sameDraft && draft.retryRound !== undefined) body.set('feedback_round', draft.retryRound);
@@ -1108,6 +1165,7 @@ async function submit(event) {
       state.draft = {words: field.value, needsCurrentForm: true};
       saveDrafts();
       card.remove();
+      if (state.draft.words) showStaleDraft(state, false);
       staleAnswerNotice = message;
       showActionFailure(actionFailure, message);
     } else if (request.key) state.attempts.set(request.key, message);

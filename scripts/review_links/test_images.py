@@ -1781,6 +1781,29 @@ class ImageQuestionTests(ImagesFixture):
         paths = images.decision_root(self.root).glob(f"{identity}-*.json")
         self.assertEqual(len(list(paths)), 3)
 
+    def test_stale_request_id_keeps_its_refusal_without_a_round(self) -> None:
+        record = self.register()
+        self.ask(record)
+        identity = record["id"]
+        images.answer_question(self.root, identity, "Q1", "The gate passed.")
+        self.sent.clear()
+        token = images.request_token(images.console_token(self.root), identity)
+        post = {"image": identity, "token": token, "action": "feedback", "feedback": "Keep the red row.",
+                "answer_request": "a" * 32}
+        with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
+            self.submit(urlencode({**post, "feedback_round": images.feedback_round(set())}))
+
+        current = {**post, "feedback_round": images.feedback_round({"Q1"})}
+        with patch.object(image_store, "write_answers", wraps=image_store.write_answers) as write:
+            for repeat in (post, current):
+                with self.assertRaisesRegex(question_record.AnswerRefused, "This page is stale"):
+                    self.submit(urlencode(repeat))
+            write.assert_not_called()
+        self.assertEqual(self.sent, [])
+        self.assertFalse(images.decision_root(self.root).exists())
+        self.submit(urlencode({**current, "answer_request": "b" * 32}))
+        self.assertEqual(len(self.sent), 1)
+
     @unittest.skipUnless(shutil.which("firefox"), "Firefox is required for the picture form")
     def test_browser_keeps_a_stale_draft_for_the_current_round(self) -> None:
         record = self.register("Stale fixture")
@@ -1803,7 +1826,8 @@ class ImageQuestionTests(ImagesFixture):
         probe = r'''
 async (find, whenPageShows, check) => {
  const realFetch = window.fetch.bind(window);
- const posts = [];
+ const posts = [], copied = [];
+ Object.defineProperty(navigator, 'clipboard', {value: {writeText: async text => copied.push(text)}});
  window.fetch = (url, options) => {
   if (url !== location.pathname) return realFetch(url, options);
   if (options?.method === 'POST') {
@@ -1820,13 +1844,26 @@ async (find, whenPageShows, check) => {
  find('Other fixture').querySelector('textarea').value = 'Keep this draft.';
  form.requestSubmit(form.querySelector('button[value=feedback]'));
  await whenPageShows('the refreshed list', () => !oldList.isConnected);
- const drafts = sessionStorage.getItem('images.answer-drafts:' + location.pathname) ?? '';
- check(drafts.includes(words), 'Storage keeps the draft words.');
+ const savedDrafts = () => sessionStorage.getItem('images.answer-drafts:' + location.pathname) ?? '';
+ check(savedDrafts().includes(words), 'Storage keeps the draft words.');
  const status = document.getElementById('image-action-failure');
  check(!status.hidden && status.textContent.includes('This page is stale'), 'The page shows the refusal.');
  check(find('Other fixture').querySelector('textarea').value === 'Keep this draft.', 'The other draft remains.');
  if (ALREADY_ANSWERED) {
   check(!document.getElementById(stale.id), 'An answered image has no stale form.');
+  const draft = document.querySelector('[data-image-stale-drafts] section');
+  check(draft?.textContent.includes('Feedback for this round was already sent.'), 'The notice says the feedback was sent.');
+  check(draft?.textContent.includes(words), 'The notice shows the unsent words.');
+  if (!draft) return;
+  const buttons = [...draft.querySelectorAll('button')];
+  buttons.find(button => button.textContent === 'Copy').click();
+  await whenPageShows('the copy confirmation', () => draft.textContent.includes('Copied.'));
+  check(copied.length === 1 && copied[0] === words, 'Copy takes the exact draft words.');
+  check(savedDrafts().includes(words), 'Copy keeps the draft in storage.');
+  buttons.find(button => button.textContent === 'Dismiss').click();
+  check(!draft.isConnected && !savedDrafts().includes(words), 'Dismiss clears the notice and draft.');
+  check(savedDrafts().includes('Keep this draft.'), 'Dismiss keeps the other draft.');
+  check(posts.length === 1, 'Copy and Dismiss do not send feedback.');
   return;
  }
  const fresh = find('Stale fixture').querySelector('form');
