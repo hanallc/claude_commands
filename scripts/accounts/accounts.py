@@ -2964,6 +2964,7 @@ class AccountOpenWorkerActivity(AccountWorkerActivity, Protocol):
 
 class AccountPaneReader(Protocol):
     OpenWorker: type[AccountOpenWorkerActivity]
+    StartingWorker: type[AccountWorkerActivity]
 
     def observe_parents(self, parents: Sequence[staff.StaffRow], record: staff.StaffSnapshot
                         ) -> dict[staff.StaffId, list[AccountWorkerActivity]]: ...
@@ -6040,6 +6041,8 @@ class DiagnosticStream(io.StringIO):
 def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = False, include_models: bool = False,
                 account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> StatusReading:
     """Read each account once; retain diagnostics before any later failure."""
+    from scripts.herdr import herdr
+
     account_config = read_account_settings(account_config)
     enclosing = _status_diagnostics.get()
     diagnostics = enclosing if isinstance(enclosing, StatusDiagnostics) else StatusDiagnostics()
@@ -6047,7 +6050,8 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     tty = sys.stderr.isatty()
     held = DiagnosticStream(sys.stderr)
     try:
-        with (redirect_stderr(held), role_map.observe_map_reads(_observe_map_provenance),
+        with (redirect_stderr(held), herdr.starting_pane_notes() as starting,
+              role_map.observe_map_reads(_observe_map_provenance),
               role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext()):
             reading = _with_upcoming_moves(_read_status(
                 source, detail=detail, include_models=include_models, account_config=account_config))
@@ -6064,7 +6068,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
     represented = set(reading.represented_stderr) | diagnostics.recovered
     represented.update(raw for raw_lines in diagnostics.counterparts.values() for raw in raw_lines)
     represented.update(raw for raw_lines in diagnostics.included_raw.values() for raw in raw_lines)
-    notes = list(reading.notes)
+    notes = [*reading.notes, *starting]
     warning_groups: dict[tuple[str, str], list[str]] = {}
     for line in dict.fromkeys(held.getvalue().splitlines()):
         if not line.strip() or line in represented or line in diagnostics.delivered:
@@ -6890,22 +6894,26 @@ def _observed_role_sessions(groups: GroupAccounts, *, include_workers: bool, inc
 
         for states in worker_panes.observe_parents(parents, membership).values():
             for state in states:
+                opening = (isinstance(state, worker_panes.StartingWorker)
+                           or isinstance(state, worker_panes.OpenWorker) and state.status == "starting")
+                if opening:
+                    session_lines.append(f"worker {state.row.name}: starting")
                 evidence = session_staff.worker_backend(membership, state.row.id)
                 if not isinstance(evidence, session_staff.RecordedWorker):
-                    session_lines.append(f"worker {state.row.name}: {evidence.reason}")
+                    if not opening:
+                        session_lines.append(f"worker {state.row.name}: {evidence.reason}")
                     continue
-                status = ("starting" if isinstance(state, worker_panes.OpenWorker) and state.status == "starting"
-                          else worker_panes.worker_state(state))
+                status = "starting" if opening else worker_panes.worker_state(state)
                 if status == "unknown":
                     reason = cast(object, getattr(state, "reason", "pane status is unknown"))
                     session_lines.append(f"worker {state.row.name}: {reason}")
                     continue
-                if isinstance(state, worker_panes.OpenWorker) and isinstance(evidence.backend, staff.CodexBackend):
+                if (opening or isinstance(state, worker_panes.OpenWorker)) and isinstance(evidence.backend, staff.CodexBackend):
                     directory = evidence.backend.codex_home
                     counts.setdefault((directory, "workers"), {})[state.row.current_session] = session_state.classify(
                         state.row, session_state.LiveActivity(status), detached=detached)
                     record_name(directory, state.row.current_session, state.row.name)
-                    if include_models:
+                    if include_models and isinstance(state, worker_panes.OpenWorker):
                         open_codex_workers[state.row.current_session] = directory
                     observed_workers.add(state.row.current_session)
     unobserved_workers = [member for member in staff.active(membership, "worker")

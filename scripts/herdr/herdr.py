@@ -1671,8 +1671,9 @@ class SubmitStarts:
 SUBMIT_UNPROVED = SubmitUnproved()
 
 
-class PaneSessionsStarting(Enum):
-    STARTING = PANE_STARTING
+@dataclass(frozen=True)
+class PaneSessionsStarting:
+    pid: int
 
 
 @dataclass(frozen=True)
@@ -1707,6 +1708,10 @@ class PaneEvidenceRun:
     shell_processes: dict[tuple[str, str, str], int] = field(default_factory=dict)
     reported: set[tuple[str, str, str]] = field(default_factory=set)
     lock: RLock = field(default_factory=RLock)
+
+    @cached_property
+    def start_seconds(self) -> float:
+        return _read_start_seconds()
 
 
 class RestorePaneEvidenceRun(PaneEvidenceRun):
@@ -1777,6 +1782,27 @@ class PaneObservations:
 
 
 _pane_observations: ContextVar[PaneObservations | None] = ContextVar("pane_observations", default=None)
+_starting_notes: ContextVar[list[str] | None] = ContextVar("starting_pane_notes", default=None)
+
+
+@contextmanager
+def starting_pane_notes() -> Generator[list[str]]:
+    """Give a status report the starting notices for its normal output."""
+    notes: list[str] = []
+    token = _starting_notes.set(notes)
+    try:
+        yield notes
+    finally:
+        _starting_notes.reset(token)
+
+
+def _report_starting_pane(place: str) -> None:
+    note = f"herdr {place}: {PANE_STARTING}"
+    notes = _starting_notes.get()
+    if notes is None:
+        print(note, file=sys.stderr)
+    else:
+        notes.append(note)
 
 
 _reported_target_retentions: ContextVar[set[tuple[HerdrPlace | NotInHerdr, str | AgentProcessIdentity, str]]] = (
@@ -2479,25 +2505,31 @@ class Herdr:
     def _row_pane_sessions(self, pane: dict[str, object], run: PaneEvidenceRun) -> PaneSessions:
         key = self._pane_evidence_key(pane)
         with run.lock:
-            if key in run.sessions:
-                return run.sessions[key]
+            cached = run.sessions.get(key)
+            if cached is not None and (not isinstance(cached, PaneSessionsStarting)
+                                       or _process_start_in_progress(cached.pid)):
+                return cached
             try:
                 arguments = ("pane", "process-info", "--pane", json_text(pane.get("pane_id"), "pane id"))
+                snapshot = _pane_observations.get()
+                if isinstance(cached, PaneSessionsStarting) and snapshot is not None:
+                    _ = snapshot.replies.pop((self.session, arguments), None)
                 info = json_object(self.result(*arguments).get("process_info"), "native pane processes")
                 shell, foreground = _pane_process_ids(info, "native pane processes")
                 try:
                     observed = _pane_session(info, pane)
-                except _ForegroundArgvStarting:
+                except _ForegroundArgvStarting as error:
                     # Read the arguments again on the next scan.
-                    if (snapshot := _pane_observations.get()) is not None:
+                    if snapshot is not None:
                         _ = snapshot.replies.pop((self.session, arguments), None)
-                    return PaneSessionsStarting.STARTING
+                    _ = run.sessions.pop(key, None)
+                    return PaneSessionsStarting(error.pid)
                 sessions: PaneSessions = (frozenset() if isinstance(observed, NoForegroundAgent)
                                           else frozenset({observed.session_id}))
                 if not sessions and foreground == shell:
                     run.shell_processes[key] = shell
-            except CodexPaneStarting:
-                sessions = PaneSessionsStarting.STARTING
+            except CodexPaneStarting as error:
+                sessions = PaneSessionsStarting(error.state.pid)
             except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
                 if isinstance(error, HerdrFailure) and error.code == "pane_not_found":
                     sessions = _PaneProcessNotFound(str(error))
@@ -2553,7 +2585,7 @@ class Herdr:
                     if notice in run.reported:
                         continue
                     if isinstance(sessions, PaneSessionsStarting):
-                        print(f"herdr {self.session}:{unread.pane}: {PANE_STARTING}", file=sys.stderr)
+                        _report_starting_pane(f"{self.session}:{unread.pane}")
                     else:
                         print(f"herdr {self.session}:{unread.pane} tab {unread.tab}: pane evidence is unknown: "
                               + f"{' '.join(unread.reason.splitlines())}; row placement retained", file=sys.stderr)
@@ -3821,8 +3853,44 @@ type CheckedPane[Owner] = ProvedMatch[Owner] | ProvedOtherOwner | ObservedEmpty 
 
 
 def _foreground_processes(info: dict[str, object]) -> list[dict[str, object]]:
-    return [json_object(value, "native foreground process")
+    rows = [json_object(value, "native foreground process")
             for value in json_items(info.get("foreground_processes"), "native foreground processes")]
+    if _platform() != "linux" or len(rows) < 2:
+        return rows
+    processes: list[dict[str, object]] = []
+    groups: dict[int, int] = {}
+    leaders: set[int] = set()
+    for row in rows:
+        pid = row.get("pid")
+        group = _linux_thread_group(pid) if type(pid) is int and pid > 0 else None
+        if group is None:
+            processes.append(row)
+            continue
+        position = groups.get(group)
+        if position is None:
+            groups[group] = len(processes)
+            processes.append(row if pid == group else {**row, "pid": group})
+        elif pid == group:
+            if group in leaders:
+                processes.append(row)
+            else:
+                processes[position] = row
+        if pid == group:
+            leaders.add(group)
+    return processes
+
+
+def _linux_thread_group(pid: int) -> int | None:
+    """Read the thread group from the kernel's status for this PID."""
+    try:
+        with (proc_root() / str(pid) / "status").open() as status:
+            for line in status:
+                if line.startswith("Tgid:"):
+                    group = int(line.removeprefix("Tgid:"))
+                    return group if group > 0 else None
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _foreground_pid(process: dict[str, object]) -> int:
@@ -3996,7 +4064,16 @@ def _prove_foreground_owner(info: dict[str, object], *, for_input: bool, message
 def pane_foreground(place: HerdrPlace, info: dict[str, object]) -> ForegroundPaneAgent | ObservedEmpty | UnknownPaneOwner:
     """Read the foreground evidence before comparing it with a requested owner."""
     try:
-        owner = _foreground_pane_owner(info, for_input=False, message_owner=_message_proof.message_owner.get())
+        lookup = _message_proof.active_lookup.get()
+        proof = lookup.owner if lookup is not None else _message_proof.StrictOwnerProof.REQUIRED
+        owner = _foreground_pane_owner(info, for_input=False, message_owner=proof)
+        if (isinstance(owner, ForegroundArgvStarting) and owner.kind == "claude" and lookup is not None
+                and isinstance(proof, _message_proof.ProvedMessageOwner) and owner.pid == proof.pid):
+            try:
+                if _process_birth(owner.pid) == proof.start:
+                    lookup.starting_panes.add(place)
+            except (OSError, ValueError):
+                pass
         if (isinstance(owner, ClaudeForegroundWithoutArgv)
                 or isinstance(owner, ForegroundArgvStarting) and owner.kind == "claude"):
             return ClaudePaneWithoutArgv(place, owner.reason, owner.pid)
@@ -4106,26 +4183,45 @@ class CodexPaneSession:
 class _ForegroundArgvStarting(HerdrFailure):
     """The starting agent has no readable arguments."""
 
+    def __init__(self, owner: ForegroundArgvStarting) -> None:
+        super().__init__(owner.reason)
+        self.pid: int = owner.pid
+
 
 def _foreground_start_in_progress(pid: int, pane: dict[str, object]) -> bool:
     """Check the age of an agent in the pane's foreground process group."""
     try:
         shell, foreground = _pane_process_ids(pane, "starting pane")
-        if pid == shell or foreground == shell:
-            return False
+    except HerdrFailure:
+        return False
+    return pid != shell and foreground != shell and _process_start_in_progress(pid, group=foreground)
+
+
+def _read_start_seconds() -> float:
+    try:
+        return conf.read("shutdown").number("start_seconds")
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _process_start_in_progress(pid: int, *, group: int | None = None) -> bool:
+    """Check the age of a live process and its group when supplied."""
+    try:
         if _platform() == "darwin":
             info = _darwin_process_bsd_info(pid)
-            if info.pbi_pgid != foreground or not info.pbi_start_tvsec:
+            if (group is not None and info.pbi_pgid != group) or not info.pbi_start_tvsec:
                 return False
             age = time.time() - (info.pbi_start_tvsec + info.pbi_start_tvusec / 1_000_000)
         else:
             fields = _linux_process_stat(pid)
             started = int(fields[19])
-            if fields[0] in {"Z", "X", "x"} or int(fields[2]) != foreground or started <= 0:
+            if fields[0] in {"Z", "X", "x"} or (group is not None and int(fields[2]) != group) or started <= 0:
                 return False
             uptime = float((proc_root() / "uptime").read_text().split(maxsplit=1)[0])
             age = uptime - started / os.sysconf("SC_CLK_TCK")
-        return 0 <= age < conf.read("shutdown").number("start_seconds")
+        run = _pane_evidence_run.get()
+        seconds = run.start_seconds if isinstance(run, PaneEvidenceRun) else _read_start_seconds()
+        return 0 <= age < seconds
     except (HerdrFailure, OSError, ValueError, IndexError):
         return False
 
@@ -4207,7 +4303,7 @@ def _pane_session(info: dict[str, object], pane: Mapping[str, object], *,
                   for_input: bool = False, for_opening: bool = False) -> ClaudePaneSession | CodexPaneSession | NoForegroundAgent:
     owner = foreground_pane_owner(info, for_input=for_input)
     if isinstance(owner, ForegroundArgvStarting):
-        raise _ForegroundArgvStarting(owner.reason)
+        raise _ForegroundArgvStarting(owner)
     if isinstance(owner, UnprovedForegroundOwner):
         raise HerdrFailure(owner.reason)
     if isinstance(owner, NoForegroundAgent):
@@ -5255,6 +5351,8 @@ def native_process(pid: int, kind: str, reported: str | PaneNotRead = PANE_NOT_R
     if _process_birth(pid) != started:
         raise ValueError(f"pid {pid}: native process start changed")
     if isinstance(identity, StartingCodexPane):
+        if not _process_start_in_progress(pid):
+            raise ValueError(f"pid {pid}: Codex launch identity is unavailable")
         raise CodexPaneStarting(identity)
     if isinstance(identity, CodexWrapperPending):
         raise CodexSessionPending(identity.reason)
@@ -5558,7 +5656,7 @@ def codex_conversations(*, wanted: str = "") -> CodexConversations:
             observations = _pane_observations.get()
             if (isinstance(error, CodexPaneStarting) and observations is not None
                     and isinstance(observations.process_places.get(pid), HerdrPlace)):
-                print(f"herdr pid {pid}: {PANE_STARTING}", file=sys.stderr)
+                _report_starting_pane(f"pid {pid}")
                 continue
             if environment is not None:
                 if "--no-daemon" not in arguments:

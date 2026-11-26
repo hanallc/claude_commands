@@ -615,6 +615,9 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
     # Only a worker that launched a pane in a parent tab can recover one.
     launched_here = {launch_owners[pane_id] for pane in panes
                      if (pane_id := _text(pane, "pane_id")) in launch_owners and _text(pane, "tab_id") in parent_tabs}
+    absence_unproved = any(item.tab in parent_tabs and (
+        item.pane not in launch_owners if isinstance(item, herdr.StartingPane)
+        else not isinstance(selection, SelectedWorkers)) for item in scan.unknown)
     states: list[WorkerPane] = []
     for row in selected:
         matches = scan.found.get(row.id, [])
@@ -663,8 +666,7 @@ def _parent_evidence(parent: StaffId, record: staff.StaffSnapshot,
                 states.append(_uncertain(row, "recovery pane belongs to another native session"))
                 continue
             states.append(StoppedWorker(row, identity, terminal))
-        elif not isinstance(selection, SelectedWorkers) and any(
-                item.tab in parent_tabs and not isinstance(item, herdr.StartingPane) for item in scan.unknown):
+        elif absence_unproved:
             states.append(_uncertain(row, "pane evidence is incomplete; absence is unproved"))
         else:
             states.append(ClosedWorker(row))

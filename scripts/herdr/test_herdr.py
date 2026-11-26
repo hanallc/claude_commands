@@ -38,6 +38,7 @@ from scripts.herdr import pane_launch
 from scripts.herdr import fake_herdr
 from scripts.message import codex_daemon
 from scripts.herdr.fake_herdr import CommandResponse
+from scripts.lib import conf
 from scripts.lib.agent_scope import agents_slice
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib import operation_deadline, session_folder
@@ -153,7 +154,9 @@ def codex_launch_evidence(root: Path, argv: list[str], *, pane_id: str = "w1:p1"
     identity = fixture_runtime_id("herdr-codex-launch")
     proc = root / "codex-launch-proc"
     (proc / str(pid) / "fd").mkdir(parents=True, exist_ok=True)
-    _ = (proc / str(pid) / "cmdline").write_bytes("\0".join(argv).encode())
+    fake_unit_host.process({"HERDR_PROC": str(proc)}, pid, pid - 1, argv, {},
+                           started=str(100 * os.sysconf("SC_CLK_TCK")))
+    _ = (proc / "uptime").write_text("101.0 0.0\n")
     reported = argv[argv.index("resume") + 1] if "resume" in argv else identity
     pane: herdr.PaneIdentity = {"pane_id": pane_id, "session_id": reported, "workspace_id": "w1"}
     info: dict[str, object] = {"process_info": {"foreground_processes": [
@@ -164,7 +167,7 @@ def codex_launch_evidence(root: Path, argv: list[str], *, pane_id: str = "w1:p1"
             raise AssertionError(f"unexpected process: {observed_pid}")
         return {"CODEX_THREAD_ID": identity, "CODEX_HOME": str(root / ".codex2")}
 
-    with (patch.dict(os.environ, {"HERDR_PROC": str(proc),
+    with (patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_PLATFORM": "linux",
                                       "HERDR_PANE_RECORD_DIR": str(root / "codex-launch-records")}),
           isolated_staff_file(root / "codex-staff.json", {}),
           native_process_commands(pid),
@@ -368,6 +371,9 @@ class NativePaneSessionTests(StaffTestCase):
         proc = self.root / "unheld-proc"
         process = proc / "998079"
         (process / "fd").mkdir(parents=True)
+        fake_unit_host.process({"HERDR_PROC": str(proc)}, 998079, 1, ["codex"], {},
+                               started=str(100 * os.sysconf("SC_CLK_TCK")))
+        _ = (proc / "uptime").write_text("101.0 0.0\n")
         for arguments, refusal, cause in ((["codex"], herdr.CodexPaneStarting, "pane is starting"),
                           (["codex", "app-server", "--managed-daemon"], ValueError, "unsupported subcommand"),
                           (["codex", "exec", "resume", identity], ValueError, "unsupported subcommand"),
@@ -981,6 +987,77 @@ class NativePaneSessionTests(StaffTestCase):
                         self.assertEqual(notes.getvalue(), "herdr agents:w1:p1: pane is starting\n")
                         self.assertEqual(reads.call_count, run + 1)
 
+    def test_codex_with_launch_arguments_expires_without_a_session_report(self) -> None:
+        configuration = self.root / "start-config"
+        _ = write_config_fixture(configuration / "shutdown.conf", "start_seconds=20\n")
+        with (patch.dict(os.environ, {**config_environment(configuration), "HERDR_PLATFORM": "linux"}),
+              codex_launch_evidence(self.root, ["codex", "--no-daemon"]) as evidence):
+            pane = herdr.json_object(evidence["pane"], "fixture pane")
+            pane.update(session_id=None, tab_id="w1:t1")
+            info = herdr.json_object(evidence["process_info"], "fixture process info")
+            info.update(shell_pid=998069, foreground_process_group_id=998070)
+            client = herdr.Herdr("agents")
+            record = staff.initial_snapshot()
+            with herdr.pane_evidence_run(), redirect_stderr(io.StringIO()) as notes:
+                self.assertEqual(client.scan_row_panes(record, [pane]).unknown, [herdr.StartingPane("w1:p1", "w1:t1")])
+                _ = (self.root / "codex-launch-proc/uptime").write_text("120.0 0.0\n")
+                expired, = client.scan_row_panes(record, [pane]).unknown
+            self.assertNotIsInstance(expired, herdr.StartingPane)
+            self.assertIn("pane evidence is unknown: pid 998070: Codex launch identity is unavailable", notes.getvalue())
+            with self.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
+                _ = client.codex_launch("w1:p1")
+
+    def test_start_deadline_reads_shutdown_once_per_poll(self) -> None:
+        configuration = self.root / "start-config"
+        path = configuration / "shutdown.conf"
+        proc = self.root / "proc"
+        panes = [{"pane_id": f"p{pid}", "tab_id": "t1"} for pid in (998070, 998071)]
+        replies: dict[str, dict[str, object]] = {}
+        for pid in (998070, 998071):
+            fake_unit_host.process({"HERDR_PROC": str(proc)}, pid, 998069, [], {},
+                                   started=str(100 * os.sysconf("SC_CLK_TCK")))
+            replies[f"p{pid}"] = {"process_info": {"shell_pid": 998069, "foreground_process_group_id": pid,
+                                  "foreground_processes": [{"pid": pid, "name": "claude"}]}}
+        _ = (proc / "uptime").write_text("101.0 0.0\n")
+        client = herdr.Herdr("agents")
+        record = staff.initial_snapshot()
+
+        def read_pane(*arguments: str) -> dict[str, object]:
+            return replies[arguments[-1]]
+
+        with (patch.dict(os.environ, {**config_environment(configuration), "HERDR_PROC": str(proc),
+                                     "HERDR_PLATFORM": "linux"}),
+              patch.object(client, "result", side_effect=read_pane),
+              patch.object(conf, "read", wraps=conf.read) as read, redirect_stderr(io.StringIO())):
+            for seconds, expected in ((20, 2), (1, 0)):
+                _ = write_config_fixture(path, f"start_seconds={seconds}\n")
+                with herdr.observation_snapshot():
+                    scan = client.scan_row_panes(record, [dict(pane) for pane in panes])
+                self.assertEqual(len(scan.unknown), 2)
+                self.assertEqual(sum(isinstance(pane, herdr.StartingPane) for pane in scan.unknown), expected)
+        self.assertEqual([item for item in read.call_args_list if item.args[0] == "shutdown"], [call("shutdown")] * 2)
+
+    def test_foreground_codex_counts_verified_thread_groups(self) -> None:
+        proc = self.root / "proc"
+        leader, thread = 998070, 998071
+        for pid in (leader, thread):
+            (proc / str(pid)).mkdir(parents=True)
+        _ = (proc / str(leader) / "status").write_text(f"Tgid:\t{leader}\n")
+        status = proc / str(thread) / "status"
+        rows = [{"pid": thread, "name": "tokio-rt-worker", "argv": ["codex"]},
+                {"pid": leader, "name": "codex", "argv": ["codex", "--no-daemon"]}]
+        with patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_PLATFORM": "linux"}):
+            _ = status.write_text(f"Tgid:\t{leader}\n")
+            for foreground in (rows, rows[::-1]):
+                owner = herdr.foreground_pane_owner({"foreground_processes": foreground}, for_input=True)
+                self.assertEqual(owner, herdr.ProvedCodexForeground(
+                    leader, ["codex", "--no-daemon"], None, (), herdr.CodexTerminalInput.AVAILABLE))
+            _ = status.write_text(f"Tgid:\t{thread}\n")
+            owner = herdr.foreground_pane_owner({"foreground_processes": rows}, for_input=True)
+            self.assertIsInstance(owner, herdr.UnprovedForegroundOwner)
+            assert isinstance(owner, herdr.UnprovedForegroundOwner)
+            self.assertIn("expected one foreground codex process, found 2", owner.reason)
+
     def test_launch_argument_cannot_prove_the_current_pane_session(self) -> None:
         launch = fixture_runtime_id("native-fallback-launch")
         proc = self.root / "fallback-proc"
@@ -1097,8 +1174,9 @@ class CodexAnomalyNameTests(StaffTestCase):
         proc = self.root / "unknown-codex-proc"
         process = proc / str(pid)
         (process / "fd").mkdir(parents=True)
-        _ = (process / "cmdline").write_bytes(b"codex\0--no-daemon\0")
-        _ = (process / "environ").write_bytes(b"")
+        fake_unit_host.process({"HERDR_PROC": str(proc)}, pid, 1, ["codex", "--no-daemon"], {},
+                               started=str(100 * os.sysconf("SC_CLK_TCK")))
+        _ = (proc / "uptime").write_text("101.0 0.0\n")
         records: list[sessions.SessionRecord] = [{
             "pid": pid + 1, "sessionId": fixture_runtime_id("unrelated-registry-process"),
             "name": "unrelated", "messagingSocketPath": "", "updatedAt": 1, "tmux": "", "formerNames": [],
@@ -1127,6 +1205,7 @@ class CodexAnomalyNameTests(StaffTestCase):
                 registry.side_effect = OSError("registry is unavailable")
             with self.assertRaisesRegex(herdr.CodexPaneStarting, "Codex launch identity is unavailable"):
                 _ = herdr.native_process(pid, "codex", "")
+            (process / "stat").unlink()
             self.assertEqual(herdr.running_codex_threads(thread_host=lambda _argv: False), set())
             name = {"tab": "morty", "registry": "registry-name", "pid": f"pid {pid}"}[source]
             self.assertEqual(output.getvalue(), f"anomaly: {name} (Codex thread unknown); not blocking\n")
