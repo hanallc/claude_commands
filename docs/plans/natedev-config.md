@@ -873,26 +873,13 @@ Proposal steps to plan phases: step 1 → Phases 1 and 3; step 2 → Phase 2; st
 
 **Gotchas:** The scan takes about 10 s on the full tree. It reports `scripts/aws_target/hana_source.py` 106 and 107 on main (List 357 owns that repair).
 
-### Phase 23 — Join with combo2 before its merge  · status: todo
+### Phase 23 — Join with combo2 before its merge  · status: done
 
-**Depends on:** Phase 21
+#### As-built
 
-#### Work Order
-
-**Goal:** Resolve the item 224 tip against sdlc combo2 (`3c2a11eb68`, ahead in the merge line) in a scratch join, so the real join after combo2 reaches main is fast (showrunner order, 02:58 PST Nov 25).
-
-**Spec:**
-1. The scratch join is in `/home/natepiano/worktrees/claude/config/join224` (branch `config-join224`), base `4f57485534`. 31 files conflict.
-2. Keep combo2's behavior. Reapply the branch's config moves: reads through `conf.read`/`conf.path`, no code defaults; where combo2 changed a moved literal, the key takes combo2's value.
-3. A new literal from combo2 stays a literal. No key is added, renamed or deleted. No refusal is added.
-
-**Workers:** 2 writers — `impl` holds the config files, `conf.py`, `live_settings.py` and the review page files; `test` holds the other conflict files.
-
-**Invariants:** as Phase 21.
-
-**State:** none.
-
-**Acceptance gate:** no conflict markers; `basedpyright` 0/0/0 on each resolved Python file; the conflict test ids pass by name; `fixture_conf_keys` 0 missing; after combo2 reaches main, a green `copies.py run --affected` of the real join.
+- The scratch joins merged sdlc combo2 (`90ddc24ca9`, `3b9bec287e`) and then devtools `ca31f2226d` into the branch in `join224`. After devtools reached main, `9f4b36d18c` merged main `5a70285346` with no conflict.
+- The resolutions kept combo2's behavior and the branch's config moves through `conf.read`/`conf.path`. No key was added, renamed or deleted. No refusal was added.
+- The phase has no checkpoint commit; its work is the join merge commits.
 
 ### Phase 24 — Read scan recall follow-ups  · status: done
 
