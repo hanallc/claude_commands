@@ -1317,7 +1317,7 @@ def details(item: ReviewItem, inputs: ReviewBodyInputs, *,
         if isinstance(destination, investigation.ListDestination):
             body = f'<p><a href="{report_url(destination)}">Open List item {destination.number}</a></p>' + body
         if source.record.answer and not (isinstance(item.exchange_handoff, review_items.FiledReviewExchange)
-                                         and "initial" in item.exchange_handoff.exchange_ids):
+                                         and item.exchange_handoff.filed_investigation_answer):
             body += answer_section(source.record.answer)
     elif isinstance(source, review_items.ProposalSource):
         body = ('<section><h3>Proposal</h3><div data-proposal-body>'

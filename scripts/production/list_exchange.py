@@ -69,7 +69,6 @@ class QuestionSlot:
 @dataclass(frozen=True)
 class QuestionEvent:
     position: int
-    tag: str = ""
     slot_id: str = ""
 
 
@@ -87,12 +86,13 @@ class LoggedReply:
     digest: str
 
 
-class UnloggedReply(StrEnum):
-    IN_SLOT = "answer held only in the slot"
+class ReplyWithoutEvent(StrEnum):
+    SLOT = "slot answer"
+    NATIVE_RECORD = "native record answer"
     NO_ANSWER = "no saved answer"
 
 
-type ReplyOrigin = TaggedReply | LoggedReply | UnloggedReply
+type ReplyOrigin = TaggedReply | LoggedReply | ReplyWithoutEvent
 
 
 @dataclass(frozen=True)
@@ -105,7 +105,7 @@ class ExchangeBinding:
         if isinstance(self.question, QuestionSlot):
             return self.question.identity
         if isinstance(self.question, QuestionEvent):
-            return self.question.slot_id or self.question.tag
+            return self.question.slot_id
         return ""
 
 
@@ -131,6 +131,9 @@ class Exchange:
 class FiledExchange(Exchange):
     """An exchange stored on a List item."""
 
+    # Keep the old encoding for receipt verification until the writer saves the new form.
+    legacy_binding: str = field(default="", kw_only=True)
+
     @classmethod
     def from_exchange(cls, value: Exchange) -> FiledExchange:
         return cls(value.source, value.source_key, value.exchange_id, value.direction, value.question,
@@ -138,15 +141,17 @@ class FiledExchange(Exchange):
 
     def updated(self, current: Exchange) -> FiledExchange:
         """Keep the saved answer and binding as the source changes."""
-        incoming = self.from_exchange(current)
+        incoming = current if isinstance(current, FiledExchange) else self.from_exchange(current)
         binding = incoming.binding
         if isinstance(self.binding, ExchangeBinding):
             if not isinstance(binding, ExchangeBinding) or self.binding.question != binding.question:
                 return self
             if isinstance(self.answer, ExchangeAnswer):
-                if self.binding.reply != binding.reply and not isinstance(binding.question, QuestionRecord):
-                    return self
-                binding = self.binding
+                if self.binding.reply != binding.reply:
+                    if not isinstance(binding.question, QuestionRecord):
+                        return self
+                    if self.binding.reply is not ReplyWithoutEvent.NATIVE_RECORD:
+                        binding = self.binding
         if isinstance(self.answer, QuestionWithoutAnswer):
             return incoming
         if not isinstance(incoming.answer, ExchangeAnswer) or self.answer.text != incoming.answer.text:
@@ -157,8 +162,10 @@ class FiledExchange(Exchange):
 
 def _store_binding(binding: ExchangeBinding) -> dict[str, dict[str, str | int]]:
     match binding.question:
-        case QuestionEvent(position, tag, slot_id):
-            question: dict[str, str | int] = {"kind": "event", "position": position, "tag": tag, "slot_id": slot_id}
+        case QuestionEvent(position, slot_id):
+            question: dict[str, str | int] = {"kind": "log", "position": position}
+            if slot_id:
+                question["slot_id"] = slot_id
         case QuestionSlot(identity):
             question = {"kind": "slot", "id": identity}
         case QuestionRecord(identity):
@@ -168,7 +175,7 @@ def _store_binding(binding: ExchangeBinding) -> dict[str, dict[str, str | int]]:
             reply: dict[str, str | int] = {"kind": "tag", "tag": tag}
         case LoggedReply(position, digest):
             reply = {"kind": "event", "position": position, "digest": digest}
-        case UnloggedReply() as unlogged:
+        case ReplyWithoutEvent() as unlogged:
             reply = {"kind": unlogged}
     return {"question": question, "reply": reply}
 
@@ -186,13 +193,16 @@ def _position(fields: dict[str, object]) -> int:
     return value
 
 
-def _read_binding(value: object) -> ExchangeBinding:
+def _read_binding(value: object) -> tuple[ExchangeBinding, str]:
     fields = _fields(value)
     question, reply = _fields(fields["question"]), _fields(fields["reply"])
     match _field(question, "kind"):
         case "event":
-            origin: QuestionOrigin = QuestionEvent(_position(question), _field(question, "tag"),
-                                                   _field(question, "slot_id"))
+            position = _position(question)
+            tag, slot_id = _field(question, "tag"), _field(question, "slot_id")
+            origin: QuestionOrigin = QuestionSlot(tag) if tag else QuestionEvent(position, slot_id)
+        case "log":
+            origin = QuestionEvent(_position(question), _nonempty_field(question, "slot_id") if "slot_id" in question else "")
         case "slot":
             origin = QuestionSlot(_nonempty_field(question, "id"))
         case "record":
@@ -207,9 +217,14 @@ def _read_binding(value: object) -> ExchangeBinding:
             if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
                 raise ValueError("invalid exchange event digest")
             answer = LoggedReply(_position(reply), digest)
+        case "answer held only in the slot":
+            answer = ReplyWithoutEvent.NATIVE_RECORD if isinstance(origin, QuestionRecord) else ReplyWithoutEvent.SLOT
+            if isinstance(origin, QuestionEvent) and origin.slot_id:
+                origin = QuestionSlot(origin.slot_id)
         case kind:
-            answer = UnloggedReply(kind)
-    return ExchangeBinding(origin, answer)
+            answer = ReplyWithoutEvent(kind)
+    legacy = _field(question, "kind") == "event" or _field(reply, "kind") == "answer held only in the slot"
+    return ExchangeBinding(origin, answer), json.dumps(fields, ensure_ascii=False) if legacy else ""
 
 
 def _time_text(time: datetime | TimeNotRecorded) -> str:
@@ -233,7 +248,8 @@ def encode(exchanges: tuple[FiledExchange, ...]) -> str:
             if isinstance(answer, ExchangeAnswer) else answer,
         })
         if isinstance(exchange.binding, ExchangeBinding):
-            rows[-1]["binding"] = _store_binding(exchange.binding)
+            rows[-1]["binding"] = (cast(object, json.loads(exchange.legacy_binding))
+                                   if exchange.legacy_binding else _store_binding(exchange.binding))
     return json.dumps(rows, ensure_ascii=False)
 
 
@@ -282,8 +298,9 @@ def decode(raw: str) -> tuple[FiledExchange, ...]:
             answerer = Nate.USER if answerer == Nate.USER else StaffId(answerer)
         else:
             raise ValueError("invalid filed answerer")
+        binding, legacy = _read_binding(row["binding"]) if "binding" in row else (UnboundExchange.LEGACY, "")
         exchanges.append(FiledExchange(Source(_field(row, "source")), key, identity,
             Direction(_field(row, "direction")), _field(row, "question"), _read_time(_field(row, "asked_at")),
             Nate.USER if asker == Nate.USER else StaffId(asker), answerer, answer,
-            binding=_read_binding(row["binding"]) if "binding" in row else UnboundExchange.LEGACY))
+            binding=binding, legacy_binding=legacy))
     return tuple(exchanges)

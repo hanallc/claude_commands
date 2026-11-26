@@ -62,6 +62,7 @@ from scripts.message import send_result, session_send
 from scripts.review_links.test_page_question import question_outcome
 from scripts.review_links.server_test_support import started_review_server
 from scripts.production import (
+    list_exchange,
     change_review, change_routing, delivery_state, investigation, next_item, proposal_issue,
     record_store, staff, the_list, tidy_wrapped, unrouted_alert, update_registration,
 )
@@ -7039,10 +7040,20 @@ class ReviewLinksServerTests(unittest.TestCase):
                 if key == investigation_key:
                     question = case.status.slots(saved.delivery.page, saved.delivery.row).question
                     assert isinstance(question, change_page.OpenQuestion)
+                    self.assertIn(investigation_key, {entry["key"] for entry in current.entries})
                     _ = investigation.answer(report.owner, report.id, 'The smoke checks passed.',
                                              question_id=question.question_id)
                     cache.publish_delivery_result(investigation_key)
-                    self.assertNotIn('question-delivery:'+investigation_key, cache.get().assets)
+                    final = cache.get()
+                    self.assertNotIn('question-delivery:'+investigation_key, final.assets)
+                    self.assertNotIn(investigation_key, {entry["key"] for entry in final.entries})
+                    keeper = record_store.list_keeper(conf.read("console"), staff.snapshot())
+                    assert keeper is not None
+                    row, = the_list.records(keeper.id)
+                    pairs = [(exchange.question, exchange.answer.text) for exchange in row.filed_exchanges
+                             if isinstance(exchange.answer, list_exchange.ExchangeAnswer)]
+                    self.assertCountEqual(pairs, [(report.question, report.answer),
+                                                  ("Which checks passed?", "The smoke checks passed.")])
                 elif key in (proposal, efficiency):
                     self.assertNotIn('question-delivery:'+investigation_key, current.assets)
 
