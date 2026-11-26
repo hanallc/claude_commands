@@ -286,14 +286,35 @@ class Child(unittest.TestCase):
                 self.assertEqual(os.environ.get("BUILDLOG_DIR"), caller or None)
                 self.assertFalse(path.exists())
 
-    def test_a_direct_run_blocks_writes_to_the_login_home_config(self) -> None:
+    def run_config_write_fixture(self, source: str, *, relative: bool = False) -> subprocess.CompletedProcess[str]:
         login_home = self.root / "login"
         config = login_home / ".claude/config/showrunners.conf"
         config.parent.mkdir(parents=True)
         _ = config.write_text("original\n")
         alias = self.root / "config-link"
         alias.symlink_to(config.parent, target_is_directory=True)
-        source = f"""
+        _ = (self.root / "test_config_write.py").write_text(source)
+        program = STANDALONE_TEST_STARTUP + f"""
+import pwd
+import runpy
+from types import SimpleNamespace
+pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir={str(login_home)!r})
+runpy.run_module("unittest", run_name="__main__", alter_sys=True)
+"""
+        environment = without_user_test_manager(self.root, self.environment())
+        environment["HOME"] = str(self.root / "other-home")
+        environment["CONF_DIR"] = alias.name if relative else str(alias)
+        # The direct runner reads its limits before it enters the test.
+        for path in self.root.glob("config/*.conf"):
+            _ = (config.parent / path.name).write_bytes(path.read_bytes())
+        result = subprocess.run(
+            [str(SHIM), "-B", "-c", program, "discover", "-s", str(self.root), "-p", "test_config_write.py"],
+            env=environment, cwd=self.root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(config.read_text(), "original\n")
+        return result
+
+    def test_a_direct_run_blocks_writes_to_the_login_home_config(self) -> None:
+        result = self.run_config_write_fixture(f"""
 import subprocess
 import sys
 import unittest
@@ -307,29 +328,60 @@ class Fixture(unittest.TestCase):
              str(path)], capture_output=True, text=True, timeout={TEST_HANG_GUARD_SECS!r})
         self.assertEqual(child.returncode, 1, child.stderr)
         self.assertIn("Test attempted to write live configuration", child.stderr)
+        self.assertIn(self.id(), child.stderr)
         path.write_text("test")
-"""
-        _ = (self.root / "test_config_write.py").write_text(source)
-        program = STANDALONE_TEST_STARTUP + f"""
-import pwd
-import runpy
-from types import SimpleNamespace
-pwd.getpwuid = lambda uid: SimpleNamespace(pw_dir={str(login_home)!r})
-runpy.run_module("unittest", run_name="__main__", alter_sys=True)
-"""
-        environment = without_user_test_manager(self.root, self.environment())
-        environment["HOME"] = str(self.root / "other-home")
-        environment["CONF_DIR"] = str(alias)
-        # The direct runner reads its limits before it enters the test.
-        for path in self.root.glob("config/*.conf"):
-            _ = (config.parent / path.name).write_bytes(path.read_bytes())
-        result = subprocess.run(
-            [str(SHIM), "-B", "-c", program, "discover", "-s", str(self.root), "-p", "test_config_write.py"],
-            env=environment, cwd=self.root, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
+""")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn('path.write_text("test")', result.stderr)
         self.assertIn("Test attempted to write live configuration", result.stderr)
-        self.assertEqual(config.read_text(), "original\n")
+
+    def test_a_direct_run_blocks_relative_paths_to_the_login_home_config(self) -> None:
+        result = self.run_config_write_fixture("""
+import unittest
+from scripts.lib import conf
+
+class Fixture(unittest.TestCase):
+    def test_write(self):
+        path = conf.path("showrunners")
+        self.assertFalse(path.is_absolute())
+        path.write_text("test")
+""", relative=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        attempted = self.root / "config-link/showrunners.conf"
+        self.assertIn(f"Test attempted to write live configuration at {attempted} (test test_config_write.Fixture.test_write)",
+                      result.stderr)
+
+    def test_a_direct_run_fails_when_a_child_catches_the_config_write_refusal(self) -> None:
+        child = """
+from pathlib import Path
+import sys
+
+try:
+    Path(sys.argv[1]).write_text("child")
+except AssertionError as error:
+    print(error)
+"""
+        result = self.run_config_write_fixture(f"""
+import subprocess
+import sys
+import unittest
+from scripts.lib import conf
+
+class Fixture(unittest.TestCase):
+    def test_write(self):
+        path = conf.path("showrunners")
+        child = subprocess.run([sys.executable, "-c", {child!r}, str(path)],
+                               capture_output=True, text=True, timeout={TEST_HANG_GUARD_SECS!r})
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertIn(str(path), child.stdout)
+        self.assertIn(self.id(), child.stdout)
+        print("The child caught the refusal.")
+""")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("The child caught the refusal.", result.stdout)
+        attempted = self.root / "config-link/showrunners.conf"
+        self.assertIn(f"direct test: Test attempted to write live configuration at {attempted} "
+                      + "(test test_config_write.Fixture.test_write)", result.stderr)
 
     def test_a_run_has_an_absent_session_root_and_restores_the_callers(self) -> None:
         for caller in ("", str(self.root / "caller-session")):

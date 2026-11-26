@@ -102,6 +102,11 @@ def start_test_run() -> None:
             try:
                 cleanup.close()
             except LiveConfigWrite as error:
-                print(f"direct test: {error}", file=sys.stderr)
+                try:
+                    print(f"direct test: {error}", file=sys.stderr, flush=True)
+                    _ = sys.stdout.flush()
+                finally:
+                    # A SystemExit in an atexit callback cannot set the exit status.
+                    os._exit(1)
 
     _ = atexit.register(finish)

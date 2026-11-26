@@ -1,7 +1,7 @@
 """Protect the live configuration folder during a Python test run."""
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 import fcntl
 from inspect import getsource
@@ -14,8 +14,10 @@ class LiveConfigWrite(AssertionError):
     """A test attempted to change the live configuration folder."""
 
 
-def install_live_config_guard(folder: str, violation_log: str, startup_hook: str) -> None:
+def install_live_config_guard(folder: str, violation_log: str, startup_hook: str) -> Callable[[], None]:
     """Reject Python writes to the live config and record the first attempt."""
+    from contextvars import ContextVar
+
     canonical = os.path.realpath
 
     def entry_path(path: str) -> str:
@@ -26,6 +28,22 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
     prefixes = tuple(root.rstrip(os.sep) + os.sep for root in roots)
     reported = False
     write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+    original_open = os.open
+    open_directory = ContextVar[int | None]("live_config_open_directory", default=None)
+
+    def guarded_open(path: str | bytes | os.PathLike[str] | os.PathLike[bytes], flags: int, mode: int = 0o777, *,
+                     dir_fd: int | None = None) -> int:
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        token = open_directory.set(dir_fd)
+        try:
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+        finally:
+            open_directory.reset(token)
+
+    def restore_open() -> None:
+        os.open = original_open
+        os.supports_dir_fd.discard(guarded_open)
 
     def descriptor_path(descriptor: int) -> str:
         if sys.platform == "darwin":
@@ -52,16 +70,20 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
         if resolved in roots or resolved.startswith(prefixes):
             if not os.path.isfile(startup_hook):
                 return
+            test_id = os.environ.get("DEVTOOLS_TEST_ID")
+            message = f"Test attempted to write live configuration at {absolute}"
+            if test_id:
+                message += f" (test {test_id})"
             if not reported:
                 try:
                     with open(violation_log, "a", encoding="utf-8", errors="backslashreplace") as log:
-                        _ = log.write(f"{absolute}\n")
+                        _ = log.write(f"{message}\n")
                 except FileNotFoundError:
                     if not os.path.isfile(startup_hook):
                         return
                     raise
                 reported = True
-            raise LiveConfigWrite(f"Test attempted to write live configuration at {absolute}")
+            raise LiveConfigWrite(message)
 
     def check_entry(value: object, directory_fd: object = -1) -> None:
         check(value, directory_fd, follow_entry=False)
@@ -69,10 +91,10 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
     def audit(event: str, arguments: tuple[object, ...]) -> None:
         if event == "open":
             path, _, flags = arguments
-            # The event omits dir_fd. The working directory may be wrong.
-            if isinstance(flags, int) and flags & write_flags and isinstance(path, (str, bytes)) and os.path.isabs(path):
+            # The event omits dir_fd. Use the directory from guarded_open when it has one.
+            if isinstance(flags, int) and flags & write_flags:
                 exclusive = flags & os.O_CREAT and flags & os.O_EXCL
-                check(path, follow_entry=not (flags & os.O_NOFOLLOW or exclusive))
+                check(path, open_directory.get(), follow_entry=not (flags & os.O_NOFOLLOW or exclusive))
         elif event in {"os.rename", "os.link"}:
             check_entry(arguments[0], arguments[2])
             check_entry(arguments[1], arguments[3])
@@ -86,6 +108,10 @@ def install_live_config_guard(folder: str, violation_log: str, startup_hook: str
             check(arguments[0], follow_entry=True)
 
     sys.addaudithook(audit)
+    os.open = guarded_open
+    if original_open in os.supports_dir_fd:
+        os.supports_dir_fd.add(guarded_open)
+    return restore_open
 
 
 @contextmanager
@@ -122,10 +148,11 @@ if spec is not None and spec.loader is not None:
     previous = os.environ.get("PYTHONPATH")
     os.environ["PYTHONPATH"] = (str(hook.parent) if previous is None
                                 else os.pathsep.join((str(hook.parent), previous)))
-    install_live_config_guard(str(folder), str(violation_log), str(hook))
+    restore_open = install_live_config_guard(str(folder), str(violation_log), str(hook))
     try:
         yield
     finally:
+        restore_open()
         if previous is None:
             _ = os.environ.pop("PYTHONPATH", None)
         else:
@@ -133,4 +160,4 @@ if spec is not None and spec.loader is not None:
         hook.unlink(missing_ok=True)
         if violation_log.exists():
             with violation_log.open(encoding="utf-8") as log:
-                raise LiveConfigWrite(f"Test attempted to write live configuration at {log.readline().rstrip()}")
+                raise LiveConfigWrite(log.readline().rstrip())

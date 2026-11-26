@@ -414,7 +414,18 @@ def _unittest_boundary(module: ModuleType) -> None:
         @wraps(method)
         def run(*args: object, **kwargs: object) -> object:
             begin()
-            return method(*args, **kwargs)
+            test = args[0] if owner is TestCase and args else None
+            if not isinstance(test, TestCase):
+                return method(*args, **kwargs)
+            previous = os.environ.get("DEVTOOLS_TEST_ID")
+            os.environ["DEVTOOLS_TEST_ID"] = test.id()
+            try:
+                return method(*args, **kwargs)
+            finally:
+                if previous is None:
+                    _ = os.environ.pop("DEVTOOLS_TEST_ID", None)
+                else:
+                    os.environ["DEVTOOLS_TEST_ID"] = previous
 
         setattr(owner, method.__name__, run)
 
