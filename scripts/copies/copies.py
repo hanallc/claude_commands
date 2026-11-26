@@ -3191,35 +3191,26 @@ def receive_metadata(tree: Path, args: CopyArguments) -> None:
     authority.unlink(missing_ok=True)
 
 
-def receiver_channel_closed(channel: int, pid: int) -> bool:
-    """Detect channel closure without taking protocol bytes from rsync."""
+def receiver_channel_closed(channel: int, lifetime: int) -> bool:
+    """Watch for channel closure until the inherited pipe reaches EOF."""
     mode = os.fstat(channel).st_mode
     if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
         return False
     if sys.platform == "darwin":
         with closing(select.kqueue()) as queue:
-            process = select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-                                     select.KQ_NOTE_EXIT)
-            try:
-                _ = queue.control([process], 0)
-            except ProcessLookupError:
-                return False
-            incoming = select.kevent(channel, select.KQ_FILTER_READ, select.KQ_EV_ADD | select.KQ_EV_CLEAR)
-            _ = queue.control([incoming], 0)
+            # The write filter on a read-only pipe reports EOF.
+            channel_filter = select.KQ_FILTER_WRITE if stat.S_ISFIFO(mode) else select.KQ_FILTER_READ
+            incoming = select.kevent(channel, channel_filter, select.KQ_EV_ADD | select.KQ_EV_CLEAR)
+            completion = select.kevent(lifetime, select.KQ_FILTER_READ, select.KQ_EV_ADD | select.KQ_EV_CLEAR)
+            _ = queue.control([incoming, completion], 0)
             while True:
-                events = queue.control(None, 2)
-                if any(event.filter == select.KQ_FILTER_READ and event.flags & select.KQ_EV_EOF for event in events):
-                    return True
-                if any(event.filter == select.KQ_FILTER_PROC for event in events):
-                    return False
-    child = os.pidfd_open(pid)
-    try:
-        events = select.poll()
-        events.register(channel, select.POLLRDHUP)
-        events.register(child, select.POLLIN)
-        return any(descriptor == channel for descriptor, _ in events.poll())
-    finally:
-        os.close(child)
+                closed = {event.ident for event in queue.control(None, 2) if event.flags & select.KQ_EV_EOF}
+                if closed:
+                    return channel in closed
+    events = select.poll()
+    events.register(channel, select.POLLRDHUP)
+    events.register(lifetime, select.POLLHUP)
+    return any(descriptor == channel for descriptor, _ in events.poll())
 
 
 def run_mirror_receiver(command: list[str], descriptors: tuple[int, ...], environment: dict[str, str]) -> int:
@@ -3231,14 +3222,14 @@ def run_mirror_receiver(command: list[str], descriptors: tuple[int, ...], enviro
             inherited.close()
             disconnected = True
             try:
-                disconnected = receiver_channel_closed(0, group)
+                disconnected = receiver_channel_closed(0, reading)
             finally:
                 if disconnected:
                     # Keep the leader PID until after the signal, so the group ID cannot be reused.
                     with suppress(ProcessLookupError):
                         os.killpg(group, signal.SIGKILL)
-                    # Rsync forks with these descriptors. EOF also covers its children.
-                    _ = lifetime.read(1)
+                # Every inherited pipe writer must close before the lease can end.
+                _ = lifetime.read(1)
             return child.wait()
 
 

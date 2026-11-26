@@ -644,6 +644,51 @@ signal.pause()
                 unrelated.kill()
             _ = unrelated.wait(timeout=5)
 
+    @unittest.skipUnless(sys.platform == "linux", "The test uses pidfds to confirm process exit")
+    def test_cut_receiver_ends_its_child_after_the_leader_exits(self) -> None:
+        program = """\
+import os, signal
+child = os.fork()
+if child:
+    print(os.getpid(), child, flush=True)
+    assert os.read(0, 1) == b"x"
+    os._exit(23)
+signal.pause()
+"""
+
+        def stop_child(descriptor: int) -> None:
+            with suppress(ProcessLookupError):
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+
+        command = self.mirror_receiver("cut-session", sys.executable, "-c", program)
+        with (subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as receiver,
+              ExitStack() as descriptors):
+            try:
+                assert receiver.stdin is not None and receiver.stdout is not None
+                self.assertTrue(select.select([receiver.stdout], [], [], 10)[0], "The receiver did not start")
+                leader, child = map(int, cast(str, receiver.stdout.readline()).split())
+                child_exit = os.pidfd_open(child)
+                _ = descriptors.callback(os.close, child_exit)
+                _ = descriptors.callback(stop_child, child_exit)
+                leader_exit = os.pidfd_open(leader)
+                _ = descriptors.callback(os.close, leader_exit)
+                _ = receiver.stdin.write("x")
+                receiver.stdin.flush()
+                self.assertTrue(select.select([leader_exit], [], [], 5)[0], "The leader did not exit")
+                with self.assertRaisesRegex(copies.CopyError, "cut-session"):
+                    with copies.local_mirror_lease(self.mirror, "busy-check"):
+                        self.fail("The active child lost its lease")
+                self.assertEqual(os.getpgid(leader), leader, "The receiver reaped the leader")
+
+                receiver.stdin.close()
+                self.assertEqual(receiver.wait(timeout=5), 23)
+                self.assertTrue(select.select([child_exit], [], [], 5)[0], "The child survived the channel cut")
+                with copies.local_mirror_lease(self.mirror, "after-cut"):
+                    pass
+            finally:
+                if receiver.poll() is None:
+                    receiver.kill()
+
     def test_normal_remote_rsync_releases_the_receiver_lease(self) -> None:
         mirror = self.remote(path=str(self.mirror))
         exclude = self.root / "excludes"
