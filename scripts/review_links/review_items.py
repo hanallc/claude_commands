@@ -20,8 +20,7 @@ from scripts.agents.remote import local_machine
 if TYPE_CHECKING:
     from scripts.production.update_registration import QuestionStaff
 
-from scripts.lib import urgency
-from scripts.lib import user_zone as user_zone_config
+from scripts.lib import conf, urgency
 from scripts.lib.user_zone import user_zone
 from scripts.nightly_review import candidates
 from scripts.production import change_review, change_routing, delivery_state, investigation, staff, update_registration
@@ -328,7 +327,7 @@ class ReviewItem:
 
     def for_you(self, now: datetime) -> bool:
         """Count Open records whose next action belongs to the user."""
-        return self.queue_at(now) is question_path.Queue.NEEDS_ME
+        return not on_list(self) and self.queue_at(now) is question_path.Queue.NEEDS_ME
 
     def hidden_until(self, now: datetime) -> bool:
         return self.queue_at(now) is question_path.Queue.LATER
@@ -940,6 +939,94 @@ def investigation_items(members: staff.StaffSnapshot, *, owners: tuple[staff.Sta
 
 def investigation_type(record: investigation.Investigation) -> ReviewType:
     return ReviewType.BUG if record.kind == investigation.InvestigationKind.BUG else ReviewType.INVESTIGATION
+
+
+def on_list(item: ReviewItem) -> bool:
+    """Check if the source record belongs to a List item."""
+    source = item.source
+    if isinstance(source, InvestigationSource) and source.record.belongs_on_list:
+        return True
+    return any(list_move_event(event) for event in item.log)
+
+
+def list_move_event(event: ReviewLog) -> bool:
+    words = cast(object, event.words)
+    return (event.who == 'nate' and isinstance(words, str)
+            and re.fullmatch(r'moved to List item [1-9][0-9]*', words) is not None)
+
+
+def change_on_list(row: dict[str, str]) -> bool:
+    return any(list_move_event(event) for event in review_events.decode(row.get('Review log', '')))
+
+
+def can_move_wait(item: ReviewItem) -> bool:
+    return (item.type != ReviewType.FOR_YOU and item.state in (ReviewState.WAITING, ReviewState.VALIDATING)
+            and not on_list(item))
+
+
+def list_reply(item: ReviewItem) -> str:
+    """Read the latest reply from the native evidence for the List."""
+    source = item.source
+    if isinstance(source, ChangeSource):
+        question = source.slots.question
+        return question.answer if isinstance(question, delivery_state.AnsweredQuestion) else ''
+    for index in reversed(range(len(item.log))):
+        words = item.log[index].words
+        if words.startswith('Answer: '):
+            return words.removeprefix('Answer: ')
+        if index in item.body_answer_events:
+            return words
+    return ''
+
+
+@dataclass(frozen=True)
+class ValidationLogStart:
+    first_result_index: int
+
+
+class LegacyValidationLog(StrEnum):
+    MOVE_MARKER = 'use the List move entry'
+
+
+def validation_request_words(feedback: str) -> str:
+    return 'validate' + (': ' + feedback if feedback else '')
+
+
+def validation_log_start(row: dict[str, str], pending_request: str = '') -> ValidationLogStart:
+    """Start at the next log entry after the validation request."""
+    events = review_events.decode(row.get('Review log', ''))
+    if pending_request and not any(
+            (event.who, event.words, event.feedback_request_id) == ('nate', pending_request, '')
+            for event in events[-1:]):
+        return ValidationLogStart(len(events)+1)
+    return ValidationLogStart(len(events))
+
+
+def validation_problem(item: ReviewItem, list_number: int, start: ValidationLogStart | LegacyValidationLog) -> str:
+    """Read the problem for the validation that moved to this List item."""
+    source = item.source
+    if not isinstance(source, ChangeSource):
+        return ''
+    log = review_events.decode(source.row.get('Review log', ''))
+    if isinstance(start, ValidationLogStart):
+        events = iter(log[start.first_result_index:])
+    else:
+        marker = f'moved to List item {list_number}'
+        events = iter(log)
+        for event in events:
+            if event.who == 'nate' and event.words == marker:
+                break
+        else:
+            return ''
+
+    prefix = 'Check found a problem: '
+    problem = ''
+    for event in events:
+        if event.words.partition(':')[0] == 'validate':
+            break
+        if event.words.startswith(prefix):
+            problem = event.words.removeprefix(prefix)
+    return problem
 
 
 def investigation_item(record: investigation.Investigation, members: staff.StaffSnapshot, path: Path, *,
@@ -1623,7 +1710,7 @@ def question_counts(owner: staff.StaffRow, _production_zone: ZoneInfo, identitie
                     source: str = '') -> tuple[int,str]:
     """Count Questions in the same zone as Review and /next."""
     if sources is not None and not os.environ.get('USER_ZONE'):
-        sources.append(Path(user_zone_config.CONF))
+        sources.append(conf.path('user_zone'))
     zone = user_zone()
     items = read_kind(ReviewType.QUESTION,owner,identities.record,sources=sources,show='open',zone=zone)
     now = datetime.now(zone)

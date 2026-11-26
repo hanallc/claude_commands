@@ -164,6 +164,7 @@ The shared pane launch builder uses `set_home`.
 | `docs/production_format.md` | read | staff.py get (shell) |
 | `scripts/accounts/accounts.py` | read | local_snapshot |
 | `scripts/accounts/move_test_support.py` | read | StaffId (fixture type) |
+| `scripts/accounts/moves.py` | read | native_id checks a saved move member reference |
 | `scripts/accounts/pane_moves.py` | read | local_snapshot, WorkerName.parse |
 | `scripts/accounts/refusal_watch.py` | read | initial_snapshot |
 | `scripts/accounts/session_state.py` | read | StaffRow, Exited, Paused |
@@ -269,6 +270,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/add_showrunner_test_support.py` | read | staff.json path |
 | `scripts/production/add_unit.py` | write | cli_result, ensure, initial_snapshot, native_id, operation, row_operation, set_worktree |
 | `scripts/production/add_unit_test_support.py` | write | find, native_id, record_production, set_worktree, update_current_session |
+| `scripts/production/behavior_request.py` | read | StaffId identifies the List keeper from the saved item path. |
 | `scripts/production/behavior_review.py` | read | caller_identity identifies the requester. StaffId identifies the owner of the saved question. StaffRefused reports a staff refusal. |
 | `scripts/production/broadcast.py` | read | initial_snapshot supplies producer membership. StaffUnreadable reports a failure to read it. |
 | `scripts/production/census.py` | read | StaffId |
@@ -344,6 +346,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/production/worker.py` | write | backend, snapshot, runtime_id, row_operation, retire |
 | `scripts/production/worker_admission.py` | write | by_current_session, ensure_worker, native_id, runtime_id, snapshot, update_current_session |
 | `scripts/production/worker_capacity.py` | read | snapshot, local_snapshot, WorkerName.parse, CodexBackend; staff writes go through restart.stop_row and worker_panes.close |
+| `scripts/review_links/accounts_page.py` | read | local_snapshot, by_id, native_id and row_activity show the retry button only for a free failed move member |
 | `scripts/review_links/branch_page.py` | read | snapshot, worktree_machine, by_id, by_current_session, caller_identity; session_staff.RowResolver reads branches and production docs |
 | `scripts/review_links/change_browser.py` | read | QuestionStaff.read resolves question answer recipients; the shared routing record supplies question owners |
 | `scripts/review_links/change_page.py` | read | snapshot resolves Review owners; QuestionStaff.read resolves saved questions during delivery recovery and owner answers; source_name names each source |
@@ -409,7 +412,7 @@ The shared pane launch builder uses `set_home`.
 | `scripts/worktree/worktrees.py` | read | snapshot, StaffSnapshot, StaffAbsent, StaffRefused |
 | `~/rust/cargo-liner-handler/crates/cargo-handler/src/census/hierarchy.rs` | read | StaffFileReader reads staff.json (Rust, direct) |
 
-The table has 254 accessor rows (44 write, 209 read, and 1 owner).
+The table has 255 accessor rows (44 write, 210 read, and 1 owner).
 
 ## Approved copies
 

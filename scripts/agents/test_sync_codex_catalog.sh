@@ -94,7 +94,8 @@ from pathlib import Path
 import re
 import sys
 path = Path(sys.argv[1])
-path.write_text(re.sub(r"^(direct|gpt-[^=\n]*)=", r"\1 = ", path.read_text(), flags=re.MULTILINE))
+text = path.read_text().replace("\n\n[codex.families]", "\n[codex.families]")
+path.write_text(re.sub(r"^(direct|gpt-[^=\n]*)=", r"\1 = ", text, flags=re.MULTILINE))
 PYTHON
     printf '%s\n' 'model = "gpt-9-sol"' > "$CODEX_CONFIG"
     cat > "$MODELS_CACHE" <<'EOF'
@@ -127,6 +128,16 @@ EOF
         || fail "sync duplicated the generated family section"
     grep -q '^sol=gpt-6.10-sol$' "$AGENTS" \
         || fail "family sync did not update the shared registry"
+    "$SCRIPT_DIR/../lib/py" - "$AGENTS" <<'PYTHON'
+from pathlib import Path
+import sys
+from scripts.lib.test_config_form import check_blank_lines
+
+path = Path(sys.argv[1])
+violations = check_blank_lines(path.parent, [Path(path.name)])
+if violations:
+    sys.exit("\n".join(violation.diagnostic() for violation in violations))
+PYTHON
     [[ -f "$SYNC_STATE" ]] || fail "complete family sync did not close the freshness gate"
     run_sync --check >/dev/null 2>"$STDERR_FILE" \
         || fail "--check rejected the synced family catalog: $(<"$STDERR_FILE")"

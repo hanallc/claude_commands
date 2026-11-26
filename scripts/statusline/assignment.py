@@ -297,10 +297,11 @@ class ActionFields:
 
 
 def read_actions(*, remote: bool) -> RenderRead[ActionFields]:
+    from scripts.lib import conf
     from scripts.statusline import rebuild_row
 
     sources = RenderSources()
-    config = rebuild_row.DEFAULT_CONFIG
+    config = conf.path("statusline")
     actions_count, waiting_rebuilds = "unavailable", ""
     refresh_due, deadline = False, 0
     try:
@@ -394,20 +395,22 @@ def render_status(*, remote: bool) -> None:
     adhoc = read_adhoc(session_id)
     actions = read_actions(remote=remote)
     if actions.value.refresh_due:
+        from scripts.lib import conf
         from scripts.statusline import rebuild_row
 
         try:
             _ = subprocess.Popen(
-                [sys.executable, "-I", str(Path(rebuild_row.__file__).resolve()), "refresh", "--config", str(rebuild_row.DEFAULT_CONFIG)],
+                [sys.executable, "-I", str(Path(rebuild_row.__file__).resolve()), "refresh",
+                 "--config", str(conf.path("statusline"))],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
         except OSError:
             pass
     if cacheable:
-        from scripts.lib import user_zone
+        from scripts.lib import conf
 
-        sources.watch(Path(user_zone.CONF))
+        sources.watch(conf.path("user_zone"))
     counts = read_counts(members.value, session_id)
     fields = dict(assignment=label, role=role, counts=counts.value, branch=branch.value,
                   adhoc=adhoc.value, for_you=actions.value.other_count, rebuild=actions.value.waiting_rebuilds)

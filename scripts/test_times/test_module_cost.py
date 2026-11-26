@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from scripts.lib.checkout_test_support import copy_test_runner
 
-from contextlib import ExitStack, redirect_stderr, redirect_stdout, suppress
+from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout, suppress
 import ctypes
 import errno
 import fcntl
@@ -19,17 +19,28 @@ import sys
 import tempfile
 import threading
 import time
-from typing import cast
+from typing import TextIO, cast, override
 import unittest
 from unittest import mock
 
 from scripts.lib.descendants import adopt_descendants
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.test_times import module_cost, task_cpu
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
 
 
 class ModuleCostTests(unittest.TestCase):
+    config: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory())) / "config"
+        self.config = folder / "test_times.conf"
+        _ = write_config_fixture(self.config, "# whole: 1..\nmodule_cost.max_output_replay_bytes=1048576\n")
+        _ = config_environment(folder)
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {"CONF_DIR": str(folder)})))
+
     def test_reads_task_ids_without_decoding_the_task_name(self) -> None:
         samples = [
             (b"Name:\tworker\nTgid:\t401\nPid:\t402\nPPid:\t202\n", (401, 202)),
@@ -458,15 +469,38 @@ with (mock.patch.object(module_cost, 'supervise', side_effect=stall),
             self.assertEqual(result.si_status, 0)
 
     def test_replay_caps_snapshot_bytes_and_prints_one_notice(self) -> None:
-        limit = module_cost.OUTPUT_REPLAY_LIMIT_BYTES
-        prefix = "a" * (limit - 2) + "é"
-        stream = io.StringIO()
-        with module_cost.child_output(stream) as output:
-            _ = output.write(prefix + "discard this suffix\n")
-            output.flush()
-        replay, notice = stream.getvalue().splitlines()
-        self.assertTrue(replay == prefix, "The replay changed or exceeded the byte limit")
-        self.assertEqual(notice, f"module_cost: output truncated after {limit} bytes")
+        def produce(text: str) -> int:
+            def start(request: object, timeout_s: float, stdout: TextIO, stderr: TextIO) -> int:
+                del request, timeout_s
+                for stream in (stdout, stderr):
+                    _ = stream.write(text + "discard this suffix\n")
+                    stream.flush()
+                return 0
+            with mock.patch.object(module_cost, "start_supervisor", start):
+                return module_cost.main(["--tree", ".", "fixture/test_pause.py"])
+
+        for limit in (1_048_576, 129):
+            with self.subTest(limit=limit):
+                _ = write_config_fixture(self.config, f"module_cost.max_output_replay_bytes={limit}\n")
+                prefix = "a" * (limit - 2) + "é"
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(produce(prefix), 0)
+                for stream in (stdout, stderr):
+                    replay, notice = stream.getvalue().splitlines()
+                    self.assertTrue(replay == prefix, "The replay changed or exceeded the byte limit")
+                    self.assertEqual(notice, f"module_cost: output truncated after {limit} bytes")
+
+    def test_unusable_replay_limit_refuses_before_starting_the_supervisor(self) -> None:
+        _ = write_config_fixture(self.config, "module_cost.max_output_replay_bytes=0\n")
+        errors = io.StringIO()
+        with (mock.patch.object(module_cost, "start_supervisor", return_value=0) as start,
+              redirect_stderr(errors)):
+            status = module_cost.main(["--tree", ".", "fixture/test_pause.py"])
+        self.assertEqual(status, 1)
+        self.assertIn("module_cost.max_output_replay_bytes", errors.getvalue())
+        self.assertIn("no usable committed value", errors.getvalue())
+        start.assert_not_called()
 
     @unittest.skipUnless(sys.platform == "linux", "Linux is required")
     def test_deferred_reaper_preserves_a_callers_child_after_another_reaper_collects_the_supervisor(self) -> None:

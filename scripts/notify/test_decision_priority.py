@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.notify import decision_priority
 from scripts.notify import silence
 from scripts.notify import pushover
@@ -29,6 +30,7 @@ class DecisionPriorityTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(self.root)})))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(self.root / "notify")})))
         _ = self.enterContext(patch.object(pushover, "log"))
+        _ = write_config_fixture(self.root / "notify.conf")
         self.configure(1800)
 
     def configure(self, seconds: int) -> None:

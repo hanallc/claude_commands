@@ -13,6 +13,7 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.accounts import accounts, next_moves, role_map
+from scripts.lib import conf
 from scripts.notify import push_texts, pushover, review, silence
 from scripts.notify.user_action import ActionRequired
 from scripts.review_links import accounts_page
@@ -116,6 +117,16 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
         _ = self.alert([self.note("claude1.md", "active", "20"), self.note("claude2.md", "active", "20"),
                         self.note("claude3.md", "active", "20")])
 
+        self.assertEqual(self.expiry_accounts(), ["claude2"])
+
+    def test_a_short_rise_after_refill_can_send_an_expiry_push(self) -> None:
+        lookback = conf.read("accounts").whole("rate.lookback_minutes")
+        readings = [run_out.Reading(self.now - timedelta(minutes=lookback), 100),
+                    run_out.Reading(self.now - timedelta(minutes=10), 98),
+                    run_out.Reading(self.now - timedelta(minutes=5), 19),
+                    run_out.Reading(self.now, 20)]
+        with mock.patch.object(run_out, "read_readings", return_value={"claude2": readings}):
+            _ = self.alert([self.recorded_note(self.now, 80)])
         self.assertEqual(self.expiry_accounts(), ["claude2"])
 
     def test_forecast_after_reset_or_outside_the_window_stays_silent(self) -> None:
@@ -292,14 +303,23 @@ class ClaudeExpiryTests(support.SeededQuotaReminderFixture):
             self.assertEqual(pushover.send(argv), 0)
             deliver.assert_called_once()
 
-    def test_forecast_uses_the_age_and_balance_of_the_latest_reading(self) -> None:
+    def test_forecast_uses_the_latest_balance_and_starts_at_now(self) -> None:
         observed = self.now - timedelta(minutes=10)
         left = 24 + 1 / 6
+        self.save_rates(self.now, {"claude2": 2}, left=left)
+        note = self.recorded_note(self.now, left)
+        _ = self.alert([note])
+        self.assertEqual(self.expiry_accounts(), [])
+
+        config = quota_alert.CONFIG
+        settings = config.read_text(encoding="utf-8")
+        _ = config.write_text(settings.replace("claude_expiry.alert_hours=12", "claude_expiry.alert_hours=13"),
+                              encoding="utf-8")
         self.save_rates(observed, {"claude2": 2}, left=left)
         _ = self.alert([self.recorded_note(observed, left)])
 
         self.assertEqual(self.expiry_accounts(), ["claude2"])
-        self.assertEqual((self.noted[0].title, self.noted[0].body), ("claude2 runs out Sun 11-22 04:55 EST", ""))
+        self.assertEqual((self.noted[0].title, self.noted[0].body), ("claude2 runs out Sun 11-22 05:05 EST", ""))
 
     def test_each_host_override_needs_a_whole_number_limit(self) -> None:
         config = quota_alert.CONFIG

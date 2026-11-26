@@ -101,8 +101,8 @@ def describe(zone: str) -> str:
 
 
 def stored(conf: Path) -> str:
-    """The file's zone= value, or the default when the file or the line is missing."""
-    return user_zone.stored_zone(str(conf)) or user_zone.DEFAULT_ZONE
+    """Read the file's zone or recover a committed zone."""
+    return user_zone.configured_zone_name(conf)
 
 
 def _ssh(remote: str) -> subprocess.CompletedProcess[str] | str:
@@ -191,10 +191,7 @@ def set_zone(name: str) -> int:
     if platform.system() == "Darwin":
         raise Refusal("run /zone on natedev: the Mac pulls ~/.claude main from there")
     zone = resolve(name)
-    conf = Path(user_zone.CONF)
-    if conf.resolve() != config.path(STEM).resolve():
-        raise Refusal(f"{conf} is not the live settings file {config.path(STEM)}")
-    checkout = checkout_of(conf)
+    checkout = checkout_of(config.path(STEM))
     print(f"zone: {describe(zone)}")
     delivered = True
     label = datetime.now(ZoneInfo(zone)).tzname() or zone
@@ -231,7 +228,7 @@ def set_zone(name: str) -> int:
 
 def show() -> int:
     print(f"zone: {describe(user_zone.user_zone_name())}")
-    checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
+    checkout = None if platform.system() == "Darwin" else checkout_of(config.path(STEM))
     for line in drain(checkout, pulled=None):
         print(line)
     return 0
@@ -245,7 +242,7 @@ def main(arguments: list[str]) -> int:
             case ["set", name]:
                 return set_zone(name)
             case ["drain"] | ["drain", "--pulled", _]:
-                checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
+                checkout = None if platform.system() == "Darwin" else checkout_of(config.path(STEM))
                 pulled = PurePosixPath(arguments[2]) if len(arguments) == 3 else None
                 for line in drain(checkout, pulled=pulled):
                     print(line)

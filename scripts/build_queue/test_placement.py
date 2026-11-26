@@ -153,7 +153,7 @@ def mac_linux_fixture(fixture: AdmissionFixture, *, enabled: str = "on", registe
         + f"enabled.mac-linux={enabled}\nunreachable_wait_seconds=600\n")
     _ = (fixture.root / "mac_linux.conf").write_text(
         "ssh.hops=fixture-mac fixture-guest\nguest.user=fixture\ntest.jobs=8\n"
-        + "run.time_limit_seconds=7200\n")
+        + "run.time_limit_seconds=7200\n\n# whole: 1..\nssh.connect_attempts=3\n")
     backoff = fixture.root / ".local/state/build-targets/mac-linux/unreachable_until"
     backoff.parent.mkdir(parents=True, exist_ok=True)
     return backoff
@@ -1674,6 +1674,15 @@ class PlacementTests(unittest.TestCase):
                     assert isinstance(reply, wire.Assignment), reply
                     self.assertEqual(reply.assignment.destination, guest.destination)
                     continue
+                if case == "stale":
+                    assert isinstance(reply, wire.PlacementWait), reply
+                    self.assertEqual(reply.wait, wire.PlacementEvidenceWait())
+                    self.assertEqual(reply.eligibility, (
+                        placement.CandidateEligibility(guest.destination, placement.EvidenceNeeded(reason)),
+                        placement.CandidateEligibility(local_candidate(fixture).destination, ALLOWED_HOST),
+                    ))
+                    self.assertNotIn(request.episode, fixture.server.reservations)
+                    continue
                 assert isinstance(reply, wire.LocalPlacementGranted), reply
                 self.assertEqual(reply.assignment.destination, local_candidate(fixture).destination)
                 self.assertEqual(fixture.server.placement_eligibility[request.episode][0],
@@ -1743,7 +1752,7 @@ class PlacementTests(unittest.TestCase):
                 waiting, = fixture.server.handle_request(request)
                 assert isinstance(waiting, wire.PlacementWait), waiting
                 self.assertEqual(waiting.eligibility[0].eligibility,
-                                 placement.TemporaryExclusion("mac_linux_reading_required"))
+                                 placement.EvidenceNeeded("mac_linux_reading_required"))
                 _ = publish_candidate(fixture, request)
                 _ = fixture.run_pass()
                 assignment = assignment_for(fixture, request)
@@ -1898,7 +1907,7 @@ class PlacementTests(unittest.TestCase):
                     return reply
 
                 with (mock.patch.object(mac_linux, "new_run_settings", return_value=mac_linux.GuestSettings(
-                          ("fixture-mac", "fixture-guest"), "fixture", 1, 60, 5)),
+                          ("fixture-mac", "fixture-guest"), "fixture", 1, 60, 5, connect_attempt_limit=3)),
                       mock.patch.object(mac_linux, "candidate_source", return_value=source),
                       mock.patch.object(mac_linux, "read_guest_checkout", return_value=checkout),
                       mock.patch.object(mac_linux, "mac_linux_reservation", return_value=nullcontext(claim)),
@@ -3518,7 +3527,7 @@ class PlacementTests(unittest.TestCase):
             claim = placement.ProviderClaimReference(guest.destination.provider, guest.destination.target,
                 guest.destination.scope, claim_id, guest.episode, guest.attempt)
             guest_claim = claim_state.ClaimIdentity(claim_id, guest.episode, guest.attempt)
-            settings = mac_linux.GuestSettings(("fixture-mac", "fixture-guest"), "guest", 1, 10, 20)
+            settings = mac_linux.GuestSettings(("fixture-mac", "fixture-guest"), "guest", 1, 10, 20, connect_attempt_limit=3)
             checkout = mac_linux.GuestCheckoutIdentity("guest-machine", "/fixture")
             source = mac_linux.CandidateSource("head", "commit", "tree", "main", "origin", "runner",
                                                frozenset({"module"}), ModuleCoverage.COMPLETE)

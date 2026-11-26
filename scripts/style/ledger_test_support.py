@@ -29,6 +29,7 @@ from scripts.style.style_reader_test_support import oracle_reader
 from scripts.production import staff
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file
 from scripts.herdr.missing_binary import MISSING_HERDR_BIN
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 if TYPE_CHECKING:
     from scripts.style import declarations
@@ -210,6 +211,10 @@ class LedgerTestCase(unittest.TestCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         cls.template_repo = Path(cls.enterClassContext(tempfile.TemporaryDirectory())) / "sample"
+        config = cls.template_repo.parent / "config"
+        _ = write_config_fixture(config / "style_ledger.conf", "# whole: 1..\nwrite.lock_attempts=3\n")
+        _ = config_environment(config)
+        _ = cast(object, cls.enterClassContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)})))
         cls.template_repo.mkdir()
         fixture = cls(methodName="runTest")
         fixture.repo = cls.template_repo
