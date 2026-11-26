@@ -469,8 +469,10 @@ A row with no unit starts with its owner. Mac rows carry the owner and step in s
 For other rows with no unit, the text before `: ` gives the owner. The text after `: ` goes in Step.
 An owner with a staff entry shows in its staff color. An owner without a staff entry shows in plain ink.
 For natedev and Mac CI, the feed sends the showrunner from the text before ` CI` in the `ci_label` setting.
-The current setting gives `hana`. The runner and job go in the tooltip title.
-A row with no unit has no small line, because the line would repeat the owner.
+The current setting gives `hana`.
+A CI row shows the step in the heading, for example `CI nextest`, and `hana` below it.
+The runner and job appear only in the tooltip title.
+Other rows with no unit leave the small line empty.
 The "what" is the caller's own text when the request identity has a `what` field, and else the step name. `mac_queue_run.py` writes its `--what` text as the `what` field of the `--assignment-file` JSON, next to `episode` and `pid`. `place-step` reads that field before placement and the queue record keeps it, so a Mac run row shows, for example, `cargo-liner: run 6 installs`. An assignment file with no `what` keeps the step name.
 `snapshot_codec.owner_name` gives the owner of local, remote, and cloud rows in this order.
 1. The recorded unit, then the staff unit.
@@ -1265,9 +1267,11 @@ A later read can replace this fallback with a usable name.
 The service refuses new admissions and placements that resolve to this fallback.
 A terminal, CI runner, named timer, or named session can still submit work.
 A showrunner needs no unit.
-The service sends bob one alert per repository and folder through the outage alert ledger.
+The service sends bob one alert per cause through the outage alert ledger.
+The key uses a hash of the repository and folder and a hash of the given ID or name and the command program.
+The key has no process ID or time.
 The sender runs outside the admission pass.
-A named admission from that repository and folder clears the alert.
+A named admission clears all older alerts for that repository and folder.
 The shared name check rejects blank text, dashes, raw IDs, text with `$`, and the fallback label.
 A staff unit uses its own name for priority. A worker uses its parent unit.
 A showrunner keeps its caller name and has an empty unit.
@@ -2697,7 +2701,15 @@ It reads the session from the copy record or the process environment.
 The decoder also accepts `launcher_session` from older readings when the shared session field is empty or absent.
 A Mac unit row shows the unit in its unit color and the showrunner below it.
 A showrunner's own row shows the showrunner in the showrunner color.
-If the feed finds no staff row, the row shows the checkout folder name with no small line.
+If the reader and staff lookup find no owner, the row shows the checkout folder name with no small line.
+For a direct non-CI Mac build, the reader uses the agent ID from the process environment when available.
+Without an agent ID or a recorded session, a macOS app ancestor gives the name `terminal`.
+This rule covers terminal apps and editors such as Zed.
+If the chain reaches launchd with no app ancestor, the row shows `script · <program>`.
+The name comes from the program that launchd started.
+A shell in a multiplexer shows the multiplexer as a script when launchd is the parent of its server.
+The feed sends bob the same alert as a refusal for a script source.
+It uses the same ledger with an empty ID and the program that launchd started.
 The Step column uses the shared layout.
 The Mac reader identifies hana CI by a `Runner.Worker` or `Runner.Listener` process ancestor.
 A placed Mac row shows only its step name; the placement id stays in the row's `gate_label`.
@@ -2728,7 +2740,7 @@ It aligns Machine, Started, Used, and Reading age in labelled rows.
 A readable counter adds a Progress row.
 A failed or old reading replaces the Mac run rows with one short `Mac builds` status.
 The feed log retains raw errors; the page shows only the status and reading age.
-CI runner records supply the `hana CI` owner for their Running and Waiting steps.
+The CI showrunner name appears below the heading for the Running and Waiting steps.
 The feed matches each step's recorded runner unit to the CI runner records.
 The feed reads runner and Cargo scope membership before it reads the process table.
 It reads anonymous RAM only from live runner processes outside admitted Cargo process trees and scopes.

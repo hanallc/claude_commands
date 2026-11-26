@@ -13,7 +13,7 @@ import os
 import re
 import sqlite3
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
@@ -31,6 +31,7 @@ from typing import Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.accounts import outage_alerts
 from scripts.aws_target import config as aws_config, hana_result, ledger
 from scripts.aws_target.hana_generation import HanaHostGeneration
 from scripts.aws_target.ledger_test_support import install_cost_settings, numeric_settings, text_setting
@@ -1210,6 +1211,36 @@ class MemoryFeedTests(unittest.TestCase):
                         memory_feed.notify_unplaced_mac_runs(replace(reading, unplaced_runs=newer), notified)
                         self.assertEqual(send.call_count, 3)
 
+    def test_mac_script_sources_report_each_program_once(self) -> None:
+        build = queue_view.MacBuild(410, "/Mac/hana", 100, "cargo build", "hana")
+        record = queue_view.mac_build_record(build)
+        nightly = queue_view.mac_build_from_record({**record, "script_source": {
+            "program": "/bin/nightly", "parent_pid": 309, "parent_command": "/bin/zsh nightly.sh"}})
+        retry = replace(nightly, pid=411, started_at=200)
+        other = queue_view.mac_build_from_record({**record, "pid": 412, "script_source": {
+            "program": "/bin/check", "parent_pid": 310, "parent_command": "/bin/check"}})
+        reading = queue_view.MacBuildReading(250, (nightly, retry, other))
+
+        def inline_thread(*, target: Callable[[outage_alerts.AlertClaim, str], None],
+                          args: tuple[outage_alerts.AlertClaim, str], name: str, daemon: bool) -> mock.Mock:
+            self.assertEqual(name, "admission-source-refusal")
+            self.assertTrue(daemon)
+            return mock.Mock(start=lambda: target(*args))
+
+        with (mock.patch("scripts.accounts.outage_alerts._path", return_value=self.root / "alert-ledger.json"),
+              mock.patch.object(admission_service, "threading", mock.Mock(Thread=inline_thread)),
+              mock.patch.object(admission_service, "send_admission_alert", return_value=True) as send):
+            memory_feed.notify_mac_script_sources(reading)
+            memory_feed.notify_mac_script_sources(replace(reading, read_at=300))
+            self.assertEqual(send.call_count, 2)
+            messages = [cast(str, call.args[1]) for call in send.call_args_list]
+            self.assertTrue(all(call.args[0] == "bob" for call in send.call_args_list))
+            self.assertIn("Machine: mac.", messages[0])
+            self.assertIn("Process: 410 cargo build. Parent: 309 /bin/zsh nightly.sh.", messages[0])
+            self.assertIn("Parent: 310 /bin/check.", messages[1])
+            self.assertEqual(outage_alerts.clear_prefix(
+                admission_service.SourceLocation("hana", "/Mac/hana").alert_prefix, time.time() + 1), 2)
+
     def configure(self, *, seconds: float = 0.125) -> None:
         _ = write_config_fixture(self.configuration,
                                  f"output_folder={self.output}\n# range: 5e-324..\ninterval_seconds={seconds}\n"
@@ -2353,6 +2384,22 @@ process.stdout.write(JSON.stringify({
                                       names=read_step_names())
         self.assertEqual((row.get("caller"), row.get("owner_text")), ("mac caller", "mac caller"))
         self.assertEqual(row["name"], "mac caller: nextest")
+
+    def test_mac_work_uses_the_observed_terminal_or_script_name(self) -> None:
+        record = queue_view.mac_build_record(queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana"))
+        for source, expected in (
+            ({"terminal": True}, "terminal"),
+            ({"script_source": {"program": "/usr/local/bin/nightly", "parent_pid": 90081,
+                                "parent_command": "/bin/zsh nightly.sh"}}, "script · nightly"),
+        ):
+            with self.subTest(expected=expected):
+                build = queue_view.mac_build_from_record({**record, **source})
+                identity = unit_labels.UnitLabels("")
+                row = memory_feed.mac_work_row(build, queue_view.MacBuildReading(1, (build,)), identity,
+                                              names=read_step_names())
+                self.assertEqual(row["row_owner"], expected)
+                self.assertEqual(row["row_step"], "nextest")
+                self.assertEqual(row.get("owner_text"), expected)
 
     def test_a_placed_mac_run_shows_the_source_checkout_and_what(self) -> None:
         build = queue_view.MacBuild(90082, "/private/hana", 0, "cargo nextest run", "hana",
@@ -6537,12 +6584,13 @@ def write_browser_fixture(folder: Path) -> None:
         with mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((research_director,))):
             pages["step_owners"] = json.loads(memory_feed.page_json(fixture.owner_machine_page(owner)))
         cast(dict[str, object], pages["step_owners"])["swap_by"] = fixture.owner_swap_reading(owner).rows
+        _ = (fixture.root / "build_admission.conf").write_text("ci_label=hana CI · {runner} · {job}\n")
         ci_page = fixture.owner_machine_page(owner, ci=True)
         ci_row, = [row for row in ci_page["walk"] if row.get("kind") == "mac-build"]
         ci_waiter = ci_page["waiters"][0]
         ci_waiter["name"] = ci_row["name"]
         ci_waiter["title"] = ci_row["title"]
-        ci_waiter["showrunner"] = ""
+        ci_waiter["showrunner"] = ci_row.get("showrunner", "")
         ci_waiter["unit"] = ""
         ci_waiter["detail"] = ""
         ci_waiter["ci_label"] = ci_row.get("ci_label", "")

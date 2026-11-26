@@ -56,7 +56,7 @@ from scripts.build_queue import cloud_progress, limits_view, person_actions, pla
 from scripts.build_targets import targets
 from scripts.build_targets.mac_linux import TRANSFER_ALLOWANCE_SECONDS
 from scripts.build_queue.queue_evidence import service_activity_text, step_labels
-from scripts.build_queue import admission_client, admission_protocol as wire, head_facts, kill_action, queue_view
+from scripts.build_queue import admission_client, admission_protocol as wire, admission_service, head_facts, kill_action, queue_view
 from scripts.build_queue.admission_wire import ReservedCloudSlot
 from scripts.build_queue.queue_lines import age, blocking_step_name, plain, step_owner_name, step_text
 from scripts.build_queue.snapshot_codec import owner_name, row_what
@@ -1743,11 +1743,16 @@ def mac_work_row(build: queue_view.MacBuild, reading: queue_view.MacBuildReading
                                 kind=QueueKind.MAC, what=what)
     shown_step = title_step if what else recorded_step(verb, names)
     ci = build.origin is queue_view.MacBuildOrigin.CI
+    observed_name = build.source_name if placed_step is None and not source_folder else ""
+    if observed_name:
+        identity = unit_labels.UnitLabels("")
     unit = staff_unit(identity, missing="—")
-    caller = "" if label or public_queue_text(identity.owner_text) else codec.select_queue_name(
-        public_owner_name(identity.session, build.session))
+    caller = observed_name or ("" if label or public_queue_text(identity.owner_text) else codec.select_queue_name(
+        public_owner_name(identity.session, build.session)))
     if ci:
         who = QueueKind.CI.value
+    elif observed_name:
+        who = observed_name
     elif verify_source_missing:
         who = ""
     else:
@@ -4178,6 +4183,23 @@ def notify_unplaced_mac_runs(reading: queue_view.MacBuildReading, notified: set[
         notified.update((run.pid, run.started_at) for run in new_runs)
 
 
+def notify_mac_script_sources(reading: queue_view.MacBuildReading) -> None:
+    """Report each Mac script without a named source through the shared ledger."""
+    if reading.error:
+        return
+    for build in reading.builds:
+        script = build.script_source
+        if script is None:
+            continue
+        source = admission_service.SourceLocation(build.repository, build.folder)
+        command = admission_service.source_command_text(build.command)
+        parent_command = admission_service.source_command_text(script.parent_command)
+        parent = f"{script.parent_pid} {parent_command}"
+        admission_service.start_source_refusal_alert(source, "", script.program, lambda:
+            admission_service.source_refusal_message(source, observed_at=reading.read_at, machine="mac", given="",
+                command=command, process=f"{build.pid} {command}", parent=parent))
+
+
 def main(argv: Sequence[str]) -> int:
     args = page_arguments(argv)
     if args.command == "link":
@@ -4224,8 +4246,9 @@ def main(argv: Sequence[str]) -> int:
             if now >= next_mac_at:
                 queue_view.refresh_mac_builds()
                 if not args.once:
-                    # A one-time proof run reads the Mac but sends no alert.
-                    notify_unplaced_mac_runs(queue_view.read_mac_builds(), notified_mac_runs)
+                    mac_reading = queue_view.read_mac_builds()
+                    notify_unplaced_mac_runs(mac_reading, notified_mac_runs)
+                    notify_mac_script_sources(mac_reading)
                 next_mac_at = now + queue_view.mac_activity_refresh_seconds()
             if now >= next_tokens_at:
                 # Read the dump that the previous request wrote, then ask for the next one.

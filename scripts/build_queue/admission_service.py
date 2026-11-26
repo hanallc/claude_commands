@@ -359,9 +359,40 @@ class SourceLocation:
     folder: str
 
     @property
-    def alert_key(self) -> str:
-        source = json.dumps((self.repository, self.folder))
-        return "source-refused:" + hashlib.sha256(source.encode()).hexdigest()
+    def alert_prefix(self) -> str:
+        location = json.dumps((self.repository, os.path.normpath(self.folder) if self.folder else ""))
+        return "source-refused:" + hashlib.sha256(location.encode()).hexdigest() + ":"
+
+    def alert_key(self, given: str, program: str) -> str:
+        cause = json.dumps((given, program))
+        return self.alert_prefix + hashlib.sha256(cause.encode()).hexdigest()
+
+
+def start_source_refusal_alert(source: SourceLocation, given: str, program: str,
+                               message: Callable[[], str]) -> None:
+    """Claim the cause and send the message in a separate thread."""
+    try:
+        claimed = outage_alerts.claim(source.alert_key(given, program))
+        if isinstance(claimed, outage_alerts.AlertClaim):
+            try:
+                threading.Thread(target=deliver_source_refusal, args=(claimed, message()),
+                                 name="admission-source-refusal", daemon=True).start()
+            except (OSError, ValueError, RuntimeError):
+                outage_alerts.release(claimed)
+                raise
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"memory admission: cannot start source refusal alert: {error}", file=sys.stderr)
+
+
+def source_refusal_message(source: SourceLocation, *, observed_at: float, machine: str, given: str,
+                           command: str, process: str, parent: str) -> str:
+    at = datetime.fromtimestamp(observed_at, ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z")
+    return ("Build queue refused a run with no named source.\n"
+            f"Time: {at}. Machine: {machine}.\n"
+            f"Given: {given or 'no session id, staff id or name'} (resolves to nothing).\n"
+            f"Repository: {source.repository}. Folder: {source.folder}.\n"
+            f"Command: {command}.\nProcess: {process}. Parent: {parent}.\n"
+            "Later refusals of this cause send no message until a run from this folder starts with a named source.")
 
 
 def source_location(request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest) -> SourceLocation:
@@ -385,8 +416,13 @@ _SOURCE_CREDENTIAL = re.compile(
     + r"(?:gh[pousr]_|github_pat_|sk-|AKIA|ASIA)[A-Za-z0-9_]{8,}|://[^ /]+:[^ /]+@", re.IGNORECASE)
 
 
-def source_command_text(args: list[str] | tuple[str, ...]) -> str:
+def source_command_text(args: list[str] | tuple[str, ...] | str) -> str:
     """Omit arguments that can carry credentials."""
+    if isinstance(args, str):
+        try:
+            args = shlex.split(args)
+        except ValueError:
+            return "unavailable"
     for index, arg in enumerate(args):
         if _SOURCE_CREDENTIAL.search(arg):
             return shlex.join([*args[:index], "[redacted]"])
@@ -7268,34 +7304,27 @@ done
             return replace(identity, session_id=caller.session_id or identity.session_id, name=caller.name, unit=caller.unit)
         name = exported_name or supplied.name
         if identity.session_id:
-            given = f"session id {identity.session_id!r}"
+            value, given = identity.session_id, f"session id {identity.session_id!r}"
         elif staff_id:
-            given = f"staff id {staff_id!r}"
+            value, given = staff_id, f"staff id {staff_id!r}"
         elif name and name != codec.UNKNOWN_CALLER:
-            given = f"name {name!r}"
+            value, given = name, f"name {name!r}"
         else:
-            given = ""
+            value, given = "", ""
         reason = "Refused: this request names no source. "
         reason += (f"The {given} resolves to no staff row and no session name. "
                    + "Run it from a named session, or set CLAUDE_SESSION_NAME." if given
                    else "It gives no session id, staff id or name.")
         source = source_location(request)
-        try:
-            claimed = outage_alerts.claim(source.alert_key)
-            if isinstance(claimed, outage_alerts.AlertClaim):
-                try:
-                    message = self._source_refusal_message(request, source, given)
-                    threading.Thread(target=deliver_source_refusal, args=(claimed, message),
-                                     name="admission-source-refusal", daemon=True).start()
-                except (OSError, ValueError, RuntimeError):
-                    outage_alerts.release(claimed)
-                    raise
-        except (OSError, ValueError, RuntimeError) as error:
-            print(f"memory admission: cannot start source refusal alert: {error}", file=sys.stderr)
+        command = (request.argv if isinstance(request, wire.AdmitRequest)
+                   else request.constraints.command if isinstance(request, wire.PlacementRequest)
+                   else (request.profile.step,))
+        start_source_refusal_alert(source, value, command[0] if command else "",
+            lambda: self._source_refusal_message(request, source, given, source_command_text(command)))
         return wire.Refused(reason)
 
     def _source_refusal_message(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest,
-                                source: SourceLocation, given: str) -> str:
+                                source: SourceLocation, given: str, command: str) -> str:
         owner = request.owner
         machine = owner.host if isinstance(owner, placement.SubmittingOwner) else self.host
         process, parent = f"{owner.pid} unavailable", "unavailable"
@@ -7304,23 +7333,15 @@ done
             if isinstance(reading, gate.ProcessIdentity) and reading.start == owner.start_time:
                 process = source_process_text(self.proc.path, owner.pid)
                 parent = source_process_text(self.proc.path, reading.parent)
-        command = (source_command_text(request.argv) if isinstance(request, wire.AdmitRequest)
-                   else source_command_text(request.constraints.command) if isinstance(request, wire.PlacementRequest)
-                   else request.profile.step)
-        at = datetime.fromtimestamp(self.clock.now(), ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z")
-        return ("Build queue refused a run with no named source.\n"
-                f"Time: {at}. Machine: {machine}.\n"
-                f"Given: {given or 'no session id, staff id or name'} (resolves to nothing).\n"
-                f"Repository: {source.repository}. Folder: {source.folder}.\n"
-                f"Command: {command}.\nProcess: {process}. Parent: {parent}.\n"
-                "Later refusals of this cause send no message until a run from this folder starts with a named source.")
+        return source_refusal_message(source, observed_at=self.clock.now(), machine=machine, given=given,
+                                      command=command, process=process, parent=parent)
 
     def _clear_source_refusal(self, request: wire.AdmitRequest | wire.LaunchRequest | wire.PlacementRequest,
                               observed_at: float) -> None:
         if not codec.public_queue_text(request.identity.name):
             return
         try:
-            _ = outage_alerts.clear(source_location(request).alert_key, observed_at)
+            _ = outage_alerts.clear_prefix(source_location(request).alert_prefix, observed_at)
         except (OSError, ValueError) as error:
             print(f"memory admission: cannot clear source refusal alert: {error}", file=sys.stderr)
 

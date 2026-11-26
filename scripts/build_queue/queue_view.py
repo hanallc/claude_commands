@@ -86,6 +86,13 @@ def parse_gate_label(wire: str) -> MacGateLabel:
 
 
 @dataclass(frozen=True)
+class MacScriptSource:
+    program: str
+    parent_pid: int
+    parent_command: str
+
+
+@dataclass(frozen=True)
 class MacBuild:
     pid: int
     folder: str
@@ -104,6 +111,16 @@ class MacBuild:
     gate_label: MacGateLabel = MacGateLabel.UNAVAILABLE
     gate_placement: str = ""
     verify_call_id: str = ""
+    terminal: bool = False
+    script_source: MacScriptSource | None = None
+
+    @property
+    def source_name(self) -> str:
+        if self.terminal:
+            return "terminal"
+        if self.script_source is not None:
+            return "script · " + Path(self.script_source.program).name
+        return ""
 
 
 @dataclass(frozen=True)
@@ -187,6 +204,7 @@ def gate_label_text(build: MacBuild) -> str:
 
 
 def mac_build_record(build: MacBuild) -> dict[str, object]:
+    source = build.script_source
     return {"pid": build.pid, "folder": build.folder, "started_at": build.started_at,
             "command": build.command, "repository": build.repository,
             "test_pid": build.stage.test_pid if isinstance(build.stage, MacTesting) else
@@ -196,7 +214,9 @@ def mac_build_record(build: MacBuild) -> dict[str, object]:
                 if isinstance(build.counter, progress_profile.ProgressCounter) else {},
             "recorded_unit": build.recorded_unit, "session": build.session, "origin": build.origin.value,
             "ci_runner": build.ci_runner, "ci_job": build.ci_job, "gate_label": gate_label_text(build),
-            "verify_call_id": build.verify_call_id}
+            "verify_call_id": build.verify_call_id, "terminal": build.terminal,
+            "script_source": {"program": source.program, "parent_pid": source.parent_pid,
+                              "parent_command": source.parent_command} if source is not None else None}
 
 
 def mac_build_from_record(row: dict[str, object]) -> MacBuild:
@@ -210,6 +230,9 @@ def mac_build_from_record(row: dict[str, object]) -> MacBuild:
     stage = MacTesting(test_pid) if test_pid > 0 else MacBuilding() if test_pid == 0 else MacStageUnavailable()
     if isinstance(counter, progress_profile.ProgressCounter) and counter.phase.startswith("test:"):
         stage = MacTestingCounter(counter)
+    source = cast(dict[str, object] | None, row.get("script_source"))
+    script_source = (MacScriptSource(str(source["program"]), int(cast(int, source["parent_pid"])),
+                                    str(source["parent_command"])) if source else None)
     return MacBuild(int(cast(int, row["pid"])), str(row["folder"]), float(cast(float, row["started_at"])),
                     command, str(row["repository"]), stage,
                     resident if resident >= 0 else MacMemoryUnavailable(), mac_command_jobs(command), counter,
@@ -219,7 +242,7 @@ def mac_build_from_record(row: dict[str, object]) -> MacBuild:
                     parse_gate_label(str(row.get("gate_label", ""))),
                     str(row.get("gate_label", "")).removeprefix("placement ")
                     if str(row.get("gate_label", "")).startswith("placement ") else "",
-                    str(row.get("verify_call_id", "")))
+                    str(row.get("verify_call_id", "")), row.get("terminal") is True, script_source)
 
 
 def read_mac_builds() -> MacBuildReading:
@@ -508,6 +531,25 @@ def build_origin(pid, processes):
     return "non-ci"
 
 
+def direct_build_source(pid, processes):
+    """Find the app ancestor or the program that launchd started."""
+    cursor = pid
+    seen = set()
+    while cursor in processes and cursor not in seen and cursor != 1:
+        seen.add(cursor)
+        process = processes[cursor]
+        executable = process["executable"]
+        if cursor != pid and ".app/Contents/MacOS/" in executable:
+            return dict(terminal=True)
+        if process["parent"] == 1 and executable:
+            parent_pid = processes[pid]["parent"]
+            parent = processes.get(parent_pid, {})
+            return dict(script_source=dict(program=executable, parent_pid=parent_pid,
+                                           parent_command=parent.get("command") or "unavailable"))
+        cursor = process["parent"]
+    return {}
+
+
 def read_gate_records():
     records = {}
     for path in (Path.home() / ".local/state/mac-gate/records").glob("[0-9]*"):
@@ -635,6 +677,10 @@ def read_builds(processes=None, records=None, captures=None):
             origin = "unknown"
         ci_environment = environment if origin == "ci" else {}
         session = record["session"] or environment.get("CODEX_THREAD_ID") or environment.get("CLAUDE_CODE_SESSION_ID", "")
+        gate = gate_label(pid, processes, records, ci_uid)
+        source = (direct_build_source(pid, processes)
+                  if not session and origin == "non-ci" and gate != "hana-ci" and not gate.startswith("placement ")
+                  else {})
         try:
             folder = str(Path(folder).resolve())
         except OSError:
@@ -649,8 +695,7 @@ def read_builds(processes=None, records=None, captures=None):
                            recorded_unit=record["recorded_unit"], session=session,
                            origin=origin, ci_runner=ci_environment.get("RUNNER_NAME", ""),
                            ci_job=ci_environment.get("GITHUB_JOB", ""),
-                           gate_label=gate_label(pid, processes, records, ci_uid),
-                           verify_call_id=environment.get("BUILDLOG_CALL_ID", "")))
+                           gate_label=gate, verify_call_id=environment.get("BUILDLOG_CALL_ID", ""), **source))
     return sorted(builds, key=lambda build: (build["started_at"], build["pid"]))
 
 
@@ -669,6 +714,8 @@ print("rc=0")
 
 def refresh_mac_builds() -> None:
     """Refresh the shared reading from the feed loop at its configured interval."""
+    from scripts.build_queue.admission_service import source_command_text
+
     now = time.time()
     previous = read_mac_builds()
     try:
@@ -687,6 +734,9 @@ def refresh_mac_builds() -> None:
             counter = progress_profile.parse_progress(str(row.pop("progress_tail")))
             row["counter"] = ({"phase": counter.phase, "done": counter.done, "total": counter.total}
                               if isinstance(counter, progress_profile.ProgressCounter) else {})
+            if isinstance(source := row.get("script_source"), dict):
+                evidence = cast(dict[str, object], source)
+                evidence["parent_command"] = source_command_text(str(evidence.get("parent_command", "")))
             builds.append(mac_build_from_record(row))
         reading = MacBuildReading(now, tuple(sorted(builds, key=lambda build: build.started_at)),
                                   unplaced_runs=unplaced, home=str(data.get("home", "")))

@@ -2274,9 +2274,15 @@ function publicParts(parts) {
 }
 // Use the same owner and step layout for all Running rows.
 function queueRowLabels(row) {
-  const unit = ciRow(row) ? "" : ownerText(row.unit);
+  const ci = ciRow(row);
+  const unit = ci ? "" : ownerText(row.unit);
   const verify = row.verify?.verb || "";
-  const showrunner = unit ? ownerText(row.showrunner) : "";
+  const showrunner = ci || unit ? ownerText(row.showrunner) : "";
+  if (ci && showrunner) {
+    const split = row.name.indexOf(": ");
+    const step = row.row_step ?? (split < 0 ? "" : row.name.slice(split + 2));
+    return {name: step ? "CI " + step : row.name, unit, owner: showrunner, step: "", verify};
+  }
   const owner = showrunner === unit ? "" : showrunner;
   if (row.kind === "mac-build" && row.row_owner !== undefined) {
     return {name: row.row_owner, unit, owner, step: row.row_step, verify};

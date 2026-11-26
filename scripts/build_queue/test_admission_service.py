@@ -7129,18 +7129,26 @@ class ServiceTests(unittest.TestCase):
 
             with mock.patch.object(service, "threading", mock.Mock(wraps=threading, Thread=record_thread)), \
                     mock.patch.object(service, "send_admission_alert", side_effect=send):
-                request = fixture.request(need=GIB)
-                refuse(request, "missing-session")
-                refuse(fixture.request(need=GIB), "another-session")
-                (recipient, message), = messages
-                self.assertEqual(recipient, "bob")
-                self.assertIn("Given: session id 'missing-session' (resolves to nothing).", message)
-                self.assertIn(f"Repository: fixture. Folder: {fixture.root}.", message)
+                causes = (("missing-session", "cargo"), ("another-session", "cargo"), ("missing-session", "rustc"))
+
+                def refuse_causes() -> None:
+                    for given, program in causes:
+                        refuse(replace(fixture.request(need=GIB), argv=(program, "build")), given)
+
+                refuse_causes()
+                self.assertEqual(len(messages), 3)
+                for (given, program), (recipient, message) in zip(causes, messages, strict=True):
+                    self.assertEqual(recipient, "bob")
+                    self.assertIn(f"Given: session id '{given}' (resolves to nothing).", message)
+                    self.assertIn(f"Command: {program} build.", message)
+                    self.assertIn(f"Repository: fixture. Folder: {fixture.root}.", message)
+                refuse(replace(fixture.request(need=GIB), argv=("cargo", "check")), "missing-session")
+                self.assertEqual(len(messages), 3)
 
                 fixture.clock.advance(5)
                 _ = only_admitted(fixture.connect(fixture.request(need=GIB)).replies())
-                refuse(fixture.request(need=GIB), "missing-session")
-                self.assertEqual(len(messages), 2)
+                refuse_causes()
+                self.assertEqual(len(messages), 6)
 
     def test_service_admits_a_showrunner_without_a_unit(self) -> None:
         member = staff.StaffRow(staff.StaffId("showrunner"), "showrunner", "cargo-liner", staff.StaffRoot(),

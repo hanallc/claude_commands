@@ -1623,6 +1623,25 @@ try {
             queueFixture = null;
             await call('Emulation.setScrollbarsHidden', {hidden:true});
           }
+          if (!shootBefore) {
+            servedReading = readings.step_ci;
+            await navigate('memory_live.html');
+            const ciLabels = await evaluate(`(() => {
+              const mac = latest.walk.find(row => row.kind === 'mac-build');
+              return [['row', mac], ['wait', latest.waiters[0]]].map(([kind, row]) => {
+                const tip = kind + ':' + row.key;
+                const chart = document.querySelector('.wrow[data-tip="' + tip + '"]');
+                return [chart.querySelector('.name').textContent, chart.querySelector('.owner').textContent,
+                  tooltipHtml(tip, latest)];
+              });
+            })()`);
+            for (const [name, small, tooltip] of ciLabels) {
+              assert.equal(small, 'hana');
+              assert.equal(name, 'CI nextest');
+              assert.match(tooltip, /hana-mac-1 · test-hana/);
+              assert.match(tooltip, /Showrunner/i);
+            }
+          }
           if (queueRowsProof) {
             console.log(JSON.stringify({pass:true,rows:rows.names}));
             break browserProof;
@@ -3815,7 +3834,7 @@ try {
               assert.equal(state.name,'CI nextest');
               assert.equal(state.step,'');
               assert.equal(state.waitingStep,'');
-              assert.equal(state.small,'');
+              assert.equal(state.small,'hana');
               assert.deepEqual(state.headers, runningHeaders);
               assert.deepEqual(state.waiting, queuedHeaders);
               assert.ok(state.spacings.every(gap=>gap===12), JSON.stringify(state.spacings));
@@ -3872,7 +3891,7 @@ try {
               small:document.querySelector('.wrow[data-run="' + proofRun(0) + '"] .owner').textContent,
               step:document.querySelector('tr[data-tip="' + proofTip('row', 0) + '"] .step').textContent,
               tooltip:tooltipHtml(proofTip('row', 0),latest)})`);
-            assert.match(displayed.name,/^CI /);assert.equal(displayed.small,'');
+            assert.match(displayed.name,/^CI /);assert.equal(displayed.small,live.row.showrunner);
             assert.equal(displayed.step,'');assert.match(displayed.tooltip,/hana CI/);
             await writeFile(join(folder,'live-mac-ci-page.json'),JSON.stringify(displayed,null,2));
             await capture('live-mac-ci','#walk');

@@ -153,6 +153,60 @@ def empty_mac_reading(fixture: QueueFixture) -> None:
 
 
 class MacQueueViewTests(unittest.TestCase):
+    def mac_source_build(self, ancestors: tuple[str, ...], *, agent: str = "", placement: str = "") -> queue_view.MacBuild:
+        with QueueFixture(captured=False) as fixture:
+            folder = str(fixture.root)
+            programs = ("/bin/cargo", *ancestors)
+            processes = {100 - index: {
+                "parent": 99 - index if index + 1 < len(programs) else 1,
+                "command": executable + (" build" if index == 0 else ""),
+                "executable": executable, "resident_bytes": 1234, "started_at": NOW,
+            } for index, executable in enumerate(programs)}
+            environment = {"CODEX_THREAD_ID": agent, "MAC_PLACEMENT": placement}
+            script = queue_view.mac_build_script().replace("print(json.dumps(read_reading()))",
+                f"read_processes = lambda: {processes!r}\n"
+                + "read_captures = lambda processes: {}\n"
+                + "read_gate_records = lambda: {}\n"
+                + f"output = lambda arguments: 'p100\\nn{folder}\\n'\n"
+                + "repository_name = lambda folder: 'hana'\n"
+                + "project_record = lambda folder: dict(recorded_unit='', session='', repository='')\n"
+                + f"process_environment = lambda pid: {environment!r} if pid == 100 else {{}}\n"
+                + "print(json.dumps(read_builds()))")
+            result = subprocess.run(["sh", "-c", script], text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            row, = cast(list[dict[str, object]], json.loads(result.stdout.removesuffix("rc=0\n")))
+            row["counter"] = {}
+            build = queue_view.mac_build_from_record(row)
+            self.assertEqual(queue_view.mac_build_from_record(queue_view.mac_build_record(build)), build)
+            return build
+
+    def test_mac_agent_id_takes_priority_over_the_app(self) -> None:
+        build = self.mac_source_build(("/Applications/Zed.app/Contents/MacOS/zed",), agent="agent-id")
+        self.assertEqual((build.session, build.source_name), ("agent-id", ""))
+
+    def test_mac_app_ancestors_use_terminal(self) -> None:
+        for executable in ("/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+                           "/Applications/Zed.app/Contents/MacOS/zed"):
+            with self.subTest(executable=executable):
+                build = self.mac_source_build(("/bin/zsh", executable))
+                self.assertEqual(build.source_name, "terminal")
+
+    def test_mac_launchd_scripts_use_the_program_under_launchd(self) -> None:
+        build = self.mac_source_build(("/bin/zsh", "/usr/local/bin/build-nightly"))
+        self.assertEqual(build.source_name, "script · build-nightly")
+        assert build.script_source is not None
+        self.assertEqual(build.script_source.program, "/usr/local/bin/build-nightly")
+
+    def test_mac_multiplexer_under_launchd_is_a_script(self) -> None:
+        build = self.mac_source_build(("/bin/zsh", "/opt/homebrew/bin/tmux"))
+        self.assertEqual(build.source_name, "script · tmux")
+
+    def test_mac_ci_and_placement_keep_their_source(self) -> None:
+        ci = self.mac_source_build(("/actions/Runner.Worker",))
+        self.assertEqual((ci.origin, ci.source_name), (queue_view.MacBuildOrigin.CI, ""))
+        placed = self.mac_source_build(("/usr/local/bin/mac_queue_run",), placement="episode/attempt")
+        self.assertEqual((placed.gate_placement, placed.source_name), ("episode/attempt", ""))
+
     def test_gate_records_classify_process_trees_and_reject_reused_pids(self) -> None:
         with QueueFixture(captured=False) as fixture:
             records = fixture.root / ".local/state/mac-gate/records"
