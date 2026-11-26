@@ -59,6 +59,7 @@ class SignedImageAnswer(TypedDict):
     feedback: str
     time: str
     round_id: str
+    previous_answer_key: NotRequired[str]
 
 
 class ImageAnswer(TypedDict):
@@ -145,7 +146,13 @@ def _signed_image_answer(value: object, identity: str) -> SignedImageAnswer:
         case {"answer": str(answer), "feedback": str(feedback), "time": str(stamp), "round_id": str(round_id)} if (
                 answer in ("approved", "feedback")):
             if datetime.fromisoformat(stamp).utcoffset() == UTC.utcoffset(None):
-                return {"answer": answer, "feedback": feedback, "time": stamp, "round_id": round_id}
+                signed: SignedImageAnswer = {"answer": answer, "feedback": feedback, "time": stamp, "round_id": round_id}
+                previous = cast(dict[str, object], value).get("previous_answer_key")
+                if previous is None:
+                    return signed
+                if isinstance(previous, str) and re.fullmatch(r"review:[0-9a-f]{64}", previous):
+                    signed["previous_answer_key"] = previous
+                    return signed
         case _:
             pass
     raise ValueError(f"{identity}: Invalid signed image answer.")
