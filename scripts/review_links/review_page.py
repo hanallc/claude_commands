@@ -291,7 +291,7 @@ def list_destination(item: ReviewItem) -> investigation.ListDestination | invest
 
 
 def report_url(destination: investigation.ListDestination) -> str:
-    return page_frame.LIST_PAGE_PATH + page_frame.list_item_fragment(destination.keeper, destination.number)
+    return page_frame.STUDIO_PAGE_PATH + page_frame.list_item_fragment(destination.keeper, destination.number)
 
 
 def list_report_details(report: the_list.ListReport) -> str:

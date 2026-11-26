@@ -2882,7 +2882,7 @@ def list_report_delivery_prefix(record: investigation.Investigation, prefix: str
     if (route.path != f"/{CONSOLE_FOLDER}/review.html" or not route.netloc or len(item_key) != 1
             or re.fullmatch(r"investigation/[^/]+/" + re.escape(record.id), item_key[0]) is None):
         return prefix
-    url = route._replace(path=page_frame.LIST_PAGE_PATH,
+    url = route._replace(path=page_frame.STUDIO_PAGE_PATH,
                          fragment=page_frame.list_item_fragment(destination.keeper, destination.number)[1:])
     return text + "\n\nEvidence on the List\n" + url.geturl()
 

@@ -1521,12 +1521,13 @@ def _page_owner_is_active(row: staff.StaffRow, members: staff.StaffSnapshot) -> 
 def page_owners(page: str, settings: conf.ConfigRead, members: staff.StaffSnapshot) -> PageOwners:
     """Resolve the owner to show and the recipient for new items."""
     key = f"page.{page}.owner"
-    label_key = f"page.{page}.label"
+    label_page = "studio" if page == "list" else page
+    label_key = f"page.{label_page}.label"
     values = settings.values(key, label_key, "owner.default")
     designated = staff.StaffId(values.get(key, ""))
     default = staff.StaffId(values.get("owner.default", ""))
     # A page outside the console navigation, such as rebuilds, has no label setting.
-    label = values.get(label_key) or page.replace("_", " ").title()
+    label = values.get(label_key) or label_page.replace("_", " ").title()
     route = _page_owner_route(label, designated, default, members)
     shown = members.rows_by_id.get(designated)
     if shown is not None and shown.kind in ("unit", "showrunner", "producer") and _page_owner_is_active(shown, members):

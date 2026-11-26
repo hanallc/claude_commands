@@ -1,4 +1,4 @@
-"""Show The List from the producer's numbered records."""
+"""Show List records in the Studio and handle item actions."""
 from __future__ import annotations
 
 import hashlib
@@ -29,7 +29,7 @@ from scripts.production.the_list import list_time
 from scripts.production.update_registration import QuestionStaff, RegistrationFailure
 from scripts.review_links import change_browser, change_page, console, go_ledger, page_frame, question_path
 from scripts.review_links import record_table, review_actions, review_items, review_legacy, review_link, review_page
-from scripts.review_links import search_fold, staff_names
+from scripts.review_links import search_fold, staff_names, studio_page
 from scripts.review_links import question_record
 from scripts.statusline import counts_row, rebuild_row
 
@@ -262,10 +262,6 @@ def top_priority_mark(shown: TopPriority, members: staff.StaffSnapshot, item: th
             or isinstance(producer.retirement, staff.RetiredProducer)):
         return TopPriorityMark.HIDDEN
     return TopPriorityMark.TOP_ITEM if producer.top_item == staff.TopItem(item.number) else TopPriorityMark.MAKE_TOP
-
-
-def page_url() -> str:
-    return PAGE_PATH
 
 
 def records(*, include_closed: bool = False) -> list[ListRecord]:
@@ -1035,11 +1031,11 @@ def console_item_label(address: SplitResult) -> str:
     path = address.path.removesuffix(".html")
     if path.endswith("/console/review"):
         return "Review item"
-    if path.endswith(("/console/images", "/console/list")):
+    if path.endswith(("/console/images", "/console/list", "/console/studio")):
         fragment = parse_qs(address.fragment)
         if path.endswith("/console/images") and fragment.get("image"):
             return "Images page"
-        if path.endswith("/console/list"):
+        if path.endswith(("/console/list", "/console/studio")):
             item = re.fullmatch(r"(?:[^/]+/)?L?([0-9]+)", fragment.get("item", [""])[0])
             if item:
                 return f"List item {item[1]}"
@@ -1857,7 +1853,7 @@ def _remove_unheld_go(ledger: Path, keeper: staff.StaffId, identity: str, go_id:
     return True
 
 
-def save_go(root: Path, ledger: Path, body: str, client: str, *, views: Mapping[str, ListView],
+def save_go(root: Path, ledger: Path, body: str, client: str, *,
             review_records: ImmediateReviewRecords = LinkedReviewRead.FROM_DISK
             ) -> tuple[str, SavedActionState | None]:
     """Write the ledger record, then close the ask with its go id."""
@@ -1881,13 +1877,8 @@ def save_go(root: Path, ledger: Path, body: str, client: str, *, views: Mapping[
                 raise GoSavedUnsent(str(error)) from error
             raise
     try:
-        page_path = urlsplit(page).path
-    except ValueError:
-        page_path = PAGE_PATH
-    view = views.get(page_path, LIST_VIEW)
-    try:
         state = action_state(keeper, edit.item, review_records=review_records, include_detail=True,
-                             top_priority=view.top_priority)
+                             top_priority=TopPriority.SHOWN)
     except Exception as error:
         print(f"review-links List Go {identity}: {error}", file=sys.stderr)
         return entry["go_id"], None
@@ -2120,45 +2111,6 @@ class ListQuery:
                                   for field, value, filter_name in LINK_REVEAL_FIELDS)
 
 
-type ProducerControl = Callable[[Iterable[record_table.Chip], str], str]
-
-
-def producer_chip_row(chips: Iterable[record_table.Chip], selected: str, *, label_html: str = '') -> str:
-    """Render the Producer chips."""
-    return record_table.chip_row(FIELD_LABELS["producer"], chips, selected, encode_values=True, label_html=label_html)
-
-
-class ProducerPlacement(Enum):
-    """Where a List view puts its Producer control."""
-
-    ABOVE_FILTERS = "above the filters"
-    BESIDE_WORDS = "beside the words box"
-
-
-@dataclass(frozen=True)
-class ListView:
-    """The page around the List rows: its names, its path, its style, its Producer control and its top items."""
-
-    title: str
-    log_name: str
-    path: str
-    style: str
-    producer: ProducerControl
-    placement: ProducerPlacement
-    top_priority: TopPriority
-
-    def producer_ids(self, members: staff.StaffSnapshot,
-                     with_items: Iterable[the_list.ItemOwner]) -> set[the_list.ItemOwner]:
-        """Include active producers without items when the view shows picture tabs."""
-        producers = set(with_items)
-        if self.placement is ProducerPlacement.ABOVE_FILTERS:
-            producers.update(row.id for row in staff.active(members, "producer")
-                             if not isinstance(row.retirement, staff.RetiredProducer))
-        return producers
-
-
-LIST_VIEW = ListView("The List", "list", PAGE_PATH, '', producer_chip_row, ProducerPlacement.BESIDE_WORDS,
-                     TopPriority.HIDDEN)
 TOP_LABEL = '<span class="list-top-label">' + TOP_FLAG + 'Top priority</span>'
 NO_TOP_ITEM = ('<div class="list-top-what"><b>No top priority item</b>'
                + '<div class="list-top-next">Open an item and click "Make top priority".</div></div>')
@@ -2203,8 +2155,7 @@ def top_bands(top_items: Iterable[ListRecord], today: datetime, names: staff_nam
 
 def render(root: Path, *, include_counts: bool = True, defer_counts: bool = False,
            status: change_page.DeliveryStatus | Literal["standalone"] = "standalone",
-           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK, query: str = "",
-           view: ListView = LIST_VIEW) -> bytes:
+           review_records: ReviewRecords | LinkedReviewRead = LinkedReviewRead.FROM_DISK, query: str = "") -> bytes:
     started, read_at = time.perf_counter(), time.time()
     members = staff.snapshot()
     names = staff_names.StaffNames(members)
@@ -2238,7 +2189,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                          if parked and isinstance(deadline := entry.item.parked_until, datetime)), default=None)
     deadline_attr = f' data-park-deadline="{park_deadline}"' if park_deadline is not None else ''
     secret = form_secret(root)
-    producers = view.producer_ids(members, (entry.item.producer for entry in items))
+    producers = studio_page.producer_ids(members, (entry.item.producer for entry in items))
     selection = ListQuery.read(query, items, producers)
     chip_totals: dict[str, Counter[str]] = {facet.name: Counter() for facet in FILTER_FACETS}
     search = normalize_search_text(selection.words.strip(QUERY_WHITESPACE))
@@ -2260,7 +2211,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     for index, (entry, parked, schedule) in enumerate(ordered_items):
         scheduled = not isinstance(schedule, the_list.NoSchedule)
         owners.add(entry.item.owner)
-        mark = top_priority_mark(view.top_priority, members, entry.item)
+        mark = top_priority_mark(TopPriority.SHOWN, members, entry.item)
         if mark is TopPriorityMark.TOP_ITEM:
             top_items.append(entry)
         open_question = not scheduled and the_list.has_open_question(entry.item)
@@ -2332,15 +2283,12 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
     if include_counts:
         if defer_counts:
             counts_query = COUNTS_AND_LINKS_QUERY if deferred_links else COUNTS_QUERY
-            counts = f'<div data-list-counts-url="{view.path}?{html.escape(counts_query)}"></div>'
+            counts = f'<div data-list-counts-url="{studio_page.PAGE_PATH}?{html.escape(counts_query)}"></div>'
         else:
             counts = counts_strip(members, names)
-    producer_control = (producer_chip_row(producer_chips, producer_selected, label_html=colored_producer)
-                        if view.producer is producer_chip_row else view.producer(producer_chips, producer_selected))
-    action_path = f' data-list-path="{view.path}"' if view.path != PAGE_PATH else ''
-    content = (STYLE + view.style + page_frame.title(view.title, "list")
+    content = (STYLE + studio_page.STYLE + page_frame.title(studio_page.TITLE, "list")
                + '<p data-review-refresh-error role="status" hidden></p>'
-               + f'<div data-list{action_path} data-refresh-seconds="{seconds}"'
+               + f'<div data-list data-list-path="{studio_page.PAGE_PATH}" data-refresh-seconds="{seconds}"'
                + f' data-zone="{html.escape(zone.key, quote=True)}"'
                + f' data-request-timeout-seconds="{request_timeout}" data-delivery-window-seconds="{delivery_window}"'
                + f' data-park-retry-seconds="{park_retry}"' + deadline_attr
@@ -2348,12 +2296,11 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + f' {card_motion.attributes()}'
                + f' data-closed-keys="{html.escape(json.dumps(closed_keys), quote=True)}"'
                + f' data-parking="{parking}" style="--list-log-max-height:{log_max_height}rem{producer_property}">'
-               + (producer_control if view.placement is ProducerPlacement.ABOVE_FILTERS else '')
-               + (top_bands(top_items, today, names) if view.top_priority is TopPriority.SHOWN else '')
+               + studio_page.tabs(producer_chips, producer_selected)
+               + top_bands(top_items, today, names)
                + '<div data-record-filters>'
                + record_table.chip_row('Owner', owner_chips, owner_selected, encode_values=True)
                + '<div class="list-producer-filter">'
-               + (producer_control if view.placement is ProducerPlacement.BESIDE_WORDS else '')
                + record_table.words_box('list-search', 'Filter by number, owner, item or state', value=words)
                + '</div>'
                + '<div class="list-show-filter"><div class="list-show-controls">' + record_table.chip_row('Show', shows, show_selected)
@@ -2376,7 +2323,7 @@ def render(root: Path, *, include_counts: bool = True, defer_counts: bool = Fals
                + '<button class="list-review-close" type="button" data-close autofocus>Close</button></dialog>'
                + record_table.render_inline_detail()
                + SCHEDULE_TEMPLATES + '<script>' + SCRIPT + '</script>')
-    return page_frame.rendered(change_page.document(content, view.title), started, read_at)
+    return page_frame.rendered(change_page.document(content, studio_page.TITLE), started, read_at)
 
 
 SCHEDULE_TEMPLATES = """
@@ -2452,7 +2399,6 @@ border-radius:0;margin:var(--page-window-top,0px) 0 0}
 [data-list-review-dialog][data-fullscreen] iframe{height:100%;max-height:none}
 [data-record-filters] .record-filter-row button{max-width:100%;overflow-wrap:anywhere}
 .list-producer-filter{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin-bottom:8px}
-.list-producer-filter .record-filter-row{flex:1 1 auto;min-width:0;max-width:100%;margin:0}
 .list-producer-filter .record-filter-words{flex:0 1 300px;min-width:0;margin:0 0 0 auto}
 .list-show-controls{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;margin-bottom:8px}
 .list-show-controls .record-filter-row{min-width:0;margin-bottom:0}
@@ -2502,6 +2448,11 @@ background:var(--ink-2);border-radius:50%}
 .list-actions{position:relative}
 :is(.list-tell,.list-actions,.list-parking-actions)>button,.list-park [data-later-toggle]{
  border:1px solid var(--ink-3);border-radius:8px;background:var(--card);color:var(--ink);cursor:pointer
+}
+[data-list-item][data-parked]:not([data-parked="false"])
+ [data-feedback-form]:not([data-waiting-actions]):has([value="read"]):has([value="top"])
+ :is(.list-actions:not(.list-repair-actions)>button,.list-parking-actions>button,.list-park [data-later-toggle]){
+ padding-inline:8px
 }
 .list-tell>[data-send-status]:empty{display:none}
 .list-ask{border:1px solid var(--warning);border-radius:8px;padding:12px 14px;margin:0 0 12px}

@@ -540,6 +540,11 @@ window.fetch=(url,options)=>{
         record = investigation.load(created.saved.owner, created.saved.id)
         destination = record.list_destination
         assert isinstance(destination, investigation.ListDestination)
+        link = page_frame.STUDIO_PAGE_PATH + page_frame.list_item_fragment(destination.keeper, destination.number)
+        self.assertIn(f'<a href="{link}">Open List item {destination.number}</a>'.encode(), card)
+        evidence_link = "http://console.test" + review_page.PAGE_PATH + "#" + urlencode({"item": created.key})
+        prefix = change_page.list_report_delivery_prefix(record, f"Feedback\n\nEvidence in Review\n{evidence_link}")
+        self.assertEqual(prefix, "Feedback\n\nEvidence on the List\nhttp://console.test" + link)
         row = the_list.load(destination.keeper, f"L{destination.number}")
         assert isinstance(row.report, the_list.ListReport)
         self.assertEqual((row.report.kind, row.report.evidence_key, row.report.words),
@@ -3532,7 +3537,8 @@ window.fetch=async(_url,options)=>options?.method==='POST'
 </script>""", 1)
         pages = (console.ConsolePage('review', 'Review', 'inbox', 'Review',
                                      console.AvailablePage('/console/review.html')),
-                 console.ConsolePage('list', 'List', 'list-checks', 'List', console.AvailablePage('/console/list.html')))
+                 console.ConsolePage('studio', 'Studio', 'clapperboard', 'The Studio',
+                                     console.AvailablePage(page_frame.STUDIO_PAGE_PATH)))
         list_counts = ''.join(list_page.count_link(alias, path+'#showrunner=page-owner', alias)
                               for alias, path in (('changes', '/console/changes.html'),
                                                   ('questions', '/console/changes.html?type=questions')))
@@ -3566,7 +3572,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
  const draft=()=>detail('page-owner/C1')?.querySelector('textarea');
  const words='Keep these unsent words.';
  const nav=page=>document.querySelector('[data-page='+page+']');
- const list=()=>document.querySelector('[data-console-page=list]')?.contentDocument;
+ const list=()=>document.querySelector('[data-console-page=studio]')?.contentDocument;
  const aliasLink=alias=>list()?.querySelector('a[href*="page='+alias+'&"]');
  const selectedType=type=>review().querySelector('[data-filter-row="type"] [data-filter-value="'+type+'"][aria-pressed="true"]');
  try{
@@ -3574,10 +3580,10 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
    'the failed Review document');
   const failed=review();
   check(typeof frame.contentWindow.consoleNavigate==='undefined','The error page does not register navigation.');
-  nav('list').click();
+  nav('studio').click();
   // The console intercepts List links only after its ready handler runs, a task after readyState changes.
   let listConnected=false;
-  document.querySelector('[data-console-page=list]').addEventListener('console-document-ready',
+  document.querySelector('[data-console-page=studio]').addEventListener('console-document-ready',
    ()=>{listConnected=true;},{once:true});
   await until(()=>listConnected && list()?.readyState==='interactive' && aliasLink('questions'),
    'the connected interactive List document');
@@ -3586,9 +3592,9 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
   check(review().readyState==='loading','The second Review document waits for the fixture.');
   check(frame.contentWindow.location.hash.startsWith('#') && !frame.contentWindow.location.search,
    'The alias reloads Review at a fragment URL.');
-  nav('list').click();
+  nav('studio').click();
   aliasLink('questions').click();
-  nav('list').click();
+  nav('studio').click();
   aliasLink('changes').click();
   await fetch('/release-pages');
   await until(()=>selectedType('change'),'the last requested alias');
@@ -3630,7 +3636,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
   document.querySelector('[data-page=review]').click();
   check(expanded(REBUILD),'Review keeps the selected rebuild card.');
   for(const [alias,type] of [['questions','question'],['changes','change']]){
-   nav('list').click();
+   nav('studio').click();
    aliasLink(alias).click();
    await until(()=>selectedType(type),'the Review filter for '+alias);
    check(new URL(location.href).searchParams.get('page')==='review' && !frame.hidden && review()===original,
@@ -3671,7 +3677,7 @@ window.fetch=(url,options)=>String(url).includes('for-you.json') ? Promise.resol
                     review_requests.append((status, self.path))
                     body = review_start if status == 200 else error_html
                 else:
-                    body = {'/console/': shell_html, '/console/list.html': list_html,
+                    body = {'/console/': shell_html, page_frame.STUDIO_PAGE_PATH: list_html,
                             '/console/rebuilds.html': b'<h1>Rebuilds</h1>'}.get(path, b'')
                 self.send_response(status)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
