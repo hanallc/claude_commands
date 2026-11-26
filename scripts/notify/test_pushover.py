@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -26,6 +27,8 @@ from scripts.notify import pushover
 from scripts.notify import review
 from scripts.notify import push_texts
 from scripts.notify import push_reference
+from scripts.notify import question_pushes
+from scripts.message import send
 from scripts.notify import silence
 from scripts.notify.test_review import FakeReviewer, verdict, with_footer
 from scripts.notify.user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
@@ -218,6 +221,7 @@ class PushoverTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(pushover, "LOG_FILE", folder / "log"))
         _ = self.enterContext(mock.patch.object(pushover, "parent_source", return_value="python test_pushover.py"))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NOTIFY_STATE_DIR": str(folder / "state")})))
+        _ = self.enterContext(mock.patch.object(send, "STATE", folder / "message"))
         _ = self.enterContext(mock.patch.object(review, "review", side_effect=approve))
         _ = self.enterContext(mock.patch.object(review, "schedule"))
         _ = self.enterContext(mock.patch.object(pushover, "request_template_fix"))
@@ -318,6 +322,95 @@ class PushoverTests(unittest.TestCase):
                         self.assertIn("anomaly: question record " + str(path), str(anomaly["outcome"]))
                         self.assertEqual(anomaly["reference"], reference)
 
+    def test_answer_during_release_drops_only_the_bound_opening(self) -> None:
+        path = self.keys.parent / "question.md"
+        def write_question(status: str, since: str) -> None:
+            _ = path.write_text(f'---\nrecord_type: question\nstatus: {status}\n' +
+                                f'registration: {{"since":"{since}"}}\n---\n')
+
+        def push(source: str, reference: push_reference.PushReference) -> silence.KeptPush:
+            return {"source": source, "priority": "0", "title": source, "message": "Details", "detail": "",
+                    "key": "same-key", "text_id": "decision.choices", "reference": reference}
+
+        posted: list[str] = []
+        def post(_url: str, body: bytes) -> tuple[int, bytes]:
+            posted.append(urllib.parse.parse_qs(body.decode())["title"][0])
+            return 200, b'{"status":1}'
+
+        self.silence_on()
+        with (mock.patch.object(send, "STATE", self.keys.parent / "message"),
+              mock.patch.object(send, "cancel_user_push", side_effect=AssertionError("normal push cancellation")),
+              mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.keys.parent / "notifier")})):
+            write_question("open", "first")
+            first = push("override", push_reference.admission_reference("decision.choices", str(path)))
+            self.assertEqual(pushover.deliver_here(first, self.keys, post), 0)
+            unrelated = push("unrelated", push_reference.NO_REFERENCE)
+            self.assertEqual(pushover.deliver_here(unrelated, self.keys, post), 0)
+            write_question("open", "second")
+            newer = push("override", push_reference.admission_reference("decision.choices", str(path)))
+            self.assertEqual(pushover.deliver_here(newer, self.keys, post), 0)
+            self.assertEqual(pushover.deliver_here(first, self.keys, post), 5)
+            question_pushes.answer_saved(path)
+            self.assertCountEqual(silence.read_kept(), [unrelated, newer])
+
+            def release(held: silence.KeptPush) -> int:
+                if held == newer:
+                    write_question("closed", "second")
+                    question_pushes.answer_saved(path)
+                return pushover.post_kept(held, self.keys, post)
+
+            self.assertEqual(silence.off(lambda _argv: 0, release), 0)
+            self.assertEqual(question_pushes.drain(), 0)
+            self.assertEqual(silence.read_kept(), [])
+            self.assertEqual(posted, ["unrelated"])
+
+    def test_remote_answer_retires_only_the_bound_emergency_and_its_queue(self) -> None:
+        path = self.keys.parent / "question on mac.md"
+        reference = push_reference.QuestionReference(kind="question", path=str(path), since="opening", machine="mac")
+        push: silence.KeptPush = {"source": "drawer", "key": "same key", "priority": "2", "title": "Decision",
+                                  "message": "Details", "detail": "", "text_id": "decision.choices", "reference": reference}
+        binding_path = question_pushes.binding_path(push["source"], push["key"])
+        expected = question_pushes.Binding(push["source"], push["key"], reference, True)
+        posts: list[str] = []
+
+        def post(url: str, body: bytes) -> tuple[int, bytes]:
+            self.assertEqual(question_pushes.read_binding(binding_path), expected)
+            posts.append(url)
+            if url == pushover.API_URL:
+                self.assertEqual(urllib.parse.parse_qs(body.decode())["tags"], [pushover.push_tag(expected.tag_key)])
+            return 200, b'{"status":1}'
+
+        def cancel(source: str, key: str, *, exact_tag: bool) -> tuple[int, str]:
+            self.assertTrue(exact_tag)
+            return pushover.cancel(["--exact-tag-key", "--source", source, key], self.keys, post), "cancelled"
+
+        status = "open"
+
+        def ssh(argv: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(argv[:4], ["ssh", "-o", "BatchMode=yes", "mac"])
+            self.assertIn("question-opening", argv[-1])
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"status": status, "since": "opening"}), "")
+
+        with (mock.patch.object(sys, "platform", "linux"),
+              mock.patch.object(subprocess, "run", side_effect=ssh) as remote,
+              mock.patch.object(send, "cancel_user_push", side_effect=cancel),
+              mock.patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(self.keys.parent / "notifier")})):
+            self.assertEqual(pushover.deliver_here(push, self.keys, post), 0)
+            queued = send.queue_path(send.USER)
+            queued.parent.mkdir(parents=True)
+            row = {"time": "now", "from": push["source"], "to": send.USER, "key": push["key"],
+                   "summary": "", "text": "Details", "reason": "fixture copy"}
+            unrelated = {**row, "from": "different sender"}
+            _ = queued.write_text(json.dumps(row) + "\n" + json.dumps(unrelated) + "\n")
+            question_pushes.answer_saved(path)
+            remote.assert_called_once()
+            status = "closed"
+            self.assertEqual(question_pushes.drain(), 0)
+            self.assertEqual(question_pushes.drain(), 0)
+        self.assertFalse(binding_path.exists())
+        self.assertEqual(send.read_queue(queued), [unrelated])
+        self.assertEqual(posts, [pushover.API_URL, pushover.CANCEL_URL.format(tag=pushover.push_tag(expected.tag_key))])
+
     def test_failed_drop_log_preserves_the_full_drop_on_stderr_and_removes_the_push(self) -> None:
         path = self.keys.parent / "question-closed.md"
         _ = path.write_text('---\nrecord_type: question\nstatus: closed\nregistration: {"since":"opening"}\n---\n')
@@ -360,7 +453,7 @@ class PushoverTests(unittest.TestCase):
                 read.assert_not_called()
                 keys.assert_not_called()
 
-    def test_reference_survives_admission_review_and_silence_without_an_immediate_release_check(self) -> None:
+    def test_reference_survives_review_and_checks_the_authoritative_opening(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "decision.choices")
         path = self.keys.parent / "question-admission.md"
         _ = path.write_text('---\nrecord_type: question\nstatus: open\nregistration: {"since":"2026-11-03T12:00"}\n---\n')
@@ -377,14 +470,18 @@ class PushoverTests(unittest.TestCase):
         record_line = next(line for line in output.getvalue().splitlines() if line.startswith("pushover: reviewed JSON: "))
         record = cast(dict[str, object], json.loads(record_line.removeprefix("pushover: reviewed JSON: ")))
         self.assertEqual(record["reference"], expected)
-        # Forwarded references permit records that exist only on the originating machine.
+        # Read the opening on the machine that owns the Question.
         path.unlink()
-        forwarded = ["--ssh-forwarded-reference", "--text-id", entry.id, "--push-reference", json.dumps(expected), *argv[4:]]
+        remote = {**expected, "machine": "mac"}
+        forwarded = ["--ssh-forwarded-reference", "--text-id", entry.id, "--push-reference", json.dumps(remote), *argv[4:]]
         with (mock.patch.dict(os.environ, {"SSH_CONNECTION": "origin 1 receiver 2"}),
               mock.patch.object(push_reference, "read_question", side_effect=AssertionError("remote record read during admission")),
+              mock.patch.object(question_pushes, "opening", return_value=push_reference.QuestionOpening("open", expected["since"])) as opening,
               redirect_stdout(io.StringIO())):
             code, form = self.run_send(forwarded)
         self.assertEqual((code, form), (0, {}))
+        opening.assert_called_with(remote)
+        self.assertEqual(silence.read_kept()[0].get("reference"), remote)
 
     def test_legacy_kept_free_text_still_releases_without_new_admission(self) -> None:
         posted: list[str] = []

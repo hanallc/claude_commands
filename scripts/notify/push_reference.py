@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 
 class KeptPushDropped(int):
@@ -18,6 +19,7 @@ class QuestionReference(TypedDict):
     kind: Literal["question"]
     path: str
     since: str
+    machine: NotRequired[Literal["mac"]]
 
 
 class NoReference(TypedDict):
@@ -37,7 +39,12 @@ def read_reference(value: object) -> PushReference:
             return NO_REFERENCE
         path, since = record.get("path"), record.get("since")
         if record.get("kind") == "question" and isinstance(path, str) and Path(path).is_absolute() and isinstance(since, str) and since:
-            return QuestionReference(kind="question", path=path, since=since)
+            result = QuestionReference(kind="question", path=path, since=since)
+            if "machine" in record:
+                if record["machine"] != "mac":
+                    raise ValueError("invalid question host")
+                result["machine"] = "mac"
+            return result
     raise ValueError("invalid push reference")
 
 
@@ -87,9 +94,12 @@ def admission_reference(text_id: str, question: str = "", forwarded: str = "", *
         if opening.status != "open":
             raise ValueError(f"question is {opening.status}: {path}")
         reference = QuestionReference(kind="question", path=str(path), since=opening.since)
+        if sys.platform == "darwin":
+            reference["machine"] = "mac"
     elif reference["kind"] == "question":
         path = Path(reference["path"])
-        if not (remote_forward and not path.exists()):
+        foreign = reference.get("machine") == "mac" and sys.platform != "darwin"
+        if not (remote_forward and (foreign or not path.exists())):
             opening = read_question(path)
             if opening.status != "open":
                 raise ValueError(f"question closed: {path}")
