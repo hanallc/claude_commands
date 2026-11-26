@@ -662,7 +662,7 @@ def _legacy_draft_fingerprint(request_id: str, request: NewItemRequest, words: s
 def _submission_fingerprint(request: NewItemRequest, words: str, uploads: tuple[_ImageUpload, ...]) -> str:
     payload: list[object] = [request.kind, words, new_item_dialog.evidence_fields(request.evidence), _image_fingerprints(uploads)]
     if request.page:
-        payload.append(request.page)
+        payload.append("list" if new_item_dialog.is_list_submission_page(request.page) else request.page)
     if request.page_recipient != new_item_dialog.PageRecipient.PAGE_OWNER:
         payload.append(request.page_recipient)
     if request.page_recipient == new_item_dialog.PageRecipient.PRODUCER:
@@ -1616,7 +1616,7 @@ def _send_recipient(address: SubmissionAddress, page: str, members: staff.StaffS
         if choice == new_item_dialog.PageRecipient.PRODUCER and row.kind != "producer":
             raise SubmissionError("Pick a producer.")
         return row
-    elif page and page != "list":
+    elif page and not new_item_dialog.is_list_submission_page(page):
         configured = page_owner(page, conf.read_or_repository("console"), members)
         if isinstance(configured, PageOwnerUnavailable):
             raise SubmissionConflict("The page owner is unavailable. Open New item again.")
@@ -1744,7 +1744,7 @@ def new_item_routing(page: str, settings: conf.ConfigRead, members: staff.StaffS
             continue
     assignees = {row.id: row for row in members.rows if row.kind in ("showrunner", "unit")
                  and _page_owner_is_active(row, members)}
-    # The List owner keeps the List. The List does not choose an assignee.
+    # Old List requests have no preferred producer. The Studio uses its page owner.
     key = f"page.{page}.owner"
     designated = staff.StaffId(settings.values(key).get(key, "")) if page != "list" else staff.StaffId("")
     producer = producers.get(designated)
@@ -1765,7 +1765,7 @@ def new_item_routing(page: str, settings: conf.ConfigRead, members: staff.StaffS
         recipients=[_recipient_option(row, members) for row in producers.values()],
         assignees=[AssigneeOption(id=row.id, name=row.name) for row in ordered],
         page_owner=producer.id if producer is not None else staff.StaffId(""), page_owner_reason=reason,
-        page_assignee=owner.id if owner is not None else staff.StaffId(""))
+        page_assignee=owner.id if owner is not None and page != "studio" else staff.StaffId(""))
 
 
 def _file_question_for_remote_owner(recipient: staff.StaffRow, title: str, members: staff.StaffSnapshot,
@@ -2184,8 +2184,10 @@ def _browser_payload_hash(request: NewItemRequest, words: str, evidence: Evidenc
                           uploads: tuple[_ImageUpload, ...], screenshot: new_item_dialog.SubmissionScreenshot,
                           delivery: InitialDelivery | NoInitialDelivery) -> str:
     digest = "" if isinstance(screenshot, new_item_dialog.NoPageScreenshot) else screenshot.digest
+    # Keep the same fingerprint for a draft sent from the old List and from the Studio.
+    page = "list" if new_item_dialog.is_list_submission_page(request.page) else request.page
     fields: list[object] = [request.kind, request.recipient_id, words, new_item_dialog.evidence_fields(evidence),
-                            _image_fingerprints(uploads), request.page, request.page_recipient,
+                            _image_fingerprints(uploads), page, request.page_recipient,
                             asdict(request.page_state) if request.page_state else None, digest]
     if isinstance(delivery, InitialDelivery) and isinstance(delivery.list_assignee, ListCommandAssignee):
         fields.append(delivery.list_assignee.id)
@@ -2234,7 +2236,7 @@ def _list_draft_replay(folder: Path, send: ListDraftSend, intent: new_item_dialo
         request = filing.request
         if request.kind == SubmissionKind.PROPOSAL and request.page_recipient != new_item_dialog.PageRecipient.PRODUCER:
             request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
-        if request.page != "list" or request.request_id != send.request_id or filing.refusal is not None:
+        if not new_item_dialog.is_list_submission_page(request.page) or request.request_id != send.request_id or filing.refusal is not None:
             return ListDraftReplay()
         evidence = read_evidence(new_item_dialog.evidence_fields(request.evidence))
         words = read_words(request.words, "Your words", kind=request.kind)
@@ -2283,7 +2285,7 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
         with _locked_filed_draft(folder, members, on_list=True) as lookup:
             if isinstance(lookup, SubmissionLookup) and isinstance(lookup.native, LocatedSubmission):
                 item = lookup.native
-                if item.details.page != "list":
+                if not new_item_dialog.is_list_submission_page(item.details.page):
                     raise DraftAlreadyFiled(item.destination.id)
                 saved = item.destination
                 _check_capture_target(capture_target, saved)
@@ -2300,7 +2302,7 @@ def _submit_list_draft(send: ListDraftSend, members: staff.StaffSnapshot | None,
             raise SubmissionConflict("This screenshot belongs to another item.")
         filing = send.prepare()
         request = filing.request
-        if request.page != "list" or request.request_id != send.request_id:
+        if not new_item_dialog.is_list_submission_page(request.page) or request.request_id != send.request_id:
             raise SubmissionError("Invalid List draft request.")
         return _submit(request, members=members, screenshot=filing.screenshot,
                        capture_requested=filing.capture_requested, refusal=filing.refusal,
@@ -2391,14 +2393,14 @@ def submit(
             capture_intent.submitted_draft_id != request.request_id
             or not new_item_dialog.capture_key_matches_draft(capture_intent.capture_key, request.request_id)
             or (DRAFT_ID.fullmatch(request.request_id)
-                and (not isinstance(request, NewItemRequest) or request.page != "list"))):
+                and (not isinstance(request, NewItemRequest) or not new_item_dialog.is_list_submission_page(request.page)))):
         raise SubmissionError("The screenshot belongs to another draft.")
     if isinstance(request, new_item_dialog.UnverifiedDraftRetry):
         return _recover_unverified_draft(request.request_id, members, request.error, capture_target=capture_target)
     if isinstance(request, ListDraftSend):
         return _submit_list_draft(request, members, capture_intent=capture_intent, capture_target=capture_target,
                                   initial_delivery=initial_delivery)
-    if request.page == "list":
+    if new_item_dialog.is_list_submission_page(request.page):
         if BROWSER_DRAFT_ID.fullmatch(request.request_id):
             filing = ListDraftFiling(request, screenshot, capture_requested, refusal)
             return _submit_list_draft(ListDraftSend(request.request_id, lambda: filing), members,
@@ -2438,8 +2440,9 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
         request = replace(request, page_recipient=new_item_dialog.PageRecipient.SELECTED)
     legacy_draft = DRAFT_ID.fullmatch(request_id) is not None
     browser_draft = BROWSER_DRAFT_ID.fullmatch(request_id) is not None
-    list_draft = browser_draft and request.page == "list"
-    legacy_list_draft = legacy_draft and request.page == "list"
+    list_page_request = new_item_dialog.is_list_submission_page(request.page)
+    list_draft = browser_draft and list_page_request
+    legacy_list_draft = legacy_draft and list_page_request
     if producer_route and legacy_draft:
         raise SubmissionError("Open New item again to select a producer.")
     if request_id.startswith(("r2-", "r3-", "r4-", "r5-", "r6-")) and not (legacy_draft or browser_draft):
@@ -2580,7 +2583,7 @@ def _submit(request: NewItemRequest, *, members: staff.StaffSnapshot | None,
                               and notice.from_command else "nate via New item")
                     unit = member.name if member.kind == "unit" else ""
                     route = _plan_producer_filing(PendingProducerFiling(member.id, recipient.id, unit, source), current)
-            elif request.page == "list" and isinstance(initial_delivery, InitialDelivery):
+            elif list_page_request and isinstance(initial_delivery, InitialDelivery):
                 route = _plan_list_filing(initial_delivery.list_assignee, recipient, current)
             pending_file = folder / "pending.json"
             images = tuple(upload.reference for upload in uploads)

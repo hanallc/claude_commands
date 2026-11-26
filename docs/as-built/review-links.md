@@ -1382,7 +1382,8 @@ If a refresh removes an open item, its row closes.
 `/console/studio.html` reads the numbered List records on each request.
 The page uses the shared status line in `page_frame.py`.
 The page owner button opens the shared New item dialog.
-For a new draft, **To** selects the owner configured in `page.list.owner`.
+For a new draft on the Studio, **To** selects the producer from `page.studio.owner`.
+If the Studio has no configured producer, **To** has no selection.
 For a Review kind, **Send** files and delivers the Review item to the selected recipient.
 The List assigns numbers when its own record writer creates an item.
 The browser stores the recipient selection with the draft ID and restores both after a reload.
@@ -1696,8 +1697,8 @@ The item dialog shows Remove, Park, and a text box for Ask question and `Tell <p
 The text box uses `Your words for <producer> about this item` as its placeholder and accessible name.
 The page reads the producer name from the staff snapshot.
 A producer without a staff row shows as its staff ID.
-The List New item button uses the configured page owner or its fallback.
-The owner corner shows that recipient.
+The Studio header and its copy above the open Review card use the same New item button.
+The dialog selects the configured Studio producer for a new draft.
 Ask question and Tell sit below the box at its right edge, beside the send status.
 Both buttons stay disabled until the box contains words.
 Clearing the box disables both buttons.
@@ -2206,8 +2207,9 @@ It shows the Top priority label with the flag, the item number and title in bold
 A producer with no top item shows **No top priority item** and **Open an item and click "Make top priority".**
 The page renders one band for each top item and one band for no top item.
 A `:has()` rule for each band shows the band of the pressed Producer tab, so a tab click makes no request.
-`CONSOLE_DOCUMENTS` maps the Studio path to `list`, so New item and its screenshot use the List owner, `page.list.owner`.
-`page.studio.owner` sets the owner when the console shows the Studio as unavailable.
+`CONSOLE_DOCUMENTS` maps the Studio path to `studio` for screenshot capture.
+The Studio header and New item dialog use `page.studio.owner`.
+The List records stay in the store selected by `page.list.owner`.
 The Studio uses the List status age limit and has no `status.studio` key.
 
 #### Question and answer inventory
