@@ -102,6 +102,7 @@ class ServerFixture(unittest.TestCase):
         self.config = self.folder / "producer_map.conf"
         _ = self.config.write_text("# The producer of a showrunner or of a unit.\n", encoding="utf-8")
         _ = write_config_fixture(self.folder / "review_links.conf")
+        _ = write_config_fixture(self.folder / "user_zone.conf")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.folder),
                                                                         "XDG_STATE_HOME": str(self.folder / "state")})))
         self.server = FakeServer()

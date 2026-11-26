@@ -704,10 +704,8 @@ class ChangePageTests(unittest.TestCase):
             assert isinstance(saved, change_page.OpenQuestion)
             self.assertEqual(saved.question_id, "new-question")
 
-        config = self.temporary / "notify.conf"
-        _ = config.write_text("review_timeout_seconds=113\n")
-        with (patch.object(review, "NOTIFY_CONFIG", config),
-              patch.object(remote, "local_machine", return_value="natedev"),
+        _ = write_config_fixture(conf.path("notify"), "review_timeout_seconds=113\n")
+        with (patch.object(remote, "local_machine", return_value="natedev"),
               patch.object(remote, "machine_alias", return_value=remote.MachineAlias("mac")),
               patch.object(remote, "this_machine", return_value="natedev"),
               patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as ssh):
@@ -1017,7 +1015,7 @@ class ChangePageTests(unittest.TestCase):
         self.root = self.temporary / "snapshots"
         configuration = self.temporary / "config"
         configuration.mkdir()
-        for stem in ("change_review", "nix_env"):
+        for stem in ("change_review", "nix_env", "notify"):
             _ = write_config_fixture(configuration / f'{stem}.conf')
         _ = write_config_fixture(configuration / "statusline.conf",
                                  f'role.showrunner=#a379fd\nrebuild.cache={self.temporary / "rebuild-cache"}\n')
