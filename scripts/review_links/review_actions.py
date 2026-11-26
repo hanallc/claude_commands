@@ -6,7 +6,7 @@ import secrets
 import shlex
 import sys
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
@@ -288,11 +288,19 @@ _READ_STAFF_AUTHORITY = staff.ReadStaffAuthority()
 
 def prepare_submission_delivery(saved: review_submissions.SavedSubmission, words: str,
                                 status: change_page.DeliveryStatus, *, evidence_page: str = "",
-                                members: staff.StaffSnapshot | staff.ReadStaffAuthority = _READ_STAFF_AUTHORITY
+                                members: staff.StaffSnapshot | staff.ReadStaffAuthority = _READ_STAFF_AUTHORITY,
+                                claims: ExitStack | None = None
                                 ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
-    """Claim the first message for a published native request."""
-    with staff.supplied_snapshot(members) if isinstance(members, staff.StaffSnapshot) else nullcontext():
-        return _claim_submission_delivery(saved.address, status, words=words, evidence_page=evidence_page)
+    """Claim the first message for a published native request.
+
+    If supplied, the caller's stack releases the claim when it closes.
+    """
+    with (nullcontext(claims) if claims is not None else ExitStack()) as cleanup:
+        with staff.supplied_snapshot(members) if isinstance(members, staff.StaffSnapshot) else nullcontext():
+            delivery = _claim_submission_delivery(saved.address, status, cleanup, words=words, evidence_page=evidence_page)
+        if claims is None:
+            _ = cleanup.pop_all()
+        return delivery
 
 
 def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
@@ -315,8 +323,8 @@ def _ensure_list_filing(saved: review_submissions.SavedSubmission) -> None:
         review_submissions.skip_list_filing(saved, str(error))
 
 
-def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus, *,
-                               words: str = "", evidence_page: str = ""
+def _claim_submission_delivery(address: review_submissions.SubmissionAddress, status: change_page.DeliveryStatus,
+                               claims: ExitStack, *, words: str = "", evidence_page: str = ""
                                ) -> change_page.MessageDelivery | change_page.NoMessageDelivery:
     # Finish the List row under the recipient locks before taking the delivery lock.
     with review_submissions.submission_for_delivery(address) as filing:
@@ -389,6 +397,7 @@ def _claim_submission_delivery(address: review_submissions.SubmissionAddress, st
         _ = change_page.outbound_review_message(delivery)
         if slots.verdict != intent:
             status.write_slots(page, row, slots.updated('verdict', intent))
+        _ = claims.callback(status.release_owned_claims, (intent.attempt,))
         status.request_attempts[intent.attempt] = change_page.AttemptOwnership(status.path(page, row), 'claimed')
         review_submissions.clear_initial_delivery(address)
     return delivery
@@ -399,12 +408,9 @@ def recover_submission_deliveries(status: change_page.DeliveryStatus, review_pat
     for pending in review_submissions.pending_initial_deliveries(status.root):
         try:
             page = pending.evidence_origin + review_path if pending.evidence_origin else ""
-            delivery = _claim_submission_delivery(pending.address, status, evidence_page=page)
-            try:
+            with ExitStack() as claims:
+                delivery = _claim_submission_delivery(pending.address, status, claims, evidence_page=page)
                 change_page.deliver(delivery, status)
-            finally:
-                if isinstance(delivery, change_page.MessageDelivery):
-                    status.release_owned_claims((delivery.attempt,))
         except (OSError, ValueError, RuntimeError, staff.StaffRefused) as error:
             print(f"Review first message {pending.address.request_id}: {error}", file=sys.stderr)
 

@@ -3686,6 +3686,34 @@ class ReviewLinksServerTests(unittest.TestCase):
             send.assert_called_once()
         self.assertEqual(len(investigation.records(request.recipient_id)), 1)
 
+    def test_new_item_releases_the_claim_when_the_claim_lock_exits_with_an_error(self) -> None:
+        _, _, request = self.page_bug_fixture()
+        request = replace(request, request_id="r6-" + uuid4().hex)
+        status = self.server.delivery_status
+        locked = status.locked
+        body = self.new_item_body(request)
+
+        @contextmanager
+        def fail_claim_unlock() -> Generator[None]:
+            with locked():
+                had_claim = bool(status.request_attempts)
+                yield
+                claimed = not had_claim and bool(status.request_attempts)
+            if claimed:
+                raise OSError("The claim lock failed to unlock.")
+
+        with patch.object(change_page, "send_to_staff") as send:
+            with patch.object(status, "locked", side_effect=fail_claim_unlock):
+                failed = self.new_item_http(body, finished=True)
+            self.assertEqual(failed.status, 503, failed.body)
+            self.assertEqual(status.request_attempts, {})
+            send.assert_not_called()
+            first, = investigation.records(request.recipient_id)
+            retry = self.new_item_http(body, finished=True)
+            self.assertEqual(retry.status, 200, retry.body)
+            self.assertEqual(json.loads(retry.body)["id"], first.id)
+            send.assert_called_once()
+
     def test_new_item_releases_the_claim_when_the_handover_lock_fails(self) -> None:
         _, _, request = self.page_bug_fixture()
         request = replace(request, request_id="r6-" + uuid4().hex)

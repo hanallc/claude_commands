@@ -1947,11 +1947,10 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 with exclusive(review_submissions.image_folder(saved).parent / ".lock"):
                     try:
                         delivery = review_actions.prepare_submission_delivery(
-                            saved, saved.words, status, evidence_page=evidence_page, members=created.members)
+                            saved, saved.words, status, evidence_page=evidence_page, members=created.members,
+                            claims=claims)
                     except review_actions.SubmissionDeliveryPending:
                         delivery = change_page.NoMessageDelivery()
-                    if isinstance(delivery, change_page.MessageDelivery):
-                        _ = claims.callback(status.release_owned_claims, (delivery.attempt,))
                     if on_list or isinstance(request, new_item_dialog.NewItemRequest) and (
                             request.page_recipient == new_item_dialog.PageRecipient.PRODUCER):
                         number = the_list.reserved_review_number(review_submissions.list_filing_reservation(saved))
