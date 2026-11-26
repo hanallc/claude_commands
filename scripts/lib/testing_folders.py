@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import atexit
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import os
 from pathlib import Path
+import pwd
+import sys
 import tempfile
 from typing import NewType
 
 from scripts.lib import build_folders
+from scripts.lib.live_config_guard import LiveConfigWrite, guard_live_config
 from scripts.lib.session_folder import ROOT_ENV as SESSION_ROOT_ENV
 
 
@@ -81,7 +84,12 @@ def start_test_run() -> None:
     caller_log = os.environ.get(BUILDLOG_ENV)
     parent = _prepared_parent
     lifetime = test_run_folder() if isinstance(parent, SelectParentFromCheckout) else _test_run_folder(parent)
-    path = lifetime.__enter__()
+    with ExitStack() as scope:
+        path = scope.enter_context(lifetime)
+        # HOME can change during a test. Protect the login account's config.
+        live_config = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".claude/config"
+        scope.enter_context(guard_live_config(live_config, path, path / "live-config-writes"))
+        cleanup = scope.pop_all()
     if not caller_log:
         os.environ[BUILDLOG_ENV] = str(path / "buildlog")
 
@@ -91,6 +99,9 @@ def start_test_run() -> None:
                 _ = os.environ.pop(BUILDLOG_ENV, None)
             else:
                 os.environ[BUILDLOG_ENV] = caller_log
-            _ = lifetime.__exit__(None, None, None)
+            try:
+                cleanup.close()
+            except LiveConfigWrite as error:
+                print(f"direct test: {error}", file=sys.stderr)
 
     _ = atexit.register(finish)

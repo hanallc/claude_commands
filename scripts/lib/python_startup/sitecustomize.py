@@ -43,6 +43,7 @@ TEST_RUNNER_FILES = (*STARTUP_FILES, "scripts/test_times/module_run.py", "script
                      "scripts/production/production_names.py",
                      "scripts/lib/boot_identity.py", "scripts/lib/process_start.py",
                      "scripts/lib/conf.py", "scripts/lib/git_files.py", "scripts/lib/testing_folders.py",
+                     "scripts/lib/live_config_guard.py",
                      "scripts/lib/session_folder.py", "scripts/lib/unit_runs.py",
                      "config/build_folders.conf", "config/test_times.conf")
 _DIRECT_TEST_UNIT_PREFIX = "claude-direct-test-"
