@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
 from enum import StrEnum
+from functools import cache
 import hashlib
 from importlib import import_module
 import io
@@ -34,6 +35,10 @@ from scripts.lib.showrunner_state import state_root
 
 class BehaviorCheckError(RuntimeError):
     """The test changes or their review record could not be read."""
+
+
+class NoQuestionDraft(StrEnum):
+    OMITTED = "no question file supplied"
 
 
 class GitRange(NamedTuple):
@@ -64,12 +69,14 @@ class GitRange(NamedTuple):
             return str((Path(root) / remote).resolve())
         return remote
 
-    def command(self, action: str, *, production: str = "") -> str:
+    def command(self, action: str, *, production: str = "", question: Path | NoQuestionDraft = NoQuestionDraft.OMITTED) -> str:
         scripts = Path(__file__).resolve().parents[1]
         command = [str(scripts / "lib/py"), str(scripts / "production/behavior_check.py"), action,
                    "--repo", str(self.repo.resolve()), "--base", self.base, "--commit", self.commit]
         if production:
             command.extend(("--production", production))
+        if isinstance(question, Path):
+            command.extend(("--question", str(question.resolve())))
         return shlex.join(command)
 
 
@@ -104,12 +111,11 @@ class ChangedTests:
     tests: tuple[TestChange, ...]
     repository: str
     files: tuple[ChangedFile, ...]
-    commit_messages: bytes
 
     @property
     def key(self) -> str:
         changes = sorted((change.test, change.old, change.new) for change in self.tests)
-        fields = (self.repository, sorted(self.files), changes, hashlib.sha256(self.commit_messages).hexdigest())
+        fields = (self.repository, sorted(self.files), changes)
         return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -367,9 +373,77 @@ def changed_tests(change: GitRange, *, timeout: float | None = None) -> ChangedT
             edits_to_tests.append(TestChange(test, text, new.get(test, "")))
     if not edits_to_tests:
         return NoChangedTests.EMPTY
-    messages = change.git("log", "--format=%B", "-z", "--no-notes", "--no-show-signature", "--encoding=UTF-8",
-                          f"{change.base}..{change.commit}", "--", timeout=timeout)
-    return ChangedTests(tuple(edits_to_tests), change.origin_identity(timeout), tuple(files), messages)
+    return ChangedTests(tuple(edits_to_tests), change.origin_identity(timeout), tuple(files))
+
+
+class TestHistoryCommit(NamedTuple):
+    parents: list[str]
+    subject: str
+
+
+def question_authors(change: GitRange, tests: ChangedTests, findings: set[str]) -> dict[str, str]:
+    """Trace each finding to the commit that supplied the final test text."""
+    rows = change.git("log", "--format=%H%x00%P%x00%s", "-z", "--no-notes", "--no-show-signature",
+                      "--encoding=UTF-8", f"{change.base}..{change.commit}", "--")
+    fields = iter(rows.decode("utf-8", errors="replace").removesuffix("\0").split("\0")) if rows else iter(())
+    history = {commit: TestHistoryCommit(next(fields).split(), next(fields)) for commit in fields}
+    if change.commit not in history:
+        subject = change.git("show", "-s", "--format=%s", "--no-notes", "--no-show-signature", change.commit, "--")
+        return dict.fromkeys(findings, f"{change.commit} {subject.decode('utf-8', errors='replace').rstrip()}")
+    pairs = test_paths(change, [file.path for file in tests.files if is_test_file(file.path)], None)
+    pairs.sort(key=lambda pair: -len(pair.before))
+
+    @cache
+    def blob_at(commit: str, path: str) -> str:
+        return test_blobs(change, commit, [path], None).get(path, "")
+
+    @cache
+    def tests_in_blob(path: str, blob: str) -> tuple[list[str], list[TestSpan]]:
+        return test_lines(path, change.git("cat-file", "blob", blob))
+
+    @cache
+    def parent_path(parent: str, commit: str, path: str) -> str:
+        if blob_at(parent, path) or not blob_at(commit, path):
+            return path
+        pairs = test_paths(GitRange(change.repo, parent, commit), [path], None)
+        return next((pair.before for pair in pairs if pair.after == path), path)
+
+    def has_test_text(commit: str, path: str, name: str, text: str) -> bool:
+        blob = blob_at(commit, path)
+        if not blob:
+            return not text
+        try:
+            lines, spans = tests_in_blob(path, blob)
+        except (SyntaxError, UnicodeError):
+            return False
+        return test_texts(path, lines, spans, {name}).get(f"{path}::{name}", "") == text
+
+    authors: dict[str, str] = {}
+    for finding in tests.tests:
+        if finding.test not in findings:
+            continue
+        pair = next(pair for pair in pairs if finding.test.startswith(pair.before + "::"))
+        name = finding.test.removeprefix(pair.before + "::")
+        path = pair.after
+        commit = change.commit
+        on_first_parent = True
+        unit = ""
+        while True:
+            step = history[commit]
+            candidates = ((parent, parent_path(parent, commit, path)) for parent in step.parents)
+            parent, previous_path = next(((parent, previous_path) for parent, previous_path in candidates
+                                          if has_test_text(parent, previous_path, name, finding.new)), ("", path))
+            if parent not in history:
+                break
+            if on_first_parent and parent != step.parents[0]:
+                on_first_parent = False
+                merge = re.fullmatch(r"Merge (\S+) phase (\S+) \([0-9a-fA-F]{7,64}\) into \S+", step.subject)
+                if merge:
+                    unit = f"Ask {merge[1]} (phase {merge[2]})"
+            commit = parent
+            path = previous_path
+        authors[finding.test] = unit or f"{commit} {step.subject}"
+    return authors
 
 
 class Approval(StrEnum):
@@ -485,6 +559,7 @@ class BehaviorCommand(argparse.Namespace):
     repo: Path | None = None
     base: str = ""
     commit: str = ""
+    question: Path | None = None
 
 
 def add_range_arguments(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
@@ -501,6 +576,7 @@ def main(arguments: list[str]) -> int:
     run = commands.add_parser("run", help="Start or collect the independent review.")
     add_range_arguments(run)
     _ = run.add_argument("--production", default="", help="The owner of a Review question.")
+    _ = run.add_argument("--question", type=Path, help="Read the author's question from this JSON file.")
     status = commands.add_parser("status", help="Read the saved review or answer.")
     _ = status.add_argument("--key", default="")
     add_range_arguments(status, required=False)
@@ -511,9 +587,9 @@ def main(arguments: list[str]) -> int:
     try:
         change = GitRange(args.repo or Path(), args.base, args.commit)
         if args.key:
-            execute = cast(Callable[[str, GitRange, NoChangedTests, str, str], int],
+            execute = cast(Callable[[str, GitRange, NoChangedTests, str, str, Path | NoQuestionDraft], int],
                            import_module("scripts.production.behavior_review").execute)
-            return execute("status", change, NoChangedTests.EMPTY, args.key, "")
+            return execute("status", change, NoChangedTests.EMPTY, args.key, "", NoQuestionDraft.OMITTED)
         change = change.pinned()
         if args.action == "check":
             require_review(change)
@@ -525,9 +601,9 @@ def main(arguments: list[str]) -> int:
         if args.action == "find":
             print(json.dumps({"key": key, "tests": [asdict(test) for test in result.tests]}, indent=2))
             return 0
-        execute = cast(Callable[[str, GitRange, ChangedTests, str, str], int],
+        execute = cast(Callable[[str, GitRange, ChangedTests, str, str, Path | NoQuestionDraft], int],
                        import_module("scripts.production.behavior_review").execute)
-        return execute(args.action, change, result, key, args.production)
+        return execute(args.action, change, result, key, args.production, args.question or NoQuestionDraft.OMITTED)
     except (BehaviorCheckError, OSError) as error:
         print(f"behavior_check: {error}", file=sys.stderr)
         return 1

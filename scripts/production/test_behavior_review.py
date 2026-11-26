@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -23,7 +23,13 @@ from scripts.review_links import review_events
 
 CLEAR_REPLY = '[{"test":"test_fixture.py::test_move","finding":"none"}]'
 REVIEWER = "fixture-reviewer"
-MOVE_REASON = "An immediate move can lose work."
+MOVE_QUESTION = update_registration.QuestionParts(
+    ask="Allow a wait before an account move? (2026-11-23)",
+    context='You said, "Move at once." A wait lets the running build finish.',
+    items=["A build can take 90 minutes."],
+    choices=["Yes (wait for the build)", "No (move at once)"],
+    recommend="Yes, because the unit can finish the build.",
+)
 
 
 class BehaviorReviewTests(ScriptRepositoryTestCase):
@@ -55,9 +61,18 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         _ = self.git("commit", "-m", message)
         return self.git("rev-parse", "HEAD").stdout.strip()
 
-    def changed_range(self, message: str = MOVE_REASON) -> tuple[list[str], str]:
+    def changed_range(self, *, phase_merge: bool = False) -> tuple[list[str], str]:
         base = self.commit("test_fixture.py", "def test_move():\n    assert 'move now'\n", "Set the current behavior.")
-        commit = self.commit("test_fixture.py", "def test_move():\n    assert 'wait first'\n", message)
+        if phase_merge:
+            _ = self.git("switch", "-c", "unit")
+        test_edit = self.commit("test_fixture.py", "def test_move():\n    assert 'wait first'\n", "Change move timing.")
+        if phase_merge:
+            unit_tip = self.commit("test_fixture.py", "def test_move():\n    assert 'wait first'\n\nVALUE = 1\n", "Set a value.")
+            _ = self.git("switch", "main")
+            _ = self.git("merge", "--no-ff", "unit", "-m", f"Merge moves phase 7 ({unit_tip[:7]}) into production")
+            commit = self.git("rev-parse", "HEAD").stdout.strip()
+        else:
+            commit = test_edit
         tests = behavior_check.changed_tests(behavior_check.GitRange(self.repo, base, commit))
         assert isinstance(tests, behavior_check.ChangedTests)
         key = tests.key
@@ -70,6 +85,9 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
 
     def reply(self, text: str) -> None:
         _ = self.write(self.folder / "review.md", text)
+
+    def question_file(self, parts: update_registration.QuestionParts) -> Path:
+        return self.write(self.root / "question.json", json.dumps(parts))
 
     def test_run_without_changed_tests_starts_no_worker_and_writes_no_record(self) -> None:
         base = self.git("rev-parse", "HEAD").stdout.strip()
@@ -186,10 +204,10 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
             self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": "Move at once.",
                                     "source": str(self.root / "decision.md"), "date": "2026-11-23",
-                                    "change": "The test now expects the move to wait."}]))
+                                    "change": "The move now waits.\nAn extra line."}]))
             code, output = self.cli("run", *args)
             self.assertEqual(code, 1, output)
-            self.assertIn("the reply has no behavior name. Run the check again for a new review.", output)
+            self.assertIn("one line about the change", output)
             self.assertFalse(behavior_check.record_path(key).with_suffix(".run").exists())
             self.reply('[{"test":"test_fixture.py::test_move","finding":"none"}]')
             self.assertEqual(self.cli("run", *args), (0, f"{key} clear\n"))
@@ -198,6 +216,7 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def filed_question(self) -> tuple[list[str], str, behavior_check.Waiting, update_registration.QuestionRecord]:
         args, key = self.changed_range()
         self.specified_move_reply()
+        draft = self.question_file(MOVE_QUESTION)
 
         def accept(_key: review.QuestionKey, question: str, *, console_kind: str) -> review.QuestionAccepted:
             self.assertEqual(console_kind, "question")
@@ -205,59 +224,84 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
 
         with (mock.patch.object(astra_review, "run_review", return_value=0) as runner,
               mock.patch.object(review, "review_question", side_effect=accept) as text_check):
-            code, output = self.cli("run", *args, "--production", self.producer.name)
+            code, output = self.cli("run", *args, "--production", self.producer.name, "--question", str(draft))
             self.assertEqual(code, 1, output)
             self.assertIn("The land waits", output)
             waiting = behavior_check.read_record(key)
             assert isinstance(waiting, behavior_check.Waiting)
-            # Retry a stop after the question was saved and before the landing record was saved.
+            draft.unlink()
+            self.assertEqual(self.cli("run", *args), (1, output))
+            # Recover a question filed before the command could save the landing record.
             behavior_check.record_path(key).unlink()
-            self.assertEqual(self.cli("run", *args, "--production", self.producer.name), (1, output))
+            self.assertEqual(self.cli("run", *args), (1, output))
         runner.assert_called_once()
         prompt = cast(str, runner.call_args.args[1])
-        self.assertIn("write one sentence about what Nate would see change", prompt)
-        self.assertIn("Omit test names, file names, and function names", prompt)
-        messages = self.folder / "commit-messages.txt"
-        self.assertIn(f"Read the commit messages for the range under review in {messages}.", prompt)
-        self.assertIn('If the messages give no reason, use exactly "The change gives no reason."', prompt)
-        self.assertEqual(messages.read_text(), MOVE_REASON + "\n")
+        self.assertIn("write one plain line for the author about how the behavior changes", prompt)
+        self.assertFalse((self.folder / "commit-messages.txt").exists())
         text_check.assert_called_once()
         self.assertEqual(behavior_check.read_record(key), waiting)
         records = update_registration.question_records_for_owner(self.producer.id, strict=True)
         self.assertEqual(len(records), 1)
         question = records[0]
-        self.assertEqual(question.item.get("parts"), {
-            "ask": "Allow a change to immediate moves? (2026-11-23)",
-            "context": ('On 2026-11-23 you said, "Move at once." An immediate move can lose work. '
-                        + 'If you say Yes, the move waits for the current step.\n\nThe merge waits for your answer.'),
-            "items": [],
-            "recommend": "No, because you keep immediate moves.",
-            "choices": ["Yes (the move waits for the current step)", "No (the change stays out and you keep immediate moves)"],
-        })
+        self.assertEqual(question.item.get("parts"), MOVE_QUESTION)
         self.assertNotIn("test_move", question.item.get("question", ""))
         self.assertNotIn("test_fixture.py", question.item.get("question", ""))
         return args, key, waiting, question
 
-    def specified_move_reply(self, reason: str = MOVE_REASON) -> None:
+    def specified_move_reply(self) -> None:
         source = self.write(self.root / "decision.md", "Move at once.")
         self.reply(json.dumps([{"test": "test_fixture.py::test_move", "finding": "specified", "quote": "Move at once.",
-                                "source": str(source), "date": "2026-11-23", "behavior": "immediate moves",
-                                "reason": reason, "change": "If you say Yes, the move waits for the current step."}]))
+                                "source": str(source), "date": "2026-11-23",
+                                "change": "The move waits for the current step."}]))
+
+    def test_a_finding_without_a_question_reports_its_words_and_unit(self) -> None:
+        args, key = self.changed_range(phase_merge=True)
+        self.specified_move_reply()
+        with (mock.patch.object(astra_review, "run_review", return_value=0),
+              mock.patch.object(update_registration, "ask") as ask):
+            code, output = self.cli("run", *args)
+        self.assertEqual(code, 1)
+        self.assertIn(f"Nate's words (2026-11-23, {self.root / 'decision.md'}): Move at once.", output)
+        self.assertIn("Change: The move waits for the current step.\nAsk moves (phase 7)\n", output)
+        self.assertIn("Nate was not asked. Write the question for nate in the question template as JSON, "
+                      + "then run again with --question FILE.\n", output)
+        ask.assert_not_called()
+        self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
+
+    def test_a_question_requires_both_choices_and_the_quote_and_date(self) -> None:
+        args, key = self.changed_range()
+        self.specified_move_reply()
+        cases: list[tuple[update_registration.QuestionParts, str]] = [
+            ({**MOVE_QUESTION, "choices": ["Yesterday was too soon.", "No"]}, "start with Yes and No"),
+            ({**MOVE_QUESTION, "choices": ["Yes", "No", "Later"]}, "give two choices"),
+            ({**MOVE_QUESTION, "context": "The move waits.", "items": ["Move at once."]}, "omit Nate's quote"),
+            ({**MOVE_QUESTION, "ask": "Allow a wait before an account move?"}, "omit 2026-11-23"),
+        ]
+        with (mock.patch.object(astra_review, "run_review", return_value=0) as runner,
+              mock.patch.object(update_registration, "ask") as ask):
+            for parts, reason in cases:
+                with self.subTest(reason=reason):
+                    code, output = self.cli("run", *args, "--question", str(self.question_file(parts)))
+                    self.assertEqual(code, 1)
+                    self.assertIn(reason, output)
+        runner.assert_called_once()
+        ask.assert_not_called()
+        self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
 
     def test_a_console_hold_reports_that_nate_was_not_asked_and_refuses_land(self) -> None:
-        args, key = self.changed_range("Change move timing.")
-        self.specified_move_reply("The change gives no reason.")
+        args, key = self.changed_range()
+        self.specified_move_reply()
+        draft = self.question_file(MOVE_QUESTION)
         hold = review.QuestionAwaitingFacts("draft", ("Explain the wait.",))
         with (mock.patch.object(astra_review, "run_review", return_value=0),
               mock.patch.object(review, "review_question", return_value=hold) as text_check):
-            code, output = self.cli("run", *args, "--production", self.producer.name)
+            code, output = self.cli("run", *args, "--production", self.producer.name, "--question", str(draft))
         text_check.assert_called_once()
-        draft = cast(str, text_check.call_args.args[1])
-        self.assertIn('"Move at once." The change gives no reason. If you say Yes,', draft)
         self.assertEqual(code, 1)
         self.assertIn("question held for review", output)
-        self.assertIn("Explain the wait.\nNate was not asked. Give the reason for the change in the commit message, "
-                      + "then run the check again.\n", output)
+        self.assertIn("Explain the wait.", output)
+        self.assertIn(f"{args[-1]} Change move timing.\n", output)
+        self.assertIn(f"Nate was not asked. Revise {draft} and run again.\n", output)
         self.assertEqual(update_registration.question_records_for_owner(self.producer.id, strict=True), [])
         self.assertEqual(behavior_check.read_record(key), behavior_check.NoReview.MISSING)
         self.assertEqual(self.cli("check", *args)[0], 1)
@@ -310,12 +354,6 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
     def test_questions_with_the_same_behavior_title_keep_distinct_request_keys(self) -> None:
         _, key, first, question = self.filed_question()
         title = question.item["text"]
-        evidence = behavior_review.SpecifiedBehavior("test_fixture.py::test_move", "Move at once.",
-                                                      self.root / "decision.md", date(2026, 11, 23),
-                                                      "If you say Yes, the move waits for the current step.",
-                                                      "immediate moves", MOVE_REASON)
-        extra = replace(evidence, test="other.py::test_stop", quote="Restart the work", day=date(2026, 11, 24),
-                        change="If you say Yes, the work stays stopped.", behavior="work restarts")
         second_key = "e" * 64
         keys: list[review.QuestionKey] = []
 
@@ -325,14 +363,10 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
             return review.QuestionAccepted(text)
 
         with mock.patch.object(review, "review_question", side_effect=accept):
-            second = behavior_review.ask(second_key, [evidence], self.producer.name)
-            self.assertEqual(behavior_review.ask(second_key, [evidence], self.producer.name), second)
-            third_key = "d" * 64
-            third = behavior_review.ask(third_key, [evidence, extra, replace(extra, test="more.py::test_restart")],
-                                        self.producer.name)
-        self.assertEqual(len(keys), 2)
+            second = behavior_review.ask(second_key, MOVE_QUESTION, self.producer.name)
+            self.assertEqual(behavior_review.ask(second_key, MOVE_QUESTION, self.producer.name), second)
+        self.assertEqual(len(keys), 1)
         self.assertIn(second_key, keys[0].text)
-        self.assertIn(third_key, keys[1].text)
         self.assertNotEqual(first.question_id, second.question_id)
         scope = update_registration.ProducerQuestions(self.producer)
         records = update_registration.native_question_records(scope, self.identities, strict=True)
@@ -340,16 +374,6 @@ class BehaviorReviewTests(ScriptRepositoryTestCase):
         self.assertEqual(by_id[first.question_id].item.get("request_key"), key)
         self.assertEqual(by_id[second.question_id].item.get("request_key"), second_key)
         self.assertEqual(by_id[second.question_id].item["text"], title)
-        third_item = by_id[third.question_id].item
-        self.assertEqual(third_item["text"], title)
-        parts = third_item.get("parts")
-        assert parts is not None
-        self.assertEqual(parts["items"], [
-            'On 2026-11-24 you said, "Restart the work". An immediate move can lose work. If you say Yes, the work stays stopped.',
-        ])
-        self.assertEqual(parts["choices"], ["Yes (all the changes go in)",
-                                            "No (the changes stay out and the behaviors you set stay)"])
-        self.assertNotIn("test_stop", third_item.get("question", ""))
         self.assertTrue(all(record.status == "open" for record in records))
 
 
