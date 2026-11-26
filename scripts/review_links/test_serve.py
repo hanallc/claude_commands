@@ -53,7 +53,7 @@ from xml.etree import ElementTree
 from scripts.aws_target import aws_page, machines_page
 from scripts.agents import remote
 from scripts.agents.remote import local_machine
-from scripts.build_queue import kill_action, memory_feed, memory_files
+from scripts.build_queue import admission_wire, kill_action, memory_feed, memory_files
 from scripts.for_you.action import ActionStore
 from scripts.message import send_result, session_send
 from scripts.review_links.test_page_question import question_outcome
@@ -8546,24 +8546,47 @@ class ReviewLinksServerTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CONF_DIR": str(settings)})))
         origin = f"http://127.0.0.1:{self.port}"
         token = self.server.new_item_token
-        reference, handle = "a" * 64, "b" * 64
-        form = {"token": token, "reference": reference, "handle": handle, "words": "Use the next slot."}
-        result: kill_action.KillResult = {"reference": reference, "step": "check", "pid": 17,
-            "stop": kill_action.StopState.STOPPED, "delivery": kill_action.DeliveryState.QUEUED,
-            "time": "19:41 EST", "recipient_name": "fixture", "recipient_role": "worker"}
-        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+        run = kill_action.OutsideKillCandidate(17, "123", "check")
+        target = kill_action.OutsideKillTarget(run, kill_action.OutsideCommandTree(), staff.StaffId("fixture"),
+                                              "fixture, worker", "fixture", "worker")
+        reference = run.reference
+        targets = {reference: target}
+        actions = kill_action.KillActions(self.root, lambda: targets)
+        handle = actions.handle(target)
+        form = {"token": token, "reference": reference, "handle": handle, "words": "Use the next slot.",
+                "kill_number": "0"}
+        result = {"reference": reference, "kill_number": 1, "step": "check", "pid": 17,
+                  "stop": "Stopped", "delivery": "Message queued", "time": "12:30 UTC",
+                  "recipient_name": "fixture", "recipient_role": "worker"}
+        stopped_at = datetime(2026, 11, 25, 12, 30, tzinfo=timezone.utc)
+        finished_options: dict[str, object] = {
+            "token": token, "listed": [reference], "offers": {}, "results": [result], "refresh_seconds": 17}
+        with (patch.object(kill_action, "datetime", Mock(now=Mock(return_value=stopped_at))),
+              patch.object(time, "time", return_value=1000) as wall_clock,
+              patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
               patch.object(serve, "builds_operator", return_value=False) as operator,
-              patch.object(self.server.kill_actions, "options", return_value=({}, [])) as options,
-              patch.object(self.server.kill_actions, "stop", return_value=result) as stop):
+              patch.object(self.server, "kill_actions", actions),
+              patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(kill_action, "stop_outside_tree", return_value=kill_action.OutsideTreeEmpty()),
+              patch.object(kill_action, "deliver", return_value=kill_action.DeliveryState.QUEUED),
+              patch.object(actions, "options", wraps=actions.options) as options,
+              patch.object(actions, "stop", wraps=actions.stop) as stop):
+            self.publish_kill_rows(reference)
+            selected = f"{kill_action.PATH}?reference={reference}"
             self.assertEqual(self.request(kill_action.PATH).status, 403)
+            self.assertEqual(self.request(selected).status, 400)
             options.assert_not_called()
             self.assertEqual(self.post(kill_action.PATH, urlencode(form), origin=origin)[0], 403)
             operator.return_value = True
             response = self.request(kill_action.PATH)
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.loads(response.body), {"token": token, "offers": {}, "results": [],
-                                                          "refresh_seconds": 17})
-            options.assert_called_once_with(17)
+            self.assertEqual(json.loads(response.body), {"token": token, "listed": [reference], "offers": {reference: {
+                "handle": handle, "kill_number": 0, "pid": 17, "started_by": "fixture, worker",
+                "recipient_name": "fixture",
+                "step": "check",
+                "message": 'nate killed your run "check" (pid 17) from the Builds page at 12:30 UTC.'}},
+                "results": [], "refresh_seconds": 17})
+            options.assert_called_once_with(17, frozenset({reference}))
             for sent_origin, values, expected in (
                 ("", form, 403),
                 ("http://wrong.invalid", form, 403),
@@ -8574,8 +8597,111 @@ class ReviewLinksServerTests(unittest.TestCase):
                     self.assertEqual(self.post(kill_action.PATH, urlencode(values), origin=sent_origin)[0], expected)
             stop.assert_not_called()
             status, body = self.post(kill_action.PATH, urlencode(form), origin=origin)
-            self.assertEqual((status, json.loads(body)), (200, {"result": result}))
-            stop.assert_called_once_with(reference, handle, form["words"])
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"result": result})
+            stop.assert_called_once_with(reference, handle, form["words"], 0)
+            response = self.request(kill_action.PATH)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.body), finished_options)
+
+            targets.clear()
+            wall_clock.return_value = 1100
+            response = self.request(kill_action.PATH)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.body), finished_options)
+            self.publish_kill_rows()
+            response = self.request(kill_action.PATH)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.body), {**finished_options, "listed": [], "results": []})
+            self.assertEqual(self.request(selected).status, 400)
+            options.assert_called_with(17, frozenset())
+            self.assertEqual(self.request(f"{kill_action.PATH}?reference=../saved").status, 400)
+
+    def test_build_kill_refuses_a_post_without_the_kill_number(self) -> None:
+        origin = f"http://127.0.0.1:{self.port}"
+        form = {"token": self.server.new_item_token, "reference": "a" * 64,
+                "handle": "b" * 64, "words": ""}
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "builds_operator", return_value=True),
+              patch.object(self.server.kill_actions, "stop", return_value=kill_action.NoStopRoute()) as stop):
+            status, body = self.post(kill_action.PATH, urlencode(form), origin=origin)
+            self.assertEqual((status, json.loads(body)),
+                             (400, {"reason": "The Kill request is invalid or too large."}))
+            stop.assert_not_called()
+
+    def publish_kill_rows(self, *references: str, outside: tuple[str, ...] = ()) -> None:
+        folder = self.root / "builds"
+        folder.mkdir(exist_ok=True)
+        configuration = conf.path("review_links").parent / "memory_feed.conf"
+        if not configuration.exists():
+            _ = write_config_fixture(configuration, f"output_folder={folder}\n")
+        _ = (folder / memory_files.DATA_NAME).write_text(json.dumps({
+            "walk": [{"kill_ref": reference} for reference in references],
+            "outside_queue": [{"kill_ref": reference} for reference in outside]}))
+
+    def check_listed_kill_after_expiry(self, *, read_before_expiry: bool) -> None:
+        run = kill_action.OutsideKillCandidate(17, "123", "check")
+        saved: kill_action.KillResult = {"reference": run.reference, "kill_number": 2, "step": run.step,
+            "pid": run.row_pid, "stop": kill_action.StopState.STOPPED, "delivery": kill_action.DeliveryState.SENT,
+            "time": "12:30 UTC", "recipient_name": "fixture", "recipient_role": "worker"}
+        record = kill_action.SavedKillAction("a" * 32, run, saved, staff.StaffId("fixture"), "fixture",
+                                              kill_action.FinishedStop(1000), kill_action.OutsideCommandTree())
+        folder = self.root / ".review-link-build-kill"
+        folder.mkdir()
+        _ = (folder / f"{run.reference}.json").write_text(admission_wire.encode_record(record))
+        self.publish_kill_rows(run.reference)
+        actions = kill_action.KillActions(self.root)
+        actions.resume()
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "builds_operator", return_value=True),
+              patch.object(self.server, "kill_actions", actions),
+              patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(time, "time", return_value=1000) as clock):
+            if read_before_expiry:
+                self.assertEqual(json.loads(self.request(kill_action.PATH).body)["results"], [saved])
+            clock.return_value = 1100
+            response = self.request(kill_action.PATH)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.body)["results"], [saved])
+            self.publish_kill_rows()
+            self.assertEqual(json.loads(self.request(kill_action.PATH).body)["results"], [])
+
+    def test_build_kill_keeps_a_settled_result_when_the_recent_results_expire(self) -> None:
+        self.check_listed_kill_after_expiry(read_before_expiry=True)
+
+    def test_build_kill_first_read_after_expiry_returns_the_listed_record(self) -> None:
+        self.check_listed_kill_after_expiry(read_before_expiry=False)
+
+    def test_build_kill_refuses_a_stale_kill_number_after_an_unconfirmed_stop(self) -> None:
+        origin = f"http://127.0.0.1:{self.port}"
+        run = kill_action.OutsideKillCandidate(17, "123", "check")
+        target = kill_action.OutsideKillTarget(run, kill_action.OutsideCommandTree(), staff.StaffId("fixture"),
+                                              "fixture, worker", "fixture", "worker")
+        actions = kill_action.KillActions(self.root, lambda: {run.reference: target})
+        queued = "a" * 64
+        self.publish_kill_rows(queued, outside=(run.reference,))
+        form = {"token": self.server.new_item_token, "reference": run.reference,
+                "handle": actions.handle(target), "words": "", "kill_number": "0"}
+        with (patch.object(serve, "tailscale_ip", return_value="127.0.0.1"),
+              patch.object(serve, "builds_operator", return_value=True),
+              patch.object(self.server, "kill_actions", actions),
+              patch.object(kill_action, "live_targets", return_value={}),
+              patch.object(fcntl, "flock", wraps=fcntl.flock) as lock,
+              patch.object(kill_action, "stop_outside_tree",
+                           return_value=kill_action.OutsideProcessSurvived(run.row_pid)) as stop):
+            response = self.request(kill_action.PATH)
+            self.assertEqual(response.status, 200)
+            snapshot = cast(dict[str, object], json.loads(response.body))
+            self.assertEqual(snapshot.get("listed"), sorted((queued, run.reference)))
+            self.assertEqual(snapshot.get("outside"), [run.reference])
+            status, body = self.post(kill_action.PATH, urlencode(form), origin=origin)
+            self.assertEqual(status, 200)
+            self.assertEqual(cast(dict[str, kill_action.KillResult], json.loads(body))["result"].get("kill_number"), 1)
+            lock.reset_mock()
+            status, body = self.post(kill_action.PATH, urlencode(form), origin=origin)
+            self.assertEqual((status, json.loads(body)), (409, {"reason": "The run or its stop route changed."}))
+            lock.assert_called_once_with(ANY, fcntl.LOCK_EX)
+            stop.assert_called_once()
 
     def test_builds_operator_checks_the_peer_against_the_local_owner(self) -> None:
         settings = self.root.parent / "operator-config"
