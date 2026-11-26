@@ -3984,6 +3984,14 @@ def has_park_receipt(item: ListItem, request: str) -> bool:
     return isinstance(saved, (PageRequest, PageFeedback)) and saved.action == "park"
 
 
+def remove_receipt(item: ListItem, request: str) -> PageRequest | PageFeedback | NoPageRequest:
+    """Find the receipt even if Remove saved without a notice."""
+    saved = _page_requests(item).get(_request_id(request))
+    if isinstance(saved, (PageRequest, PageFeedback)) and saved.action == "remove":
+        return saved
+    return NoPageRequest.ABSENT
+
+
 def unpark_no_change_reason(item: ListItem, request: str) -> UnparkNoChangeReason:
     """Read the original reason from an Unpark receipt."""
     saved = _page_requests(item).get(_request_id(request))

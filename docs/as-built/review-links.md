@@ -1989,6 +1989,7 @@ Remove closes the item through `the_list.close` with source `the_list.PAGE_SOURC
 Remove sits at the left edge of the open row above the four-line text box.
 Remove saves the exact text from the box as closing words and adds it after the removal line in the notice.
 A blank box uses the short Studio notice and the default closing words.
+Remove accepts a retry if trimming its reason gives the reason in an older receipt.
 After a confirmed Remove, the page clears the submitted draft if it still matches.
 Park and Remove collapse the row after the save.
 The table applies the saved state before the next refresh.
@@ -2165,7 +2166,7 @@ The log and retry use the original recipient after reassignment.
 The page retains draft words, dates, actions, request IDs, and tokens during a refresh.
 An unchanged retry uses its saved request ID and token after a lost response.
 After a lost Park or Remove response, the List reads the current item before it restores the row.
-For Park, it checks the receipt for the exact request even when the item already has a parking time.
+It checks the receipt for the exact request, including a Remove that saved without a notice.
 Changed feedback uses the fresh signed request from the page.
 A successful send clears the saved request ID and only the text that the user sent.
 Each successful POST returns a fresh signed request ID for the next action.
