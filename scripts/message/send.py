@@ -2402,14 +2402,15 @@ def _settle_codex_pane_claim(key: str, recipient: StableRecipient, attempt: Pend
             state["last"][address] = started
             pending[address] = attempt
             state["pending"] = pending
-            if not attempt.get("once_per_key"):
-                return False
         if confirmed:
             del pending[address]
             if not pending:
                 del state["pending"]
             if "codex_pane_logical_recipient" in attempt:
-                state["last"][attempt["codex_pane_logical_recipient"]] = started
+                logical_recipient = attempt["codex_pane_logical_recipient"]
+                last = state["last"].get(logical_recipient)
+                if last is None or datetime.fromisoformat(last) < datetime.fromisoformat(started):
+                    state["last"][logical_recipient] = started
             if attempt.get("once_per_key"):
                 state["once_accepted"] = True
     return confirmed
