@@ -518,6 +518,33 @@ class WorktreeLifecycleTests(unittest.TestCase):
         self.assertFalse(old.is_symlink())
         self.assertEqual(journal.read_text(), "unreadable move record")
 
+    def test_rows_126_127_128_moves_refuse_a_former_fixed_folder(self) -> None:
+        self.layout_fixture()
+        with patch.dict(os.environ, self.environment, clear=True):
+            for row in (126, 127, 128):
+                with self.subTest(row=row):
+                    old = self.trees / f"old-{row}"
+                    if row == 127:
+                        _ = self.git(self.root, "clone", str(self.repository), str(old))
+                    else:
+                        _ = self.add_linked_tree(self.repository, old, f"move-{row}")
+                    former = self.root / f"former-build-{row}"
+                    with patch.object(build_folders, "build_root", return_value=former):
+                        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="verify") as fixed:
+                            _ = (fixed / "artifact").write_text("fixed output")
+                    nested = old / "former-build"
+                    _ = former.rename(nested)
+                    new = self.trees / "origin/fixture-unit" / f"new-{row}"
+                    with patch.object(worktrees, "_worktree_copy_required", return_value=row == 126):
+                        if row == 127:
+                            move = worktrees.WorktreeMove(old, new, "origin", "fixture-unit", f"new-{row}",
+                                                          worktrees.MoveOutput.LIVE_UNIT)
+                            _ = worktrees._open_move(move)  # pyright: ignore[reportPrivateUsage]
+                        with self.assertRaisesRegex((ValueError, OSError, worktrees.Refused), "fixed build folder"):
+                            _ = worktrees.move_worktree(old, "origin", "fixture-unit", f"new-{row}")
+                    self.assertEqual((nested / fixed.relative_to(former) / "artifact").read_text(), "fixed output")
+                    self.assertFalse(new.exists())
+
     def test_move_writes_the_checkout_record_before_deferring_the_output(self) -> None:
         self.layout_fixture()
         config = Path(self.environment["CONF_DIR"]) / "build_folders.conf"
@@ -3727,6 +3754,25 @@ raise SystemExit(2)
             with move.hold_outputs():
                 leftover.touch()
             self.assertTrue(leftover.is_file())
+
+    def test_row_124_unit_rename_refuses_a_former_fixed_folder(self) -> None:
+        self.layout_fixture()
+        source = self.trees / "origin/demo"
+        move = worktrees.UnitFolderRename("origin", "demo", "renamed", source, source.with_name("renamed"))
+        with patch.dict(os.environ, self.environment, clear=True):
+            former = self.root / "former-build"
+            with patch.object(build_folders, "build_root", return_value=former):
+                with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="verify") as fixed:
+                    _ = (fixed / "artifact").write_text("fixed output")
+            output = move.old_build / "probe"
+            output.mkdir(parents=True)
+            move.new_build.mkdir(parents=True)
+            nested = output / "former-build"
+            _ = former.rename(nested)
+            with move.hold_outputs(), self.assertRaisesRegex(OSError, "fixed build folder"):
+                move.finish()
+            self.assertEqual((nested / fixed.relative_to(former) / "artifact").read_text(), "fixed output")
+            self.assertFalse((move.new_build / output.name).exists())
 
     def test_retire_reports_and_keeps_an_unverified_copy(self) -> None:
         self.layout_fixture()

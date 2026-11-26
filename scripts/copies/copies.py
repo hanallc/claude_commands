@@ -2535,13 +2535,16 @@ def remote_copies_command(action: str, mirror: RemoteMirror, *tail: str) -> str:
 
 
 def remote_rsync(source: Path, mirror: RemoteMirror, excludes: Path, options: list[str],
-                 *, receiver_setup: str = "") -> list[str]:
+                 *, receiver_setup: str = "", protect_fixed_recovery: bool = False) -> list[str]:
     """Refresh a leased mirror through the remote copy owner."""
     receiver = remote_copies_command("mirror-receive", mirror, "--", "rsync")
     if receiver_setup:
         receiver = receiver_setup + "exec " + receiver
     # Keep the existing command order while metadata removal keeps the record last.
     exclusions = floor_claims.MIRROR_METADATA[1:] + floor_claims.MIRROR_METADATA[:1]
+    if protect_fixed_recovery:
+        keep = build_folders.copy_keep_file(Path(mirror.path)).name
+        exclusions += (keep, ".mac-smoke-launch-*")
     return ["rsync", RSYNC_RECEIVER_WRITE_TIME_FLAGS, "--compress", "--delete", f"--rsync-path={receiver}",
             *(f"--exclude=/{name}" for name in exclusions),
             f"--exclude-from={excludes}", "-e", shlex.join(["ssh", *options]),

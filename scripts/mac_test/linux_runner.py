@@ -809,6 +809,7 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
         free = output_free_bytes(mirror, {**os.environ, **environment}) / (1024 ** 3)
         if free < floor:
             if target.exists():
+                build_folders.require_no_fixed_build_folders(target)
                 shutil.rmtree(target)
             cleanup = '0' if trim_build_folder(target, environment) == 0 else '1'
         else:

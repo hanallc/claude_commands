@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Generator
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, chdir, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import errno
 import fcntl
@@ -223,6 +223,49 @@ class RemoteCopiesTests(unittest.TestCase):
             self.assertEqual(copies.mirror_run(args), 0)
         self.assertTrue(received.is_file())
         self.assertEqual(payload.read_text(), "[]\n")
+
+    def test_row_34_fixed_refresh_keeps_the_mirror_and_recovery_files(self) -> None:
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            mirror = self.remote(path=str(folder))
+            copies.mark_mirror(folder, mirror.owner, mirror.repository.name, mirror.session)
+            keep = build_folders.copy_keep_file(folder)
+            _ = keep.write_text("saved run\n")
+            _ = (self.source / "source.txt").write_text("local source edit\n")
+            _ = (folder / "source.txt").write_text("receiver edit\n")
+            _ = (folder / "receiver-only.txt").write_text("stale\n")
+            files = (folder / keep.name, folder / ".mac-smoke-launch-123", folder / ".git",
+                     folder / "target", folder / "ignored.txt")
+            for path in files:
+                _ = path.write_text(f"{path.name}\n")
+            record = folder / floor_claims.MIRROR_RECORD
+            before = record.read_bytes()
+            excludes = self.root / "excludes"
+            _ = excludes.write_text("/.git\n/target\n/ignored.txt\n")
+            command = copies.remote_rsync(self.source, mirror, excludes, [], protect_fixed_recovery=True)
+            result = subprocess.run([*command[:-1], f"{folder}/"], capture_output=True, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for path in files:
+                self.assertEqual(path.read_text(), f"{path.name}\n")
+            self.assertEqual(keep.read_text(), "saved run\n")
+            self.assertEqual(record.read_bytes(), before)
+            self.assertEqual((folder / "source.txt").read_text(), "local source edit\n")
+            self.assertFalse((folder / "receiver-only.txt").exists())
+
+    def test_row_37_fetch_cleanup_refuses_a_former_fixed_folder(self) -> None:
+        root = build_folders.build_root()
+        with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:
+            _ = (folder / "compiled").write_text("Cargo output")
+        fetch = self.mirror / "artifacts"
+        self.mirror.mkdir(parents=True)
+        _ = root.rename(fetch)
+        saved = fetch / folder.relative_to(root) / "compiled"
+        with copies.local_mirror_lease(self.mirror, "fetch"), chdir(self.mirror):
+            descriptors = ",".join(map(str, copies.COMMAND_LOCKS.get()))
+            with (mock.patch.dict(os.environ, {floor_claims.MIRROR_LEASE_FDS: descriptors}),
+                  self.assertRaisesRegex(copies.CopyError, "guarded fetch cleanup refused")):
+                copies.clear_mirror_fetch_folder(fetch.name)
+        self.assertEqual(saved.read_text(), "Cargo output")
 
     def test_mirror_receive_refuses_a_staged_fixed_checkout(self) -> None:
         with build_folders.fixed_repository_build_folder("hana", machine="mac", unit="alpha") as folder:

@@ -21,8 +21,10 @@ import unittest
 from unittest import mock
 
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.lib import conf, removal_guard, scratch
+from scripts.lib import build_copies, build_folders, conf, removal_guard, scratch
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.checkout_test_support import write_stdlib_tool
+from scripts.lib.git_test_support import commit_repository
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.build_hold import override_guard
@@ -195,6 +197,32 @@ class QueueRunTests(unittest.TestCase):
 
     def events(self, root: Path) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in (root / "events").read_text().splitlines()]
+
+    def test_rows_81_82_smoke_refuses_untracked_directories_before_checkout(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        private = private_copy_config(root)
+        source = root / "source"
+        source.mkdir()
+        with mock.patch.dict(os.environ, {**private.environment, "HOME": str(root), "MAC_PLACEMENT": "smoke/attempt"}):
+            _ = subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
+            _ = subprocess.run(["git", "-C", str(source), "remote", "add", "origin", "https://example.test/widget.git"],
+                               check=True, capture_output=True)
+            _ = (source / "tracked").write_text("source")
+            revision = commit_repository(source, "source")
+            with build_folders.fixed_repository_build_folder("widget", machine="mac", unit="verify") as folder:
+                build_copies.prepare_fixed_checkout(source, folder, revision, reserved=("target",))
+                tracked = folder / "tracked"
+                _ = tracked.write_text("local edits")
+                notes = folder / "notes"
+                notes.mkdir()
+                _ = (notes / "proof").write_text("working data")
+            with (mock.patch("scripts.agents.remote.this_machine", return_value="mac"),
+                  mock.patch.object(sys, "stdin", io.StringIO("+")),
+                  redirect_stdout(io.StringIO()),
+                  self.assertRaisesRegex(ValueError, "untracked folders")):
+                _ = mac_queue_run.run_smoke_folder(source, "verify", revision, "", "", "fixture", ["/usr/bin/true"])
+            self.assertEqual(tracked.read_text(), "local edits")
+            self.assertEqual((notes / "proof").read_text(), "working data")
 
     def write_block(self, path: Path, *, expired: bool = False, ci: mac_test.CiSwitch = "not_configured",
                     session: str = "holder-session") -> None:

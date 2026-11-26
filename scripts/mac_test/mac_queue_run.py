@@ -511,7 +511,7 @@ def run_smoke_folder(source: Path, unit: str, commit: str, bundle: str, ref: str
     """Prepare and run a smoke checkout under the Mac folder lease."""
     from scripts.agents import remote
     from scripts.copies import copies
-    from scripts.lib import build_folders
+    from scripts.lib import build_copies, build_folders
     from scripts.mac_test import floor_claims
 
     machine = remote.this_machine()
@@ -554,23 +554,19 @@ def run_smoke_folder(source: Path, unit: str, commit: str, bundle: str, ref: str
             finally:
                 clear_smoke_bundle(upload, episode)
         target = build_folders.fixed_cargo_folder(checkout)
-        environment = {**os.environ, "GIT_DIR": git_directory, "GIT_WORK_TREE": str(checkout),
+        environment = {**os.environ,
                        "CARGO_TARGET_DIR": str(target), "CARGO_BUILD_BUILD_DIR": str(target),
                        build_folders.COPY_KEEP_ENV: str(build_folders.copy_keep_file(checkout)),
                        "MAC_SMOKE_SAVED_FOLDER": str(record),
                        "COPIES_COMMAND_LEASE_FDS": ",".join(map(str, locks))}
 
-        def git(*words: str) -> bytes:
-            return subprocess.run(["git", *words], cwd=checkout, env=environment, stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.PIPE, pass_fds=locks, timeout=timeout, check=True).stdout
-
-        _ = git("init", "-q")
-        _ = git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--", str(source), commit)
-        reserved = ("target", *floor_claims.MIRROR_METADATA)
-        if git("ls-tree", commit, "--", *reserved):
-            raise ValueError(f"{commit}: the commit tracks a reserved build path")
-        _ = git("checkout", "--quiet", "--force", "--detach", commit)
-        _ = git("clean", "-ffdx", *(word for name in reserved for word in ("-e", f"/{name}")))
+        reserved = ("target", build_folders.COPY_USE_STAMP, *floor_claims.MIRROR_METADATA,
+                    *(path.name for path in sorted(checkout.glob(".mac-smoke-launch-*"))))
+        with contextlib.ExitStack() as inherited:
+            for descriptor in copies.COMMAND_LOCKS.get():
+                _ = inherited.enter_context(build_folders.inherit_build_lock(descriptor))
+            build_copies.prepare_fixed_checkout(source, checkout, commit, reserved=reserved,
+                                               registration_parent=Path(git_directory))
         status = subprocess.run(command, cwd=checkout, env=environment, pass_fds=locks, check=False).returncode
         if os.path.lexists(marker):
             return status or 4

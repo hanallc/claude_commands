@@ -423,7 +423,8 @@ from scripts.aws_target import gate_box, ledger
 
 os.chdir(sys.argv[1])
 socket.gethostname = lambda: 'nixos'
-if os.environ['FIXTURE_GUEST_RESULT'] in ('disconnect-before-copy', 'interrupted-before-copy'):
+if ('--check-placement' not in sys.argv
+        and os.environ['FIXTURE_GUEST_RESULT'] in ('disconnect-before-copy', 'interrupted-before-copy')):
     print('fixture pause before take_copy', file=sys.stderr, flush=True)
     signal.pause()
 sys.argv = sys.argv[2:]
@@ -3987,6 +3988,24 @@ with (patch.object(conf, 'read', read_config),
         self.assertIn('inside a Git checkout', self.not_started(result))
         self.assertFalse((self.guest_home / '.claude/build').exists())
         self.assertFalse((self.guest_home / 'build').exists())
+
+    def test_rows_23_26_guest_checks_placement_before_removal_and_reset(self) -> None:
+        self.assertIsInstance(self.route(), GateRun)
+        main = self.guest_home / '.claude'
+        old_bootstrap = main / mac_linux.BOOTSTRAP_DIR / 'old-data'
+        old_bootstrap.parent.mkdir()
+        _ = old_bootstrap.write_text('Keep the earlier bootstrap.')
+        config = self.repo / 'config/build_folders.conf'
+        _ = write_config_fixture(config, 'roots.build=~/.claude/build\n')
+        _ = (self.repo / 'history.txt').write_text('The incoming source.\n')
+        _ = self.git('commit', '-qam', 'configure an invalid guest build root')
+        _ = self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
+
+        result = self.route()
+
+        self.assertIn('inside a Git checkout', self.not_started(result))
+        self.assertEqual(old_bootstrap.read_text(), 'Keep the earlier bootstrap.')
+        self.assertEqual((main / 'history.txt').read_text(), 'old source\n')
 
     def test_run_guest_keeps_output_in_a_folder_without_a_worktree(self) -> None:
         checkout = self.guest_home / 'build/claude/mac-linux'

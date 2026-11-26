@@ -42,7 +42,7 @@ from scripts.aws_target import gate_box, ledger
 from scripts.build_queue import execution_identity
 from scripts.build_queue.admission_jobs import GateJobNotRecorded, StepJob
 from scripts.build_targets import target_config
-from scripts.lib import atomic_file, build_folders, conf, git_exclude, git_files, git_rescue, process_group, process_start
+from scripts.lib import atomic_file, build_copies, build_folders, conf, git_exclude, process_group, process_start
 from scripts.mac_test import claim_state, eligibility
 from scripts.production.gate_modules import GateRefused, discover_test_modules
 from scripts.production.gate_routes import (
@@ -61,6 +61,7 @@ GUEST_CLAIM_TARGET = eligibility.MAC_LINUX_CLAIM_TARGET
 ORIGIN_MAIN = 'refs/remotes/origin/main'
 RUNNER_PATH = 'scripts/build_targets/mac_linux.py'
 BOOTSTRAP_DIR = '.git/mac-linux'
+BOOTSTRAP_PLACEMENT_PENDING = '.git/mac-linux-placement-pending'
 SSH_CONNECT_TIMEOUT_SECONDS = 8
 CONNECT_ATTEMPTS = 3
 # Give the guest port forward time to accept a new connection.
@@ -1045,14 +1046,16 @@ if [ ! -f .git/HEAD ]; then
     git init -q --initial-branch=main --object-format={object_format}
 fi
 bootstrap="$PWD/{BOOTSTRAP_DIR}"
-rm -rf -- "$bootstrap"
-mkdir -p -- "$bootstrap/tmp"
-trap 'rm -rf -- "$bootstrap"' EXIT
-export TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache"
-head -c {bootstrap_bytes} | tar -xf - -C "$bootstrap"
-if ! LC_ALL=C git bundle unbundle - >/dev/null 2>"$bootstrap/bundle-error"; then
-    cat "$bootstrap/bundle-error" >&2
-    if grep -Fq {shlex.quote(MISSING_PREREQUISITE_MESSAGE)} "$bootstrap/bundle-error"; then
+placement_pending={BOOTSTRAP_PLACEMENT_PENDING}
+: > "$placement_pending"
+stage=$(mktemp -d "$bootstrap-stage.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+mkdir -- "$stage/tmp"
+export TMPDIR="$stage/tmp" XDG_CACHE_HOME="$stage/cache"
+head -c {bootstrap_bytes} | tar -xf - -C "$stage"
+if ! LC_ALL=C git bundle unbundle - >/dev/null 2>"$stage/bundle-error"; then
+    cat "$stage/bundle-error" >&2
+    if grep -Fq {shlex.quote(MISSING_PREREQUISITE_MESSAGE)} "$stage/bundle-error"; then
         exit {MISSING_PREREQUISITE_STATUS}
     fi
     exit 1
@@ -1063,7 +1066,7 @@ fi
 read -r group _ < "/proc/$$/fd/{RUN_LOCK_FD}"
 {{ while read -r _; do :; done; exec setsid {guest_group_signal_command()} "$group" KILL; }} <&0 >/dev/null 2>&1 {RUN_LOCK_FD}>&- &
 watcher=$!
-trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$bootstrap"' EXIT
+trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$stage"' EXIT
 exec </dev/null
 commit={shlex.quote(source.commit)}
 origin_main={shlex.quote(source.origin_main)}
@@ -1074,11 +1077,19 @@ if [ "$tree" != {shlex.quote(source.tree)} ]; then
 fi
 git cat-file -e "$origin_main^{{commit}}"
 git config remote.origin.url {shlex.quote(source.origin_url)}
+git archive {shlex.quote(source.runner_commit)} scripts config | tar -xf - -C "$stage"
+mkdir -- "$stage/next-config"
+git show "$origin_main:config/build_folders.conf" > "$stage/next-config/build_folders.conf"
+CONF_DIR="$stage/next-config" "$stage/scripts/lib/py" "$stage/{RUNNER_PATH}" "$stage/request.json" --check-placement
+rm -f -- "$placement_pending"
+rm -rf -- "$bootstrap"
+mv -T -- "$stage" "$bootstrap"
+trap 'kill "$watcher" 2>/dev/null || :; rm -rf -- "$bootstrap"' EXIT
+export TMPDIR="$bootstrap/tmp" XDG_CACHE_HOME="$bootstrap/cache"
 git symbolic-ref HEAD refs/heads/main
 git symbolic-ref refs/remotes/origin/HEAD {ORIGIN_MAIN}
 printf 'update refs/heads/main %s\\nupdate {ORIGIN_MAIN} %s\\n' "$origin_main" "$origin_main" | git update-ref --stdin
 git reset --hard -q "$origin_main"
-git archive {shlex.quote(source.runner_commit)} scripts config | tar -xf - -C "$bootstrap"
 umask 022
 "$bootstrap/scripts/lib/py" "$bootstrap/{RUNNER_PATH}" "$bootstrap/request.json"'''
     lock = guest_attempt_command('lock', armed, RUN_LOCK_FD)
@@ -1095,10 +1106,14 @@ def cleanup_shell(settings: GuestSettings, armed: ArmedGuestAttempt) -> str:
     send_group = guest_group_signal_command()
     cleanup = f'''set -euo pipefail
 lock="/proc/$$/fd/8"
+placement_pending={BOOTSTRAP_PLACEMENT_PENDING}
 prove_end() {{
     flock -x -n 8 || return 1
-    if ! {cancel} || ! rm -rf -- {BOOTSTRAP_DIR}; then
+    if ! {cancel}; then
         exit {GUEST_END_PENDING_STATUS}
+    fi
+    if [ ! -e "$placement_pending" ]; then
+        rm -rf -- {BOOTSTRAP_DIR} || exit {GUEST_END_PENDING_STATUS}
     fi
     printf 'ended\\n'
     exit 0
@@ -2889,36 +2904,11 @@ def run_limited(tmp: Path, argv: Sequence[str], copy: Path, environment: dict[st
         os.close(status_read)
 
 
-def prepare_guest_folder(source: Path, checkout: Path, commit: str, attempt: str) -> Path:
+def prepare_guest_folder(source: Path, checkout: Path, commit: str) -> Path:
     """Set up the commit in the leased folder and retain its Cargo output."""
-    locks = build_folders.held_build_folder_descriptors()
-    timeout = build_folders.repository_git_timeout()
-
-    def git(path: Path, *words: str) -> str:
-        return subprocess.run(['git', '-C', str(path), *words], check=True, capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, pass_fds=locks, timeout=timeout).stdout
-
     reserved = ('target', build_folders.COPY_USE_STAMP)
-    if git(source, 'ls-tree', commit, '--', *reserved):
-        raise GuestUnavailable(f'{commit}: the commit tracks a reserved build path.')
     target = build_folders.fixed_cargo_folder(checkout)
-    try:
-        worktree = build_folders.linked_build_checkout(checkout, source)
-    except git_files.NotACheckout:
-        if not build_folders.may_remove_folder_tree(checkout):
-            raise GuestUnavailable(f'{checkout}: the guest build folder contains a mount.')
-        build_folders.create_fixed_build_checkout(source, checkout, commit, timeout=timeout)
-    else:
-        if not build_folders.may_remove_folder_tree(checkout, worktree.git_dir):
-            raise GuestUnavailable(f'{checkout}: the guest build folder contains a mount.')
-        index = worktree.git_dir / 'index'
-        index.with_name('index.lock').unlink(missing_ok=True)
-        if not os.path.lexists(index):
-            _ = git(checkout, 'read-tree', 'HEAD')
-        _ = git_rescue.rescue(checkout, f'{TARGET}-{attempt}', generated=[checkout / name for name in reserved],
-                              pass_fds=locks)
-        _ = git(checkout, 'checkout', '--force', '--detach', commit)
-    _ = git(checkout, 'clean', '-ffdx', *(word for name in reserved for word in ('-e', f'/{name}')))
+    build_copies.prepare_fixed_checkout(source, checkout, commit, reserved=reserved)
     for name in reserved:
         git_exclude.ensure_excluded(checkout, f'/{name}')
     target.mkdir(exist_ok=True)
@@ -2938,6 +2928,18 @@ def save_guest_build_folder(source: Path, checkout: Path, attempt: str) -> None:
     atomic_file.write_text_atomic(marker, str(record) + '\n', new_file_mode=0o600)
 
 
+def check_guest_placement(request_path: Path) -> int:
+    """Check the incoming build configuration before removing the bootstrap."""
+    request = guest_request(request_path)
+    try:
+        repository = build_folders.repo_word(Path.cwd())
+        _ = build_folders.check_fixed_repository_placement(repository, machine=TARGET)
+        build_folders.require_no_fixed_build_folders(Path(BOOTSTRAP_DIR))
+    except (OSError, ValueError) as error:
+        return refuse_run(str(error), request['attempt'])
+    return 0
+
+
 def run_guest(request_path: Path) -> int:
     """Run the gate or command in the guest's fixed repository folder."""
     request = guest_request(request_path)
@@ -2951,7 +2953,7 @@ def run_guest(request_path: Path) -> int:
         except build_folders.InvalidFixedBuildRoot as error:
             return refuse_run(str(error), request['attempt'])
         save_guest_build_folder(main, checkout, request['attempt'])
-        target = prepare_guest_folder(main, checkout, request['commit'], request['attempt'])
+        target = prepare_guest_folder(main, checkout, request['commit'])
         with build_folders.tool_folder(TARGET, target) as runtime:
             home = runtime / 'home'
             (home / '.claude').mkdir(parents=True)
@@ -3086,5 +3088,7 @@ if __name__ == '__main__':
         reconcile_guest_end(sys.argv[2], int(sys.argv[3]))
     elif sys.argv[2:3] == [RUN_COPY]:
         run_copy(Path(sys.argv[1]), int(sys.argv[3]))
+    elif sys.argv[2:3] == ['--check-placement']:
+        raise SystemExit(check_guest_placement(Path(sys.argv[1])))
     else:
         raise SystemExit(run_guest(Path(sys.argv[1])))

@@ -21,7 +21,8 @@ import unittest
 from unittest import mock
 
 from scripts.lib.fixture_test_support import set_up_fixture
-from scripts.lib import process_stat, removal_guard
+from scripts.lib import build_folders, process_stat, removal_guard
+from scripts.lib.build_copies_test_support import private_copy_config
 from scripts.lib.helper_tree_test_support import COPY_HELPERS, copy_helpers
 
 from scripts.lib.py_floor_test_support import interpreter_cache_environment
@@ -727,6 +728,22 @@ class LinuxShellTests(unittest.TestCase):
         self.assertTrue(recent.exists())
         self.assertEqual((self.mirror / "custom-build/warm-proof").read_text(), "warm\n")
         self.assertEqual((self.mirror / "target/retained").read_text(), "default folder\n")
+
+    def test_row_73_low_disk_cleanup_refuses_a_former_fixed_folder(self) -> None:
+        private = private_copy_config(self.root / "private-build")
+        with mock.patch.dict(os.environ, private.environment):
+            root = build_folders.build_root()
+            with build_folders.fixed_repository_build_folder("hana", machine="mac-linux", unit="verify") as folder:
+                _ = (folder / "compiled").write_text("Cargo output")
+        target = self.mirror / "custom-build"
+        _ = root.rename(target)
+        self.environment["FAKE_FREE_GIB"] = "1"
+
+        result = self.execute(self.request(words=("--target-dir", target.name)))
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("mac_cleanup=1", result.stdout)
+        self.assertEqual((target / folder.relative_to(root) / "compiled").read_text(), "Cargo output")
 
     def test_explicit_build_folder_cannot_escape_the_selected_slot(self) -> None:
         neighbor = self.root / offload.remote_mirror(self.identity, "linux", 1) / "target/retained"

@@ -1120,6 +1120,54 @@ with folders.temporary_build_folder(request) as path:
         self.assertEqual(self.git(path, "rev-parse", "HEAD"), self.base)
         self.assertEqual(build_folders.build_folder_state(path), "free")
 
+    def test_rows_28_29_fixed_reuse_refuses_untracked_directories_and_keeps_ignored_files(self) -> None:
+        _ = (self.source / ".gitignore").write_text("target/\n*.cache\n")
+        revision = commit_repository(self.source, "ignore build cache")
+        reserved = ("target", build_folders.COPY_USE_STAMP)
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as path:
+            build_copies.prepare_fixed_checkout(self.source, path, revision, reserved=reserved)
+            untracked = path / "untracked"
+            untracked.mkdir()
+            proof = untracked / "proof"
+            _ = proof.write_text("untracked changes")
+            tracked = path / "change.txt"
+            _ = tracked.write_text("keep edits before refusal")
+            with self.assertRaisesRegex(build_copies.UntrackedCopyDirectories, "untracked folders"):
+                build_copies.prepare_fixed_checkout(self.source, path, revision, reserved=reserved)
+            self.assertEqual(tracked.read_text(), "keep edits before refusal")
+            self.assertEqual(proof.read_text(), "untracked changes")
+            proof.unlink()
+            untracked.rmdir()
+            ignored = path / "scratch.cache"
+            _ = ignored.write_text("keep cache")
+            build_copies.prepare_fixed_checkout(self.source, path, revision, reserved=reserved)
+            self.assertEqual(ignored.read_text(), "keep cache")
+            self.assertEqual(tracked.read_text(), "first commit\n")
+
+    def test_row_54_fixed_registration_rescues_existing_files_before_checkout(self) -> None:
+        reserved = ("target", build_folders.COPY_USE_STAMP)
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as path:
+            tracked = path / "change.txt"
+            _ = tracked.write_text("prior checkout content\n")
+            build_copies.prepare_fixed_checkout(self.source, path, self.base, reserved=reserved)
+            self.assertEqual(tracked.read_text(), "first commit\n")
+            self.assertIn("source", self.lease(path))
+        saved, = self.rescue_refs().splitlines()
+        self.assertEqual(self.git(self.source, "show", f"{saved}:change.txt"), "prior checkout content")
+
+    def test_row_28_fixed_reuse_refuses_a_changed_source_record(self) -> None:
+        reserved = ("target", build_folders.COPY_USE_STAMP)
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as path:
+            build_copies.prepare_fixed_checkout(self.source, path, self.base, reserved=reserved)
+            _ = (path / "change.txt").write_text("keep after refusal")
+        lease = self.lease(path)
+        lease["source"] = {}
+        _ = build_folders.lease_path(path).write_text(json.dumps(lease))
+        with build_folders.fixed_repository_build_folder("widget", machine="mac-linux", unit="queue") as reused:
+            with self.assertRaisesRegex(ValueError, "fixed checkout source changed"):
+                build_copies.prepare_fixed_checkout(self.source, reused, self.base, reserved=reserved)
+        self.assertEqual((path / "change.txt").read_text(), "keep after refusal")
+
     def test_a_damaged_copy_index_and_source_edits_restore_from_the_rescue_before_reset(self) -> None:
         for number, damaged in enumerate((b"damaged index\x00\xff", b"DIRC\x00\x00\x00\xff")):
             with self.subTest(index=damaged):
@@ -1168,6 +1216,39 @@ with folders.temporary_build_folder(request) as path:
 
     def test_assigned_copy_recovers_cargo_reset_after_sigkill(self) -> None:
         self.assert_cargo_reset_recovers(self.interrupt_cargo_reset())
+
+    def test_row_138_cargo_reset_refuses_a_held_child_lease(self) -> None:
+        with self.take_queue_copy() as copy:
+            child = copy.cargo_dir / "child"
+            child.mkdir()
+            artifact = child / "artifact"
+            _ = artifact.write_text("Cargo output")
+            with child.with_suffix(".lock").open("wb") as lock:
+                build_folder_lock.mark_lock(lock.fileno())
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertFalse(build_folders.reset_numbered_copy_cargo(copy.path))
+                self.assertEqual(artifact.read_text(), "Cargo output")
+                self.assertNotIn("cargo_removal", self.lease(copy.path))
+            self.assertTrue(build_folders.reset_numbered_copy_cargo(copy.path))
+            self.assertFalse(copy.cargo_dir.exists())
+
+    def test_row_197_cargo_recovery_refuses_a_held_child_lease(self) -> None:
+        path = self.interrupt_cargo_reset()
+        stage, = (entry for entry in path.glob(".removing-*") if entry.is_dir())
+        child = stage / "child"
+        child.mkdir()
+        recorded = self.lease(path)["cargo_removal"]
+        with child.with_suffix(".lock").open("wb") as lock:
+            build_folder_lock.mark_lock(lock.fileno())
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with (self.assertRaisesRegex(BlockingIOError, "assigned copy 2"),
+                  build_copies.take_copy(self.source, self.base, showrunner="builds", unit="queue",
+                                        work="next", purpose="test", selection=build_copies.ExactCopyRequest(2))):
+                self.fail("Cargo recovery removed a child with a held lease")
+            self.assertEqual(self.lease(path)["cargo_removal"], recorded)
+            self.assertEqual((stage / "old").read_text(), "old Cargo output")
+            self.assertTrue(child.is_dir())
+        self.assert_cargo_reset_recovers(path)
 
     def test_assigned_copy_recovers_cargo_reset_under_a_linked_build_root(self) -> None:
         real_root = self.root / "real-build"

@@ -900,6 +900,63 @@ class FolderFormTests(unittest.TestCase):
                 self.fail("The allocator accepted a build root inside a Cargo target directory.")
         self.assertFalse((output / "build").exists())
 
+    def test_f1_placement_refuses_a_git_checkout_at_the_fixed_path(self) -> None:
+        checkout = folders.build_root() / "hana/mac"
+        _ = subprocess.run(["git", "init", "-q", str(checkout)], check=True, capture_output=True)
+        with self.assertRaisesRegex(folders.InvalidFixedBuildRoot, "inside a Git checkout"):
+            with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo"):
+                self.fail("The allocator accepted an unrelated Git checkout")
+        self.assertFalse(folders.lease_path(checkout).exists())
+        self.assertTrue((checkout / ".git/HEAD").is_file())
+
+    def test_f7_placement_uses_the_volume_case_rule(self) -> None:
+        root = folders.build_root()
+        root.mkdir()
+        with self.config.open("a") as output:
+            _ = output.write(f"roots.copies={root.with_name(root.name.upper()) / 'copies'}\n")
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(os, "pathconf", return_value=0),
+              self.assertRaisesRegex(folders.InvalidFixedBuildRoot, "contains a scratch root")):
+            _ = folders.build_root(form=folders.FixedRepositoryBuildFolders("mac"))
+        with (mock.patch.object(sys, "platform", "darwin"),
+              mock.patch.object(os, "pathconf", return_value=1)):
+            self.assertEqual(folders.build_root(form=folders.FixedRepositoryBuildFolders("mac")), root)
+
+    def test_placement_refuses_overlap_with_each_configured_root(self) -> None:
+        root = folders.build_root()
+        initial = self.config.read_text()
+        for key in ("scratch", "session", "copies", "workspace", "temporary", "gate"):
+            for location in (root.parent, root / key):
+                with self.subTest(key=key, location=location):
+                    values = [line for line in initial.splitlines() if not line.startswith(f"roots.{key}")]
+                    _ = self.config.write_text("\n".join([*values, f"roots.{key}={location}", ""]))
+                    with (mock.patch.dict(os.environ, {"SESSION_TEMP_ROOT": ""}),
+                          self.assertRaisesRegex(folders.InvalidFixedBuildRoot, "scratch root")):
+                        _ = folders.build_root(form=folders.FixedRepositoryBuildFolders("mac"))
+
+    def test_rows_198_199_temporary_sweep_keeps_former_fixed_folders(self) -> None:
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                former = self.root / f"former-{staged}"
+                with mock.patch.object(folders, "build_root", return_value=former):
+                    with folders.fixed_repository_build_folder("hana", machine="mac", unit="demo") as fixed:
+                        _ = (fixed / "proof").write_text("fixed output")
+                sweep_root = self.root / f"sweep-{staged}"
+                sweep_root.mkdir()
+                name = ".removing-123-0123456789abcdef" if staged else "output"
+                outer = sweep_root / name
+                _ = former.rename(outer)
+                with build_folder_lock.folder_parent(outer, sweep_root, create=False) as parent:
+                    descriptor = build_folder_lock.open_lock(outer, parent, create=True)
+                    try:
+                        build_folder_lock.mark_lock(descriptor)
+                    finally:
+                        os.close(descriptor)
+
+                folders.sweep_temporary_build_folders(sweep_root, wait=False)
+
+                self.assertEqual((outer / fixed.relative_to(former) / "proof").read_text(), "fixed output")
+
     def test_mac_uses_the_common_build_root(self) -> None:
         with mock.patch("socket.gethostname", return_value="Nates-MacBook-Pro-2023.local"):
             path = folders.output_path("hana", "demo", "mac")

@@ -29,6 +29,7 @@ import tempfile
 from threading import Lock
 import time
 from typing import TYPE_CHECKING, Literal, Protocol, cast, final, overload, override
+from unicodedata import normalize
 
 from urllib.parse import urlsplit
 
@@ -562,7 +563,40 @@ def _entry_exists(path: Path) -> bool:
     return True
 
 
-def _check_fixed_build_root(root: Path, settings: ConfigRead) -> Path:
+def _fixed_path_is_within(path: Path, parent: Path) -> bool:
+    """Compare canonical paths using the parent volume's case rule."""
+    if path.is_relative_to(parent):
+        return True
+    if sys.platform != "darwin":
+        return False
+    folded_path = Path(normalize("NFC", str(path)).casefold())
+    folded_parent = Path(normalize("NFC", str(parent)).casefold())
+    if not folded_path.is_relative_to(folded_parent):
+        return False
+    for ancestor in (parent, *parent.parents):
+        try:
+            # Darwin defines _PC_CASE_SENSITIVE as 11.
+            return os.pathconf(ancestor, os.pathconf_names.get("PC_CASE_SENSITIVE", 11)) == 0
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+    return False
+
+
+def _fixed_linked_checkout(path: Path) -> bool:
+    try:
+        lease = folder_lease_fields(path)
+        if (lease.get("machine") != path.name or lease.get("repository") != path.parent.name
+                or "last_use" in lease):
+            return False
+        checkout = git_files.at(path)
+        identity = CopyDirectoryIdentity.from_stat(checkout.common_dir_status)
+        _ = _copy_git_checkout(path, checkout.common_dir, identity)
+        return True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _check_fixed_build_root(root: Path, settings: ConfigRead, *, allow_managed_checkout: bool = False) -> Path:
     """Check the placement before fixed checkouts can use the root."""
     from scripts.lib import cargo_target_config, session_folder
     from scripts.build_targets import target_config
@@ -580,12 +614,13 @@ def _check_fixed_build_root(root: Path, settings: ConfigRead) -> Path:
                     if key == "build-dir" else (output.base / output.value).resolve())
             except cargo_target_config.NoCargoManifest:
                 continue
-            if canonical.is_relative_to(target):
+            if _fixed_path_is_within(canonical, target):
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a Cargo target directory ({target})")
         for ancestor in (canonical, *canonical.parents):
             if ancestor.name == "target" or _entry_exists(ancestor / ".rustc_info.json"):
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a Cargo target directory ({ancestor})")
-            if _entry_exists(ancestor / ".git"):
+            if (_entry_exists(ancestor / ".git")
+                    and not (allow_managed_checkout and ancestor == canonical and _fixed_linked_checkout(canonical))):
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a Git checkout ({ancestor})")
             if _CI_ADMISSION_DIRECTORY.match(ancestor.name) or ancestor.name == "typecheck-venv":
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a scratch root ({ancestor})")
@@ -596,21 +631,27 @@ def _check_fixed_build_root(root: Path, settings: ConfigRead) -> Path:
             Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier"),
             Path(DEFAULT_STATE_DIR), Path("~/.local/state/merge-gate"),
         ]
+        configured_roots: list[Path] = []
         session = os.environ.get(session_folder.ROOT_ENV) or settings.value("roots.session", str, default="")
         if session:
-            scratch_roots.append(Path(session))
+            configured_roots.append(Path(session))
         for key in ("roots.scratch", "roots.copies", "roots.temporary", "roots.gate", "roots.workspace"):
             if value := settings.value(key, str, default=""):
-                scratch_roots.append(Path(os.path.expandvars(value.replace("${TMPDIR}", str(inherited_temporary_parent())))))
+                configured_roots.append(Path(os.path.expandvars(
+                    value.replace("${TMPDIR}", str(inherited_temporary_parent())))))
         for name in ("SCRATCH_ROOT", "SCRATCH_COPIES_ROOT", "GATE_STATE_DIR"):
             if value := os.environ.get(name):
                 scratch_roots.append(Path(value))
         if value := os.environ.get("SCRATCH_ROOT"):
             scratch_roots.extend(Path(value).parent / name for name in ("unit", "delegate"))
-        for location in scratch_roots:
+        for location in (*scratch_roots, *configured_roots):
             scratch = location.expanduser().resolve()
-            if canonical.is_relative_to(scratch):
+            if _fixed_path_is_within(canonical, scratch):
                 raise InvalidFixedBuildRoot(f"{root}: the fixed build root is inside a scratch root ({scratch})")
+        for location in configured_roots:
+            scratch = location.expanduser().resolve()
+            if _fixed_path_is_within(scratch, canonical):
+                raise InvalidFixedBuildRoot(f"{root}: the fixed build root contains a scratch root ({scratch})")
     except (OSError, RuntimeError) as error:
         raise InvalidFixedBuildRoot(f"{root}: cannot verify the fixed build root: {error}") from error
     return canonical
@@ -2125,6 +2166,10 @@ def _write_lease(path: Path, directory: int, spec: BuildFolderSpec, *, released:
               "start_time": now}
     if spec.kind == "fixed-repository":
         record.update(machine=spec.machine, repository=spec.repository)
+        with suppress(FileNotFoundError):
+            previous = _read_folder_lease(path, directory)
+            if "source" in previous:
+                record["source"] = previous["source"]
     if spec.kind == "copy" and isinstance(spec.copy_checkout, CopyCheckout):
         if released:
             record = _read_folder_lease(path, directory)
@@ -3097,28 +3142,40 @@ def leased_build_folder(spec: BuildFolderSpec | UniqueBuildFolder | MainOutput |
         _release_build_folder(path)
 
 
-@contextmanager
-def fixed_repository_build_folder(repo: str, *, machine: str, unit: str) -> Generator[Path]:
-    """Hold the fixed repository folder on the machine that runs the build."""
+def check_fixed_repository_placement(repo: str, *, machine: str) -> Path:
+    """Check the configured location of a fixed repository folder."""
     settings = _settings()
     form = build_folder_form(machine, settings=settings)
     if not isinstance(form, FixedRepositoryBuildFolders):
         raise InvalidFolderForm(f"forms.build.{machine}: the build folder form must be per-repository")
     root = build_root(settings=settings, form=form)
-    repository, owner = _form_name(repo), _unit_name(unit)
+    repository = _form_name(repo)
     parent = root / repository
     if _check_fixed_build_root(parent, settings) != parent:
         raise InvalidFixedBuildRoot(f"{parent}: the fixed checkout parent must not be a symbolic link")
     if _CI_ADMISSION_DIRECTORY.match(machine) or machine == "typecheck-venv":
         raise InvalidFixedBuildRoot(f"{parent / machine}: the fixed checkout cannot use a scratch directory name")
-    request = _FixedRepositoryFolder(form, root, repository, owner)
+    checkout = parent / machine
+    if _check_fixed_build_root(checkout, settings, allow_managed_checkout=True) != checkout:
+        raise InvalidFixedBuildRoot(f"{checkout}: the fixed checkout must not be a symbolic link")
+    return checkout
+
+
+@contextmanager
+def fixed_repository_build_folder(repo: str, *, machine: str, unit: str) -> Generator[Path]:
+    """Hold the fixed repository folder on the machine that runs the build."""
+    checkout = check_fixed_repository_placement(repo, machine=machine)
+    request = _FixedRepositoryFolder(FixedRepositoryBuildFolders(machine), checkout.parent.parent,
+                                     checkout.parent.name, _unit_name(unit))
     with leased_build_folder(request) as path:
         yield path
 
 
-def create_fixed_build_checkout(source: Path, checkout: Path, commit: str, *, timeout: float) -> None:
-    """Create a linked checkout under the caller's fixed folder lease."""
+def _register_fixed_build_checkout(source: Path, checkout: Path, commit: str,
+                                   registration_parent: Path | Literal["allocate"]) -> None:
+    """Link a fixed folder to its source and preserve any existing files."""
     locks = held_build_folder_descriptors()
+    timeout = repository_git_timeout()
 
     def git(path: Path, *words: str) -> None:
         _ = subprocess.run(["git", "-C", str(path), *words], check=True, capture_output=True,
@@ -3128,16 +3185,47 @@ def create_fixed_build_checkout(source: Path, checkout: Path, commit: str, *, ti
         git(source, "worktree", "add", "--detach", str(checkout), commit)
     else:
         # Register the checkout without moving the existing Cargo output.
-        with tempfile.TemporaryDirectory(prefix="mac-linux-worktree-", dir=source / ".git") as temporary:
-            staging = Path(temporary) / "checkout"
+        with ExitStack() as cleanup:
+            if registration_parent == "allocate":
+                registration_parent = Path(cleanup.enter_context(
+                    tempfile.TemporaryDirectory(prefix="mac-linux-worktree-", dir=source / ".git")))
+            staging = registration_parent / "checkout"
             git(source, "worktree", "add", "--detach", "--no-checkout", str(staging), commit)
             directory = linked_build_checkout(staging, source).git_dir
             pointer = checkout.resolve() / ".git"
             atomic_file.write_text_atomic(directory / "gitdir", str(pointer) + "\n")
             atomic_file.write_text_atomic(pointer, f"gitdir: {directory}\n")
-        _ = linked_build_checkout(checkout, source)
-        git(checkout, "reset", "--hard", commit)
-    _ = linked_build_checkout(checkout, source)
+
+
+def fixed_build_checkout_source(source: Path, path: Path, commit: str, *,
+                                registration_parent: Path | Literal["allocate"] = "allocate") -> git_files.Checkout:
+    """Verify the leased checkout and record its source before use."""
+    source = source.resolve(strict=True)
+    with build_folder_lock.folder_parent(path, build_root(), create=False) as directory:
+        _current_copy_lock(path, directory)
+        lease = _read_folder_lease(path, directory)
+        if lease.get("machine") != path.name or lease.get("repository") != path.parent.name or "last_use" in lease:
+            raise ValueError(f"{path}: the fixed build folder lease changed")
+        fields: dict[str, object] = {}
+        _copy_creation_fields(path, path.stat(), source, fields)
+        try:
+            checkout = linked_build_checkout(path, source)
+        except git_files.NotACheckout:
+            if "source" in lease or not may_remove_folder_tree(path):
+                raise ValueError(f"{path}: cannot verify the fixed checkout source") from None
+            require_no_fixed_build_folders(path, include_root=False)
+            _register_fixed_build_checkout(source, path, commit, registration_parent)
+            checkout = linked_build_checkout(path, source)
+        if not may_remove_folder_tree(path, checkout.git_dir):
+            raise ValueError(f"{path}: the fixed checkout contains a mount")
+        git_identity = CopyDirectoryIdentity.from_stat(checkout.git_dir_status)
+        fields.update(git_directory=str(checkout.git_dir), git_device=git_identity.device, git_inode=git_identity.inode)
+        if "source" in lease and lease["source"] != fields:
+            raise ValueError(f"{path}: the fixed checkout source changed")
+        if "source" not in lease:
+            lease["source"] = fields
+            _publish_lease(path, directory, lease)
+        return checkout
 
 
 def cargo_target_argument(words: Sequence[str]) -> str:

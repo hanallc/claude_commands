@@ -2660,7 +2660,8 @@ def copy_tree(
     if isinstance(ignored, IgnoredPathListingFailed):
         return False
     receiver_setup = ""
-    if isinstance(offload_fixed_folder.get(), HeldOffloadFolder):
+    fixed = isinstance(offload_fixed_folder.get(), HeldOffloadFolder)
+    if fixed:
         ignored = (*ignored, ".linux-run.json")
         identity = controller.claim_identity
         if not isinstance(identity, claim_state.ClaimIdentity):
@@ -2672,7 +2673,7 @@ def copy_tree(
         with mirror_exclude_file(ignored) as exclude_path:
             result = controller.capture_copy(copies.remote_rsync(
                 request.source_root, mirror, exclude_path, ssh_options(config.connection),
-                receiver_setup=receiver_setup))
+                receiver_setup=receiver_setup, protect_fixed_recovery=fixed))
             return isinstance(result, CommandOutput) and result.status == 0
     except OSError as error:
         controller.copy_failure_detail = f"copy: {error}"
