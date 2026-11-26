@@ -865,7 +865,7 @@ def mac_console_state(output: bytes) -> MacConsole:
     """Read the lock state of the logged-in console session."""
     try:
         root = cast(object, plistlib.loads(output))
-    except (ValueError, ExpatError, OverflowError, AttributeError, IndexError) as exc:
+    except (ValueError, ExpatError, OverflowError, AttributeError, LookupError) as exc:
         raise MacConsoleReadFailure("invalid ioreg property list") from exc
     if not isinstance(root, dict):
         raise MacConsoleReadFailure("the ioreg property list must have a top-level dictionary")
@@ -3431,6 +3431,8 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
                     invocation.attempts.append(failed_attempt(shot, final, reason, started_ns, str(exc)))
                     invocation.failures.append(CaptureFailure(reason, f"{name}: {exc}"))
                     if isinstance(exc, MacConsoleReadFailure):
+                        if passed:
+                            write_views(path, views)
                         raise
                     failures.append(f"FAIL {name}: {exc}")
                     print(failures[-1], file=sys.stderr)

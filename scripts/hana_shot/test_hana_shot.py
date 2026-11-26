@@ -2919,14 +2919,16 @@ class MacConsoleTests(BuildLogIsolatedTest):
                     probe.assert_not_called()
 
     def test_mac_alert_clear_command_reports_invalid_ioreg_output(self) -> None:
-        with (
-            mock.patch.object(process_start, "process_start", return_value=process_start.Started("100")),
-            mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")),
-            redirect_stderr(io.StringIO()) as stderr,
-        ):
-            status = hana_shot.main(["--mac-lock-cleared", "123", "100", REMOTE_HOST])
-        self.assertEqual(status, 1)
-        self.assertEqual(stderr.getvalue(), "hana_shot: cannot read the Mac lock state: invalid ioreg property list\n")
+        for output in (b"", b'<?xml version="1.0" encoding="unknown-encoding"?><plist><dict/></plist>'):
+            with (
+                self.subTest(output=output),
+                mock.patch.object(process_start, "process_start", return_value=process_start.Started("100")),
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output, b"")),
+                redirect_stderr(io.StringIO()) as stderr,
+            ):
+                status = hana_shot.main(["--mac-lock-cleared", "123", "100", REMOTE_HOST])
+                self.assertEqual(status, 1)
+                self.assertEqual(stderr.getvalue(), "hana_shot: cannot read the Mac lock state: invalid ioreg property list\n")
 
 
 class RemoteTests(HanaShotTest):
@@ -3049,26 +3051,37 @@ class RemoteTests(HanaShotTest):
                 self.assertFalse((self.scratch / "shot.png").exists())
                 sleep.assert_not_called()
 
-    def test_views_check_stops_after_invalid_mac_console_output(self) -> None:
+    def test_views_check_saves_passing_views_before_stopping_on_invalid_mac_console_output(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
-        _ = (self.scratch / "views.toml").write_text('[views.first]\nmode = "home"\n[views.second]\nmode = "home"\n')
+        views_path = self.scratch / "views.toml"
+        _ = views_path.write_text(''.join(f'[views.{name}]\nmode = "home"\n' for name in ("first", "second", "third")))
         read_console = hana_shot.probe_mac_console
+        successful_probes = 0
 
         def probe(remote: str | None, timeout: float) -> hana_shot.MacConsole:
+            nonlocal successful_probes
             state = read_console(remote, timeout)
-            _ = (self.scratch / "mac-console.plist").write_bytes(b"")
+            successful_probes += 1
+            if successful_probes == 2:
+                _ = (self.scratch / "mac-console.plist").write_bytes(b"")
             return state
 
         sleep = mock.Mock(side_effect=AssertionError("invalid ioreg output must not wait"))
         with (
             mock.patch.object(hana_shot, "probe_mac_console", side_effect=probe) as checked,
             mock.patch.object(hana_shot, "time", mock.Mock(wraps=time, sleep=sleep)),
+            mock.patch.object(hana_shot, "brightest", return_value=0.5),
         ):
             result = self.views("check", "--port", str(self.port), "--out", str(self.scratch / "check"), "--remote", REMOTE_HOST)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stderr, "hana_shot: cannot read the Mac lock state: invalid ioreg property list\n")
-        self.assertEqual(checked.call_count, 2)
-        self.assertEqual(self.fake.methods("brp_extras/screenshot"), [])
+        self.assertIn("PASS first", result.stdout)
+        self.assertEqual(checked.call_count, 3)
+        self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 1)
+        views = cast(dict[str, dict[str, object]], tomllib.loads(views_path.read_text())["views"])
+        self.assertIn("verified", views["first"])
+        self.assertNotIn("verified", views["second"])
+        self.assertNotIn("verified", views["third"])
 
     def test_shot_waits_before_the_camera_read_and_each_capture_retry(self) -> None:
         _ = self.fake_remote(copies=True, system="Darwin")
