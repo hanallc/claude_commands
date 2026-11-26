@@ -1022,7 +1022,10 @@ def render() -> str:
     <button type="button" data-later-draft hidden>Edit a separate draft</button>
     <button type="button" data-cancel>Cancel</button><button type="submit" disabled>Send</button>
    </div>
-   <div data-saved-controls hidden><button type="button" data-done aria-describedby="new-item-saved">Done</button></div>
+   <div data-saved-controls hidden>
+    <button type="button" data-retry-notices hidden>Retry notices</button>
+    <button type="button" data-done aria-describedby="new-item-saved">Done</button>
+   </div>
   </footer>
 '''
     dialog = page_frame.console_dialog('review-new-item', 'new-item-title', 'New item', body,
@@ -1309,6 +1312,7 @@ function bindDraft(dialog, fresh = false) {
  const kindInputs = [...form.querySelectorAll('input[name="kind"]')];
  const sendNotice = dialog.querySelector('[data-send-disabled]');
  const confirmation = dialog.querySelector('[data-saved-confirmation]'), done = dialog.querySelector('[data-done]');
+ const retryNotices = dialog.querySelector('[data-retry-notices]');
  const closeButton = dialog.querySelector('[data-close]');
  const sendControls = dialog.querySelector('[data-send-controls]'), savedControls = done.parentElement;
  const producerHint = dialog.querySelector('[data-producer-hint]');
@@ -1320,7 +1324,7 @@ function bindDraft(dialog, fresh = false) {
  let selectedRecipient = '';
  let pageOwner = '';
  let assignees, selectedAssignee = '';
- let captureSession, pageContext, savedItem, laterDraft, laterBase;
+ let captureSession, pageContext, savedItem, laterDraft, laterBase, noticeDraft;
  let awaitingEarlierSend = false, awaitingNativeRecovery = false, submittedDraft;
  let separateFromNativeDraft = false, nativeListEdit, separateListEdit;
  let draftDatabase, submittedStorageKey;
@@ -2170,6 +2174,8 @@ function bindDraft(dialog, fresh = false) {
 
  function showConfirmation(item) {
   savedItem = item;
+  if (!item?.notices_pending) noticeDraft = undefined;
+  retryNotices.hidden = !noticeDraft;
   const saved = Boolean(item);
   const scheduled = saved && item.id.startsWith('L');
   confirmation.textContent = scheduled
@@ -2183,6 +2189,30 @@ function bindDraft(dialog, fresh = false) {
   updateSend();
   if (saved) done.focus();
  }
+
+ retryNotices.addEventListener('click', async () => {
+  if (!noticeDraft || sending) return;
+  setError('');
+  setSending(true);
+  retryNotices.disabled = done.disabled = true;
+  try {
+   let result;
+   try {
+    result = await post({...noticeDraft, token});
+   } catch (failure) {
+    if (!failure?.staleToken) throw failure;
+    token = (await loadOptions(opening.signal)).token;
+    result = await post({...noticeDraft, token});
+   }
+   if (result.id !== savedItem.id) throw new Error('The server did not return the saved item ID.');
+   showConfirmation(result);
+  } catch (failure) {
+   setError(failure.message || 'Could not retry the notices.');
+  } finally {
+   retryNotices.disabled = done.disabled = false;
+   setSending(false);
+  }
+ });
 
  function close({sent = false, acknowledged = false} = {}) {
   if (sending || (!sent && !dialog.open)) return;
@@ -2403,6 +2433,7 @@ function bindDraft(dialog, fresh = false) {
    if (typeof result.id !== 'string' || !expectedId.test(result.id)) {
     throw new Error('The server did not return a saved item ID.');
    }
+   if (item.kind === 'scheduled' && result.notices_pending) noticeDraft = item;
    saved = result;
   } catch (failure) {
    if (!dialog.open) dialog.showModal();
